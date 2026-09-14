@@ -4,6 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ use ureq::{Agent, Proxy};
 const VERSION: &str = "0.0.5-preview"; // release tag
 const WORKLOADS_VERSION: &str = "0.0.5"; // version in filename
 const WORKLOAD_CHECKSUM: &str = "ddac5359eca42e7ec65b4a7cfc6f4bc1d629d9c204ba714ec15e4ae830c37ba2"; // benchmarks checksum
+const DOWNLOAD_ATTEMPTS: usize = 3;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
@@ -39,16 +41,31 @@ fn download_workloads() -> Vec<u8> {
 }
 
 fn download_tarball(url: &str, expected_checksum: &str) -> Vec<u8> {
-    let response = build_agent().get(url).call().unwrap();
+    let agent = build_agent();
+    let mut attempt = 1;
 
+    loop {
+        match download(&agent, url) {
+            Ok(data) => {
+                verify_checksum(&data, expected_checksum);
+                return data;
+            }
+            Err(error) if attempt < DOWNLOAD_ATTEMPTS => {
+                eprintln!("Download attempt {attempt} failed: {error}. Retrying...");
+                std::thread::sleep(Duration::from_secs(1));
+                attempt += 1;
+            }
+            Err(error) => panic!("Failed to download {url}: {error}"),
+        }
+    }
+}
+
+fn download(agent: &Agent, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = agent.get(url).call()?;
     let mut data: Vec<u8> = Vec::new();
-    response
-        .into_body()
-        .as_reader()
-        .read_to_end(&mut data)
-        .unwrap();
-    verify_checksum(&data, expected_checksum);
-    data
+    response.into_body().as_reader().read_to_end(&mut data)?;
+
+    Ok(data)
 }
 
 /// Panic unless the SHA-256 of `data` equals `expected` (lowercase hex). Called before any

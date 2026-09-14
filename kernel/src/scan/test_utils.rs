@@ -13,7 +13,7 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::log_replay::{scan_action_iter, ScanPartitionValuesOptions, ScanStatsOptions};
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::{schema_ref, SchemaRef};
 use crate::table_features::ColumnMappingMode;
 use crate::unit_test_utils::string_array_to_engine_data;
 use crate::JsonHandler;
@@ -75,11 +75,11 @@ pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData>
 
 // Generates a batch with an add action.
 // The schema is provided as null columns affect equality checks.
-pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+pub(crate) fn add_batch_for_row_tracking(output_schema: SchemaRef) -> Box<ArrowEngineData> {
     parse_batch(
         [
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId": 42, "tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col"},"createdTime":1677811175819}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId":42,"defaultRowCommitVersion":5,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col", "delta.rowTracking.materializedRowCommitVersionColumnName":"row_commit_version_col"},"createdTime":1677811175819}}"#,
         ],
         output_schema,
     )
@@ -158,8 +158,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
     context: T,
     validate_callback: ScanCallback<T>,
 ) {
-    let logical_schema =
-        logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
+    let logical_schema = logical_schema.unwrap_or_else(|| schema_ref! {});
     let state_info = Arc::new(StateInfo {
         logical_schema: logical_schema.clone(),
         physical_schema: logical_schema,
@@ -168,7 +167,8 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
         physical_partition_schema: None,
-        physical_stats_columns: HashSet::new(),
+        eligible_physical_stats_columns: HashSet::new(),
+        requested_physical_stats_columns: Vec::new(),
         is_catalog_managed: false,
         skip_row_transforms: false,
     });

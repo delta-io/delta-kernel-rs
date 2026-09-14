@@ -563,7 +563,7 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
+        col, column_name, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
         OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
         ScalarExpressionEvaluator, VariadicExpression,
     };
@@ -571,7 +571,7 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructType};
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -634,7 +634,7 @@ mod tests {
 
         fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
             if name.len() == 1 && name[0] == "old_col" {
-                Cow::Owned(ColumnName::new(["new_col"]))
+                Cow::Owned(column_name!("new_col"))
             } else {
                 Cow::Borrowed(name)
             }
@@ -691,14 +691,14 @@ mod tests {
             }
 
             // Check that other expressions are unchanged
-            assert_eq!(result_expr.exprs[0], Expr::literal(1));
+            assert_eq!(result_expr.exprs[0], lit(1));
             if let Expr::Column(col) = &result_expr.exprs[2] {
                 assert_eq!(col.len(), 1);
                 assert_eq!(col[0], "unchanged_col");
             } else {
                 panic!("Expected column expression");
             }
-            assert_eq!(result_expr.exprs[3], Expr::literal("test"));
+            assert_eq!(result_expr.exprs[3], lit("test"));
         }
     }
 
@@ -787,7 +787,7 @@ mod tests {
                 name: &'a ColumnName,
             ) -> Option<Cow<'a, ColumnName>> {
                 if name.len() == 1 && name[0] == "transform_me" {
-                    Some(Cow::Owned(ColumnName::new(["transformed"])))
+                    Some(Cow::Owned(column_name!("transformed")))
                 } else {
                     Some(Cow::Borrowed(name))
                 }
@@ -822,7 +822,7 @@ mod tests {
                 panic!("Expected unchanged column");
             }
 
-            assert_eq!(result_expr.exprs[1], Expr::literal(10)); // 5 * 2
+            assert_eq!(result_expr.exprs[1], lit(10)); // 5 * 2
 
             if let Expr::Column(col) = &result_expr.exprs[2] {
                 assert_eq!(col.len(), 1);
@@ -831,15 +831,15 @@ mod tests {
                 panic!("Expected transformed column");
             }
 
-            assert_eq!(result_expr.exprs[3], Expr::literal("keep"));
+            assert_eq!(result_expr.exprs[3], lit("keep"));
         }
     }
 
     fn test_output_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]))
+        schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        }
     }
 
     #[test]

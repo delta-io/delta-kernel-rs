@@ -37,7 +37,7 @@ StructExpression
             Short(0)
   StructPatch
     input_path
-      Column(foo.bar.baz)
+      Column(foo, bar, baz)
     prepended_fields
       String(prepended)
     field_patches
@@ -87,7 +87,7 @@ StructExpression
   StructPatch
   StructPatch
     input_path
-      Column(empty.nested)
+      Column(empty, nested)
   Array
     Short(5)
     Short(0)
@@ -264,3 +264,6 @@ And
 
 === Predicate Round-trip Test ===
 SUCCESS: Round-trip predicate matches original!
+
+=== Dotted-field Column Round-trip Test ===
+SUCCESS: dotted field "b.c" survived as a single column part!

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::StructType;
@@ -154,10 +154,7 @@ async fn test_clustered_table_write_has_stats(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let clustering_cols = vec![
-        ColumnName::new(["row_number"]),
-        ColumnName::new(["address", "street"]),
-    ];
+    let clustering_cols = vec![column_name!("row_number"), column_name!("address.street")];
     let setup = setup_clustered_table(
         cm_mode,
         nested_schema()?,
@@ -191,12 +188,9 @@ async fn test_clustered_table_write_has_stats(
     }
 
     // Resolve a non-clustering column to verify it's excluded from stats
-    let non_clustering_physical = get_any_level_column_physical_name(
-        snapshot.schema().as_ref(),
-        &ColumnName::new(["name"]),
-        cm,
-    )?
-    .into_inner();
+    let non_clustering_physical =
+        get_any_level_column_physical_name(snapshot.schema().as_ref(), &column_name!("name"), cm)?
+            .into_inner();
 
     // Verify stats for each write commit (v2 and v3, since v1 is the property update).
     // Batch 1 (v2): row_number 1..3, address.street "st1".."st3"
@@ -244,10 +238,7 @@ async fn test_clustered_table_write_has_stats_parsed(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let clustering_cols = vec![
-        ColumnName::new(["row_number"]),
-        ColumnName::new(["address", "street"]),
-    ];
+    let clustering_cols = vec![column_name!("row_number"), column_name!("address.street")];
     let setup = setup_clustered_table(
         cm_mode,
         nested_schema()?,
@@ -282,12 +273,9 @@ async fn test_clustered_table_write_has_stats_parsed(
             );
         }
     }
-    let non_clustering_physical = get_any_level_column_physical_name(
-        snapshot.schema().as_ref(),
-        &ColumnName::new(["name"]),
-        cm,
-    )?
-    .into_inner();
+    let non_clustering_physical =
+        get_any_level_column_physical_name(snapshot.schema().as_ref(), &column_name!("name"), cm)?
+            .into_inner();
 
     snapshot.checkpoint(engine.as_ref(), None)?;
 

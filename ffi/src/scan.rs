@@ -1131,10 +1131,12 @@ mod scan_builder_tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let id = "id";
+        let parts = [kernel_string_slice!(id)];
         let col = unsafe {
             ok_or_panic(visit_expression_column(
                 state,
-                kernel_string_slice!(id),
+                parts.as_ptr(),
+                parts.len(),
                 allocate_err,
             ))
         };

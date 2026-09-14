@@ -136,6 +136,45 @@ fn metadata(m: Metadata) -> serde_json::Value {
     json!({"metaData": serde_json::to_value(&m).unwrap()})
 }
 
+// The AMT protocol carried by the CRC (adaptiveMetadata-preview + deletionVectors).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_protocol_crc() -> Protocol {
+    Protocol::try_new_modern(
+        ["adaptiveMetadata-preview", "deletionVectors"],
+        ["adaptiveMetadata-preview", "deletionVectors"],
+    )
+    .unwrap()
+}
+
+// The AMT protocol carried by the checkpoint action (a superset, so it's distinguishable).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_protocol_checkpoint() -> Protocol {
+    Protocol::try_new_modern(
+        [
+            "adaptiveMetadata-preview",
+            "deletionVectors",
+            "timestampNtz",
+        ],
+        [
+            "adaptiveMetadata-preview",
+            "deletionVectors",
+            "timestampNtz",
+        ],
+    )
+    .unwrap()
+}
+
+// A `checkpoint` action carrying `p` and `m` at `checkpoint_version`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_checkpoint_action(checkpoint_version: i64, p: Protocol, m: Metadata) -> Value {
+    json!({ "checkpoint": [
+        { "checkpointMetadata": { "version": checkpoint_version } },
+        { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": checkpoint_version } },
+        { "protocol": serde_json::to_value(&p).unwrap() },
+        { "metaData": serde_json::to_value(&m).unwrap() },
+    ] })
+}
+
 fn add(path: &str, size: i64) -> serde_json::Value {
     json!({"add": {
         "path": path,
@@ -395,7 +434,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
@@ -407,7 +446,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
         Ok(log_segment
             .pick_latest_base_crc(&self.engine, in_memory_base)
             .map(|c| c.version))
@@ -698,6 +737,43 @@ async fn test_get_m_from_newer_delta_over_older_crc() {
         .build()
         .await
         .assert_p_m(None, &protocol_b(), &metadata_a());
+}
+
+// A lagging checkpoint action (nested version below the CRC) must not override the CRC's newer
+// P&M in a CRC-seeded pruned replay. v1 changes P&M via top-level actions (matching the CRC); v2
+// is a manifest commit whose checkpoint action snapshots the older v0 P&M.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
+    CrcReadTest::new()
+        .commit(
+            0,
+            [
+                commit_info(DEFAULT_OPERATION, None),
+                protocol(amt_protocol_checkpoint()),
+                metadata(metadata_a()),
+            ],
+        )
+        .commit(
+            1,
+            [
+                commit_info(DEFAULT_OPERATION, None),
+                protocol(amt_protocol_crc()),
+                metadata(metadata_b()),
+            ],
+        )
+        .crc(1, amt_protocol_crc(), metadata_b(), None)
+        .commit(
+            2,
+            [amt_checkpoint_action(
+                0,
+                amt_protocol_checkpoint(),
+                metadata_a(),
+            )],
+        )
+        .build()
+        .await
+        .assert_p_m(None, &amt_protocol_crc(), &metadata_b());
 }
 
 #[tokio::test]

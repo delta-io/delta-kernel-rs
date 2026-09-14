@@ -77,6 +77,27 @@ bool run_test_case(const TestCase* test) {
   return all_passed;
 }
 
+// Round-trips a kernel multi-part column whose middle field ("b.c") contains a period, checking
+// the outbound and inbound visitors both preserve it as a single part.
+bool run_dotted_column_roundtrip_test() {
+  SharedExpression* original = get_testing_dotted_field_column();
+  ExpressionItemList expr_list = construct_expression(original);
+  SharedExpression* reconstructed = convert_engine_to_kernel_expression(expr_list);
+  bool equal = expressions_are_equal(&reconstructed, &original);
+
+  printf("=== Dotted-field Column Round-trip Test ===\n");
+  if (equal) {
+    printf("SUCCESS: dotted field \"b.c\" survived as a single column part!\n");
+  } else {
+    printf("FAILURE: reconstructed column does NOT match [\"a\", \"b.c\", \"d\"]!\n");
+  }
+
+  free_kernel_expression(original);
+  free_kernel_expression(reconstructed);
+  free_expression_list(expr_list);
+  return equal;
+}
+
 int main() {
   // Define test cases
   // We use an iterator pattern to add tests
@@ -121,6 +142,11 @@ int main() {
       printf("\n");  // Separator between test cases
     }
   }
-  
+
+  printf("\n");
+  if (!run_dotted_column_roundtrip_test()) {
+    all_tests_passed = false;
+  }
+
   return all_tests_passed ? 0 : 1;
 }

@@ -261,75 +261,37 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DataType, StructField};
+    use crate::schema::{schema, DataType};
 
     #[test]
     fn test_depth_checker() {
-        let schema = DataType::try_struct_type([
-            StructField::nullable(
-                "a",
-                ArrayType::new(
-                    DataType::try_struct_type([
-                        StructField::nullable("w", DataType::LONG),
-                        StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
-                        StructField::nullable(
-                            "y",
-                            MapType::new(DataType::LONG, DataType::STRING, true),
-                        ),
-                        StructField::nullable(
-                            "z",
-                            DataType::try_struct_type([
-                                StructField::nullable("n", DataType::LONG),
-                                StructField::nullable("m", DataType::STRING),
-                            ])
-                            .unwrap(),
-                        ),
-                    ])
-                    .unwrap(),
-                    true,
-                ),
-            ),
-            StructField::nullable(
-                "b",
-                DataType::try_struct_type([
-                    StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
-                    StructField::nullable(
-                        "p",
-                        MapType::new(DataType::LONG, DataType::STRING, true),
-                    ),
-                    StructField::nullable(
-                        "q",
-                        DataType::try_struct_type([
-                            StructField::nullable(
-                                "s",
-                                DataType::try_struct_type([
-                                    StructField::nullable("u", DataType::LONG),
-                                    StructField::nullable("v", DataType::LONG),
-                                ])
-                                .unwrap(),
-                            ),
-                            StructField::nullable("t", DataType::LONG),
-                        ])
-                        .unwrap(),
-                    ),
-                    StructField::nullable("r", DataType::LONG),
-                ])
-                .unwrap(),
-            ),
-            StructField::nullable(
-                "c",
-                MapType::new(
-                    DataType::LONG,
-                    DataType::try_struct_type([
-                        StructField::nullable("f", DataType::LONG),
-                        StructField::nullable("g", DataType::STRING),
-                    ])
-                    .unwrap(),
-                    true,
-                ),
-            ),
-        ])
-        .unwrap();
+        let schema = DataType::from(schema! {
+            nullable "a": [ nullable {
+                nullable "w": LONG,
+                nullable "x": [ nullable LONG ],
+                nullable "y": { LONG => nullable STRING },
+                nullable "z": {
+                    nullable "n": LONG,
+                    nullable "m": STRING,
+                },
+            } ],
+            nullable "b": {
+                nullable "o": [ nullable LONG ],
+                nullable "p": { LONG => nullable STRING },
+                nullable "q": {
+                    nullable "s": {
+                        nullable "u": LONG,
+                        nullable "v": LONG,
+                    },
+                    nullable "t": LONG,
+                },
+                nullable "r": LONG,
+            },
+            nullable "c": { LONG => nullable {
+                nullable "f": LONG,
+                nullable "g": STRING,
+            } },
+        });
 
         // Similar to SchemaDepthChecker::check, but also returns call count
         let check_with_call_count =

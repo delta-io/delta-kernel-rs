@@ -61,13 +61,14 @@ impl UCClient {
 
     /// `GET /delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`:
     /// fetch the table's metadata plus inline unpublished commits.
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(catalog = catalog.as_ref(), schema = schema.as_ref(), table = table.as_ref()))]
     pub async fn load_table(
         &self,
-        catalog: &str,
-        schema: &str,
-        table: &str,
+        catalog: impl AsRef<str>,
+        schema: impl AsRef<str>,
+        table: impl AsRef<str>,
     ) -> Result<LoadTableResponse> {
+        let (catalog, schema, table) = (catalog.as_ref(), schema.as_ref(), table.as_ref());
         let url = self.base_url.join(&table_path(catalog, schema, table))?;
 
         let response =
@@ -84,14 +85,15 @@ impl UCClient {
     /// Vend temporary cloud-storage credentials for the table via the Delta-Tables
     /// `GET .../catalogs/{catalog}/schemas/{schema}/tables/{table}/credentials?operation=...`
     /// endpoint.
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(catalog = catalog.as_ref(), schema = schema.as_ref(), table = table.as_ref(), operation = ?operation))]
     pub async fn get_table_credentials(
         &self,
-        catalog: &str,
-        schema: &str,
-        table: &str,
+        catalog: impl AsRef<str>,
+        schema: impl AsRef<str>,
+        table: impl AsRef<str>,
         operation: Operation,
     ) -> Result<CredentialsResponse> {
+        let (catalog, schema, table) = (catalog.as_ref(), schema.as_ref(), table.as_ref());
         let path = format!("{}/credentials", table_path(catalog, schema, table));
         let mut url = self.base_url.join(&path)?;
         url.query_pairs_mut()
@@ -105,14 +107,15 @@ impl UCClient {
     /// `GET /delta/v1/config?catalog={catalog}&protocol-versions={csv}`: session-start handshake.
     /// `protocol_versions` is a list of version strings such as `["1.1", "2.3"]` indicating the
     /// highest version per major version the client supports.
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(catalog = catalog.as_ref(), protocol_versions = ?protocol_versions))]
     pub async fn get_config(
         &self,
-        catalog: &str,
+        catalog: impl AsRef<str>,
         protocol_versions: &[&str],
     ) -> Result<CatalogConfig> {
         let mut url = self.base_url.join("delta/v1/config")?;
-        url.query_pairs_mut().append_pair("catalog", catalog);
+        url.query_pairs_mut()
+            .append_pair("catalog", catalog.as_ref());
         url.query_pairs_mut()
             .append_pair("protocol-versions", &protocol_versions.join(","));
 
@@ -125,19 +128,20 @@ impl UCClient {
     /// best-effort commit telemetry to the catalog after a commit succeeds.
     ///
     /// Supply the row counts and histogram that only the write engine knows.
-    #[instrument(skip(self, report))]
+    #[instrument(skip_all, fields(catalog = catalog.as_ref(), schema = schema.as_ref(), table = table.as_ref(), table_id = table_id.as_ref()))]
     pub async fn report_metrics(
         &self,
-        catalog: &str,
-        schema: &str,
-        table: &str,
-        table_id: &str,
+        catalog: impl AsRef<str>,
+        schema: impl AsRef<str>,
+        table: impl AsRef<str>,
+        table_id: impl AsRef<str>,
         report: CommitReport,
     ) -> Result<()> {
+        let (catalog, schema, table) = (catalog.as_ref(), schema.as_ref(), table.as_ref());
         let path = format!("{}/metrics", table_path(catalog, schema, table));
         let url = self.base_url.join(&path)?;
         let body = ReportMetricsRequest {
-            table_id: table_id.to_string(),
+            table_id: table_id.as_ref().to_string(),
             report: Some(MetricsReport {
                 commit_report: Some(report),
             }),
@@ -153,17 +157,17 @@ impl UCClient {
     /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables`: reserve a staging
     /// table, allocating its UUID and storage location and returning temporary credentials for
     /// the version 0 commit.
-    #[instrument(skip(self, request))]
+    #[instrument(skip_all, fields(catalog = catalog.as_ref(), schema = schema.as_ref()))]
     pub async fn create_staging_table(
         &self,
-        catalog: &str,
-        schema: &str,
+        catalog: impl AsRef<str>,
+        schema: impl AsRef<str>,
         request: CreateStagingTableRequest,
     ) -> Result<CreateStagingTableResponse> {
         let path = format!(
             "delta/v1/catalogs/{}/schemas/{}/staging-tables",
-            encode_segment(catalog),
-            encode_segment(schema)
+            encode_segment(catalog.as_ref()),
+            encode_segment(schema.as_ref())
         );
         let url = self.base_url.join(&path)?;
         let response =
@@ -175,17 +179,17 @@ impl UCClient {
     /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/tables`: register a table with the
     /// catalog after its version 0 commit, promoting the staging table. Returns the registered
     /// table as a `LoadTableResponse`.
-    #[instrument(skip(self, request))]
+    #[instrument(skip_all, fields(catalog = catalog.as_ref(), schema = schema.as_ref()))]
     pub async fn create_table(
         &self,
-        catalog: &str,
-        schema: &str,
+        catalog: impl AsRef<str>,
+        schema: impl AsRef<str>,
         request: CreateTableRequest,
     ) -> Result<LoadTableResponse> {
         let path = format!(
             "delta/v1/catalogs/{}/schemas/{}/tables",
-            encode_segment(catalog),
-            encode_segment(schema)
+            encode_segment(catalog.as_ref()),
+            encode_segment(schema.as_ref())
         );
         let url = self.base_url.join(&path)?;
         let response =

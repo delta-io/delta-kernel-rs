@@ -2,6 +2,7 @@
 //! log_segment module since it should only really be used there? as hint for listing?
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
+use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
@@ -107,6 +109,43 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
+    /// Reconstructs a checkpoint hint from its serialized fields, dropping oversized sidecar and
+    /// non-file-action arrays so the retained hint is always bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the optional checkpoint schema string is not a valid Delta schema.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        version: Version,
+        size: i64,
+        parts: Option<usize>,
+        size_in_bytes: Option<i64>,
+        num_of_add_files: Option<i64>,
+        checkpoint_schema: Option<String>,
+        checksum: Option<String>,
+        tags: Option<HashMap<String, String>>,
+        v2_checkpoint: Option<LastCheckpointV2>,
+    ) -> DeltaResult<Self> {
+        let checkpoint_schema = checkpoint_schema
+            .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
+            .transpose()?;
+        Ok(Self {
+            version,
+            size,
+            parts,
+            size_in_bytes,
+            num_of_add_files,
+            checkpoint_schema,
+            checksum,
+            tags,
+            v2_checkpoint,
+        }
+        .drop_oversized_fields())
+    }
+
     /// Whether this hint describes the checkpoint a log segment selected, given that segment's
     /// `checkpoint_parts`. Multiple checkpoints can share a version, so a matching version alone is
     /// not enough: the hint's own identity must equal the selected checkpoint's.
@@ -195,9 +234,13 @@ impl LastCheckpointHint {
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage.read_files(vec![(file_path, None)])?.next() {
+        match storage
+            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
+            .next()
+        {
             Some(Ok(data)) => {
                 let result: Option<LastCheckpointHint> =
                     Self::from_bytes_with_oversized_fields_dropped(&data)
@@ -233,14 +276,36 @@ impl LastCheckpointHint {
     }
 }
 
+impl LastCheckpointV2 {
+    /// Reconstructs V2 checkpoint state from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn from_parts(
+        path: String,
+        size_in_bytes: Option<i64>,
+        modification_time: Option<i64>,
+        sidecar_files: Option<Vec<Sidecar>>,
+        non_file_actions: Option<Vec<HintAction>>,
+    ) -> Self {
+        Self {
+            path,
+            size_in_bytes,
+            modification_time,
+            sidecar_files,
+            non_file_actions,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
+    use crate::DeltaResultIteratorStatic;
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -284,7 +349,8 @@ mod tests {
                     {"path": "sidecar-1.parquet", "sizeInBytes": 42, "modificationTime": 1700000000000}
                 ],
                 "nonFileActions": [
-                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7}},
+                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": [], "writerFeatures": []}},
                     {"metaData": {"id": "table-id", "format": {"provider": "parquet", "options": {}},
                         "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
                         "partitionColumns": [], "configuration": {}}},
@@ -468,6 +534,60 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::at_threshold(30, Some(30))]
+    #[case::above_threshold(31, None)]
+    fn reconstructed_hint_bounds_embedded_fields(
+        #[case] count: usize,
+        #[case] expected_count: Option<usize>,
+    ) {
+        let sidecar = Sidecar::new("s.parquet".to_string(), 1, 0, None);
+        let action = HintAction::Protocol(Protocol::default());
+        let hint = LastCheckpointHint::from_parts(
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(LastCheckpointV2::from_parts(
+                "cp.parquet".to_string(),
+                None,
+                None,
+                Some(vec![sidecar; count]),
+                Some(vec![action; count]),
+            )),
+        )
+        .unwrap();
+        let v2 = hint.v2_checkpoint.unwrap();
+        assert_eq!(v2.sidecar_files.as_ref().map(Vec::len), expected_count);
+        assert_eq!(v2.non_file_actions.as_ref().map(Vec::len), expected_count);
+    }
+
+    #[test]
+    fn reconstructed_hint_validates_checkpoint_schema() {
+        let schema = r#"{"type":"struct","fields":[]}"#.to_string();
+        let hint =
+            LastCheckpointHint::from_parts(1, 1, None, None, None, Some(schema), None, None, None)
+                .unwrap();
+        assert!(hint.checkpoint_schema.is_some());
+
+        assert!(LastCheckpointHint::from_parts(
+            1,
+            1,
+            None,
+            None,
+            None,
+            Some("not a schema".to_string()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    }
+
     /// Returns the single `actions` element matching `extract`, asserting there is exactly one.
     fn one_action<'a, T: 'a>(
         actions: &'a [HintAction],
@@ -577,8 +697,9 @@ mod tests {
 
         let (engine, snapshot, _tempdir) = load_test_table(table)?;
         let seg = snapshot.log_segment();
-        let hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root)?
-            .expect("table has a _last_checkpoint");
+        let hint =
+            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root, None)?
+                .expect("table has a _last_checkpoint");
         let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 
         // Version, checkpoint file path, and sidecar paths are this table's exact identity.
@@ -658,7 +779,7 @@ mod tests {
         assert_eq!(metadata.format_provider(), "parquet", "{table}: format");
         assert_eq!(
             metadata.parse_schema()?,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+            schema! { nullable "id": LONG },
             "{table}: metadata schema"
         );
         assert!(
@@ -716,5 +837,46 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// A storage handler whose every method panics, so a test can prove an operation never touched
+    /// storage.
+    struct NoIoStorageHandler;
+
+    impl StorageHandler for NoIoStorageHandler {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+            panic!("list_from should not be called");
+        }
+        fn read_files(
+            &self,
+            _files: Vec<crate::FileSlice>,
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+            panic!("read_files should not be called");
+        }
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+            panic!("put should not be called");
+        }
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+            panic!("copy_atomic should not be called");
+        }
+        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+            panic!("head should not be called");
+        }
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            panic!("delete should not be called");
+        }
+    }
+
+    // A cancelled token must surface as `Err(Cancelled)`, never swallowed as "no hint"
+    // (`Ok(None)`). The pre-cancelled token short-circuits the default
+    // `read_files_with_cancellation` before any read, so the panicking handler is never
+    // touched.
+    #[test]
+    fn try_read_propagates_cancellation() {
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+        let token: CancellationTokenRef =
+            std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
+        let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
+        assert!(matches!(result, Err(Error::Cancelled)));
     }
 }

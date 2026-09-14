@@ -269,6 +269,56 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
+// Visitor for `visit_file_size_histogram`. The three slices are equal-length and valid only for
+// the duration of this call, so we read (never retain) them here. The boundary is the inclusive
+// lower bound of each bin.
+void print_file_size_histogram(
+  void* engine_context,
+  KernelI64Slice sorted_bin_boundaries,
+  KernelI64Slice file_counts,
+  KernelI64Slice total_bytes)
+{
+  (void)engine_context;
+  int64_t total_files = 0;
+  int64_t total_size = 0;
+  for (uintptr_t i = 0; i < file_counts.len; i++) {
+    total_files += file_counts.ptr[i];
+    total_size += total_bytes.ptr[i];
+  }
+  print_diag("  histogram: %" PRIuPTR " bins, %" PRId64 " files, %" PRId64 " bytes total\n",
+             sorted_bin_boundaries.len, total_files, total_size);
+  for (uintptr_t i = 0; i < sorted_bin_boundaries.len; i++) {
+    if (file_counts.ptr[i] == 0) {
+      continue; // skip empty bins to keep the output readable
+    }
+    print_diag("    bin [>= %" PRId64 " bytes]: %" PRId64 " files, %" PRId64 " bytes\n",
+               sorted_bin_boundaries.ptr[i], file_counts.ptr[i], total_bytes.ptr[i]);
+  }
+}
+
+// Exercise the CRC-derived file statistics: the scalar stats (num_files / table_size_bytes) and
+// the optional variable-length file-size histogram. Both read the snapshot's CRC without I/O and
+// report nothing when the snapshot has no complete CRC file stats. Output is diagnostic-only (see
+// print_diag / VERBOSE) so it does not perturb the example's golden test output; the FFI calls run
+// regardless, exercising the C-side path end to end.
+void print_snapshot_file_stats(SharedSnapshot* snapshot)
+{
+  print_diag("\nSnapshot file statistics (from CRC):\n");
+  OptionalValueFfiFileStats stats = snapshot_file_stats(snapshot);
+  if (stats.tag == SomeFfiFileStats) {
+    print_diag("  num_files: %" PRId64 ", table_size_bytes: %" PRId64 "\n",
+               stats.some.num_files, stats.some.table_size_bytes);
+  } else {
+    print_diag("  no scalar file stats\n");
+  }
+
+  // The visitor prints the histogram detail; kernel invokes it only when a histogram is present.
+  OptionalValueusize num_bins = visit_file_size_histogram(snapshot, NULL, print_file_size_histogram);
+  if (num_bins.tag != Someusize) {
+    print_diag("  no file size histogram\n");
+  }
+}
+
 static const char *LEVEL_STRING[] = {
   "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -440,6 +490,8 @@ int main(int argc, char* argv[])
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
+
+  print_snapshot_file_stats(snapshot);
 
   PartitionList* partition_cols = get_partition_list(snapshot);
 

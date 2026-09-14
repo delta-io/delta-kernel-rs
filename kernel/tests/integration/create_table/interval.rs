@@ -1,10 +1,8 @@
 //! Interval-type integration tests for the CreateTable API.
 
-use std::sync::Arc;
-
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::expressions::column_name;
+use delta_kernel::schema::{schema_ref, DataType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
@@ -16,24 +14,23 @@ fn test_create_table_rejects_interval_clustering(
     #[values(false, true)] nested: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let (interval_field, clustering_column) = if nested {
+    let (schema, clustering_column) = if nested {
         (
-            StructField::nullable(
-                "nested",
-                StructType::new_unchecked([StructField::nullable("iv", interval)]),
-            ),
-            ColumnName::new(["nested", "iv"]),
+            schema_ref! {
+                not_null "id": INTEGER,
+                nullable "nested": { nullable "iv": (interval) },
+            },
+            column_name!("nested.iv"),
         )
     } else {
         (
-            StructField::nullable("iv", interval),
-            ColumnName::new(["iv"]),
+            schema_ref! {
+                not_null "id": INTEGER,
+                nullable "iv": (interval),
+            },
+            column_name!("iv"),
         )
     };
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::INTEGER),
-        interval_field,
-    ])?);
 
     let result = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::Clustered {
@@ -58,22 +55,20 @@ mod supported {
 
     /// Top-level schema carrying the given interval `DataType`.
     fn top_level_interval_schema(interval: DataType) -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("iv", interval, true),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "iv": (interval),
+        }
     }
 
     /// Schema with the given interval `DataType` nested inside a struct.
     fn nested_interval_schema(interval: DataType) -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked([StructField::new("inner_iv", interval, true)]),
-                true,
-            ),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": {
+                nullable "inner_iv": (interval),
+            },
+        }
     }
 
     /// Creating a table with interval columns preserves its schema across column mapping modes.

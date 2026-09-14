@@ -290,6 +290,7 @@ mod tests {
     fn test_incremental_safe_operations() {
         for op in [
             "WRITE",
+            "STREAMING UPDATE",
             "MERGE",
             "UPDATE",
             "DELETE",

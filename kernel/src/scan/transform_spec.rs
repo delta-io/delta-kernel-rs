@@ -23,6 +23,15 @@ use crate::{DeltaResult, Error};
 // description for that concept.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
+/// Per-file Add-action values used to reconstruct stable row id/commit version.
+///
+/// A value is absent when the Add action doesn't have the corresponding field.
+#[derive(Debug, Default)]
+pub(crate) struct FileRowTrackingMetadata {
+    pub(crate) base_row_id: Option<i64>,
+    pub(crate) default_row_commit_version: Option<i64>,
+}
+
 /// Describes a single field transformation to apply when converting physical data to logical
 /// schema.
 ///
@@ -49,6 +58,11 @@ pub(crate) enum FieldTransformSpec {
         field_name: String,
         /// column name which contains row indexes
         row_index_field_name: String,
+    },
+    /// Generate the stable Row Commit Version column.
+    GenerateRowCommitVersion {
+        /// Column containing the materialized Row Commit Version.
+        field_name: String,
     },
     /// Insert a partition column after the named input column.
     /// The partition column is identified by its field index in the logical table schema.
@@ -109,6 +123,7 @@ pub(crate) fn parse_partition_values(
             FieldTransformSpec::DynamicColumn { .. }
             | FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::GenerateRowId { .. }
+            | FieldTransformSpec::GenerateRowCommitVersion { .. }
             | FieldTransformSpec::StaticDrop { .. } => None,
         })
         .try_collect()
@@ -123,7 +138,7 @@ pub(crate) fn get_transform_expr(
     transform_spec: &TransformSpec,
     mut metadata_values: HashMap<usize, (String, Scalar)>,
     physical_schema: &StructType,
-    base_row_id: Option<i64>,
+    row_tracking_metadata: FileRowTrackingMetadata,
 ) -> DeltaResult<ExpressionRef> {
     let mut patch = ExpressionStructPatchBuilder::new();
 
@@ -138,12 +153,27 @@ pub(crate) fn get_transform_expr(
                 field_name,
                 row_index_field_name,
             } => {
-                let base_row_id = base_row_id.ok_or_else(|| {
+                let base_row_id = row_tracking_metadata.base_row_id.ok_or_else(|| {
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
                 let expr = Arc::new(Expression::coalesce([
                     Expression::column([field_name]),
                     lit(base_row_id) + Expression::column([row_index_field_name]),
+                ]));
+                patch.replace(field_name.clone(), expr)
+            }
+            GenerateRowCommitVersion { field_name } => {
+                let default_row_commit_version = row_tracking_metadata
+                    .default_row_commit_version
+                    .ok_or_else(|| {
+                    Error::missing_data(concat!(
+                        "Missing defaultRowCommitVersion for Row Commit Version ",
+                        "reconstruction",
+                    ))
+                })?;
+                let expr = Arc::new(Expression::coalesce([
+                    Expression::column([field_name]),
+                    lit(default_row_commit_version),
                 ]));
                 patch.replace(field_name.clone(), expr)
             }
@@ -233,16 +263,15 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, BinaryExpressionOp};
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{schema, schema_ref, DataType, PrimitiveType};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
     #[test]
     fn test_parse_partition_value_invalid_index() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "col1",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! {
+            nullable "col1": STRING,
+        };
         let partition_values = HashMap::new();
 
         let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
@@ -252,11 +281,11 @@ mod tests {
     // Tests for parse_partition_values function
     #[test]
     fn test_parse_partition_values_mixed_transforms() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("age", DataType::LONG),
-            StructField::nullable("_change_type", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "age": LONG,
+            nullable "_change_type": STRING,
+        };
         let transform_spec = vec![
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 1,
@@ -302,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_parse_partition_values_empty_spec() {
-        let schema = Arc::new(StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let transform_spec = vec![];
         let partition_values = HashMap::new();
 
@@ -363,7 +392,7 @@ mod tests {
     fn test_parse_partition_value_raw_invalid_type() {
         let result = parse_partition_value_raw(
             Some(&"value".to_string()),
-            &DataType::struct_type_unchecked(vec![]), // Non-primitive type
+            &DataType::from(schema! {}), // Non-primitive type
         );
         assert_result_error_with_message(result, "Unexpected partition column type");
     }
@@ -387,19 +416,19 @@ mod tests {
         let partition_values = HashMap::new(); // Missing required partition value
 
         // Create a minimal physical schema for test
-        let physical_schema = StructType::new_unchecked(vec![]);
+        let physical_schema = schema! {};
         let result = get_transform_expr(
             &transform_spec,
             partition_values,
             &physical_schema,
-            None, /* base_row_id */
+            FileRowTrackingMetadata::default(),
         );
         assert_result_error_with_message(result, "missing partition value");
     }
 
     #[test]
     fn test_get_transform_expr_static_transforms() {
-        let expr = Arc::new(Expression::literal(42));
+        let expr = Arc::new(lit(42));
         let transform_spec = vec![
             FieldTransformSpec::StaticInsert {
                 insert_after: Some("col1".to_string()),
@@ -412,15 +441,15 @@ mod tests {
         let metadata_values = HashMap::new();
 
         // Create a physical schema with the relevant columns
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("col1", DataType::STRING),
-            StructField::nullable("col2", DataType::LONG),
-        ]);
+        let physical_schema = schema! {
+            nullable "col1": STRING,
+            nullable "col2": LONG,
+        };
         let result = get_transform_expr(
             &transform_spec,
             metadata_values,
             &physical_schema,
-            None, /* base_row_id */
+            FileRowTrackingMetadata::default(),
         )
         .unwrap();
 
@@ -452,17 +481,17 @@ mod tests {
         }];
 
         // Physical schema contains change_type
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            nullable "_change_type": STRING,
+        };
         let metadata_values = HashMap::new();
 
         let result = get_transform_expr(
             &transform_spec,
             metadata_values,
             &physical_schema,
-            None, /* base_row_id */
+            FileRowTrackingMetadata::default(),
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -495,8 +524,7 @@ mod tests {
         }];
 
         // Physical schema does not contain change_type
-        let physical_schema =
-            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+        let physical_schema = schema! { nullable "id": STRING };
         let mut metadata_values = HashMap::new();
         metadata_values.insert(
             1,
@@ -510,7 +538,7 @@ mod tests {
             &transform_spec,
             metadata_values,
             &physical_schema,
-            None, /* base_row_id */
+            FileRowTrackingMetadata::default(),
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -539,8 +567,7 @@ mod tests {
             insert_after: Some("id".to_string()),
         }];
 
-        let physical_schema =
-            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+        let physical_schema = schema! { nullable "id": STRING };
         let mut metadata_values = HashMap::new();
         metadata_values.insert(1, ("year".to_string(), Scalar::Integer(2024)));
 
@@ -548,7 +575,7 @@ mod tests {
             &transform_spec,
             metadata_values,
             &physical_schema,
-            None, /* base_row_id */
+            FileRowTrackingMetadata::default(),
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -577,8 +604,7 @@ mod tests {
         }];
 
         // Physical schema without _change_type (so it needs to come from metadata)
-        let physical_schema =
-            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+        let physical_schema = schema! { nullable "id": STRING };
 
         // Empty metadata values - missing required _change_type
         let metadata_values = HashMap::new();
@@ -588,7 +614,7 @@ mod tests {
             &transform_spec,
             metadata_values,
             &physical_schema,
-            None, /* base_row_id */
+            FileRowTrackingMetadata::default(),
         );
         assert_result_error_with_message(result, "missing partition value for dynamic column");
     }
@@ -601,17 +627,20 @@ mod tests {
         }];
 
         // Physical schema contains row index col, but no row-id col
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null("row_index_col", DataType::LONG),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            not_null "row_index_col": LONG,
+        };
         let metadata_values = HashMap::new();
 
         let result = get_transform_expr(
             &transform_spec,
             metadata_values,
             &physical_schema,
-            Some(4), /* base_row_id */
+            FileRowTrackingMetadata {
+                base_row_id: Some(4),
+                ..Default::default()
+            },
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -642,10 +671,10 @@ mod tests {
         }];
 
         // Physical schema contains row index col, but no row-id col
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null("row_index_col", DataType::LONG),
-        ]);
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            not_null "row_index_col": LONG,
+        };
         let metadata_values = HashMap::new();
 
         assert_result_error_with_message(
@@ -653,9 +682,66 @@ mod tests {
                 &transform_spec,
                 metadata_values,
                 &physical_schema,
-                None, /* base_row_id */
+                FileRowTrackingMetadata::default(),
             ),
             "Asked to generate RowIds, but no baseRowId found",
+        );
+    }
+
+    #[test]
+    fn get_transform_expr_generates_stable_row_commit_versions() -> DeltaResult<()> {
+        let transform_spec = vec![FieldTransformSpec::GenerateRowCommitVersion {
+            field_name: "row_commit_version_col".to_string(),
+        }];
+        let physical_schema = schema! {
+            nullable "id": STRING,
+            nullable "row_commit_version_col": LONG,
+        };
+
+        let expression = get_transform_expr(
+            &transform_spec,
+            HashMap::new(),
+            &physical_schema,
+            FileRowTrackingMetadata {
+                default_row_commit_version: Some(5),
+                ..Default::default()
+            },
+        )?;
+        let Expression::StructPatch(patch) = expression.as_ref() else {
+            panic!("Expected StructPatch expression");
+        };
+        let row_commit_version_patch = patch
+            .field_patches
+            .get("row_commit_version_col")
+            .expect("Should have row_commit_version_col patch");
+        assert!(!row_commit_version_patch.keep_input);
+        assert_eq!(
+            row_commit_version_patch.insertions,
+            [Arc::new(Expression::coalesce([
+                col!("row_commit_version_col"),
+                lit(5i64),
+            ]))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_transform_expr_rejects_missing_default_row_commit_version() {
+        let transform_spec = vec![FieldTransformSpec::GenerateRowCommitVersion {
+            field_name: "row_commit_version_col".to_string(),
+        }];
+        let physical_schema = schema! {
+            nullable "row_commit_version_col": LONG,
+        };
+
+        assert_result_error_with_message(
+            get_transform_expr(
+                &transform_spec,
+                HashMap::new(),
+                &physical_schema,
+                FileRowTrackingMetadata::default(),
+            ),
+            "Missing defaultRowCommitVersion",
         );
     }
 }

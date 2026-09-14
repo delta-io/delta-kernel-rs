@@ -68,8 +68,9 @@ impl DataLayout {
     /// Nested columns (construct the variant directly):
     ///
     /// ```ignore
+    /// use delta_kernel::expressions::column_name;
     /// let layout = DataLayout::Clustered {
-    ///     columns: vec![ColumnName::new(["user", "address", "city"])],
+    ///     columns: vec![column_name!("user.address.city")],
     /// };
     /// ```
     pub fn clustered<I, S>(columns: I) -> Self

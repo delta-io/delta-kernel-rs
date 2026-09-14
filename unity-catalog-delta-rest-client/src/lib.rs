@@ -24,7 +24,7 @@
 pub mod clients;
 pub mod config;
 pub mod error;
-pub mod http;
+pub(crate) mod http;
 
 #[cfg(test)]
 mod tests;
@@ -32,3 +32,7 @@ mod tests;
 pub use clients::{UCClient, UCUpdateTableRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
+pub use unity_catalog_delta_client_api as api;
+pub use unity_catalog_delta_client_api::credentials::*;
+pub use unity_catalog_delta_client_api::models::*;
+pub use unity_catalog_delta_client_api::UpdateTableClient;

@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use crate::actions::NUM_RECORDS;
     use crate::expressions::ExpressionStructPatch;
-    use crate::schema::MapType;
+    use crate::schema::{schema, schema_ref, MapType};
 
     #[test]
     fn test_config_defaults() {
@@ -353,10 +353,9 @@ mod tests {
         stats_schema: &SchemaRef,
         partition_schema: Option<&SchemaRef>,
     ) -> (SchemaRef, ExpressionRef) {
-        let base_schema = StructType::new_unchecked([StructField::nullable(
-            ADD_NAME,
-            add_schema(partition_schema.is_some()),
-        )]);
+        let base_schema = schema! {
+            nullable ADD_NAME: (add_schema(partition_schema.is_some())),
+        };
         let read_schema = build_checkpoint_read_schema(
             &base_schema,
             stats_schema.as_ref(),
@@ -368,15 +367,17 @@ mod tests {
     }
 
     fn add_schema(with_partition_schema: bool) -> StructType {
-        let fields = [
-            Some(StructField::not_null("path", DataType::STRING)),
-            with_partition_schema.then(|| {
-                let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-                StructField::nullable(PARTITION_VALUES_FIELD, partition_values)
-            }),
-            Some(StructField::nullable(STATS_FIELD, DataType::STRING)),
-        ];
-        StructType::new_unchecked(fields.into_iter().flatten())
+        let partition_values = with_partition_schema.then(|| {
+            StructField::nullable(
+                PARTITION_VALUES_FIELD,
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            )
+        });
+        schema! {
+            not_null "path": STRING,
+            ..(partition_values),
+            nullable STATS_FIELD: STRING,
+        }
     }
 
     #[test]
@@ -387,7 +388,7 @@ mod tests {
             write_stats_as_json: true,
             write_stats_as_struct: false,
         };
-        let stats_schema = Arc::new(StructType::new_unchecked([]));
+        let stats_schema = schema_ref! {};
         let (_, transform_expr) = build_checkpoint_transform(&config, &stats_schema, None);
 
         let (_, inner) = extract_patches(&transform_expr);
@@ -411,11 +412,11 @@ mod tests {
             write_stats_as_json: true,
             write_stats_as_struct: true,
         };
-        let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let pv_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("year", DataType::INTEGER),
-            StructField::nullable("month", DataType::INTEGER),
-        ]));
+        let stats_schema = schema_ref! {};
+        let pv_schema = schema_ref! {
+            nullable "year": INTEGER,
+            nullable "month": INTEGER,
+        };
         let (_, transform_expr) =
             build_checkpoint_transform(&config, &stats_schema, Some(&pv_schema));
 
@@ -479,13 +480,14 @@ mod tests {
             write_stats_as_json,
             write_stats_as_struct,
         };
-        let num_records = StructField::nullable(NUM_RECORDS, DataType::LONG);
-        let stats_schema = Arc::new(StructType::new_unchecked([num_records]));
+        let stats_schema = schema_ref! {
+            nullable NUM_RECORDS: LONG,
+        };
         let pv_schema = with_partition_schema.then(|| {
-            Arc::new(StructType::new_unchecked([
-                StructField::nullable("year", DataType::INTEGER),
-                StructField::nullable("month", DataType::INTEGER),
-            ]))
+            schema_ref! {
+                nullable "year": INTEGER,
+                nullable "month": INTEGER,
+            }
         });
 
         let (output_schema, _) =

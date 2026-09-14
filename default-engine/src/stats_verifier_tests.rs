@@ -21,7 +21,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::expressions::{column_name, ColumnName};
+    use delta_kernel::expressions::column_name;
     use delta_kernel::schema::DataType;
     use delta_kernel::transaction::stats_verifier::{
         verify_num_records_present, StatsColumnVerifier,
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_verifier_with_empty_add_files() {
-        let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
+        let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[]);
         assert!(result.is_ok());
@@ -124,7 +124,7 @@ mod tests {
             vec![Some(100), Some(50)],
         );
 
-        let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
+        let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch]);
         assert!(result.is_ok());
@@ -146,7 +146,7 @@ mod tests {
                 max_values,
             );
             let verifier =
-                StatsColumnVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
+                StatsColumnVerifier::new(vec![(column_name!("col"), DataType::LONG)]);
             let err_msg = verifier.verify(&[batch]).unwrap_err().to_string();
             assert!(err_msg.contains("file1.parquet"), "case: {category}");
             assert!(err_msg.contains(category), "case: {category}");
@@ -170,7 +170,7 @@ mod tests {
             vec![None],
         );
 
-        let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
+        let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch1, batch2]);
 
@@ -206,7 +206,7 @@ mod tests {
             vec![None],
         );
 
-        let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
+        let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
         assert!(verifier.verify(&[batch]).is_ok());
     }
@@ -222,7 +222,7 @@ mod tests {
             vec![None],
         );
 
-        let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
+        let columns = vec![(column_name!("col"), DataType::LONG)];
         let verifier = StatsColumnVerifier::new(columns);
         let result = verifier.verify(&[batch]);
         assert!(matches!(result, Err(Error::StatsValidation(_))));
@@ -308,8 +308,8 @@ mod tests {
             vec![Some(20)],
         );
         let columns = vec![
-            (ColumnName::new(["col_a"]), DataType::LONG),
-            (ColumnName::new(["col_b"]), DataType::LONG),
+            (column_name!("col_a"), DataType::LONG),
+            (column_name!("col_b"), DataType::LONG),
         ];
         assert!(StatsColumnVerifier::new(columns).verify(&[batch]).is_ok());
 
@@ -325,8 +325,8 @@ mod tests {
             vec![Some(20)],
         );
         let columns = vec![
-            (ColumnName::new(["col_a"]), DataType::LONG),
-            (ColumnName::new(["col_b"]), DataType::LONG),
+            (column_name!("col_a"), DataType::LONG),
+            (column_name!("col_b"), DataType::LONG),
         ];
         let err_msg = StatsColumnVerifier::new(columns)
             .verify(&[batch])
@@ -371,7 +371,7 @@ mod tests {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
 
         let verifier =
-            StatsColumnVerifier::new(vec![(ColumnName::new(["city"]), DataType::STRING)]);
+            StatsColumnVerifier::new(vec![(column_name!("city"), DataType::STRING)]);
         verifier.verify(&[engine_data]).unwrap();
     }
 
@@ -570,7 +570,7 @@ mod tests {
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
 
-        let verifier = StatsColumnVerifier::new(vec![(ColumnName::new(["col"]), dt)]);
+        let verifier = StatsColumnVerifier::new(vec![(column_name!("col"), dt)]);
         verifier.verify(&[engine_data]).unwrap();
     }
 

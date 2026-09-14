@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -57,11 +57,8 @@ fn measuring_engine(
 }
 
 /// Build a minimal single-column INTEGER schema for test tables.
-fn simple_schema() -> Arc<StructType> {
-    Arc::new(
-        StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])
-            .expect("valid schema"),
-    )
+fn simple_schema() -> SchemaRef {
+    schema_ref! { nullable "id": INTEGER }
 }
 
 /// Insert `count` rows (starting from `start_val`) into an existing table, using

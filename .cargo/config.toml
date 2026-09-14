@@ -1,0 +1,48 @@
+[alias]
+clippy-no-default-kernel-dependents = [
+  "clippy",
+  "--locked",
+  "--workspace",
+  "--no-default-features",
+  "--exclude",
+  "delta_kernel",
+  "--exclude",
+  "delta_kernel_ffi",
+  "--exclude",
+  "delta_kernel_derive",
+  "--exclude",
+  "delta_kernel_ffi_macros",
+  "--",
+  "-D",
+  "warnings",
+]
+check-no-default-kernel = [
+  "check",
+  "--locked",
+  "--no-default-features",
+  "--package",
+  "delta_kernel",
+]
+check-no-default-engine = [
+  "check",
+  "--locked",
+  "--no-default-features",
+  "--package",
+  "delta_kernel_default_engine",
+  "--features",
+  "arrow",
+]
+clippy-no-default-kernel-leaves = [
+  "clippy",
+  "--locked",
+  "--no-default-features",
+  "--package",
+  "delta_kernel_ffi",
+  "--package",
+  "delta_kernel_derive",
+  "--package",
+  "delta_kernel_ffi_macros",
+  "--",
+  "-D",
+  "warnings",
+]

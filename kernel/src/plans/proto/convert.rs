@@ -228,7 +228,7 @@ impl From<&DynamicScan> for proto_plan::DynamicScanNode {
             path_column: Some((&node.path_column).into()),
             file_size_column: Some((&node.file_size_column).into()),
             last_modified_column: Some((&node.last_modified_column).into()),
-            dv_column: Some((&node.dv_column).into()),
+            dv_column: node.dv_column.as_ref().map(Into::into),
         }
     }
 }
@@ -808,11 +808,9 @@ impl TryFrom<proto_schema::DataType> for DataType {
             .ok_or_else(|| Error::schema("DataType proto missing kind"))?;
         let data_type = match kind {
             DataTypeKind::Primitive(primitive) => DataType::Primitive(primitive.try_into()?),
-            DataTypeKind::Array(array) => DataType::Array(Box::new((*array).try_into()?)),
-            DataTypeKind::Struct(struct_type) => {
-                DataType::Struct(Box::new(struct_type.try_into()?))
-            }
-            DataTypeKind::Map(map) => DataType::Map(Box::new((*map).try_into()?)),
+            DataTypeKind::Array(array) => DataType::from(ArrayType::try_from(*array)?),
+            DataTypeKind::Struct(struct_type) => DataType::from(StructType::try_from(struct_type)?),
+            DataTypeKind::Map(map) => DataType::from(MapType::try_from(*map)?),
             // Kernel does not support shredded variants, so always decode as unshredded.
             DataTypeKind::Variant(_) => DataType::unshredded_variant(),
         };
@@ -1002,10 +1000,10 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
-        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
-        OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator, StructData,
-        UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
+        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
+        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1022,8 +1020,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType, ToSchema as _,
+        schema, schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1090,7 +1088,7 @@ mod tests {
     }
 
     fn sample_schema() -> SchemaRef {
-        Arc::new(StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap())
+        schema_ref! { nullable "id": INTEGER }
     }
 
     fn decode(op: &Operation) -> proto_op::Operation {
@@ -1242,13 +1240,10 @@ mod tests {
 
     #[test]
     fn from_plan() {
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::not_null("name", DataType::STRING),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            not_null "name": STRING,
+        };
         let plan = Plan {
             nodes: vec![
                 PlanNode {
@@ -1261,10 +1256,7 @@ mod tests {
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(
-                            Expression::Column(ColumnName::new(["id"])),
-                            lit(5i32),
-                        )),
+                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
                     }),
                     inputs: vec![0],
                 },
@@ -1338,10 +1330,10 @@ mod tests {
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            last_modified_column: ColumnName::new(["filemod"]),
-            dv_column: ColumnName::new(["dv"]),
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: Some(column_name!("dv")),
         }),
         "dynamic_scan"
     )]
@@ -1444,48 +1436,58 @@ mod tests {
     }
 
     fn sample_dynamic_scan_input_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable("c", DataType::INTEGER),
-        ]))
+        schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+            nullable "c": INTEGER,
+        }
     }
 
     fn sample_dynamic_scan_output_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("c", DataType::INTEGER),
-        ]))
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "c": INTEGER,
+        }
     }
 
     #[rstest]
     #[case(
         FileType::Json,
         Url::parse("memory:///base/").unwrap(),
-        "memory:///base/"
+        "memory:///base/",
+        Some(column_name!("dv"))
     )]
     #[case(
         FileType::Parquet,
         Url::parse("file:///table/").unwrap(),
-        "file:///table/"
+        "file:///table/",
+        Some(column_name!("dv"))
+    )]
+    #[case(
+        FileType::Parquet,
+        Url::parse("memory:///base/").unwrap(),
+        "memory:///base/",
+        None
     )]
     fn from_dynamic_scan(
         #[case] file_type: FileType,
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
+        #[case] dv_column: Option<ColumnName>,
     ) -> DeltaResult<()> {
+        let expect_dv_column = dv_column.is_some();
         let node = DynamicScan::try_new(
             &sample_dynamic_scan_input_schema(),
             sample_dynamic_scan_output_schema(),
             file_type,
             base_url,
             ["c"],
-            ColumnName::new(["path"]),
-            ColumnName::new(["size"]),
-            ColumnName::new(["filemod"]),
-            ColumnName::new(["dv"]),
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            dv_column,
         )?;
         let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
@@ -1495,7 +1497,7 @@ mod tests {
         );
         assert_eq!(proto.base_url, expected_base_url);
         assert_eq!(proto.file_constant_columns.len(), 1);
-        assert!(proto.dv_column.is_some());
+        assert_eq!(proto.dv_column.is_some(), expect_dv_column);
 
         assert_eq!(
             proto.path_column.expect("path column present").path,
@@ -1521,8 +1523,8 @@ mod tests {
     #[test]
     fn from_aggregate() {
         let node = Aggregate {
-            group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"]))],
+            group_by: vec![column_name!("g")],
+            aggs: vec![Agg::max(column_name!("a"))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
@@ -1533,21 +1535,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Agg::min(ColumnName::new(["a"])), "min")]
-    #[case(Agg::max(ColumnName::new(["a"])), "max")]
-    #[case(Agg::sum(ColumnName::new(["a"])), "sum")]
-    #[case(Agg::count(ColumnName::new(["a"])), "count")]
+    #[case(Agg::min(column_name!("a")), "min")]
+    #[case(Agg::max(column_name!("a")), "max")]
+    #[case(Agg::sum(column_name!("a")), "sum")]
+    #[case(Agg::count(column_name!("a")), "count")]
     #[case(Agg::count_star(), "count_star")]
-    #[case(Agg::min_non_null_by(
-        ColumnName::new(["a"]),
-        ColumnName::new(["s"]),
-        ColumnName::new(["k"])
-    ), "min_non_null_by")]
-    #[case(Agg::max_non_null_by(
-        ColumnName::new(["a"]),
-        ColumnName::new(["s"]),
-        ColumnName::new(["k"])
-    ), "max_non_null_by")]
+    #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
@@ -1569,8 +1563,8 @@ mod tests {
     fn from_semi_join(#[case] inverted: bool) {
         let node = SemiJoin {
             inverted,
-            probe_keys: vec![ColumnName::new(["p"])],
-            build_keys: vec![ColumnName::new(["b"])],
+            probe_keys: vec![column_name!("p")],
+            build_keys: vec![column_name!("b")],
         };
         let proto = proto_plan::SemiJoinNode::from(&node);
         assert_eq!(proto.inverted, inverted);
@@ -1589,7 +1583,7 @@ mod tests {
 
     #[rstest]
     #[case(lit(1), "literal")]
-    #[case(Expression::Column(ColumnName::new(["a"])), "column")]
+    #[case(col!("a"), "column")]
     #[case(Expression::Predicate(Box::new(Predicate::TRUE)), "predicate")]
     #[case(Expression::struct_from([lit(1)]), "struct_expr")]
     #[case(
@@ -1603,7 +1597,7 @@ mod tests {
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
-    #[case(Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))), "map_to_struct")]
+    #[case(Expression::map_to_struct(col!("m")), "map_to_struct")]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1649,7 +1643,7 @@ mod tests {
 
     #[test]
     fn from_column_name() {
-        let proto = proto_expr::ColumnName::from(&ColumnName::new(["a", "b", "c"]));
+        let proto = proto_expr::ColumnName::from(&column_name!("a.b.c"));
         assert_eq!(proto.path, vec!["a", "b", "c"]);
     }
 
@@ -1733,9 +1727,9 @@ mod tests {
 
     #[test]
     fn from_map_to_struct_expression() {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
-            Expression::map_to_struct(Expression::Column(ColumnName::new(["m"]))),
-        ) else {
+        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
+            expr_kind_of(Expression::map_to_struct(col!("m")))
+        else {
             panic!("expected a map_to_struct expression");
         };
         assert!(map_to_struct.map_expr.is_some());
@@ -2062,12 +2056,7 @@ mod tests {
     #[rstest]
     #[case(DataType::INTEGER, "primitive")]
     #[case(ArrayType::new(DataType::INTEGER, true).into(), "array")]
-    #[case(
-        StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)])
-            .unwrap()
-            .into(),
-        "struct"
-    )]
+    #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
@@ -2156,11 +2145,10 @@ mod tests {
 
     #[test]
     fn from_struct_type() {
-        let struct_type = StructType::try_new(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::not_null("b", DataType::STRING),
-        ])
-        .unwrap();
+        let struct_type = schema! {
+            nullable "a": INTEGER,
+            not_null "b": STRING,
+        };
         let proto = proto_schema::StructType::from(&struct_type);
         assert_eq!(proto.fields.len(), 2);
         assert!(proto.fields[0].nullable);
@@ -2314,10 +2302,10 @@ mod tests {
         MapType::new(DataType::STRING, DataType::LONG, true),
         true
     )))]
-    #[case(DataType::from(StructType::try_new(vec![
-        StructField::nullable("a", DataType::INTEGER),
-        StructField::not_null("b", DataType::STRING),
-    ]).unwrap()))]
+    #[case(DataType::from(schema! {
+        nullable "a": INTEGER,
+        not_null "b": STRING,
+    }))]
     fn round_trip_composite(#[case] data_type: DataType) {
         assert_data_type_round_trips(data_type);
     }
@@ -2335,26 +2323,15 @@ mod tests {
 
     #[test]
     fn round_trip_full_schema() {
-        let schema = StructType::try_new(vec![
-            StructField::nullable("id", DataType::LONG)
-                .with_metadata([("k", MetadataValue::Number(7))]),
-            StructField::not_null("name", DataType::STRING),
-            StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
-            StructField::nullable(
-                "attrs",
-                MapType::new(DataType::STRING, DataType::LONG, true),
-            ),
-            StructField::nullable(
-                "price",
-                DataType::Primitive(PrimitiveType::decimal(10, 2).unwrap()),
-            ),
-            StructField::nullable(
-                "nested",
-                StructType::try_new(vec![StructField::not_null("inner", DataType::BOOLEAN)])
-                    .unwrap(),
-            ),
-        ])
-        .unwrap();
+        let schema = schema! {
+            (StructField::nullable("id", DataType::LONG)
+                .with_metadata([("k", MetadataValue::Number(7))])),
+            not_null "name": STRING,
+            nullable "scores": [ nullable INTEGER ],
+            nullable "attrs": { STRING => nullable LONG },
+            nullable "price": (PrimitiveType::decimal(10, 2).unwrap()),
+            nullable "nested": { not_null "inner": BOOLEAN },
+        };
         assert_schema_round_trips(schema);
     }
 
@@ -2362,14 +2339,11 @@ mod tests {
     /// decodes to the canonical unshredded form rather than round-tripping its inner struct.
     #[test]
     fn variant_decodes_to_unshredded() {
-        let shredded = DataType::Variant(Box::new(
-            StructType::try_new(vec![
-                StructField::not_null("metadata", DataType::BINARY),
-                StructField::not_null("value", DataType::BINARY),
-                StructField::nullable("typed_value", DataType::INTEGER),
-            ])
-            .unwrap(),
-        ));
+        let shredded = DataType::Variant(Box::new(schema! {
+            not_null "metadata": BINARY,
+            not_null "value": BINARY,
+            nullable "typed_value": INTEGER,
+        }));
         let decoded = DataType::try_from(proto_schema::DataType::from(&shredded));
         assert_eq!(
             decoded.expect("decode succeeds"),

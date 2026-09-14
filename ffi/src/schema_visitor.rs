@@ -382,6 +382,24 @@ pub unsafe extern "C" fn visit_field_timestamp_nanos_ntz(
         .into_extern_result(&allocate_error)
 }
 
+/// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_void(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable)
+        .into_extern_result(&allocate_error)
+}
+
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
 /// precision and scale.
 ///
@@ -631,27 +649,8 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, KernelError};
-    use crate::ffi_test_utils::ok_or_panic;
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
     use crate::KernelStringSlice;
-
-    // Error allocator for tests that panics when invoked. It is used in tests where we don't expect
-    // errors.
-    #[no_mangle]
-    extern "C" fn test_allocate_error(
-        etype: KernelError,
-        msg: crate::KernelStringSlice,
-    ) -> *mut EngineError {
-        panic!(
-            "Error allocator called with type {:?}, message: {:?}",
-            etype,
-            unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
-            }
-        );
-    }
 
     macro_rules! visit_field {
         ($type:ident, $state:ident, $name:expr, $nullable:tt) => {
@@ -660,7 +659,7 @@ mod tests {
                     &mut $state,
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -673,7 +672,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     arg1,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -688,7 +687,7 @@ mod tests {
                     arg1,
                     arg2,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -703,7 +702,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     ef,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -720,7 +719,7 @@ mod tests {
                     kf,
                     vf,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -737,7 +736,7 @@ mod tests {
                     fields.as_ptr(),
                     field_count,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -833,6 +832,7 @@ mod tests {
         //   col_timestamp_nanos_ntz: timestamp_nanos_ntz,
         //   col_interval_year_month: interval year to month,
         //   col_interval_day_time: interval day to second,
+        //   col_void: void,
         //   col_decimal: decimal(10,2),
         //   col_array: array<string>,
         //   col_map: map<string, long>,
@@ -865,6 +865,7 @@ mod tests {
             visit_field!(interval_year_month, state, "col_interval_year_month", false);
         let col_interval_day_time =
             visit_field!(interval_day_time, state, "col_interval_day_time", false);
+        let col_void = visit_field!(void, state, "col_void", false);
         let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
@@ -915,6 +916,7 @@ mod tests {
             col_timestamp_nanos_ntz,
             col_interval_year_month,
             col_interval_day_time,
+            col_void,
             col_decimal,
             col_array,
             col_map,
@@ -928,7 +930,7 @@ mod tests {
                 all_columns.as_ptr(),
                 all_columns.len(),
                 false,
-                test_allocate_error,
+                allocate_err,
             )
         });
 
@@ -957,6 +959,7 @@ mod tests {
             ("col_timestamp_nanos_ntz", PrimitiveType::TimestampNanosNtz),
             ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
             ("col_interval_day_time", PrimitiveType::IntervalDayTime),
+            ("col_void", PrimitiveType::Void),
         ];
 
         for (index, (expected_name, expected_type)) in
@@ -1417,10 +1420,7 @@ mod tests {
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg.ptr.cast(), msg.len))
             };
             assert_eq!(
                 msg,

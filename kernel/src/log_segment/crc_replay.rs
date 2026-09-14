@@ -31,38 +31,33 @@ use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
-    column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
+    SchemaRef, StructField,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
 
-#[allow(clippy::expect_used)]
-static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let base = schema! {
-        // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-        // an Add row.
-        nullable ADD_NAME: { not_null "size": LONG },
-        // remove.size is optional, so we read remove.path (required) to know a row is a Remove
-        // before reading its size.
-        nullable REMOVE_NAME: {
-            not_null "path": STRING,
-            nullable "size": LONG,
-        },
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-        nullable COMMIT_INFO_NAME: {
-            nullable "operation": STRING,
-            nullable "inCommitTimestamp": LONG,
-        },
-    };
-    let with_file = base
-        .add_metadata_column("_file", MetadataColumnSpec::FilePath)
-        .expect("add _file metadata column");
-    Arc::new(with_file)
-});
+static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+    // an Add row.
+    nullable ADD_NAME: { not_null "size": LONG },
+    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+    // before reading its size.
+    nullable REMOVE_NAME: {
+        not_null "path": STRING,
+        nullable "size": LONG,
+    },
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    nullable COMMIT_INFO_NAME: {
+        nullable "operation": STRING,
+        nullable "inCommitTimestamp": LONG,
+    },
+    (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+};
 
 impl LogSegment {
     /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
@@ -159,8 +154,8 @@ impl LogSegment {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
-        // No commit boundaries here, so the delta stays incremental-safe. It covers the full
-        // table, which `into_complete_crc` turns into a Complete CRC.
+        // The checkpoint covers the full table, so `into_complete_crc` produces a Complete CRC.
+        // Invalid Add sizes mark replay unsafe and degrade its file stats to `Indeterminate`.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
@@ -200,14 +195,7 @@ impl LogSegment {
         };
         // A log with no checkpoint must start at version 0; a higher first version means a table
         // truncated without a checkpoint.
-        require!(
-            first.version == 0,
-            Error::generic(format!(
-                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
-                 (expected 0); the log appears truncated without a checkpoint",
-                first.version
-            ))
-        );
+        require!(first.version == 0, Error::MissingVersion(0));
         let delta = self.replay_commits_into_crc_delta(
             engine,
             self.listed.ascending_commit_files.iter(),
@@ -401,10 +389,13 @@ impl CrcReplayAccumulator {
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
+        if size < 0 {
+            warn!("CRC reverse-replay: add action has negative size {size}");
+            self.delta.is_incremental_safe = false;
+            return Ok(());
+        }
         let fs = &mut self.delta.file_stats;
         fs.gross_add_files += 1;
-        // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
-        //              Indeterminate instead, like a missing remove size.
         fs.gross_add_bytes += size_to_u64(size)?;
         if let Some(hist) = fs.net_histogram.as_mut() {
             hist.insert(size)?;
@@ -423,6 +414,10 @@ impl CrcReplayAccumulator {
             return Ok(());
         }
         match size {
+            Some(s) if s < 0 => {
+                warn!("CRC reverse-replay: remove action at {path} has negative size {s}");
+                self.delta.is_incremental_safe = false;
+            }
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
                 fs.gross_remove_files += 1;
@@ -642,16 +637,13 @@ impl RowVisitor for CommitCrcVisitor<'_> {
 /// accumulator needs. `add.size` is the only Add leaf read, and it is required, so its presence
 /// marks an Add row (a checkpoint Add missing `size` errors at read time). A checkpoint has no
 /// `remove` or `commitInfo` to project.
-#[allow(clippy::expect_used)]
-static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(schema! {
-        nullable ADD_NAME: { not_null "size": LONG },
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-    })
-});
+static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable ADD_NAME: { not_null "size": LONG },
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+};
 
 // A checkpoint has no source-specific columns, so its projection is the shared columns.
 
@@ -699,6 +691,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::safe("WRITE", true)]
+    #[case::streaming_update("STREAMING UPDATE", true)]
     #[case::unsafe_op("ANALYZE STATS", false)]
     fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
         let mut acc = CrcReplayAccumulator::new(None);
@@ -750,6 +743,14 @@ mod tests {
         assert!(acc.delta.is_incremental_safe);
     }
 
+    #[test]
+    fn on_add_negative_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        acc.on_add(-1).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
     // ===== remove =====
 
     #[test]
@@ -765,6 +766,14 @@ mod tests {
     fn on_remove_missing_size_trips_is_incremental_safe() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_remove("p", None).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
+    #[test]
+    fn on_remove_negative_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        acc.on_remove("p", Some(-1)).unwrap();
         assert!(!acc.delta.is_incremental_safe);
         assert!(acc.current_commit_saw_file_action);
     }
@@ -959,6 +968,7 @@ mod tests {
             vec![],
             None,
             Some(2),
+            None,
         )
         .unwrap();
 
@@ -1036,6 +1046,7 @@ mod tests {
             vec![],
             None,
             Some(0),
+            None,
         )
         .unwrap();
         for base in [0, 5] {
@@ -1066,11 +1077,12 @@ mod tests {
             vec![],
             None,
             Some(1),
+            None,
         )
         .unwrap();
-        assert_result_error_with_message(
+        assert!(matches!(
             segment.build_crc_from_version_zero(&engine),
-            "log appears truncated without a checkpoint",
-        );
+            Err(Error::MissingVersion(0))
+        ));
     }
 }

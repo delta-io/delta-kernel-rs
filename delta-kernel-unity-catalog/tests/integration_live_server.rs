@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
-use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::expressions::column_name;
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot};
@@ -176,21 +176,14 @@ async fn live_create_table() {
     // ===== Step 3: Define the schema =====
     // A nested struct so clustering can target both a top-level and a nested
     // column.
-    let schema: SchemaRef = Arc::new(
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::nullable("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::STRING),
-                ])
-                .expect("failed to build nested schema"),
-            ),
-        ])
-        .expect("failed to build schema"),
-    );
+    let schema: SchemaRef = schema_ref! {
+        not_null "id": INTEGER,
+        nullable "name": STRING,
+        nullable "address": {
+            nullable "city": STRING,
+            nullable "zip": STRING,
+        },
+    };
 
     // ===== Step 4: Invoke kernel to write the v0 commit (00.json) via the UC committer =====
     // The v0 path writes directly to storage and does not call the catalog. Enable row tracking so
@@ -206,10 +199,7 @@ async fn live_create_table() {
     create_table(table_root.as_str(), schema, "delta-kernel-rs-live-test")
         .with_table_properties(disk_props)
         .with_data_layout(DataLayout::Clustered {
-            columns: vec![
-                ColumnName::new(["name"]),
-                ColumnName::new(["address", "city"]),
-            ],
+            columns: vec![column_name!("name"), column_name!("address", "city")],
         })
         .build(engine.as_ref(), committer)
         .expect("failed to build create-table transaction")
