@@ -91,6 +91,10 @@ mod tests {
     use tracing_subscriber::Registry;
 
     use super::*;
+    use crate::engine::sync::SyncEngine;
+    use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
+    use crate::unit_test_utils::{copy_test_table, load_test_table};
+    use crate::Snapshot;
 
     #[derive(Clone, Debug, PartialEq)]
     enum FrameEvent {
@@ -120,11 +124,40 @@ mod tests {
     }
 
     fn capture(f: impl FnOnce()) -> Vec<FrameEvent> {
+        test_utils::ensure_metrics_compatible_global_subscriber();
         let reporter = Arc::new(CapturingFrameReporter::default());
         let subscriber = Registry::default().with(FrameReporterLayer::new(reporter.clone()));
         with_default(subscriber, f);
         let events = reporter.events.lock().unwrap().clone();
         events
+    }
+
+    fn entered_callstacks(events: &[FrameEvent]) -> Vec<Vec<&'static str>> {
+        let mut stack = Vec::new();
+        let mut callstacks = Vec::new();
+        for event in events {
+            match *event {
+                FrameEvent::Enter { id, name } => {
+                    stack.push((id, name));
+                    callstacks.push(stack.iter().map(|(_, name)| *name).collect());
+                }
+                FrameEvent::Exit { id } => {
+                    let Some((entered_id, _)) = stack.pop() else {
+                        panic!("exit without matching enter: {events:?}");
+                    };
+                    assert_eq!(id, entered_id, "frames exited out of order: {events:?}");
+                }
+            }
+        }
+        assert!(stack.is_empty(), "unclosed frames: {events:?}");
+        callstacks
+    }
+
+    fn assert_contains_callstack(callstacks: &[Vec<&str>], expected: &[&str]) {
+        assert!(
+            callstacks.iter().any(|stack| stack == expected),
+            "missing callstack {expected:?}; captured {callstacks:?}"
+        );
     }
 
     #[test]
@@ -270,5 +303,88 @@ mod tests {
             panic!("unexpected enter event: {:?}", events[0]);
         };
         assert_eq!(events[1], FrameEvent::Exit { id });
+    }
+
+    #[test]
+    fn snapshot_construction_reports_expected_callstacks() {
+        let (table_url, _tempdir) = copy_test_table("table-without-dv-small").unwrap();
+        let engine = SyncEngine::new();
+
+        let events = capture(|| {
+            Snapshot::builder_for(table_url).build(&engine).unwrap();
+        });
+        let callstacks = entered_callstacks(&events);
+
+        assert_contains_callstack(
+            &callstacks,
+            &[
+                SNAPSHOT_COMPLETED_SPAN,
+                "log_segment.for_snapshot",
+                "last_checkpoint.read",
+            ],
+        );
+        assert_contains_callstack(
+            &callstacks,
+            &[
+                SNAPSHOT_COMPLETED_SPAN,
+                "log_segment.for_snapshot",
+                "log.list",
+            ],
+        );
+        assert_contains_callstack(
+            &callstacks,
+            &[
+                SNAPSHOT_COMPLETED_SPAN,
+                "try_new_from_log_segment",
+                "log_seg.load_p_m",
+            ],
+        );
+    }
+
+    #[test]
+    fn imperative_scan_reports_expected_callstacks() {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+
+        let events = capture(|| {
+            let scan = snapshot.scan_builder().build().unwrap();
+            for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+                metadata.unwrap();
+            }
+        });
+        let callstacks = entered_callstacks(&events);
+
+        assert_contains_callstack(&callstacks, &["scan_builder.build"]);
+        assert_contains_callstack(&callstacks, &["scan_log_replay.process_actions_batch"]);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
+    fn declarative_scan_reports_expected_callstacks() {
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
+
+        let events = capture(|| {
+            let scan = snapshot.scan_builder().build().unwrap();
+            scan.declarative_metadata_scan_plan(engine.as_ref())
+                .unwrap();
+        });
+        let callstacks = entered_callstacks(&events);
+
+        assert_contains_callstack(
+            &callstacks,
+            &[
+                "scan.declarative_metadata_scan_plan",
+                "checkpoint_shape.try_new",
+                "checkpoint_shape.from_v2_checkpoint_hint",
+                "checkpoint_shape.try_new_manifest",
+            ],
+        );
+        assert_contains_callstack(
+            &callstacks,
+            &[
+                "scan.declarative_metadata_scan_plan",
+                "scan_plan.build_metadata_scan_plan",
+            ],
+        );
     }
 }

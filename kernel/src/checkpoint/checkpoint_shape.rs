@@ -118,6 +118,12 @@ impl CheckpointShape {
     /// caller to inspect the file. A non-empty sidecar list is a manifest; an empty list is a leaf
     /// (the writer emits an empty list only for a leaf, and trims an oversized manifest to absent,
     /// never to empty).
+    #[tracing::instrument(
+        name = "checkpoint_shape.from_v2_checkpoint_hint",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn from_v2_checkpoint_hint(
         exec: &dyn PlanExecutor,
         segment: &LogSegment,
@@ -161,6 +167,12 @@ impl CheckpointShape {
     ///
     /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, use it directly,
     /// Otherwise read the sidecar's footer to get the schema.
+    #[tracing::instrument(
+        name = "checkpoint_shape.try_new_manifest",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
         sidecar: FileMeta,
