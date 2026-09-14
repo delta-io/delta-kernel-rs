@@ -62,7 +62,7 @@ static bool visit_empty_metadata(void* metadata, KernelMetadataVisitorState* sta
 
 static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
   const struct schema_spec* spec = data;
-  const EngineMetadata metadata = { NULL, visit_empty_metadata };
+  EngineMetadata metadata = { NULL, visit_empty_metadata };
   uintptr_t* child_ids = malloc(spec->field_count * sizeof(uintptr_t));
   for (size_t i = 0; i < spec->field_count; i++) {
     const struct field_spec* f = &spec->fields[i];

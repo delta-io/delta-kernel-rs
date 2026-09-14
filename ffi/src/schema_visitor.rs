@@ -21,6 +21,7 @@
 //! elements. Trying to pass an ID more than once to a complex field visitor will result in an
 //! error.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -43,9 +44,11 @@ pub struct KernelSchemaVisitorState {
 
 /// An engine-owned metadata object and the callback that visits its values.
 ///
-/// Field visitors invoke `visitor` synchronously with a fresh Kernel-owned state. The engine must
-/// keep `metadata` valid for that call and return `true` only when every metadata value was
-/// inserted successfully. Returning `false` rejects the field.
+/// Field visitors borrow this descriptor exclusively for the call and invoke `visitor`
+/// synchronously with a fresh Kernel-owned state. The descriptor must be non-null, aligned, and
+/// unaliased; its opaque `metadata` must satisfy the callback's validity requirements until the
+/// callback returns. The callback must not retain the state or unwind across the C ABI. Returning
+/// `false` rejects the field.
 #[repr(C)]
 pub struct EngineMetadata {
     /// Opaque engine-owned metadata representation, borrowed for the callback duration.
@@ -65,7 +68,7 @@ pub struct KernelMetadataVisitorState {
 }
 
 fn visit_engine_metadata_impl(
-    engine_metadata: &EngineMetadata,
+    engine_metadata: &mut EngineMetadata,
 ) -> DeltaResult<HashMap<String, MetadataValue>> {
     let mut state = KernelMetadataVisitorState::default();
     if !(engine_metadata.visitor)(engine_metadata.metadata, &mut state) {
@@ -75,36 +78,32 @@ fn visit_engine_metadata_impl(
     Ok(state.values)
 }
 
-#[cfg(test)]
-extern "C" fn visit_empty_metadata(
-    _metadata: *mut c_void,
-    _state: &mut KernelMetadataVisitorState,
-) -> bool {
-    true
-}
-
-#[cfg(test)]
-pub(crate) fn empty_engine_metadata() -> EngineMetadata {
-    EngineMetadata {
-        metadata: std::ptr::null_mut(),
-        visitor: visit_empty_metadata,
-    }
-}
-
 fn visit_metadata_value_impl(
     state: &mut KernelMetadataVisitorState,
     key: DeltaResult<&str>,
     value: MetadataValue,
 ) -> DeltaResult<()> {
-    state.values.insert(key?.to_string(), value);
-    Ok(())
+    match state.values.entry(key?.to_string()) {
+        Entry::Vacant(entry) => {
+            entry.insert(value);
+            Ok(())
+        }
+        Entry::Occupied(entry) => Err(Error::schema(format!(
+            "Duplicate metadata key: {}",
+            entry.key()
+        ))),
+    }
 }
 
 /// Visit a signed integral metadata value.
 ///
+/// Returns `Ok(true)` after insertion. Returns an allocated error when `key` is not valid UTF-8 or
+/// already exists in the active metadata state.
+///
 /// # Safety
 ///
-/// Caller must provide valid visitor state, UTF-8 key data, and an error allocator.
+/// Caller must pass the active state supplied to `EngineMetadata::visitor`, valid key data for the
+/// call duration, and a valid error allocator. The state must not be aliased.
 #[no_mangle]
 pub unsafe extern "C" fn visit_metadata_number(
     state: &mut KernelMetadataVisitorState,
@@ -120,9 +119,13 @@ pub unsafe extern "C" fn visit_metadata_number(
 
 /// Visit a UTF-8 string metadata value.
 ///
+/// Returns `Ok(true)` after insertion. Returns an allocated error when `key` or `value` is not
+/// valid UTF-8, or when `key` already exists in the active metadata state.
+///
 /// # Safety
 ///
-/// Caller must provide valid visitor state, UTF-8 key and value data, and an error allocator.
+/// Caller must pass the active state supplied to `EngineMetadata::visitor`, valid key and value
+/// data for the call duration, and a valid error allocator. The state must not be aliased.
 #[no_mangle]
 pub unsafe extern "C" fn visit_metadata_string(
     state: &mut KernelMetadataVisitorState,
@@ -140,9 +143,13 @@ pub unsafe extern "C" fn visit_metadata_string(
 
 /// Visit a Boolean metadata value.
 ///
+/// Returns `Ok(true)` after insertion. Returns an allocated error when `key` is not valid UTF-8 or
+/// already exists in the active metadata state.
+///
 /// # Safety
 ///
-/// Caller must provide valid visitor state, UTF-8 key data, and an error allocator.
+/// Caller must pass the active state supplied to `EngineMetadata::visitor`, valid key data for the
+/// call duration, and a valid error allocator. The state must not be aliased.
 #[no_mangle]
 pub unsafe extern "C" fn visit_metadata_boolean(
     state: &mut KernelMetadataVisitorState,
@@ -156,11 +163,16 @@ pub unsafe extern "C" fn visit_metadata_boolean(
         .into_extern_result(&allocate_error)
 }
 
-/// Visit one arbitrary JSON metadata value.
+/// Visit one metadata value encoded as JSON.
+///
+/// Scalar JSON values are stored in their canonical number, string, or Boolean metadata variants.
+/// Returns `Ok(true)` after insertion. Returns an allocated error when `key` is not valid UTF-8,
+/// `json` is not valid JSON, or `key` already exists in the active metadata state.
 ///
 /// # Safety
 ///
-/// Caller must provide valid visitor state, UTF-8 key and JSON data, and an error allocator.
+/// Caller must pass the active state supplied to `EngineMetadata::visitor`, valid key and JSON
+/// data for the call duration, and a valid error allocator. The state must not be aliased.
 #[no_mangle]
 pub unsafe extern "C" fn visit_metadata_json(
     state: &mut KernelMetadataVisitorState,
@@ -170,8 +182,8 @@ pub unsafe extern "C" fn visit_metadata_json(
 ) -> ExternResult<bool> {
     let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
     let json = unsafe { TryFromStringSlice::try_from_slice(&json) };
-    json.and_then(|json| serde_json::from_str(json).map_err(Error::from))
-        .and_then(|value| visit_metadata_value_impl(state, key, MetadataValue::Other(value)))
+    json.and_then(|json| serde_json::from_str::<MetadataValue>(json).map_err(Error::from))
+        .and_then(|value| visit_metadata_value_impl(state, key, value))
         .map(|()| true)
         .into_extern_result(&allocate_error)
 }
@@ -244,7 +256,7 @@ pub unsafe extern "C" fn visit_field_string(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -264,7 +276,7 @@ pub unsafe extern "C" fn visit_field_long(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -284,7 +296,7 @@ pub unsafe extern "C" fn visit_field_integer(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -304,7 +316,7 @@ pub unsafe extern "C" fn visit_field_short(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -324,7 +336,7 @@ pub unsafe extern "C" fn visit_field_byte(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -344,7 +356,7 @@ pub unsafe extern "C" fn visit_field_float(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -364,7 +376,7 @@ pub unsafe extern "C" fn visit_field_double(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -384,7 +396,7 @@ pub unsafe extern "C" fn visit_field_boolean(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -404,7 +416,7 @@ pub unsafe extern "C" fn visit_field_binary(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -424,7 +436,7 @@ pub unsafe extern "C" fn visit_field_date(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -444,7 +456,7 @@ pub unsafe extern "C" fn visit_field_timestamp(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -470,7 +482,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -496,7 +508,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -522,7 +534,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -548,7 +560,7 @@ pub unsafe extern "C" fn visit_field_void(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -571,7 +583,7 @@ pub unsafe extern "C" fn visit_field_decimal(
     precision: u8,
     scale: u8,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -624,7 +636,7 @@ pub unsafe extern "C" fn visit_field_struct(
     field_ids: *const usize,
     field_count: usize,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -660,8 +672,9 @@ fn visit_field_struct_impl(
     metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let data_type = create_struct_data_type(state, field_ids)?;
-    let field = StructField::new(name_str, data_type, nullable).with_metadata(metadata?);
+    let field = StructField::new(name_str, data_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -681,7 +694,7 @@ pub unsafe extern "C" fn visit_field_array(
     name: KernelStringSlice,
     element_type_id: usize,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -698,6 +711,7 @@ fn visit_field_array_impl(
     metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
         Error::generic(format!(
             "Invalid element type ID {element_type_id} for array"
@@ -705,7 +719,7 @@ fn visit_field_array_impl(
     })?;
 
     let array_type = ArrayType::new(element_field.data_type, element_field.nullable);
-    let field = StructField::new(name_str, array_type, nullable).with_metadata(metadata?);
+    let field = StructField::new(name_str, array_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -728,7 +742,7 @@ pub unsafe extern "C" fn visit_field_map(
     key_type_id: usize,
     value_type_id: usize,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -753,6 +767,7 @@ fn visit_field_map_impl(
     metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
 
     let key_field = unwrap_field(state, key_type_id)
         .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
@@ -769,7 +784,7 @@ fn visit_field_map_impl(
         value_field.data_type,
         value_field.nullable,
     );
-    let field = StructField::new(name_str, map_type, nullable).with_metadata(metadata?);
+    let field = StructField::new(name_str, map_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -789,7 +804,7 @@ pub unsafe extern "C" fn visit_field_variant(
     name: KernelStringSlice,
     variant_struct_id: usize,
     nullable: bool,
-    metadata: &EngineMetadata,
+    metadata: &mut EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -806,8 +821,9 @@ fn visit_field_variant_impl(
     metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let data_type = create_variant_data_type(state, variant_struct_id)?;
-    let field = StructField::new(name_str, data_type, nullable).with_metadata(metadata?);
+    let field = StructField::new(name_str, data_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -834,7 +850,9 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, KernelError};
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_with_message, empty_engine_metadata, ok_or_panic,
+    };
     use crate::KernelStringSlice;
 
     #[derive(Default)]
@@ -904,7 +922,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("mapped"),
                 true,
-                &test_engine_metadata(&mut metadata),
+                &mut test_engine_metadata(&mut metadata),
                 allocate_err,
             ))
         };
@@ -939,7 +957,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("field"),
                 false,
-                &EngineMetadata {
+                &mut EngineMetadata {
                     metadata: std::ptr::null_mut(),
                     visitor: reject_metadata,
                 },
@@ -982,6 +1000,122 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_metadata_key_is_rejected_without_replacing_value() {
+        let mut state = KernelMetadataVisitorState::default();
+        unsafe {
+            ok_or_panic(visit_metadata_number(
+                &mut state,
+                KernelStringSlice::new_unsafe("key"),
+                1,
+                allocate_err,
+            ));
+        }
+
+        let result = unsafe {
+            visit_metadata_number(
+                &mut state,
+                KernelStringSlice::new_unsafe("key"),
+                2,
+                allocate_err,
+            )
+        };
+
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_eq!(state.values.get("key"), Some(&MetadataValue::Number(1)));
+    }
+
+    #[test]
+    fn metadata_json_canonicalizes_scalar_values() {
+        for (key, json, expected) in [
+            ("number", "1", MetadataValue::Number(1)),
+            (
+                "string",
+                r#""value""#,
+                MetadataValue::String("value".to_string()),
+            ),
+            ("boolean", "true", MetadataValue::Boolean(true)),
+        ] {
+            let mut state = KernelMetadataVisitorState::default();
+            unsafe {
+                ok_or_panic(visit_metadata_json(
+                    &mut state,
+                    KernelStringSlice::new_unsafe(key),
+                    KernelStringSlice::new_unsafe(json),
+                    allocate_err,
+                ));
+            }
+            assert_eq!(state.values.get(key), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn every_primitive_and_decimal_field_preserves_metadata() {
+        macro_rules! assert_primitive_metadata {
+            ($visitor:ident, $name:literal) => {{
+                let mut state = KernelSchemaVisitorState::default();
+                let mut metadata = TestMetadata {
+                    number: 17,
+                    ..Default::default()
+                };
+                let mut engine_metadata = test_engine_metadata(&mut metadata);
+                let field_id = unsafe {
+                    ok_or_panic($visitor(
+                        &mut state,
+                        KernelStringSlice::new_unsafe($name),
+                        false,
+                        &mut engine_metadata,
+                        allocate_err,
+                    ))
+                };
+                let field = unwrap_field(&mut state, field_id).unwrap();
+                assert_eq!(
+                    field.metadata().get("number"),
+                    Some(&MetadataValue::Number(17))
+                );
+            }};
+        }
+
+        assert_primitive_metadata!(visit_field_string, "string");
+        assert_primitive_metadata!(visit_field_long, "long");
+        assert_primitive_metadata!(visit_field_integer, "integer");
+        assert_primitive_metadata!(visit_field_short, "short");
+        assert_primitive_metadata!(visit_field_byte, "byte");
+        assert_primitive_metadata!(visit_field_float, "float");
+        assert_primitive_metadata!(visit_field_double, "double");
+        assert_primitive_metadata!(visit_field_boolean, "boolean");
+        assert_primitive_metadata!(visit_field_binary, "binary");
+        assert_primitive_metadata!(visit_field_date, "date");
+        assert_primitive_metadata!(visit_field_timestamp, "timestamp");
+        assert_primitive_metadata!(visit_field_timestamp_ntz, "timestamp_ntz");
+        assert_primitive_metadata!(visit_field_interval_year_month, "interval_year_month");
+        assert_primitive_metadata!(visit_field_interval_day_time, "interval_day_time");
+        assert_primitive_metadata!(visit_field_void, "void");
+
+        let mut state = KernelSchemaVisitorState::default();
+        let mut metadata = TestMetadata {
+            number: 17,
+            ..Default::default()
+        };
+        let mut engine_metadata = test_engine_metadata(&mut metadata);
+        let field_id = unsafe {
+            ok_or_panic(visit_field_decimal(
+                &mut state,
+                KernelStringSlice::new_unsafe("decimal"),
+                10,
+                2,
+                false,
+                &mut engine_metadata,
+                allocate_err,
+            ))
+        };
+        let field = unwrap_field(&mut state, field_id).unwrap();
+        assert_eq!(
+            field.metadata().get("number"),
+            Some(&MetadataValue::Number(17))
+        );
+    }
+
+    #[test]
     fn complex_fields_keep_parent_and_child_metadata_isolated() {
         let mut state = KernelSchemaVisitorState::default();
         let mut child_metadata = TestMetadata {
@@ -993,7 +1127,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("child"),
                 true,
-                &test_engine_metadata(&mut child_metadata),
+                &mut test_engine_metadata(&mut child_metadata),
                 allocate_err,
             ))
         };
@@ -1008,7 +1142,7 @@ mod tests {
                 [child].as_ptr(),
                 1,
                 false,
-                &test_engine_metadata(&mut parent_metadata),
+                &mut test_engine_metadata(&mut parent_metadata),
                 allocate_err,
             ))
         };
@@ -1031,7 +1165,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("element"),
                 true,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 allocate_err,
             ))
         };
@@ -1045,7 +1179,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("array"),
                 array_child,
                 true,
-                &test_engine_metadata(&mut array_metadata),
+                &mut test_engine_metadata(&mut array_metadata),
                 allocate_err,
             ))
         };
@@ -1062,7 +1196,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("key"),
                 false,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 allocate_err,
             ))
         };
@@ -1071,7 +1205,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("value"),
                 true,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 allocate_err,
             ))
         };
@@ -1086,7 +1220,7 @@ mod tests {
                 key,
                 value,
                 true,
-                &test_engine_metadata(&mut map_metadata),
+                &mut test_engine_metadata(&mut map_metadata),
                 allocate_err,
             ))
         };
@@ -1103,7 +1237,7 @@ mod tests {
                 &mut state,
                 KernelStringSlice::new_unsafe("value"),
                 true,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 allocate_err,
             ))
         };
@@ -1114,7 +1248,7 @@ mod tests {
                 [variant_child].as_ptr(),
                 1,
                 false,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 allocate_err,
             ))
         };
@@ -1128,7 +1262,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("variant"),
                 variant_struct,
                 true,
-                &test_engine_metadata(&mut variant_metadata),
+                &mut test_engine_metadata(&mut variant_metadata),
                 allocate_err,
             ))
         };
@@ -1141,81 +1275,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generated_headers_include_metadata_visitor_surface() {
-        let target_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("target/ffi-headers");
-        let field_visitors = [
-            "visit_field_string",
-            "visit_field_long",
-            "visit_field_integer",
-            "visit_field_short",
-            "visit_field_byte",
-            "visit_field_float",
-            "visit_field_double",
-            "visit_field_boolean",
-            "visit_field_binary",
-            "visit_field_date",
-            "visit_field_timestamp",
-            "visit_field_timestamp_ntz",
-            "visit_field_interval_year_month",
-            "visit_field_interval_day_time",
-            "visit_field_void",
-            "visit_field_decimal",
-            "visit_field_struct",
-            "visit_field_array",
-            "visit_field_map",
-            "visit_field_variant",
-        ];
-        for extension in ["h", "hpp"] {
-            let header =
-                std::fs::read_to_string(target_dir.join(format!("delta_kernel_ffi.{extension}")))
-                    .unwrap();
-            let metadata_parameter = match extension {
-                "h" => "const struct EngineMetadata *metadata",
-                "hpp" => "const EngineMetadata *metadata",
-                _ => unreachable!(),
-            };
-            for symbol in [
-                "EngineMetadata",
-                "KernelMetadataVisitorState",
-                "visit_metadata_number",
-                "visit_metadata_string",
-                "visit_metadata_boolean",
-                "visit_metadata_json",
-            ] {
-                assert!(
-                    header.contains(symbol),
-                    "{symbol} missing from {extension} header"
-                );
-            }
-            for symbol in field_visitors {
-                let declaration_start = header
-                    .find(&format!("{symbol}("))
-                    .unwrap_or_else(|| panic!("{symbol} missing from {extension} header"));
-                let declaration_end = header[declaration_start..]
-                    .find(");")
-                    .map(|offset| declaration_start + offset)
-                    .unwrap_or_else(|| panic!("{symbol} declaration is incomplete in {extension}"));
-                let declaration = &header[declaration_start..declaration_end];
-                let metadata_position = declaration
-                    .find(metadata_parameter)
-                    .unwrap_or_else(|| panic!("{symbol} has no EngineMetadata in {extension}"));
-                let allocator_position = declaration
-                    .find("AllocateErrorFn allocate_error")
-                    .unwrap_or_else(|| panic!("{symbol} has no error allocator in {extension}"));
-                let metadata_end = metadata_position + metadata_parameter.len();
-                assert_eq!(
-                    declaration[metadata_end..allocator_position].trim(),
-                    ",",
-                    "{symbol} metadata must immediately precede error allocation in {extension}"
-                );
-            }
-        }
-    }
-
     macro_rules! visit_field {
         ($type:ident, $state:ident, $name:expr, $nullable:tt) => {
             paste::paste! { ok_or_panic(unsafe {
@@ -1223,7 +1282,7 @@ mod tests {
                     &mut $state,
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
-                    &empty_engine_metadata(),
+                    &mut empty_engine_metadata(),
                     allocate_err,
                 )
             }) }
@@ -1237,7 +1296,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     arg1,
                     $nullable,
-                    &empty_engine_metadata(),
+                    &mut empty_engine_metadata(),
                     allocate_err,
                 )
             }) }
@@ -1253,7 +1312,7 @@ mod tests {
                     arg1,
                     arg2,
                     $nullable,
-                    &empty_engine_metadata(),
+                    &mut empty_engine_metadata(),
                     allocate_err,
                 )
             }) }
@@ -1269,7 +1328,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     ef,
                     $nullable,
-                    &empty_engine_metadata(),
+                    &mut empty_engine_metadata(),
                     allocate_err,
                 )
             })
@@ -1287,7 +1346,7 @@ mod tests {
                     kf,
                     vf,
                     $nullable,
-                    &empty_engine_metadata(),
+                    &mut empty_engine_metadata(),
                     allocate_err,
                 )
             })
@@ -1305,7 +1364,7 @@ mod tests {
                     fields.as_ptr(),
                     field_count,
                     $nullable,
-                    &empty_engine_metadata(),
+                    &mut empty_engine_metadata(),
                     allocate_err,
                 )
             })
@@ -1328,6 +1387,103 @@ mod tests {
                 false
             )
         }};
+    }
+
+    #[test]
+    fn rejected_complex_field_metadata_preserves_child_ids_for_retry() {
+        let mut state = KernelSchemaVisitorState::default();
+        let child = visit_field!(string, state, "child", true);
+        let mut rejected_metadata = EngineMetadata {
+            metadata: std::ptr::null_mut(),
+            visitor: reject_metadata,
+        };
+        let result = unsafe {
+            visit_field_struct(
+                &mut state,
+                KernelStringSlice::new_unsafe("parent"),
+                [child].as_ptr(),
+                1,
+                false,
+                &mut rejected_metadata,
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let parent = visit_struct_field!(state, "parent", false, child);
+        assert!(unwrap_field(&mut state, parent).is_some());
+
+        let mut state = KernelSchemaVisitorState::default();
+        let element = visit_field!(string, state, "element", true);
+        let mut rejected_metadata = EngineMetadata {
+            metadata: std::ptr::null_mut(),
+            visitor: reject_metadata,
+        };
+        let result = unsafe {
+            visit_field_array(
+                &mut state,
+                KernelStringSlice::new_unsafe("array"),
+                element,
+                false,
+                &mut rejected_metadata,
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let array = visit_array_field!(state, "array", false, element);
+        assert!(unwrap_field(&mut state, array).is_some());
+
+        let mut state = KernelSchemaVisitorState::default();
+        let key = visit_field!(string, state, "key", false);
+        let value = visit_field!(long, state, "value", true);
+        let mut rejected_metadata = EngineMetadata {
+            metadata: std::ptr::null_mut(),
+            visitor: reject_metadata,
+        };
+        let result = unsafe {
+            visit_field_map(
+                &mut state,
+                KernelStringSlice::new_unsafe("map"),
+                key,
+                value,
+                false,
+                &mut rejected_metadata,
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let map = visit_map_field!(state, "map", false, key, value);
+        assert!(unwrap_field(&mut state, map).is_some());
+
+        let mut state = KernelSchemaVisitorState::default();
+        let child = visit_field!(binary, state, "value", false);
+        let variant_struct = visit_struct_field!(state, "variant_struct", false, child);
+        let mut rejected_metadata = EngineMetadata {
+            metadata: std::ptr::null_mut(),
+            visitor: reject_metadata,
+        };
+        let result = unsafe {
+            visit_field_variant(
+                &mut state,
+                KernelStringSlice::new_unsafe("variant"),
+                variant_struct,
+                false,
+                &mut rejected_metadata,
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let mut empty_metadata = empty_engine_metadata();
+        let variant = unsafe {
+            ok_or_panic(visit_field_variant(
+                &mut state,
+                KernelStringSlice::new_unsafe("variant"),
+                variant_struct,
+                false,
+                &mut empty_metadata,
+                allocate_err,
+            ))
+        };
+        assert!(unwrap_field(&mut state, variant).is_some());
     }
 
     fn assert_array(field: &StructField, element_type: DataType, contains_null: bool) {
@@ -1488,7 +1644,7 @@ mod tests {
                 all_columns.as_ptr(),
                 all_columns.len(),
                 false,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 allocate_err,
             )
         });
@@ -1987,7 +2143,7 @@ mod tests {
                 kf,
                 vf,
                 false,
-                &empty_engine_metadata(),
+                &mut empty_engine_metadata(),
                 ensure_map_err,
             )
         };

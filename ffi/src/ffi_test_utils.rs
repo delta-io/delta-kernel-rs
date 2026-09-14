@@ -14,11 +14,29 @@ use test_utils::add_commit;
 
 use crate::error::{EngineError, ExternResult, KernelError};
 #[cfg(test)]
+use crate::schema_visitor::{EngineMetadata, KernelMetadataVisitorState};
+#[cfg(test)]
 use crate::{
     engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
     SharedExternEngine, SharedSnapshot,
 };
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+
+#[cfg(test)]
+extern "C" fn visit_empty_metadata(
+    _metadata: *mut c_void,
+    _state: &mut KernelMetadataVisitorState,
+) -> bool {
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn empty_engine_metadata() -> EngineMetadata {
+    EngineMetadata {
+        metadata: std::ptr::null_mut(),
+        visitor: visit_empty_metadata,
+    }
+}
 
 // Used to allocate EngineErrors with test information from Rust tests
 #[cfg(test)]
