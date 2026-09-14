@@ -345,33 +345,382 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
-/// An expression that parses a JSON string column into a struct column of `output_schema`, the
-/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
-/// that operator discards.
+/// Parses a UTF-8 JSON object into a typed row.
 ///
-/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
-/// `add.stats` with this operator and data skipping reads null stats as "include the file". The
-/// required part is that it does not error; whether a given row comes back as a null struct or as a
-/// struct of null fields is unspecified, since data skipping treats the two alike.
+/// Parsing is directed by `output_schema`; types are selected from the schema, not inferred from
+/// JSON tokens. The result fields have exactly the types and nullability declared by
+/// `output_schema`. Field matching is exact and case-sensitive, and extra object members are
+/// ignored. A SQL-null input produces a null row. A defined non-null input produces a present row.
 ///
-/// An empty string is not valid JSON here, so it is unparseable. This operator does not share
-/// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
-/// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
+/// # Standards
 ///
-/// # Default engine behavior
+/// This contract uses existing standards where they completely define the required value:
 ///
-/// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
-/// engine works around that for the leaf types that fail most often (timestamp, date, decimal) by
-/// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
-/// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
-/// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
-/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
-/// rest of the batch.
+/// - JSON text, tokens, strings, numbers, objects, and arrays have the meanings defined by RFC
+///   8259;
+/// - row, array, exact-numeric, approximate-numeric, boolean, character, date, timestamp, and
+///   SQL-null values use the corresponding ISO/IEC 9075 (standard SQL) value concepts;
+/// - conversion of a finite JSON number to `FLOAT` or `DOUBLE` uses IEEE 754 `roundTiesToEven`;
+/// - `BINARY` uses the Base64 alphabet and padding of RFC 4648 section 4 and the encoding
+///   requirements of RFC 4648 section 3.5.
+///
+/// # Null and JSON-string semantics
+///
+/// A SQL-null input produces a null root row. For non-null input, these rules apply recursively at
+/// requested object members, array elements, and map values. The document root must be an object.
+///
+/// - a missing object member becomes SQL null;
+/// - JSON `null` becomes SQL null;
+/// - the JSON string `""` becomes an empty SQL string for `STRING` and an empty byte sequence for
+///   `BINARY`;
+/// - for every other target, `""` has the wrong JSON token kind and is undefined.
+///
+/// After decoding, the result must be checked against the nullability declared by `output_schema`.
+/// A null in a non-nullable struct field, array element, or map value is an evaluation error. A
+/// null parent struct does not affect the nullability of its children.
+///
+/// NOTE: Empty-string-to-null conversion is a rule of Delta partition-value serialization, not
+/// JSON or decoding. [`ParseJsonExpression`] does not apply it.
+///
+/// Container decoding applies recursively:
+///
+/// - `STRUCT` requires a JSON object and decodes requested children by exact field name. A missing
+///   or JSON-null struct is null; `{}` and an object whose requested children are all null are
+///   present structs with null children. Parent validity must be preserved at every depth.
+/// - `ARRAY<T>` requires a JSON array and applies the statically compiled `T` decoder to each
+///   element. It preserves element order, cardinality, and JSON-null elements as SQL-null elements.
+/// - `MAP<STRING,T>` requires a JSON object, converts member names to string keys, and applies the
+///   statically compiled `T` decoder to each member value. Entries with JSON-null values remain
+///   present with SQL-null values. Other map key types are unsupported.
+///
+/// In all three cases, a child or element type may itself be a supported struct, array, or map.
+/// The same null, token-kind, and leaf rules apply at every depth.
+///
+/// # Example SQL-engine lowering
+///
+/// The following two-stage lowering is one way a SQL engine can implement the semantics. It is not
+/// a required implementation strategy:
+///
+/// 1. Compile a raw type from `output_schema` and evaluate `from_json(json_text, raw_type)`. The
+///    raw type replaces `BINARY`, `DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`, and `VOID` leaves with
+///    `STRING` and applies that replacement recursively through structs, arrays, and maps. Other
+///    supported leaves keep their target types. Decimal decoding in this stage must preserve the
+///    exact JSON number.
+/// 2. Statically transform the raw value to `output_schema`: Base64-decode binary strings, parse
+///    date and timestamp strings with the rules below, replace raw `VOID` values with typed nulls,
+///    and recursively rebuild structs, arrays, and maps.
+///
+/// # Complete two-stage SQL example
+///
+/// Suppose the requested Delta type is:
+///
+/// ```text
+/// STRUCT<
+///   byte_value: BYTE,
+///   short_value: SHORT,
+///   int_value: INTEGER,
+///   long_value: LONG,
+///   float_value: FLOAT,
+///   double_value: DOUBLE,
+///   decimal_value: DECIMAL(10,2),
+///   boolean_value: BOOLEAN,
+///   string_value: STRING,
+///   binary_value: BINARY,
+///   date_value: DATE,
+///   timestamp_value: TIMESTAMP,
+///   timestamp_ntz_value: TIMESTAMP_NTZ,
+///   void_value: VOID,
+///   nested_value: STRUCT<ts: TIMESTAMP, binary: BINARY>,
+///   times: ARRAY<TIMESTAMP>,
+///   blobs: MAP<STRING,BINARY>
+/// >
+/// ```
+///
+/// This input covers every supported scalar type and all three recursive container types:
+///
+/// ```json
+/// {
+///   "byte_value": -8,
+///   "short_value": 32000,
+///   "int_value": -7,
+///   "long_value": 9007199254740993,
+///   "float_value": 1.5,
+///   "double_value": "Infinity",
+///   "decimal_value": 12345678.90,
+///   "boolean_value": true,
+///   "string_value": "delta",
+///   "binary_value": "AQI=",
+///   "date_value": "2024-02-29",
+///   "timestamp_value": "2024-01-02T05:04:05.123456789+02:00",
+///   "timestamp_ntz_value": "2024-01-02 03:04:05.987654321",
+///   "void_value": null,
+///   "nested_value": {"ts": "2024-06-01T00:00:00Z", "binary": "AAI="},
+///   "times": ["2024-01-02T03:04:05Z", null],
+///   "blobs": {"first": "AAE=", "missing": null}
+/// }
+/// ```
+///
+/// Phase one parses the JSON string into the explicitly declared `ROW<...>` type:
+///
+/// ```sql
+/// WITH raw AS (
+///   SELECT from_json(
+///     json_text,
+///     ROW<
+///       byte_value TINYINT,
+///       short_value SMALLINT,
+///       int_value INTEGER,
+///       long_value BIGINT,
+///       float_value REAL,
+///       double_value DOUBLE,
+///       decimal_value DECIMAL(10,2),
+///       boolean_value BOOLEAN,
+///       string_value VARCHAR,
+///       binary_value VARCHAR,
+///       date_value VARCHAR,
+///       timestamp_value VARCHAR,
+///       timestamp_ntz_value VARCHAR,
+///       void_value VARCHAR,
+///       nested_value ROW<ts VARCHAR, binary VARCHAR>,
+///       times ARRAY<VARCHAR>,
+///       blobs MAP<VARCHAR,VARCHAR>
+///     >
+///   ) AS r
+///   FROM input_rows
+/// )
+/// SELECT * FROM raw;
+/// ```
+///
+/// The raw row is:
+///
+/// ```text
+/// ROW(
+///   byte_value=-8,
+///   short_value=32000,
+///   int_value=-7,
+///   long_value=9007199254740993,
+///   float_value=1.5,
+///   double_value=+Infinity,
+///   decimal_value=12345678.90,
+///   boolean_value=TRUE,
+///   string_value='delta',
+///   binary_value='AQI=',
+///   date_value='2024-02-29',
+///   timestamp_value='2024-01-02T05:04:05.123456789+02:00',
+///   timestamp_ntz_value='2024-01-02 03:04:05.987654321',
+///   void_value=NULL::VARCHAR,
+///   nested_value=ROW(ts='2024-06-01T00:00:00Z', binary='AAI='),
+///   times=['2024-01-02T03:04:05Z', NULL],
+///   blobs={'first': 'AAE=', 'missing': NULL}
+/// )
+/// ```
+///
+/// Phase two converts the string fields into their requested Delta types. The outer `CASE` checks
+/// `json_text` so a SQL-null input remains null. `transform` converts each array element, and
+/// `transform_values` converts each map value. These conversions leave null inputs null. Every
+/// rebuilt struct must follow the null semantics above. The final `ROW` uses the names and field
+/// order from the requested output schema.
+///
+/// ```sql
+/// WITH raw AS (
+///   SELECT json_text, from_json(
+///     json_text,
+///     ROW<
+///       byte_value TINYINT,
+///       short_value SMALLINT,
+///       int_value INTEGER,
+///       long_value BIGINT,
+///       float_value REAL,
+///       double_value DOUBLE,
+///       decimal_value DECIMAL(10,2),
+///       boolean_value BOOLEAN,
+///       string_value VARCHAR,
+///       binary_value VARCHAR,
+///       date_value VARCHAR,
+///       timestamp_value VARCHAR,
+///       timestamp_ntz_value VARCHAR,
+///       void_value VARCHAR,
+///       nested_value ROW<ts VARCHAR, binary VARCHAR>,
+///       times ARRAY<VARCHAR>,
+///       blobs MAP<VARCHAR,VARCHAR>
+///     >
+///   ) AS r
+///   FROM input_rows
+/// )
+/// SELECT CASE WHEN json_text IS NULL THEN NULL ELSE ROW(
+///   r.byte_value,
+///   r.short_value,
+///   r.int_value,
+///   r.long_value,
+///   r.float_value,
+///   r.double_value,
+///   r.decimal_value,
+///   r.boolean_value,
+///   r.string_value,
+///   base64_decode(r.binary_value),
+///   CAST(r.date_value AS DATE),
+///   parse_timestamp_utc(r.timestamp_value),
+///   parse_timestamp_ntz(r.timestamp_ntz_value),
+///   CAST(NULL AS VOID),
+///   ROW(
+///     parse_timestamp_utc(r.nested_value.ts),
+///     base64_decode(r.nested_value.binary)
+///   ),
+///   transform(r.times, ts -> parse_timestamp_utc(ts)),
+///   transform_values(r.blobs, (key, value) -> base64_decode(value))
+/// ) END AS parsed
+/// FROM raw;
+/// ```
+///
+/// Here `parse_timestamp_utc` returns a `TIMESTAMP WITH TIME ZONE` value normalized to UTC;
+/// timezone display conversion is not part of parsing. `parse_timestamp_ntz` returns `TIMESTAMP`
+/// without a timezone. The final row is:
+///
+/// ```text
+/// ROW(
+///   byte_value=-8,
+///   short_value=32000,
+///   int_value=-7,
+///   long_value=9007199254740993,
+///   float_value=1.5,
+///   double_value=+Infinity,
+///   decimal_value=12345678.90,
+///   boolean_value=TRUE,
+///   string_value='delta',
+///   binary_value=X'0102',
+///   date_value=DATE '2024-02-29',
+///   timestamp_value=UTC '2024-01-02T03:04:05.123456Z',
+///   timestamp_ntz_value=TIMESTAMP '2024-01-02 03:04:05.987654',
+///   void_value=NULL::VOID,
+///   nested_value=ROW(ts=UTC '2024-06-01T00:00:00Z', binary=X'0002'),
+///   times=[UTC '2024-01-02T03:04:05Z', NULL],
+///   blobs={'first': X'0001', 'missing': NULL::BINARY}
+/// )
+/// ```
+///
+/// These function names are illustrative. An engine may use any equivalent JSON parser, Base64
+/// decoder, timestamp parser, and array or map conversion.
+///
+/// Missing fields and JSON null follow the null rules above. Inputs not listed in the table,
+/// including the wrong JSON token type, have undefined behavior.
+///
+/// # Type rules
+///
+/// The table lists the defined non-null inputs. All other inputs are undefined.
+///
+/// | Delta target | Required JSON input | Required decoding | Undefined examples |
+/// |---|---|---|---|
+/// | `BYTE` | integer token | parse exactly as a signed 8-bit integer | `1.0`, `1e0`, `128`, or `"1"` |
+/// | `SHORT` | integer token | parse exactly as a signed 16-bit integer | `1.0`, `1e0`, `32768`, or `"1"` |
+/// | `INTEGER` | integer token | parse exactly as a signed 32-bit integer | `1.0`, `1e0`, `2147483648`, or `"1"` |
+/// | `LONG` | integer token | parse exactly as a signed 64-bit integer | `1.0`, `1e0`, overflow, or `"1"` |
+/// | `FLOAT` | finite number token | parse as IEEE-754 binary32 using `roundTiesToEven` | finite overflow or a non-number |
+/// | `DOUBLE` | finite number token | parse as IEEE-754 binary64 using `roundTiesToEven` | finite overflow or a non-number |
+/// | `FLOAT` or `DOUBLE` special | exactly `"NaN"`, `"Infinity"`, or `"-Infinity"` | return the corresponding IEEE value | any other string or an unquoted non-finite value |
+/// | `DECIMAL(p,s)` | exactly representable number token | parse exactly as `DECIMAL(p,s)` | a string, a value requiring rounding, or a value exceeding precision `p` |
+/// | `BOOLEAN` | `true` or `false` | return SQL `BOOLEAN` | `"true"`, `0`, or `1` |
+/// | `STRING` | string token | decode the JSON string; preserve `""` | a non-string |
+/// | `BINARY` | padded RFC 4648 Base64 string | decode to bytes; `""` becomes empty bytes | bad alphabet, padding, whitespace, or non-zero unused bits |
+/// | `DATE` | string in exact `YYYY-MM-DD` grammar | parse as SQL `DATE` | an invalid date or alternate spelling |
+/// | `TIMESTAMP` | string in the grammar below | apply its offset, or use UTC when absent; truncate to microseconds | invalid grammar, leap second, bad offset, or out-of-range instant |
+/// | `TIMESTAMP_NTZ` | offset-free string in the grammar below | parse without a timezone; truncate to microseconds | an offset, invalid grammar, or out-of-range value |
+/// | `VOID` | none | return SQL null | every non-null JSON value |
+/// | `STRUCT` | object token | recursively parse requested members as a SQL row | a non-object |
+/// | `ARRAY<T>` | array token | recursively parse each element in order | a non-array |
+/// | `MAP<STRING,T>` | object token | use member names as keys and recursively parse each value | a non-object |
+///
+/// `VARIANT`, both interval types, and feature-gated `GEOMETRY` and `GEOGRAPHY` are unsupported.
+/// An output schema containing one of these types anywhere in its recursive type tree must be
+/// rejected during planning.
+///
+/// A lexical integer has JSON grammar `-?(0|[1-9][0-9]*)`; `1.0` and `1e0` are not integer
+/// representations. Decimal and floating-point targets accept the full JSON number grammar.
+/// Finite floating-point underflow, including underflow to signed zero, is defined.
+///
+/// Decimal conversion must operate on the original number text without passing through a binary
+/// floating-point value. The number must be exactly representable by the target `DECIMAL(p,s)`.
+/// Fewer fractional digits are zero-padded as needed. An input that requires discarding non-zero
+/// fractional digits to reach scale `s`, or whose coefficient at scale `s` contains more than `p`
+/// digits, is undefined. For example, `999.9` decoded as `DECIMAL(5,2)` becomes `999.90`, while
+/// `999.994` is undefined for that target.
+///
+/// `BINARY` requires the RFC 4648 alphabet `A-Z`, `a-z`, `0-9`, `+`, `/`, a length divisible by
+/// four, zero to two trailing `=` characters exactly where required, zero unused trailing bits,
+/// and no whitespace. Re-encoding the decoded bytes with a padded RFC 4648 encoder must reproduce
+/// the input. For example, `"AQI="` decodes to the bytes `01 02`, and `""` decodes to an empty
+/// byte sequence.
+///
+/// # Date and timestamp grammar
+///
+/// Dates use Gregorian calendar rules for every year, including years before 1582. Required
+/// timestamps have this grammar:
+///
+/// ```text
+/// date          := YYYY "-" MM "-" DD
+/// time          := hh ":" mm ":" ss ["." 1*9DIGIT]
+/// offset        := "Z" | ("+" | "-") hh ":" mm
+/// timestamp     := date ("T" | " ") time [offset]
+/// timestamp_ntz := date ("T" | " ") time
+/// ```
+///
+/// Years are `0001..9999`; hours, minutes, and seconds are respectively `00..23`, `00..59`, and
+/// `00..59`. Numeric offsets range from `-18:00` through `+18:00`, with an offset hour of 18 only
+/// valid when its minutes are zero. The normalized UTC instant must also remain within the stated
+/// year range.
+///
+/// `TIMESTAMP` is parsed directly as a UTC instant. An offsetless value is interpreted as UTC; an
+/// explicit offset is applied and the result normalized to UTC. Converting that instant to a
+/// display timezone is a separate operation. `TIMESTAMP_NTZ` is a timezone-free local date-time
+/// and does not accept `Z` or a numeric offset. Fractions beyond microseconds are truncated. For
+/// example:
+///
+/// - for `TIMESTAMP`, `"2020-01-02T03:04:05.123456789+02:30"` becomes the UTC instant
+///   `2020-01-02T00:34:05.123456Z`;
+/// - for `TIMESTAMP`, `"2020-01-02 03:04:05"` becomes the UTC instant `2020-01-02T03:04:05Z`;
+/// - for `TIMESTAMP_NTZ`, `"2020-01-02T03:04:05.123456789"` becomes the timezone-free value
+///   `2020-01-02T03:04:05.123456`.
+///
+/// # Undefined portability behavior
+///
+/// An input row is outside the portable contract, and therefore has undefined behavior, for any
+/// of the following reasons:
+///
+/// - the text is not exactly one complete strict RFC 8259 JSON object, including an empty or
+///   partial document, multiple roots, trailing non-whitespace, a byte-order mark, comments, single
+///   quotes, unquoted names, unescaped controls, or non-standard number syntax;
+/// - the root JSON value is not an object: it is JSON null, a string, a number, a boolean, or an
+///   array;
+/// - an object anywhere in the document has duplicate keys, including in an ignored extra field;
+/// - a decoded string is not valid Unicode or contains an unpaired surrogate escape;
+/// - a requested value has the wrong JSON token kind, including `""` for a target other than
+///   `STRING` or `BINARY`;
+/// - an integer is not in lexical integer form or is outside the target range;
+/// - a finite float, decimal, date, timestamp, or normalized UTC instant is outside its target
+///   range, or a decimal would require rounding to the target scale;
+/// - Base64 violates RFC 4648 sections 3.5 or 4, is URL-safe, is incorrectly padded, or contains
+///   whitespace;
+/// - a date is calendar-invalid, or a timestamp contains a leap second, lowercase `z`, a named
+///   zone, or an unsupported offset;
+/// - a `TIMESTAMP_NTZ` contains an offset;
+/// - any other value is outside the required representation for its target type.
+///
+/// Here "undefined" is a cross-engine portability boundary, not Rust memory-model undefined
+/// behavior. For such a row, an implementation may return SQL null, return a partial result,
+/// return any value representable by the declared output type, or report an evaluation error at
+/// row, batch, or query scope.
+///
+/// # Invalid expressions and schemas
+///
+/// The child expression must produce `STRING`; a type mismatch is an expression error, not an
+/// undefined JSON value. Unsupported or ambiguous output schemas must fail when the evaluator is
+/// planned. These are a map with a non-`STRING` key, case-insensitive duplicate field names in any
+/// struct, `VARIANT`, an interval, `GEOMETRY`, or `GEOGRAPHY` anywhere in the recursive output
+/// schema, or `VOID` inside an array or map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
-    /// The expression that evaluates to a STRING column containing JSON objects.
+    /// Expression producing the `STRING` JSON text described by this type's contract.
     pub json_expr: Box<Expression>,
-    /// The schema defining the structure to parse the JSON into.
+    /// Root struct shape directing recursive decoding, including result nullability.
     pub output_schema: SchemaRef,
 }
 
@@ -921,10 +1270,9 @@ impl Expression {
         Self::Unknown(name.into())
     }
 
-    /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
-    /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
-    /// `ToJson` truncates it.
+    /// Creates a schema-directed JSON decoding expression.
+    ///
+    /// See [`ParseJsonExpression`] for the complete semantic contract.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
