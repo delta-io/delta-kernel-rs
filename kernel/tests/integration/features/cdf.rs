@@ -1,12 +1,14 @@
 use std::error;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::array::{RecordBatch, StringArray};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred};
+use delta_kernel::object_store::path::Path as ObjectStorePath;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{schema_ref, DataType, SchemaRef};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Engine, Error, PredicateRef, Version};
@@ -17,6 +19,7 @@ use test_utils::column_mapping_fixtures::cm_field;
 use test_utils::{
     add_commit, assert_result_error_with_message, create_default_engine,
     create_default_engine_with_batch, create_table, engine_store_setup, load_test_data,
+    record_batch_to_bytes,
 };
 use url::Url;
 
@@ -171,6 +174,30 @@ async fn add_cdf_metadata_commit(
         .map(|action| action.to_string())
         .join("\n");
     add_commit(table_url.as_str(), store, version, commit).await
+}
+
+async fn write_single_string_parquet(
+    store: &delta_kernel::object_store::DynObjectStore,
+    table_url: &Url,
+    path: &str,
+    column_name: &str,
+    value: &str,
+) -> Result<usize, Box<dyn error::Error>> {
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        column_name,
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(StringArray::from(vec![Some(value)]))],
+    )?;
+    let parquet_data = record_batch_to_bytes(&batch);
+    let parquet_size = parquet_data.len();
+    let data_url = table_url.join(path)?;
+    let data_path = ObjectStorePath::from_url_path(data_url.path())?;
+    store.put(&data_path, parquet_data.into()).await?;
+    Ok(parquet_size)
 }
 
 fn collect_empty_cdf(table_changes: TableChanges, engine: Arc<dyn Engine>) -> DeltaResult<usize> {
@@ -582,40 +609,70 @@ fn partition_table() -> DeltaResult<()> {
     Ok(())
 }
 
-#[rstest]
-#[case::added(&[], &["id"])]
-#[case::removed(&["id"], &[])]
-#[case::reordered(&["id", "name"], &["name", "id"])]
 #[tokio::test]
-async fn cdf_allows_unmapped_partition_column_changes(
-    #[values(0, 1)] start_version: Version,
-    #[case] initial_partition_columns: &[&str],
-    #[case] read_partition_columns: &[&str],
+async fn cdf_rejects_real_files_across_unmapped_partition_layout_change(
 ) -> Result<(), Box<dyn error::Error>> {
-    let (store, engine, table_url) = engine_store_setup("cdf_unmapped_partition_changes", None);
-    let engine: Arc<dyn Engine> = Arc::new(engine);
-    let schema = cdf_partition_evolution_schema(CdfColumnMappingMode::None);
-    add_cdf_metadata_commit(
-        store.as_ref(),
-        &table_url,
-        0,
-        &schema,
-        initial_partition_columns,
-        CdfColumnMappingMode::None,
-    )
-    .await?;
-    add_cdf_metadata_commit(
-        store.as_ref(),
-        &table_url,
-        1,
-        &schema,
-        read_partition_columns,
-        CdfColumnMappingMode::None,
-    )
-    .await?;
+    let (store, engine, table_url) = engine_store_setup("cdf_real_unmapped_partition_change", None);
+    let schema = schema_ref! {
+        nullable "a": STRING,
+        nullable "b": STRING,
+    };
+    let old_path = "b=B0/old.parquet";
+    let new_path = "a=A1/new.parquet";
+    let old_size =
+        write_single_string_parquet(store.as_ref(), &table_url, old_path, "a", "A0").await?;
+    let new_size =
+        write_single_string_parquet(store.as_ref(), &table_url, new_path, "b", "B1").await?;
 
-    let table_changes = TableChanges::try_new(table_url, engine.as_ref(), start_version, Some(1))?;
-    assert_eq!(collect_empty_cdf(table_changes, engine)?, 0);
+    let commit_0 = [
+        cdf_protocol_action(CdfColumnMappingMode::None),
+        cdf_metadata_action(&schema, &["b"], CdfColumnMappingMode::None),
+        json!({
+            "add": {
+                "path": old_path,
+                "partitionValues": { "b": "B0" },
+                "size": old_size,
+                "modificationTime": 1_700_000_000_000i64,
+                "dataChange": true,
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit(table_url.as_str(), store.as_ref(), 0, commit_0).await?;
+
+    let commit_1 = [
+        cdf_metadata_action(&schema, &["a"], CdfColumnMappingMode::None),
+        json!({
+            "remove": {
+                "path": old_path,
+                "deletionTimestamp": 1_700_000_001_000i64,
+                "dataChange": true,
+                "extendedFileMetadata": true,
+                "partitionValues": { "b": "B0" },
+                "size": old_size,
+            }
+        }),
+        json!({
+            "add": {
+                "path": new_path,
+                "partitionValues": { "a": "A1" },
+                "size": new_size,
+                "modificationTime": 1_700_000_001_000i64,
+                "dataChange": true,
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit_1).await?;
+
+    assert_result_error_with_message(
+        TableChanges::try_new(table_url, &engine, 0, Some(1)),
+        "Change data feed encountered incompatible schema",
+    );
     Ok(())
 }
 
@@ -624,19 +681,21 @@ async fn cdf_allows_unmapped_partition_column_changes(
 #[case::removed(&["id"], &[])]
 #[case::reordered(&["id", "name"], &["name", "id"])]
 #[tokio::test]
-async fn cdf_rejects_mapped_partition_column_changes(
+async fn cdf_rejects_partition_column_changes(
+    #[values(CdfColumnMappingMode::None, CdfColumnMappingMode::Name)]
+    column_mapping_mode: CdfColumnMappingMode,
     #[case] initial_partition_columns: &[&str],
     #[case] read_partition_columns: &[&str],
 ) -> Result<(), Box<dyn error::Error>> {
-    let (store, engine, table_url) = engine_store_setup("cdf_mapped_partition_changes", None);
-    let schema = cdf_partition_evolution_schema(CdfColumnMappingMode::Name);
+    let (store, engine, table_url) = engine_store_setup("cdf_partition_changes", None);
+    let schema = cdf_partition_evolution_schema(column_mapping_mode);
     add_cdf_metadata_commit(
         store.as_ref(),
         &table_url,
         0,
         &schema,
         initial_partition_columns,
-        CdfColumnMappingMode::Name,
+        column_mapping_mode,
     )
     .await?;
     add_cdf_metadata_commit(
@@ -645,7 +704,7 @@ async fn cdf_rejects_mapped_partition_column_changes(
         1,
         &schema,
         read_partition_columns,
-        CdfColumnMappingMode::Name,
+        column_mapping_mode,
     )
     .await?;
 
@@ -696,11 +755,11 @@ async fn cdf_uses_mapped_partition_layout_at_start_version(
 #[case::without_mapping(CdfColumnMappingMode::None)]
 #[case::with_mapping(CdfColumnMappingMode::Name)]
 #[tokio::test]
-async fn cdf_validates_intermediate_partition_column_changes(
+async fn cdf_rejects_intermediate_partition_column_changes(
     #[case] column_mapping_mode: CdfColumnMappingMode,
 ) -> Result<(), Box<dyn error::Error>> {
     let (store, engine, table_url) = engine_store_setup("cdf_intermediate_partition_changes", None);
-    let engine: Arc<dyn Engine> = Arc::new(engine);
+    let engine = Arc::new(engine);
     let schema = cdf_partition_evolution_schema(column_mapping_mode);
     add_cdf_metadata_commit(
         store.as_ref(),
@@ -731,15 +790,14 @@ async fn cdf_validates_intermediate_partition_column_changes(
     .await?;
 
     let table_changes = TableChanges::try_new(table_url, engine.as_ref(), 0, Some(2))?;
-    let result = collect_empty_cdf(table_changes, engine);
-    if column_mapping_mode == CdfColumnMappingMode::Name {
-        assert_result_error_with_message(
-            result,
-            "Change data feed encountered incompatible schema",
-        );
-    } else {
-        assert_eq!(result?, 0);
-    }
+    assert_result_error_with_message(
+        table_changes
+            .into_scan_builder()
+            .build()?
+            .execute(engine)?
+            .collect::<DeltaResult<Vec<_>>>(),
+        "Change data feed encountered incompatible schema",
+    );
     Ok(())
 }
 

@@ -189,10 +189,9 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///   schema equality.
 /// - [`TableChanges::try_new_row_tracking_cdf_listing`] requires row tracking to remain enabled. It
 ///   allows additive nullable columns and relaxed nullability, but rejects datatype changes.
-/// - When both a commit and the end-version read layout use no column mapping, partition columns
-///   may change. Otherwise, the ordered logical and physical partition columns must match. An
-///   unmapped candidate may use the mapped end-version read layout, but a mapped candidate cannot
-///   use an unmapped read layout, and differing mapped modes are rejected.
+/// - The ordered logical and physical partition columns must match the end-version read layout. An
+///   unmapped candidate may use a mapped end-version read layout, but a mapped candidate cannot use
+///   an unmapped read layout, and differing mapped modes are rejected.
 ///
 /// Construction validates the range boundaries. Intermediate metadata and protocol updates are
 /// validated when the transaction log is replayed by the scan or listing operation.
@@ -232,10 +231,9 @@ impl TableChanges {
     /// - The change data feed table feature must be enabled in both the start or end versions.
     /// - Every enabled reader feature must be supported by the kernel.
     /// - The schemas at the start and end versions must be exactly equal.
-    /// - When both boundaries use no column mapping, partition columns may change. Otherwise, the
-    ///   ordered logical and physical partition columns must match. An unmapped start layout may
-    ///   use the mapped end layout, but a mapped start layout cannot use an unmapped end layout,
-    ///   and differing mapped modes are rejected.
+    /// - The ordered logical and physical partition columns at the range boundaries must match. An
+    ///   unmapped start layout may use the mapped end layout, but a mapped start layout cannot use
+    ///   an unmapped end layout, and differing mapped modes are rejected.
     ///
     /// Note that this does not check that change data feed is enabled for every commit in the
     /// range. It also does not check that the schema and partition columns remain compatible for
@@ -277,10 +275,10 @@ impl TableChanges {
     /// Construction validates the range boundaries. [`TableChanges::scan_file_listing`] validates
     /// intermediate metadata and protocol updates while replaying the range. Every enabled reader
     /// feature must be supported by Kernel, and each schema must be readable using the end-version
-    /// logical schema without datatype widening. When both layouts use no column mapping,
-    /// partition columns may change. Otherwise, the ordered logical and physical partition columns
-    /// must match. An unmapped candidate may use the mapped end layout, but a mapped candidate
-    /// cannot use an unmapped end layout, and differing mapped modes are rejected.
+    /// logical schema without datatype widening. The ordered logical and physical partition
+    /// columns must match the end-version layout. An unmapped candidate may use the mapped end
+    /// layout, but a mapped candidate cannot use an unmapped end layout, and differing mapped
+    /// modes are rejected.
     ///
     /// # Parameters
     ///
@@ -293,9 +291,8 @@ impl TableChanges {
     /// # Errors
     ///
     /// Returns an error if the range cannot be loaded or a boundary has unavailable row tracking,
-    /// unsupported reader features, an incompatible schema, or partition columns that change while
-    /// column mapping is enabled. Errors from intermediate versions are returned by
-    /// [`TableChanges::scan_file_listing`].
+    /// unsupported reader features, an incompatible schema, or partition columns that change.
+    /// Errors from intermediate versions are returned by [`TableChanges::scan_file_listing`].
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn try_new_row_tracking_cdf_listing(
@@ -599,8 +596,7 @@ impl TableChangesReadConfiguration {
 
     /// Rejects partition layouts that cannot be read with this configuration.
     ///
-    /// Two unmapped layouts are compatible regardless of their partition columns. Otherwise, the
-    /// mapping modes must match or the candidate must be unmapped, and the ordered logical and
+    /// The mapping modes must match or the candidate must be unmapped, and the ordered logical and
     /// physical partition columns must match.
     fn ensure_partition_columns_compatible(
         &self,
@@ -608,31 +604,52 @@ impl TableChangesReadConfiguration {
         version: Version,
     ) -> DeltaResult<()> {
         let candidate_mode = table_configuration.column_mapping_mode();
-        if candidate_mode == ColumnMappingMode::None
-            && self.column_mapping_mode == ColumnMappingMode::None
-        {
-            return Ok(());
-        }
-
         let mapping_modes_compatible =
             candidate_mode == self.column_mapping_mode || candidate_mode == ColumnMappingMode::None;
         let logical_partition_columns_match = table_configuration.logical_partition_columns()
             == self.logical_partition_columns.as_slice();
-        let physical_partition_columns_match = table_configuration
-            .physical_partition_columns()
-            .eq(self.physical_partition_columns.iter().cloned());
+        let candidate_physical_partition_columns: Vec<_> =
+            table_configuration.physical_partition_columns().collect();
+        let physical_partition_columns_match =
+            candidate_physical_partition_columns == self.physical_partition_columns;
 
         if !mapping_modes_compatible
             || !logical_partition_columns_match
             || !physical_partition_columns_match
         {
-            return Err(Error::change_data_feed_incompatible_schema_at_version(
-                self.schema.as_ref(),
-                table_configuration.logical_schema_ref().as_ref(),
+            return Err(self.incompatible_partition_layout_error(
+                table_configuration,
+                &candidate_physical_partition_columns,
                 version,
             ));
         }
         Ok(())
+    }
+
+    fn incompatible_partition_layout_error(
+        &self,
+        table_configuration: &TableConfiguration,
+        candidate_physical_partition_columns: &[String],
+        version: Version,
+    ) -> Error {
+        Error::ChangeDataFeedIncompatibleSchema(
+            format!(
+                "schema: {}; column mapping mode: {:?}; logical partition columns: {:?}; \
+                 physical partition columns: {:?}",
+                self.schema.as_ref(),
+                self.column_mapping_mode,
+                self.logical_partition_columns,
+                self.physical_partition_columns,
+            ),
+            format!(
+                "schema at version {version}: {}; column mapping mode: {:?}; logical partition \
+                 columns: {:?}; physical partition columns: {:?}",
+                table_configuration.logical_schema_ref().as_ref(),
+                table_configuration.column_mapping_mode(),
+                table_configuration.logical_partition_columns(),
+                candidate_physical_partition_columns,
+            ),
+        )
     }
 }
 
@@ -784,6 +801,49 @@ mod tests {
             Error::ChangeDataFeedIncompatibleSchema(_, actual)
                 if actual.starts_with(&format!("schema at version {version}:"))
         ));
+    }
+
+    struct ExpectedPartitionLayout<'a> {
+        mapping_mode: ColumnMappingMode,
+        logical_partition_columns: &'a [&'a str],
+        physical_partition_columns: &'a [&'a str],
+    }
+
+    fn assert_incompatible_partition_layout_at_version<T>(
+        result: DeltaResult<T>,
+        version: Version,
+        expected_layout: ExpectedPartitionLayout<'_>,
+        actual_layout: ExpectedPartitionLayout<'_>,
+    ) {
+        let (expected, actual) = match result {
+            Err(Error::ChangeDataFeedIncompatibleSchema(expected, actual)) => (expected, actual),
+            Ok(_) => panic!("expected an incompatible partition layout"),
+            Err(error) => panic!("expected an incompatible partition layout, got {error:?}"),
+        };
+        assert!(actual.starts_with(&format!("schema at version {version}:")));
+
+        let assert_layout = |description: &str, layout: ExpectedPartitionLayout<'_>| {
+            assert!(
+                description.contains(&format!("column mapping mode: {:?}", layout.mapping_mode)),
+                "missing mapping mode in {description}"
+            );
+            assert!(
+                description.contains(&format!(
+                    "logical partition columns: {:?}",
+                    layout.logical_partition_columns
+                )),
+                "missing logical partition columns in {description}"
+            );
+            assert!(
+                description.contains(&format!(
+                    "physical partition columns: {:?}",
+                    layout.physical_partition_columns
+                )),
+                "missing physical partition columns in {description}"
+            );
+        };
+        assert_layout(&expected, expected_layout);
+        assert_layout(&actual, actual_layout);
     }
 
     fn collect_row_tracking_change_count(
@@ -977,8 +1037,7 @@ mod tests {
     #[case::removed(&["id"], &[])]
     #[case::reordered(&["id", "value"], &["value", "id"])]
     #[tokio::test]
-    async fn try_new_row_tracking_allows_no_mapping_partition_column_changes(
-        #[values(0, 1)] start_version: Version,
+    async fn try_new_row_tracking_rejects_no_mapping_partition_column_changes(
         #[case] initial_partition_columns: &[&str],
         #[case] read_partition_columns: &[&str],
     ) {
@@ -1003,15 +1062,21 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let result = TableChanges::try_new_row_tracking_cdf_listing(
-            table_root,
-            engine.as_ref(),
-            start_version,
-            Some(1),
-        );
-        assert!(
-            result.is_ok(),
-            "no-mapping partition changes should be allowed: {result:?}"
+        let result =
+            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(1));
+        assert_incompatible_partition_layout_at_version(
+            result,
+            0,
+            ExpectedPartitionLayout {
+                mapping_mode: ColumnMappingMode::None,
+                logical_partition_columns: read_partition_columns,
+                physical_partition_columns: read_partition_columns,
+            },
+            ExpectedPartitionLayout {
+                mapping_mode: ColumnMappingMode::None,
+                logical_partition_columns: initial_partition_columns,
+                physical_partition_columns: initial_partition_columns,
+            },
         );
     }
 
@@ -1142,9 +1207,19 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        assert_incompatible_schema_at_version(
+        assert_incompatible_partition_layout_at_version(
             TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(1)),
             0,
+            ExpectedPartitionLayout {
+                mapping_mode: ColumnMappingMode::Name,
+                logical_partition_columns: &["id"],
+                physical_partition_columns: &["physical_id"],
+            },
+            ExpectedPartitionLayout {
+                mapping_mode: ColumnMappingMode::None,
+                logical_partition_columns: &["id"],
+                physical_partition_columns: &["id"],
+            },
         );
     }
 
@@ -1355,7 +1430,7 @@ mod tests {
     #[case::without_mapping(false)]
     #[case::with_mapping(true)]
     #[tokio::test]
-    async fn scan_row_tracking_validates_intermediate_partition_column_changes(
+    async fn scan_row_tracking_rejects_intermediate_partition_column_changes(
         #[case] column_mapping_enabled: bool,
     ) {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
@@ -1394,12 +1469,10 @@ mod tests {
         let table_changes =
             TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(2))
                 .unwrap();
-        let result = collect_row_tracking_change_count(table_changes, engine);
-        if column_mapping_enabled {
-            assert_incompatible_schema_at_version(result, 1);
-        } else {
-            assert_eq!(result.unwrap(), 0);
-        }
+        assert_incompatible_schema_at_version(
+            collect_row_tracking_change_count(table_changes, engine),
+            1,
+        );
     }
 
     #[tokio::test]

@@ -114,9 +114,8 @@ pub(crate) fn table_changes_action_iter(
 ///     - Ensure that schema updates satisfy the mode's compatibility policy. Change Data Feed mode
 ///       requires equality; row-tracking mode allows additive nullable columns and relaxed
 ///       nullability, but rejects datatype changes.
-///     - Apply the partition-layout policy: unmapped layouts may evolve, while layouts involving
-///       column mapping require compatible mapping modes and matching ordered logical and physical
-///       partition columns.
+///     - Require compatible mapping modes and matching ordered logical and physical partition
+///       columns.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
 /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
