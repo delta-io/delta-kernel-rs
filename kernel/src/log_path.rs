@@ -114,9 +114,13 @@ mod test {
         let filename = "subdir/00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
         LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
 
-        // incorrect filenames
+        // Catalog-defined commit identifiers do not need to be UUIDs.
         let table_root = Url::from_str("s3://my-bucket/my-table/").unwrap();
         let filename = "00000000000000000010.not-a-uuid.json";
+        LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap();
+
+        // incorrect filenames
+        let filename = "00000000000000000010..json";
         LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
         let filename = "000000000000000000aa.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
         LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();

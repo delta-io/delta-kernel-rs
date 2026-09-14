@@ -2,24 +2,26 @@ use url::Url;
 
 use crate::commit_range::CommitRange;
 use crate::log_segment::LogSegment;
-use crate::path::ParsedLogPath;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, Error, LogPath, Version};
 
 /// Builder for a [`CommitRange`].
 ///
 /// Created via [`CommitRange::builder_for`] (path-based) or
 /// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end version
-/// and the commit ordering. [`Self::build`] lists the log for a path-based builder or reuses the
+/// and the commit ordering. Catalog-managed tables also supply the catalog-ratified log tail and
+/// maximum catalog version. [`Self::build`] lists the log for a path-based builder or reuses the
 /// commit-file metadata in a snapshot-based builder, then validates contiguity.
-// TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
-// `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
     end_version: Option<Version>,
     snapshot: Option<SnapshotRef>,
     commit_ordering: CommitOrdering,
+    log_tail: Vec<LogPath>,
+    max_catalog_version: Option<Version>,
 }
 
 impl CommitRangeBuilder {
@@ -30,6 +32,8 @@ impl CommitRangeBuilder {
             end_version: None,
             snapshot: None,
             commit_ordering: CommitOrdering::AscendingOrder,
+            log_tail: Vec::new(),
+            max_catalog_version: None,
         }
     }
 
@@ -40,6 +44,8 @@ impl CommitRangeBuilder {
             end_version: None,
             snapshot: Some(snapshot.clone()),
             commit_ordering: CommitOrdering::AscendingOrder,
+            log_tail: Vec::new(),
+            max_catalog_version: None,
         }
     }
 
@@ -57,6 +63,20 @@ impl CommitRangeBuilder {
         self
     }
 
+    /// Set the catalog-ratified staged commits to use as the authoritative log tail. The entries
+    /// must be sorted in ascending, contiguous version order.
+    pub fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
+        self.log_tail = log_tail;
+        self
+    }
+
+    /// Set the maximum version ratified by the catalog. Filesystem commits beyond this version are
+    /// ignored. Catalog-managed ranges that contain staged commits must set this value.
+    pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
+        self.max_catalog_version = Some(max_catalog_version);
+        self
+    }
+
     /// Resolve commit-file metadata, validate contiguity, and produce a [`CommitRange`]. A
     /// path-based builder lists `_delta_log/`; a snapshot-based builder reuses the snapshot's log
     /// segment. Neither path reads commit JSON.
@@ -64,29 +84,33 @@ impl CommitRangeBuilder {
     /// Returns [`Error::MissingVersion`] if a snapshot-derived range requires a commit that is not
     /// available in the snapshot's log segment. Returns an error if the resolved version range is
     /// invalid (start > end), the listed commits are non-contiguous, or the requested start version
-    /// is not present on the filesystem.
+    /// is unavailable from both the filesystem and the supplied catalog tail.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
         let start_version = self.start_version;
-        let end_version = self.end_version;
+        let requested_end_version = self.end_version;
+        if let Some(end_version) = requested_end_version {
+            validate_version_range(start_version, end_version)?;
+        }
+        let log_tail: Vec<ParsedLogPath> =
+            self.log_tail.clone().into_iter().map(Into::into).collect();
+        self.validate_catalog_managed_inputs(&log_tail)?;
+        let end_version = requested_end_version.or(self.max_catalog_version);
 
-        let log_segment = match &self.snapshot {
-            Some(snapshot) => snapshot.log_segment().clone(),
-            None => LogSegment::for_table_changes(
+        let uses_snapshot_log_segment = self.snapshot.is_some() && log_tail.is_empty();
+        let log_segment = match (&self.snapshot, log_tail.is_empty()) {
+            (Some(snapshot), true) => snapshot.log_segment().clone(),
+            _ => LogSegment::for_table_changes_with_log_tail(
                 engine.storage_handler().as_ref(),
                 log_root,
                 start_version,
                 end_version,
+                log_tail,
             )?,
         };
 
-        // Preserve invalid-input errors for an explicitly reversed range. When no end was
-        // supplied, a start beyond a snapshot is an availability error instead.
-        if let Some(end_version) = end_version {
-            validate_version_range(start_version, end_version)?;
-        }
         let end_version = end_version.unwrap_or(log_segment.end_version);
 
         // Snapshot's log segment may extend past [start, end]; filter to the requested range.
@@ -97,7 +121,7 @@ impl CommitRangeBuilder {
             .filter(|f| f.version >= start_version && f.version <= end_version)
             .collect();
 
-        if self.snapshot.is_some() {
+        if uses_snapshot_log_segment {
             validate_start_version_available(start_version, commit_files.first())?;
             if end_version > log_segment.end_version {
                 return Err(Error::MissingVersion(log_segment.end_version + 1));
@@ -116,6 +140,76 @@ impl CommitRangeBuilder {
             end_version,
             commit_ordering: self.commit_ordering,
         })
+    }
+
+    fn validate_catalog_managed_inputs(&self, log_tail: &[ParsedLogPath]) -> DeltaResult<()> {
+        if let Some(max_catalog_version) = self.max_catalog_version {
+            require!(
+                self.start_version <= max_catalog_version,
+                Error::MaxCatalogVersion(format!(
+                    "Start version {} exceeds max catalog version {max_catalog_version}",
+                    self.start_version
+                ))
+            );
+            if let Some(end_version) = self.end_version {
+                require!(
+                    end_version <= max_catalog_version,
+                    Error::MaxCatalogVersion(format!(
+                        "End version {end_version} exceeds max catalog version \
+                         {max_catalog_version}"
+                    ))
+                );
+            }
+        }
+
+        for pair in log_tail.windows(2) {
+            require!(
+                pair[0].version.checked_add(1) == Some(pair[1].version),
+                Error::LogTailVersionsNotContiguous {
+                    first_version: pair[0].version,
+                    second_version: pair[1].version,
+                }
+            );
+        }
+        require!(
+            log_tail
+                .iter()
+                .all(|path| path.file_type == LogPathFileType::StagedCommit),
+            Error::generic("Commit range log tail must contain only staged commits")
+        );
+        require!(
+            log_tail.is_empty() || self.max_catalog_version.is_some(),
+            Error::MaxCatalogVersion(
+                "Max catalog version is required when providing staged commits. Use \
+                 with_max_catalog_version()."
+                    .to_string()
+            )
+        );
+
+        if let (Some(last), Some(max_catalog_version)) = (log_tail.last(), self.max_catalog_version)
+        {
+            if let Some(end_version) = self.end_version {
+                require!(
+                    last.version >= end_version,
+                    Error::MaxCatalogVersion(format!(
+                        "Log tail version {} is less than requested end version {end_version} for \
+                         max catalog version {max_catalog_version}",
+                        last.version
+                    ))
+                );
+            } else {
+                require!(
+                    last.version == max_catalog_version,
+                    Error::MaxCatalogVersion(format!(
+                        "Log tail version {} does not match max catalog version \
+                         {max_catalog_version}",
+                        last.version
+                    ))
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Parse the stored table-root string into a [`Url`].
@@ -179,13 +273,23 @@ mod tests {
     use crate::commit_range::DeltaAction;
     use crate::engine::sync::SyncEngine;
     use crate::utils::FoldWithOption as _;
-    use crate::{Engine, Snapshot};
+    use crate::{Engine, FileMeta, LogPath, Snapshot};
 
     /// `table-with-dv-small` has versions 0 and 1 (snapshot version = 1).
     fn dv_small_table_root() -> Url {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         Url::from_directory_path(path).unwrap()
+    }
+
+    fn staged_commit(table_root: &Url, version: Version) -> LogPath {
+        LogPath::staged_commit(
+            table_root.clone(),
+            &format!("{version:020}.catalog-{version}.json"),
+            0,
+            1,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -310,6 +414,106 @@ mod tests {
             1,
             "table-with-dv-small latest commit is v=1"
         );
+    }
+
+    #[test]
+    fn test_build_catalog_managed_range_includes_unpublished_staged_commit() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let range = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(vec![staged_commit(&table_root, 1)])
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), 1);
+        assert_eq!(range.commit_files.len(), 2);
+        assert_eq!(range.commit_files[1].version, 1);
+        assert_eq!(
+            range.commit_files[1].file_type,
+            LogPathFileType::StagedCommit
+        );
+    }
+
+    #[test]
+    fn test_max_catalog_version_bounds_filesystem_commits() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let range = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), 0);
+        assert_eq!(range.commit_files.len(), 1);
+        assert_eq!(range.commit_files[0].version, 0);
+    }
+
+    #[test]
+    fn test_catalog_log_tail_requires_max_catalog_version() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let err = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(vec![staged_commit(&table_root, 1)])
+            .build(&engine)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::MaxCatalogVersion(_)));
+    }
+
+    #[test]
+    fn test_catalog_log_tail_must_be_contiguous() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let err = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(vec![
+                staged_commit(&table_root, 0),
+                staged_commit(&table_root, 2),
+            ])
+            .with_max_catalog_version(2)
+            .build(&engine)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::LogTailVersionsNotContiguous { .. }));
+    }
+
+    #[test]
+    fn test_catalog_log_tail_must_contain_only_staged_commits() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let published = LogPath::try_new(FileMeta::new(
+            table_root
+                .join("_delta_log/00000000000000000001.json")
+                .unwrap(),
+            0,
+            1,
+        ))
+        .unwrap();
+        let err = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(vec![published])
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Generic(message) if message.contains("only staged")));
+    }
+
+    #[test]
+    fn test_catalog_version_bounds_are_validated() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let start_err = CommitRange::builder_for(table_root.as_str(), 2)
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap_err();
+        assert!(matches!(start_err, Error::MaxCatalogVersion(_)));
+
+        let end_err = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_end_version(2)
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap_err();
+        assert!(matches!(end_err, Error::MaxCatalogVersion(_)));
     }
 
     #[test]
