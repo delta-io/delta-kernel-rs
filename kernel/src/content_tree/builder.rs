@@ -319,10 +319,9 @@ mod tests {
                 },
             )
             .collect();
-        let row_refs: Vec<&[Scalar]> = scalars.iter().map(Vec::as_slice).collect();
         engine
             .evaluation_handler()
-            .create_many(WRITE_METADATA_INPUT_SCHEMA.clone(), &row_refs)
+            .create_many(WRITE_METADATA_INPUT_SCHEMA.clone(), scalars)
             .unwrap()
     }
 
@@ -347,10 +346,10 @@ mod tests {
                 .into()
             })
             .collect();
-        let rows: Vec<&[Scalar]> = entries.iter().map(StructData::values).collect();
+        let rows: Vec<Vec<Scalar>> = entries.iter().map(|e| e.values().to_vec()).collect();
         engine
             .evaluation_handler()
-            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), &rows)
+            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), rows)
             .unwrap()
     }
 
@@ -365,7 +364,7 @@ mod tests {
     ) -> ContentTreeNodeEntry {
         ContentTreeNodeEntry {
             content_type: DataContentType::Data,
-            location: Some(path.to_string()),
+            location: path.to_string(),
             file_format: DataFileFormat::Parquet,
             tracking: TrackingInfo {
                 status: TrackingStatus::Added,
@@ -382,7 +381,7 @@ mod tests {
             partition: None,
             sort_order_id: None,
             record_count: num_records,
-            file_size_in_bytes: Some(size),
+            file_size_in_bytes: size,
             content_stats: None,
             manifest_info: None,
             key_metadata: None,
