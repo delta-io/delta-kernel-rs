@@ -47,6 +47,7 @@ test_registry_override() {
 
 test_release_command_dispatch() {
     local capture="$TEST_ROOT/release-command"
+    local failure_log="$TEST_ROOT/release-command-failure"
 
     (
         # shellcheck source=release.sh
@@ -69,6 +70,36 @@ test_release_command_dispatch() {
         main release
     )
     assert_contains "$capture" "main"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        main unexpected
+    ) > "$failure_log" 2>&1; then
+        fail "unknown release command unexpectedly succeeded"
+    fi
+    assert_contains "$failure_log" "Unknown command: unexpected"
+    assert_contains "$failure_log" "release [version]"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        main changelog
+    ) > "$failure_log" 2>&1; then
+        fail "changelog command unexpectedly succeeded without a version"
+    fi
+    assert_contains "$failure_log" "changelog <version>"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
+        run_cargo_release() { :; }
+        verify_release_changelog() { return 1; }
+        handle_release_branch 0.29.0
+    ) > "$failure_log" 2>&1; then
+        fail "release preparation continued after changelog verification failed"
+    fi
+    assert_contains "$failure_log" "Generated changelog is incomplete"
 }
 
 commit_file() {
@@ -149,6 +180,24 @@ test_changelog_refresh_and_verification() {
     }
     verify_release_changelog
 
+    git tag v0.29.0
+    verify_release_changelog 0.29.0 > already-tagged.log
+    assert_contains already-tagged.log "already tagged; no release changelog to verify"
+    git tag -d v0.29.0 >/dev/null
+
+    if verify_release_changelog 0.30.0 > missing-section.log 2>&1; then
+        fail "verification unexpectedly passed without a release section"
+    fi
+    assert_contains missing-section.log "CHANGELOG.md has no section for v0.30.0"
+
+    if (
+        render_release_changelog() { return 1; }
+        verify_release_changelog 0.29.0
+    ) > render-failure.log 2>&1; then
+        fail "verification unexpectedly passed when changelog rendering failed"
+    fi
+    assert_contains render-failure.log "Could not render the expected changelog for v0.29.0"
+
     mkdir -p "$failing_bin"
     printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$failing_bin/git-cliff"
     chmod +x "$failing_bin/git-cliff"
@@ -165,8 +214,8 @@ test_changelog_refresh_and_verification() {
     if ./release.sh verify-changelog 0.29.0 > verification.log 2>&1; then
         fail "stale changelog verification unexpectedly passed"
     fi
-    assert_contains verification.log "missing PR #102"
-    if grep -Fq "missing PR #998" verification.log; then
+    assert_contains verification.log "[#102]:"
+    if grep -Fq "[#998]:" verification.log; then
         fail "verification required a commit skipped by cliff.toml"
     fi
 

@@ -19,7 +19,6 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-RELEASE_CHANGELOG_HEADING=
 
 # print commands before executing them for debugging
 # set -x
@@ -118,23 +117,46 @@ latest_kernel_release_tag() {
 
 release_changelog_heading() {
     local version="$1"
-    printf -v RELEASE_CHANGELOG_HEADING '## [v%s]' "$version"
+    printf '## [v%s]' "$version"
 }
 
-release_changelog_section() {
-    release_changelog_heading "$1"
-    awk -v heading="$RELEASE_CHANGELOG_HEADING" '
-        index($0, heading) == 1 { in_release = 1 }
-        in_release && /^## \[v/ && index($0, heading) != 1 { exit }
-        in_release { print }
+# Extract or remove a release section using the same section-boundary rules.
+filter_release_changelog_section() {
+    local mode="$1"
+    local version="$2"
+    local heading
+    heading=$(release_changelog_heading "$version")
+
+    awk -v heading="$heading" -v mode="$mode" '
+        index($0, heading) == 1 {
+            in_release = 1
+            if (mode == "extract") { print }
+            next
+        }
+        in_release && /^## \[v/ {
+            in_release = 0
+            if (mode == "extract") { exit }
+        }
+        mode == "extract" && in_release { print }
+        mode == "strip" && !in_release { print }
     ' "$REPO_ROOT/CHANGELOG.md"
 }
 
-release_changelog_subjects() {
+release_changelog_section() {
+    filter_release_changelog_section extract "$1"
+}
+
+# Render the pending changelog from git-cliff's context so the template remains the source of truth
+# for commit filtering and PR references.
+render_release_changelog() {
     local version="$1"
     git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags \
         --unreleased --include-path "*" --tag "$version" --context | \
-        jq -r '.[].commits[].message | split("\n")[0]'
+        git cliff --config "$REPO_ROOT/cliff.toml" --from-context -
+}
+
+changelog_pr_references() {
+    awk '/^\[#[0-9]+\]: /'
 }
 
 # Verify that the current release section contains every PR git-cliff would render after the
@@ -142,7 +164,7 @@ release_changelog_subjects() {
 # main moves.
 verify_release_changelog() {
     local version="${1:-}"
-    local previous_tag section subjects subject pr
+    local previous_tag section rendered references reference
     local missing=0
 
     if [[ -z "$version" ]]; then
@@ -168,21 +190,19 @@ verify_release_changelog() {
         return 1
     fi
 
-    if ! subjects=$(release_changelog_subjects "$version"); then
-        log_warning "Could not determine the changelog entries for v$version"
+    if ! rendered=$(render_release_changelog "$version"); then
+        log_warning "Could not render the expected changelog for v$version"
         return 1
     fi
+    references=$(changelog_pr_references <<< "$rendered")
 
-    while IFS= read -r subject; do
-        # The greedy prefix selects the last PR token, matching cliff.toml's link extraction.
-        if [[ "$subject" =~ .*\(\#([0-9]+)\) ]]; then
-            pr="${BASH_REMATCH[1]}"
-            if ! grep -Fq "[#$pr]:" <<< "$section"; then
-                log_warning "CHANGELOG.md v$version is missing PR #$pr: $subject"
-                missing=1
-            fi
+    while IFS= read -r reference; do
+        [[ -z "$reference" ]] && continue
+        if ! grep -Fqx "$reference" <<< "$section"; then
+            log_warning "CHANGELOG.md v$version is missing rendered PR reference: $reference"
+            missing=1
         fi
-    done <<< "$subjects"
+    done <<< "$references"
 
     if (( missing != 0 )); then
         log_warning "Update from main, then run: ./release.sh changelog $version"
@@ -195,12 +215,7 @@ verify_release_changelog() {
 # Remove the changelog section for the version specified as the first argument.
 strip_release_changelog_section() {
     local output="$2"
-    release_changelog_heading "$1"
-    awk -v heading="$RELEASE_CHANGELOG_HEADING" '
-        index($0, heading) == 1 { skipping = 1; next }
-        skipping && /^## \[v/ { skipping = 0 }
-        !skipping { print }
-    ' "$REPO_ROOT/CHANGELOG.md" > "$output"
+    filter_release_changelog_section strip "$1" > "$output"
 }
 
 # Replace, rather than append, the pending release section so this command is safe to rerun after

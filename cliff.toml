@@ -42,8 +42,8 @@ trim = true
 postprocessors = []
 
 [git]
-# Only plain semver tags mark Kernel releases. Artifact-specific tags such as v0.0.1_dat must not
-# truncate the Kernel changelog range.
+# Only plain or pre-release semver tags mark Kernel releases. Artifact-specific tags such as
+# v0.0.1_dat must not truncate the Kernel changelog range.
 tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$"
 # parse the commits based on https://www.conventionalcommits.org
 conventional_commits = true

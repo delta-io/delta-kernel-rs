@@ -50,8 +50,9 @@ can push the branch and open the PR. Review the generated changelog before reque
    changes restricted to `internal-api` are not breaking changes.
 4. Run `./release.sh verify-changelog 0.29.0`.
 
-Kernel changelogs only use plain semantic-version tags such as `v0.28.0` as release boundaries.
-Artifact-specific tags such as `v0.0.1_dat` do not truncate the changelog range.
+Kernel changelogs only use plain or pre-release semantic-version tags such as `v0.28.0` or
+`v0.29.0-rc.1` as release boundaries. Artifact-specific tags such as `v0.0.1_dat` do not truncate
+the changelog range.
 
 ### If `main` changes while the PR is open
 
