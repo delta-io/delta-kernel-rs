@@ -954,6 +954,8 @@ mod tests {
     use crate::arrow::array::{BooleanArray, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::create_row;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1078,9 +1080,8 @@ mod tests {
         // Round-trip through the engine JSON writer and reader: build engine data, serialize it to
         // a commit line with `to_json_bytes`, then parse it back and reconstruct the action.
         let engine = SyncEngine::new();
-        let data = action
-            .clone()
-            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let bytes = to_json_bytes(std::iter::once(Ok(
             FilteredEngineData::with_all_rows_selected(data),
         )))?;

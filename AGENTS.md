@@ -99,9 +99,6 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
   but writes are still blocked.
-- `row-tracking-preservation-in-dev`: enables `Transaction::ack_row_tracking_preservation()` and
-  acknowledged file removals and deletion-vector updates on Row Tracking tables. This remains
-  experimental until Kernel emits `delta.rowTracking.preserved` in CommitInfo tags.
 - `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -327,6 +324,10 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
   for patterns with bindings or guards. For example: `self == Variant` not
   `matches!(self, Variant)`.
+- Prefer `#[repr(C)]` enums for closed FFI choice sets instead of integer aliases and constants.
+  Add `cbindgen:prefix-with-name=true` so generated variants remain unambiguous. Use an integer
+  discriminator only when unknown values are intentionally recoverable, and validate them at the
+  boundary. Invalid enum tags are undefined behavior, so unsafe FFI APIs must require valid tags.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.

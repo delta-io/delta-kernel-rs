@@ -10,122 +10,21 @@ use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::RowTrackingMetadataColumns;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
-#[cfg(feature = "row-tracking-preservation-in-dev")]
-use test_utils::read_scan;
 use test_utils::{
-    assert_result_error_with_message, insert_data, into_record_batch, test_table_setup,
+    assert_result_error_with_message, insert_data, into_record_batch, read_scan, test_table_setup,
     test_table_setup_mt,
 };
-#[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-use url::Url;
 
 use crate::common::read_utils::read_row_tracking_scan;
-#[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-use crate::common::write_utils::set_table_properties;
-
-#[cfg(not(feature = "row-tracking-preservation-in-dev"))]
-/// `Transaction::commit` is rejected when it contains staged removeFiles and row
-/// tracking is _supported_ and not _suspended_, which is broader than _enabled_.
-#[rstest::rstest]
-#[case::enabled(
-    &[("delta.enableRowTracking", "true")],
-    false, /* suspend_after_create */
-    true,  /* expect_err */
-)]
-#[case::supported_only(
-    &[("delta.feature.rowTracking", "supported")],
-    false, /* suspend_after_create */
-    true,  /* expect_err */
-)]
-#[case::supported_and_suspended(
-    &[("delta.feature.rowTracking", "supported")],
-    true,  /* suspend_after_create */
-    false, /* expect_err */
-)]
-#[case::iceberg_compat_v3(
-    // V3 auto-enables row tracking, so the gate fires.
-    &[("delta.enableIcebergCompatV3", "true")],
-    false, /* suspend_after_create */
-    true,  /* expect_err */
-)]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_row_tracking_remove_gate(
-    #[case] create_properties: &[(&str, &str)],
-    #[case] suspend_after_create: bool,
-    #[case] expect_err: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = schema_ref! { nullable "number": INTEGER };
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-
-    // v0: create table with the requested initial properties.
-    kernel_create_table(table_path.as_str(), schema.clone(), "Test/1.0")
-        .with_table_properties(create_properties.iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    // Optional v1: inject a metadata-only commit that sets `delta.rowTrackingSuspended=true`.
-    // kernel's create_table rejects this property at create time, so we set it via
-    // the integration test hack here.
-    let initial_snapshot = if suspend_after_create {
-        set_table_properties(
-            &table_path,
-            &table_url,
-            engine.as_ref(),
-            0, /* current_version */
-            &[("delta.rowTrackingSuspended", "true")],
-        )?
-    } else {
-        Snapshot::builder_for(&table_path).build(engine.as_ref())?
-    };
-
-    // Insert a file.
-    insert_data(
-        initial_snapshot,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_committed();
-
-    // Remove the inserted file.
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let scan = snapshot.clone().scan_builder().build()?;
-    let scan_files = scan
-        .scan_metadata(engine.as_ref())?
-        .next()
-        .unwrap()?
-        .scan_files;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
-    txn.remove_files(scan_files);
-
-    if expect_err {
-        let err = txn
-            .commit(engine.as_ref())
-            .expect_err("commit must fail when rowTracking is supported and not suspended");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Remove actions are not yet supported") && msg.contains("rowTracking"),
-            "expected remove-block error mentioning rowTracking, got: {msg}",
-        );
-    } else {
-        txn.commit(engine.as_ref())?.unwrap_committed();
-    }
-    Ok(())
-}
-
-#[cfg(feature = "row-tracking-preservation-in-dev")]
 mod row_tracking_preservation {
     use std::collections::HashMap;
 
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
-    use delta_kernel::arrow::array::Array;
+    use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
+    use delta_kernel::schema::{DataType, SchemaRef, StructField};
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
-    use test_utils::read_add_infos;
+    use test_utils::{read_actions_from_commit, read_add_infos};
     use url::Url;
 
     use super::*;
@@ -135,6 +34,245 @@ mod row_tracking_preservation {
         write_deletion_vector_to_store,
     };
     use crate::features::row_tracking::setup_number_table_with_features;
+
+    const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CommitInfoTagTestCase {
+        Enabled,
+        Supported,
+        Suspended,
+    }
+
+    impl CommitInfoTagTestCase {
+        /// Returns the properties that create an enabled or supported-only Row Tracking table.
+        /// The suspended case starts supported-only and is suspended in a later commit.
+        fn create_table_properties(self) -> &'static [(&'static str, &'static str)] {
+            match self {
+                Self::Enabled => &[("delta.enableRowTracking", "true")],
+                Self::Supported | Self::Suspended => &[("delta.feature.rowTracking", "supported")],
+            }
+        }
+
+        fn expected_tag(self) -> Option<&'static str> {
+            (self == Self::Enabled).then_some("true")
+        }
+    }
+
+    fn assert_row_tracking_preserved_tag(
+        table_url: &Url,
+        commit_version: u64,
+        expected: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let commit_infos = read_actions_from_commit(table_url, commit_version, "commitInfo")?;
+        assert_eq!(commit_infos.len(), 1);
+        assert_eq!(
+            commit_infos[0]["tags"][ROW_TRACKING_PRESERVED_TAG].as_str(),
+            expected
+        );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::enabled(CommitInfoTagTestCase::Enabled)]
+    #[case::supported(CommitInfoTagTestCase::Supported)]
+    #[case::suspended(CommitInfoTagTestCase::Suspended)]
+    #[tokio::test]
+    async fn insert_commit_info_preservation_tag_requires_row_tracking_enabled(
+        #[case] test_case: CommitInfoTagTestCase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // === Create a table in the requested Row Tracking state ===
+        let (_temp_dir, table_path, engine) = test_table_setup()?;
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        let snapshot = kernel_create_table(
+            table_path.as_str(),
+            schema_ref! { nullable "number": INTEGER },
+            "Test/1.0",
+        )
+        .with_table_properties(test_case.create_table_properties().iter().copied())
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+        let snapshot = if test_case == CommitInfoTagTestCase::Suspended {
+            set_table_properties(
+                &table_path,
+                &table_url,
+                engine.as_ref(),
+                0, /* current_version */
+                &[("delta.rowTrackingSuspended", "true")],
+            )?
+        } else {
+            snapshot
+        };
+
+        // === Insert data and validate the preservation tag ===
+        let commit_version = insert_data(
+            snapshot,
+            &engine,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .await?
+        .unwrap_committed()
+        .commit_version();
+        assert_row_tracking_preserved_tag(&table_url, commit_version, test_case.expected_tag())?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_table_does_not_emit_row_tracking_preservation_tag(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, table_path, engine) = test_table_setup()?;
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        let commit_version = kernel_create_table(
+            table_path.as_str(),
+            schema_ref! { nullable "number": INTEGER },
+            "Test/1.0",
+        )
+        .with_table_properties([("delta.enableRowTracking", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .commit_version();
+
+        assert_row_tracking_preserved_tag(&table_url, commit_version, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn alter_table_emits_row_tracking_preservation_tag() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, table_path, engine) = test_table_setup()?;
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        let snapshot = kernel_create_table(
+            table_path.as_str(),
+            schema_ref! { nullable "number": INTEGER },
+            "Test/1.0",
+        )
+        .with_table_properties([("delta.enableRowTracking", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+        let commit_version = snapshot
+            .alter_table()
+            .add_column(StructField::nullable("added", DataType::INTEGER))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_committed()
+            .commit_version();
+
+        assert_row_tracking_preserved_tag(&table_url, commit_version, Some("true"))?;
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::connector_commit_info_with_tags(ConnectorCommitInfoTestCase::PopulatedTags)]
+    #[case::connector_commit_info_without_tags(ConnectorCommitInfoTestCase::MissingTagsField)]
+    #[case::connector_commit_info_with_null_tags(ConnectorCommitInfoTestCase::NullTagsMap)]
+    fn commit_info_preservation_tag_merges_connector_commit_info(
+        #[case] test_case: ConnectorCommitInfoTestCase,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // === Create a Row Tracking table ===
+        let (_temp_dir, table_path, engine) = test_table_setup()?;
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        let snapshot = kernel_create_table(
+            table_path.as_str(),
+            schema_ref! { nullable "number": INTEGER },
+            "Test/1.0",
+        )
+        .with_table_properties([("delta.enableRowTracking", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+        // === Commit with connector-provided CommitInfo ===
+        let (connector_commit_info, connector_commit_info_schema) =
+            test_case.connector_commit_info()?;
+        let commit_version = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_commit_info(
+                Box::new(ArrowEngineData::new(connector_commit_info)),
+                connector_commit_info_schema,
+            )
+            .commit(engine.as_ref())?
+            .unwrap_committed()
+            .commit_version();
+
+        // === Validate the merged CommitInfo ===
+        let commit_infos = read_actions_from_commit(&table_url, commit_version, "commitInfo")?;
+        assert_eq!(commit_infos.len(), 1);
+        let committed_commit_info = &commit_infos[0];
+        assert_eq!(
+            committed_commit_info["tags"][ROW_TRACKING_PRESERVED_TAG],
+            "true"
+        );
+        match test_case {
+            ConnectorCommitInfoTestCase::PopulatedTags => {
+                assert_eq!(
+                    committed_commit_info["tags"]["connectorTag"],
+                    "connectorValue"
+                );
+                assert!(committed_commit_info["tags"]["nullableConnectorTag"].is_null());
+            }
+            ConnectorCommitInfoTestCase::MissingTagsField => {
+                assert_eq!(committed_commit_info["customApp"], "connector");
+            }
+            ConnectorCommitInfoTestCase::NullTagsMap => {}
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ConnectorCommitInfoTestCase {
+        PopulatedTags,
+        MissingTagsField,
+        NullTagsMap,
+    }
+
+    impl ConnectorCommitInfoTestCase {
+        /// Returns `(connector_commit_info, connector_commit_info_schema)` for this case.
+        fn connector_commit_info(
+            self,
+        ) -> Result<(RecordBatch, SchemaRef), Box<dyn std::error::Error>> {
+            match self {
+                Self::PopulatedTags => {
+                    let mut tags =
+                        MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                    tags.keys().append_value("connectorTag");
+                    tags.values().append_value("connectorValue");
+                    tags.keys().append_value("nullableConnectorTag");
+                    tags.values().append_null();
+                    tags.keys().append_value(ROW_TRACKING_PRESERVED_TAG);
+                    tags.values().append_value("false");
+                    tags.append(true)?;
+                    Ok((
+                        RecordBatch::try_from_iter([(
+                            "tags",
+                            Arc::new(tags.finish()) as ArrayRef,
+                        )])?,
+                        schema_ref! { nullable "tags": { STRING => nullable STRING } },
+                    ))
+                }
+                Self::MissingTagsField => Ok((
+                    RecordBatch::try_from_iter([(
+                        "customApp",
+                        Arc::new(StringArray::from(vec!["connector"])) as ArrayRef,
+                    )])?,
+                    schema_ref! { nullable "customApp": STRING },
+                )),
+                Self::NullTagsMap => {
+                    let mut tags =
+                        MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                    tags.append(false)?;
+                    Ok((
+                        RecordBatch::try_from_iter([(
+                            "tags",
+                            Arc::new(tags.finish()) as ArrayRef,
+                        )])?,
+                        schema_ref! { nullable "tags": { STRING => nullable STRING } },
+                    ))
+                }
+            }
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RemoveTestCase {

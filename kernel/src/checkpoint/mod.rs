@@ -116,7 +116,11 @@ use crate::actions::{
     SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
+<<<<<<< HEAD
 use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
+=======
+use crate::expressions::{ExpressionRef, Scalar, StructData};
+>>>>>>> 3fc6dbf877d7118aef5a8a8ae088217ad2d0c8bf
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
@@ -125,8 +129,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
-    EvaluationHandlerExtension, FileMeta, Version,
+    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -678,6 +682,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
+<<<<<<< HEAD
         // Start with an all-null row
         let null_row = engine.evaluation_handler().null_row(schema.clone())?;
 
@@ -700,6 +705,27 @@ impl CheckpointWriter {
         )?;
 
         let checkpoint_metadata_batch = evaluator.evaluate(null_row.as_ref())?;
+=======
+        // Build the checkpointMetadata struct value
+        let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
+            vec![StructField::not_null("version", DataType::LONG)],
+            vec![Scalar::from(self.version)],
+        )?);
+        // Build an action row with only the checkpointMetadata field set.
+        let row: Vec<Scalar> = schema
+            .fields()
+            .map(|field| {
+                if field.name() == CHECKPOINT_METADATA_NAME {
+                    checkpoint_metadata_value.clone()
+                } else {
+                    Scalar::null(field.data_type().clone())
+                }
+            })
+            .collect();
+        let checkpoint_metadata_batch = engine
+            .evaluation_handler()
+            .create_many(schema.clone(), vec![row])?;
+>>>>>>> 3fc6dbf877d7118aef5a8a8ae088217ad2d0c8bf
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
@@ -747,8 +773,8 @@ impl CheckpointWriter {
     }
 }
 
-/// Creates the data for the _last_checkpoint file containing checkpoint
-/// metadata with the `create_one` method. Factored out to facilitate testing.
+/// Creates the data for the _last_checkpoint file containing checkpoint metadata. Factored out to
+/// facilitate testing.
 ///
 /// # Parameters
 /// - `engine`: Engine for data processing
@@ -776,15 +802,15 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_one(
+    engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
-        &[
+        vec![vec![
             version.into(),
             actions_counter.into(),
             None::<i64>.into(), // parts = None since we only support single-part checkpoints
             size_in_bytes.into(),
             add_actions_counter.into(),
-        ],
+        ]],
     )
 }
 

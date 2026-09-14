@@ -1246,7 +1246,6 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
             .into_iter()
             .map(Ok),
     )?;
-    #[cfg(feature = "row-tracking-preservation-in-dev")]
     txn.ack_row_tracking_preservation();
     txn.commit(engine.as_ref())?.unwrap_committed();
 

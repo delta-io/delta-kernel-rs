@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 pub(crate) use evaluate_expression::extract_column;
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
-use itertools::Itertools;
 use tracing::debug;
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
@@ -271,23 +270,10 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         }))
     }
 
-    /// Create a single-row array with all-null leaf values. Note that if a nested struct is
-    /// included in the `output_type`, the entire struct will be NULL (instead of a not-null struct
-    /// with NULL fields).
-    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
-        let fields = output_schema.fields();
-        let arrays = fields
-            .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
-            .try_collect()?;
-        let record_batch =
-            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
-        Ok(Box::new(ArrowEngineData::new(record_batch)))
-    }
-
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
+        rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
         if rows.is_empty() {

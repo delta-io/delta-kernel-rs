@@ -323,36 +323,79 @@ impl fmt::Display for MetricEvent {
 
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
-/// The kind of log-segment load: a full listing from the base up to the target, or an
-/// incremental listing of the commits above an existing segment.
+/// How the snapshot was constructed.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    EnumString,
+    StrumDisplay,
+    AsRefStr,
+    IntoStaticStr,
 )]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
-pub enum LogSegmentLoadType {
+pub enum SnapshotLoadType {
     /// The segment was listed from its base (a checkpoint, else version 0) up to the target. A
     /// fresh snapshot build (`LogSegment::for_snapshot`) reads this way.
     Full,
-    /// The segment was listed as a delta above an existing base. An incremental snapshot update
-    /// (`Snapshot::try_new_from`) reads only the commits above the existing snapshot.
+    /// The build started from an existing snapshot. It may return that snapshot unchanged, replay
+    /// newer commits, or rebuild from a newly discovered checkpoint.
     Incremental,
+    /// The snapshot was constructed from complete caller-supplied state without asking the engine
+    /// to list or read Delta log files.
+    SnapshotHint,
     /// Decode fell back here because the span's `load_type` field was unset or unrecognized.
     /// Kernel never emits this deliberately.
     #[default]
     Unknown,
 }
 
+impl SnapshotLoadType {
+    fn parse_or_unknown(s: &str) -> Self {
+        parse_load_type_or_unknown(s)
+    }
+}
+
+/// How the log segment and protocol/metadata state were loaded.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum LogSegmentLoadType {
+    /// The segment was listed from its base through the target version.
+    Full,
+    /// The segment load started from an existing snapshot. It may reuse that segment, extend it,
+    /// or replace it after discovering a newer checkpoint.
+    Incremental,
+    /// Decode fell back here because the span field was unset or unrecognized.
+    #[default]
+    Unknown,
+}
+
 impl LogSegmentLoadType {
     fn parse_or_unknown(s: &str) -> Self {
-        if s.is_empty() {
-            return Self::Unknown;
-        }
-        Self::from_str(s).unwrap_or_else(|e| {
-            warn!("Invalid load_type '{s}': {e}. Using Unknown.");
-            Self::Unknown
-        })
+        parse_load_type_or_unknown(s)
     }
+}
+
+fn parse_load_type_or_unknown<T>(s: &str) -> T
+where
+    T: Default + FromStr,
+    T::Err: fmt::Display,
+{
+    if s.is_empty() {
+        return T::default();
+    }
+    s.parse().unwrap_or_else(|error| {
+        warn!("Invalid load_type '{s}': {error}. Using Unknown.");
+        T::default()
+    })
 }
 
 /// A log segment was listed and assembled for a snapshot.
@@ -655,7 +698,7 @@ pub struct SnapshotBuildSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 
     // === Set during span lifetime ===
     pub version: u64,
@@ -722,7 +765,7 @@ pub struct SnapshotBuildFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
@@ -1273,7 +1316,7 @@ pub struct SnapshotLoadMetricContext {
     pub(crate) operation_id: MetricId,
     pub(crate) correlation_id: Option<Arc<str>>,
     pub(crate) is_catalog_managed: bool,
-    pub(crate) load_type: LogSegmentLoadType,
+    pub(crate) load_type: SnapshotLoadType,
 }
 
 #[cfg(test)]
@@ -1285,7 +1328,7 @@ impl SnapshotLoadMetricContext {
             operation_id: MetricId::nil(),
             correlation_id: None,
             is_catalog_managed: false,
-            load_type: LogSegmentLoadType::default(),
+            load_type: SnapshotLoadType::default(),
         }
     }
 }
@@ -1345,13 +1388,13 @@ pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<st
     v.0
 }
 
-pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType {
+pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
     #[derive(Default)]
-    struct V(LogSegmentLoadType);
+    struct V(SnapshotLoadType);
     impl Visit for V {
         fn record_str(&mut self, field: &Field, value: &str) {
             if field.name() == "load_type" {
-                self.0 = LogSegmentLoadType::parse_or_unknown(value);
+                self.0 = SnapshotLoadType::parse_or_unknown(value);
             }
         }
         fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
@@ -1926,6 +1969,31 @@ mod tests {
     }
 
     #[rstest]
+    #[case::full(SnapshotLoadType::Full, "full")]
+    #[case::incremental(SnapshotLoadType::Incremental, "incremental")]
+    #[case::snapshot_hint(SnapshotLoadType::SnapshotHint, "snapshot_hint")]
+    #[case::unknown(SnapshotLoadType::Unknown, "unknown")]
+    fn snapshot_load_type_serializes_to_wire_name_and_parses_back(
+        #[case] load_type: SnapshotLoadType,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = load_type.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(SnapshotLoadType::from_str(wire).unwrap(), load_type);
+    }
+
+    #[rstest]
+    #[case::known("incremental", SnapshotLoadType::Incremental)]
+    #[case::empty_maps_to_unknown("", SnapshotLoadType::Unknown)]
+    #[case::unrecognized_maps_to_unknown("totally_unknown", SnapshotLoadType::Unknown)]
+    fn snapshot_load_type_parse_or_unknown(
+        #[case] value: &str,
+        #[case] expected: SnapshotLoadType,
+    ) {
+        assert_eq!(SnapshotLoadType::parse_or_unknown(value), expected);
+    }
+
+    #[rstest]
     #[case::full(LogSegmentLoadType::Full, "full")]
     #[case::incremental(LogSegmentLoadType::Incremental, "incremental")]
     #[case::unknown(LogSegmentLoadType::Unknown, "unknown")]
@@ -2028,7 +2096,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: Some("snap-req-3".into()),
-            load_type: LogSegmentLoadType::Incremental,
+            load_type: SnapshotLoadType::Incremental,
             version: 0,
             duration: Duration::default(),
         };
@@ -2038,6 +2106,6 @@ mod tests {
             panic!("expected SnapshotBuildFailure");
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
-        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
     }
 }
