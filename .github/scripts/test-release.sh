@@ -112,6 +112,7 @@ commit_file() {
 test_changelog_refresh_and_verification() {
     local repository="$TEST_ROOT/repository"
     local failing_bin="$TEST_ROOT/failing-bin"
+    local bullet_backup="$TEST_ROOT/changelog-before-bullet-removal"
     local saved_changelog="$TEST_ROOT/changelog-before-failure"
     local backup refresh_log failure_backup
     mkdir -p "$repository"
@@ -214,8 +215,8 @@ test_changelog_refresh_and_verification() {
     if ./release.sh verify-changelog 0.29.0 > verification.log 2>&1; then
         fail "stale changelog verification unexpectedly passed"
     fi
-    assert_contains verification.log "[#102]:"
-    if grep -Fq "[#998]:" verification.log; then
+    assert_contains verification.log "PR #102"
+    if grep -Fq "PR #998" verification.log; then
         fail "verification required a commit skipped by cliff.toml"
     fi
 
@@ -226,6 +227,17 @@ test_changelog_refresh_and_verification() {
     assert_count CHANGELOG.md 1 "## [v0.28.0]"
     assert_contains CHANGELOG.md "Previous release notes"
     ./release.sh verify-changelog 0.29.0
+
+    cp CHANGELOG.md "$bullet_backup"
+    sed -i '/Include late change/d' CHANGELOG.md
+    if ./release.sh verify-changelog 0.29.0 > missing-bullet.log 2>&1; then
+        fail "verification unexpectedly passed with a missing changelog bullet"
+    fi
+    assert_contains missing-bullet.log "missing the changelog entry for PR #102"
+    if grep -Fq "missing the link reference for PR #102" missing-bullet.log; then
+        fail "verification treated the retained PR reference as missing"
+    fi
+    cp "$bullet_backup" CHANGELOG.md
 
     cp CHANGELOG.md "$saved_changelog"
     if PATH="$failing_bin:$PATH" ./release.sh changelog 0.29.0 > refresh-failure.log 2>&1; then

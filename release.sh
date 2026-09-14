@@ -155,8 +155,20 @@ render_release_changelog() {
         git cliff --config "$REPO_ROOT/cliff.toml" --from-context -
 }
 
-changelog_pr_references() {
-    awk '/^\[#[0-9]+\]: /'
+changelog_pr_reference_ids() {
+    awk 'match($0, /^\[#[0-9]+\]:/) { print substr($0, 3, RLENGTH - 4) }'
+}
+
+changelog_pr_bullet_ids() {
+    awk '
+        {
+            line = $0
+            while (match(line, /\(\[#[0-9]+\]\)/)) {
+                print substr(line, RSTART + 3, RLENGTH - 5)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    '
 }
 
 # Verify that the current release section contains every PR git-cliff would render after the
@@ -164,7 +176,7 @@ changelog_pr_references() {
 # main moves.
 verify_release_changelog() {
     local version="${1:-}"
-    local previous_tag section rendered references reference
+    local previous_tag section rendered expected_prs section_references section_bullets pr
     local missing=0
 
     if [[ -z "$version" ]]; then
@@ -194,15 +206,21 @@ verify_release_changelog() {
         log_warning "Could not render the expected changelog for v$version"
         return 1
     fi
-    references=$(changelog_pr_references <<< "$rendered")
+    expected_prs=$(changelog_pr_reference_ids <<< "$rendered")
+    section_references=$(changelog_pr_reference_ids <<< "$section")
+    section_bullets=$(changelog_pr_bullet_ids <<< "$section")
 
-    while IFS= read -r reference; do
-        [[ -z "$reference" ]] && continue
-        if ! grep -Fqx "$reference" <<< "$section"; then
-            log_warning "CHANGELOG.md v$version is missing rendered PR reference: $reference"
+    while IFS= read -r pr; do
+        [[ -z "$pr" ]] && continue
+        if ! grep -Fqx "$pr" <<< "$section_references"; then
+            log_warning "CHANGELOG.md v$version is missing the link reference for PR #$pr"
             missing=1
         fi
-    done <<< "$references"
+        if ! grep -Fqx "$pr" <<< "$section_bullets"; then
+            log_warning "CHANGELOG.md v$version is missing the changelog entry for PR #$pr"
+            missing=1
+        fi
+    done <<< "$expected_prs"
 
     if (( missing != 0 )); then
         log_warning "Update from main, then run: ./release.sh changelog $version"
