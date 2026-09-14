@@ -2316,21 +2316,21 @@ mod tests {
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            empty_engine_metadata(),
+                            &empty_engine_metadata(),
                             allocate_err,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            empty_engine_metadata(),
+                            &empty_engine_metadata(),
                             allocate_err,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            empty_engine_metadata(),
+                            &empty_engine_metadata(),
                             allocate_err,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
@@ -2346,7 +2346,7 @@ mod tests {
                 field_ids.as_ptr(),
                 field_ids.len(),
                 false,
-                empty_engine_metadata(),
+                &empty_engine_metadata(),
                 allocate_err,
             ))
         }

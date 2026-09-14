@@ -170,7 +170,7 @@ See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
 The build-side counterpart to `visit_schema`: per-field callbacks that let the
 engine construct a Kernel `StructType` from its own type system (for example,
-to pass to `scan_builder_with_schema`). Every field function takes an
+to pass to `scan_builder_with_schema`). Every field function takes a borrowed
 `EngineMetadata`: an opaque engine-owned value plus a synchronous callback that
 inserts the field's metadata into a short-lived `KernelMetadataVisitorState`.
 Neither the state nor borrowed string slices may be retained after the callback.

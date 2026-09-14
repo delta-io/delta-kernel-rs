@@ -1108,7 +1108,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(id),
                 true,
-                empty_engine_metadata(),
+                &empty_engine_metadata(),
                 allocate_err,
             ))
         };
@@ -1121,7 +1121,7 @@ mod scan_builder_tests {
                 field_ids.as_ptr(),
                 1,
                 false,
-                empty_engine_metadata(),
+                &empty_engine_metadata(),
                 allocate_err,
             ))
         }
@@ -1272,7 +1272,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(bare_field),
                 true,
-                empty_engine_metadata(),
+                &empty_engine_metadata(),
                 allocate_err,
             ))
         }

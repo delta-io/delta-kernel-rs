@@ -59,40 +59,40 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
   EngineMetadata metadata = { item, visit_schema_item_metadata };
   ExternResultusize visit_res;
   if (strcmp(item->type, "string") == 0) {
-    visit_res = visit_field_string(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_string(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "void") == 0) {
-    visit_res = visit_field_void(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_void(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "integer") == 0) {
-    visit_res = visit_field_integer(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_integer(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "short") == 0) {
-    visit_res = visit_field_short(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_short(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "byte") == 0) {
-    visit_res = visit_field_byte(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_byte(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "long") == 0) {
-    visit_res = visit_field_long(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_long(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "float") == 0) {
-    visit_res = visit_field_float(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_float(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "double") == 0) {
-    visit_res = visit_field_double(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_double(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "boolean") == 0) {
-    visit_res = visit_field_boolean(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_boolean(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "binary") == 0) {
-    visit_res = visit_field_binary(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_binary(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "date") == 0) {
-    visit_res = visit_field_date(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_date(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "timestamp") == 0) {
-    visit_res = visit_field_timestamp(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_timestamp(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "timestamp_ntz") == 0) {
-    visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "interval year to month") == 0) {
-    visit_res = visit_field_interval_year_month(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_interval_year_month(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "interval day to second") == 0) {
-    visit_res = visit_field_interval_day_time(state, name, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_interval_day_time(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strncmp(item->type, "decimal", 7) == 0) {
     unsigned int precision;
     int scale;
     sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
-    visit_res = visit_field_decimal(state, name, precision, scale, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_decimal(state, name, precision, scale, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "array") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     // an array should always have 1 child
@@ -105,7 +105,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       // previous visit will have printed the issue
       return 0;
     }
-    visit_res = visit_field_array(state, name, child_visit_id, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_array(state, name, child_visit_id, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "map") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     // an map should always have 2 children
@@ -123,7 +123,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       // previous visit will have printed the issue
       return 0;
     }
-    visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, item->is_nullable, metadata, allocate_error);
+    visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "struct") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     uintptr_t child_visit_ids[child_list.len];
@@ -143,7 +143,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       child_visit_ids,
       child_list.len,
       item->is_nullable,
-      metadata,
+      &metadata,
       allocate_error);
   } else {
     printf("[ERROR] Can't visit unknown type: %s\n", item->type);
@@ -217,7 +217,7 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
     cols,
     col_index,
     false,
-    (EngineMetadata){ NULL, visit_empty_field_metadata },
+    &(EngineMetadata){ NULL, visit_empty_field_metadata },
     allocate_error);
 
   if (visit_res.tag != Okusize) {
