@@ -942,7 +942,6 @@ mod test {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
@@ -1353,47 +1352,20 @@ mod test {
         let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "ts", ts_type,
         )]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let config = |features: &[TableFeature]| {
+            MockTableConfigurationBuilder::new()
+                .with_schema(Arc::clone(&schema))
+                .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+                .try_build()
+        };
 
-        let protocol_without_timestamp_nanos_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
-
-        let protocol_with_timestamp_nanos_features = Protocol::try_new(
-            3,
-            7,
-            Some([
-                TableFeature::TimestampNanos,
-                TableFeature::TimestampWithoutTimezone,
-            ]),
-            Some([
-                TableFeature::TimestampNanos,
-                TableFeature::TimestampWithoutTimezone,
-            ]),
-        )
-        .unwrap();
-
-        let table_root = Url::try_from("file:///").unwrap();
-
-        // FIXME: Move to using MockTableConfigurationBuilder like below
-        let result = TableConfiguration::try_new(
-            metadata.clone(),
-            protocol_without_timestamp_nanos_features,
-            table_root.clone(),
-            0,
-        );
+        let result = config(&[]);
         assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features");
 
-        let result = TableConfiguration::try_new(
-            metadata,
-            protocol_with_timestamp_nanos_features,
-            table_root,
-            0,
-        );
+        let result = config(&[
+            TableFeature::TimestampNanos,
+            TableFeature::TimestampWithoutTimezone,
+        ]);
         assert!(
             result.is_ok(),
             "Should succeed when nanosecond timestamps are used with required features"
