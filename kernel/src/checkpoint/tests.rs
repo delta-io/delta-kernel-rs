@@ -12,7 +12,9 @@ use crate::action_reconciliation::{
     ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
+use crate::arrow::array::{
+    create_array, Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray,
+};
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::checkpoint::{
     create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
@@ -70,6 +72,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot_version = snapshot.version();
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Use V2 schema for the checkpoint metadata batch
@@ -99,6 +102,29 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     // Verify we have one row
     assert_eq!(record_batch.num_rows(), 1);
+
+    // Verify the checkpointMetadata action carries the expected tags and version
+    let checkpoint_metadata = record_batch
+        .column_by_name("checkpointMetadata")
+        .expect("Schema should have checkpointMetadata field")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("checkpointMetadata must be a struct");
+    let tags = checkpoint_metadata
+        .column_by_name("tags")
+        .expect("checkpointMetadata must carry a tags field");
+    assert!(
+        tags.as_any().downcast_ref::<MapArray>().is_some(),
+        "tags must be a map"
+    );
+    assert!(tags.is_null(0), "tags should be written null");
+    let version = checkpoint_metadata
+        .column_by_name("version")
+        .expect("checkpointMetadata must carry a version field")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("version must be an int64");
+    assert_eq!(version.value(0), snapshot_version as i64);
 
     // Verify action counts
     assert_eq!(checkpoint_batch.actions_count, 1);
