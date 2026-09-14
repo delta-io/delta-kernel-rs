@@ -62,7 +62,7 @@ impl LogSegment {
     ///
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
-    #[instrument(name = "log_seg.load_p_m", skip_all, err)]
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,

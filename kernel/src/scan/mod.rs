@@ -409,6 +409,7 @@ impl ScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
+    #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
     pub fn build(self) -> DeltaResult<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
@@ -1117,6 +1118,12 @@ impl Scan {
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
+    #[tracing::instrument(
+        name = "scan.declarative_metadata_scan_plan",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.

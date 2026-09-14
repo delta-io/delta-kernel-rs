@@ -946,6 +946,12 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
     // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
     // cannot easily be unified.
+    #[tracing::instrument(
+        name = "scan_log_replay.process_actions_batch",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -1037,6 +1043,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     // probably also need to be applied to the other copy. The copy exists because
     // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
     // `&self`. Presently, the different in mutabilities cannot easily be unified.
+    #[tracing::instrument(
+        name = "scan_log_replay.process_actions_batch",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,

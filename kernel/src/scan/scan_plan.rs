@@ -48,6 +48,12 @@ impl Scan {
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
     /// Returns `None` for an empty result or a statically false predicate.
+    #[tracing::instrument(
+        name = "scan_plan.build_metadata_scan_plan",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(super) fn build_metadata_scan_plan(
         &self,
         shape: &CheckpointShape,
