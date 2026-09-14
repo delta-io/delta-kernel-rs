@@ -386,26 +386,42 @@ impl MetricsReporter for FfiMetricsReporter {
     }
 }
 
-/// The lifecycle transition reported for a call-frame-enabled tracing span.
+/// Data reported when the current thread enters a call-frame-enabled tracing span.
+#[repr(C)]
+pub struct FrameOpen {
+    /// Identifier shared with the matching [`FrameEvent::CLOSE`] event.
+    pub span_id: u64,
+    /// Static tracing span name, valid only for the duration of the callback.
+    pub name: KernelStringSlice,
+}
+
+/// Data reported when the current thread exits a call-frame-enabled tracing span.
+#[repr(C)]
+pub struct FrameClose {
+    /// Identifier from the matching [`FrameEvent::OPEN`] event.
+    pub span_id: u64,
+}
+
+/// Lifecycle event reported for a call-frame-enabled tracing span.
 ///
 /// cbindgen:prefix-with-name=true
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameEventType {
+#[repr(C)]
+pub enum FrameEvent {
     /// The current thread entered the span.
-    OPEN = 0,
+    OPEN(FrameOpen),
     /// The current thread exited the span.
-    CLOSE = 1,
+    CLOSE(FrameClose),
 }
 
 /// Callback registered through [`enable_frame_reporting`] to receive frame lifecycle events.
 ///
 /// Calls run synchronously and may overlap across threads, so callback state must be thread-safe.
+/// This callback may be called frequently and should not perform any blocking IO or expensive
+/// CPU-bound computation.
+///
 /// Profile consumers should capture time and maintain a separate event stack for each callback
-/// thread. `name` is valid only until the callback returns. [`FrameEventType::OPEN`] passes the
-/// span name, while [`FrameEventType::CLOSE`] passes an empty string.
-pub type FrameEventFn =
-    extern "C" fn(event_type: FrameEventType, span_id: u64, name: KernelStringSlice);
+/// thread. [`FrameEvent::OPEN`]'s name is valid only until the callback returns.
+pub type FrameEventFn = extern "C" fn(event: FrameEvent);
 
 /// Forwards frame lifecycle notifications to the registered FFI callback.
 #[derive(Debug)]
@@ -416,14 +432,16 @@ struct FfiFrameReporter {
 impl FrameReporter for FfiFrameReporter {
     fn enter(&self, span_id: u64, name: &'static str) {
         if let Some(callback) = self.callback.get() {
-            callback(FrameEventType::OPEN, span_id, kernel_string_slice!(name));
+            callback(FrameEvent::OPEN(FrameOpen {
+                span_id,
+                name: kernel_string_slice!(name),
+            }));
         }
     }
 
     fn exit(&self, span_id: u64) {
         if let Some(callback) = self.callback.get() {
-            let name = "";
-            callback(FrameEventType::CLOSE, span_id, kernel_string_slice!(name));
+            callback(FrameEvent::CLOSE(FrameClose { span_id }));
         }
     }
 }
@@ -677,9 +695,9 @@ fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
 /// Enables synchronous callbacks when opted-in kernel tracing spans are entered and exited.
 ///
 /// A span opts in by declaring an `enable_call_frame` field. `callback` receives a
-/// [`FrameEventType::OPEN`] event immediately after the current thread enters the span and a
-/// matching [`FrameEventType::CLOSE`] event immediately before the exit completes. Re-entering a
-/// span produces another OPEN/CLOSE pair with the same span ID.
+/// [`FrameEvent::OPEN`] event immediately after the current thread enters the span and a matching
+/// [`FrameEvent::CLOSE`] event immediately before the exit completes. Re-entering a span produces
+/// another OPEN/CLOSE pair with the same span ID.
 ///
 /// This function may be called only once so a callback cannot be replaced between a span's OPEN
 /// and CLOSE events. This guarantees that both events are delivered to the same callback. If a
@@ -1121,26 +1139,23 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     struct CapturedFrameEvent {
-        event_type: FrameEventType,
+        is_open: bool,
         span_id: u64,
         name: Option<String>,
     }
 
     static FRAME_EVENTS: Mutex<Vec<CapturedFrameEvent>> = Mutex::new(vec![]);
 
-    extern "C" fn capture_frame_event(
-        event_type: FrameEventType,
-        span_id: u64,
-        name: KernelStringSlice,
-    ) {
-        let name: &str = unsafe { TryFromStringSlice::try_from_slice(&name).unwrap() };
-        let name = if name.is_empty() {
-            None
-        } else {
-            Some(name.to_string())
+    extern "C" fn capture_frame_event(event: FrameEvent) {
+        let (is_open, span_id, name) = match event {
+            FrameEvent::OPEN(FrameOpen { span_id, name }) => {
+                let name: &str = unsafe { TryFromStringSlice::try_from_slice(&name).unwrap() };
+                (true, span_id, Some(name.to_string()))
+            }
+            FrameEvent::CLOSE(FrameClose { span_id }) => (false, span_id, None),
         };
         FRAME_EVENTS.lock().unwrap().push(CapturedFrameEvent {
-            event_type,
+            is_open,
             span_id,
             name,
         });
@@ -1175,14 +1190,14 @@ mod tests {
         });
 
         let events = FRAME_EVENTS.lock().unwrap();
-        assert_eq!(events[0].event_type, FrameEventType::OPEN);
+        assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("outer"));
-        assert_eq!(events[1].event_type, FrameEventType::OPEN);
+        assert!(events[1].is_open);
         assert_eq!(events[1].name.as_deref(), Some("inner"));
-        assert_eq!(events[2].event_type, FrameEventType::CLOSE);
+        assert!(!events[2].is_open);
         assert_eq!(events[2].span_id, events[1].span_id);
         assert_eq!(events[2].name, None);
-        assert_eq!(events[3].event_type, FrameEventType::CLOSE);
+        assert!(!events[3].is_open);
         assert_eq!(events[3].span_id, events[0].span_id);
         assert_eq!(events[3].name, None);
     }
@@ -1200,9 +1215,9 @@ mod tests {
 
         let events = FRAME_EVENTS.lock().unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, FrameEventType::OPEN);
+        assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("captured"));
-        assert_eq!(events[1].event_type, FrameEventType::CLOSE);
+        assert!(!events[1].is_open);
         assert_eq!(events[1].span_id, events[0].span_id);
     }
 
@@ -1227,9 +1242,9 @@ mod tests {
 
         let events = FRAME_EVENTS.lock().unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, FrameEventType::OPEN);
+        assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("reloadable"));
-        assert_eq!(events[1].event_type, FrameEventType::CLOSE);
+        assert!(!events[1].is_open);
         assert_eq!(events[1].span_id, events[0].span_id);
     }
 }

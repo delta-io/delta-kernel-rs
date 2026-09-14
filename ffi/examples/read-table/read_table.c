@@ -11,18 +11,17 @@
 #include "kernel_schema_visitor.h"
 #include "kernel_utils.h"
 
-static void frame_callback(
-  FrameEventType event_type,
-  uint64_t span_id,
-  KernelStringSlice name)
+static void frame_callback(FrameEvent event)
 {
-  switch (event_type) {
-    case FrameEventTypeOPEN:
-    case FrameEventTypeCLOSE:
+  switch (event.tag) {
+    case FrameEventOPEN:
+      (void)event.open.span_id;
+      (void)event.open.name;
+      break;
+    case FrameEventCLOSE:
+      (void)event.close.span_id;
       break;
   }
-  (void)span_id;
-  (void)name;
 }
 
 // Print the content of a selection vector if `VERBOSE` is defined in read_table.h

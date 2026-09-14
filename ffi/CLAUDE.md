@@ -206,11 +206,11 @@ Metrics registration:
 Frame lifecycle registration:
 - `enable_frame_reporting(callback)` -- forwards OPEN/CLOSE for each dynamic activation of a span
   declaring the static `enable_call_frame` field. The callback runs synchronously on the entering
-  or exiting thread. OPEN includes the span id and a borrowed UTF-8 name; CLOSE includes the same
-  id with an empty name. Calls may overlap across threads; callback state must be thread-safe, and
-  profile consumers must maintain a separate event stack for each callback thread. Registration is
-  one-shot so a callback cannot be replaced between a span's OPEN and CLOSE events; another call
-  fails and leaves the existing callback active.
+  or exiting thread and receives a tagged `FrameEvent` union. OPEN includes the span id and a
+  borrowed UTF-8 name; CLOSE includes the matching id. Calls may overlap across threads; callback
+  state must be thread-safe, and profile consumers must maintain a separate event stack for each
+  callback thread. Registration is one-shot so a callback cannot be replaced between a span's OPEN
+  and CLOSE events; another call fails and leaves the existing callback active.
 
 The `MetricEvent` and any `KernelStringSlice` it carries are only valid for the duration of the
 callback. Durations are `u64`, suffixed `_ns` (nanoseconds) or `_ms` (milliseconds). Operation ids
