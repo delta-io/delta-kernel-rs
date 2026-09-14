@@ -657,7 +657,7 @@ impl CheckpointWriter {
     ///
     /// This function generates the [`CheckpointMetadata`] action that must be included in the
     /// V2 spec checkpoint file. This action contains metadata about the checkpoint, particularly
-    /// its version.
+    /// its version and tags.
     ///
     /// # Implementation Details
     ///
