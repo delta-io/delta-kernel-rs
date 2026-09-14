@@ -804,8 +804,7 @@ pub trait ParquetHandler: AsAny {
     /// Timestamp columns MUST be normalized to the protocol specified microsecond precision: a
     /// `TIMESTAMP(MILLIS)` (or any other non-microsecond unit) column read into a `TIMESTAMP` /
     /// `TIMESTAMP_NTZ` field must be rescaled to microseconds (a finer unit such as nanosecond is
-    /// truncated). The default engine does this via `arrow::compute::cast` while reordering columns
-    /// to the requested schema.
+    /// truncated). The default engine does this via `arrow::compute::cast`.
     ///
     /// [Delta protocol type widening rules]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#type-widening
     ///
