@@ -710,6 +710,7 @@ mod tests {
     async fn azure_listing_pushes_directory_and_offset_and_remains_lazy() {
         const OFFSET: &str = "table/_delta_log/00000000000000000010.json";
         const NEXT: &str = "table/_delta_log/00000000000000000011.json";
+        const NEXT_PAGE: &str = "table/_delta_log/00000000000000000012.json";
 
         let server = MockServer::start().await;
         let body = format!(
@@ -744,12 +745,22 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/container"))
+            .and(query_param("prefix", "table/_delta_log/"))
+            .and(query_param("delimiter", "/"))
             .and(query_param("marker", "page-2"))
+            .and(query_param_is_missing("startFrom"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                "<EnumerationResults><Blobs></Blobs></EnumerationResults>",
+                format!(
+                    "<EnumerationResults><Blobs>\
+                     <Blob><Name>{NEXT_PAGE}</Name><Properties>\
+                     <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
+                     <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
+                     </Properties></Blob>\
+                     </Blobs></EnumerationResults>"
+                ),
                 "application/xml",
             ))
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -772,8 +783,13 @@ mod tests {
             files.next().unwrap().unwrap().location,
             table_url.join(&format!("/{NEXT}")).unwrap()
         );
-        drop(files);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            files.next().unwrap().unwrap().location,
+            table_url.join(&format!("/{NEXT_PAGE}")).unwrap()
+        );
+        assert!(files.next().is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
         server.verify().await;
     }
 
