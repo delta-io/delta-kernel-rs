@@ -1119,7 +1119,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::arrow::util::display::FormatOptions;
-    use crate::arrow::util::pretty::{pretty_format_batches, pretty_format_batches_with_options};
+    use crate::arrow::util::pretty::pretty_format_batches_with_options;
     use crate::expressions::{
         col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
@@ -1156,8 +1156,9 @@ mod tests {
         assert_eq!(col.values(), expected);
     }
 
-    fn pretty_struct(array: &StructArray) -> String {
-        pretty_format_batches(&[RecordBatch::from(array.clone())])
+    fn pretty_struct_with_nulls(array: &StructArray) -> String {
+        let options = FormatOptions::default().with_null("NULL");
+        pretty_format_batches_with_options(&[RecordBatch::from(array.clone())], &options)
             .unwrap()
             .to_string()
     }
@@ -1182,6 +1183,31 @@ mod tests {
             "{border}\n| {name:<width$} |\n| {arrow_type:<width$} |\n{border}\n| {value:<width$} |\n{border}",
             name = "value",
         )
+    }
+
+    fn evaluate_parse_json(json: Vec<Option<&str>>, output_schema: Arc<StructType>) -> ArrayRef {
+        let expected_type = ArrowDataType::Struct(
+            ArrowSchema::try_from_kernel(output_schema.as_ref())
+                .unwrap()
+                .fields()
+                .clone(),
+        );
+        let input_schema =
+            ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(input_schema),
+            vec![Arc::new(StringArray::from(json)) as ArrayRef],
+        )
+        .unwrap();
+
+        let result = evaluate_expression(
+            &Expr::parse_json(col!("json_col"), output_schema),
+            &batch,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.data_type(), &expected_type);
+        result
     }
 
     fn create_nested_test_batch() -> RecordBatch {
@@ -2164,16 +2190,6 @@ mod tests {
         assert!(eval(divide(col!("zero"), col!("zero"))).is_nan());
     }
 
-    fn create_json_batch() -> RecordBatch {
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings = StringArray::from(vec![
-            Some(r#"{"a": 1, "b": "hello"}"#),
-            Some(r#"{"a": 2, "b": "world"}"#),
-            Some(r#"{"a": 3, "b": "test"}"#),
-        ]);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap()
-    }
-
     #[rstest]
     #[case::keeps_on_true(Some(true), false)]
     #[case::nulls_on_false(Some(false), true)]
@@ -2353,42 +2369,6 @@ mod tests {
         assert_eq!(result.null_count(), expected_null_count);
     }
 
-    #[test]
-    fn test_parse_json_basic() {
-        let batch = create_json_batch();
-
-        // Define the output schema for parsing
-        let output_schema = schema_ref! {
-            nullable "a": LONG,
-            nullable "b": STRING,
-        };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 2);
-        assert_eq!(struct_result.len(), 3);
-
-        // Verify 'a' column (Long values)
-        let a_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(a_col.values(), &[1, 2, 3]);
-
-        // Verify 'b' column (String values)
-        let b_col = struct_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(b_col.value(0), "hello");
-        assert_eq!(b_col.value(1), "world");
-        assert_eq!(b_col.value(2), "test");
-    }
-
     #[rstest]
     #[case::byte("-8", DataType::BYTE, "Int8", "-8")]
     #[case::short("32000", DataType::SHORT, "Int16", "32000")]
@@ -2460,144 +2440,224 @@ mod tests {
     }
 
     #[rstest]
+    #[case::basic(
+        vec![
+            Some(r#"{"a":1,"b":"hello"}"#),
+            Some(r#"{"a":2,"b":"world"}"#),
+            Some(r#"{"a":3,"b":"test"}"#),
+        ],
+        schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        },
+        concat!(
+            "+---+-------+\n",
+            "| a | b     |\n",
+            "+---+-------+\n",
+            "| 1 | hello |\n",
+            "| 2 | world |\n",
+            "| 3 | test  |\n",
+            "+---+-------+",
+        ),
+    )]
     #[case::void(
-        (r#"{"value":null}"#, schema_ref! { nullable "value": VOID }),
-        expected_single_value_table("Null", "NULL"),
+        vec![Some(r#"{"value":null}"#)],
+        schema_ref! { nullable "value": VOID },
+        concat!(
+            "+-------+\n",
+            "| value |\n",
+            "+-------+\n",
+            "| NULL  |\n",
+            "+-------+",
+        ),
     )]
     #[ignore = "pending ParseJson semantics implementation"]
     #[case::padded_base64(
-        (r#"{"value":"AQI="}"#, schema_ref! { not_null "value": BINARY }),
-        expected_single_value_table("Binary", "0102"),
+        vec![Some(r#"{"value":"AQI="}"#)],
+        schema_ref! { not_null "value": BINARY },
+        concat!(
+            "+-------+\n",
+            "| value |\n",
+            "+-------+\n",
+            "| 0102  |\n",
+            "+-------+",
+        ),
     )]
     #[case::empty_binary(
-        (r#"{"value":""}"#, schema_ref! { not_null "value": BINARY }),
-        expected_single_value_table("Binary", ""),
+        vec![Some(r#"{"value":""}"#)],
+        schema_ref! { not_null "value": BINARY },
+        concat!(
+            "+-------+\n",
+            "| value |\n",
+            "+-------+\n",
+            "|       |\n",
+            "+-------+",
+        ),
     )]
     #[case::field_matching_missing_null_and_extra_members(
-        (
+        vec![Some(
             r#"{"name":"lower","Name":"upper","json_null":null,"extra":123}"#,
-            schema_ref! {
-                not_null "name": STRING,
-                nullable "missing": STRING,
-                nullable "json_null": STRING,
-            },
-        ),
+        )],
+        schema_ref! {
+            not_null "name": STRING,
+            nullable "missing": STRING,
+            nullable "json_null": STRING,
+        },
         concat!(
             "+-------+---------+-----------+\n",
             "| name  | missing | json_null |\n",
-            "| Utf8  | Utf8    | Utf8      |\n",
             "+-------+---------+-----------+\n",
             "| lower | NULL    | NULL      |\n",
             "+-------+---------+-----------+",
-        )
-        .to_string(),
+        ),
     )]
-    fn test_parse_json_pretty_semantics(
-        #[case] input: (&str, Arc<StructType>),
-        #[case] expected: String,
+    #[case::recursive_containers(
+        vec![
+            Some(
+                r#"{"nested":{"ts":"2020-01-02T03:04:05.123456789+02:30","label":"inside"},"items":[{"n":1,"label":"one"},null,{"n":2,"label":""}],"times":["2020-01-02T03:04:05Z",null],"counts":{"first":1,"missing":null}}"#,
+            ),
+            Some(r#"{"nested":null,"items":[],"times":[],"counts":{}}"#),
+            Some(r#"{"nested":{}}"#),
+        ],
+        schema_ref! {
+            nullable "nested": {
+                nullable "ts": TIMESTAMP,
+                nullable "label": STRING,
+            },
+            nullable "items": (ArrayType::new(
+                schema! {
+                    nullable "n": INTEGER,
+                    nullable "label": STRING,
+                },
+                true,
+            )),
+            nullable "times": (ArrayType::new(DataType::TIMESTAMP, true)),
+            nullable "counts": (MapType::new(DataType::STRING, DataType::LONG, true)),
+        },
+        concat!(
+            "+--------------------------------------------------+---------------------------------------------+------------------------------+---------------------------+\n",
+            "| nested                                           | items                                       | times                        | counts                    |\n",
+            "+--------------------------------------------------+---------------------------------------------+------------------------------+---------------------------+\n",
+            "| {ts: 2020-01-02T00:34:05.123456Z, label: inside} | [{n: 1, label: one}, NULL, {n: 2, label: }] | [2020-01-02T03:04:05Z, NULL] | {first: 1, missing: NULL} |\n",
+            "| NULL                                             | []                                          | []                           | {}                        |\n",
+            "| {ts: NULL, label: NULL}                          | NULL                                        | NULL                         | NULL                      |\n",
+            "+--------------------------------------------------+---------------------------------------------+------------------------------+---------------------------+",
+        ),
+    )]
+    #[case::nested_struct(
+        vec![
+            Some(r#"{"outer":10,"inner":{"x":1,"y":2}}"#),
+            Some(r#"{"outer":20,"inner":{"x":3,"y":4}}"#),
+        ],
+        schema_ref! {
+            nullable "outer": LONG,
+            nullable "inner": {
+                nullable "x": LONG,
+                nullable "y": LONG,
+            },
+        },
+        concat!(
+            "+-------+--------------+\n",
+            "| outer | inner        |\n",
+            "+-------+--------------+\n",
+            "| 10    | {x: 1, y: 2} |\n",
+            "| 20    | {x: 3, y: 4} |\n",
+            "+-------+--------------+",
+        ),
+    )]
+    #[case::empty_batch(
+        Vec::<Option<&str>>::new(),
+        schema_ref! { nullable "a": LONG },
+        concat!(
+            "+---+\n",
+            "| a |\n",
+            "+---+\n",
+            "+---+",
+        ),
+    )]
+    fn test_parse_json_output(
+        #[case] json: Vec<Option<&str>>,
+        #[case] output_schema: Arc<StructType>,
+        #[case] expected: &str,
     ) {
-        let (json, output_schema) = input;
-        let input_schema = ArrowSchema::new(vec![ArrowField::new(
-            "json_col",
-            ArrowDataType::Utf8,
-            false,
-        )]);
-        let json = StringArray::from(vec![json]);
-        let batch =
-            RecordBatch::try_new(Arc::new(input_schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            pretty_struct_with_types_and_nulls(result.as_struct()),
-            expected,
-        );
+        let result = evaluate_parse_json(json, output_schema);
+        assert_eq!(pretty_struct_with_nulls(result.as_struct()), expected);
     }
 
     #[rstest]
-    #[case::all_members_missing(r#"{}"#)]
-    #[case::all_members_json_null(r#"{"a":null,"b":null}"#)]
-    fn test_parse_json_present_root_with_all_null_fields(#[case] json: &str) {
-        let input_schema = ArrowSchema::new(vec![ArrowField::new(
-            "json_col",
-            ArrowDataType::Utf8,
-            false,
-        )]);
-        let json = StringArray::from(vec![json]);
-        let batch =
-            RecordBatch::try_new(Arc::new(input_schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let output_schema = schema_ref! {
+    #[case::present_root_with_all_null_fields(
+        vec![Some(r#"{}"#), Some(r#"{"a":null,"b":null}"#)],
+        schema_ref! {
             nullable "a": INTEGER,
             nullable "b": STRING,
-        };
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
-        let parsed = result.as_struct();
-        assert!(parsed.is_valid(0));
-        assert_eq!(
-            pretty_struct(parsed),
-            concat!(
-                "+---+---+\n",
-                "| a | b |\n",
-                "+---+---+\n",
-                "|   |   |\n",
-                "+---+---+",
-            )
-        );
-    }
-
-    #[rstest]
+        },
+        None,
+        concat!(
+            "+------+------+\n",
+            "| a    | b    |\n",
+            "+------+------+\n",
+            "| NULL | NULL |\n",
+            "| NULL | NULL |\n",
+            "+------+------+",
+        ),
+        vec![true, true],
+    )]
     #[ignore = "pending ParseJson semantics implementation"]
-    fn test_parse_json_distinguishes_null_input_from_present_all_null_structs() {
-        let input_schema =
-            ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json = StringArray::from(vec![None, Some(r#"{}"#), Some(r#"{"a":null,"b":null}"#)]);
-        let batch =
-            RecordBatch::try_new(Arc::new(input_schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let output_schema = schema_ref! {
-            nullable "a": INTEGER,
-            nullable "b": STRING,
-        };
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
+    #[case::null_input(
+        vec![Some(r#"{"a":1}"#), None, Some(r#"{"a":3}"#)],
+        schema_ref! { nullable "a": LONG },
+        None,
+        concat!(
+            "+------+\n",
+            "| a    |\n",
+            "+------+\n",
+            "| 1    |\n",
+            "| NULL |\n",
+            "| 3    |\n",
+            "+------+",
+        ),
+        vec![true, false, true],
+    )]
+    #[case::null_nested_parent_with_non_nullable_child(
+        vec![
+            Some(r#"{"nested":null}"#),
+            Some(r#"{"nested":{"required":7}}"#),
+        ],
+        schema_ref! {
+            nullable "nested": {
+                not_null "required": INTEGER,
+            },
+        },
+        Some("nested"),
+        concat!(
+            "+---------------+\n",
+            "| nested        |\n",
+            "+---------------+\n",
+            "| NULL          |\n",
+            "| {required: 7} |\n",
+            "+---------------+",
+        ),
+        vec![false, true],
+    )]
+    fn test_parse_json_struct_validity(
+        #[case] json: Vec<Option<&str>>,
+        #[case] output_schema: Arc<StructType>,
+        #[case] struct_field: Option<&str>,
+        #[case] expected: &str,
+        #[case] expected_validity: Vec<bool>,
+    ) {
+        let result = evaluate_parse_json(json, output_schema);
         let parsed = result.as_struct();
 
-        assert_eq!(
-            pretty_struct(parsed),
-            concat!(
-                "+---+---+\n",
-                "| a | b |\n",
-                "+---+---+\n",
-                "|   |   |\n",
-                "|   |   |\n",
-                "|   |   |\n",
-                "+---+---+",
-            )
-        );
-        assert!(parsed.is_null(0), "SQL null must produce a null struct");
-        assert!(parsed.is_valid(1), "{{}} must produce a present struct");
-        assert!(
-            parsed.is_valid(2),
-            "an object with null fields must produce a present struct"
-        );
-        assert!(parsed
-            .columns()
-            .iter()
-            .all(|column| column.null_count() == 3));
+        assert_eq!(pretty_struct_with_nulls(parsed), expected);
+
+        let checked_struct = struct_field.map_or(parsed, |field| {
+            parsed.column_by_name(field).unwrap().as_struct()
+        });
+        let actual_validity = (0..checked_struct.len())
+            .map(|row| checked_struct.is_valid(row))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_validity, expected_validity);
     }
 
     #[rstest]
@@ -2641,91 +2701,6 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "nullability violation must be an error");
-    }
-
-    #[rstest]
-    fn test_parse_json_allows_null_parent_with_non_nullable_child() {
-        let input_schema = ArrowSchema::new(vec![ArrowField::new(
-            "json_col",
-            ArrowDataType::Utf8,
-            false,
-        )]);
-        let json = StringArray::from(vec![r#"{"nested":null}"#, r#"{"nested":{"required":7}}"#]);
-        let batch =
-            RecordBatch::try_new(Arc::new(input_schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let output_schema = schema_ref! {
-            nullable "nested": {
-                not_null "required": INTEGER,
-            },
-        };
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            pretty_struct(result.as_struct()),
-            concat!(
-                "+---------------+\n",
-                "| nested        |\n",
-                "+---------------+\n",
-                "|               |\n",
-                "| {required: 7} |\n",
-                "+---------------+",
-            )
-        );
-    }
-
-    #[rstest]
-    fn test_parse_json_defined_recursive_container_semantics() {
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "json_col",
-            ArrowDataType::Utf8,
-            false,
-        )]);
-        let json = StringArray::from(vec![
-            Some(
-                r#"{"nested":{"ts":"2020-01-02T03:04:05.123456789+02:30","label":"inside"},"items":[{"n":1,"label":"one"},null,{"n":2,"label":""}],"times":["2020-01-02T03:04:05Z",null],"counts":{"first":1,"missing":null}}"#,
-            ),
-            Some(r#"{"nested":null,"items":[],"times":[],"counts":{}}"#),
-            Some(r#"{"nested":{}}"#),
-        ]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json) as ArrayRef]).unwrap();
-        let item_type = schema! {
-            nullable "n": INTEGER,
-            nullable "label": STRING,
-        };
-        let output_schema = schema_ref! {
-            nullable "nested": {
-                nullable "ts": TIMESTAMP,
-                nullable "label": STRING,
-            },
-            nullable "items": (ArrayType::new(item_type, true)),
-            nullable "times": (ArrayType::new(DataType::TIMESTAMP, true)),
-            nullable "counts": (MapType::new(DataType::STRING, DataType::LONG, true)),
-        };
-
-        let result = evaluate_expression(
-            &Expr::parse_json(col!("json_col"), output_schema),
-            &batch,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            pretty_struct(result.as_struct()),
-            concat!(
-                "+--------------------------------------------------+-----------------------------------------+--------------------------+-----------------------+\n",
-                "| nested                                           | items                                   | times                    | counts                |\n",
-                "+--------------------------------------------------+-----------------------------------------+--------------------------+-----------------------+\n",
-                "| {ts: 2020-01-02T00:34:05.123456Z, label: inside} | [{n: 1, label: one}, , {n: 2, label: }] | [2020-01-02T03:04:05Z, ] | {first: 1, missing: } |\n",
-                "|                                                  | []                                      | []                       | {}                    |\n",
-                "| {ts: , label: }                                  |                                         |                          |                       |\n",
-                "+--------------------------------------------------+-----------------------------------------+--------------------------+-----------------------+",
-            )
-        );
     }
 
     #[rstest]
@@ -2801,184 +2776,6 @@ mod tests {
         assert_eq!(b_col.value(0), "hello");
         assert_eq!(b_col.value(1), "world");
         assert_eq!(b_col.value(2), "test");
-    }
-
-    #[test]
-    fn test_parse_json_nested_struct() {
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings = StringArray::from(vec![
-            Some(r#"{"outer": 10, "inner": {"x": 1, "y": 2}}"#),
-            Some(r#"{"outer": 20, "inner": {"x": 3, "y": 4}}"#),
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
-
-        // Define nested output schema
-        let output_schema = schema_ref! {
-            nullable "outer": LONG,
-            nullable "inner": {
-                nullable "x": LONG,
-                nullable "y": LONG,
-            },
-        };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 2);
-        assert_eq!(struct_result.len(), 2);
-
-        // Verify 'outer' column
-        let outer_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(outer_col.values(), &[10, 20]);
-
-        // Verify nested 'inner' struct
-        let inner_struct = struct_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        let x_col = inner_struct
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let y_col = inner_struct
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(x_col.values(), &[1, 3]);
-        assert_eq!(y_col.values(), &[2, 4]);
-    }
-
-    #[rstest]
-    #[ignore = "pending ParseJson semantics implementation"]
-    fn test_parse_json_with_nulls() {
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings = StringArray::from(vec![Some(r#"{"a": 1}"#), None, Some(r#"{"a": 3}"#)]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
-
-        let output_schema = schema_ref! { nullable "a": LONG };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.len(), 3);
-        assert!(struct_result.is_valid(0));
-        assert!(struct_result.is_null(1));
-        assert!(struct_result.is_valid(2));
-
-        let a_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert!(!a_col.is_null(0));
-        assert_eq!(a_col.value(0), 1);
-        assert!(a_col.is_null(1));
-        assert!(!a_col.is_null(2));
-        assert_eq!(a_col.value(2), 3);
-    }
-
-    #[test]
-    fn test_parse_json_empty_batch() {
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings: StringArray = StringArray::from(Vec::<Option<&str>>::new());
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
-
-        let output_schema = schema_ref! { nullable "a": LONG };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_json_missing_field() {
-        // JSON objects are missing field "b" that the schema expects
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings = StringArray::from(vec![
-            Some(r#"{"a": 1}"#),            // missing "b"
-            Some(r#"{"a": 2, "b": "hi"}"#), // has both
-            Some(r#"{"a": 3}"#),            // missing "b"
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
-
-        let output_schema = schema_ref! {
-            nullable "a": LONG,
-            nullable "b": STRING,
-        };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.len(), 3);
-
-        // 'a' column should have all values
-        let a_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(a_col.values(), &[1, 2, 3]);
-
-        // 'b' column should have NULLs where missing
-        let b_col = struct_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!(b_col.is_null(0)); // missing in JSON
-        assert_eq!(b_col.value(1), "hi");
-        assert!(b_col.is_null(2)); // missing in JSON
-    }
-
-    #[test]
-    fn test_parse_json_extra_field_ignored() {
-        // JSON has extra field "c" not in schema - should be ignored
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings = StringArray::from(vec![
-            Some(r#"{"a": 1, "b": "x", "c": "extra"}"#),
-            Some(r#"{"a": 2, "b": "y", "ignored": 999}"#),
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
-
-        // Schema only asks for "a" and "b"
-        let output_schema = schema_ref! {
-            nullable "a": LONG,
-            nullable "b": STRING,
-        };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 2); // Only 2 columns, not 3
-        assert_eq!(struct_result.len(), 2);
-
-        let a_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(a_col.values(), &[1, 2]);
-
-        let b_col = struct_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(b_col.value(0), "x");
-        assert_eq!(b_col.value(1), "y");
     }
 
     #[test]
