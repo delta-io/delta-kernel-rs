@@ -754,6 +754,115 @@ fn test_scan_metadata_from_projects_cached_typed_stats_for_narrower_scan() {
 }
 
 #[test_log::test]
+fn test_scan_metadata_from_preserves_json_stats_for_later_replay() {
+    // Version 4 precedes the checkpoint: its four files have JSON stats from commits.
+    let path = fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(4)
+        .build(&engine)
+        .unwrap();
+    let version = snapshot.version();
+
+    // Cache all files with both JSON and typed stats. No predicate has removed any files.
+    let cache_scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    let mut cached_metadata = Vec::new();
+    for metadata in cache_scan.scan_metadata(&engine).unwrap() {
+        let metadata = metadata.unwrap();
+        let data = metadata.scan_files.apply_selection_vector().unwrap();
+        let batch = extract_record_batch(data.as_ref()).unwrap();
+        let json_stats = get_column!(batch, "stats", StringArray);
+        assert_eq!(
+            json_stats.null_count(),
+            0,
+            "cache must start with JSON stats"
+        );
+        cached_metadata.push(data);
+    }
+    let cached_batch = extract_record_batch(cached_metadata[0].as_ref()).unwrap();
+    let cached_schema =
+        Arc::new(StructType::try_from_arrow(cached_batch.schema().as_ref()).unwrap());
+    assert_eq!(
+        cached_metadata.iter().map(|data| data.len()).sum::<usize>(),
+        4
+    );
+
+    // First replay: request only `id` typed stats, but keep JSON for queries on other columns.
+    let id_stats_scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("id")]))
+        .build()
+        .unwrap();
+    let replayed_metadata: Vec<_> = id_stats_scan
+        .scan_metadata_from(&engine, version, cached_schema, cached_metadata, None)
+        .unwrap()
+        .map_ok(|metadata| metadata.scan_files.apply_selection_vector().unwrap())
+        .try_collect()
+        .unwrap();
+    let replayed_batch = extract_record_batch(replayed_metadata[0].as_ref()).unwrap();
+    let replayed_schema =
+        Arc::new(StructType::try_from_arrow(replayed_batch.schema().as_ref()).unwrap());
+    assert_eq!(
+        replayed_metadata
+            .iter()
+            .map(|data| data.len())
+            .sum::<usize>(),
+        4
+    );
+    assert!(replayed_schema.contains_col([STATS_PARSED, MIN_VALUES, "id"]));
+    assert!(!replayed_schema.contains_col([STATS_PARSED, MIN_VALUES, "value"]));
+    for data in &replayed_metadata {
+        let batch = extract_record_batch(data.as_ref()).unwrap();
+        let json_stats = get_column!(batch, "stats", StringArray);
+        assert_eq!(
+            json_stats.null_count(),
+            0,
+            "replay must retain existing JSON stats"
+        );
+    }
+
+    // Second replay: `value` is absent from the typed stats, so pruning needs the retained JSON.
+    let value_scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::eq(col!("value"), lit("value_4"))))
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("value")]))
+        .build()
+        .unwrap();
+    let mut replayed_paths = Vec::new();
+    for metadata in value_scan
+        .scan_metadata_from(&engine, version, replayed_schema, replayed_metadata, None)
+        .unwrap()
+    {
+        replayed_paths = metadata
+            .unwrap()
+            .visit_scan_files(replayed_paths, |paths, file| {
+                paths.push(file.path.to_string())
+            })
+            .unwrap();
+    }
+
+    // A fresh scan of the same version and predicate identifies the one expected file.
+    let mut expected_paths = get_files_for_scan(value_scan, &engine).unwrap();
+    assert_eq!(expected_paths.len(), 1);
+    expected_paths.sort_unstable();
+    replayed_paths.sort_unstable();
+    assert_eq!(
+        replayed_paths, expected_paths,
+        "replaying the cache must prune the same files as a fresh scan"
+    );
+}
+
+#[test_log::test]
 fn test_scan_metadata_from_updates_typed_cache_with_new_commits() {
     let path = fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = Url::from_directory_path(path).unwrap();
