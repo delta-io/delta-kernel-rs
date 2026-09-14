@@ -478,14 +478,13 @@ async fn test_listing_omits_staged_commits() {
 }
 
 #[tokio::test]
-async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
+async fn test_listing_does_not_yield_staged_commits() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
     ];
-    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
-    // reaches them only after all relevant files. None should be consumed beyond the first.
+    // Staged commits sort after every version-named file ('_' > '9') but live in a subdirectory.
     log_files
         .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
 
@@ -498,19 +497,19 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the single staged commit that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), 3);
 }
 
-// Any path past the version-named region stops the listing, not just `_staged_commits/`:
-// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
-// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
-// is ever consumed.
+// Nested paths are excluded by `StorageHandler`; direct paths past the version-named region stop
+// the listing.
 #[rstest]
-#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
-#[case::non_underscore_sentinel("_delta_log/Zsentinel")]
+#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet", 3)]
+#[case::non_underscore_sentinel("_delta_log/Zsentinel", 4)]
 #[tokio::test]
-async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_path: &str) {
+async fn test_listing_excludes_nested_and_stops_at_direct_non_version_path(
+    #[case] sentinel_path: &str,
+    #[case] expected_items_listed: u32,
+) {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -527,8 +526,7 @@ async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_pat
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the sentinel that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), expected_items_listed);
 }
 
 #[tokio::test]

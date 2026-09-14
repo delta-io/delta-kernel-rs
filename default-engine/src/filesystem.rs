@@ -67,8 +67,17 @@ async fn list_from_impl(
 
     let has_ordered_listing = supports_ordered_listing(&path);
 
+    // `list_with_offset` lets capable stores push down the offset but recursively lists
+    // descendants.
     let stream = store
         .list_with_offset(Some(&prefix), &offset)
+        .try_filter(move |meta| {
+            futures::future::ready(
+                meta.location
+                    .prefix_match(&prefix)
+                    .is_some_and(|parts| parts.count() == 1),
+            )
+        })
         .map(move |meta| {
             let meta = meta?;
             let mut location = path.clone();
@@ -413,7 +422,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files: Vec<_> = engine
             .storage_handler()
-            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&table_root.join("_delta_log/").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
             .unwrap();
@@ -443,7 +452,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files = engine
             .storage_handler()
-            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&url.join("_delta_log/").unwrap().join("0").unwrap())
             .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
@@ -460,6 +469,34 @@ mod tests {
             len += 1;
         }
         assert_eq!(len, 10, "list_from should have returned 10 files");
+    }
+
+    #[tokio::test]
+    async fn list_from_applies_offset_and_excludes_nested_files() {
+        let store = Arc::new(InMemory::new());
+        for key in [
+            "_delta_log/00000000000000000000.json",
+            "_delta_log/00000000000000000001.json",
+            "_delta_log/00000000000000000002.json",
+            "_delta_log/_staged_commits/00000000000000000003.uuid.json",
+        ] {
+            store
+                .put(&Path::from(key), Bytes::from_static(b"x").into())
+                .await
+                .unwrap();
+        }
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+        let start = Url::parse("memory:///_delta_log/00000000000000000001.json").unwrap();
+
+        let locations: Vec<_> = handler
+            .list_from(&start)
+            .unwrap()
+            .map(|result| result.unwrap().location.path().to_string())
+            .collect();
+
+        assert_eq!(locations, vec!["/_delta_log/00000000000000000002.json"]);
     }
 
     #[tokio::test]
