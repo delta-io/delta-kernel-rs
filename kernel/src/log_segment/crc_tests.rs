@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rstest::rstest;
 use serde_json::{json, Value};
-use test_utils::{assert_result_error_with_message, delta_path_for_version};
+use test_utils::delta_path_for_version;
 use url::Url;
 
 use super::LogSegment;
@@ -824,21 +824,14 @@ async fn test_ict_from_crc_at_snapshot_version() {
 }
 
 #[tokio::test]
-async fn test_ict_errors_when_crc_has_no_ict() {
-    let setup = CrcReadTest::new()
+async fn test_ict_enabled_crc_without_ict_is_rejected() {
+    CrcReadTest::new()
         .v2_checkpoint(0, protocol_ict(), metadata_ict())
         .commit(1, [commit_info(DEFAULT_OPERATION, Some(2000))])
         .crc(1, protocol_ict(), metadata_ict(), None)
         .build()
-        .await;
-
-    let (snapshot, _) = setup.snapshot_at(None);
-    let result = snapshot.get_in_commit_timestamp(&setup.engine);
-
-    assert_result_error_with_message(
-        result,
-        "In-Commit Timestamp not found in CRC file at version 1",
-    );
+        .await
+        .assert_ict(None, Some(2000));
 }
 
 // ============================================================================

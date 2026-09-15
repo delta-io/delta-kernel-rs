@@ -25,14 +25,13 @@ const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 /// This format is reserved for future use and not currently supported.
 const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum DeletionVectorStorageType {
-    #[cfg_attr(test, serde(rename = "u"))]
+    #[serde(rename = "u")]
     PersistedRelative,
-    #[cfg_attr(test, serde(rename = "i"))]
+    #[serde(rename = "i")]
     Inline,
-    #[cfg_attr(test, serde(rename = "p"))]
+    #[serde(rename = "p")]
     PersistedAbsolute,
 }
 
@@ -124,12 +123,8 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "DeletionVectorDescriptorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: DeletionVectorStorageType,
@@ -159,6 +154,30 @@ pub struct DeletionVectorDescriptor {
 
     /// Number of rows the given DV logically removes from the file.
     pub cardinality: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionVectorDescriptorRaw {
+    storage_type: DeletionVectorStorageType,
+    path_or_inline_dv: String,
+    offset: Option<i32>,
+    size_in_bytes: i32,
+    cardinality: i64,
+}
+
+impl TryFrom<DeletionVectorDescriptorRaw> for DeletionVectorDescriptor {
+    type Error = Error;
+
+    fn try_from(value: DeletionVectorDescriptorRaw) -> DeltaResult<Self> {
+        Self::try_new(
+            value.storage_type,
+            value.path_or_inline_dv,
+            value.offset,
+            value.size_in_bytes,
+            value.cardinality,
+        )
+    }
 }
 
 impl DeletionVectorDescriptor {
