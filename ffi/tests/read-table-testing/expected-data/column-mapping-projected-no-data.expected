@@ -5,4 +5,3 @@ Schema:
 ├─ letter: string (column mapping id: 1)
 ├─ new_int: long (column mapping id: 2)
 └─ date: date (column mapping id: 3)
-
