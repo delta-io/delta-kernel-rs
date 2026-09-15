@@ -554,6 +554,8 @@ pub trait StorageHandler: AsAny {
     /// included, and subdirectories are not returned as entries. For example, listing from
     /// `dir/0001.json` returns direct children like `dir/0002.checkpoint.parquet` and
     /// `dir/0002.json` (in lexicographic order), but nothing under `dir/sub/`.
+    /// Delta log discovery defensively tolerates recursive descendants, but that compatibility
+    /// behavior is not part of this contract and implementations must not rely on it.
     ///
     /// The parent directory is derived from `path`:
     /// - If `path` is directory-like (ends with `/`), the parent is `path` itself and the result
