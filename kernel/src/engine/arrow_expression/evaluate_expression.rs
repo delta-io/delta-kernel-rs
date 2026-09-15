@@ -607,7 +607,8 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
 }
 
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
-pub fn evaluate_predicate(
+#[internal_api]
+pub(crate) fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
     inverted: bool,
@@ -784,7 +785,8 @@ const STATS_TIMESTAMP_TZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
 
 /// Converts a StructArray to JSON-encoded strings
-pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+#[internal_api]
+pub(crate) fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
     let (array_ref, _is_scalar) = input.get();
     match array_ref.data_type() {
         ArrowDataType::Struct(_) => {
@@ -869,7 +871,7 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// - **Mismatched row counts**: Not all arrays have the same number of rows.
 /// - **Mismatched data types**: Not all arrays have exactly the same data type.
 /// - **Invalid result type**: If `result_type` is provided but doesn't match the arrays' data type.
-pub fn coalesce_arrays(
+fn coalesce_arrays(
     arrays: &[ArrayRef],
     result_type: Option<&DataType>,
 ) -> Result<ArrayRef, ArrowError> {
