@@ -177,7 +177,6 @@ nor borrowed string slices may be retained after the callback.
 
 | Function | Purpose |
 |----------|---------|
-| `KernelMetadataVisitorState` | Collect Kernel metadata values during that callback |
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
 | `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
@@ -390,9 +389,6 @@ pattern is the same in every case:
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the
 call; copy them if you need to retain them beyond the callback.
-
-For build-side schema metadata, return `false` from the engine callback when an insertion fails.
-Kernel rejects the field without adding it to the schema visitor state.
 
 ## Error handling
 
