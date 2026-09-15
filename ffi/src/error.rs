@@ -80,6 +80,7 @@ pub enum FFIKernelError {
     StartVersionNotFound = 51,
     InvalidGeoParamsError = 52,
     MaxCatalogVersionError = 53,
+    UnsupportedProtocolVersionError = 54,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -118,6 +119,9 @@ impl From<KernelError> for FFIKernelError {
             KernelError::MissingMetadata => FFIKernelError::MissingMetadataError,
             KernelError::MissingProtocol => FFIKernelError::MissingProtocolError,
             KernelError::InvalidProtocol(_) => FFIKernelError::InvalidProtocolError,
+            KernelError::UnsupportedProtocolVersion { .. } => {
+                FFIKernelError::UnsupportedProtocolVersionError
+            }
             KernelError::MissingMetadataAndProtocol => {
                 FFIKernelError::MissingMetadataAndProtocolError
             }
@@ -344,6 +348,9 @@ impl From<EngineExecError> for KernelError {
             .into(),
             FFIKernelError::FileAlreadyExists => KernelError::FileAlreadyExists(message),
             FFIKernelError::UnsupportedError => KernelError::Unsupported(message),
+            FFIKernelError::UnsupportedProtocolVersionError => {
+                KernelError::Unsupported(message)
+            }
             FFIKernelError::InvalidCheckpoint => KernelError::InvalidCheckpoint(message),
             FFIKernelError::SchemaError => KernelError::Schema(message),
             FFIKernelError::InvalidTransactionStateError => {
@@ -401,6 +408,8 @@ impl From<EngineExecError> for KernelError {
 
 #[cfg(test)]
 mod error_code_tests {
+    use delta_kernel::error::ProtocolVersionType;
+
     use super::*;
 
     fn exec_error(etype: FFIKernelError, message: &str) -> EngineExecError {
@@ -516,6 +525,20 @@ mod error_code_tests {
         let err: KernelError = exec_error(FFIKernelError::MaxCatalogVersionError, "invalid").into();
         assert!(matches!(err, KernelError::MaxCatalogVersion(message) if message == "invalid"));
     }
+
+    #[test]
+    fn unsupported_protocol_version_has_stable_ffi_mapping() {
+        let error = KernelError::UnsupportedProtocolVersion {
+            version_type: ProtocolVersionType::Reader,
+            min_reader_version: i32::MAX,
+            min_writer_version: 7,
+        };
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::UnsupportedProtocolVersionError
+        );
+        assert_eq!(FFIKernelError::UnsupportedProtocolVersionError as i32, 54);
+    }
 }
 
 #[cfg(all(test, feature = "declarative-plans"))]
@@ -535,6 +558,10 @@ mod tests {
     #[case::file_not_found(FFIKernelError::FileNotFoundError, "File not found: boom")]
     #[case::schema(FFIKernelError::SchemaError, "Schema error: boom")]
     #[case::unsupported(FFIKernelError::UnsupportedError, "Unsupported: boom")]
+    #[case::unsupported_protocol(
+        FFIKernelError::UnsupportedProtocolVersionError,
+        "Unsupported: boom"
+    )]
     #[case::generic(FFIKernelError::GenericError, "Generic delta kernel error: boom")]
     #[case::invalid_expr(
         FFIKernelError::InvalidExpression,
