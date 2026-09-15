@@ -5,13 +5,6 @@
  * `KernelSchemaVisitor` in kernel parlance.
  */
 
-bool visit_empty_field_metadata(void* metadata, KernelMetadataVisitorState* state)
-{
-  (void)metadata;
-  (void)state;
-  return true;
-}
-
 bool metadata_result_succeeded(ExternResultbool result)
 {
   if (result.tag == Okbool) {
@@ -217,7 +210,7 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
     cols,
     col_index,
     false,
-    &(EngineMetadata){ NULL, visit_empty_field_metadata },
+    NULL,
     allocate_error);
 
   if (visit_res.tag != Okusize) {

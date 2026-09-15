@@ -1090,9 +1090,7 @@ mod scan_builder_tests {
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
     };
-    use crate::ffi_test_utils::{
-        allocate_err, default_engine_metadata, ok_or_panic, recover_error, setup_snapshot,
-    };
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
@@ -1110,7 +1108,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(id),
                 true,
-                &mut default_engine_metadata(),
+                None,
                 allocate_err,
             ))
         };
@@ -1123,7 +1121,7 @@ mod scan_builder_tests {
                 field_ids.as_ptr(),
                 1,
                 false,
-                &mut default_engine_metadata(),
+                None,
                 allocate_err,
             ))
         }
@@ -1274,7 +1272,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(bare_field),
                 true,
-                &mut default_engine_metadata(),
+                None,
                 allocate_err,
             ))
         }

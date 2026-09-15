@@ -884,7 +884,6 @@ mod tests {
     use super::*;
     use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
     use crate::expressions::free_kernel_expression;
-    use crate::ffi_test_utils::default_engine_metadata;
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
@@ -2316,21 +2315,21 @@ mod tests {
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            &mut default_engine_metadata(),
+                            None,
                             allocate_err,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            &mut default_engine_metadata(),
+                            None,
                             allocate_err,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
-                            &mut default_engine_metadata(),
+                            None,
                             allocate_err,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
@@ -2346,7 +2345,7 @@ mod tests {
                 field_ids.as_ptr(),
                 field_ids.len(),
                 false,
-                &mut default_engine_metadata(),
+                None,
                 allocate_err,
             ))
         }

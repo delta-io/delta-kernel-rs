@@ -170,10 +170,10 @@ See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
 The build-side counterpart to `visit_schema`: per-field callbacks that let the
 engine construct a Kernel `StructType` from its own type system (for example,
-to pass to `scan_builder_with_schema`). Every field function takes an exclusively borrowed
-`EngineMetadata`: an opaque engine-owned value plus a synchronous callback that inserts the
-field's metadata into a short-lived `KernelMetadataVisitorState`. Neither the descriptor, state,
-nor borrowed string slices may be retained after the callback.
+to pass to `scan_builder_with_schema`). Every field function optionally takes an immutable
+`EngineMetadata` descriptor: an opaque engine-owned value plus a synchronous callback that inserts
+the field's metadata into a short-lived `KernelMetadataVisitorState`. A null descriptor means the
+field has no metadata. Neither the descriptor, state, nor borrowed string slices may be retained.
 
 | Function | Purpose |
 |----------|---------|
@@ -183,7 +183,7 @@ nor borrowed string slices may be retained after the callback.
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
 | `visit_metadata_number` / `visit_metadata_string` / `visit_metadata_boolean` | Insert a typed integral, UTF-8 string, or Boolean value into the active field metadata state |
-| `visit_metadata_json` | Insert one value from valid UTF-8 JSON; scalar values use their canonical number, string, or Boolean metadata variant |
+| `visit_metadata_json` | Insert valid UTF-8 JSON; i64-range integers, strings, and Booleans use typed metadata variants, while floats, out-of-range integers, null, arrays, and objects remain opaque JSON values |
 
 **Reading (scans)**
 

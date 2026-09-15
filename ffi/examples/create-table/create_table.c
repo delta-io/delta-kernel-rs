@@ -54,15 +54,8 @@ struct schema_spec {
   size_t field_count;
 };
 
-static bool visit_default_metadata(void* metadata, KernelMetadataVisitorState* state) {
-  (void)metadata;
-  (void)state;
-  return true;
-}
-
 static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
   const struct schema_spec* spec = data;
-  EngineMetadata metadata = { NULL, visit_default_metadata };
   uintptr_t* child_ids = malloc(spec->field_count * sizeof(uintptr_t));
   for (size_t i = 0; i < spec->field_count; i++) {
     const struct field_spec* f = &spec->fields[i];
@@ -70,10 +63,10 @@ static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
     ExternResultusize r;
     switch (f->type) {
       case FIELD_LONG:
-        r = visit_field_long(state, name, f->nullable, &metadata, allocate_error);
+        r = visit_field_long(state, name, f->nullable, NULL, allocate_error);
         break;
       case FIELD_STRING:
-        r = visit_field_string(state, name, f->nullable, &metadata, allocate_error);
+        r = visit_field_string(state, name, f->nullable, NULL, allocate_error);
         break;
       default:
         fprintf(stderr, "Unknown field type %d\n", f->type);
@@ -92,7 +85,7 @@ static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
   // pass a stable placeholder.
   KernelStringSlice root_name = { "root", 4 };
   ExternResultusize root = visit_field_struct(
-      state, root_name, child_ids, spec->field_count, /*nullable*/ false, &metadata, allocate_error);
+      state, root_name, child_ids, spec->field_count, /*nullable*/ false, NULL, allocate_error);
   free(child_ids);
   if (root.tag != Okusize) {
     print_error("visit_field_struct failed for top-level", (Error*)root.err);
