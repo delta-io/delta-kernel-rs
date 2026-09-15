@@ -429,7 +429,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
+        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
