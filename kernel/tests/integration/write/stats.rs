@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
@@ -22,6 +24,330 @@ use test_utils::{
 use url::Url;
 
 use crate::common::write_utils::set_table_properties;
+
+#[tokio::test]
+async fn print_kernel_stats_serialization_edge_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "byte": BYTE,
+        nullable "short": SHORT,
+        nullable "int": INTEGER,
+        nullable "long": LONG,
+        nullable "float_finite": FLOAT,
+        nullable "double_finite": DOUBLE,
+        nullable "float_nan": FLOAT,
+        nullable "double_nan": DOUBLE,
+        nullable "float_pos_inf": FLOAT,
+        nullable "double_pos_inf": DOUBLE,
+        nullable "float_neg_inf": FLOAT,
+        nullable "double_neg_inf": DOUBLE,
+        nullable "float_zero": FLOAT,
+        nullable "decimal": (DataType::decimal(38, 18)?),
+        nullable "date": DATE,
+        nullable "timestamp": TIMESTAMP,
+        nullable "timestamp_ntz": TIMESTAMP_NTZ,
+        nullable "str_ascii": STRING,
+        nullable "str_cjk": STRING,
+        nullable "str_supplementary": STRING,
+        nullable "str_supplementary16": STRING,
+        nullable "str_controls": STRING,
+        nullable "str_u10ffff": STRING,
+        nullable "all_null_long": LONG,
+        nullable "boolean": BOOLEAN,
+        nullable "binary": BINARY,
+        nullable "void": VOID,
+        nullable "interval_ym": INTERVAL_YEAR_MONTH,
+        nullable "interval_dt": INTERVAL_DAY_TIME,
+        nullable "array": [ nullable INTEGER ],
+        nullable "map": { STRING => nullable INTEGER },
+        nullable "nested": {
+            nullable "number": INTEGER,
+            nullable "text": STRING,
+        },
+    };
+
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.dataSkippingNumIndexedCols", "-1")],
+    )?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+    let arrow_schema = Arc::new(arrow_schema);
+
+    let list_field = match arrow_schema.field_with_name("array")?.data_type() {
+        ArrowDataType::List(field) => field.clone(),
+        data_type => panic!("expected list, got {data_type:?}"),
+    };
+    let array = ListArray::new(
+        list_field,
+        OffsetBuffer::new(vec![0, 2, 2, 2, 4].into()),
+        Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), None])),
+        Some(NullBuffer::from_iter([true, true, false, true])),
+    );
+
+    let (map_entry_field, map_sorted) = match arrow_schema.field_with_name("map")?.data_type() {
+        ArrowDataType::Map(field, sorted) => (field.clone(), *sorted),
+        data_type => panic!("expected map, got {data_type:?}"),
+    };
+    let map_entry_fields = match map_entry_field.data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        data_type => panic!("expected map entries struct, got {data_type:?}"),
+    };
+    let map_entries = StructArray::new(
+        map_entry_fields,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "z", "m"])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
+        ],
+        None,
+    );
+    let map = MapArray::new(
+        map_entry_field,
+        OffsetBuffer::new(vec![0, 1, 2, 2, 3].into()),
+        map_entries,
+        Some(NullBuffer::from_iter([true, true, false, true])),
+        map_sorted,
+    );
+
+    let nested_fields = match arrow_schema.field_with_name("nested")?.data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        data_type => panic!("expected nested struct, got {data_type:?}"),
+    };
+    let nested = StructArray::new(
+        nested_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![Some(0), Some(2), None, Some(-1)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("ignored"),
+                Some("z"),
+                None,
+                Some("a"),
+            ])) as ArrayRef,
+        ],
+        Some(NullBuffer::from_iter([false, true, true, true])),
+    );
+
+    let decimal_limit = 10_i128.pow(38) - 1;
+    let timestamp_values = vec![Some(-1_500), Some(1_783_007_755_999_900), None, Some(0)];
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int8Array::from(vec![
+                Some(i8::MIN),
+                Some(i8::MAX),
+                None,
+                Some(0),
+            ])),
+            Arc::new(Int16Array::from(vec![
+                Some(i16::MIN),
+                Some(i16::MAX),
+                None,
+                Some(0),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(i32::MIN),
+                Some(i32::MAX),
+                None,
+                Some(0),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                Some(i64::MAX),
+                None,
+                Some(0),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(-3.5),
+                Some(7.25),
+                None,
+                Some(-0.0),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(-3.5),
+                Some(7.25),
+                None,
+                Some(-0.0),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(-1.0),
+                Some(f32::NAN),
+                None,
+                Some(1.0),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(-1.0),
+                Some(f64::NAN),
+                None,
+                Some(1.0),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(1.0),
+                Some(f32::INFINITY),
+                None,
+                Some(2.0),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                Some(f64::INFINITY),
+                None,
+                Some(2.0),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(f32::NEG_INFINITY),
+                Some(1.0),
+                None,
+                Some(2.0),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NEG_INFINITY),
+                Some(1.0),
+                None,
+                Some(2.0),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(-0.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![
+                    Some(-decimal_limit),
+                    Some(decimal_limit),
+                    None,
+                    Some(0),
+                ])
+                .with_precision_and_scale(38, 18)?,
+            ),
+            Arc::new(Date32Array::from(vec![
+                Some(-719_162),
+                Some(2_932_896),
+                None,
+                Some(0),
+            ])),
+            Arc::new(
+                TimestampMicrosecondArray::from(timestamp_values.clone()).with_timezone("UTC"),
+            ),
+            Arc::new(TimestampMicrosecondArray::from(timestamp_values)),
+            Arc::new(StringArray::from(vec![
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+                None,
+                Some("m"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("漢漢漢漢漢漢漢漢漢漢漢"),
+                Some("語語語語語語語語語語語"),
+                None,
+                Some("界"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"),
+                Some("🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"),
+                None,
+                Some("😁"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"),
+                Some("🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"),
+                None,
+                Some("😁"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("\0\"\\\n"),
+                Some("z\t\r"),
+                None,
+                Some("middle"),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{10ffff}a"),
+                Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\u{10ffff}b"),
+                None,
+                Some("m"),
+            ])),
+            new_null_array(&ArrowDataType::Int64, 4),
+            Arc::new(BooleanArray::from(vec![
+                Some(false),
+                Some(true),
+                None,
+                Some(false),
+            ])),
+            Arc::new(BinaryArray::from(vec![
+                Some(&[0x00][..]),
+                Some(&[0xff][..]),
+                None,
+                Some(&[0xab, 0xcd][..]),
+            ])),
+            new_null_array(arrow_schema.field_with_name("void")?.data_type(), 4),
+            Arc::new(Int32Array::from(vec![Some(-14), Some(14), None, Some(0)])),
+            Arc::new(Int64Array::from(vec![
+                Some(-86_400_000_001),
+                Some(86_400_000_001),
+                None,
+                Some(0),
+            ])),
+            Arc::new(array),
+            Arc::new(map),
+            Arc::new(nested),
+        ],
+    )?;
+
+    write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+    assert_eq!(add_actions.len(), 1);
+    let stats_json = add_actions[0]
+        .get("stats")
+        .and_then(|stats| stats.as_str())
+        .expect("add action should have stats");
+    println!("KERNEL_STATS_JSON={stats_json}");
+    let _: serde_json::Value = serde_json::from_str(stats_json)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn print_kernel_temporal_physical_extrema_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "date": DATE,
+        nullable "timestamp": TIMESTAMP,
+        nullable "timestamp_ntz": TIMESTAMP_NTZ,
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.dataSkippingNumIndexedCols", "-1")],
+    )?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![
+            Arc::new(Date32Array::from(vec![i32::MIN, i32::MAX])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![i64::MIN, i64::MAX]).with_timezone("UTC"),
+            ),
+            Arc::new(TimestampMicrosecondArray::from(vec![i64::MIN, i64::MAX])),
+        ],
+    )?;
+
+    match write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await {
+        Ok(_) => {
+            let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+            let stats_json = add_actions[0]
+                .get("stats")
+                .and_then(|stats| stats.as_str())
+                .expect("add action should have stats");
+            println!("KERNEL_TEMPORAL_EXTREMA_STATS_JSON={stats_json}");
+        }
+        Err(error) => println!("KERNEL_TEMPORAL_EXTREMA_ERROR={error:#}"),
+    }
+
+    Ok(())
+}
 
 /// Builds a RecordBatch with schema (id: long, tags: array<string>, props: map<string, long>,
 /// v: variant). Each row gets one entry in tags, one entry in props, and a simple integer variant.
