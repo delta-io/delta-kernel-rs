@@ -1144,21 +1144,37 @@ mod tests {
         name: Option<String>,
     }
 
-    static FRAME_EVENTS: Mutex<Vec<CapturedFrameEvent>> = Mutex::new(vec![]);
+    // The global subscriber receives spans from every test thread, so its callback cannot share
+    // storage with tests that install an isolated thread-local dispatcher.
+    static LOCAL_FRAME_EVENTS: Mutex<Vec<CapturedFrameEvent>> = Mutex::new(vec![]);
+    static GLOBAL_FRAME_EVENTS: Mutex<Vec<CapturedFrameEvent>> = Mutex::new(vec![]);
 
-    extern "C" fn capture_frame_event(event: FrameEvent) {
+    fn record_frame_event(events: &Mutex<Vec<CapturedFrameEvent>>, event: FrameEvent) {
         let (is_open, span_id, name) = match event {
             FrameEvent::OPEN(FrameOpen { span_id, name }) => {
-                let name: &str = unsafe { TryFromStringSlice::try_from_slice(&name).unwrap() };
+                let name: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+                let Ok(name) = name else {
+                    return;
+                };
                 (true, span_id, Some(name.to_string()))
             }
             FrameEvent::CLOSE(FrameClose { span_id }) => (false, span_id, None),
         };
-        FRAME_EVENTS.lock().unwrap().push(CapturedFrameEvent {
-            is_open,
-            span_id,
-            name,
-        });
+        if let Ok(mut events) = events.lock() {
+            events.push(CapturedFrameEvent {
+                is_open,
+                span_id,
+                name,
+            });
+        }
+    }
+
+    extern "C" fn capture_local_frame_event(event: FrameEvent) {
+        record_frame_event(&LOCAL_FRAME_EVENTS, event);
+    }
+
+    extern "C" fn capture_global_frame_event(event: FrameEvent) {
+        record_frame_event(&GLOBAL_FRAME_EVENTS, event);
     }
 
     fn emit_reloadable_frame_span() {
@@ -1169,8 +1185,8 @@ mod tests {
     #[test]
     fn frame_reporting_delivers_nested_lifecycle_events_synchronously() {
         let _lock = TEST_LOCK.lock().unwrap();
-        FRAME_EVENTS.lock().unwrap().clear();
-        let dispatch = create_frame_dispatch(capture_frame_event);
+        LOCAL_FRAME_EVENTS.lock().unwrap().clear();
+        let dispatch = create_frame_dispatch(capture_local_frame_event);
 
         tracing_core::dispatcher::with_default(&dispatch, || {
             let ignored = tracing::info_span!("ignored");
@@ -1178,18 +1194,18 @@ mod tests {
 
             let outer = tracing::info_span!("outer", enable_call_frame = Empty);
             let outer_guard = outer.enter();
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 1);
+            assert_eq!(LOCAL_FRAME_EVENTS.lock().unwrap().len(), 1);
 
             let inner = tracing::info_span!("inner", enable_call_frame = Empty);
             let inner_guard = inner.enter();
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 2);
+            assert_eq!(LOCAL_FRAME_EVENTS.lock().unwrap().len(), 2);
             drop(inner_guard);
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 3);
+            assert_eq!(LOCAL_FRAME_EVENTS.lock().unwrap().len(), 3);
             drop(outer_guard);
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 4);
+            assert_eq!(LOCAL_FRAME_EVENTS.lock().unwrap().len(), 4);
         });
 
-        let events = FRAME_EVENTS.lock().unwrap();
+        let events = LOCAL_FRAME_EVENTS.lock().unwrap();
         assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("outer"));
         assert!(events[1].is_open);
@@ -1205,28 +1221,34 @@ mod tests {
     #[test]
     fn frame_reporter_callback_can_only_be_registered_once() {
         let _lock = TEST_LOCK.lock().unwrap();
-        FRAME_EVENTS.lock().unwrap().clear();
-        assert!(unsafe { enable_frame_reporting(capture_frame_event) });
-        assert!(!unsafe { enable_frame_reporting(capture_frame_event) });
+        GLOBAL_FRAME_EVENTS.lock().unwrap().clear();
+        assert!(unsafe { enable_frame_reporting(capture_global_frame_event) });
+        assert!(!unsafe { enable_frame_reporting(capture_global_frame_event) });
+
+        let unrelated = tracing::info_span!("unrelated", enable_call_frame = Empty);
+        let unrelated_guard = unrelated.enter();
+        drop(unrelated_guard);
 
         let captured = tracing::info_span!("captured", enable_call_frame = Empty);
         let captured_guard = captured.enter();
         drop(captured_guard);
 
-        let events = FRAME_EVENTS.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert!(events[0].is_open);
-        assert_eq!(events[0].name.as_deref(), Some("captured"));
-        assert!(!events[1].is_open);
-        assert_eq!(events[1].span_id, events[0].span_id);
+        let events = GLOBAL_FRAME_EVENTS.lock().unwrap();
+        let open = events
+            .iter()
+            .find(|event| event.is_open && event.name.as_deref() == Some("captured"))
+            .expect("captured frame should be opened");
+        assert!(events
+            .iter()
+            .any(|event| !event.is_open && event.span_id == open.span_id));
     }
 
     #[test]
     fn frame_filter_enables_existing_trace_callsites_when_reloaded() {
         let _lock = TEST_LOCK.lock().unwrap();
-        FRAME_EVENTS.lock().unwrap().clear();
+        LOCAL_FRAME_EVENTS.lock().unwrap().clear();
         let reporter = Arc::new(FfiFrameReporter {
-            callback: Arc::new(OnceLock::from(capture_frame_event as FrameEventFn)),
+            callback: Arc::new(OnceLock::from(capture_local_frame_event as FrameEventFn)),
         });
         let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::OFF);
         let layer = FrameReporterLayer::new(reporter).with_filter(filter_layer);
@@ -1234,13 +1256,13 @@ mod tests {
 
         tracing_core::dispatcher::with_default(&dispatch, || {
             emit_reloadable_frame_span();
-            assert!(FRAME_EVENTS.lock().unwrap().is_empty());
+            assert!(LOCAL_FRAME_EVENTS.lock().unwrap().is_empty());
 
             filter_handle.reload(LevelFilter::TRACE).unwrap();
             emit_reloadable_frame_span();
         });
 
-        let events = FRAME_EVENTS.lock().unwrap();
+        let events = LOCAL_FRAME_EVENTS.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("reloadable"));
