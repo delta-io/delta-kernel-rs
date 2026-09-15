@@ -22,8 +22,8 @@ use crate::schema::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType, DataType};
 use crate::table_features::{
-    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, LEGACY_READER_FEATURES, MAX_VALID_READER_VERSION,
+    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -665,6 +665,18 @@ impl Protocol {
 
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
+
+        // A future reader protocol may define different feature-list rules. Preserve the action
+        // so the read-capability check can report the unsupported version before interpreting
+        // fields whose semantics this kernel does not know.
+        if min_reader_version > MAX_VALID_READER_VERSION {
+            return Ok(Self {
+                min_reader_version,
+                min_writer_version,
+                reader_features,
+                writer_features,
+            });
+        }
 
         // The protocol states that Reader features may be present if and only if the
         // min_reader_version is 3
@@ -2096,6 +2108,20 @@ mod tests {
         let p = Protocol::try_new_legacy(1, 1).unwrap();
         assert_eq!(p.min_reader_version(), 1);
         assert_eq!(p.min_writer_version(), 1);
+    }
+
+    #[test]
+    fn defer_feature_validation_for_unsupported_reader_version() {
+        let protocol = Protocol::try_new(
+            i32::MAX,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(TableFeature::EMPTY_LIST),
+            Some(TableFeature::EMPTY_LIST),
+        )
+        .unwrap();
+
+        assert_eq!(protocol.min_reader_version(), i32::MAX);
+        assert_eq!(protocol.reader_features(), Some([].as_slice()));
     }
 
     #[test]

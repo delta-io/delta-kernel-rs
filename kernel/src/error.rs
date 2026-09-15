@@ -2,6 +2,7 @@
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;
+use std::fmt;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
@@ -90,6 +91,24 @@ pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + 
 /// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
 /// reference borrowed data.
 pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
+
+/// Whether an unsupported Delta protocol version applies to reads or writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolVersionType {
+    /// The table requires a newer reader protocol.
+    Reader,
+    /// The table requires a newer writer protocol.
+    Writer,
+}
+
+impl fmt::Display for ProtocolVersionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reader => f.write_str("reader"),
+            Self::Writer => f.write_str("writer"),
+        }
+    }
+}
 
 /// An error validating connector-provided state for snapshot construction.
 #[derive(Debug, thiserror::Error)]
@@ -342,6 +361,19 @@ pub enum Error {
     /// Invalid protocol action was read from the log
     #[error("Invalid protocol action in the delta log: {0}")]
     InvalidProtocol(String),
+
+    /// The table requires a protocol version newer than this kernel supports.
+    #[error(
+        "Unsupported Delta protocol {version_type} version: minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version}"
+    )]
+    UnsupportedProtocolVersion {
+        /// Whether the unsupported version is the reader or writer version.
+        version_type: ProtocolVersionType,
+        /// The table's minimum reader version.
+        min_reader_version: i32,
+        /// The table's minimum writer version.
+        min_writer_version: i32,
+    },
 
     /// Neither metadata nor protocol could be found in the delta log
     #[error("No table metadata or protocol found in delta log.")]

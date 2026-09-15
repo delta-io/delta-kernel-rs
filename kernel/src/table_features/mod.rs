@@ -27,6 +27,7 @@ pub(crate) use timestamp_ntz::{
 };
 
 use crate::actions::Protocol;
+use crate::error::ProtocolVersionType;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
@@ -903,10 +904,11 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()>
         ))
     );
     if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-        return Err(Error::unsupported(format!(
-            "Unsupported minimum reader version {}",
-            protocol.min_reader_version()
-        )));
+        return Err(Error::UnsupportedProtocolVersion {
+            version_type: ProtocolVersionType::Reader,
+            min_reader_version: protocol.min_reader_version(),
+            min_writer_version: protocol.min_writer_version(),
+        });
     }
     Ok(())
 }
@@ -979,6 +981,7 @@ mod tests {
         Ok,
         InvalidProtocol,
         Unsupported,
+        UnsupportedProtocol,
     }
 
     #[rstest]
@@ -988,7 +991,7 @@ mod tests {
     )]
     #[case::reader_version_above_maximum(
         Protocol::new_unchecked(99, 1, None, None),
-        ExpectRead::Unsupported
+        ExpectRead::UnsupportedProtocol
     )]
     #[case::legacy_reader_v1(Protocol::try_new_legacy(1, 1).unwrap(), ExpectRead::Ok)]
     #[case::legacy_reader_v2(Protocol::try_new_legacy(2, 5).unwrap(), ExpectRead::Ok)]
@@ -1055,6 +1058,10 @@ mod tests {
             ExpectRead::Unsupported => assert!(
                 matches!(result, Err(Error::Unsupported(_))),
                 "expected Unsupported, got: {result:?}"
+            ),
+            ExpectRead::UnsupportedProtocol => assert!(
+                matches!(result, Err(Error::UnsupportedProtocolVersion { .. })),
+                "expected UnsupportedProtocolVersion, got: {result:?}"
             ),
         }
     }

@@ -17,6 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
+use crate::error::ProtocolVersionType;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
@@ -748,10 +749,11 @@ impl TableConfiguration {
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(Error::unsupported(format!(
-                "Unsupported minimum writer version {}",
-                self.protocol.min_writer_version()
-            )));
+            return Err(Error::UnsupportedProtocolVersion {
+                version_type: ProtocolVersionType::Writer,
+                min_reader_version: self.protocol.min_reader_version(),
+                min_writer_version: self.protocol.min_writer_version(),
+            });
         }
 
         // Check all enabled writer features have kernel support
@@ -939,6 +941,7 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
+    use crate::error::ProtocolVersionType;
     use crate::schema::{
         column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
     };
@@ -1091,7 +1094,11 @@ mod test {
                     .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_protocol(MockProtocolBuilder::new().with_versions(1, 8).build())
                     .build(),
-                Err(Error::unsupported("Unsupported minimum writer version 8")),
+                Err(Error::UnsupportedProtocolVersion {
+                    version_type: ProtocolVersionType::Writer,
+                    min_reader_version: 1,
+                    min_writer_version: 8,
+                }),
             ),
             // Column mapping is now supported for writes.
             (
