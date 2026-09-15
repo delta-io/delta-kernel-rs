@@ -248,14 +248,13 @@ impl Transaction {
         Ok(self)
     }
 
-    /// Stages `file` to be committed as the table's root manifest. Errors if `file` is not located
-    /// under the table root.
+    /// Stages `file` to be committed as the table's root manifest.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
         let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-            Error::internal_error("read_snapshot() called on create-table transaction")
+            Error::internal_error("existing-table transaction unexpectedly has no snapshot")
         })?;
-        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot)?);
+        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
         Ok(self)
     }
 

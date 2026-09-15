@@ -309,7 +309,7 @@ fn with_row_tracking_high_water_mark_impl(
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
 }
 
-/// Commits `file` as this transaction's root manifest.
+/// Stages `file` to be committed as this transaction's root manifest.
 ///
 /// # Safety
 ///

@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::LOG_CHECKPOINT_SCHEMA;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
@@ -523,8 +521,9 @@ impl<S> Transaction<S> {
         let checkpoint_action: Option<Box<dyn EngineData>> = None;
 
         // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
-        // -> removes For existing table: CommitInfo -> adds -> txns -> domain_metadata ->
+        // For create-table: CommitInfo -> Protocol -> Metadata -> checkpoint -> adds -> txns ->
+        // domain_metadata -> removes
+        // For existing table: CommitInfo -> checkpoint -> adds -> txns -> domain_metadata ->
         // removes
         let actions = iter::once(commit_info_action)
             .chain(protocol_action.map(Ok))
@@ -871,7 +870,7 @@ impl<S> Transaction<S> {
                     dm_changes,
                     &self.set_transactions,
                 )?;
-                action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), engine)
+                action.into_engine_data(engine)
             })
             .transpose()
     }
@@ -3151,7 +3150,7 @@ mod tests {
             last_modified: 0,
             size: 1024,
         };
-        RootManifestFile::new(file, read_snapshot).unwrap()
+        RootManifestFile::new(file, read_snapshot)
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]

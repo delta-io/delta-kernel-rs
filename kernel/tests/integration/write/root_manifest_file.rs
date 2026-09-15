@@ -51,11 +51,8 @@ async fn setup_adaptive_metadata_table(
     )
     .await?;
 
-    // Return the snapshot's canonicalized root (macOS resolves `/var` -> `/private/var`) so
-    // manifest paths match the locality check.
-    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-    let table_root = snapshot.table_root().clone();
-    Ok((engine, temp_dir, table_root, snapshot))
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    Ok((engine, temp_dir, table_url, snapshot))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -105,22 +102,6 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         .iter()
         .any(|f| f["name"] == json!("id") && f["type"] == json!("integer")));
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_with_root_manifest_file_rejects_a_file_outside_the_table_root(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, _temp_dir, _table_url, snapshot) =
-        setup_adaptive_metadata_table("root_manifest_file_locality").await?;
-
-    let file = FileMeta {
-        location: Url::parse("memory:///elsewhere/root.parquet")?,
-        last_modified: 0,
-        size: 1024,
-    };
-    let result = begin_transaction(snapshot, &engine)?.with_root_manifest_file(file);
-    assert!(result.is_err());
     Ok(())
 }
 

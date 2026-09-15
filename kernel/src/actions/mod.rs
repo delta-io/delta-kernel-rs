@@ -27,6 +27,8 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::{create_row, Engine};
 use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1325,7 +1327,6 @@ impl CheckpointAction {
     /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
     /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
     /// hence a fallible method rather than an infallible `From`.
-    #[allow(unused)]
     fn try_into_scalar(self) -> DeltaResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
@@ -1450,8 +1451,8 @@ impl ContentRoot {
 impl CheckpointAction {
     /// Builds a checkpoint action at `version` with all `transactions` and `domain_metadata`
     /// inlined and no sidecars.
-    // TODO: spill transactions and domain metadata into sidecars once the adaptiveMetadata sidecar
-    // format is defined.
+    // TODO(#2866): spill transactions and domain metadata into sidecars once the adaptiveMetadata
+    // sidecar format is defined.
     #[internal_api]
     pub(crate) fn new(
         version: i64,
@@ -1471,6 +1472,16 @@ impl CheckpointAction {
             txn_sidecars: vec![],
             domain_metadata_sidecars: vec![],
         }
+    }
+
+    /// Serialize this checkpoint action into a single-row `EngineData`.
+    #[internal_api]
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
+        create_row(
+            engine,
+            LOG_CHECKPOINT_SCHEMA.clone(),
+            self.try_into_scalar()?,
+        )
     }
 
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
