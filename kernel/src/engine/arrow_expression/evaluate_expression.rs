@@ -2388,10 +2388,17 @@ mod tests {
         "Decimal128(10, 2)",
         "12345678.90",
     )]
+    #[case::decimal_scale_padding(
+        "999.9",
+        DataType::decimal(5, 2).unwrap(),
+        "Decimal128(5, 2)",
+        "999.90",
+    )]
     #[case::boolean("true", DataType::BOOLEAN, "Boolean", "true")]
     #[case::string(r#""delta\u03bb""#, DataType::STRING, "Utf8", "deltaλ")]
     #[case::empty_string(r#""""#, DataType::STRING, "Utf8", "")]
     #[case::date(r#""2024-02-29""#, DataType::DATE, "Date32", "2024-02-29")]
+    #[case::date_before_1582(r#""1200-06-15""#, DataType::DATE, "Date32", "1200-06-15")]
     #[case::timestamp_with_offset(
         r#""2020-01-02T03:04:05.123456789+02:30""#,
         DataType::TIMESTAMP,
@@ -2481,6 +2488,30 @@ mod tests {
             "+-------+\n",
             "| 0102  |\n",
             "+-------+",
+        ),
+    )]
+    #[ignore = "pending ParseJson semantics implementation"]
+    #[case::two_padding_characters_base64(
+        vec![Some(r#"{"value":"AQ=="}"#)],
+        schema_ref! { not_null "value": BINARY },
+        concat!(
+            "+-------+\n",
+            "| value |\n",
+            "+-------+\n",
+            "| 01    |\n",
+            "+-------+",
+        ),
+    )]
+    #[ignore = "pending ParseJson semantics implementation"]
+    #[case::no_padding_base64(
+        vec![Some(r#"{"value":"AQID"}"#)],
+        schema_ref! { not_null "value": BINARY },
+        concat!(
+            "+--------+\n",
+            "| value  |\n",
+            "+--------+\n",
+            "| 010203 |\n",
+            "+--------+",
         ),
     )]
     #[case::empty_binary(

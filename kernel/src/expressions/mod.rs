@@ -373,7 +373,7 @@ pub struct VariadicExpression {
 /// - JSON `null` becomes SQL null;
 /// - the JSON string `""` becomes an empty SQL string for `STRING` and an empty byte sequence for
 ///   `BINARY`;
-/// - for every other target, `""` has the wrong JSON token kind and is undefined.
+/// - for every other target, `""` is a decoding error and its behavior is undefined.
 ///
 /// After decoding, the result must be checked against the nullability declared by `output_schema`.
 /// A null in a non-nullable struct field, array element, or map value is an evaluation error. A
@@ -601,8 +601,8 @@ pub struct VariadicExpression {
 /// These function names are illustrative. An engine may use any equivalent JSON parser, Base64
 /// decoder, timestamp parser, and array or map conversion.
 ///
-/// Missing fields and JSON null follow the null rules above. Inputs not listed in the table,
-/// including the wrong JSON token type, have undefined behavior.
+/// Missing fields and JSON null follow the null rules above. Inputs not listed in the type table
+/// below, including the wrong JSON token type, have undefined behavior.
 ///
 /// # Type rules
 ///
@@ -621,10 +621,10 @@ pub struct VariadicExpression {
 /// | `BOOLEAN` | `true` or `false` | return SQL `BOOLEAN` | `"true"`, `0`, or `1` |
 /// | `STRING` | string token | decode the JSON string; preserve `""` | a non-string |
 /// | `BINARY` | padded RFC 4648 Base64 string | decode to bytes; `""` becomes empty bytes | bad alphabet, padding, whitespace, or non-zero unused bits |
-/// | `DATE` | string in exact `YYYY-MM-DD` grammar | parse as SQL `DATE` | an invalid date or alternate spelling |
+/// | `DATE` | string using the `date` grammar and year range below | parse as SQL `DATE` | an invalid date or alternate spelling |
 /// | `TIMESTAMP` | string in the grammar below | apply its offset, or use UTC when absent; truncate to microseconds | invalid grammar, leap second, bad offset, or out-of-range instant |
 /// | `TIMESTAMP_NTZ` | offset-free string in the grammar below | parse without a timezone; truncate to microseconds | an offset, invalid grammar, or out-of-range value |
-/// | `VOID` | none | return SQL null | every non-null JSON value |
+/// | `VOID` | no non-null input | return SQL null | every non-null JSON value |
 /// | `STRUCT` | object token | recursively parse requested members as a SQL row | a non-object |
 /// | `ARRAY<T>` | array token | recursively parse each element in order | a non-array |
 /// | `MAP<STRING,T>` | object token | use member names as keys and recursively parse each value | a non-object |
@@ -692,8 +692,8 @@ pub struct VariadicExpression {
 ///   array;
 /// - an object anywhere in the document has duplicate keys, including in an ignored extra field;
 /// - a decoded string is not valid Unicode or contains an unpaired surrogate escape;
-/// - a requested value has the wrong JSON token kind, including `""` for a target other than
-///   `STRING` or `BINARY`;
+/// - a requested value does not have the representation required by the type table, including `""`
+///   for a target other than `STRING` or `BINARY`;
 /// - an integer is not in lexical integer form or is outside the target range;
 /// - a finite float, decimal, date, timestamp, or normalized UTC instant is outside its target
 ///   range, or a decimal would require rounding to the target scale;
@@ -704,10 +704,9 @@ pub struct VariadicExpression {
 /// - a `TIMESTAMP_NTZ` contains an offset;
 /// - any other value is outside the required representation for its target type.
 ///
-/// Here "undefined" is a cross-engine portability boundary, not Rust memory-model undefined
-/// behavior. For such a row, an implementation may return SQL null, return a partial result,
-/// return any value representable by the declared output type, or report an evaluation error at
-/// row, batch, or query scope.
+/// These are decoding errors whose behavior is undefined across engines. An implementation may
+/// fail evaluation or return any value representable by the declared output type, including SQL
+/// null or a partial result, with or without a warning.
 ///
 /// # Invalid expressions and schemas
 ///
