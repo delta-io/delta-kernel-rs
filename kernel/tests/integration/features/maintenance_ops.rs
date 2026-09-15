@@ -188,7 +188,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
     }))
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_crc_writes_reject_unsupported_table_features(
+async fn snapshot_load_and_maintenance_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
@@ -230,7 +230,12 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     .join("\n");
     add_commit(table_url.as_str(), &store, 0, commit).await?;
 
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot_result = Snapshot::builder_for(table_url).build(engine.as_ref());
+    if reader_features.contains(&"futureFeature") {
+        assert_result_error_with_message(snapshot_result, "futureFeature");
+        return Ok(());
+    }
+    let snapshot = snapshot_result?;
     let checkpoint_result = snapshot
         .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());
