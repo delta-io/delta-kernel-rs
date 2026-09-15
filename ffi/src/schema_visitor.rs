@@ -903,6 +903,13 @@ mod tests {
         false
     }
 
+    fn rejected_engine_metadata() -> EngineMetadata {
+        EngineMetadata {
+            metadata: std::ptr::null_mut(),
+            visitor: reject_metadata,
+        }
+    }
+
     fn test_engine_metadata(metadata: &mut TestMetadata) -> EngineMetadata {
         EngineMetadata {
             metadata: std::ptr::from_mut(metadata).cast(),
@@ -1262,94 +1269,84 @@ mod tests {
     #[test]
     fn complex_fields_keep_parent_and_child_metadata_isolated() {
         let mut state = KernelSchemaVisitorState::default();
-        let child = visit_field!(string, state, "child", true; numbered_test_metadata(1));
-        let parent = visit_struct_field!(
+
+        let schema_id = visit_struct_field!(
             state,
-            "parent",
+            "schema",
             false,
-            [child];
-            numbered_test_metadata(2)
+            visit_struct_field!(
+                state,
+                "parent",
+                false,
+                [visit_field!(
+                    string,
+                    state,
+                    "child",
+                    true;
+                    numbered_test_metadata(1)
+                )];
+                numbered_test_metadata(2)
+            ),
+            visit_field!(
+                array,
+                state,
+                "array",
+                visit_field!(string, state, "element", true),
+                true;
+                numbered_test_metadata(3)
+            ),
+            visit_field!(
+                map,
+                state,
+                "map",
+                visit_field!(string, state, "key", false),
+                visit_field!(long, state, "value", true),
+                true;
+                numbered_test_metadata(4)
+            ),
+            visit_field!(
+                variant,
+                state,
+                "variant",
+                visit_struct_field!(
+                    state,
+                    "variant_struct",
+                    false,
+                    visit_field!(string, state, "value", true),
+                ),
+                true;
+                numbered_test_metadata(5)
+            ),
         );
-        let parent = unwrap_field(&mut state, parent).unwrap();
-        assert_eq!(
-            parent.metadata().get("number"),
-            Some(&MetadataValue::Number(2))
-        );
-        let DataType::Struct(children) = parent.data_type() else {
+
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
+        let fields: Vec<_> = schema.fields().collect();
+        assert_eq!(fields.len(), 4);
+
+        let DataType::Struct(children) = fields[0].data_type() else {
             panic!("expected struct")
         };
+        let child = children.fields().next().unwrap();
         assert_eq!(
-            children.fields().next().unwrap().metadata().get("number"),
+            child.metadata().get("number"),
             Some(&MetadataValue::Number(1))
         );
 
-        let element = visit_field!(string, state, "element", true);
-        let array = visit_field!(
-            array,
-            state,
-            "array",
-            element,
-            true;
-            numbered_test_metadata(3)
-        );
-        assert_eq!(
-            unwrap_field(&mut state, array)
-                .unwrap()
-                .metadata()
-                .get("number"),
-            Some(&MetadataValue::Number(3))
-        );
-
-        let key = visit_field!(string, state, "key", false);
-        let value = visit_field!(long, state, "value", true);
-        let map = visit_field!(
-            map,
-            state,
-            "map",
-            key,
-            value,
-            true;
-            numbered_test_metadata(4)
-        );
-        assert_eq!(
-            unwrap_field(&mut state, map)
-                .unwrap()
-                .metadata()
-                .get("number"),
-            Some(&MetadataValue::Number(4))
-        );
-
-        let variant_struct = visit_struct_field!(
-            state,
-            "variant_struct",
-            false,
-            visit_field!(string, state, "value", true),
-        );
-        let variant = visit_field!(
-            variant,
-            state,
-            "variant",
-            variant_struct,
-            true;
-            numbered_test_metadata(5)
-        );
-        assert_eq!(
-            unwrap_field(&mut state, variant)
-                .unwrap()
-                .metadata()
-                .get("number"),
-            Some(&MetadataValue::Number(5))
-        );
+        let expected_fields = [("parent", 2), ("array", 3), ("map", 4), ("variant", 5)];
+        for (field, (name, expected)) in fields.iter().zip(expected_fields) {
+            assert_eq!(field.name(), name);
+            assert_eq!(
+                field.metadata().get("number"),
+                Some(&MetadataValue::Number(expected))
+            );
+        }
     }
 
     #[test]
     fn rejected_complex_field_metadata_preserves_child_ids_for_retry() {
         let mut state = KernelSchemaVisitorState::default();
+
         let child = visit_field!(string, state, "child", true);
-        let mut rejected_metadata = EngineMetadata {
-            metadata: std::ptr::null_mut(),
-            visitor: reject_metadata,
-        };
         let result = unsafe {
             visit_field_struct(
                 &mut state,
@@ -1357,41 +1354,29 @@ mod tests {
                 [child].as_ptr(),
                 1,
                 false,
-                &mut rejected_metadata,
+                &mut rejected_engine_metadata(),
                 allocate_err,
             )
         };
         assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
         let parent = visit_struct_field!(state, "parent", false, child);
-        assert!(unwrap_field(&mut state, parent).is_some());
 
-        let mut state = KernelSchemaVisitorState::default();
         let element = visit_field!(string, state, "element", true);
-        let mut rejected_metadata = EngineMetadata {
-            metadata: std::ptr::null_mut(),
-            visitor: reject_metadata,
-        };
         let result = unsafe {
             visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("array"),
                 element,
                 false,
-                &mut rejected_metadata,
+                &mut rejected_engine_metadata(),
                 allocate_err,
             )
         };
         assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
         let array = visit_array_field!(state, "array", false, element);
-        assert!(unwrap_field(&mut state, array).is_some());
 
-        let mut state = KernelSchemaVisitorState::default();
         let key = visit_field!(string, state, "key", false);
         let value = visit_field!(long, state, "value", true);
-        let mut rejected_metadata = EngineMetadata {
-            metadata: std::ptr::null_mut(),
-            visitor: reject_metadata,
-        };
         let result = unsafe {
             visit_field_map(
                 &mut state,
@@ -1399,44 +1384,34 @@ mod tests {
                 key,
                 value,
                 false,
-                &mut rejected_metadata,
+                &mut rejected_engine_metadata(),
                 allocate_err,
             )
         };
         assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
         let map = visit_map_field!(state, "map", false, key, value);
-        assert!(unwrap_field(&mut state, map).is_some());
 
-        let mut state = KernelSchemaVisitorState::default();
         let child = visit_field!(binary, state, "value", false);
         let variant_struct = visit_struct_field!(state, "variant_struct", false, child);
-        let mut rejected_metadata = EngineMetadata {
-            metadata: std::ptr::null_mut(),
-            visitor: reject_metadata,
-        };
         let result = unsafe {
             visit_field_variant(
                 &mut state,
                 KernelStringSlice::new_unsafe("variant"),
                 variant_struct,
                 false,
-                &mut rejected_metadata,
+                &mut rejected_engine_metadata(),
                 allocate_err,
             )
         };
         assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
-        let mut empty_metadata = empty_engine_metadata();
-        let variant = unsafe {
-            ok_or_panic(visit_field_variant(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant"),
-                variant_struct,
-                false,
-                &mut empty_metadata,
-                allocate_err,
-            ))
-        };
-        assert!(unwrap_field(&mut state, variant).is_some());
+        let variant = visit_field!(variant, state, "variant", variant_struct, false);
+
+        let schema_id = visit_struct_field!(state, "schema", false, parent, array, map, variant);
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
+        assert_eq!(
+            schema.fields().map(StructField::name).collect::<Vec<_>>(),
+            ["parent", "array", "map", "variant"]
+        );
     }
 
     fn assert_array(field: &StructField, element_type: DataType, contains_null: bool) {
