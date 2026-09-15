@@ -23,7 +23,7 @@ use crate::{
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
 #[cfg(test)]
-extern "C" fn visit_empty_metadata(
+extern "C" fn visit_default_metadata(
     _metadata: *mut c_void,
     _state: &mut KernelMetadataVisitorState,
 ) -> bool {
@@ -31,10 +31,10 @@ extern "C" fn visit_empty_metadata(
 }
 
 #[cfg(test)]
-pub(crate) fn empty_engine_metadata() -> EngineMetadata {
+pub(crate) fn default_engine_metadata() -> EngineMetadata {
     EngineMetadata {
         metadata: std::ptr::null_mut(),
-        visitor: visit_empty_metadata,
+        visitor: visit_default_metadata,
     }
 }
 

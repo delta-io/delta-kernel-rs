@@ -54,7 +54,7 @@ struct schema_spec {
   size_t field_count;
 };
 
-static bool visit_empty_metadata(void* metadata, KernelMetadataVisitorState* state) {
+static bool visit_default_metadata(void* metadata, KernelMetadataVisitorState* state) {
   (void)metadata;
   (void)state;
   return true;
@@ -62,7 +62,7 @@ static bool visit_empty_metadata(void* metadata, KernelMetadataVisitorState* sta
 
 static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
   const struct schema_spec* spec = data;
-  EngineMetadata metadata = { NULL, visit_empty_metadata };
+  EngineMetadata metadata = { NULL, visit_default_metadata };
   uintptr_t* child_ids = malloc(spec->field_count * sizeof(uintptr_t));
   for (size_t i = 0; i < spec->field_count; i++) {
     const struct field_spec* f = &spec->fields[i];
