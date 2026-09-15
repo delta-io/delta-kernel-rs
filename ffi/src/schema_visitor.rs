@@ -910,6 +910,13 @@ mod tests {
         }
     }
 
+    fn numbered_test_metadata(number: i64) -> TestMetadata {
+        TestMetadata {
+            number,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn field_metadata_preserves_typed_values_and_callback_context() {
         let mut state = KernelSchemaVisitorState::default();
@@ -1115,166 +1122,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn complex_fields_keep_parent_and_child_metadata_isolated() {
-        let mut state = KernelSchemaVisitorState::default();
-        let mut child_metadata = TestMetadata {
-            number: 1,
-            ..Default::default()
-        };
-        let child = unsafe {
-            ok_or_panic(visit_field_string(
-                &mut state,
-                KernelStringSlice::new_unsafe("child"),
-                true,
-                &mut test_engine_metadata(&mut child_metadata),
-                allocate_err,
-            ))
-        };
-        let mut parent_metadata = TestMetadata {
-            number: 2,
-            ..Default::default()
-        };
-        let parent = unsafe {
-            ok_or_panic(visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("parent"),
-                [child].as_ptr(),
-                1,
-                false,
-                &mut test_engine_metadata(&mut parent_metadata),
-                allocate_err,
-            ))
-        };
-        let parent = unwrap_field(&mut state, parent).unwrap();
-        assert_eq!(
-            parent.metadata().get("number"),
-            Some(&MetadataValue::Number(2))
-        );
-        let DataType::Struct(children) = parent.data_type() else {
-            panic!("expected struct")
-        };
-        let child = children.fields().next().unwrap();
-        assert_eq!(
-            child.metadata().get("number"),
-            Some(&MetadataValue::Number(1))
-        );
-
-        let array_child = unsafe {
-            ok_or_panic(visit_field_string(
-                &mut state,
-                KernelStringSlice::new_unsafe("element"),
-                true,
-                &mut empty_engine_metadata(),
-                allocate_err,
-            ))
-        };
-        let mut array_metadata = TestMetadata {
-            number: 3,
-            ..Default::default()
-        };
-        let array = unsafe {
-            ok_or_panic(visit_field_array(
-                &mut state,
-                KernelStringSlice::new_unsafe("array"),
-                array_child,
-                true,
-                &mut test_engine_metadata(&mut array_metadata),
-                allocate_err,
-            ))
-        };
-        assert_eq!(
-            unwrap_field(&mut state, array)
-                .unwrap()
-                .metadata()
-                .get("number"),
-            Some(&MetadataValue::Number(3))
-        );
-
-        let key = unsafe {
-            ok_or_panic(visit_field_string(
-                &mut state,
-                KernelStringSlice::new_unsafe("key"),
-                false,
-                &mut empty_engine_metadata(),
-                allocate_err,
-            ))
-        };
-        let value = unsafe {
-            ok_or_panic(visit_field_long(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                true,
-                &mut empty_engine_metadata(),
-                allocate_err,
-            ))
-        };
-        let mut map_metadata = TestMetadata {
-            number: 4,
-            ..Default::default()
-        };
-        let map = unsafe {
-            ok_or_panic(visit_field_map(
-                &mut state,
-                KernelStringSlice::new_unsafe("map"),
-                key,
-                value,
-                true,
-                &mut test_engine_metadata(&mut map_metadata),
-                allocate_err,
-            ))
-        };
-        assert_eq!(
-            unwrap_field(&mut state, map)
-                .unwrap()
-                .metadata()
-                .get("number"),
-            Some(&MetadataValue::Number(4))
-        );
-
-        let variant_child = unsafe {
-            ok_or_panic(visit_field_string(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                true,
-                &mut empty_engine_metadata(),
-                allocate_err,
-            ))
-        };
-        let variant_struct = unsafe {
-            ok_or_panic(visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant_struct"),
-                [variant_child].as_ptr(),
-                1,
-                false,
-                &mut empty_engine_metadata(),
-                allocate_err,
-            ))
-        };
-        let mut variant_metadata = TestMetadata {
-            number: 5,
-            ..Default::default()
-        };
-        let variant = unsafe {
-            ok_or_panic(visit_field_variant(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant"),
-                variant_struct,
-                true,
-                &mut test_engine_metadata(&mut variant_metadata),
-                allocate_err,
-            ))
-        };
-        assert_eq!(
-            unwrap_field(&mut state, variant)
-                .unwrap()
-                .metadata()
-                .get("number"),
-            Some(&MetadataValue::Number(5))
-        );
-    }
-
     macro_rules! visit_field {
         ($type:ident, $state:ident, $name:expr, $nullable:tt) => {
             paste::paste! { ok_or_panic(unsafe {
@@ -1287,6 +1134,19 @@ mod tests {
                 )
             }) }
         };
+
+        ($type:ident, $state:ident, $name:expr, $nullable:tt; $metadata:expr) => {{
+            let mut engine_metadata = test_engine_metadata(&mut $metadata);
+            paste::paste! { ok_or_panic(unsafe {
+                [<visit_field_ $type>](
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    $nullable,
+                    &mut engine_metadata,
+                    allocate_err,
+                )
+            }) }
+        }};
 
         ($type:ident, $state:ident, $name:expr, $arg1:expr, $nullable:tt) => {
             paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
@@ -1301,6 +1161,21 @@ mod tests {
                 )
             }) }
         };
+
+        ($type:ident, $state:ident, $name:expr, $arg1:expr, $nullable:tt; $metadata:expr) => {{
+            let mut engine_metadata = test_engine_metadata(&mut $metadata);
+            paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
+                let arg1 = $arg1;
+                [<visit_field_ $type>](
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    arg1,
+                    $nullable,
+                    &mut engine_metadata,
+                    allocate_err,
+                )
+            }) }
+        }};
 
         ($type:ident, $state:ident, $name:expr, $arg1:expr, $arg2:expr, $nullable:tt) => {
             paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
@@ -1317,6 +1192,23 @@ mod tests {
                 )
             }) }
         };
+
+        ($type:ident, $state:ident, $name:expr, $arg1:expr, $arg2:expr, $nullable:tt; $metadata:expr) => {{
+            let mut engine_metadata = test_engine_metadata(&mut $metadata);
+            paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
+                let arg1 = $arg1;
+                let arg2 = $arg2;
+                [<visit_field_ $type>](
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    arg1,
+                    arg2,
+                    $nullable,
+                    &mut engine_metadata,
+                    allocate_err,
+                )
+            }) }
+        }};
     }
 
     macro_rules! visit_array_field {
@@ -1354,6 +1246,23 @@ mod tests {
     }
 
     macro_rules! visit_struct_field {
+        ($state:ident, $name:expr, $nullable:tt, [$($fields:expr),* $(,)?]; $metadata:expr) => {{
+            let fields = vec![$($fields),*];
+            let field_count = fields.len();
+            let mut engine_metadata = test_engine_metadata(&mut $metadata);
+            ok_or_panic(unsafe {
+                visit_field_struct(
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    fields.as_ptr(),
+                    field_count,
+                    $nullable,
+                    &mut engine_metadata,
+                    allocate_err,
+                )
+            })
+        }};
+
         ($state:ident, $name:expr, $nullable:tt, $($fields:expr),* $(,)?) => {{
             let fields = vec![$($fields),*];
             let field_count = fields.len();
@@ -1387,6 +1296,89 @@ mod tests {
                 false
             )
         }};
+    }
+
+    #[test]
+    fn complex_fields_keep_parent_and_child_metadata_isolated() {
+        let mut state = KernelSchemaVisitorState::default();
+        let child = visit_field!(string, state, "child", true; numbered_test_metadata(1));
+        let parent = visit_struct_field!(
+            state,
+            "parent",
+            false,
+            [child];
+            numbered_test_metadata(2)
+        );
+        let parent = unwrap_field(&mut state, parent).unwrap();
+        assert_eq!(
+            parent.metadata().get("number"),
+            Some(&MetadataValue::Number(2))
+        );
+        let DataType::Struct(children) = parent.data_type() else {
+            panic!("expected struct")
+        };
+        assert_eq!(
+            children.fields().next().unwrap().metadata().get("number"),
+            Some(&MetadataValue::Number(1))
+        );
+
+        let element = visit_field!(string, state, "element", true);
+        let array = visit_field!(
+            array,
+            state,
+            "array",
+            element,
+            true;
+            numbered_test_metadata(3)
+        );
+        assert_eq!(
+            unwrap_field(&mut state, array)
+                .unwrap()
+                .metadata()
+                .get("number"),
+            Some(&MetadataValue::Number(3))
+        );
+
+        let key = visit_field!(string, state, "key", false);
+        let value = visit_field!(long, state, "value", true);
+        let map = visit_field!(
+            map,
+            state,
+            "map",
+            key,
+            value,
+            true;
+            numbered_test_metadata(4)
+        );
+        assert_eq!(
+            unwrap_field(&mut state, map)
+                .unwrap()
+                .metadata()
+                .get("number"),
+            Some(&MetadataValue::Number(4))
+        );
+
+        let variant_struct = visit_struct_field!(
+            state,
+            "variant_struct",
+            false,
+            visit_field!(string, state, "value", true),
+        );
+        let variant = visit_field!(
+            variant,
+            state,
+            "variant",
+            variant_struct,
+            true;
+            numbered_test_metadata(5)
+        );
+        assert_eq!(
+            unwrap_field(&mut state, variant)
+                .unwrap()
+                .metadata()
+                .get("number"),
+            Some(&MetadataValue::Number(5))
+        );
     }
 
     #[test]
