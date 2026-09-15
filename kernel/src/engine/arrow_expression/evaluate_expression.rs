@@ -607,8 +607,7 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
 }
 
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
-#[internal_api]
-pub(crate) fn evaluate_predicate(
+pub fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
     inverted: bool,
