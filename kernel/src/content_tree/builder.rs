@@ -50,6 +50,10 @@ static WRITE_METADATA_INPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. See
 /// [`RequiredFieldsNonNullVisitor`]. Nullability is only used to name the selected leaves; the
 /// non-null contract is enforced by the visitor, not this schema.
+///
+/// These are exactly the columns that are `nullable` in [`WRITE_METADATA_INPUT_SCHEMA`] but map to
+/// non-nullable output entry fields. `path`/`size` are omitted deliberately: they are already
+/// `not_null` in the input schema (mandatory add-file fields), so they need no separate check.
 static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     StructType::new_unchecked([
         StructField::not_null(
@@ -107,9 +111,9 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
     let projections = ContentTreeEntryProjections {
         status: TrackingStatus::Added,
         snapshot_id,
-        // TODO(C1): AMT `location` (Iceberg field id 100) is expected to be the percent-decoded
-        // data-file path, but `path` is the raw RFC-2396-encoded `AddFile.path`. A decode step is
-        // needed once kernel has an expression-level percent-decode op.
+        // TODO(#3319): AMT `location` (Iceberg field id 100) is expected to be the
+        // percent-decoded data-file path, but `path` is the raw RFC-2396-encoded `AddFile.path`.
+        // A decode step is needed once kernel has an expression-level percent-decode op.
         location: Expression::column([PATH_NAME]),
         file_size_in_bytes: Expression::column([SIZE_NAME]),
         sequence_number: Expression::column([DEFAULT_ROW_COMMIT_VERSION_NAME]),
@@ -117,7 +121,7 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
         first_row_id: Expression::column([BASE_ROW_ID_NAME]),
     };
 
-    let expr = build_content_tree_entry_expression(&output_schema, &projections);
+    let expr = build_content_tree_entry_expression(&output_schema, &projections)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         WRITE_METADATA_INPUT_SCHEMA.clone(),
         Arc::new(expr),
@@ -161,9 +165,9 @@ fn require_non_null<'a>(getter: &'a dyn GetData<'a>, row: usize, field: &str) ->
 /// Per-field expressions driving [`build_content_tree_entry_expression`].
 struct ContentTreeEntryProjections {
     status: TrackingStatus,
-    // TODO: root-manifest entries always carry an explicit `snapshotId` and `sequenceNumber`. Leaf
-    // entries may instead inherit both from their manifest (a null value meaning "inherit"), so
-    // this becomes optional once leaf writing is supported.
+    // TODO(#3321): root-manifest entries always carry an explicit `snapshotId` and
+    // `sequenceNumber`. Leaf entries may instead inherit both from their manifest (a null value
+    // meaning "inherit"), so this becomes optional once leaf writing is supported.
     snapshot_id: i64,
     location: Expression,
     file_size_in_bytes: Expression,
@@ -179,15 +183,16 @@ struct ContentTreeEntryProjections {
 fn build_content_tree_entry_expression(
     output_schema: &StructType,
     projections: &ContentTreeEntryProjections,
-) -> Expression {
+) -> DeltaResult<Expression> {
+    let tracking = build_tracking_expression(projections)?;
     struct_expr_from_schema(output_schema, |name| match name {
         CONTENT_TYPE => Some(lit(DataContentType::Data)),
         LOCATION => Some(projections.location.clone()),
         FILE_FORMAT => Some(lit(DataFileFormat::Parquet)),
-        TRACKING => Some(build_tracking_expression(projections)),
-        // TODO: `specId` 0 is only correct for unpartitioned tables. A partitioned table's spec 0
-        // is its real (non-empty) partition spec, so this must carry the table's actual spec id
-        // once the write path supports partitioned AMT tables.
+        TRACKING => Some(tracking.clone()),
+        // TODO(#3320): `specId` 0 is only correct for unpartitioned tables. A partitioned table's
+        // spec 0 is its real (non-empty) partition spec, so this must carry the table's actual
+        // spec id once the write path supports partitioned AMT tables.
         PARTITION_SPEC_ID => Some(lit(0i32)),
         RECORD_COUNT => Some(projections.record_count.clone()),
         FILE_SIZE_IN_BYTES => Some(projections.file_size_in_bytes.clone()),
@@ -197,7 +202,7 @@ fn build_content_tree_entry_expression(
 }
 
 /// Builds the `tracking` sub-struct for an added `Data` entry.
-fn build_tracking_expression(projections: &ContentTreeEntryProjections) -> Expression {
+fn build_tracking_expression(projections: &ContentTreeEntryProjections) -> DeltaResult<Expression> {
     struct_expr_from_schema(&TrackingInfo::to_schema(), |name| match name {
         TRACKING_STATUS => Some(lit(projections.status)),
         TRACKING_SNAPSHOT_ID => Some(lit(projections.snapshot_id)),
@@ -208,25 +213,28 @@ fn build_tracking_expression(projections: &ContentTreeEntryProjections) -> Expre
 }
 
 /// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
-/// for a named field; unmatched fields (those returning `None`) become typed null literals, so the
-/// result matches the schema in field order and type.
+/// for a named field; an unmatched nullable field (one returning `None`) becomes a typed null
+/// literal, so the result matches the schema in field order and type.
+///
+/// # Errors
+/// Returns an error if a non-nullable field has no projection: falling back to a typed null there
+/// would silently emit a null in a non-nullable column.
 fn struct_expr_from_schema(
     schema: &StructType,
     project: impl Fn(&str) -> Option<Expression>,
-) -> Expression {
-    Expression::struct_from(schema.fields().map(|field| {
-        project(field.name().as_str()).unwrap_or_else(|| {
-            // A missing projection must only ever fall back to null for a nullable field; a
-            // required field with no projection would silently become a null of a non-nullable
-            // type.
-            debug_assert!(
-                field.is_nullable(),
-                "no projection for required field {}",
+) -> DeltaResult<Expression> {
+    let fields = schema
+        .fields()
+        .map(|field| match project(field.name().as_str()) {
+            Some(expr) => Ok(expr),
+            None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
+            None => Err(Error::generic(format!(
+                "no projection for required content-tree entry field '{}'",
                 field.name()
-            );
-            null_lit(field.data_type().clone())
+            ))),
         })
-    }))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(Expression::struct_from(fields))
 }
 
 #[cfg(test)]
@@ -239,7 +247,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
     use crate::schema::SchemaStructPatchBuilder;
-    use crate::transaction::BASE_ADD_FILES_SCHEMA;
+    use crate::transaction::{with_row_tracking_cols, BASE_ADD_FILES_SCHEMA};
     use crate::Engine;
 
     /// A row of write-metadata input, where any field may be null (to exercise null rejection).
@@ -436,23 +444,32 @@ mod tests {
 
     #[rstest]
     #[case::num_records(
-        InputRow { path: Some("a.parquet"), size: Some(1), num_records: None, base_row_id: Some(0), commit_version: Some(0) },
+        vec![InputRow { path: Some("a.parquet"), size: Some(1), num_records: None, base_row_id: Some(0), commit_version: Some(0) }],
         "stats.numRecords"
     )]
     #[case::base_row_id(
-        InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: None, commit_version: Some(0) },
+        vec![InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: None, commit_version: Some(0) }],
         BASE_ROW_ID_NAME
     )]
     #[case::commit_version(
-        InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: Some(0), commit_version: None },
+        vec![InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: Some(0), commit_version: None }],
         DEFAULT_ROW_COMMIT_VERSION_NAME
     )]
+    // A null in a non-zero row must still be rejected: guards against a validator that only
+    // inspects row 0.
+    #[case::null_in_second_row(
+        vec![
+            InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: Some(0), commit_version: Some(0) },
+            InputRow { path: Some("b.parquet"), size: Some(1), num_records: Some(1), base_row_id: None, commit_version: Some(0) },
+        ],
+        BASE_ROW_ID_NAME
+    )]
     fn convert_append_metadata_to_entry_batch_rejects_null_required_field(
-        #[case] row: InputRow,
+        #[case] rows: Vec<InputRow>,
         #[case] field: &str,
     ) {
         let engine = SyncEngine::new();
-        let input = write_metadata_input_nullable(&engine, &[row]);
+        let input = write_metadata_input_nullable(&engine, &rows);
         let err = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0)
             .err()
             .expect("null required field should be rejected");
@@ -492,13 +509,7 @@ mod tests {
     /// must be updated to match.
     #[test]
     fn write_metadata_input_schema_matches_add_file_projection() -> DeltaResult<()> {
-        let augmented = SchemaStructPatchBuilder::new()
-            .append(StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG))
-            .append(StructField::nullable(
-                DEFAULT_ROW_COMMIT_VERSION_NAME,
-                DataType::LONG,
-            ))
-            .build(&BASE_ADD_FILES_SCHEMA)?;
+        let augmented = with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?;
         let projected = augmented.project(&[
             PATH_NAME,
             SIZE_NAME,
