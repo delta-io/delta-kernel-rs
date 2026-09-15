@@ -164,9 +164,9 @@ txn.add_files(file_metadata);
 
 // Commit atomically
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => println!("v{}", c.commit_version()),
-    CommitResult::ConflictedTransaction(_) => { /* handle conflict */ }
-    CommitResult::RetryableTransaction(_) => { /* retry */ }
+    CommitResult::Committed(c) => println!("v{}", c.commit_version()),
+    CommitResult::Conflicted(_) => { /* handle conflict */ }
+    CommitResult::Retryable(_) => { /* retry */ }
 }
 ```
 

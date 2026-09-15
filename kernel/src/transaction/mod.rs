@@ -582,7 +582,7 @@ impl<S> Transaction<S> {
                 );
                 let crc_delta =
                     self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
-                Ok(CommitResult::CommittedTransaction(
+                Ok(CommitResult::Committed(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
             }
@@ -590,9 +590,7 @@ impl<S> Transaction<S> {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::Conflict.as_ref());
-                Ok(CommitResult::ConflictedTransaction(
-                    self.into_conflicted(version),
-                ))
+                Ok(CommitResult::Conflicted(self.into_conflicted(version)))
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
@@ -600,7 +598,7 @@ impl<S> Transaction<S> {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
-                Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
+                Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
             Err(e) => Err(e),
         }
@@ -1701,32 +1699,33 @@ pub struct PostCommitStats {
 /// error occurred, the result is Err(Error).
 ///
 /// The commit result can be one of the following:
-/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and in
-///   the future a post-commit snapshot can be obtained from the committed transaction.
-/// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
-///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
-/// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
-///   can be retried without rebasing.
+/// - [`CommitResult::Committed`]: the transaction was successfully committed. [PostCommitStats] and
+///   in the future a post-commit snapshot can be obtained from the committed transaction.
+/// - [`CommitResult::Conflicted`]: the transaction conflicted with an existing version. This
+///   transcation must be rebased before retrying. (currently no rebase APIs exist, caller must
+///   create new txn)
+/// - [`CommitResult::Retryable`]: an IO (retryable) error occurred during the commit. This
+///   transaction can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
 pub enum CommitResult<S = ExistingTable> {
     /// The transaction was successfully committed.
-    CommittedTransaction(CommittedTransaction),
+    Committed(CommittedTransaction),
     /// This transaction conflicted with an existing version (see
     /// [ConflictedTransaction::conflict_version]). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    ConflictedTransaction(ConflictedTransaction<S>),
+    Conflicted(ConflictedTransaction<S>),
     /// An IO (retryable) error occurred during the commit.
-    RetryableTransaction(RetryableTransaction<S>),
+    Retryable(RetryableTransaction<S>),
 }
 
 impl<S> CommitResult<S> {
     /// Returns true if the commit was successful.
     pub fn is_committed(&self) -> bool {
-        matches!(self, CommitResult::CommittedTransaction(_))
+        matches!(self, CommitResult::Committed(_))
     }
 }
 
@@ -1736,8 +1735,8 @@ impl<S: std::fmt::Debug> CommitResult<S> {
     #[allow(clippy::panic)]
     pub fn unwrap_committed(self) -> CommittedTransaction {
         match self {
-            CommitResult::CommittedTransaction(c) => c,
-            other => panic!("Expected CommittedTransaction, got: {other:?}"),
+            CommitResult::Committed(c) => c,
+            other => panic!("Expected Committed, got: {other:?}"),
         }
     }
 
@@ -3326,10 +3325,10 @@ mod tests {
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
-            matches!(result, CommitResult::RetryableTransaction(_)),
-            "Expected RetryableTransaction, got: {result:?}"
+            matches!(result, CommitResult::Retryable(_)),
+            "Expected Retryable, got: {result:?}"
         );
-        if let CommitResult::RetryableTransaction(retryable) = result {
+        if let CommitResult::Retryable(retryable) = result {
             assert!(
                 retryable.error.to_string().contains("simulated IO error"),
                 "Unexpected error: {}",
@@ -3925,8 +3924,8 @@ mod tests {
 
         let result = txn.commit(&engine)?;
         assert!(
-            matches!(result, CommitResult::ConflictedTransaction(_)),
-            "Expected ConflictedTransaction from capturing committer"
+            matches!(result, CommitResult::Conflicted(_)),
+            "Expected Conflicted from capturing committer"
         );
 
         // The ICT in CommitMetadata must be prev_ict + 1 (monotonicity), NOT the wall time.
@@ -3960,7 +3959,7 @@ mod tests {
         let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
+        assert!(matches!(result, CommitResult::Retryable(_)));
         let failure = commit_failure_event(&reporter).expect("commit failure event");
         assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
         assert_eq!(failure.table_type, TableType::PathBased);
