@@ -177,7 +177,6 @@ nor borrowed string slices may be retained after the callback.
 
 | Function | Purpose |
 |----------|---------|
-| `EngineMetadata` | Provide mutable access to engine-owned field metadata and its synchronous visitor callback |
 | `KernelMetadataVisitorState` | Collect Kernel metadata values during that callback |
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
 | `visit_field_void` | Build a void primitive `StructField` |
