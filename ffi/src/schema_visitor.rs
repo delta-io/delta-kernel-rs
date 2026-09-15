@@ -238,8 +238,9 @@ fn visit_field_primitive_impl(
     metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let field = StructField::new(name_str, DataType::Primitive(primitive_type), nullable)
-        .with_metadata(metadata?);
+        .with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -601,6 +602,7 @@ fn visit_field_decimal_impl(
     metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
 
     let decimal_type = DecimalType::try_new(precision, scale)?;
     let field = StructField::new(
@@ -608,7 +610,7 @@ fn visit_field_decimal_impl(
         DataType::Primitive(PrimitiveType::Decimal(decimal_type)),
         nullable,
     )
-    .with_metadata(metadata?);
+    .with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -1242,6 +1244,22 @@ mod tests {
         assert_field_metadata!(interval_day_time, "interval_day_time");
         assert_field_metadata!(void, "void");
         assert_field_metadata!(decimal, "decimal", 10, 2);
+    }
+
+    #[test]
+    fn decimal_metadata_error_precedes_type_validation() {
+        let mut state = KernelSchemaVisitorState::default();
+        let error = visit_field_decimal_impl(
+            &mut state,
+            Ok("decimal"),
+            0,
+            0,
+            false,
+            Err(Error::schema("metadata error")),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Schema(message) if message == "metadata error"));
     }
 
     #[test]
