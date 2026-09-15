@@ -28,6 +28,7 @@ use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::ParsedLogPath;
+use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
@@ -558,6 +559,18 @@ impl Snapshot {
         }
 
         self.get_domain_metadata_internal(domain, engine)
+    }
+
+    /// Get the highest row ID assigned in this snapshot.
+    ///
+    /// Returns `None` when the snapshot has no active `delta.rowTracking` domain metadata.
+    /// This method performs log replay and returns an error if the domain metadata cannot be read
+    /// or its JSON configuration is malformed.
+    pub fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        RowTrackingDomainMetadata::get_high_water_mark(self, engine)
     }
 
     /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.

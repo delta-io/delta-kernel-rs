@@ -1498,6 +1498,28 @@ pub unsafe extern "C" fn snapshot_timestamp(
         .into_extern_result(&engine_ref)
 }
 
+/// Get the highest row ID assigned in this snapshot.
+///
+/// Returns [`OptionalValue::None`] when the snapshot has no active `delta.rowTracking` domain
+/// metadata. Returns an error if the domain metadata cannot be read or its JSON configuration is
+/// malformed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid snapshot and engine handles.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<i64>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
+        .map(OptionalValue::from)
+        .into_extern_result(&engine_ref)
+}
+
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
 ///
 /// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`]. The variable-length file
@@ -2330,6 +2352,54 @@ mod tests {
         assert_eq!(&histogram.sorted_bin_boundaries[..3], &[0, 8192, 16384]);
         assert_eq!(histogram.file_counts.iter().sum::<i64>(), 10);
         assert_eq!(histogram.total_bytes.iter().sum::<i64>(), 5259);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_row_tracking_high_water_mark_present() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::Some(9),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_row_tracking_high_water_mark_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::None,
+        );
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
