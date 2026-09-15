@@ -858,7 +858,22 @@ mod tests {
     #[derive(Default)]
     struct TestMetadata {
         visited: bool,
-        number: i64,
+        values: HashMap<String, MetadataValue>,
+    }
+
+    impl TestMetadata {
+        fn from<K>(values: impl IntoIterator<Item = (K, MetadataValue)>) -> Self
+        where
+            K: Into<String>,
+        {
+            Self {
+                visited: false,
+                values: values
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value))
+                    .collect(),
+            }
+        }
     }
 
     extern "C" fn visit_all_metadata(
@@ -867,31 +882,39 @@ mod tests {
     ) -> bool {
         let metadata = unsafe { &mut *metadata.cast::<TestMetadata>() };
         metadata.visited = true;
-        unsafe {
-            ok_or_panic(visit_metadata_number(
-                state,
-                KernelStringSlice::new_unsafe("number"),
-                metadata.number,
-                allocate_err,
-            ));
-            ok_or_panic(visit_metadata_string(
-                state,
-                KernelStringSlice::new_unsafe("string"),
-                KernelStringSlice::new_unsafe("value"),
-                allocate_err,
-            ));
-            ok_or_panic(visit_metadata_boolean(
-                state,
-                KernelStringSlice::new_unsafe("boolean"),
-                true,
-                allocate_err,
-            ));
-            ok_or_panic(visit_metadata_json(
-                state,
-                KernelStringSlice::new_unsafe("json"),
-                KernelStringSlice::new_unsafe(r#"{"nested":[1,null,2.5]}"#),
-                allocate_err,
-            ));
+
+        for (key, value) in &metadata.values {
+            unsafe {
+                match value {
+                    MetadataValue::Number(value) => ok_or_panic(visit_metadata_number(
+                        state,
+                        KernelStringSlice::new_unsafe(key),
+                        *value,
+                        allocate_err,
+                    )),
+                    MetadataValue::String(value) => ok_or_panic(visit_metadata_string(
+                        state,
+                        KernelStringSlice::new_unsafe(key),
+                        KernelStringSlice::new_unsafe(value),
+                        allocate_err,
+                    )),
+                    MetadataValue::Boolean(value) => ok_or_panic(visit_metadata_boolean(
+                        state,
+                        KernelStringSlice::new_unsafe(key),
+                        *value,
+                        allocate_err,
+                    )),
+                    MetadataValue::Other(value) => {
+                        let value = value.to_string();
+                        ok_or_panic(visit_metadata_json(
+                            state,
+                            KernelStringSlice::new_unsafe(key),
+                            KernelStringSlice::new_unsafe(&value),
+                            allocate_err,
+                        ))
+                    }
+                };
+            }
         }
         true
     }
@@ -914,13 +937,6 @@ mod tests {
         EngineMetadata {
             metadata: std::ptr::from_mut(metadata).cast(),
             visitor: visit_all_metadata,
-        }
-    }
-
-    fn numbered_test_metadata(number: i64) -> TestMetadata {
-        TestMetadata {
-            number,
-            ..Default::default()
         }
     }
 
@@ -1037,13 +1053,12 @@ mod tests {
         };
 
         ($type:ident, $state:ident, $name:expr, $nullable:tt; $metadata:expr) => {{
-            let mut engine_metadata = test_engine_metadata(&mut $metadata);
             paste::paste! { ok_or_panic(unsafe {
                 [<visit_field_ $type>](
                     &mut $state,
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
-                    &mut engine_metadata,
+                    &mut test_engine_metadata(&mut $metadata),
                     allocate_err,
                 )
             }) }
@@ -1064,7 +1079,6 @@ mod tests {
         };
 
         ($type:ident, $state:ident, $name:expr, $arg1:expr, $nullable:tt; $metadata:expr) => {{
-            let mut engine_metadata = test_engine_metadata(&mut $metadata);
             paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
                 let arg1 = $arg1;
                 [<visit_field_ $type>](
@@ -1072,7 +1086,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     arg1,
                     $nullable,
-                    &mut engine_metadata,
+                    &mut test_engine_metadata(&mut $metadata),
                     allocate_err,
                 )
             }) }
@@ -1095,7 +1109,6 @@ mod tests {
         };
 
         ($type:ident, $state:ident, $name:expr, $arg1:expr, $arg2:expr, $nullable:tt; $metadata:expr) => {{
-            let mut engine_metadata = test_engine_metadata(&mut $metadata);
             paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
                 let arg1 = $arg1;
                 let arg2 = $arg2;
@@ -1105,7 +1118,7 @@ mod tests {
                     arg1,
                     arg2,
                     $nullable,
-                    &mut engine_metadata,
+                    &mut test_engine_metadata(&mut $metadata),
                     allocate_err,
                 )
             }) }
@@ -1150,7 +1163,6 @@ mod tests {
         ($state:ident, $name:expr, $nullable:tt, [$($fields:expr),* $(,)?]; $metadata:expr) => {{
             let fields = vec![$($fields),*];
             let field_count = fields.len();
-            let mut engine_metadata = test_engine_metadata(&mut $metadata);
             ok_or_panic(unsafe {
                 visit_field_struct(
                     &mut $state,
@@ -1158,7 +1170,7 @@ mod tests {
                     fields.as_ptr(),
                     field_count,
                     $nullable,
-                    &mut engine_metadata,
+                    &mut test_engine_metadata(&mut $metadata),
                     allocate_err,
                 )
             })
@@ -1202,29 +1214,26 @@ mod tests {
     #[test]
     fn field_metadata_preserves_typed_values_and_callback_context() {
         let mut state = KernelSchemaVisitorState::default();
-        let mut metadata = numbered_test_metadata(17);
+        let expected = HashMap::from([
+            ("number".to_string(), MetadataValue::Number(17)),
+            (
+                "string".to_string(),
+                MetadataValue::String("value".to_string()),
+            ),
+            ("boolean".to_string(), MetadataValue::Boolean(true)),
+            (
+                "json".to_string(),
+                MetadataValue::Other(serde_json::json!({
+                    "nested": [1, null, 2.5]
+                })),
+            ),
+        ]);
+        let mut metadata = TestMetadata::from(expected.clone());
         let field_id = visit_field!(string, state, "mapped", true; metadata);
         let field = unwrap_field(&mut state, field_id).unwrap();
 
         assert!(metadata.visited);
-        assert_eq!(
-            field.metadata().get("number"),
-            Some(&MetadataValue::Number(17))
-        );
-        assert_eq!(
-            field.metadata().get("string"),
-            Some(&MetadataValue::String("value".to_string()))
-        );
-        assert_eq!(
-            field.metadata().get("boolean"),
-            Some(&MetadataValue::Boolean(true))
-        );
-        assert_eq!(
-            field.metadata().get("json"),
-            Some(&MetadataValue::Other(serde_json::json!({
-                "nested": [1, null, 2.5]
-            })))
-        );
+        assert_eq!(field.metadata(), &expected);
     }
 
     #[test]
@@ -1238,12 +1247,14 @@ mod tests {
                     $name,
                     $($arg,)*
                     false;
-                    numbered_test_metadata(17)
+                    TestMetadata::from([("number", MetadataValue::Number(17))])
                 );
                 let field = unwrap_field(&mut state, field_id).unwrap();
                 assert_eq!(
                     field.metadata().get("number"),
-                    Some(&MetadataValue::Number(17))
+                    Some(&MetadataValue::Number(17)),
+                    "{name} field metadata",
+                    name = $name,
                 );
             }};
         }
@@ -1283,9 +1294,9 @@ mod tests {
                     state,
                     "child",
                     true;
-                    numbered_test_metadata(1)
+                    TestMetadata::from([("number", MetadataValue::Number(1))])
                 )];
-                numbered_test_metadata(2)
+                TestMetadata::from([("number", MetadataValue::Number(2))])
             ),
             visit_field!(
                 array,
@@ -1293,7 +1304,7 @@ mod tests {
                 "array",
                 visit_field!(string, state, "element", true),
                 true;
-                numbered_test_metadata(3)
+                TestMetadata::from([("number", MetadataValue::Number(3))])
             ),
             visit_field!(
                 map,
@@ -1302,7 +1313,7 @@ mod tests {
                 visit_field!(string, state, "key", false),
                 visit_field!(long, state, "value", true),
                 true;
-                numbered_test_metadata(4)
+                TestMetadata::from([("number", MetadataValue::Number(4))])
             ),
             visit_field!(
                 variant,
@@ -1315,7 +1326,7 @@ mod tests {
                     visit_field!(string, state, "value", true),
                 ),
                 true;
-                numbered_test_metadata(5)
+                TestMetadata::from([("number", MetadataValue::Number(5))])
             ),
         );
 
