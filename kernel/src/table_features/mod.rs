@@ -894,7 +894,7 @@ pub(crate) fn auto_enable_property_driven_features(
 
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
-/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
+/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::UnsupportedProtocolVersion`].
 pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
     require!(
         protocol.min_reader_version() >= MIN_VALID_RW_VERSION,

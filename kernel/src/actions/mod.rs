@@ -23,7 +23,8 @@ use crate::schema::{
 use crate::schema::{schema, ArrayType, DataType};
 use crate::table_features::{
     FeatureType, TableFeature, LEGACY_READER_FEATURES, MAX_VALID_READER_VERSION,
-    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -666,52 +667,59 @@ impl Protocol {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
-        // A future reader protocol may define different feature-list rules. Preserve the action
-        // so the read-capability check can report the unsupported version before interpreting
-        // fields whose semantics this kernel does not know.
-        if min_reader_version > MAX_VALID_READER_VERSION {
+        // Feature-list presence rules are version-specific. Validate each list only when this
+        // kernel understands the corresponding protocol version.
+        let reader_version_supported = min_reader_version <= MAX_VALID_READER_VERSION;
+        if reader_version_supported {
+            // The protocol states that Reader features may be present if and only if the
+            // min_reader_version is 3
+            if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
+                require!(
+                    reader_features.is_some(),
+                    Error::invalid_protocol(
+                        "Reader features must be present when minimum reader version = 3"
+                    )
+                );
+            } else {
+                require!(
+                    reader_features.is_none(),
+                    Error::invalid_protocol(
+                        "Reader features must not be present when minimum reader version != 3"
+                    )
+                );
+            }
+        }
+
+        let writer_version_supported = min_writer_version <= MAX_VALID_WRITER_VERSION;
+        if writer_version_supported {
+            // The protocol states that Writer features may be present if and only if the
+            // min_writer_version is 7
+            if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
+                require!(
+                    writer_features.is_some(),
+                    Error::invalid_protocol(
+                        "Writer features must be present when minimum writer version = 7"
+                    )
+                );
+            } else {
+                require!(
+                    writer_features.is_none(),
+                    Error::invalid_protocol(
+                        "Writer features must not be present when minimum writer version != 7"
+                    )
+                );
+            }
+        }
+
+        // Cross-validation relies on both versions' feature-list semantics. Preserve future
+        // protocols so the capability checks can report the unsupported version.
+        if !reader_version_supported || !writer_version_supported {
             return Ok(Self {
                 min_reader_version,
                 min_writer_version,
                 reader_features,
                 writer_features,
             });
-        }
-
-        // The protocol states that Reader features may be present if and only if the
-        // min_reader_version is 3
-        if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
-            require!(
-                reader_features.is_some(),
-                Error::invalid_protocol(
-                    "Reader features must be present when minimum reader version = 3"
-                )
-            );
-        } else {
-            require!(
-                reader_features.is_none(),
-                Error::invalid_protocol(
-                    "Reader features must not be present when minimum reader version != 3"
-                )
-            );
-        }
-
-        // The protocol states that Writer features may be present if and only if the
-        // min_writer_version is 7
-        if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
-            require!(
-                writer_features.is_some(),
-                Error::invalid_protocol(
-                    "Writer features must be present when minimum writer version = 7"
-                )
-            );
-        } else {
-            require!(
-                writer_features.is_none(),
-                Error::invalid_protocol(
-                    "Writer features must not be present when minimum writer version != 7"
-                )
-            );
         }
 
         // Self- and cross-validate the reader and writer feature lists.
@@ -2110,18 +2118,49 @@ mod tests {
         assert_eq!(p.min_writer_version(), 1);
     }
 
-    #[test]
-    fn defer_feature_validation_for_unsupported_reader_version() {
+    #[rstest]
+    #[case::reader(i32::MAX, TABLE_FEATURES_MIN_WRITER_VERSION)]
+    #[case::writer(TABLE_FEATURES_MIN_READER_VERSION, i32::MAX)]
+    fn defer_cross_validation_for_unsupported_version(
+        #[case] min_reader_version: i32,
+        #[case] min_writer_version: i32,
+    ) {
         let protocol = Protocol::try_new(
-            i32::MAX,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(TableFeature::EMPTY_LIST),
-            Some(TableFeature::EMPTY_LIST),
+            min_reader_version,
+            min_writer_version,
+            Some(vec![TableFeature::DeletionVectors]),
+            Some(vec![TableFeature::AppendOnly]),
         )
         .unwrap();
 
-        assert_eq!(protocol.min_reader_version(), i32::MAX);
-        assert_eq!(protocol.reader_features(), Some([].as_slice()));
+        assert_eq!(protocol.min_reader_version(), min_reader_version);
+        assert_eq!(protocol.min_writer_version(), min_writer_version);
+    }
+
+    #[test]
+    fn validate_writer_feature_shape_for_unsupported_reader_version() {
+        assert_result_error_with_message(
+            Protocol::try_new(
+                i32::MAX,
+                TABLE_FEATURES_MIN_WRITER_VERSION,
+                Some(TableFeature::EMPTY_LIST),
+                TableFeature::NO_LIST,
+            ),
+            "Writer features must be present when minimum writer version = 7",
+        );
+    }
+
+    #[test]
+    fn validate_reader_feature_shape_for_unsupported_writer_version() {
+        assert_result_error_with_message(
+            Protocol::try_new(
+                TABLE_FEATURES_MIN_READER_VERSION,
+                i32::MAX,
+                TableFeature::NO_LIST,
+                Some(TableFeature::EMPTY_LIST),
+            ),
+            "Reader features must be present when minimum reader version = 3",
+        );
     }
 
     #[test]

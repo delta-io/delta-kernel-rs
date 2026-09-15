@@ -332,6 +332,8 @@ impl From<EngineExecError> for Error {
             .into(),
             KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
             KernelError::UnsupportedError => Error::Unsupported(message),
+            // EngineExecError does not retain the version fields needed to reconstruct the
+            // structured error, so this intentionally collapses to Unsupported.
             KernelError::UnsupportedProtocolVersionError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
             KernelError::SchemaError => Error::Schema(message),
