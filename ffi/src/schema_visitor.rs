@@ -980,7 +980,7 @@ mod tests {
             )
         };
 
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
         assert!(state.elements.is_empty());
     }
 
@@ -1013,7 +1013,7 @@ mod tests {
             )
         };
 
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::MalformedJsonError, None);
         assert!(state.values.is_empty());
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
         let mut state = KernelMetadataVisitorState::default();
         let result = unsafe { visit_metadata_number(&mut state, key, 1, allocate_err) };
 
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
         assert!(state.values.is_empty());
     }
 
@@ -1048,7 +1048,7 @@ mod tests {
             )
         };
 
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
         assert!(state.values.is_empty());
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
             )
         };
 
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
         assert!(state.values.is_empty());
     }
 
