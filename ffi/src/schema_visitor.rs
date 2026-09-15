@@ -918,45 +918,6 @@ mod tests {
     }
 
     #[test]
-    fn field_metadata_preserves_typed_values_and_callback_context() {
-        let mut state = KernelSchemaVisitorState::default();
-        let mut metadata = TestMetadata {
-            number: 17,
-            ..Default::default()
-        };
-        let field_id = unsafe {
-            ok_or_panic(visit_field_string(
-                &mut state,
-                KernelStringSlice::new_unsafe("mapped"),
-                true,
-                &mut test_engine_metadata(&mut metadata),
-                allocate_err,
-            ))
-        };
-        let field = unwrap_field(&mut state, field_id).unwrap();
-
-        assert!(metadata.visited);
-        assert_eq!(
-            field.metadata().get("number"),
-            Some(&MetadataValue::Number(17))
-        );
-        assert_eq!(
-            field.metadata().get("string"),
-            Some(&MetadataValue::String("value".to_string()))
-        );
-        assert_eq!(
-            field.metadata().get("boolean"),
-            Some(&MetadataValue::Boolean(true))
-        );
-        assert_eq!(
-            field.metadata().get("json"),
-            Some(&MetadataValue::Other(serde_json::json!({
-                "nested": [1, null, 2.5]
-            })))
-        );
-    }
-
-    #[test]
     fn rejected_metadata_does_not_insert_field() {
         let mut state = KernelSchemaVisitorState::default();
         let result = unsafe {
@@ -1053,73 +1014,6 @@ mod tests {
             }
             assert_eq!(state.values.get(key), Some(&expected));
         }
-    }
-
-    #[test]
-    fn every_primitive_and_decimal_field_preserves_metadata() {
-        macro_rules! assert_primitive_metadata {
-            ($visitor:ident, $name:literal) => {{
-                let mut state = KernelSchemaVisitorState::default();
-                let mut metadata = TestMetadata {
-                    number: 17,
-                    ..Default::default()
-                };
-                let mut engine_metadata = test_engine_metadata(&mut metadata);
-                let field_id = unsafe {
-                    ok_or_panic($visitor(
-                        &mut state,
-                        KernelStringSlice::new_unsafe($name),
-                        false,
-                        &mut engine_metadata,
-                        allocate_err,
-                    ))
-                };
-                let field = unwrap_field(&mut state, field_id).unwrap();
-                assert_eq!(
-                    field.metadata().get("number"),
-                    Some(&MetadataValue::Number(17))
-                );
-            }};
-        }
-
-        assert_primitive_metadata!(visit_field_string, "string");
-        assert_primitive_metadata!(visit_field_long, "long");
-        assert_primitive_metadata!(visit_field_integer, "integer");
-        assert_primitive_metadata!(visit_field_short, "short");
-        assert_primitive_metadata!(visit_field_byte, "byte");
-        assert_primitive_metadata!(visit_field_float, "float");
-        assert_primitive_metadata!(visit_field_double, "double");
-        assert_primitive_metadata!(visit_field_boolean, "boolean");
-        assert_primitive_metadata!(visit_field_binary, "binary");
-        assert_primitive_metadata!(visit_field_date, "date");
-        assert_primitive_metadata!(visit_field_timestamp, "timestamp");
-        assert_primitive_metadata!(visit_field_timestamp_ntz, "timestamp_ntz");
-        assert_primitive_metadata!(visit_field_interval_year_month, "interval_year_month");
-        assert_primitive_metadata!(visit_field_interval_day_time, "interval_day_time");
-        assert_primitive_metadata!(visit_field_void, "void");
-
-        let mut state = KernelSchemaVisitorState::default();
-        let mut metadata = TestMetadata {
-            number: 17,
-            ..Default::default()
-        };
-        let mut engine_metadata = test_engine_metadata(&mut metadata);
-        let field_id = unsafe {
-            ok_or_panic(visit_field_decimal(
-                &mut state,
-                KernelStringSlice::new_unsafe("decimal"),
-                10,
-                2,
-                false,
-                &mut engine_metadata,
-                allocate_err,
-            ))
-        };
-        let field = unwrap_field(&mut state, field_id).unwrap();
-        assert_eq!(
-            field.metadata().get("number"),
-            Some(&MetadataValue::Number(17))
-        );
     }
 
     macro_rules! visit_field {
@@ -1296,6 +1190,73 @@ mod tests {
                 false
             )
         }};
+    }
+
+    #[test]
+    fn field_metadata_preserves_typed_values_and_callback_context() {
+        let mut state = KernelSchemaVisitorState::default();
+        let mut metadata = numbered_test_metadata(17);
+        let field_id = visit_field!(string, state, "mapped", true; metadata);
+        let field = unwrap_field(&mut state, field_id).unwrap();
+
+        assert!(metadata.visited);
+        assert_eq!(
+            field.metadata().get("number"),
+            Some(&MetadataValue::Number(17))
+        );
+        assert_eq!(
+            field.metadata().get("string"),
+            Some(&MetadataValue::String("value".to_string()))
+        );
+        assert_eq!(
+            field.metadata().get("boolean"),
+            Some(&MetadataValue::Boolean(true))
+        );
+        assert_eq!(
+            field.metadata().get("json"),
+            Some(&MetadataValue::Other(serde_json::json!({
+                "nested": [1, null, 2.5]
+            })))
+        );
+    }
+
+    #[test]
+    fn every_primitive_and_decimal_field_preserves_metadata() {
+        macro_rules! assert_field_metadata {
+            ($type:ident, $name:literal $(, $arg:expr)*) => {{
+                let mut state = KernelSchemaVisitorState::default();
+                let field_id = visit_field!(
+                    $type,
+                    state,
+                    $name,
+                    $($arg,)*
+                    false;
+                    numbered_test_metadata(17)
+                );
+                let field = unwrap_field(&mut state, field_id).unwrap();
+                assert_eq!(
+                    field.metadata().get("number"),
+                    Some(&MetadataValue::Number(17))
+                );
+            }};
+        }
+
+        assert_field_metadata!(string, "string");
+        assert_field_metadata!(long, "long");
+        assert_field_metadata!(integer, "integer");
+        assert_field_metadata!(short, "short");
+        assert_field_metadata!(byte, "byte");
+        assert_field_metadata!(float, "float");
+        assert_field_metadata!(double, "double");
+        assert_field_metadata!(boolean, "boolean");
+        assert_field_metadata!(binary, "binary");
+        assert_field_metadata!(date, "date");
+        assert_field_metadata!(timestamp, "timestamp");
+        assert_field_metadata!(timestamp_ntz, "timestamp_ntz");
+        assert_field_metadata!(interval_year_month, "interval_year_month");
+        assert_field_metadata!(interval_day_time, "interval_day_time");
+        assert_field_metadata!(void, "void");
+        assert_field_metadata!(decimal, "decimal", 10, 2);
     }
 
     #[test]
