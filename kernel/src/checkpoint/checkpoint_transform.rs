@@ -16,7 +16,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{col, Expression, ExpressionRef, UnaryExpressionOp};
+use crate::expressions::{col, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
@@ -207,11 +207,19 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// JSON null on write) reconstructs into the checkpoint identically to how the scan reconstructs it
 /// from a commit.
 ///
+/// Checkpoint construction has no reader timezone. It preserves a native value read from an earlier
+/// checkpoint; for a JSON commit, the fallback parses the raw string map as UTC. The resulting
+/// native value is written to the checkpoint and read back without a reader-timezone
+/// transformation, while the raw `partitionValues` map remains unchanged.
+///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
-        Expression::map_to_struct(col!(ADD_NAME, PARTITION_VALUES_FIELD)),
+        Expression::map_to_struct(
+            col!(ADD_NAME, PARTITION_VALUES_FIELD),
+            MapToStructOptions::default(),
+        ),
     ]))
 }
 
