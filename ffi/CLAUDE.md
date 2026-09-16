@@ -39,11 +39,13 @@ the caller's memory space.
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
+- `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
-- `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
+- `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
+  (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
 - `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
   (`alloc-tracking`)
@@ -60,10 +62,18 @@ Snapshot builder API (`ffi/src/lib.rs`):
 - `snapshot_builder_set_version(builder, version)` -- optional: pin to a specific version
 - `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
 - `snapshot_builder_set_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
+- `snapshot_builder_set_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
+  typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
+  files, or CRC files; log compaction paths are rejected. Kernel cannot verify that supplied log
+  paths belong to the builder's table, so the caller must ensure every path addresses that table.
+  A failed call leaves the builder's existing hint unchanged
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
 
-The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
+Snapshot-hint inputs and all nested pointers are borrowed only for the setter call and copied into
+the builder. Cross-component and table validation occurs when the builder is built. The caller owns
+the returned builder handle and must call either `snapshot_builder_build` or
+`free_snapshot_builder`.
 
 Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
 `snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
@@ -185,11 +195,12 @@ updates require both the `deletionVectors` reader/writer feature and
 
 ## Tracing & Metrics
 
-Gated behind the `tracing` feature. A single global `tracing` subscriber backs both logging and
-metrics; it is installed lazily the first time any `enable_*` function below is called. The
-subscriber has two reloadable slots: a logging layer (swapped wholesale between event-based and
-log-line formats) and a metrics layer (a fixed `ReportGeneratorLayer` toggled on/off via a
-reloadable level filter).
+Gated behind the `tracing` feature. A single global `tracing` subscriber backs logging, metrics,
+and frame lifecycle reporting; it is installed lazily the first time any `enable_*` function below
+is called. The subscriber has three reloadable slots: a logging layer (swapped wholesale between
+event-based and log-line formats), a metrics layer (a fixed `ReportGeneratorLayer` toggled on/off
+via a reloadable level filter), and a frame layer (a fixed `FrameReporterLayer` toggled on/off via
+a reloadable level filter).
 
 Logging registration (each re-callable to replace the active callback, format, and level):
 - `enable_event_tracing(callback, max_level)` -- structured `Event`s; the engine formats them
@@ -200,6 +211,15 @@ Logging registration (each re-callable to replace the active callback, format, a
 Metrics registration:
 - `enable_metrics_reporting(callback)` -- forwards each kernel `MetricEvent` to the callback as a
   `repr(C)` `MetricEvent` (see `src/ffi_metrics.rs`). Re-calling replaces the callback.
+
+Frame lifecycle registration:
+- `enable_frame_reporting(callback)` -- forwards OPEN/CLOSE for each dynamic activation of a span
+  declaring the static `enable_call_frame` field. The callback runs synchronously on the entering
+  or exiting thread and receives a tagged `FrameEvent` union. OPEN includes the span id and a
+  borrowed UTF-8 name; CLOSE includes the matching id. Calls may overlap across threads; callback
+  state must be thread-safe, and profile consumers must maintain a separate event stack for each
+  callback thread. Registration is one-shot so a callback cannot be replaced between a span's OPEN
+  and CLOSE events; another call fails and leaves the existing callback active.
 
 The `MetricEvent` and any `KernelStringSlice` it carries are only valid for the duration of the
 callback. Durations are `u64`, suffixed `_ns` (nanoseconds) or `_ms` (milliseconds). Operation ids

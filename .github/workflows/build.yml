@@ -59,6 +59,21 @@ env:
 # are installed via taiki-e/install-action, which fetches prebuilt binaries.
 
 jobs:
+  release-tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+        with:
+          tool: git-cliff
+      - name: Test release tooling
+        run: .github/scripts/test-release.sh
+      - name: Verify pending release changelog
+        if: startsWith(github.head_ref, 'release/') || startsWith(github.ref_name, 'release/')
+        run: ./release.sh verify-changelog
+
   ai-review-config:
     runs-on: ubuntu-latest
     steps:
@@ -66,11 +81,13 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
+      - name: Install AI reviewer config test dependencies
+        run: python3 -m pip install --no-deps PyYAML==6.0.3
       - name: Validate AI reviewer config
         run: >-
           python3 -m unittest discover
           --start-directory .github/omnigent/tests
-          --pattern test_inline_review.py
+          --pattern 'test_*.py'
 
   format:
     runs-on: ubuntu-latest

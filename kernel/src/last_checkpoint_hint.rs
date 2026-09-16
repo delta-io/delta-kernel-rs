@@ -2,6 +2,7 @@
 //! log_segment module since it should only really be used there? as hint for listing?
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,43 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
+    /// Reconstructs a checkpoint hint from its serialized fields, dropping oversized sidecar and
+    /// non-file-action arrays so the retained hint is always bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the optional checkpoint schema string is not a valid Delta schema.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        version: Version,
+        size: i64,
+        parts: Option<usize>,
+        size_in_bytes: Option<i64>,
+        num_of_add_files: Option<i64>,
+        checkpoint_schema: Option<String>,
+        checksum: Option<String>,
+        tags: Option<HashMap<String, String>>,
+        v2_checkpoint: Option<LastCheckpointV2>,
+    ) -> DeltaResult<Self> {
+        let checkpoint_schema = checkpoint_schema
+            .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
+            .transpose()?;
+        Ok(Self {
+            version,
+            size,
+            parts,
+            size_in_bytes,
+            num_of_add_files,
+            checkpoint_schema,
+            checksum,
+            tags,
+            v2_checkpoint,
+        }
+        .drop_oversized_fields())
+    }
+
     /// Whether this hint describes the checkpoint a log segment selected, given that segment's
     /// `checkpoint_parts`. Multiple checkpoints can share a version, so a matching version alone is
     /// not enough: the hint's own identity must equal the selected checkpoint's.
@@ -192,7 +230,12 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
-    #[instrument(name = "last_checkpoint.read", skip_all, err)]
+    #[instrument(
+        name = "last_checkpoint.read",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -235,6 +278,27 @@ impl LastCheckpointHint {
     #[cfg(test)]
     pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Failed to convert LastCheckpointHint to JSON bytes")
+    }
+}
+
+impl LastCheckpointV2 {
+    /// Reconstructs V2 checkpoint state from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn from_parts(
+        path: String,
+        size_in_bytes: Option<i64>,
+        modification_time: Option<i64>,
+        sidecar_files: Option<Vec<Sidecar>>,
+        non_file_actions: Option<Vec<HintAction>>,
+    ) -> Self {
+        Self {
+            path,
+            size_in_bytes,
+            modification_time,
+            sidecar_files,
+            non_file_actions,
+        }
     }
 }
 
@@ -473,6 +537,60 @@ mod tests {
             v2.non_file_actions.is_none(),
             "oversized nonFileActions dropped"
         );
+    }
+
+    #[rstest]
+    #[case::at_threshold(30, Some(30))]
+    #[case::above_threshold(31, None)]
+    fn reconstructed_hint_bounds_embedded_fields(
+        #[case] count: usize,
+        #[case] expected_count: Option<usize>,
+    ) {
+        let sidecar = Sidecar::new("s.parquet".to_string(), 1, 0, None);
+        let action = HintAction::Protocol(Protocol::default());
+        let hint = LastCheckpointHint::from_parts(
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(LastCheckpointV2::from_parts(
+                "cp.parquet".to_string(),
+                None,
+                None,
+                Some(vec![sidecar; count]),
+                Some(vec![action; count]),
+            )),
+        )
+        .unwrap();
+        let v2 = hint.v2_checkpoint.unwrap();
+        assert_eq!(v2.sidecar_files.as_ref().map(Vec::len), expected_count);
+        assert_eq!(v2.non_file_actions.as_ref().map(Vec::len), expected_count);
+    }
+
+    #[test]
+    fn reconstructed_hint_validates_checkpoint_schema() {
+        let schema = r#"{"type":"struct","fields":[]}"#.to_string();
+        let hint =
+            LastCheckpointHint::from_parts(1, 1, None, None, None, Some(schema), None, None, None)
+                .unwrap();
+        assert!(hint.checkpoint_schema.is_some());
+
+        assert!(LastCheckpointHint::from_parts(
+            1,
+            1,
+            None,
+            None,
+            None,
+            Some("not a schema".to_string()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     /// Returns the single `actions` element matching `extract`, asserting there is exactly one.

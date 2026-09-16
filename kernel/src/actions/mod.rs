@@ -27,6 +27,8 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::{create_row, Engine};
 use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -341,6 +343,39 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// Reconstructs metadata from its serialized action fields.
+    ///
+    /// This constructor does not validate the schema, partition columns, format, or table
+    /// configuration. Callers must validate the result before using it as table state.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        format_provider: String,
+        format_options: HashMap<String, String>,
+        schema_string: String,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            format: Format {
+                provider: format_provider,
+                options: format_options,
+            },
+            schema_string,
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
+
     /// Create a new [`Metadata`] instances.
     ///
     /// # Errors
@@ -610,6 +645,7 @@ impl Protocol {
     }
 
     /// Try to create a new Protocol instance from reader/writer versions and table features.
+    #[internal_api]
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
@@ -976,6 +1012,38 @@ pub(crate) struct Add {
 }
 
 impl Add {
+    /// Reconstructs an Add action from its serialized fields.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        path: String,
+        partition_values: HashMap<String, String>,
+        size: i64,
+        modification_time: i64,
+        data_change: bool,
+        stats: Option<String>,
+        tags: Option<HashMap<String, Option<String>>>,
+        deletion_vector: Option<DeletionVectorDescriptor>,
+        base_row_id: Option<i64>,
+        default_row_commit_version: Option<i64>,
+        clustering_provider: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            partition_values,
+            size,
+            modification_time,
+            data_change,
+            stats,
+            tags,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+            clustering_provider,
+        }
+    }
+
     #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
@@ -1099,6 +1167,8 @@ pub(crate) struct SetTransaction {
 }
 
 impl SetTransaction {
+    /// Creates a set-transaction action.
+    #[internal_api]
     pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
         Self {
             app_id,
@@ -1257,7 +1327,6 @@ impl CheckpointAction {
     /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
     /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
     /// hence a fallible method rather than an infallible `From`.
-    #[allow(unused)]
     fn try_into_scalar(self) -> DeltaResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
@@ -1328,6 +1397,15 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
+    /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.
+    pub(crate) fn new(path: String, size_in_bytes: i64, version: i64) -> Self {
+        ContentRoot {
+            path,
+            size_in_bytes,
+            version,
+        }
+    }
+
     /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
     ///
     /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
@@ -1371,6 +1449,41 @@ impl ContentRoot {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointAction {
+    /// Builds a checkpoint action at `version` with all `transactions` and `domain_metadata`
+    /// inlined and no sidecars.
+    // TODO(#2866): spill transactions and domain metadata into sidecars once the adaptiveMetadata
+    // sidecar format is defined.
+    #[internal_api]
+    pub(crate) fn new(
+        version: i64,
+        content_root: ContentRoot,
+        protocol: Protocol,
+        metadata: Metadata,
+        transactions: Vec<SetTransaction>,
+        domain_metadata: Vec<DomainMetadata>,
+    ) -> Self {
+        CheckpointAction {
+            version,
+            content_root,
+            protocol,
+            metadata,
+            transactions,
+            domain_metadata,
+            txn_sidecars: vec![],
+            domain_metadata_sidecars: vec![],
+        }
+    }
+
+    /// Serialize this checkpoint action into a single-row `EngineData`.
+    #[internal_api]
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
+        create_row(
+            engine,
+            LOG_CHECKPOINT_SCHEMA.clone(),
+            self.try_into_scalar()?,
+        )
+    }
+
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
     /// `checkpoint` action are skipped, so `Ok(None)` means the batch had none at all.
     ///
@@ -1471,6 +1584,23 @@ fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
 }
 
 impl Sidecar {
+    /// Creates a sidecar action.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(
+        path: String,
+        size_in_bytes: i64,
+        modification_time: i64,
+        tags: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            path,
+            size_in_bytes,
+            modification_time,
+            tags,
+        }
+    }
+
     /// Convert a Sidecar record to a FileMeta.
     ///
     /// This helper first builds the URL by joining the provided log_root with
@@ -1505,6 +1635,15 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
+impl CheckpointMetadata {
+    /// Creates checkpoint metadata.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(version: i64, tags: Option<HashMap<String, String>>) -> Self {
+        Self { version, tags }
+    }
+}
+
 /// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
 /// overlapping transactions conflict if they both contain a domain metadata action for the same
 /// metadata domain.
@@ -1521,6 +1660,7 @@ pub struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
+    #[internal_api]
     pub(crate) fn new(domain: String, configuration: String) -> Self {
         Self {
             domain,
@@ -1530,6 +1670,7 @@ impl DomainMetadata {
     }
 
     /// Create a new DomainMetadata action to remove a domain.
+    #[internal_api]
     pub(crate) fn remove(domain: String, configuration: String) -> Self {
         Self {
             domain,
