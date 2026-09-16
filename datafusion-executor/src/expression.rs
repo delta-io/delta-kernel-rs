@@ -17,7 +17,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
-    ExpressionStructPatch, MapToStructExpression, ParseJsonExpression, UnaryExpressionOp,
+    ExpressionStructPatch, MapToStructExpression, ParseJsonExpression,
     VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
@@ -68,11 +68,9 @@ pub fn to_df_expr(
         }
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
-        KernelExpression::Unary(u) => match u.op {
-            UnaryExpressionOp::ToJson => Err(Error::unsupported(
-                "converting the ToJson expression is not yet supported",
-            )),
-        },
+        KernelExpression::ToJson(_) => Err(Error::unsupported(
+            "converting the ToJson expression is not yet supported",
+        )),
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
         KernelExpression::Cast(_) => Err(Error::unsupported(

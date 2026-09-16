@@ -13,7 +13,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
-    MapToStructOptions, Predicate, PredicateRef, UnaryExpressionOp,
+    MapToStructOptions, Predicate, PredicateRef,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -858,12 +858,14 @@ fn get_add_transform_expr(
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(null_lit(DataType::STRING))
-    } else if has_stats_parsed && synthesize_json {
+    } else if let (true, true, Some(stats_schema)) =
+        (has_stats_parsed, synthesize_json, &physical_stats_schema)
+    {
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
             col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+            Expression::to_json(col!("add.stats_parsed"), stats_schema.clone()),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -1195,7 +1197,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
-        Predicate, Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
+        Predicate, Scalar, ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -2068,16 +2070,13 @@ mod tests {
         );
     }
 
-    /// Walk `expr` and count `Unary { op: ToJson, .. }` occurrences anywhere in the tree.
+    /// Walk `expr` and count [`Expression::ToJson`] occurrences anywhere in the tree.
     // Closures wrap `count_to_json` to dereference `&Arc<Expression>` -> `&Expression`;
     // clippy doesn't see the auto-deref so flags them as redundant.
     #[allow(clippy::redundant_closure)]
     fn count_to_json(expr: &Expression) -> usize {
         match expr {
-            Expression::Unary(u) => {
-                let here = (u.op == UnaryExpressionOp::ToJson) as usize;
-                here + count_to_json(&u.expr)
-            }
+            Expression::ToJson(t) => 1 + count_to_json(&t.expr),
             Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),
             Expression::Variadic(v) => v.exprs.iter().map(|e| count_to_json(e)).sum(),
             Expression::Struct(fields, nullability) => {

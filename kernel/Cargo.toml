@@ -66,7 +66,7 @@ optional = true
 [dependencies.parquet_58]
 package = "parquet"
 version = "58.1"
-features = ["async", "object_store"]
+features = ["async", "object_store", "variant_experimental"]
 optional = true
 
 # arrow 59
@@ -78,7 +78,7 @@ optional = true
 [dependencies.parquet_59]
 package = "parquet"
 version = "59"
-features = ["async", "object_store"]
+features = ["async", "object_store", "variant_experimental"]
 optional = true
 
 [features]

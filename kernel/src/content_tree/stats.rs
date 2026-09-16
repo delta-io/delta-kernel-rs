@@ -443,9 +443,9 @@ impl<'a> CategoryScopes<'a> {
         Ok(CategoryScopes { categories })
     }
 
-    /// Which categories a leaf named `leaf_name` appears in. Every leaf -- variants included -- is
-    /// a scalar in each category (a variant appears in `nullCount` as a scalar `LONG` and is
-    /// absent from `minValues`/`maxValues`), so presence is a same-name field lookup.
+    /// Which categories a leaf named `leaf_name` appears in. Presence is a same-name field lookup:
+    /// every leaf occupies one field per category it appears in, whatever that field's type (a
+    /// variant is a scalar `LONG` in `nullCount` and its own struct in the bound categories).
     fn leaf_categories(&self, leaf_name: &str) -> StatCategories {
         let [null_count, min_values, max_values] = self
             .categories
@@ -1539,8 +1539,9 @@ mod tests {
 
     /// Guards against fixture-vs-reality drift: drives the projection with the Delta stats schema
     /// the kernel really produces ([`expected_stats_schema`]) rather than a hand-built fixture,
-    /// and asserts the exact pruned result. Primitives appear in all three categories (full
-    /// set); the variant appears only in `nullCount`, so its bounds and size stat are pruned.
+    /// and asserts the exact pruned result. Every leaf appears in all three categories; the
+    /// variant's bounds are unshredded variants and it carries no `tight_bounds`, per
+    /// [`build_stats_struct`].
     #[test]
     fn projected_prunes_leaves_from_real_expected_stats_schema() {
         let table = StructType::new_unchecked([
@@ -1558,7 +1559,7 @@ mod tests {
         let expected = StructType::new_unchecked([
             expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES),
             expected_leaf("s", DataType::STRING, 1, &STAT_CATEGORIES),
-            expected_leaf("v", DataType::unshredded_variant(), 2, &[NULL_COUNT]),
+            expected_leaf("v", DataType::unshredded_variant(), 2, &STAT_CATEGORIES),
         ]);
         assert_eq!(projected, expected);
     }

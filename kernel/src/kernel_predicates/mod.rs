@@ -197,9 +197,9 @@ pub trait KernelPredicateEvaluator {
             }
             Expr::Struct(..)
             | Expr::StructPatch(_)
-            | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Variadic(_)
+            | Expr::ToJson(_)
             | Expr::ParseJson(_)
             | Expr::MapToStruct(_)
             | Expr::Cast(_)
@@ -227,10 +227,10 @@ pub trait KernelPredicateEvaluator {
                 Expr::Predicate(_)
                 | Expr::Struct(..)
                 | Expr::StructPatch(_)
-                | Expr::Unary(_)
                 | Expr::Binary(_)
                 | Expr::Variadic(_)
                 | Expr::Opaque(_)
+                | Expr::ToJson(_)
                 | Expr::ParseJson { .. }
                 | Expr::MapToStruct(_)
                 | Expr::Cast(_)
@@ -664,7 +664,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
             Expr::Literal(value) => Some(value.clone()),
             Expr::Column(name) => self.resolve_column(name),
             Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
-            Expr::Struct(..) | Expr::StructPatch(_) | Expr::Unary(_) => None, // TODO?
+            Expr::Struct(..) | Expr::StructPatch(_) | Expr::ToJson(_) => None, // TODO?
             Expr::Binary(BinaryExpression { op, left, right }) => {
                 let op_fn = match op {
                     BinaryExpressionOp::Plus => Scalar::try_add,

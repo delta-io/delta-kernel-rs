@@ -7,8 +7,7 @@ use delta_kernel::expressions::{
     ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
     JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
     OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    ToJsonExpression, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 
 use super::kernel_visitor::NullTypeTag;
@@ -25,6 +24,12 @@ type VisitVariadicFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitToJsonFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    input_schema: Handle<SharedSchema>,
+);
 type VisitParseJsonFn = extern "C" fn(
     data: *mut c_void,
     sibling_list_id: usize,
@@ -164,11 +169,14 @@ pub struct EngineExpressionVisitor {
     /// Visits a `is_null` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_is_null: VisitUnaryFn,
-    /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
-    /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
-    /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
-    /// particular, timestamps carry exactly three fractional digits, truncated.
-    pub visit_to_json: VisitUnaryFn,
+    /// Visits the `ToJson` expression belonging to the list identified by `sibling_list_id`.
+    /// The sub-expression will be in a _one_ item list identified by `child_list_id`. The
+    /// `input_schema` handle gives the Delta type of every leaf being encoded, which the sub-
+    /// expression's own data does not determine on its own.
+    /// See [`ToJsonExpression`] for the encoding the implementation must produce; in particular,
+    /// timestamps carry exactly three fractional digits, truncated, and a VARIANT encodes as one
+    /// Z85 string rather than a nested object of hex.
+    pub visit_to_json: VisitToJsonFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
@@ -647,14 +655,6 @@ fn visit_expression_impl(
             visit_expression_struct_patch(visitor, patch, sibling_list_id)
         }
         Expression::Predicate(pred) => visit_predicate_impl(visitor, pred, sibling_list_id),
-        Expression::Unary(UnaryExpression { op, expr }) => {
-            let child_list_id = call!(visitor, make_field_list, 1);
-            visit_expression_impl(visitor, expr, child_list_id);
-            let visit_fn = match op {
-                UnaryExpressionOp::ToJson => visitor.visit_to_json,
-            };
-            visit_fn(visitor.data, sibling_list_id, child_list_id);
-        }
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
@@ -680,6 +680,18 @@ fn visit_expression_impl(
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
+        }
+        Expression::ToJson(ToJsonExpression { expr, input_schema }) => {
+            let child_list_id = call!(visitor, make_field_list, 1);
+            visit_expression_impl(visitor, expr, child_list_id);
+            let schema_handle = Handle::from(input_schema.clone());
+            call!(
+                visitor,
+                visit_to_json,
+                sibling_list_id,
+                child_list_id,
+                schema_handle
+            );
         }
         Expression::ParseJson(ParseJsonExpression {
             json_expr,
@@ -907,7 +919,7 @@ mod tests {
     ignore_fn!(ignore_child_list, usize);
     ignore_fn!(ignore_map_literal, usize, usize);
     ignore_fn!(ignore_null, u8, u8, u8);
-    ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
+    ignore_fn!(ignore_json_with_schema, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
     ignore_fn!(ignore_opaque_expr, Handle<SharedOpaqueExpressionOp>, usize);
@@ -940,8 +952,8 @@ mod tests {
             visit_or: ignore_child_list,
             visit_not: ignore_child_list,
             visit_is_null: ignore_child_list,
-            visit_to_json: ignore_child_list,
-            visit_parse_json: ignore_parse_json,
+            visit_to_json: ignore_json_with_schema,
+            visit_parse_json: ignore_json_with_schema,
             visit_map_to_struct,
             visit_lt: ignore_child_list,
             visit_gt: ignore_child_list,

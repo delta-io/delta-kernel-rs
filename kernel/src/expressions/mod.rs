@@ -115,33 +115,6 @@ pub enum BinaryPredicateOp {
     In,
 }
 
-/// A unary expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum UnaryExpressionOp {
-    /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
-    /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
-    /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
-    /// timestamps, whose sub-millisecond precision this operator discards (see below).
-    ///
-    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
-    /// hex rather than base64, two digits per byte in the order the bytes appear, so
-    /// `{ b: 0xABCD, l: [1, 2], n: { z: 7 } }` becomes:
-    ///
-    /// ```text
-    /// {"b":"abcd","l":[1,2],"n":{"z":7}}
-    /// ```
-    ///
-    /// Timestamps must encode with exactly three fractional digits, truncated toward negative
-    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
-    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
-    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
-    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
-    /// prune files that hold matching rows.
-    ///
-    /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
-    ToJson,
-}
-
 /// A binary arithmetic operator over two numeric operands.
 ///
 /// Both operands share a numeric type and the result takes that type. Kernel inserts no implicit
@@ -320,14 +293,6 @@ pub struct BinaryPredicate {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UnaryExpression {
-    /// The operator.
-    pub op: UnaryExpressionOp,
-    /// The input expression.
-    pub expr: Box<Expression>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinaryExpression {
     /// The operator.
     pub op: BinaryExpressionOp,
@@ -345,9 +310,49 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// An expression that encodes a struct as a JSON object string, one string per row: SQL
+/// `to_json(expr)`. The output is STRING, and a NULL input row produces a NULL string rather than
+/// `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except timestamps, whose
+/// sub-millisecond precision this expression discards (see below).
+///
+/// `input_schema` is the kernel schema of `expr`'s output. It is required rather than inferred
+/// because several Delta types share one Arrow representation, so the Arrow data alone does not say
+/// how to encode them. A VARIANT is the case that forces this: it is Arrow
+/// `struct<metadata: binary, value: binary>`, indistinguishable from a user struct of two binaries,
+/// and the stats JSON format demands the two halves be concatenated and Z85-encoded into a single
+/// string rather than written as a nested object of hex.
+///
+/// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase hex
+/// rather than base64, two digits per byte in the order the bytes appear, so
+/// `{ b: 0xABCD, l: [1, 2], n: { z: 7 } }` becomes:
+///
+/// ```text
+/// {"b":"abcd","l":[1,2],"n":{"z":7}}
+/// ```
+///
+/// A VARIANT leaf instead encodes as one Z85 string covering both halves, so
+/// `{ v: Variant { metadata, value } }` becomes `{"v":"<z85>"}`. See [`ParseJsonExpression`] for
+/// the decoding direction.
+///
+/// Timestamps must encode with exactly three fractional digits, truncated toward negative
+/// infinity, because kernel writes `add.stats` with this expression and [Per-file Statistics]
+/// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
+/// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+/// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
+/// prune files that hold matching rows.
+///
+/// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToJsonExpression {
+    /// The expression that evaluates to the struct to encode.
+    pub expr: Box<Expression>,
+    /// The schema of `expr`'s output, naming the Delta type of every leaf to encode.
+    pub input_schema: SchemaRef,
+}
+
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
-/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
-/// that operator discards.
+/// inverse of [`ToJsonExpression`] except for the sub-millisecond timestamp precision that
+/// expression discards.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -506,8 +511,6 @@ pub enum Expression {
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
     #[serde(alias = "Transform")]
     StructPatch(ExpressionStructPatch),
-    /// An expression that takes one expression as input.
-    Unary(UnaryExpression),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
@@ -526,6 +529,10 @@ pub enum Expression {
     /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
     /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
+    /// Encode a struct expression as a JSON object string. Requires the input's kernel schema,
+    /// since Arrow data alone does not say how to encode every Delta type; see
+    /// [`ToJsonExpression`].
+    ToJson(ToJsonExpression),
     /// Parse a JSON string expression into a struct with the given schema. Unparseable input,
     /// which includes an empty string, must yield NULL rather than error; see
     /// [`ParseJsonExpression`].
@@ -602,13 +609,6 @@ impl JunctionPredicateOp {
     }
 }
 
-impl UnaryExpression {
-    pub(crate) fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
-        let expr = Box::new(expr.into());
-        Self { op, expr }
-    }
-}
-
 impl UnaryPredicate {
     pub(crate) fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
@@ -647,6 +647,15 @@ impl VariadicExpression {
     ) -> Self {
         let exprs = exprs.into_iter().map(Into::into).collect();
         Self { op, exprs }
+    }
+}
+
+impl ToJsonExpression {
+    pub(crate) fn new(expr: impl Into<Expression>, input_schema: SchemaRef) -> Self {
+        Self {
+            expr: Box::new(expr.into()),
+            input_schema,
+        }
     }
 }
 
@@ -911,11 +920,6 @@ impl Expression {
         Predicate::distinct(self, other)
     }
 
-    /// Creates a new unary expression
-    pub fn unary(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
-        Self::Unary(UnaryExpression::new(op, expr))
-    }
-
     /// Creates a new binary expression lhs OP rhs
     pub fn binary(
         op: BinaryExpressionOp,
@@ -959,8 +963,15 @@ impl Expression {
         Self::Unknown(name.into())
     }
 
+    /// Creates a new ToJson expression that encodes the struct `expr` produces as a JSON object
+    /// string. `input_schema` is the kernel schema of that struct and is required: it names the
+    /// Delta type of each leaf, which the Arrow data alone does not. See [`ToJsonExpression`].
+    pub fn to_json(expr: impl Into<Expression>, input_schema: SchemaRef) -> Self {
+        Self::ToJson(ToJsonExpression::new(expr, input_schema))
+    }
+
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
+    /// This is the inverse of [`ToJsonExpression`] - it converts a JSON-encoded string
     /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
     /// `ToJson` truncates it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
@@ -1157,15 +1168,6 @@ impl PartialEq for OpaqueExpression {
     }
 }
 
-impl Display for UnaryExpressionOp {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use UnaryExpressionOp::*;
-        match self {
-            ToJson => write!(f, "TO_JSON"),
-        }
-    }
-}
-
 impl Display for BinaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use BinaryExpressionOp::*;
@@ -1247,7 +1249,6 @@ impl Display for Expression {
                 }
                 write!(f, ")")
             }
-            Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
@@ -1256,6 +1257,14 @@ impl Display for Expression {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
             Unknown(name) => write!(f, "<unknown: {name}>"),
+            ToJson(t) => {
+                write!(
+                    f,
+                    "TO_JSON({}, <schema:{} fields>)",
+                    t.expr,
+                    t.input_schema.fields().len()
+                )
+            }
             ParseJson(p) => {
                 write!(
                     f,
@@ -1499,9 +1508,8 @@ mod tests {
         use crate::expressions::{
             col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
             Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
-            UnaryExpressionOp,
         };
-        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::schema::{schema_ref, ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
@@ -1611,8 +1619,11 @@ mod tests {
         // ==================== Expression Operations Tests ====================
 
         #[test]
-        fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
+        fn test_to_json_expression_roundtrip() {
+            let expr = Expression::to_json(
+                col!("data"),
+                schema_ref! { nullable "a": LONG, nullable "b": STRING },
+            );
             assert_roundtrip(&expr);
         }
 

@@ -19,7 +19,6 @@ use crate::committer::{
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
-use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
     ExpressionStructPatchBuilder,
@@ -287,6 +286,19 @@ impl<S> std::fmt::Debug for Transaction<S> {
     }
 }
 
+/// The schema of `schema`'s `name` field, which must be a struct.
+///
+/// `ToJson` needs the kernel schema of the struct it encodes, and for file metadata that schema is
+/// whatever the engine declared for the field.
+fn stats_schema(schema: &StructType, name: &str) -> DeltaResult<SchemaRef> {
+    match schema.field(name).map(StructField::data_type) {
+        Some(DataType::Struct(stats_schema)) => Ok(Arc::new(stats_schema.as_ref().clone())),
+        _ => Err(Error::Schema(format!(
+            "file metadata field `{name}` must be a struct"
+        ))),
+    }
+}
+
 /// Builds the projection for converting add file metadata into commit-ready Add actions.
 fn build_add_action_projection(
     input_schema: &StructType,
@@ -301,7 +313,7 @@ fn build_add_action_projection(
         .replace(
             "stats",
             StructField::nullable("stats", DataType::STRING),
-            Expression::unary(ToJson, col!("stats")),
+            Expression::to_json(col!("stats"), stats_schema(input_schema, "stats")?),
         )
         .build()?;
     let patch = Expression::struct_from([patch]);
@@ -1544,13 +1556,19 @@ impl<S> Transaction<S> {
             .flat_map(|schema| schema.fields().map(|field| field.name().to_owned()))
             .collect();
 
+        // `ToJson` needs the schema of the `stats_parsed` it re-serializes. The input schema does
+        // not carry it (see the TODO above), so derive the table's own stats schema.
+        let stats_schema = self
+            .effective_table_config
+            .build_expected_stats_schemas(self.physical_clustering_columns.as_deref(), None)?
+            .physical;
         let make_eval = |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
                 self.data_change,
                 &columns_to_drop,
-                coalesce_stats_with_parsed,
+                coalesce_stats_with_parsed.then_some(&stats_schema),
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
@@ -1600,7 +1618,7 @@ fn build_remove_struct_patch(
     commit_timestamp: i64,
     data_change: bool,
     columns_to_drop: &[&str],
-    coalesce_stats_with_parsed: bool,
+    stats_parsed_schema: Option<&SchemaRef>,
 ) -> DeltaResult<ExpressionStructPatch> {
     // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
     // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
@@ -1620,11 +1638,11 @@ fn build_remove_struct_patch(
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
         );
 
-    if coalesce_stats_with_parsed {
+    if let Some(stats_parsed_schema) = stats_parsed_schema {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             col!("stats"),
-            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
+            Expression::to_json(col!(STATS_PARSED_NAME), stats_parsed_schema.clone()),
         ]);
         patch = patch
             .replace("stats", coalesce_stats)
@@ -2086,10 +2104,10 @@ mod tests {
     #[test]
     fn test_remove_action_projection_sets_extended_metadata() -> DeltaResult<()> {
         let patch = build_remove_struct_patch(
-            0,     /* commit_timestamp */
-            true,  /* data_change */
-            &[],   /* columns_to_drop */
-            false, /* coalesce_stats_with_parsed */
+            0,    /* commit_timestamp */
+            true, /* data_change */
+            &[],  /* columns_to_drop */
+            None, /* stats_parsed_schema */
         )?;
         let path_patch = patch
             .field_patches
