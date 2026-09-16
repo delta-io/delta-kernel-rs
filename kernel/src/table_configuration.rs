@@ -704,10 +704,10 @@ impl TableConfiguration {
         }
     }
 
-    /// Validates the table protocol for the requested operation.
+    /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
+    /// the protocol's features are all supported for the requested operation type.
     ///
-    /// - For `SnapshotLoad`: checks the reader version, feature support, and requirements
-    /// - For `Scan` and `Cdf`: checks the reader version, feature support, and requirements
+    /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
@@ -1842,7 +1842,7 @@ mod test {
 
     #[cfg(not(feature = "geo-type-in-dev"))]
     #[rstest]
-    fn geospatial_is_not_supported_without_cargo_feature(
+    fn test_geospatial_not_supported_without_cargo_feature(
         #[values(
             Operation::SnapshotLoad,
             Operation::Scan,

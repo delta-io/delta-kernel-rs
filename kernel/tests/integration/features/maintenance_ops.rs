@@ -111,24 +111,6 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
 }
 
 #[rstest]
-#[case::unknown_reader_writer_no_spec(&["futureFeature"], &["futureFeature"], None)]
-#[case::unknown_reader_writer_v1(
-    &["futureFeature"],
-    &["futureFeature"],
-    Some(CheckpointSpec::V1)
-)]
-#[case::unknown_reader_writer_v2(
-    &["v2Checkpoint", "futureFeature"],
-    &["v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
-)]
-#[case::unknown_reader_writer_v2_sidecar(
-    &["v2Checkpoint", "futureFeature"],
-    &["v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-        file_actions_per_sidecar_hint: None,
-    }))
-)]
 #[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None)]
 #[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1))]
 #[case::unknown_writer_only_v2(
@@ -139,28 +121,6 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
 #[case::unknown_writer_only_v2_sidecar(
     &["v2Checkpoint"],
     &["v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-        file_actions_per_sidecar_hint: None,
-    }))
-)]
-#[case::mixed_reader_writer_no_spec(
-    &["deletionVectors", "futureFeature"],
-    &["deletionVectors", "futureFeature"],
-    None
-)]
-#[case::mixed_reader_writer_v1(
-    &["deletionVectors", "futureFeature"],
-    &["deletionVectors", "futureFeature"],
-    Some(CheckpointSpec::V1)
-)]
-#[case::mixed_reader_writer_v2(
-    &["deletionVectors", "v2Checkpoint", "futureFeature"],
-    &["deletionVectors", "v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
-)]
-#[case::mixed_reader_writer_v2_sidecar(
-    &["deletionVectors", "v2Checkpoint", "futureFeature"],
-    &["deletionVectors", "v2Checkpoint", "futureFeature"],
     Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: None,
     }))
@@ -188,7 +148,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
     }))
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_load_and_maintenance_writes_reject_unsupported_table_features(
+async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
@@ -230,12 +190,7 @@ async fn snapshot_load_and_maintenance_writes_reject_unsupported_table_features(
     .join("\n");
     add_commit(table_url.as_str(), &store, 0, commit).await?;
 
-    let snapshot_result = Snapshot::builder_for(table_url).build(engine.as_ref());
-    if reader_features.contains(&"futureFeature") {
-        assert_result_error_with_message(snapshot_result, "futureFeature");
-        return Ok(());
-    }
-    let snapshot = snapshot_result?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let checkpoint_result = snapshot
         .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());

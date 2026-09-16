@@ -144,6 +144,85 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
     Ok(())
 }
 
+#[rstest]
+#[case::supported(SnapshotLoadFeatureCase {
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors"],
+    unsupported_feature: None,
+})]
+#[case::unknown_reader(SnapshotLoadFeatureCase {
+    reader_features: &["futureFeature"],
+    writer_features: &["futureFeature"],
+    unsupported_feature: Some("futureFeature"),
+})]
+#[case::mixed_reader(SnapshotLoadFeatureCase {
+    reader_features: &["deletionVectors", "futureFeature"],
+    writer_features: &["deletionVectors", "futureFeature"],
+    unsupported_feature: Some("futureFeature"),
+})]
+#[case::unknown_writer_only(SnapshotLoadFeatureCase {
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors", "futureFeature"],
+    unsupported_feature: None,
+})]
+#[cfg_attr(
+    not(feature = "adaptive-metadata-in-dev"),
+    case::adaptive_metadata(SnapshotLoadFeatureCase {
+        reader_features: &["adaptiveMetadata-preview"],
+        writer_features: &["adaptiveMetadata-preview"],
+        unsupported_feature: Some("adaptiveMetadata-preview"),
+    })
+)]
+#[tokio::test]
+async fn snapshot_load_rejects_unsupported_reader_features(
+    #[case] case: SnapshotLoadFeatureCase,
+    #[values(false, true)] incremental: bool,
+    #[values(false, true)] time_travel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_url) = engine_store_setup("snapshot_feature_validation", None);
+    create_table(
+        table_url.as_str(),
+        schema_ref! { nullable "id": INTEGER },
+        "test_engine",
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?
+    .unwrap_committed();
+    let base = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
+    assert_eq!(base.version(), 0);
+
+    // Unsupported features cannot be introduced through Kernel's write APIs.
+    let commit = json!({
+        "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": case.reader_features,
+            "writerFeatures": case.writer_features,
+        }
+    });
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit.to_string()).await?;
+
+    let result = match (incremental, time_travel) {
+        (false, false) => Snapshot::builder_for(table_url.as_str()).build(&engine),
+        (false, true) => Snapshot::builder_for(table_url.as_str())
+            .at_version(1)
+            .build(&engine),
+        (true, false) => Snapshot::builder_from(base).build(&engine),
+        (true, true) => Snapshot::builder_from(base).at_version(1).build(&engine),
+    };
+    if let Some(feature) = case.unsupported_feature {
+        assert_result_error_with_message(result, &format!("Feature '{feature}' is not supported"));
+    } else {
+        assert_eq!(result?.version(), 1);
+    }
+
+    let original = Snapshot::builder_for(table_url.as_str())
+        .at_version(0)
+        .build(&engine)?;
+    assert_eq!(original.version(), 0);
+    Ok(())
+}
+
 /// The version-preserving derivations `checkpoint`, `write_checksum`, and `publish` inherit the
 /// source snapshot's `built_as_latest`, while a post-commit advance is always latest.
 #[rstest]
@@ -241,4 +320,10 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     );
 
     Ok(())
+}
+
+struct SnapshotLoadFeatureCase {
+    reader_features: &'static [&'static str],
+    writer_features: &'static [&'static str],
+    unsupported_feature: Option<&'static str>,
 }

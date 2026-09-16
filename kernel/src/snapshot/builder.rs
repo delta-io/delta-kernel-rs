@@ -362,9 +362,6 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
     ///
-    /// A successful build confirms that Kernel supports loading the table state. APIs that scan
-    /// or modify the table validate support for those operations separately.
-    ///
     /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
     /// [`MetricEvent::SnapshotBuildFailure`].
     ///

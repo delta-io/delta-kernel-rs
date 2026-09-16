@@ -234,7 +234,7 @@ pub(crate) enum EnablementCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum Operation {
-    /// Loading table state into a snapshot.
+    /// Create a [`Snapshot`](crate::Snapshot) on the table.
     SnapshotLoad,
     /// Read operations on regular table data
     Scan,
@@ -299,8 +299,8 @@ pub(crate) struct FeatureInfo {
     /// Note: `kernel_support` validation depends on `feature_type`:
     /// WriterOnly features: Only checked during `Operation::Write`
     /// ReaderWriter features: Checked during every operation
-    /// Snapshot loads and read operations only validate reader features, so they do not invoke
-    /// `kernel_support` for WriterOnly features.
+    /// Read operations (SnapshotLoad, Scan, Cdf) only validate reader features, so they do not
+    /// invoke `kernel_support` for WriterOnly features.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
@@ -365,9 +365,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::SnapshotLoad | Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
