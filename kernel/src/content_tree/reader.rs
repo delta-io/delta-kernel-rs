@@ -11,7 +11,8 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::{ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
 use crate::content_tree::{
     struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, TrackingStatus, CONTENT_TYPE,
-    FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, SEQUENCE_NUMBER, TRACKING, TRACKING_STATUS,
+    DV_INFO, DV_SNAPSHOT_ID, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, SEQUENCE_NUMBER, TRACKING,
+    TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ColumnName, Expression, MapData, Scalar};
@@ -45,7 +46,8 @@ const DATA_CHANGE: &str = "dataChange";
 /// AMT write path ([`super::builder`]).
 ///
 /// # Errors
-/// Returns an error if a row carries an unknown tracking-status value, if the evaluator cannot be
+/// Returns an error if a row carries an unknown tracking-status value, if a selected (live `Data`)
+/// entry carries a deletion vector (not yet supported by the read path), if the evaluator cannot be
 /// constructed or fails to evaluate, or if the selection vector length exceeds the batch.
 pub(crate) fn convert_root_entries_to_add_actions(
     engine: &dyn Engine,
@@ -111,16 +113,13 @@ fn build_entry_to_add_expression() -> DeltaResult<Expression> {
             }
             _ => return None,
         })
-    });
+    })?;
 
-    // LOG_ADD_SCHEMA is a single non-null `add` field wrapping the action struct.
-    Ok(struct_expr_from_schema(
-        &LOG_ADD_SCHEMA,
-        |name| match name {
-            ADD_NAME => Some(add.clone()),
-            _ => None,
-        },
-    ))
+    // LOG_ADD_SCHEMA is a single `add` field wrapping the action struct.
+    struct_expr_from_schema(&LOG_ADD_SCHEMA, |name| match name {
+        ADD_NAME => Some(add.clone()),
+        _ => None,
+    })
 }
 
 /// The [`MapType`] of `Add.partitionValues`, read from the action schema so callers match its
@@ -140,6 +139,10 @@ fn partition_values_map_type() -> DeltaResult<MapType> {
 /// Builds the selection vector picking the entries that become `Add` actions: a live
 /// ([`TrackingStatus::is_live`]) [`DataContentType::Data`] entry is selected; any other entry is
 /// not.
+///
+/// Errors on a selected entry that carries a deletion vector: the read path does not yet populate
+/// `Add.deletionVector`, so emitting such an entry as a DV-less `Add` would read its logically
+/// deleted rows back as live. Rejecting is conservative until the read path threads DV info across.
 #[derive(Default)]
 struct AddSelectionVisitor {
     selection: Vec<bool>,
@@ -152,8 +155,17 @@ impl RowVisitor for AddSelectionVisitor {
                 vec![
                     ColumnName::new([CONTENT_TYPE]),
                     ColumnName::new([TRACKING, TRACKING_STATUS]),
+                    // `deletionVector.location` is a required field of the DV sub-struct, so it
+                    // reads null iff the `deletionVector` struct itself is null.
+                    ColumnName::new([DV_INFO, LOCATION]),
+                    ColumnName::new([TRACKING, DV_SNAPSHOT_ID]),
                 ],
-                vec![DataType::INTEGER, DataType::INTEGER],
+                vec![
+                    DataType::INTEGER,
+                    DataType::INTEGER,
+                    DataType::STRING,
+                    DataType::LONG,
+                ],
             )
                 .into()
         });
@@ -171,6 +183,19 @@ impl RowVisitor for AddSelectionVisitor {
             } else {
                 false
             };
+            if selected {
+                let dv_location: Option<&str> = getters[2].get_opt(row, LOCATION)?;
+                let dv_snapshot_id: Option<i64> = getters[3].get_opt(row, DV_SNAPSHOT_ID)?;
+                if let Some(field) = dv_location
+                    .map(|_| DV_INFO)
+                    .or_else(|| dv_snapshot_id.map(|_| DV_SNAPSHOT_ID))
+                {
+                    return Err(Error::unsupported(format!(
+                        "AMT content-tree read path does not yet support a live entry with a \
+                         deletion vector (non-null '{field}')"
+                    )));
+                }
+            }
             self.selection.push(selected);
         }
         Ok(())
@@ -179,11 +204,14 @@ impl RowVisitor for AddSelectionVisitor {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
-    use crate::content_tree::{DataFileFormat, ManifestInfo, TrackingInfo};
+    use crate::content_tree::{DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     /// AMT/Iceberg format version stamped on entries; irrelevant to the `Add` output but required
     /// to build a well-formed [`ContentTreeNodeEntry`].
@@ -347,6 +375,48 @@ mod tests {
             out.try_into_record_batch().unwrap(),
             expected.try_into_record_batch().unwrap()
         );
+    }
+
+    #[rstest]
+    #[case(TrackingStatus::Existing, true)]
+    #[case(TrackingStatus::Added, true)]
+    #[case(TrackingStatus::Modified, true)]
+    #[case(TrackingStatus::Deleted, false)]
+    #[case(TrackingStatus::Replaced, false)]
+    fn selects_only_live_data_entries(#[case] status: TrackingStatus, #[case] kept: bool) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
+                .unwrap(),
+        );
+        assert_eq!(out.len(), usize::from(kept));
+    }
+
+    #[rstest]
+    #[case::deletion_vector_struct(true, false)]
+    #[case::dv_snapshot_id(false, true)]
+    fn live_entry_with_deletion_vector_errors(
+        #[case] set_deletion_vector: bool,
+        #[case] set_dv_snapshot_id: bool,
+    ) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        if set_deletion_vector {
+            entry.deletion_vector = Some(DeletionVectorInfo {
+                location: "dv.bin".to_string(),
+                offset: 0,
+                size_in_bytes: 1,
+                cardinality: 1,
+            });
+        }
+        if set_dv_snapshot_id {
+            entry.tracking.dv_snapshot_id = Some(1);
+        }
+        let result =
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
+        assert_result_error_with_message(result, "deletion vector");
     }
 
     #[test]

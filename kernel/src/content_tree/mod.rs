@@ -43,6 +43,7 @@ pub(crate) const TAGS: &str = "tags";
 /// Field names within the [`TrackingInfo`] sub-struct that the write path populates.
 pub(crate) const TRACKING_STATUS: &str = "status";
 pub(crate) const TRACKING_SNAPSHOT_ID: &str = "snapshotId";
+pub(crate) const DV_SNAPSHOT_ID: &str = "dvSnapshotId";
 pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
 pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
 pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
@@ -379,35 +380,62 @@ pub(crate) struct ManifestInfo {
 // === Helpers ===
 
 /// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
-/// for a named field; unmatched fields (those returning `None`) become typed null literals, so the
-/// result matches the schema in field order and type.
+/// for a named field; unmatched nullable fields (those returning `None`) become typed null
+/// literals, so the result matches the schema in field order and type.
 ///
 /// Shared by the AMT write path ([`builder`], write-metadata -> entry) and the AMT read path
 /// ([`reader`], entry -> `Add` action), which both assemble a schema-shaped struct from a subset of
 /// projected fields.
+///
+/// # Errors
+/// Returns an error if `project` returns `None` for a non-nullable field, which would otherwise
+/// silently emit a null typed to a required field.
 pub(super) fn struct_expr_from_schema(
     schema: &StructType,
     project: impl Fn(&str) -> Option<Expression>,
-) -> Expression {
-    Expression::struct_from(schema.fields().map(|field| {
-        project(field.name().as_str()).unwrap_or_else(|| {
-            // A missing projection must only ever fall back to null for a nullable field; a
-            // required field with no projection would silently become a null of a non-nullable
-            // type.
-            debug_assert!(
-                field.is_nullable(),
-                "no projection for required field {}",
+) -> DeltaResult<Expression> {
+    let fields = schema
+        .fields()
+        .map(|field| match project(field.name().as_str()) {
+            Some(expr) => Ok(expr),
+            None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
+            None => Err(Error::generic(format!(
+                "struct_expr_from_schema: no projection for required field '{}'",
                 field.name()
-            );
-            null_lit(field.data_type().clone())
+            ))),
         })
-    }))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(Expression::struct_from(fields))
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
+
+    #[rstest]
+    #[case(0, TrackingStatus::Existing)]
+    #[case(1, TrackingStatus::Added)]
+    #[case(2, TrackingStatus::Deleted)]
+    #[case(3, TrackingStatus::Replaced)]
+    #[case(4, TrackingStatus::Modified)]
+    fn tracking_status_try_from_repr_roundtrips(
+        #[case] repr: i32,
+        #[case] expected: TrackingStatus,
+    ) {
+        assert_eq!(TrackingStatus::try_from_repr(repr).unwrap(), expected);
+        assert_eq!(expected as i32, repr);
+    }
+
+    #[rstest]
+    #[case(5)]
+    #[case(-1)]
+    #[case(i32::MAX)]
+    fn tracking_status_try_from_repr_rejects_unknown(#[case] repr: i32) {
+        assert!(TrackingStatus::try_from_repr(repr).is_err());
+    }
 
     /// The `ContentTreeNodeEntry` Parquet field IDs and nullability are a protocol contract. This
     /// pins the name, field ID, and nullability of every field in `to_schema()` so an accidental
