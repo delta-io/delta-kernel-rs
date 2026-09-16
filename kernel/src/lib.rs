@@ -71,6 +71,9 @@
 #[allow(unused_extern_crates)]
 extern crate self as delta_kernel;
 
+/// The semantic version of this Delta Kernel build.
+pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::any::Any;
 use std::cmp::Ordering;
 use std::fs::DirEntry;

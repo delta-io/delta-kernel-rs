@@ -367,6 +367,18 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
 /// function is that `kernel_str` is _only_ valid until the return from this function
 pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
 
+static KERNEL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+
+/// Get the semantic version of the linked Delta Kernel library as a null-terminated C string.
+///
+/// The returned pointer is borrowed, must not be modified or freed, and remains valid until the
+/// dynamic library is unloaded. Callers that need to retain the version across library unloads
+/// must copy the string.
+#[no_mangle]
+pub extern "C" fn kernel_version() -> *const c_char {
+    KERNEL_VERSION.as_ptr().cast()
+}
+
 /// An opaque type that rust will understand as a string. This can be obtained by calling
 /// [`allocate_kernel_string`] with a [`KernelStringSlice`]
 #[handle_descriptor(target=String, mutable=true, sized=true)]
@@ -2105,6 +2117,7 @@ impl<T> Default for ReferenceSet<T> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ffi::CStr;
     use std::ptr::NonNull;
 
     use delta_kernel::object_store::memory::InMemory;
@@ -2133,6 +2146,13 @@ mod tests {
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
         std::ptr::null_mut()
+    }
+
+    #[test]
+    fn kernel_version_returns_null_terminated_package_version() {
+        let version = unsafe { CStr::from_ptr(kernel_version()) };
+
+        assert_eq!(version.to_bytes(), delta_kernel::KERNEL_VERSION.as_bytes());
     }
 
     #[derive(Default)]

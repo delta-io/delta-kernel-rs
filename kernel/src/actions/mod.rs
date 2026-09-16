@@ -31,7 +31,6 @@ use crate::utils::require;
 use crate::{create_row, Engine};
 use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _};
 
-const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub(crate) const ROW_TRACKING_PRESERVED_TAG: &str = "delta.rowTracking.preserved";
@@ -919,7 +918,7 @@ impl CommitInfo {
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
             operation_metrics: None,
-            kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            kernel_version: Some(format!("v{}", crate::KERNEL_VERSION)),
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
