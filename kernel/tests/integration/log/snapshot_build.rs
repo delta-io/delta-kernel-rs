@@ -148,29 +148,29 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
 #[case::supported(SnapshotLoadFeatureCase {
     reader_features: &["deletionVectors"],
     writer_features: &["deletionVectors"],
-    unsupported_feature: None,
+    expected_error: None,
 })]
 #[case::unknown_reader(SnapshotLoadFeatureCase {
     reader_features: &["futureFeature"],
     writer_features: &["futureFeature"],
-    unsupported_feature: Some("futureFeature"),
+    expected_error: Some("Feature 'futureFeature' is not supported"),
 })]
 #[case::mixed_reader(SnapshotLoadFeatureCase {
     reader_features: &["deletionVectors", "futureFeature"],
     writer_features: &["deletionVectors", "futureFeature"],
-    unsupported_feature: Some("futureFeature"),
+    expected_error: Some("Feature 'futureFeature' is not supported"),
 })]
 #[case::unknown_writer_only(SnapshotLoadFeatureCase {
     reader_features: &["deletionVectors"],
     writer_features: &["deletionVectors", "futureFeature"],
-    unsupported_feature: None,
+    expected_error: None,
 })]
 #[cfg_attr(
     not(feature = "adaptive-metadata-in-dev"),
     case::adaptive_metadata(SnapshotLoadFeatureCase {
         reader_features: &["adaptiveMetadata-preview"],
         writer_features: &["adaptiveMetadata-preview"],
-        unsupported_feature: Some("adaptiveMetadata-preview"),
+        expected_error: Some("Feature 'adaptiveMetadata-preview' is not supported"),
     })
 )]
 #[tokio::test]
@@ -210,8 +210,8 @@ async fn snapshot_load_rejects_unsupported_reader_features(
         (true, false) => Snapshot::builder_from(base).build(&engine),
         (true, true) => Snapshot::builder_from(base).at_version(1).build(&engine),
     };
-    if let Some(feature) = case.unsupported_feature {
-        assert_result_error_with_message(result, &format!("Feature '{feature}' is not supported"));
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
     } else {
         assert_eq!(result?.version(), 1);
     }
@@ -325,5 +325,5 @@ async fn built_as_latest_on_fresh_and_incremental_build(
 struct SnapshotLoadFeatureCase {
     reader_features: &'static [&'static str],
     writer_features: &'static [&'static str],
-    unsupported_feature: Option<&'static str>,
+    expected_error: Option<&'static str>,
 }
