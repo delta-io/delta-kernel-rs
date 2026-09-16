@@ -16,6 +16,8 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{BackReference, LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -40,6 +42,8 @@ use crate::table_features::{
 };
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::{current_time_ms, require};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -113,6 +117,8 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -240,6 +246,16 @@ impl Transaction {
             ));
         }
         self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        Ok(self)
+    }
+
+    /// Stages `file` to be committed as the table's root manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
+        let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+            Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+        })?;
+        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
         Ok(self)
     }
 
