@@ -15,17 +15,14 @@ bool metadata_result_succeeded(ExternResultbool result)
   return false;
 }
 
-bool visit_schema_item_metadata(void* metadata, KernelMetadataVisitorState* state)
+bool visit_schema_item_metadata(void* metadata, CMetadataMap* state)
 {
   SchemaItem* item = metadata;
   if (item->column_mapping_id) {
-    char* end = NULL;
-    int64_t id = strtoll(item->column_mapping_id, &end, 10);
-    if (!end || end == item->column_mapping_id || *end != '\0') {
-      return false;
-    }
     KernelStringSlice key = { "delta.columnMapping.id", strlen("delta.columnMapping.id") };
-    if (!metadata_result_succeeded(visit_metadata_number(state, key, id, allocate_error))) {
+    KernelStringSlice value = { item->column_mapping_id, strlen(item->column_mapping_id) };
+    if (!metadata_result_succeeded(
+          visit_metadata_value(state, key, MetadataNumber, value, allocate_error))) {
       return false;
     }
   }
@@ -36,7 +33,8 @@ bool visit_schema_item_metadata(void* metadata, KernelMetadataVisitorState* stat
     KernelStringSlice value = {
       item->column_mapping_physical_name, strlen(item->column_mapping_physical_name)
     };
-    if (!metadata_result_succeeded(visit_metadata_string(state, key, value, allocate_error))) {
+    if (!metadata_result_succeeded(
+          visit_metadata_value(state, key, MetadataString, value, allocate_error))) {
       return false;
     }
   }
