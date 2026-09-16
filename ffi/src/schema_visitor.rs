@@ -52,6 +52,8 @@ pub struct KernelSchemaVisitorState {
 #[repr(C)]
 pub struct EngineMetadata {
     /// Opaque engine-owned metadata representation, borrowed for the callback duration.
+    /// The callback may mutate the engine-owned metadata context; Kernel only forwards the
+    /// pointer.
     pub metadata: *mut c_void,
     /// Visits metadata values into the provided state and reports whether the visit succeeded.
     pub visitor: extern "C" fn(metadata: *mut c_void, state: &mut CMetadataMap) -> bool,
@@ -61,7 +63,8 @@ pub struct EngineMetadata {
 ///
 /// Numbers are signed decimal `i64` values, strings are passed through without JSON decoding, and
 /// Booleans must be `true` or `false`. JSON integers in the `i64` range, strings, and Booleans
-/// become typed metadata values; other JSON values remain opaque JSON.
+/// become typed metadata values; other JSON values remain opaque JSON. Prefer the matching typed
+/// kind when available; use `MetadataJson` for values without a typed variant.
 ///
 /// Returns `Ok(true)` after insertion. Invalid UTF-8, numeric text, or JSON returns an allocated
 /// `Utf8Error`, `ParseIntError`, or `MalformedJsonError`, respectively. Invalid Boolean text and
@@ -87,7 +90,7 @@ pub unsafe extern "C" fn visit_metadata_value(
         .into_extern_result(&allocate_error)
 }
 
-fn visit_engine_metadata_impl(
+fn visit_engine_metadata(
     engine_metadata: Option<&EngineMetadata>,
 ) -> DeltaResult<HashMap<String, MetadataValue>> {
     let Some(engine_metadata) = engine_metadata else {
@@ -197,7 +200,7 @@ pub unsafe extern "C" fn visit_field_string(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -218,7 +221,7 @@ pub unsafe extern "C" fn visit_field_long(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -239,7 +242,7 @@ pub unsafe extern "C" fn visit_field_integer(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -260,7 +263,7 @@ pub unsafe extern "C" fn visit_field_short(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -281,7 +284,7 @@ pub unsafe extern "C" fn visit_field_byte(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -302,7 +305,7 @@ pub unsafe extern "C" fn visit_field_float(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -323,7 +326,7 @@ pub unsafe extern "C" fn visit_field_double(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -344,7 +347,7 @@ pub unsafe extern "C" fn visit_field_boolean(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -365,7 +368,7 @@ pub unsafe extern "C" fn visit_field_binary(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -386,7 +389,7 @@ pub unsafe extern "C" fn visit_field_date(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -407,7 +410,7 @@ pub unsafe extern "C" fn visit_field_timestamp(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
         name_str,
@@ -434,7 +437,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
         name_str,
@@ -461,7 +464,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
         name_str,
@@ -488,7 +491,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
         name_str,
@@ -515,7 +518,7 @@ pub unsafe extern "C" fn visit_field_void(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -539,7 +542,7 @@ pub unsafe extern "C" fn visit_field_decimal(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_decimal_impl(state, name_str, precision, scale, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -593,7 +596,7 @@ pub unsafe extern "C" fn visit_field_struct(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
     visit_field_struct_impl(state, name_str, field_ids, nullable, metadata)
@@ -651,7 +654,7 @@ pub unsafe extern "C" fn visit_field_array(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_array_impl(state, name_str, element_type_id, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
@@ -699,7 +702,7 @@ pub unsafe extern "C" fn visit_field_map(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_map_impl(
         state,
         name_str,
@@ -761,7 +764,7 @@ pub unsafe extern "C" fn visit_field_variant(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let metadata = visit_engine_metadata_impl(unsafe { metadata.as_ref() });
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_variant_impl(state, name_str, variant_struct_id, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
