@@ -16,6 +16,7 @@ use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
+use delta_kernel::table_properties::ParquetWriterConfig;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
@@ -218,6 +219,7 @@ pub struct DefaultEngineBuilder<E> {
     /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
@@ -243,17 +245,31 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
             object_store,
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
+            parquet_writer_config: Default::default(),
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            task_executor,
+            self.io_config,
+            self.parquet_writer_config,
+        )
     }
 }
 
 impl<E> DefaultEngineBuilder<E> {
+    /// Set a custom Parquet writer configuration for all writes performed by this engine.
+    ///
+    /// Controls the compression codec used for all Parquet writes. Defaults to Zstd.
+    pub fn with_parquet_writer_config(mut self, config: ParquetWriterConfig) -> Self {
+        self.parquet_writer_config = config;
+        self
+    }
+
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
@@ -265,6 +281,7 @@ impl<E> DefaultEngineBuilder<E> {
             object_store: self.object_store,
             task_executor,
             io_config: self.io_config,
+            parquet_writer_config: self.parquet_writer_config,
         }
     }
 
@@ -293,7 +310,12 @@ impl<E> DefaultEngineBuilder<E> {
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor,
+            self.io_config,
+            self.parquet_writer_config,
+        )
     }
 }
 
@@ -313,20 +335,24 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         io_config: ReadIoConfig,
+        parquet_writer_config: ParquetWriterConfig,
     ) -> Self {
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
             task_executor.clone(),
         ));
-
         let buffer_size = io_config.buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE);
         let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
         let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);
-        let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
-            .with_buffer_size(buffer_size)
-            .with_batch_size(batch_size);
+        let parquet = DefaultParquetHandler::new(
+            object_store.clone(),
+            task_executor.clone(),
+            parquet_writer_config,
+        )
+        .with_buffer_size(buffer_size)
+        .with_batch_size(batch_size);
         let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
         let raw_parquet = Arc::new(parquet);
         Self {

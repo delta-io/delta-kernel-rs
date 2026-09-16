@@ -10,11 +10,14 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::{reader_options, writer_options};
+use crate::engine::reader_options;
 use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
+use crate::parquet::basic::Compression;
+use crate::parquet::file::properties::WriterProperties;
 use crate::schema::{SchemaRef, StructType};
+use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::utils::FoldWithOption as _;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
@@ -23,12 +26,38 @@ use crate::{
 
 pub(crate) struct SyncParquetHandler {
     store: Option<Arc<DynObjectStore>>,
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 impl SyncParquetHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
+    pub(crate) fn new(
+        store: Option<Arc<DynObjectStore>>,
+        parquet_writer_config: ParquetWriterConfig,
+    ) -> Self {
+        Self {
+            store,
+            parquet_writer_config,
+        }
     }
+}
+
+impl From<ParquetCompression> for Compression {
+    fn from(c: ParquetCompression) -> Self {
+        match c {
+            ParquetCompression::Snappy => Compression::SNAPPY,
+            ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
+            ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
+        }
+    }
+}
+
+fn writer_options_with_config(config: &ParquetWriterConfig) -> ArrowWriterOptions {
+    let props = WriterProperties::builder()
+        .set_compression(config.compression.into())
+        .build();
+    ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_skip_arrow_metadata(true)
 }
 
 pub(super) fn try_create_from_parquet(
@@ -100,11 +129,9 @@ impl ParquetHandler for SyncParquetHandler {
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
         let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut buf,
-            first_record_batch.schema(),
-            writer_options(),
-        )?;
+        let options = writer_options_with_config(&self.parquet_writer_config);
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut buf, first_record_batch.schema(), options)?;
         writer.write(&first_record_batch)?;
         for result in data {
             let engine_data = result?;
@@ -165,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler::new(None);
+        let handler = SyncParquetHandler::new(None, Default::default());
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -223,8 +250,82 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_write_parquet_file_with_filter() {
+        let handler = SyncParquetHandler::new(None, Default::default());
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_filtered.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "id",
+                    Arc::new(Int64Array::from(vec![1, 3, 5])) as Arc<dyn Array>,
+                ),
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec!["a", "c", "e"])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        let data_iter: Box<
+            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
+        > = Box::new(std::iter::once(Ok(engine_data)));
+
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        assert!(file_path.exists());
+
+        let file = File::open(&file_path).unwrap();
+        let reader =
+            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap();
+        let schema = reader.schema().clone();
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let mut result = handler
+            .read_parquet_files(
+                &[file_meta],
+                Arc::new(schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap();
+
+        let engine_data = result.next().unwrap().unwrap();
+        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
+        let record_batch = batch.record_batch();
+
+        assert_eq!(record_batch.num_rows(), 3);
+        assert_eq!(record_batch.num_columns(), 2);
+
+        let id_col = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[1, 3, 5]);
+
+        let name_col = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "a");
+        assert_eq!(name_col.value(1), "c");
+        assert_eq!(name_col.value(2), "e");
+
+        assert!(result.next().is_none());
+    }
+
+    #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
-        let handler = SyncParquetHandler::new(None);
+        let handler = SyncParquetHandler::new(None, Default::default());
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_multi_batch.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -295,7 +396,7 @@ mod tests {
 
     #[test]
     fn write_parquet_creates_parent_directories() {
-        let handler = SyncParquetHandler::new(None);
+        let handler = SyncParquetHandler::new(None, Default::default());
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("a/b/c/test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -309,7 +410,7 @@ mod tests {
     #[test]
     fn parquet_store_write_and_footer_roundtrip() {
         let store = Arc::new(crate::object_store::memory::InMemory::new());
-        let handler = SyncParquetHandler::new(Some(store));
+        let handler = SyncParquetHandler::new(Some(store), Default::default());
         let url = Url::parse("memory:///t/data.parquet").unwrap();
 
         handler

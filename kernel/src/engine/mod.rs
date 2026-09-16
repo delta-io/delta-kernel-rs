@@ -30,7 +30,6 @@ pub(crate) fn reader_options() -> ArrowReaderOptions {
 pub(crate) fn writer_options() -> ArrowWriterOptions {
     ArrowWriterOptions::new().with_skip_arrow_metadata(true)
 }
-
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
 

@@ -40,7 +40,8 @@ use crate::table_properties::{
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
+    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
+    SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -117,6 +118,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // Parquet compression codec: connectors read this to configure their Parquet writer
+    PARQUET_COMPRESSION_CODEC,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
@@ -1005,7 +1008,7 @@ mod tests {
     use crate::table_features::FeatureType;
     use crate::table_properties::{
         COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
-        PARQUET_FORMAT_VERSION,
+        PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
@@ -1099,15 +1102,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parquet_format_version_accepted() {
-        let properties =
-            HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
+    #[rstest::rstest]
+    #[case::parquet_format_version(PARQUET_FORMAT_VERSION, "2.12.0")]
+    #[case::parquet_compression_codec(PARQUET_COMPRESSION_CODEC, "snappy")]
+    fn test_parquet_writer_properties_accepted(#[case] key: &str, #[case] value: &str) {
+        let properties = HashMap::from([(key.to_string(), value.to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
-        assert_eq!(
-            validated.properties.get(PARQUET_FORMAT_VERSION),
-            Some(&"2.12.0".to_string()),
-        );
+        assert_eq!(validated.properties.get(key), Some(&value.to_string()),);
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
     }

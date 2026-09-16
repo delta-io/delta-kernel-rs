@@ -258,6 +258,31 @@ impl TableProperties {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
     }
 
+    /// Returns the [`ParquetWriterConfig`] derived from table properties.
+    ///
+    /// This maps the protocol-level [`ParquetCompressionCodec`] parsed from
+    /// `delta.parquet.compression.codec` onto the codecs the default engine's Parquet writer can
+    /// emit. Codecs the writer does not support (`Gzip`, `Lz4`, `Lz4Raw`) fall back to
+    /// [`ParquetCompression::Zstd`], as does an absent property. The parsed
+    /// [`ParquetCompressionCodec`] itself is preserved in full fidelity on
+    /// [`TableProperties::parquet_compression_codec`] for connectors that can honor those codecs.
+    ///
+    /// Connectors and engines should apply this config when writing Parquet data files so that
+    /// writes respect the table's configured compression.
+    pub fn parquet_writer_config(&self) -> ParquetWriterConfig {
+        ParquetWriterConfig {
+            compression: match self
+                .parquet_compression_codec
+                .unwrap_or(ParquetCompressionCodec::Zstd)
+            {
+                ParquetCompressionCodec::Snappy => ParquetCompression::Snappy,
+                ParquetCompressionCodec::Zstd => ParquetCompression::Zstd,
+                ParquetCompressionCodec::Uncompressed => ParquetCompression::Uncompressed,
+                _ => ParquetCompression::Zstd,
+            },
+        }
+    }
+
     /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column
     /// mapping mode. Default: `false`.
     pub fn should_randomize_file_prefixes(&self) -> bool {
@@ -345,6 +370,30 @@ pub enum IsolationLevel {
     SnapshotIsolation,
 }
 
+/// Compression codec to use when writing Parquet files.
+///
+/// String parsing is case-insensitive. Only `snappy`, `zstd`, and `uncompressed` are
+/// supported. Unrecognized values are ignored and [`TableProperties::parquet_compression`]
+/// is left unset.
+#[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
+#[strum(ascii_case_insensitive)]
+pub enum ParquetCompression {
+    /// Snappy compression.
+    Snappy,
+    /// Zstandard compression (default).
+    #[default]
+    Zstd,
+    /// No compression.
+    Uncompressed,
+}
+
+/// Configuration for writing Parquet files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParquetWriterConfig {
+    /// Compression codec to use. Defaults to [`ParquetCompression::Zstd`].
+    pub compression: ParquetCompression,
+}
+
 /// The checkpoint policy applied when writing checkpoints
 #[derive(Debug, EnumString, Default, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]
@@ -386,6 +435,8 @@ pub enum ParquetCompressionCodec {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::expressions::column_name;
@@ -659,5 +710,29 @@ mod tests {
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    // None means no property is set; use None as a sentinel for "omit the key"
+    #[case(None, ParquetWriterConfig::default())]
+    #[case(Some("snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("SNAPPY"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("Snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
+    #[case(Some("ZSTD"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
+    #[case(Some("Zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
+    #[case(Some("uncompressed"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
+    #[case(Some("UNCOMPRESSED"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
+    // Unrecognized codec falls back to the default
+    #[case(Some("not_a_codec"), ParquetWriterConfig::default())]
+    fn test_parquet_writer_config(
+        #[case] codec: Option<&str>,
+        #[case] expected: ParquetWriterConfig,
+    ) {
+        let props = match codec {
+            Some(v) => TableProperties::from([(PARQUET_COMPRESSION_CODEC, v)]),
+            None => TableProperties::default(),
+        };
+        assert_eq!(props.parquet_writer_config(), expected);
     }
 }
