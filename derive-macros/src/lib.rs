@@ -620,8 +620,22 @@ fn make_public(mut item: Item) -> Result<Item, Error> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use syn::parse_quote;
 
     use super::*;
+
+    #[test]
+    fn internal_api_rejects_public_items_without_panicking() {
+        let input = parse_quote!(
+            pub fn already_public() {}
+        );
+
+        let output = internal_api_impl(input).to_string();
+
+        assert!(output.contains("pub fn already_public"));
+        assert!(output.contains("compile_error"));
+        assert!(output.contains("item is already public"));
+    }
 
     /// Expand `gen_schema_fields` for `input` and return the generated tokens as a string. Macro
     /// errors are embedded as `compile_error!` tokens in that string; `Err` only signals that the
