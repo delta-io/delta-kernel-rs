@@ -30,15 +30,8 @@ const DATA_CHANGE: &str = "dataChange";
 /// only the rows that read as live data files.
 ///
 /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its tracking
-/// status is [live](TrackingStatus::is_live); every other entry (manifest references, tombstones)
-/// is dropped via the returned selection vector. The batch matches
-/// [`crate::actions::LOG_ADD_SCHEMA`] (`{ add: Add }`), so it can flow into log replay exactly like
-/// an `Add` parsed from a JSON commit.
-///
-/// Field mapping, per surviving row: `add.path` <- `location`, `add.size` <- `fileSizeInBytes`
-/// (0 when null), `add.baseRowId` <- `tracking.firstRowId`, and `add.defaultRowCommitVersion` <-
-/// `tracking.sequenceNumber`. `add.dataChange` is `true`. Fields the AMT root does not yet carry
-/// are left null (or a placeholder); see the per-field TODOs in [`build_entry_to_add_expression`].
+/// status is [live](TrackingStatus::is_live); every other entry is dropped via the returned
+/// selection vector.
 ///
 /// # Parameters
 /// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transform.
@@ -104,13 +97,13 @@ fn build_entry_to_add_expression() -> DeltaResult<Expression> {
             // TODO: read partition values from the entry's `partition` tuple once the read path
             // carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
-            n if n == SIZE_NAME => {
-                Expression::coalesce([Expression::column([FILE_SIZE_IN_BYTES]), lit(0i64)])
-            }
+            n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
             // TODO: the AMT entry does not carry the data file's modification time; emit a
             // placeholder until a source (e.g. an entry field or the commit timestamp) is threaded
             // through.
-            n if n == MODIFICATION_TIME => lit(i64::MIN),
+            n if n == MODIFICATION_TIME => lit(i64::MAX),
+            // TODO: `dataChange` is hard-coded true; carry the real value once the entry (or the
+            // commit context) provides it.
             n if n == DATA_CHANGE => lit(true),
             n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
@@ -191,7 +184,6 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
-    use crate::schema::StructType;
 
     /// AMT/Iceberg format version stamped on entries; irrelevant to the `Add` output but required
     /// to build a well-formed [`ContentTreeNodeEntry`].
@@ -265,7 +257,7 @@ mod tests {
                     .unwrap(),
                 ),
                 Scalar::Long(size),
-                Scalar::Long(i64::MIN),
+                Scalar::Long(i64::MAX),
                 Scalar::Boolean(true),
                 null_of("stats"),
                 null_of("tags"),
@@ -351,53 +343,6 @@ mod tests {
         );
 
         let expected = expected_batch(&engine, &[expected_add_row("live.parquet", 42, 3, 9)]);
-        assert_eq!(
-            out.try_into_record_batch().unwrap(),
-            expected.try_into_record_batch().unwrap()
-        );
-    }
-
-    /// [`ContentTreeNodeEntry::to_schema`] with `fileSizeInBytes` marked nullable, preserving its
-    /// field-id metadata. `fileSizeInBytes` is otherwise required, so this lets a test build an
-    /// input batch that carries a null size.
-    fn schema_with_nullable_file_size() -> StructType {
-        let fields: Vec<StructField> = ContentTreeNodeEntry::to_schema()
-            .fields()
-            .map(|f| {
-                if f.name().as_str() == FILE_SIZE_IN_BYTES {
-                    StructField::nullable(f.name(), f.data_type().clone())
-                        .with_metadata(f.metadata().clone())
-                } else {
-                    f.clone()
-                }
-            })
-            .collect();
-        StructType::try_new(fields).unwrap()
-    }
-
-    #[test]
-    fn null_file_size_becomes_zero() {
-        let engine = SyncEngine::new();
-        // `fileSizeInBytes` is a required entry field, but the read path coalesces a null size to
-        // 0 defensively. A null cannot flow through the struct, so build the batch under a schema
-        // that marks just that column nullable and null out its scalar.
-        let input_schema = Arc::new(schema_with_nullable_file_size());
-        let size_idx = input_schema
-            .fields()
-            .position(|f| f.name().as_str() == FILE_SIZE_IN_BYTES)
-            .expect("fileSizeInBytes field present");
-        let mut row: Vec<Scalar> = StructData::from(added_data_entry("a.parquet", 0, 1, 0, 0))
-            .values()
-            .to_vec();
-        row[size_idx] = Scalar::Null(DataType::LONG);
-        let input = engine
-            .evaluation_handler()
-            .create_many(input_schema, vec![row])
-            .unwrap();
-        let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, input.as_ref()).unwrap(),
-        );
-        let expected = expected_batch(&engine, &[expected_add_row("a.parquet", 0, 0, 0)]);
         assert_eq!(
             out.try_into_record_batch().unwrap(),
             expected.try_into_record_batch().unwrap()
