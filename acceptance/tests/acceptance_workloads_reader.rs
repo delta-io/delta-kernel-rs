@@ -281,8 +281,12 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &["DV-003/specs/DV-003_metadata_file_path"],
     ),
     (
-        "variantShredding feature not supported",
-        &["pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_read_latest"],
+        "Unsupported reader features in upgraded protocol",
+        &[
+            "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_read_latest",
+            "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_snapshot.json",
+            "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_snapshot_v2.json",
+        ],
     ),
     // Predicate parser: LIKE operator not supported
     (
