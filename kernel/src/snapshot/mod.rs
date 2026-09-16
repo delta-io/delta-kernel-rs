@@ -10,6 +10,8 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -203,7 +205,7 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
+    #[instrument(err, fields(enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
@@ -467,7 +469,6 @@ impl Snapshot {
     /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
-    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(
         parent = &self.span,
         name = SET_TRANSACTION_LOADED_SPAN,
@@ -540,6 +541,20 @@ impl Snapshot {
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
+    }
+
+    /// Fetch the latest transaction version for every application id in this snapshot.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn get_app_id_versions(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<SetTransactionMap> {
+        if let Some(crc) = self.crc_at_version() {
+            if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
+                return Ok(map.clone());
+            }
+        }
+        SetTransactionScanner::get_all(self.log_segment(), engine)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
