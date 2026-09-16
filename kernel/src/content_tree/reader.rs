@@ -8,7 +8,9 @@
 
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::{ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
+use crate::actions::{
+    ADD_NAME, ADD_SCHEMA, DATA_CHANGE_NAME, LOG_ADD_SCHEMA, MODIFICATION_TIME_NAME,
+};
 use crate::content_tree::{
     struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, TrackingStatus, CONTENT_TYPE,
     DV_INFO, DV_SNAPSHOT_ID, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, SEQUENCE_NUMBER, TRACKING,
@@ -21,11 +23,6 @@ use crate::scan::log_replay::{
 };
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
 use crate::{DeltaResult, Engine, Error};
-
-/// Name of the `Add` action's `modificationTime` field (no dedicated constant in `log_replay`).
-const MODIFICATION_TIME: &str = "modificationTime";
-/// Name of the `Add` action's `dataChange` field (no dedicated constant in `log_replay`).
-const DATA_CHANGE: &str = "dataChange";
 
 /// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
 /// only the rows that read as live data files.
@@ -103,10 +100,10 @@ fn build_entry_to_add_expression() -> DeltaResult<Expression> {
             // TODO: the AMT entry does not carry the data file's modification time; emit a
             // placeholder until a source (e.g. an entry field or the commit timestamp) is threaded
             // through.
-            n if n == MODIFICATION_TIME => lit(i64::MAX),
+            n if n == MODIFICATION_TIME_NAME => lit(i64::MAX),
             // TODO: `dataChange` is hard-coded true; carry the real value once the entry (or the
             // commit context) provides it.
-            n if n == DATA_CHANGE => lit(true),
+            n if n == DATA_CHANGE_NAME => lit(true),
             n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
                 Expression::column([TRACKING, SEQUENCE_NUMBER])

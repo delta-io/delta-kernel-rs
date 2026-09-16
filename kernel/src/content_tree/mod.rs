@@ -113,7 +113,9 @@ pub struct TrackingInfo {
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
-    /// Snapshot ID in which this entry's deletion vector last changed. Set on Modified entries.
+    /// Snapshot ID in which this entry's deletion vector last changed. May predate this entry's
+    /// own snapshot for a carried-forward entry, so it can be set on any live status, not just
+    /// `Modified`.
     #[field_id = 5]
     pub(crate) dv_snapshot_id: Option<i64>,
 
@@ -413,7 +415,21 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
+    use crate::unit_test_utils::assert_result_error_with_message;
+
+    #[test]
+    fn struct_expr_from_schema_errors_on_missing_required_field() {
+        let schema = StructType::new_unchecked([StructField::not_null("req", DataType::INTEGER)]);
+        assert_result_error_with_message(struct_expr_from_schema(&schema, |_| None), "req");
+    }
+
+    #[test]
+    fn struct_expr_from_schema_fills_missing_nullable_field_with_typed_null() {
+        let schema = StructType::new_unchecked([StructField::nullable("opt", DataType::INTEGER)]);
+        let expr = struct_expr_from_schema(&schema, |_| None).unwrap();
+        assert_eq!(expr, Expression::struct_from([null_lit(DataType::INTEGER)]));
+    }
 
     #[rstest]
     #[case(0, TrackingStatus::Existing)]
