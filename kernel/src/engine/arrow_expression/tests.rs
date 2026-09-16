@@ -12,7 +12,8 @@ use crate::arrow::array::{
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
-use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
@@ -1126,6 +1127,301 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap()
         .evaluate(&engine_data)
         .unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EvaluatorKind {
+    Expression,
+    Predicate,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TopLevelSchemaMismatch {
+    MissingField,
+    ReorderedFields,
+    RenamedField,
+    WrongType,
+}
+
+impl TopLevelSchemaMismatch {
+    fn expected_schema(self) -> SchemaRef {
+        schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        }
+    }
+
+    fn data_schema(self) -> Schema {
+        match self {
+            Self::MissingField => Schema::new(vec![Field::new("a", DataType::Int32, true)]),
+            Self::ReorderedFields => Schema::new(vec![
+                Field::new("b", DataType::Utf8, true),
+                Field::new("a", DataType::Int32, true),
+            ]),
+            Self::RenamedField => Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("c", DataType::Utf8, true),
+            ]),
+            Self::WrongType => Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Utf8, true),
+            ]),
+        }
+    }
+
+    fn expected_error(self) -> &'static str {
+        match self {
+            // Validation treats a renamed field as a missing expected field.
+            Self::MissingField | Self::RenamedField => {
+                "Expected schema field 'b' is missing in data schema fields"
+            }
+            Self::ReorderedFields => {
+                "Expected schema field 'b' is out of order in data schema fields"
+            }
+            Self::WrongType => "Expected schema type for 'a' does not match the data schema type",
+        }
+    }
+}
+
+#[rstest]
+#[case::missing_field(TopLevelSchemaMismatch::MissingField)]
+#[case::reordered_fields(TopLevelSchemaMismatch::ReorderedFields)]
+#[case::renamed_field(TopLevelSchemaMismatch::RenamedField)]
+#[case::wrong_type(TopLevelSchemaMismatch::WrongType)]
+fn evaluator_rejects_mismatched_top_level_schema(
+    #[values(EvaluatorKind::Expression, EvaluatorKind::Predicate)] evaluator_kind: EvaluatorKind,
+    #[case] mismatch: TopLevelSchemaMismatch,
+) {
+    let expected_schema = mismatch.expected_schema();
+    let data_schema = mismatch.data_schema();
+    let batch = ArrowEngineData::new(RecordBatch::new_empty(Arc::new(data_schema)));
+    let handler = ArrowEvaluationHandler;
+    let result = match evaluator_kind {
+        EvaluatorKind::Expression => handler
+            .new_expression_evaluator(
+                expected_schema,
+                Arc::new(col!("a")),
+                KernelDataType::INTEGER,
+            )
+            .unwrap()
+            .evaluate(&batch),
+        EvaluatorKind::Predicate => handler
+            .new_predicate_evaluator(expected_schema, Arc::new(Predicate::TRUE))
+            .unwrap()
+            .evaluate(&batch),
+    };
+
+    assert_result_error_with_message(result, mismatch.expected_error());
+}
+
+#[rstest]
+fn evaluator_accepts_extra_top_level_fields(
+    #[values(EvaluatorKind::Expression, EvaluatorKind::Predicate)] evaluator_kind: EvaluatorKind,
+) {
+    let expected_schema = schema_ref! {
+        nullable "a": INTEGER,
+        nullable "b": STRING,
+    };
+    let data_schema = Schema::new(vec![
+        Field::new("before", DataType::Duration(TimeUnit::Second), true),
+        Field::new("a", DataType::Int32, true),
+        Field::new("between", DataType::Boolean, true),
+        Field::new("b", DataType::Utf8, true),
+        Field::new("after", DataType::Boolean, true),
+    ]);
+    let batch = ArrowEngineData::new(RecordBatch::new_empty(Arc::new(data_schema)));
+    let handler = ArrowEvaluationHandler;
+
+    match evaluator_kind {
+        EvaluatorKind::Expression => handler
+            .new_expression_evaluator(
+                expected_schema,
+                Arc::new(col!("a")),
+                KernelDataType::INTEGER,
+            )
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap(),
+        EvaluatorKind::Predicate => handler
+            .new_predicate_evaluator(expected_schema, Arc::new(Predicate::TRUE))
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap(),
+    };
+}
+
+#[test]
+fn evaluator_accepts_nested_schema_differences() {
+    let input_schema = schema_ref! {
+        nullable "s": { not_null "a": INTEGER },
+    };
+    let batch_schema = Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(
+            vec![Field::new(
+                "unsupported",
+                DataType::Duration(TimeUnit::Second),
+                true,
+            )]
+            .into(),
+        ),
+        true,
+    )]);
+
+    validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
+}
+
+#[test]
+fn evaluator_accepts_conflicting_nested_field_type() {
+    let input_schema = schema_ref! {
+        nullable "s": { not_null "a": INTEGER },
+    };
+    let batch_schema = schema_ref! {
+        nullable "s": { nullable "a": STRING },
+    };
+    let batch_schema: Schema = batch_schema.as_ref().try_into_arrow().unwrap();
+
+    validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
+}
+
+#[test]
+fn evaluator_accepts_variant_arrow_struct_representation() {
+    let input_schema = schema_ref! {
+        nullable "v": (KernelDataType::unshredded_variant()),
+    };
+    let batch_schema = Schema::new(vec![Field::new(
+        "v",
+        DataType::Struct(
+            vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, false),
+            ]
+            .into(),
+        ),
+        true,
+    )]);
+
+    validate_data_schema_top_level(&input_schema, &batch_schema).unwrap();
+}
+
+fn kernel_int_array_type() -> KernelDataType {
+    ArrayType::new(KernelDataType::INTEGER, true).into()
+}
+
+fn arrow_int_array_element() -> Arc<Field> {
+    Arc::new(Field::new("element", DataType::Int32, true))
+}
+
+fn arrow_int_string_map_type() -> DataType {
+    let entries = Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    DataType::Map(Arc::new(entries), false)
+}
+
+#[test]
+fn evaluator_accepts_round_trippable_arrow_representations() {
+    // Each Arrow type maps unambiguously to a Kernel type through `TryIntoKernel`.
+    let arrow_types = [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Int64,
+        DataType::UInt64,
+        DataType::Int32,
+        DataType::UInt32,
+        DataType::Int16,
+        DataType::UInt16,
+        DataType::Int8,
+        DataType::UInt8,
+        DataType::Null,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Binary,
+        DataType::FixedSizeBinary(16),
+        DataType::LargeBinary,
+        DataType::BinaryView,
+        DataType::Decimal128(10, 2),
+        DataType::Date32,
+        DataType::Date64,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        DataType::Struct(Fields::empty()),
+        DataType::List(arrow_int_array_element()),
+        DataType::ListView(arrow_int_array_element()),
+        DataType::LargeList(arrow_int_array_element()),
+        DataType::LargeListView(arrow_int_array_element()),
+        DataType::FixedSizeList(arrow_int_array_element(), 3),
+        arrow_int_string_map_type(),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Utf8),
+            )),
+        ),
+    ];
+
+    for data_type in arrow_types {
+        let expected_type = (&data_type).try_into_kernel().unwrap();
+        assert_top_level_type_compatible(expected_type, data_type);
+    }
+}
+
+// Some Kernel types, such as interval types, are not round-trippable through Arrow. This test
+// ensures `validate_data_schema_top_level` accepts their Arrow representations.
+#[rstest]
+#[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH, DataType::Int32)]
+#[case::year_month_unsigned(KernelDataType::INTERVAL_YEAR_MONTH, DataType::UInt32)]
+#[case::day_time(KernelDataType::INTERVAL_DAY_TIME, DataType::Int64)]
+#[case::day_time_unsigned(KernelDataType::INTERVAL_DAY_TIME, DataType::UInt64)]
+fn evaluator_accepts_non_round_trippable_interval_arrow_representation(
+    #[case] expected_type: KernelDataType,
+    #[case] data_type: DataType,
+) {
+    assert_top_level_type_compatible(expected_type, data_type);
+}
+
+fn assert_top_level_type_compatible(expected_type: KernelDataType, data_type: DataType) {
+    let expected_schema =
+        Arc::new(StructType::try_new([StructField::nullable("value", expected_type)]).unwrap());
+    let data_schema = Schema::new(vec![Field::new("value", data_type, true)]);
+    validate_data_schema_top_level(&expected_schema, &data_schema).unwrap();
+}
+
+#[rstest]
+#[case::container_and_primitive(empty_struct_type(), DataType::Int32)]
+#[case::different_container_kinds(kernel_int_array_type(), arrow_int_string_map_type())]
+fn evaluator_rejects_incompatible_top_level_container_types(
+    #[case] expected_type: KernelDataType,
+    #[case] data_type: DataType,
+) {
+    let expected_schema =
+        Arc::new(StructType::try_new([StructField::nullable("value", expected_type)]).unwrap());
+    let data_schema = Schema::new(vec![Field::new("value", data_type, true)]);
+
+    assert_result_error_with_message(
+        validate_data_schema_top_level(&expected_schema, &data_schema),
+        "Expected schema type for 'value' does not match the data schema type",
+    );
+}
+
+fn empty_struct_type() -> KernelDataType {
+    StructType::try_new([]).unwrap().into()
 }
 
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`

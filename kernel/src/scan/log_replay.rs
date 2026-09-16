@@ -946,6 +946,12 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
     // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
     // cannot easily be unified.
+    #[tracing::instrument(
+        name = "scan_log_replay.process_actions_batch",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -1037,6 +1043,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     // probably also need to be applied to the other copy. The copy exists because
     // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
     // `&self`. Presently, the different in mutabilities cannot easily be unified.
+    #[tracing::instrument(
+        name = "scan_log_replay.process_actions_batch",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -1180,7 +1192,6 @@ mod tests {
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
-    use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
@@ -1202,7 +1213,7 @@ mod tests {
         add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::PhysicalPredicate;
+    use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
     use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -1270,7 +1281,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter() {
         run_with_validate_callback(
-            vec![add_batch_simple(get_commit_schema().clone())],
+            vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
@@ -1282,7 +1293,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
-            vec![add_batch_with_remove(get_commit_schema().clone())],
+            vec![add_batch_with_remove(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
@@ -1293,7 +1304,7 @@ mod tests {
 
     #[test]
     fn test_no_transforms() {
-        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let batch = vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())];
         let logical_schema = schema_ref! {};
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
@@ -1336,7 +1347,7 @@ mod tests {
         };
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
-        let batch = vec![add_batch_with_partition_col()];
+        let batch = vec![add_batch_with_partition_col(COMMIT_READ_SCHEMA.clone())];
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1419,7 +1430,7 @@ mod tests {
             "row_indexes_for_row_id_0",
         );
 
-        let batch = vec![add_batch_for_row_tracking(get_commit_schema().clone())];
+        let batch = vec![add_batch_for_row_tracking(COMMIT_READ_SCHEMA.clone())];
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1484,7 +1495,7 @@ mod tests {
             return Ok(());
         }
 
-        let batch = add_batch_for_row_tracking(get_commit_schema().clone());
+        let batch = add_batch_for_row_tracking(COMMIT_READ_SCHEMA.clone());
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             [Ok(ActionsBatch::new(batch, true))].into_iter(),
@@ -1929,7 +1940,7 @@ mod tests {
 
     #[test]
     fn test_scan_action_iter_with_skip_stats() {
-        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let batch = vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())];
         let schema: SchemaRef = schema_ref! {
             nullable "value": INTEGER,
             nullable "date": DATE,
@@ -2017,10 +2028,10 @@ mod tests {
         // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
         let batch = if with_partition {
             vec![add_batch_with_remove_and_partition(
-                get_commit_schema().clone(),
+                COMMIT_READ_SCHEMA.clone(),
             )]
         } else {
-            vec![add_batch_with_remove(get_commit_schema().clone())]
+            vec![add_batch_with_remove(COMMIT_READ_SCHEMA.clone())]
         };
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),

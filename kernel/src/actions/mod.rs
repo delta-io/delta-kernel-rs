@@ -27,6 +27,8 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::{create_row, Engine};
 use crate::{DeltaResult, EngineData, Error, FileMeta, FileSize, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1325,7 +1327,6 @@ impl CheckpointAction {
     /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
     /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
     /// hence a fallible method rather than an infallible `From`.
-    #[allow(unused)]
     fn try_into_scalar(self) -> DeltaResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
@@ -1396,6 +1397,15 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
+    /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.
+    pub(crate) fn new(path: String, size_in_bytes: i64, version: i64) -> Self {
+        ContentRoot {
+            path,
+            size_in_bytes,
+            version,
+        }
+    }
+
     /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
     ///
     /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
@@ -1439,6 +1449,41 @@ impl ContentRoot {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointAction {
+    /// Builds a checkpoint action at `version` with all `transactions` and `domain_metadata`
+    /// inlined and no sidecars.
+    // TODO(#2866): spill transactions and domain metadata into sidecars once the adaptiveMetadata
+    // sidecar format is defined.
+    #[internal_api]
+    pub(crate) fn new(
+        version: i64,
+        content_root: ContentRoot,
+        protocol: Protocol,
+        metadata: Metadata,
+        transactions: Vec<SetTransaction>,
+        domain_metadata: Vec<DomainMetadata>,
+    ) -> Self {
+        CheckpointAction {
+            version,
+            content_root,
+            protocol,
+            metadata,
+            transactions,
+            domain_metadata,
+            txn_sidecars: vec![],
+            domain_metadata_sidecars: vec![],
+        }
+    }
+
+    /// Serialize this checkpoint action into a single-row `EngineData`.
+    #[internal_api]
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
+        create_row(
+            engine,
+            LOG_CHECKPOINT_SCHEMA.clone(),
+            self.try_into_scalar()?,
+        )
+    }
+
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
     /// `checkpoint` action are skipped, so `Ok(None)` means the batch had none at all.
     ///

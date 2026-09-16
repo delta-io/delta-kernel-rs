@@ -8,7 +8,7 @@ use tracing::debug;
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
@@ -253,7 +253,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             expression,
             output_type,
         }))
@@ -265,7 +265,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
         Ok(Arc::new(DefaultPredicateEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             predicate,
         }))
     }
@@ -327,7 +327,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -336,14 +336,8 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
+        // TODO(#3263): Validate nested fields.
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
                 // Empty patch optimization: Skip expression evaluation and directly apply the
@@ -374,7 +368,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
@@ -382,14 +376,8 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
+        // TODO(#3263): Validate nested fields.
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
@@ -398,5 +386,127 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+/// Validates that each expected field exists and has a compatible type at top-level.
+fn validate_data_schema_top_level(
+    expected_schema: &SchemaRef,
+    data_schema: &ArrowSchema,
+) -> DeltaResult<()> {
+    let mut data_fields = data_schema.fields().iter();
+    // Some Kernel code does not provide the full input schema to the evaluator. For example,
+    // `scan_metadata_from` may evaluate scan rows containing optional `stats_parsed` and
+    // `partitionValues_parsed` columns using only the base scan-row schema. As a result,
+    // we allow `data_schema` to contain extra fields.
+    // TODO(#3263): Require evaluator input schemas to declare every top-level field.
+    for expected_field in expected_schema.fields() {
+        let data_field = data_fields
+            .find(|field| field.name() == expected_field.name())
+            .ok_or_else(|| {
+                let mismatch = if data_schema
+                    .fields()
+                    .iter()
+                    .any(|field| field.name() == expected_field.name())
+                {
+                    "out of order"
+                } else {
+                    "missing"
+                };
+                Error::schema(format!(
+                    "Expected schema field '{}' is {mismatch} in data schema fields {:?}",
+                    expected_field.name(),
+                    data_schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name())
+                        .collect::<Vec<_>>()
+                ))
+            })?;
+        require!(
+            top_level_types_compatible(expected_field.data_type(), data_field.data_type()),
+            Error::schema(format!(
+                "Expected schema type for '{}' does not match the data schema type: {:?} != {:?}",
+                expected_field.name(),
+                expected_field.data_type(),
+                data_field.data_type()
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// Checks top-level type compatibility using the Arrow-to-Kernel mappings from
+/// [`TryIntoKernel`](super::arrow_conversion::TryIntoKernel).
+///
+/// Unlike a full conversion, this does not inspect nested types or field metadata.
+fn top_level_types_compatible(expected_type: &DataType, data_type: &ArrowDataType) -> bool {
+    match (expected_type, data_type) {
+        // Dictionary types have the same logical type as their values.
+        (_, ArrowDataType::Dictionary(_, value_type)) => {
+            top_level_types_compatible(expected_type, value_type)
+        }
+        (DataType::Primitive(expected), data_type) => {
+            primitive_types_compatible(expected, data_type)
+        }
+        (DataType::Struct(_), ArrowDataType::Struct(_)) => true,
+        (
+            DataType::Array(_),
+            ArrowDataType::List(_)
+            | ArrowDataType::ListView(_)
+            | ArrowDataType::LargeList(_)
+            | ArrowDataType::LargeListView(_)
+            | ArrowDataType::FixedSizeList(_, _),
+        ) => true,
+        (DataType::Map(_), ArrowDataType::Map(_, _)) => true,
+        // Arrow has no Variant type, and it will be converted to structs.
+        (DataType::Variant(_), ArrowDataType::Struct(_)) => true,
+        _ => false,
+    }
+}
+
+fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataType) -> bool {
+    match (expected, data_type) {
+        (
+            PrimitiveType::String,
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View,
+        ) => true,
+        (PrimitiveType::Long, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
+        (PrimitiveType::Integer, ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
+        (PrimitiveType::Short, ArrowDataType::Int16 | ArrowDataType::UInt16) => true,
+        (PrimitiveType::Byte, ArrowDataType::Int8 | ArrowDataType::UInt8) => true,
+        (PrimitiveType::Float, ArrowDataType::Float32) => true,
+        (PrimitiveType::Double, ArrowDataType::Float64) => true,
+        (PrimitiveType::Boolean, ArrowDataType::Boolean) => true,
+        (
+            PrimitiveType::Binary,
+            ArrowDataType::Binary
+            | ArrowDataType::FixedSizeBinary(_)
+            | ArrowDataType::LargeBinary
+            | ArrowDataType::BinaryView,
+        ) => true,
+        (PrimitiveType::Decimal(expected), ArrowDataType::Decimal128(precision, scale)) => {
+            *precision == expected.precision()
+                && u8::try_from(*scale).is_ok_and(|scale| scale == expected.scale())
+        }
+        (PrimitiveType::Date, ArrowDataType::Date32 | ArrowDataType::Date64) => true,
+        (
+            PrimitiveType::Timestamp,
+            ArrowDataType::Timestamp(
+                TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+                Some(timezone),
+            ),
+        ) => timezone.eq_ignore_ascii_case("utc"),
+        (
+            PrimitiveType::TimestampNtz,
+            ArrowDataType::Timestamp(
+                TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+                None,
+            ),
+        ) => true,
+        (PrimitiveType::Void, ArrowDataType::Null) => true,
+        (PrimitiveType::IntervalYearMonth, ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
+        (PrimitiveType::IntervalDayTime, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
+        _ => false,
     }
 }

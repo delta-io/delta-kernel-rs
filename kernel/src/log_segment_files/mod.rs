@@ -596,7 +596,7 @@ impl LogSegmentFiles {
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
-    #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
+    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -718,7 +718,12 @@ impl LogSegmentFiles {
     /// - Window 4 [8501, 9501): checkpoint at v8900 found -> stop
     /// All files from windows 1-4 are combined with `log_tail` to produce a log segment
     /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
-    #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
+    #[instrument(
+        name = "log.list_with_backward_checkpoint_scan",
+        skip_all,
+        fields(enable_call_frame, end = end_version),
+        err
+    )]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,
         log_root: &Url,

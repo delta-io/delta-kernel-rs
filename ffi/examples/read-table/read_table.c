@@ -11,6 +11,19 @@
 #include "kernel_schema_visitor.h"
 #include "kernel_utils.h"
 
+static void frame_callback(FrameEvent event)
+{
+  switch (event.tag) {
+    case FrameEventOPEN:
+      (void)event.open.span_id;
+      (void)event.open.name;
+      break;
+    case FrameEventCLOSE:
+      (void)event.close.span_id;
+      break;
+  }
+}
+
 // Print the content of a selection vector if `VERBOSE` is defined in read_table.h
 void print_selection_vector(const char* indent, const KernelBoolSlice* selection_vec)
 {
@@ -427,6 +440,7 @@ int main(int argc, char* argv[])
 #else
   enable_event_tracing(tracing_callback, WARN);
 #endif
+  (void)enable_frame_reporting(frame_callback);
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
