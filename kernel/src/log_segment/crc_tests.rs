@@ -21,6 +21,12 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::TableFeature;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::{
+    adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Snapshot, Version};
 
@@ -134,34 +140,6 @@ fn protocol(p: Protocol) -> serde_json::Value {
 
 fn metadata(m: Metadata) -> serde_json::Value {
     json!({"metaData": serde_json::to_value(&m).unwrap()})
-}
-
-// The AMT protocol carried by the CRC (adaptiveMetadata-preview + deletionVectors).
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn amt_protocol_crc() -> Protocol {
-    Protocol::try_new_modern(
-        ["adaptiveMetadata-preview", "deletionVectors"],
-        ["adaptiveMetadata-preview", "deletionVectors"],
-    )
-    .unwrap()
-}
-
-// The AMT protocol carried by the checkpoint action (a superset, so it's distinguishable).
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn amt_protocol_checkpoint() -> Protocol {
-    Protocol::try_new_modern(
-        [
-            "adaptiveMetadata-preview",
-            "deletionVectors",
-            "timestampNtz",
-        ],
-        [
-            "adaptiveMetadata-preview",
-            "deletionVectors",
-            "timestampNtz",
-        ],
-    )
-    .unwrap()
 }
 
 // A `checkpoint` action carrying `p` and `m` at `checkpoint_version`.
@@ -745,35 +723,46 @@ async fn test_get_m_from_newer_delta_over_older_crc() {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
 async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
+    let crc_config =
+        adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let checkpoint_config = adaptive_metadata_table_configuration(
+        test_schema_flat_with_column_mapping(),
+        &[TableFeature::TimestampWithoutTimezone],
+    );
     CrcReadTest::new()
         .commit(
             0,
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(amt_protocol_checkpoint()),
-                metadata(metadata_a()),
+                protocol(checkpoint_config.protocol().clone()),
+                metadata(checkpoint_config.metadata().clone()),
             ],
         )
         .commit(
             1,
             [
                 commit_info(DEFAULT_OPERATION, None),
-                protocol(amt_protocol_crc()),
-                metadata(metadata_b()),
+                protocol(crc_config.protocol().clone()),
+                metadata(crc_config.metadata().clone()),
             ],
         )
-        .crc(1, amt_protocol_crc(), metadata_b(), None)
+        .crc(
+            1,
+            crc_config.protocol().clone(),
+            crc_config.metadata().clone(),
+            None,
+        )
         .commit(
             2,
             [amt_checkpoint_action(
                 0,
-                amt_protocol_checkpoint(),
-                metadata_a(),
+                checkpoint_config.protocol().clone(),
+                checkpoint_config.metadata().clone(),
             )],
         )
         .build()
         .await
-        .assert_p_m(None, &amt_protocol_crc(), &metadata_b());
+        .assert_p_m(None, crc_config.protocol(), crc_config.metadata());
 }
 
 #[tokio::test]
