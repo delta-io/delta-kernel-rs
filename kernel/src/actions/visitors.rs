@@ -951,7 +951,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
-    use crate::arrow::array::{BooleanArray, ListBuilder, StringArray, StringBuilder};
+    use crate::arrow::array::{BooleanArray, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -963,8 +963,9 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{column_expr_ref, Expression};
+    use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{action_batch, parse_json_batch, string_array_to_engine_data};
     use crate::Engine;
 
     #[rstest::rstest]
@@ -997,53 +998,62 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parse_metadata_preserves_format_options() -> DeltaResult<()> {
-        let metadata_json = concat!(
-            r#"{"metaData":{"id":"test-id","#,
-            r#""format":{"provider":"parquet","options":{"compression":"zstd","#,
-            r#""custom.option":"arbitrary value"}},"#,
-            r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","#,
-            r#""partitionColumns":[],"configuration":{}}}"#,
-        );
-        let data = parse_json_batch(StringArray::from(vec![metadata_json]));
+    #[rstest::rstest]
+    #[case::populated(Some(HashMap::from([
+        ("compression".to_string(), "zstd".to_string()),
+        ("custom.option".to_string(), "arbitrary value".to_string()),
+    ])))]
+    #[case::empty(Some(HashMap::new()))]
+    #[case::missing(None)]
+    fn test_parse_metadata_format_options(
+        #[case] format_options: Option<HashMap<String, String>>,
+    ) -> DeltaResult<()> {
+        let mut format = serde_json::Map::from_iter([(
+            "provider".to_string(),
+            serde_json::Value::String("parquet".to_string()),
+        )]);
+        if let Some(options) = &format_options {
+            format.insert(
+                "options".to_string(),
+                serde_json::to_value(options).unwrap(),
+            );
+        }
+        let metadata_json = serde_json::json!({
+            "metaData": {
+                "id": "test-id",
+                "format": format,
+                "schemaString": r#"{"type":"struct","fields":[]}"#,
+                "partitionColumns": [],
+                "configuration": {},
+            }
+        })
+        .to_string();
+        // The action schema requires `options`. Making it nullable here lets the missing case
+        // reach the visitor as `None` instead of failing during JSON decoding.
+        let output_schema = schema_ref! {
+            nullable "metaData": {
+                not_null "id": STRING,
+                nullable "name": STRING,
+                nullable "description": STRING,
+                not_null "format": {
+                    not_null "provider": STRING,
+                    nullable "options": { STRING => not_null STRING },
+                },
+                not_null "schemaString": STRING,
+                not_null "partitionColumns": [ not_null STRING ],
+                nullable "createdTime": LONG,
+                not_null "configuration": { STRING => not_null STRING },
+            },
+        };
+        let engine = SyncEngine::new();
+        let data = engine.json_handler().parse_json(
+            string_array_to_engine_data(StringArray::from(vec![metadata_json])),
+            output_schema,
+        )?;
 
         let metadata = Metadata::try_new_from_data(data.as_ref())?.unwrap();
 
-        assert_eq!(
-            metadata.format.options,
-            HashMap::from([
-                ("compression".to_string(), "zstd".to_string()),
-                ("custom.option".to_string(), "arbitrary value".to_string()),
-            ])
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_visit_metadata_defaults_missing_format_options() -> DeltaResult<()> {
-        let id = StringArray::from(vec!["test-id"]);
-        let provider = StringArray::from(vec!["parquet"]);
-        let schema = StringArray::from(vec![r#"{"type":"struct","fields":[]}"#]);
-        let mut partition_columns = ListBuilder::new(StringBuilder::new());
-        partition_columns.append(true);
-        let partition_columns = partition_columns.finish();
-        let null = ();
-        let getters: [&dyn GetData<'_>; 9] = [
-            &id,
-            &null,
-            &null,
-            &provider,
-            &null,
-            &schema,
-            &partition_columns,
-            &null,
-            &null,
-        ];
-
-        let metadata = visit_metadata_at(0, &getters)?.unwrap();
-
-        assert!(metadata.format.options.is_empty());
+        assert_eq!(metadata.format.options, format_options.unwrap_or_default());
         Ok(())
     }
 
