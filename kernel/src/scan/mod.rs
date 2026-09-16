@@ -754,16 +754,20 @@ fn build_physical_stats_output_schema(
     }
 }
 
-/// Returns `schema` only when it contains stats for at least one data column.
-///
-/// Expected stats schemas always contain `numRecords` and `tightBounds`. A non-empty `nullCount`
-/// struct indicates that at least one data column survives stats filtering.
 fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
-    let has_data_columns = matches!(
+    stats_schema_has_data_columns(&schema).then_some(schema)
+}
+
+/// Returns whether an expected stats schema contains stats for at least one data column.
+///
+/// Expected stats schemas always contain `numRecords` and `tightBounds`. The schema builder emits
+/// `nullCount` whenever it emits min/max values, so a non-empty `nullCount` struct distinguishes
+/// data-column stats from those bookkeeping fields.
+fn stats_schema_has_data_columns(schema: &StructType) -> bool {
+    matches!(
         schema.field(NULL_COUNT).map(StructField::data_type),
         Some(DataType::Struct(null_count)) if null_count.fields().next().is_some()
-    );
-    has_data_columns.then_some(schema)
+    )
 }
 
 impl std::fmt::Debug for Scan {
@@ -796,7 +800,7 @@ impl Scan {
     ///
     /// Structured output and predicate pruning consume that normalized column. JSON-only output
     /// can serialize a checkpoint's native `stats_parsed` directly and then drop the column.
-    fn stats_schema_for_transform(&self) -> Option<&SchemaRef> {
+    fn required_parsed_stats_schema(&self) -> Option<&SchemaRef> {
         if self.physical_stats_output_schema.is_some()
             || matches!(
                 &self.state_info.physical_predicate,
@@ -1313,6 +1317,8 @@ impl Scan {
         let checkpoint_info = self
             .snapshot
             .log_segment()
+            // Only discovery is consumed here: it reads the checkpoint/sidecar schema metadata
+            // needed to construct the processor. SequentialPhase owns the actual action reads.
             .create_checkpoint_stream(
                 engine.as_ref(),
                 checkpoint_read_schema,

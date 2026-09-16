@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use tracing::{debug, enabled, warn, Level};
 
-use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
+use crate::scan::{
+    stats_schema_has_data_columns, PartitionValuesOptions, PhysicalPredicate, StatsOptions,
+    StructStats,
+};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
@@ -172,19 +174,8 @@ fn build_data_skipping_schemas(
     let predicate_refs_physical =
         resolve_physical_columns(table_configuration, predicate_column_names_logical);
 
-    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
-    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
-    // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
-    // per-column stats wrapper, so a non-empty wrapper signals that at least one data
-    // column survived. The Delta protocol allows `minValues` / `maxValues` without
-    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
-    // emits min/max; this check relies on that implementation property.
     let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
-        matches!(
-            stats_schema.field(NULL_COUNT).map(StructField::data_type),
-            Some(DataType::Struct(null_count)) if null_count.fields().next().is_some()
-        )
-        .then_some(stats_schema)
+        stats_schema_has_data_columns(&stats_schema).then_some(stats_schema)
     };
 
     let stats_schema = match (struct_stats, physical_predicate) {
@@ -1524,6 +1515,30 @@ pub(crate) mod tests {
             n.to_string(),
         );
         m
+    }
+
+    #[rstest]
+    #[case::json_only(StatsOptions::json_only(), true)]
+    #[case::all_struct(StatsOptions::all_struct(), false)]
+    fn bookkeeping_only_stats_schema_is_retained_only_for_json_synthesis(
+        #[case] stats: StatsOptions,
+        #[case] expect_schema: bool,
+    ) {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(2),
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(0),
+            vec![],
+            stats,
+        )
+        .unwrap();
+
+        assert_eq!(state_info.physical_stats_schema.is_some(), expect_schema);
+        if let Some(schema) = state_info.physical_stats_schema {
+            assert!(!stats_schema_has_data_columns(&schema));
+        }
     }
 
     /// `delta.dataSkippingStatsColumns=<cols joined by ",">` configuration map.

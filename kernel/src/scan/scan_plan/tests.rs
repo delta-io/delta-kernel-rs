@@ -283,17 +283,23 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 
 #[rstest]
 #[case::json_only(StatsOptions::json_only(), &[JSON_STATS_FIELDS])]
-#[case::all_struct(StatsOptions::all_struct(), &[PARSED_STATS_TABLE_ALL_STATS_FIELDS])]
+#[case::all_struct(
+    StatsOptions::all_struct(),
+    &[JSON_STATS_FIELDS, PARSED_STATS_TABLE_ALL_STATS_FIELDS]
+)]
 #[case::struct_columns(
     StatsOptions::struct_columns(vec![column_name!("id")]),
-    &[ID_STATS_PARSED_FIELDS]
+    &[JSON_STATS_FIELDS, ID_STATS_PARSED_FIELDS]
 )]
-#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
+#[case::empty_struct_columns(
+    StatsOptions::struct_columns(vec![]),
+    &[JSON_STATS_FIELDS]
+)]
 #[case::all(
     StatsOptions::all(),
     &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
 )]
-#[case::none(StatsOptions::none(), &[])]
+#[case::none(StatsOptions::none(), &[JSON_STATS_FIELDS])]
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
@@ -353,15 +359,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         assert!(declarative_schema.field_with_name(STATS_PARSED).is_err());
         assert!(imperative_schema.field_with_name(STATS_PARSED).is_err());
     }
-    let ignored_stats = match (stats.emit_json, parsed_stats_requested) {
-        (true, _) => &[][..],
-        (false, _) => &[STATS][..],
-    };
-    assert_metadata_eq(
-        &actual,
-        &without_columns(&expected, ignored_stats)?,
-        "metadata output options",
-    )
+    assert_metadata_eq(&actual, &expected, "metadata output options")
 }
 
 const ADD_FIELDS: &[&str] = &[
@@ -433,32 +431,42 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::all_struct_string_map(
     StatsOptions::all_struct(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS, ALL_STATS_PARSED_FIELDS]
 )]
 #[case::all_struct_with_struct(
     StatsOptions::all_struct(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_FIELDS,
+        JSON_STATS_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
 )]
 #[case::struct_columns_string_map(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS, ID_STATS_PARSED_FIELDS]
 )]
 #[case::struct_columns_with_struct(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_FIELDS,
+        JSON_STATS_FIELDS,
+        ID_STATS_PARSED_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
 )]
 #[case::empty_struct_columns_string_map(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS]
 )]
 #[case::empty_struct_columns_with_struct(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
 )]
 #[case::all_string_map(
     StatsOptions::all(),
@@ -478,12 +486,12 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS]
 )]
 #[case::none_with_struct(
     StatsOptions::none(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
 )]
 fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
@@ -510,24 +518,30 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .map(|batch| batch?.try_into_record_batch())
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        if json_requested {
-            for batch in &actual {
-                let add = batch
-                    .column_by_name(ADD_NAME)
-                    .expect("add column")
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("add struct");
-                let stats = add
-                    .column_by_name(STATS)
-                    .expect("requested JSON stats")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("JSON stats");
+        for batch in &actual {
+            let add = batch
+                .column_by_name(ADD_NAME)
+                .expect("add column")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("add struct");
+            let stats = add
+                .column_by_name(STATS)
+                .expect("fixed JSON stats slot")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("JSON stats");
+            if json_requested {
                 assert_eq!(
                     stats.null_count(),
                     0,
                     "requested JSON stats must be populated"
+                );
+            } else {
+                assert_eq!(
+                    stats.null_count(),
+                    stats.len(),
+                    "disabled JSON stats must remain null"
                 );
             }
         }
@@ -676,35 +690,32 @@ fn assert_metadata_output_options(
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
-    if json_requested {
-        for batch in &actual {
-            let stats = batch.column_by_name(STATS).expect("requested JSON stats");
-            let stats = stats
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("JSON stats");
+    for batch in &actual {
+        let stats = batch.column_by_name(STATS).expect("fixed JSON stats slot");
+        let stats = stats
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("JSON stats");
+        if json_requested {
             assert_eq!(
                 stats.null_count(),
                 0,
                 "requested JSON stats must be populated"
             );
+        } else {
+            assert_eq!(
+                stats.null_count(),
+                stats.len(),
+                "disabled JSON stats must remain null"
+            );
         }
     }
 
-    if json_requested {
-        assert_metadata_eq(
-            &actual,
-            &expected,
-            "metadata output options across log shapes",
-        )?;
-    } else {
-        // Imperative metadata exposes source JSON even when it was not requested.
-        assert_metadata_eq(
-            &actual,
-            &without_columns(&expected, &[STATS])?,
-            "metadata output options across log shapes",
-        )?;
-    }
+    assert_metadata_eq(
+        &actual,
+        &expected,
+        "metadata output options across log shapes",
+    )?;
     Ok(())
 }
 

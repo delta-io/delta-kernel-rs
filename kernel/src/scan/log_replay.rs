@@ -280,6 +280,9 @@ impl ScanLogReplayProcessor {
             stats_options.output_schema.as_deref(),
             partition_values_options.parsed_struct,
         )?;
+        // Pruning-only columns must survive the first transform so DataSkippingFilter can read
+        // them. Projecting them out therefore requires a second evaluator; folding this projection
+        // into get_add_transform_expr would either expose internal columns or parse stats twice.
         let output_transform = if projected_schema == output_schema {
             None
         } else {
@@ -843,10 +846,13 @@ fn build_scan_output_projection(
                 project_struct_to_schema([STATS_PARSED_NAME], requested),
             );
         }
-        None => projection = projection.drop_if_exists(STATS_PARSED_NAME),
+        None if input_schema.field(STATS_PARSED_NAME).is_some() => {
+            projection = projection.drop(STATS_PARSED_NAME)
+        }
+        None => {}
     }
-    if !emit_partition_values {
-        projection = projection.drop_if_exists(PARTITION_VALUES_PARSED_NAME);
+    if !emit_partition_values && input_schema.field(PARTITION_VALUES_PARSED_NAME).is_some() {
+        projection = projection.drop(PARTITION_VALUES_PARSED_NAME);
     }
     projection.build()
 }

@@ -153,8 +153,8 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
-    use crate::utils::FoldWithOption as _;
-    use crate::{PredicateRef, SnapshotRef};
+    use crate::utils::{require, FoldWithOption as _};
+    use crate::{Error, PredicateRef, SnapshotRef};
 
     // ============================================================
     // Test helpers for focused ParallelPhase tests
@@ -1061,8 +1061,16 @@ mod tests {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
                 let read_schema = state.file_read_schema();
-                assert!(!read_schema.contains_col(["add", "stats"]));
-                assert!(!read_schema.contains_col(["add", "stats_parsed"]));
+                require!(
+                    !read_schema.contains_col(["add", "stats"]),
+                    Error::internal_error("parallel read schema unexpectedly contains add.stats")
+                );
+                require!(
+                    !read_schema.contains_col(["add", "stats_parsed"]),
+                    Error::internal_error(
+                        "parallel read schema unexpectedly contains add.stats_parsed"
+                    )
+                );
                 // Verify stats is None in parallel results and collect paths
                 let mut parallel =
                     ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
