@@ -1335,7 +1335,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         snapshot_hint: Option<Box<SnapshotHint>>,
         apply_snapshot_hint: impl FnOnce(
             delta_kernel::snapshot::SnapshotBuilder<Mode>,
-            SnapshotHint,
+            Box<SnapshotHint>,
         )
             -> DeltaResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
     ) -> DeltaResult<SnapshotRef> {
@@ -1349,7 +1349,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
             builder = builder.with_max_catalog_version(max_catalog_version);
         }
         if let Some(snapshot_hint) = snapshot_hint {
-            builder = apply_snapshot_hint(builder, *snapshot_hint)?;
+            builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
         builder.build(engine)
     }
