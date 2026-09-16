@@ -20,6 +20,7 @@ use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluat
 
 pub mod evaluate_expression;
 pub mod opaque;
+mod timestamp_timezone;
 
 #[cfg(test)]
 mod tests;
@@ -388,7 +389,6 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }
-
 /// Validates that each expected field exists and has a compatible type at top-level.
 fn validate_data_schema_top_level(
     expected_schema: &SchemaRef,
@@ -509,4 +509,10 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
         (PrimitiveType::IntervalDayTime, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
         _ => false,
     }
+}
+#[cfg(test)]
+fn expected_timestamp_micros(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_micros()
 }
