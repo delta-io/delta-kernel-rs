@@ -729,6 +729,8 @@ mod tests {
     use super::*;
     use crate::TryFromStringSlice;
 
+    // The process-global subscriber may invoke callbacks from any test thread. Thread-local
+    // storage keeps unrelated log events out of this test's expected messages.
     thread_local! {
         static MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     }
@@ -966,6 +968,8 @@ mod tests {
         })
     }
 
+    // The process-global subscriber may invoke callbacks from any test thread. Thread-local
+    // storage keeps unrelated tracing events out of this test's expected events.
     thread_local! {
         static EVENTS_OK: RefCell<Option<Vec<(String, tracing::Level)>>> =
             const { RefCell::new(None) };
@@ -1111,8 +1115,14 @@ mod tests {
         assert_eq!(error, Level::ERROR);
     }
 
+    // Metric callbacks run on the emitting thread. Thread-local storage keeps unrelated metrics
+    // out of this test's expected events.
     thread_local! {
         static METRIC_EVENTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    fn with_metric_events<T>(f: impl FnOnce(Option<&[String]>) -> T) -> T {
+        METRIC_EVENTS.with(|events| f(events.borrow().as_deref()))
     }
 
     extern "C" fn capture_metric_event(event: MetricEvent) {
@@ -1138,9 +1148,9 @@ mod tests {
             delta_kernel::metrics::emit_json_read_completed(3, 100);
             delta_kernel::metrics::emit_parquet_read_completed(2, 50);
         });
-        METRIC_EVENTS.with(|events| {
+        with_metric_events(|events| {
             assert_eq!(
-                events.borrow().as_deref(),
+                events,
                 Some(["json:3:100".to_string(), "parquet:2:50".to_string()].as_slice())
             );
         });
@@ -1153,6 +1163,8 @@ mod tests {
         name: Option<String>,
     }
 
+    // Frame callbacks run on the span's thread, including when the process-global subscriber
+    // observes other tests. Thread-local storage isolates each test's expected lifecycle.
     thread_local! {
         static FRAME_EVENTS: RefCell<Vec<CapturedFrameEvent>> = const { RefCell::new(vec![]) };
     }
@@ -1174,16 +1186,14 @@ mod tests {
         });
     }
 
-    fn clear_frame_events() {
+    fn capture_frame_events(f: impl FnOnce()) -> Vec<CapturedFrameEvent> {
         FRAME_EVENTS.with(|events| events.borrow_mut().clear());
+        f();
+        FRAME_EVENTS.with(RefCell::take)
     }
 
     fn frame_event_count() -> usize {
         FRAME_EVENTS.with(|events| events.borrow().len())
-    }
-
-    fn with_frame_events<T>(f: impl FnOnce(&[CapturedFrameEvent]) -> T) -> T {
-        FRAME_EVENTS.with(|events| f(&events.borrow()))
     }
 
     fn emit_reloadable_frame_span() {
@@ -1193,83 +1203,80 @@ mod tests {
 
     #[test]
     fn frame_reporting_delivers_nested_lifecycle_events_synchronously() {
-        clear_frame_events();
-        let dispatch = create_frame_dispatch(capture_frame_event);
+        let events = capture_frame_events(|| {
+            let dispatch = create_frame_dispatch(capture_frame_event);
 
-        tracing_core::dispatcher::with_default(&dispatch, || {
-            let ignored = tracing::info_span!("ignored");
-            let _ignored_guard = ignored.enter();
+            tracing_core::dispatcher::with_default(&dispatch, || {
+                let ignored = tracing::info_span!("ignored");
+                let _ignored_guard = ignored.enter();
 
-            let outer = tracing::info_span!("outer", enable_call_frame = Empty);
-            let outer_guard = outer.enter();
-            assert_eq!(frame_event_count(), 1);
+                let outer = tracing::info_span!("outer", enable_call_frame = Empty);
+                let outer_guard = outer.enter();
+                assert_eq!(frame_event_count(), 1);
 
-            let inner = tracing::info_span!("inner", enable_call_frame = Empty);
-            let inner_guard = inner.enter();
-            assert_eq!(frame_event_count(), 2);
-            drop(inner_guard);
-            assert_eq!(frame_event_count(), 3);
-            drop(outer_guard);
-            assert_eq!(frame_event_count(), 4);
+                let inner = tracing::info_span!("inner", enable_call_frame = Empty);
+                let inner_guard = inner.enter();
+                assert_eq!(frame_event_count(), 2);
+                drop(inner_guard);
+                assert_eq!(frame_event_count(), 3);
+                drop(outer_guard);
+                assert_eq!(frame_event_count(), 4);
+            });
         });
 
-        with_frame_events(|events| {
-            assert!(events[0].is_open);
-            assert_eq!(events[0].name.as_deref(), Some("outer"));
-            assert!(events[1].is_open);
-            assert_eq!(events[1].name.as_deref(), Some("inner"));
-            assert!(!events[2].is_open);
-            assert_eq!(events[2].span_id, events[1].span_id);
-            assert_eq!(events[2].name, None);
-            assert!(!events[3].is_open);
-            assert_eq!(events[3].span_id, events[0].span_id);
-            assert_eq!(events[3].name, None);
-        });
+        assert!(events[0].is_open);
+        assert_eq!(events[0].name.as_deref(), Some("outer"));
+        assert!(events[1].is_open);
+        assert_eq!(events[1].name.as_deref(), Some("inner"));
+        assert!(!events[2].is_open);
+        assert_eq!(events[2].span_id, events[1].span_id);
+        assert_eq!(events[2].name, None);
+        assert!(!events[3].is_open);
+        assert_eq!(events[3].span_id, events[0].span_id);
+        assert_eq!(events[3].name, None);
     }
 
     #[test]
     fn frame_reporter_callback_can_only_be_registered_once() {
-        clear_frame_events();
-        assert!(unsafe { enable_frame_reporting(capture_frame_event) });
-        assert!(!unsafe { enable_frame_reporting(capture_frame_event) });
+        let events = capture_frame_events(|| {
+            assert!(unsafe { enable_frame_reporting(capture_frame_event) });
+            assert!(!unsafe { enable_frame_reporting(capture_frame_event) });
 
-        let captured = tracing::info_span!("captured", enable_call_frame = Empty);
-        let captured_guard = captured.enter();
-        drop(captured_guard);
-
-        with_frame_events(|events| {
-            assert_eq!(events.len(), 2);
-            assert!(events[0].is_open);
-            assert_eq!(events[0].name.as_deref(), Some("captured"));
-            assert!(!events[1].is_open);
-            assert_eq!(events[1].span_id, events[0].span_id);
+            let captured = tracing::info_span!("captured", enable_call_frame = Empty);
+            let captured_guard = captured.enter();
+            drop(captured_guard);
         });
+
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_open);
+        assert_eq!(events[0].name.as_deref(), Some("captured"));
+        assert!(!events[1].is_open);
+        assert_eq!(events[1].span_id, events[0].span_id);
     }
 
     #[test]
     fn frame_filter_enables_existing_trace_callsites_when_reloaded() {
-        clear_frame_events();
-        let reporter = Arc::new(FfiFrameReporter {
-            callback: Arc::new(OnceLock::from(capture_frame_event as FrameEventFn)),
-        });
-        let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::OFF);
-        let layer = FrameReporterLayer::new(reporter).with_filter(filter_layer);
-        let dispatch = Dispatch::new(Registry::default().with(layer));
+        let events = capture_frame_events(|| {
+            let reporter = Arc::new(FfiFrameReporter {
+                callback: Arc::new(OnceLock::from(capture_frame_event as FrameEventFn)),
+            });
+            let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::OFF);
+            let layer = FrameReporterLayer::new(reporter).with_filter(filter_layer);
+            let dispatch = Dispatch::new(Registry::default().with(layer));
 
-        tracing_core::dispatcher::with_default(&dispatch, || {
-            emit_reloadable_frame_span();
-            assert_eq!(frame_event_count(), 0);
+            tracing_core::dispatcher::with_default(&dispatch, || {
+                emit_reloadable_frame_span();
+                assert_eq!(frame_event_count(), 0);
 
-            filter_handle.reload(LevelFilter::TRACE).unwrap();
-            emit_reloadable_frame_span();
+                filter_handle.reload(LevelFilter::TRACE).unwrap();
+                emit_reloadable_frame_span();
+            });
         });
 
-        with_frame_events(|events| {
-            assert_eq!(events.len(), 2);
-            assert!(events[0].is_open);
-            assert_eq!(events[0].name.as_deref(), Some("reloadable"));
-            assert!(!events[1].is_open);
-            assert_eq!(events[1].span_id, events[0].span_id);
-        });
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_open);
+        assert_eq!(events[0].name.as_deref(), Some("reloadable"));
+        assert!(!events[1].is_open);
+        assert_eq!(events[1].span_id, events[0].span_id);
     }
 }
