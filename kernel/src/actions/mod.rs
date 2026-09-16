@@ -118,6 +118,12 @@ pub(crate) const STATS_PARSED: &str = "stats_parsed";
 
 pub(crate) static ADD_SCHEMA: LazyLock<StructType> = LazyLock::new(Add::to_schema);
 
+/// `Add` action field names. Most `Add` field names are shared with the scan-row schema and homed
+/// in [`crate::scan::log_replay`]; these two have no scan-row counterpart, so they live here next
+/// to [`ADD_SCHEMA`].
+pub(crate) const MODIFICATION_TIME_NAME: &str = "modificationTime";
+pub(crate) const DATA_CHANGE_NAME: &str = "dataChange";
+
 pub(crate) static ADD_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(ADD_NAME, ADD_SCHEMA.clone()));
 pub(crate) static REMOVE_FIELD: LazyLock<StructField> =
