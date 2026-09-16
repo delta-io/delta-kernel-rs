@@ -270,10 +270,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &["err_missing_version_0/specs/err_missing_version_0_error"],
     ),
     (
-        "Does not reject unknown reader features",
-        &["ev_unknown_reader_feature/specs/ev_unknown_reader_feature_error"],
-    ),
-    (
         "Does not enforce time travel safety",
         &[
             "tt_blocked_beyond_retention/specs/tt_blocked_beyond_retention_error",

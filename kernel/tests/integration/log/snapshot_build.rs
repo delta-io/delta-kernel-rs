@@ -165,6 +165,11 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
     writer_features: &["deletionVectors", "futureFeature"],
     expected_error: None,
 })]
+#[case::unsupported_writer_only(SnapshotLoadFeatureCase {
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors", "generatedColumns"],
+    expected_error: None,
+})]
 #[cfg_attr(
     not(feature = "adaptive-metadata-in-dev"),
     case::adaptive_metadata(SnapshotLoadFeatureCase {
