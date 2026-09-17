@@ -44,7 +44,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionOptions};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -743,6 +743,7 @@ pub struct CreateTableTransactionBuilder {
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
     correlation_id: Option<Arc<str>>,
+    options: TransactionOptions,
 }
 
 impl CreateTableTransactionBuilder {
@@ -758,6 +759,7 @@ impl CreateTableTransactionBuilder {
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
             correlation_id: None,
+            options: TransactionOptions::new(),
         }
     }
 
@@ -852,6 +854,15 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Replaces options shared by create-table and existing-table transactions.
+    ///
+    /// If the options omit engine information or a correlation identifier, the corresponding
+    /// values supplied through the existing create-table APIs are retained.
+    pub fn with_options(mut self, options: TransactionOptions) -> Self {
+        self.options = options;
+        self
+    }
+
     /// Builds a [`CreateTableTransaction`] that can be committed to create the table.
     ///
     /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
@@ -885,7 +896,7 @@ impl CreateTableTransactionBuilder {
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
-        self,
+        mut self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> DeltaResult<CreateTableTransaction> {
@@ -979,6 +990,12 @@ impl CreateTableTransactionBuilder {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
+        if self.options.engine_info.is_none() {
+            self.options.engine_info = Some(self.engine_info.clone());
+        }
+        if self.options.correlation_id.is_none() {
+            self.options.correlation_id = self.correlation_id.clone();
+        }
         Transaction::try_new_create_table(
             table_configuration,
             self.engine_info,
@@ -986,7 +1003,8 @@ impl CreateTableTransactionBuilder {
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.correlation_id,
-        )
+        )?
+        .with_transaction_options(self.options)
     }
 }
 
