@@ -934,8 +934,8 @@ fn set_builder_rest_object_store_impl(
 /// Accepted codec names (case-insensitive): `"uncompressed"`/`"none"`, `"snappy"`, `"gzip"`,
 /// `"lz4"`, `"lz4_raw"`, `"zstd"`.
 ///
-/// Returns an error (naming the rejected value) if `codec` is not valid UTF-8 or is not one of the
-/// accepted names; on error the builder's existing configuration is left unchanged.
+/// Returns an error if `codec` is not valid UTF-8 or is not one of the accepted names; on error the
+/// builder's existing configuration is left unchanged.
 ///
 /// # Safety
 ///
@@ -960,9 +960,7 @@ unsafe fn set_builder_parquet_compression_impl(
     let compression = ParquetCompressionCodec::try_from(codec.as_str()).map_err(|_| {
         delta_kernel::Error::generic(format!("unsupported parquet compression codec: {codec}"))
     })?;
-    builder.parquet_writer_config = ParquetWriterConfig {
-        compression: compression.into(),
-    };
+    builder.parquet_writer_config = ParquetWriterConfig { compression };
     Ok(true)
 }
 
@@ -2167,7 +2165,7 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::schema_ref;
-    use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
+    use delta_kernel::table_properties::{ParquetCompressionCodec, ParquetWriterConfig};
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
@@ -3306,23 +3304,22 @@ mod tests {
         Ok(())
     }
 
-    // Test that set_builder_parquet_compression applies valid codec strings.
     #[cfg(feature = "default-engine-base")]
     #[rstest]
-    #[case("snappy", ParquetCompression::Snappy)]
-    #[case("SNAPPY", ParquetCompression::Snappy)]
-    #[case("uncompressed", ParquetCompression::Uncompressed)]
-    #[case("UNCOMPRESSED", ParquetCompression::Uncompressed)]
-    #[case("none", ParquetCompression::Uncompressed)]
-    #[case("zstd", ParquetCompression::Zstd)]
-    #[case("gzip", ParquetCompression::Gzip)]
-    #[case("GZIP", ParquetCompression::Gzip)]
-    #[case("lz4", ParquetCompression::Lz4)]
-    #[case("lz4_raw", ParquetCompression::Lz4Raw)]
-    #[case("LZ4_RAW", ParquetCompression::Lz4Raw)]
+    #[case("snappy", ParquetCompressionCodec::Snappy)]
+    #[case("SNAPPY", ParquetCompressionCodec::Snappy)]
+    #[case("uncompressed", ParquetCompressionCodec::Uncompressed)]
+    #[case("UNCOMPRESSED", ParquetCompressionCodec::Uncompressed)]
+    #[case("none", ParquetCompressionCodec::Uncompressed)]
+    #[case("zstd", ParquetCompressionCodec::Zstd)]
+    #[case("gzip", ParquetCompressionCodec::Gzip)]
+    #[case("GZIP", ParquetCompressionCodec::Gzip)]
+    #[case("lz4", ParquetCompressionCodec::Lz4)]
+    #[case("lz4_raw", ParquetCompressionCodec::Lz4Raw)]
+    #[case("LZ4_RAW", ParquetCompressionCodec::Lz4Raw)]
     fn test_set_builder_parquet_valid_codec(
         #[case] codec: &str,
-        #[case] expected: ParquetCompression,
+        #[case] expected: ParquetCompressionCodec,
     ) {
         let table_root = "memory:///test_table/";
         let builder_ptr = unsafe {
@@ -3347,8 +3344,6 @@ mod tests {
         let _ = unsafe { Box::from_raw(builder_ptr) }; // reclaim to free
     }
 
-    // Test that set_builder_parquet_compression rejects an unrecognized codec string with an error
-    // (naming the rejected value) and leaves the builder's config unchanged.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_set_builder_parquet_invalid_codec_errors() {
@@ -3367,7 +3362,7 @@ mod tests {
         assert_eq!(
             builder.parquet_writer_config,
             ParquetWriterConfig {
-                compression: ParquetCompression::Zstd
+                compression: ParquetCompressionCodec::Zstd
             },
             "rejected codec should leave config unchanged"
         );

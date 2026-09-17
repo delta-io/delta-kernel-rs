@@ -10,14 +10,12 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::reader_options;
+use crate::engine::{reader_options, writer_options};
 use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
-use crate::parquet::basic::Compression;
-use crate::parquet::file::properties::WriterProperties;
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
-use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
+use crate::table_properties::ParquetWriterConfig;
 use crate::utils::FoldWithOption as _;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
@@ -39,28 +37,6 @@ impl SyncParquetHandler {
             parquet_writer_config,
         }
     }
-}
-
-impl From<ParquetCompression> for Compression {
-    fn from(c: ParquetCompression) -> Self {
-        match c {
-            ParquetCompression::Snappy => Compression::SNAPPY,
-            ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
-            ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
-            ParquetCompression::Gzip => Compression::GZIP(Default::default()),
-            ParquetCompression::Lz4 => Compression::LZ4,
-            ParquetCompression::Lz4Raw => Compression::LZ4_RAW,
-        }
-    }
-}
-
-fn writer_options_with_config(config: &ParquetWriterConfig) -> ArrowWriterOptions {
-    let props = WriterProperties::builder()
-        .set_compression(config.compression.into())
-        .build();
-    ArrowWriterOptions::new()
-        .with_properties(props)
-        .with_skip_arrow_metadata(true)
 }
 
 pub(super) fn try_create_from_parquet(
@@ -132,7 +108,7 @@ impl ParquetHandler for SyncParquetHandler {
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
         let mut buf = Vec::new();
-        let options = writer_options_with_config(&self.parquet_writer_config);
+        let options = writer_options(&self.parquet_writer_config);
         let mut writer =
             ArrowWriter::try_new_with_options(&mut buf, first_record_batch.schema(), options)?;
         writer.write(&first_record_batch)?;
@@ -174,6 +150,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
+    use crate::parquet::basic::Compression;
+    use crate::table_properties::ParquetCompressionCodec;
     use crate::EngineData;
 
     fn test_data_iter() -> DeltaResultIteratorStatic<Box<dyn EngineData>> {
@@ -433,6 +411,31 @@ mod tests {
             .map(|f| f.name().to_string())
             .collect();
         assert_eq!(field_names, vec!["id".to_string(), "name".to_string()]);
+    }
+
+    #[rstest::rstest]
+    #[case(ParquetCompressionCodec::Snappy)]
+    #[case(ParquetCompressionCodec::Zstd)]
+    #[case(ParquetCompressionCodec::Uncompressed)]
+    #[case(ParquetCompressionCodec::Gzip)]
+    #[case(ParquetCompressionCodec::Lz4)]
+    #[case(ParquetCompressionCodec::Lz4Raw)]
+    fn test_sync_write_parquet_compression(#[case] codec: ParquetCompressionCodec) {
+        let handler = SyncParquetHandler::new(None, ParquetWriterConfig { compression: codec });
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("compression.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        handler.write_parquet_file(url, test_data_iter()).unwrap();
+
+        // Read the footer and confirm the configured codec was applied to the column chunk.
+        let file = File::open(&file_path).unwrap();
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        let actual = metadata.row_group(0).column(0).compression();
+        assert_eq!(actual, Compression::from(codec));
     }
 
     // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can

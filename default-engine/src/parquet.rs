@@ -14,22 +14,20 @@ use delta_kernel::engine::arrow_utils::{
     fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use delta_kernel::engine::reader_options;
+use delta_kernel::engine::{reader_options, writer_options};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
 };
-use delta_kernel::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
+use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
-use delta_kernel::parquet::basic::Compression;
-use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::{SchemaRef, StructType};
-use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
+use delta_kernel::table_properties::ParquetWriterConfig;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
@@ -44,32 +42,6 @@ use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
 use crate::UrlExt;
-
-fn parquet_compression_from(c: ParquetCompression) -> Compression {
-    match c {
-        ParquetCompression::Snappy => Compression::SNAPPY,
-        ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
-        ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
-        ParquetCompression::Gzip => Compression::GZIP(Default::default()),
-        ParquetCompression::Lz4 => Compression::LZ4,
-        ParquetCompression::Lz4Raw => Compression::LZ4_RAW,
-    }
-}
-
-/// Returns [`ArrowWriterOptions`] for kernel parquet writes.
-///
-/// Sets the compression codec from the provided config and disables embedding of the
-/// Arrow IPC schema in Parquet key-value metadata. Omitting the embedded schema keeps
-/// the files compatible with pure-Parquet readers and is consistent with how kernel
-/// reads parquet files (which also skip Arrow schema metadata).
-pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions {
-    let props = WriterProperties::builder()
-        .set_compression(parquet_compression_from(config.compression))
-        .build();
-    ArrowWriterOptions::new()
-        .with_properties(props)
-        .with_skip_arrow_metadata(true)
-}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -646,10 +618,12 @@ mod tests {
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
+    use delta_kernel::parquet::basic::Compression;
     use delta_kernel::schema::{
         schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
-    use delta_kernel::EngineData;
+    use delta_kernel::table_properties::{ParquetCompressionCodec, TableProperties};
+    use delta_kernel::{Engine, EngineData};
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
         try_into_record_batch as into_record_batch,
@@ -666,7 +640,7 @@ mod tests {
 
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
-    use crate::DEFAULT_BATCH_SIZE;
+    use crate::{DefaultEngineBuilder, DEFAULT_BATCH_SIZE};
 
     fn long_schema(name: &str) -> StructType {
         schema! { nullable (name): LONG }
@@ -1087,14 +1061,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(ParquetCompression::Snappy)]
-    #[case(ParquetCompression::Zstd)]
-    #[case(ParquetCompression::Uncompressed)]
-    #[case(ParquetCompression::Gzip)]
-    #[case(ParquetCompression::Lz4)]
-    #[case(ParquetCompression::Lz4Raw)]
+    #[case(ParquetCompressionCodec::Snappy)]
+    #[case(ParquetCompressionCodec::Zstd)]
+    #[case(ParquetCompressionCodec::Uncompressed)]
+    #[case(ParquetCompressionCodec::Gzip)]
+    #[case(ParquetCompressionCodec::Lz4)]
+    #[case(ParquetCompressionCodec::Lz4Raw)]
     #[tokio::test]
-    async fn test_write_parquet_compression(#[case] kernel_compression: ParquetCompression) {
+    async fn test_write_parquet_compression(#[case] kernel_compression: ParquetCompressionCodec) {
         let store = Arc::new(InMemory::new());
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
@@ -1128,7 +1102,62 @@ mod tests {
             .metadata()
             .clone();
         let actual = metadata.row_group(0).column(0).compression();
-        assert_eq!(actual, parquet_compression_from(kernel_compression));
+        assert_eq!(actual, Compression::from(kernel_compression));
+    }
+
+    // End-to-end connector workflow: read the codec off a table's properties, derive the writer
+    // config, thread it through the engine builder, and confirm a file written via the engine's
+    // parquet handler uses that codec. The `use_task_executor` case guards the builder's
+    // `with_task_executor` rebuild against dropping the config.
+    #[rstest::rstest]
+    #[case::default_executor(false)]
+    #[case::custom_executor(true)]
+    #[tokio::test]
+    async fn test_engine_builder_threads_table_compression(#[case] use_task_executor: bool) {
+        let props = TableProperties::from([("delta.parquet.compression.codec", "gzip")]);
+        let config = props.parquet_writer_config().unwrap();
+
+        let store = Arc::new(InMemory::new());
+        let engine: Box<dyn Engine> = if use_task_executor {
+            Box::new(
+                DefaultEngineBuilder::new(store.clone())
+                    .with_parquet_writer_config(config)
+                    .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
+                    .build(),
+            )
+        } else {
+            Box::new(
+                DefaultEngineBuilder::new(store.clone())
+                    .with_parquet_writer_config(config)
+                    .build(),
+            )
+        };
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(data)));
+
+        let file_url = Url::parse("memory:///test/e2e_compression.parquet").unwrap();
+        engine
+            .parquet_handler()
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store, path);
+        let metadata = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .metadata()
+            .clone();
+        let actual = metadata.row_group(0).column(0).compression();
+        assert_eq!(actual, Compression::from(ParquetCompressionCodec::Gzip));
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
-use crate::{Error, Version};
+use crate::{DeltaResult, Error, Version};
 
 mod deserialize;
 pub use deserialize::ParseIntervalError;
@@ -258,19 +258,27 @@ impl TableProperties {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
     }
 
-    /// Returns the [`ParquetWriterConfig`] derived from table properties.
+    /// Returns the [`ParquetWriterConfig`] derived from table properties, defaulting the
+    /// compression codec to [`ParquetCompressionCodec::Zstd`] when
+    /// `delta.parquet.compression.codec` is absent.
     ///
-    /// Maps the protocol-level [`ParquetCompressionCodec`] parsed from
-    /// `delta.parquet.compression.codec` onto the engine-writer [`ParquetCompression`], defaulting
-    /// to [`ParquetCompressionCodec::Zstd`] when the property is absent (or unrecognized, in which
-    /// case it is preserved on [`TableProperties::unknown_properties`]).
-    ///
-    /// Connectors and engines should apply this config when writing Parquet data files so that
-    /// writes respect the table's configured compression.
-    pub fn parquet_writer_config(&self) -> ParquetWriterConfig {
-        ParquetWriterConfig {
-            compression: self.compression_codec_or_default().into(),
-        }
+    /// This is the strict, connector-facing accessor: an unrecognized codec (preserved on
+    /// [`TableProperties::unknown_properties`]) is rejected with an error naming the value,
+    /// matching create-table validation. Use [`Self::compression_codec_or_default`] for the
+    /// lenient view.
+    pub fn parquet_writer_config(&self) -> DeltaResult<ParquetWriterConfig> {
+        let compression = match self.parquet_compression_codec {
+            Some(codec) => codec,
+            None => match self.unknown_properties.get(PARQUET_COMPRESSION_CODEC) {
+                Some(value) => {
+                    return Err(Error::generic(format!(
+                        "unsupported parquet compression codec: {value}"
+                    )))
+                }
+                None => ParquetCompressionCodec::Zstd,
+            },
+        };
+        Ok(ParquetWriterConfig { compression })
     }
 
     /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column
@@ -360,47 +368,14 @@ pub enum IsolationLevel {
     SnapshotIsolation,
 }
 
-/// Compression codec an engine's Parquet writer emits, carried by [`ParquetWriterConfig`].
-///
-/// This is the engine-writer view of compression, with one variant per codec the writer can emit.
-/// It is produced from the protocol-level [`ParquetCompressionCodec`] parsed from the
-/// `delta.parquet.compression.codec` table property (via the `From<ParquetCompressionCodec>`
-/// conversion) and carried to the engine by [`TableProperties::parquet_writer_config`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ParquetCompression {
-    /// Snappy compression.
-    Snappy,
-    /// Zstandard compression (default).
-    #[default]
-    Zstd,
-    /// No compression.
-    Uncompressed,
-    /// gzip compression.
-    Gzip,
-    /// LZ4 compression (deprecated Hadoop framing).
-    Lz4,
-    /// LZ4 raw (block) compression.
-    Lz4Raw,
-}
-
-impl From<ParquetCompressionCodec> for ParquetCompression {
-    fn from(codec: ParquetCompressionCodec) -> Self {
-        match codec {
-            ParquetCompressionCodec::Snappy => ParquetCompression::Snappy,
-            ParquetCompressionCodec::Zstd => ParquetCompression::Zstd,
-            ParquetCompressionCodec::Uncompressed => ParquetCompression::Uncompressed,
-            ParquetCompressionCodec::Gzip => ParquetCompression::Gzip,
-            ParquetCompressionCodec::Lz4 => ParquetCompression::Lz4,
-            ParquetCompressionCodec::Lz4Raw => ParquetCompression::Lz4Raw,
-        }
-    }
-}
-
 /// Configuration for writing Parquet files.
+///
+/// This is the engine-writer view of a table's Parquet write settings, carried to the engine by
+/// [`TableProperties::parquet_writer_config`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParquetWriterConfig {
-    /// Compression codec to use. Defaults to [`ParquetCompression::Zstd`].
-    pub compression: ParquetCompression,
+    /// Compression codec to use. Defaults to [`ParquetCompressionCodec::Zstd`].
+    pub compression: ParquetCompressionCodec,
 }
 
 /// The checkpoint policy applied when writing checkpoints
@@ -423,10 +398,11 @@ pub enum CheckpointPolicy {
 /// See [Table Properties] in the Delta protocol.
 ///
 /// [Table Properties]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#table-properties
-#[derive(Debug, Display, EnumString, IntoStaticStr, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Display, EnumString, IntoStaticStr, Copy, Clone, PartialEq, Eq, Default)]
 #[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum ParquetCompressionCodec {
     /// `zstd`. Recommended fallback per the Delta protocol when the property is absent.
+    #[default]
     Zstd,
     /// `uncompressed` (alias: `none`). No compression.
     #[strum(serialize = "uncompressed", serialize = "none")]
@@ -722,30 +698,45 @@ mod tests {
     }
 
     #[rstest]
-    // None means no property is set; use None as a sentinel for "omit the key"
-    #[case(None, ParquetWriterConfig::default())]
-    #[case(Some("snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
-    #[case(Some("SNAPPY"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
-    #[case(Some("Snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
-    #[case(Some("zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
-    #[case(Some("ZSTD"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
-    #[case(Some("Zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
-    #[case(Some("uncompressed"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
-    #[case(Some("UNCOMPRESSED"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
-    #[case(Some("none"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
-    #[case(Some("gzip"), ParquetWriterConfig { compression: ParquetCompression::Gzip })]
-    #[case(Some("lz4"), ParquetWriterConfig { compression: ParquetCompression::Lz4 })]
-    #[case(Some("lz4_raw"), ParquetWriterConfig { compression: ParquetCompression::Lz4Raw })]
-    // Unrecognized codec falls back to the default (reads stay lenient per the Delta protocol)
-    #[case(Some("not_a_codec"), ParquetWriterConfig::default())]
+    // `codec` None means the property is omitted; `expected` Some(codec) is Ok, None expects an Err
+    // naming the rejected value.
+    #[case(None, Some(ParquetCompressionCodec::Zstd))]
+    #[case(Some("snappy"), Some(ParquetCompressionCodec::Snappy))]
+    #[case(Some("SNAPPY"), Some(ParquetCompressionCodec::Snappy))]
+    #[case(Some("Snappy"), Some(ParquetCompressionCodec::Snappy))]
+    #[case(Some("zstd"), Some(ParquetCompressionCodec::Zstd))]
+    #[case(Some("ZSTD"), Some(ParquetCompressionCodec::Zstd))]
+    #[case(Some("Zstd"), Some(ParquetCompressionCodec::Zstd))]
+    #[case(Some("uncompressed"), Some(ParquetCompressionCodec::Uncompressed))]
+    #[case(Some("UNCOMPRESSED"), Some(ParquetCompressionCodec::Uncompressed))]
+    #[case(Some("none"), Some(ParquetCompressionCodec::Uncompressed))]
+    #[case(Some("gzip"), Some(ParquetCompressionCodec::Gzip))]
+    #[case(Some("lz4"), Some(ParquetCompressionCodec::Lz4))]
+    #[case(Some("lz4_raw"), Some(ParquetCompressionCodec::Lz4Raw))]
+    // Unrecognized codec is rejected (the write path aborts, per the Delta protocol).
+    #[case(Some("not_a_codec"), None)]
     fn test_parquet_writer_config(
         #[case] codec: Option<&str>,
-        #[case] expected: ParquetWriterConfig,
+        #[case] expected: Option<ParquetCompressionCodec>,
     ) {
         let props = match codec {
             Some(v) => TableProperties::from([(PARQUET_COMPRESSION_CODEC, v)]),
             None => TableProperties::default(),
         };
-        assert_eq!(props.parquet_writer_config(), expected);
+        match expected {
+            Some(compression) => {
+                assert_eq!(
+                    props.parquet_writer_config().unwrap(),
+                    ParquetWriterConfig { compression }
+                );
+            }
+            None => {
+                let err = props.parquet_writer_config().unwrap_err();
+                assert!(
+                    err.to_string().contains(codec.unwrap()),
+                    "error should name the rejected codec, got: {err}"
+                );
+            }
+        }
     }
 }

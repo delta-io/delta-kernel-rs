@@ -21,7 +21,8 @@ use delta_kernel::{
     FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
     PredicateRef, StorageHandler, Version,
 };
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -1796,13 +1797,11 @@ fn assert_histogram_totals(
 /// The first non-zero default histogram bin boundary (8KB).
 const FIRST_BIN_BOUNDARY: i64 = 8192;
 
-/// Conservative estimate of bytes per row after Zstd compression for
-/// `(int32, 100-char high-entropy string)` parquet data. The actual measured post-Zstd size is
-/// ~49 bytes/row; 40 is used as a conservative lower bound to ensure the safety margin holds.
+/// Conservative lower bound on post-Zstd bytes/row for `(int32, 80-char random string)` data
+/// (measured ~49); underestimating keeps [`LARGE_FILE_ROW_COUNT`] above the bin boundary.
 const APPROX_BYTES_PER_ROW: i64 = 40;
 
 /// Row count guaranteed to produce a parquet file exceeding [`FIRST_BIN_BOUNDARY`].
-/// Uses 2x the boundary divided by the conservative per-row estimate as a safety margin.
 const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW) as i32;
 
 /// Verifies that the in-memory CRC histogram correctly tracks file adds and removes across
@@ -1852,7 +1851,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     // ===== v2: insert large file (>= 8KB -> bin 1+) =====
     let n = LARGE_FILE_ROW_COUNT;
     let ids: ArrayRef = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()));
-    let mut rng = rand::rng();
+    let mut rng = StdRng::seed_from_u64(0);
     let strings: Vec<String> = (0..n)
         .map(|_| {
             let (a, b, c, d): (u64, u64, u64, u64) =
