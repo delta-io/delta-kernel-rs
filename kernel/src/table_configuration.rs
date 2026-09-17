@@ -221,7 +221,15 @@ impl TableConfiguration {
 
         validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
 
-        // TODO(#3240): Validate row-tracking table configuration invariants here.
+        // This is a `should` requirement in the protocol, but Kernel chooses to enforce it.
+        // Spark enforces this constraint as well.
+        require!(
+            !(table_config.table_properties.enable_row_tracking == Some(true)
+                && table_config.is_row_tracking_suspended()),
+            Error::invalid_protocol(
+                "Row tracking cannot be enabled and suspended at the same time"
+            )
+        );
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
