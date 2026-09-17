@@ -392,12 +392,6 @@ fn validate_crc_state(
             )));
         }
     }
-    if num_deleted_records_opt.is_some() != num_deletion_vectors_opt.is_some() {
-        return Err(Error::generic(
-            "CRC numDeletedRecordsOpt and numDeletionVectorsOpt must both be present or absent",
-        ));
-    }
-
     if metadata
         .configuration()
         .get(ENABLE_IN_COMMIT_TIMESTAMPS)
@@ -1198,18 +1192,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::deleted_records_only("numDeletedRecordsOpt")]
-    #[case::deletion_vectors_only("numDeletionVectorsOpt")]
-    fn de_unpaired_deletion_totals_are_rejected(#[case] field: &str) {
+    #[case::deleted_records("numDeletedRecordsOpt", Some(0), None)]
+    #[case::deletion_vectors("numDeletionVectorsOpt", None, Some(0))]
+    fn de_unpaired_deletion_totals_are_accepted(
+        #[case] field: &str,
+        #[case] expected_deleted_records: Option<i64>,
+        #[case] expected_deletion_vectors: Option<i64>,
+    ) {
         let mut crc: serde_json::Value =
             serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
         crc[field] = 0.into();
 
-        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
-        assert!(
-            error.to_string().contains("both be present or absent"),
-            "{error}"
-        );
+        let crc = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap();
+        assert_eq!(crc.num_deleted_records_opt, expected_deleted_records);
+        assert_eq!(crc.num_deletion_vectors_opt, expected_deletion_vectors);
     }
 
     #[test]
