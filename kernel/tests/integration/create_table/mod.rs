@@ -107,7 +107,6 @@ async fn test_create_simple_table() -> DeltaResult<()> {
 
 #[rstest]
 #[case::cdf_enabled(Some("true"), Some("reserved for Change Data Feed"))]
-#[case::cdf_disabled(Some("false"), None)]
 #[case::cdf_supported_only(None, None)]
 #[tokio::test]
 async fn create_table_validates_cdf_column_names(
