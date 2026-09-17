@@ -120,7 +120,12 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
-    #[instrument(name = "log_seg.build_crc_from_base", skip_all, err)]
+    #[instrument(
+        name = "log_seg.build_crc_from_base",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,

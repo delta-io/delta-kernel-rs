@@ -80,6 +80,10 @@ pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
 /// Number of leaf getters that make up a deletion vector descriptor.
 const DELETION_VECTOR_GETTER_COUNT: usize = 5;
 
+/// Number of leaf getters that make up a back reference (`manifest`, `pos`).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const BACK_REFERENCE_GETTER_COUNT: usize = 2;
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct ProtocolVisitor {
@@ -116,8 +120,13 @@ impl AddVisitor {
         path: String,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
+        let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
+            17
+        } else {
+            15
+        };
         require!(
-            getters.len() == 15,
+            getters.len() == expected_getters,
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
@@ -139,6 +148,9 @@ impl AddVisitor {
         let clustering_provider: Option<String> =
             getters[14].get_opt(row_index, "add.clustering_provider")?;
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+
         Ok(Add {
             path,
             partition_values,
@@ -151,6 +163,8 @@ impl AddVisitor {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            back_reference,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -190,8 +204,13 @@ impl RemoveVisitor {
         path: String,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
+        let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
+            17
+        } else {
+            15
+        };
         require!(
-            getters.len() == 15,
+            getters.len() == expected_getters,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -216,6 +235,9 @@ impl RemoveVisitor {
         let default_row_commit_version: Option<i64> =
             getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+
         Ok(Remove {
             path,
             data_change,
@@ -228,6 +250,8 @@ impl RemoveVisitor {
             deletion_vector,
             base_row_id,
             default_row_commit_version,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            back_reference,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -557,6 +581,30 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     }
 }
 
+/// Get a back reference out of some engine data. The caller slices `getters` so it starts with the
+/// back-reference leaves, beginning at `manifest`. Returns `Ok(None)` when no back reference is
+/// present (its required `manifest` field is absent).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn visit_back_reference_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<BackReference>> {
+    if getters.len() < BACK_REFERENCE_GETTER_COUNT {
+        return Err(Error::InternalError(format!(
+            "Wrong number of BackReference getters: {}",
+            getters.len()
+        )));
+    }
+
+    let manifest_opt: Option<String> = getters[0].get_opt(row_index, "backReference.manifest")?;
+    if let Some(manifest) = manifest_opt {
+        let pos: i32 = getters[1].get(row_index, "backReference.pos")?;
+        Ok(Some(BackReference { manifest, pos }))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Get a Metadata out of some engine data. Note that Ok(None) is returned if there is no Metadata
 /// found. The caller is responsible for slicing the `getters` slice such that the first element
 /// contains the `id` element of the metadata.
@@ -580,9 +628,9 @@ pub(crate) fn visit_metadata_at<'a>(
 
     let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
     let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
-    // get format out of primitives
     let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-    // options for format is always empty, so skip getters[4]
+    let format_options: Option<HashMap<_, _>> =
+        getters[4].get_opt(row_index, "metadata.format.options")?;
     let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
@@ -596,7 +644,7 @@ pub(crate) fn visit_metadata_at<'a>(
         description,
         format: Format {
             provider: format_provider,
-            options: HashMap::new(),
+            options: format_options.unwrap_or_default(),
         },
         schema_string,
         partition_columns,
@@ -963,8 +1011,9 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{column_expr_ref, Expression};
+    use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{action_batch, parse_json_batch, string_array_to_engine_data};
     use crate::Engine;
 
     #[rstest::rstest]
@@ -994,6 +1043,65 @@ mod tests {
             writer_features: Some(vec![TableFeature::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::populated(Some(HashMap::from([
+        ("compression".to_string(), "zstd".to_string()),
+        ("custom.option".to_string(), "arbitrary value".to_string()),
+    ])))]
+    #[case::empty(Some(HashMap::new()))]
+    #[case::missing(None)]
+    fn test_parse_metadata_format_options(
+        #[case] format_options: Option<HashMap<String, String>>,
+    ) -> DeltaResult<()> {
+        let mut format = serde_json::Map::from_iter([(
+            "provider".to_string(),
+            serde_json::Value::String("parquet".to_string()),
+        )]);
+        if let Some(options) = &format_options {
+            format.insert(
+                "options".to_string(),
+                serde_json::to_value(options).unwrap(),
+            );
+        }
+        let metadata_json = serde_json::json!({
+            "metaData": {
+                "id": "test-id",
+                "format": format,
+                "schemaString": r#"{"type":"struct","fields":[]}"#,
+                "partitionColumns": [],
+                "configuration": {},
+            }
+        })
+        .to_string();
+        // The action schema requires `options`. Making it nullable here lets the missing case
+        // reach the visitor as `None` instead of failing during JSON decoding.
+        let output_schema = schema_ref! {
+            nullable "metaData": {
+                not_null "id": STRING,
+                nullable "name": STRING,
+                nullable "description": STRING,
+                not_null "format": {
+                    not_null "provider": STRING,
+                    nullable "options": { STRING => not_null STRING },
+                },
+                not_null "schemaString": STRING,
+                not_null "partitionColumns": [ not_null STRING ],
+                nullable "createdTime": LONG,
+                not_null "configuration": { STRING => not_null STRING },
+            },
+        };
+        let engine = SyncEngine::new();
+        let data = engine.json_handler().parse_json(
+            string_array_to_engine_data(StringArray::from(vec![metadata_json])),
+            output_schema,
+        )?;
+
+        let metadata = Metadata::try_new_from_data(data.as_ref())?.unwrap();
+
+        assert_eq!(metadata.format.options, format_options.unwrap_or_default());
         Ok(())
     }
 
@@ -1476,6 +1584,96 @@ mod tests {
             Some(5),
             "default_row_commit_version mismatch - check getter index"
         );
+
+        // No back reference in this commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert_eq!(remove.back_reference, None, "back_reference mismatch");
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::empty(0)]
+    #[case::too_few(1)]
+    fn visit_back_reference_rejects_too_few_getters(#[case] getter_count: usize) {
+        let null_getter = ();
+        let getters = vec![&null_getter as &dyn GetData<'_>; getter_count];
+
+        let err = visit_back_reference_at(0, &getters).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Wrong number of BackReference getters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_add_with_back_reference() {
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":100,"modificationTime":1670892998135,"dataChange":true,"backReference":{"manifest":"_delta_log/_tree/leaf-0001.parquet","pos":7}}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut add_visitor = AddVisitor::default();
+        add_visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert_eq!(add_visitor.adds.len(), 1, "Expected exactly one add action");
+        assert_eq!(
+            add_visitor.adds[0].back_reference,
+            Some(BackReference {
+                manifest: "_delta_log/_tree/leaf-0001.parquet".to_string(),
+                pos: 7,
+            }),
+            "back_reference mismatch"
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_remove_with_back_reference() {
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"part-00000.parquet","dataChange":true,"backReference":{"manifest":"_delta_log/_tree/leaf-0001.parquet","pos":7}}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Expected exactly one remove action"
+        );
+        assert_eq!(
+            remove_visitor.removes[0].back_reference,
+            Some(BackReference {
+                manifest: "_delta_log/_tree/leaf-0001.parquet".to_string(),
+                pos: 7,
+            }),
+            "back_reference mismatch"
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn visit_back_reference_with_manifest_but_missing_pos_errors() {
+        // `pos` is required whenever the back reference is present (the visitor uses `get`, not
+        // `get_opt`), so a present `manifest` with an absent `pos` must error rather than produce a
+        // half-populated `BackReference`.
+        let manifest: StringArray = vec!["_delta_log/_tree/leaf-0001.parquet"].into();
+        let pos = ();
+        let getters: &[&dyn GetData<'_>] = &[&manifest, &pos];
+
+        let err = visit_back_reference_at(0, getters).unwrap_err();
+        assert!(
+            err.to_string().contains("backReference.pos"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1787,7 +1985,7 @@ mod tests {
         engine
             .evaluation_handler()
             .new_expression_evaluator(
-                get_commit_schema().clone(),
+                get_all_actions_schema().clone(),
                 expression.into(),
                 InCommitTimestampVisitor::schema().into(),
             )

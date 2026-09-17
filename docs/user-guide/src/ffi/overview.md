@@ -161,6 +161,7 @@ engine-owned memory.
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
 | `visit_metadata` | Invoke a single callback with `(id, name, description, format_provider, has_created_time, created_time_ms)` |
+| `visit_metadata_format_options` | Iterate arbitrary format option key/value pairs from a `SharedMetadata` handle |
 | `visit_metadata_configuration` | Iterate the `configuration` key/value map (takes a snapshot handle, not a metadata handle) |
 | `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
 
@@ -383,7 +384,7 @@ pattern is the same in every case:
 
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the
-call; copy them if you need to retain them beyond the callback.
+call. Copy them if you need to retain them beyond the callback.
 
 ## Error handling
 

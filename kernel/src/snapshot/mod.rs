@@ -10,6 +10,8 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -28,6 +30,7 @@ use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::ParsedLogPath;
+use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
@@ -203,7 +206,7 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
+    #[instrument(err, fields(enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
@@ -467,7 +470,6 @@ impl Snapshot {
     /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
-    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(
         parent = &self.span,
         name = SET_TRANSACTION_LOADED_SPAN,
@@ -542,6 +544,20 @@ impl Snapshot {
         Ok(version)
     }
 
+    /// Fetch the latest transaction version for every application id in this snapshot.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn get_app_id_versions(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<SetTransactionMap> {
+        if let Some(crc) = self.crc_at_version() {
+            if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
+                return Ok(map.clone());
+            }
+        }
+        SetTransactionScanner::get_all(self.log_segment(), engine)
+    }
+
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
     /// configuration for the domain, or None if the domain does not exist.
     ///
@@ -558,6 +574,23 @@ impl Snapshot {
         }
 
         self.get_domain_metadata_internal(domain, engine)
+    }
+
+    /// Get the row-tracking high-water mark for this snapshot.
+    ///
+    /// Returns `None` when the snapshot has no active `delta.rowTracking` domain metadata.
+    /// `Some(`[`crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK`]`)` means row tracking is active but
+    /// no row IDs have been assigned yet.
+    ///
+    /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
+    /// cannot be read or its JSON configuration is malformed.
+    pub fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+            .map(|config| parse_row_tracking_high_water_mark(&config))
+            .transpose()
     }
 
     /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
@@ -1793,6 +1826,72 @@ mod tests {
         expected.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         assert_eq!(metadata, expected);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::enabled_without_assigned_ids(
+        r#"{"rowIdHighWaterMark":-1}"#,
+        Some(crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
+        None,
+        "memory:///test_row_tracking_high_water_mark_empty/"
+    )]
+    #[case::malformed_configuration(
+        "{not-json",
+        None,
+        Some("key must be a string"),
+        "memory:///test_row_tracking_high_water_mark_malformed/"
+    )]
+    #[tokio::test]
+    async fn test_get_row_tracking_high_water_mark(
+        #[case] configuration: &str,
+        #[case] expected: Option<i64>,
+        #[case] expected_error: Option<&str>,
+        #[case] table_root: &str,
+    ) -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        commit(
+            table_root,
+            store.as_ref(),
+            0,
+            vec![
+                json!({
+                    "protocol": {
+                        "minReaderVersion": 1,
+                        "minWriterVersion": 7,
+                        "writerFeatures": ["domainMetadata", "rowTracking"]
+                    }
+                }),
+                json!({
+                    "metaData": {
+                        "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                        "format": { "provider": "parquet", "options": {} },
+                        "schemaString": r#"{"type":"struct","fields":[]}"#,
+                        "partitionColumns": [],
+                        "configuration": { "delta.enableRowTracking": "true" },
+                        "createdTime": 1587968585495i64
+                    }
+                }),
+                json!({
+                    "domainMetadata": {
+                        "domain": "delta.rowTracking",
+                        "configuration": configuration,
+                        "removed": false
+                    }
+                }),
+            ],
+        )
+        .await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let result = snapshot.get_row_tracking_high_water_mark(&engine);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            assert_eq!(result?, expected);
+        }
 
         Ok(())
     }

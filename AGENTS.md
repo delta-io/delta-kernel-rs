@@ -315,6 +315,10 @@ Keep this list updated when new protocol features are added to kernel.
   block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
   warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
+- **Keep tests with process-global state safe under concurrency:** `cargo test` runs tests as
+  parallel threads in one test binary, while nextest normally runs each test in a separate
+  process. Tests for global tracing subscribers and callbacks must not share capture buffers with
+  thread-local dispatch tests or assume no other thread can emit an event.
 
 ## Code Style
 

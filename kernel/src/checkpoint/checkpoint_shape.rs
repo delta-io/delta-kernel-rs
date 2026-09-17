@@ -41,6 +41,12 @@ pub(crate) struct CheckpointShape {
 impl CheckpointShape {
     /// Resolve `snapshot`'s checkpoint shape. Determines the checkpoint type and, when
     /// `stats_schema` is `Some`, whether the checkpoint contains parsed stats compatible with it.
+    #[tracing::instrument(
+        name = "checkpoint_shape.try_new",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn try_new(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
@@ -72,7 +78,7 @@ impl CheckpointShape {
             FileType::Parquet => {
                 let cp_schema = match segment.checkpoint_hint_schema() {
                     Some(schema) => schema,
-                    None => exec.read_parquet_footer(root_checkpoint.clone())?.schema,
+                    None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                 };
                 // No `sidecar` column means the file actions are inline, so this is a leaf.
                 if !cp_schema.contains(SIDECAR_NAME) {
@@ -112,6 +118,12 @@ impl CheckpointShape {
     /// caller to inspect the file. A non-empty sidecar list is a manifest; an empty list is a leaf
     /// (the writer emits an empty list only for a leaf, and trims an oversized manifest to absent,
     /// never to empty).
+    #[tracing::instrument(
+        name = "checkpoint_shape.from_v2_checkpoint_hint",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn from_v2_checkpoint_hint(
         exec: &dyn PlanExecutor,
         segment: &LogSegment,
@@ -137,7 +149,7 @@ impl CheckpointShape {
                     FileType::Parquet if stats_schema.is_some() => {
                         Some(match segment.checkpoint_hint_schema() {
                             Some(schema) => schema,
-                            None => exec.read_parquet_footer(root_checkpoint.clone())?.schema,
+                            None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                         })
                     }
                     _ => None,
@@ -155,6 +167,12 @@ impl CheckpointShape {
     ///
     /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, use it directly,
     /// Otherwise read the sidecar's footer to get the schema.
+    #[tracing::instrument(
+        name = "checkpoint_shape.try_new_manifest",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
         sidecar: FileMeta,
@@ -168,7 +186,7 @@ impl CheckpointShape {
                         LogSegment::schema_has_compatible_stats_parsed(&schema, stats_schema)
                     }
                     None => {
-                        let footer_schema = exec.read_parquet_footer(sidecar)?.schema;
+                        let footer_schema = read_parquet_footer_schema(exec, sidecar)?;
                         LogSegment::schema_has_compatible_stats_parsed(
                             footer_schema.as_ref(),
                             stats_schema,
@@ -203,8 +221,24 @@ impl CheckpointShape {
     }
 }
 
+#[tracing::instrument(
+    name = "checkpoint_shape.read_parquet_footer_schema",
+    skip_all,
+    fields(enable_call_frame),
+    err
+)]
+fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<SchemaRef> {
+    Ok(exec.read_parquet_footer(file)?.schema)
+}
+
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's
 /// [`FileMeta`] (enough to classify and probe; not a full enumeration).
+#[tracing::instrument(
+    name = "checkpoint_shape.collect_single_sidecar",
+    skip_all,
+    fields(enable_call_frame),
+    err
+)]
 fn collect_single_sidecar(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
