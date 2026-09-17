@@ -947,6 +947,7 @@ impl CommitInfo {
 /// specific tree version. See the [Iceberg V4 metadata RFC].
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
+#[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
 pub(crate) struct BackReference {
@@ -1028,6 +1029,7 @@ pub(crate) struct Add {
 
     /// Back reference into the adaptive metadata tree. Present only when this `add` re-adds a file
     /// that has no paired `remove` (e.g. stats backfilling); otherwise absent.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) back_reference: Option<BackReference>,
 }
@@ -1062,6 +1064,7 @@ impl Add {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
             back_reference: None,
         }
     }
@@ -1140,6 +1143,7 @@ pub(crate) struct Remove {
     /// Back reference into the adaptive metadata tree. Required when the file's entry lives in a
     /// leaf manifest; absent when the file has no leaf-manifest entry (it has no entry in the
     /// tree, or its entry is inline in the root manifest).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) back_reference: Option<BackReference>,
 }
@@ -1898,6 +1902,7 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         let expected = schema_ref! {
             nullable "add": {
                 not_null "path": STRING,
@@ -1912,6 +1917,22 @@ mod tests {
                 nullable "defaultRowCommitVersion": LONG,
                 nullable "clusteringProvider": STRING,
                 nullable "backReference": (BackReference::to_schema()),
+            },
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let expected = schema_ref! {
+            nullable "add": {
+                not_null "path": STRING,
+                not_null "partitionValues": { STRING => nullable STRING },
+                not_null "size": LONG,
+                not_null "modificationTime": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "stats": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+                nullable "clusteringProvider": STRING,
             },
         };
         assert_eq!(schema, expected);
@@ -1949,6 +1970,7 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         let expected = schema_ref! {
             nullable "remove": {
                 not_null "path": STRING,
@@ -1963,6 +1985,22 @@ mod tests {
                 nullable "baseRowId": LONG,
                 nullable "defaultRowCommitVersion": LONG,
                 nullable "backReference": (BackReference::to_schema()),
+            },
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let expected = schema_ref! {
+            nullable "remove": {
+                not_null "path": STRING,
+                nullable "deletionTimestamp": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "extendedFileMetadata": BOOLEAN,
+                (partition_values_field()),
+                nullable "size": LONG,
+                nullable "stats": STRING,
+                (tags_field()),
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
             },
         };
         assert_eq!(schema, expected);

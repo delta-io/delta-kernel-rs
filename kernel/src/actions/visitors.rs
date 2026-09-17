@@ -81,6 +81,7 @@ pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
 const DELETION_VECTOR_GETTER_COUNT: usize = 5;
 
 /// Number of leaf getters that make up a back reference (`manifest`, `pos`).
+#[cfg(feature = "adaptive-metadata-in-dev")]
 const BACK_REFERENCE_GETTER_COUNT: usize = 2;
 
 #[derive(Default)]
@@ -119,8 +120,13 @@ impl AddVisitor {
         path: String,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
+        let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
+            17
+        } else {
+            15
+        };
         require!(
-            getters.len() == 17,
+            getters.len() == expected_getters,
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
@@ -142,6 +148,7 @@ impl AddVisitor {
         let clustering_provider: Option<String> =
             getters[14].get_opt(row_index, "add.clustering_provider")?;
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
 
         Ok(Add {
@@ -156,6 +163,7 @@ impl AddVisitor {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
             back_reference,
         })
     }
@@ -196,8 +204,13 @@ impl RemoveVisitor {
         path: String,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
+        let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
+            17
+        } else {
+            15
+        };
         require!(
-            getters.len() == 17,
+            getters.len() == expected_getters,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -222,6 +235,7 @@ impl RemoveVisitor {
         let default_row_commit_version: Option<i64> =
             getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
 
         Ok(Remove {
@@ -236,6 +250,7 @@ impl RemoveVisitor {
             deletion_vector,
             base_row_id,
             default_row_commit_version,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
             back_reference,
         })
     }
@@ -569,6 +584,7 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 /// Get a back reference out of some engine data. The caller slices `getters` so it starts with the
 /// back-reference leaves, beginning at `manifest`. Returns `Ok(None)` when no back reference is
 /// present (its required `manifest` field is absent).
+#[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn visit_back_reference_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
@@ -1510,9 +1526,11 @@ mod tests {
         );
 
         // No back reference in this commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         assert_eq!(remove.back_reference, None, "back_reference mismatch");
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest::rstest]
     #[case::empty(0)]
     #[case::too_few(1)]
@@ -1529,6 +1547,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_parse_add_with_back_reference() {
         let json_strings: StringArray = vec![
@@ -1552,6 +1571,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_parse_remove_with_back_reference() {
         let json_strings: StringArray = vec![
@@ -1579,6 +1599,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn visit_back_reference_with_manifest_but_missing_pos_errors() {
         // `pos` is required whenever the back reference is present (the visitor uses `get`, not

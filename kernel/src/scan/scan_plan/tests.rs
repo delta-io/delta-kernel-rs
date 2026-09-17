@@ -403,8 +403,6 @@ const ADD_FIELDS: &[&str] = &[
     "add.defaultRowCommitVersion",
     "add.tags",
     "add.clusteringProvider",
-    "add.backReference.manifest",
-    "add.backReference.pos",
 ];
 const ALL_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.numRecords",
@@ -567,6 +565,13 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .flat_map(|fields| fields.iter())
             .map(|field| field.to_string())
             .collect();
+        // Back references are part of the adaptive-metadata-tree schema; they appear as `add`
+        // leaves only when that feature is enabled.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            expected.push("add.backReference.manifest".to_string());
+            expected.push("add.backReference.pos".to_string());
+        }
         expected.sort_unstable();
         assert_eq!(leaf_paths(&actual), expected);
         Ok(())
