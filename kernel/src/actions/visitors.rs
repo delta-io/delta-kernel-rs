@@ -585,7 +585,7 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 /// back-reference leaves, beginning at `manifest`. Returns `Ok(None)` when no back reference is
 /// present (its required `manifest` field is absent).
 #[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) fn visit_back_reference_at<'a>(
+fn visit_back_reference_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<BackReference>> {

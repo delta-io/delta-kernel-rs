@@ -951,9 +951,9 @@ impl CommitInfo {
 /// Identifies the location of a file's existing entry within the adaptive metadata tree, pointing
 /// at a specific position in a leaf manifest.
 ///
-/// A back reference lets a writer locate (and construct materialized deletion vectors from) an
-/// existing tree entry without scanning entire leaf manifests. It is meaningful only relative to a
-/// specific tree version. See the [Iceberg V4 metadata RFC].
+/// A back reference lets a writer locate an existing tree entry without scanning entire leaf
+/// manifests. It is meaningful only relative to a specific tree version. See the
+/// [Iceberg V4 metadata RFC].
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -961,7 +961,8 @@ impl CommitInfo {
 #[cfg_attr(test, derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
 pub(crate) struct BackReference {
     /// Path to the leaf manifest containing this file, relative to the table root
-    /// (e.g. `metadata/leaf-m1.parquet`).
+    /// (e.g. `metadata/leaf-m1.parquet`). Resolved by joining the table location and this path
+    /// with a `/` separator, so it must not start with `/`.
     pub(crate) manifest: String,
     /// Row position (0-indexed) of the file entry within the manifest.
     pub(crate) pos: i32,
