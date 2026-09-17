@@ -20,12 +20,16 @@ use tracing::instrument;
 use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::null_lit;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
@@ -627,10 +631,16 @@ impl<S> Transaction<S> {
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
         )?;
-        let with_data_change_patch = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new_nested(["add"])
-                .insert_after("modificationTime", lit(self.data_change)),
-        )?;
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+        let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
+            .insert_after("modificationTime", lit(self.data_change));
+        // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
+        // to keep the produced struct aligned with the `backReference` field of LOG_ADD_SCHEMA.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            add_patch = add_patch.append(null_lit(BackReference::to_schema()));
+        }
+        let with_data_change_patch = Expression::struct_patch(add_patch)?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),
