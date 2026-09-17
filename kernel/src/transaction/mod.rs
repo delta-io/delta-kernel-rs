@@ -21,8 +21,6 @@ use crate::committer::{
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::expressions::null_lit;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     col, column_name, lit, null_lit, ArrayData, ColumnName, ExpressionStructPatch,
