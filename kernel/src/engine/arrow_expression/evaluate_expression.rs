@@ -726,9 +726,18 @@ pub fn evaluate_predicate(
 
             let has_non_nan_literal =
                 is_non_nan_float_literal(left) || is_non_nan_float_literal(right);
+            let has_nonzero_ordering_literal = matches!(op, LessThan | GreaterThan)
+                && (is_nonzero_float_literal(left) || is_nonzero_float_literal(right));
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
             match (left.data_type(), right.data_type()) {
+                (ArrowDataType::Float32, ArrowDataType::Float32)
+                | (ArrowDataType::Float64, ArrowDataType::Float64)
+                    if has_nonzero_ordering_literal =>
+                {
+                    // Both zeros sort the same way against a nonzero literal.
+                    return Ok(eval_fn(&left, &right)?);
+                }
                 (ArrowDataType::Float32, ArrowDataType::Float32) => {
                     return compare_float_arrays::<Float32Type>(
                         left.as_primitive(),
@@ -1190,6 +1199,14 @@ fn is_non_nan_float_literal(expr: &Expression) -> bool {
     match expr {
         Expression::Literal(Scalar::Float(value)) => !value.is_nan(),
         Expression::Literal(Scalar::Double(value)) => !value.is_nan(),
+        _ => false,
+    }
+}
+
+fn is_nonzero_float_literal(expr: &Expression) -> bool {
+    match expr {
+        Expression::Literal(Scalar::Float(value)) => *value != 0.0,
+        Expression::Literal(Scalar::Double(value)) => *value != 0.0,
         _ => false,
     }
 }

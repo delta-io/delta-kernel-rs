@@ -1675,16 +1675,25 @@ fn test_float_in_uses_ieee_equality(#[case] needle: f64, #[case] expected: [bool
 #[case::not_distinct_zero(Expr::distinct, 0.0, true, [Some(false), Some(true), Some(false), Some(false), Some(false)])]
 #[case::inverted_greater(Expr::gt, 0.0, true, [Some(false), Some(true), Some(false), Some(true), None])]
 #[case::inverted_equal(Expr::eq, f64::NAN, true, [Some(false), Some(true), Some(true), Some(true), None])]
+#[case::below_one(Expr::lt, 1.0, false, [Some(false), Some(true), Some(false), Some(true), None])]
+#[case::above_minus_one(Expr::gt, -1.0, false, [Some(true), Some(true), Some(true), Some(false), None])]
+#[case::one_below_column(|column: Expr, literal: Expr| literal.lt(column), 1.0, false, [Some(true), Some(false), Some(true), Some(false), None])]
+#[case::minus_one_above_column(|column: Expr, literal: Expr| literal.gt(column), -1.0, false, [Some(false), Some(false), Some(false), Some(true), None])]
+#[case::inverted_below_one(Expr::lt, 1.0, true, [Some(true), Some(false), Some(true), Some(false), None])]
+#[case::inverted_above_minus_one(Expr::gt, -1.0, true, [Some(false), Some(false), Some(false), Some(true), None])]
+#[case::inverted_one_below_column(|column: Expr, literal: Expr| literal.lt(column), 1.0, true, [Some(false), Some(true), Some(false), Some(true), None])]
+#[case::inverted_minus_one_above_column(|column: Expr, literal: Expr| literal.gt(column), -1.0, true, [Some(true), Some(true), Some(true), Some(false), None])]
 fn test_float_positive_nan_total_ordering(
     #[case] make_predicate: fn(Expr, Expr) -> Pred,
     #[case] literal: f64,
     #[case] inverted: bool,
     #[case] expected: [Option<bool>; 5],
     #[values(DataType::Float32, DataType::Float64)] data_type: DataType,
+    #[values(0.0, -0.0)] zero: f64,
 ) {
     let values = Float64Array::from(vec![
         Some(f64::NAN),
-        Some(0.0),
+        Some(zero),
         Some(f64::INFINITY),
         Some(f64::NEG_INFINITY),
         None,
@@ -1744,21 +1753,23 @@ fn test_float_column_comparisons(
     );
 }
 
-#[test]
-fn test_float_negative_nan_total_ordering_is_preserved() {
+#[rstest]
+fn test_float_negative_nan_total_ordering_is_preserved(
+    #[values(0.0, -0.0, -1.0, 1.0, f64::NEG_INFINITY, f64::INFINITY)] literal: f64,
+) {
     let negative_nan = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
     let array = Arc::new(Float64Array::from(vec![negative_nan, f64::NAN])) as ArrayRef;
     let schema = Schema::new([Arc::new(Field::new("col", DataType::Float64, false))]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap();
     let col = col!("col");
 
-    let result = evaluate_predicate(&col.clone().lt(lit(0.0)), &batch, false).unwrap();
+    let result = evaluate_predicate(&col.clone().lt(lit(literal)), &batch, false).unwrap();
     assert_eq!(result, BooleanArray::from(vec![true, false]));
 
-    let result = evaluate_predicate(&col.clone().gt(lit(0.0)), &batch, false).unwrap();
+    let result = evaluate_predicate(&col.clone().gt(lit(literal)), &batch, false).unwrap();
     assert_eq!(result, BooleanArray::from(vec![false, true]));
 
-    let result = evaluate_predicate(&col.eq(lit(0.0)), &batch, false).unwrap();
+    let result = evaluate_predicate(&col.eq(lit(literal)), &batch, false).unwrap();
     assert_eq!(result, BooleanArray::from(vec![false, false]));
 }
 
