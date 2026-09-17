@@ -382,9 +382,6 @@ fn validate_crc_state(
     num_deletion_vectors_opt: Option<i64>,
     deleted_histogram: Option<&DeletedRecordCountsHistogram>,
 ) -> DeltaResult<()> {
-    if let Some(histogram) = deleted_histogram {
-        DeletedRecordCountsHistogram::validate(&histogram.deleted_record_counts)?;
-    }
     for (name, value) in [
         ("numDeletedRecordsOpt", num_deleted_records_opt),
         ("numDeletionVectorsOpt", num_deletion_vectors_opt),
@@ -394,6 +391,11 @@ fn validate_crc_state(
                 "CRC file has invalid {name}: expected a non-negative value"
             )));
         }
+    }
+    if num_deleted_records_opt.is_some() != num_deletion_vectors_opt.is_some() {
+        return Err(Error::generic(
+            "CRC numDeletedRecordsOpt and numDeletionVectorsOpt must both be present or absent",
+        ));
     }
 
     if metadata
@@ -1193,6 +1195,21 @@ mod tests {
         crc[field] = (-1).into();
         let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
         assert!(error.to_string().contains(field), "{error}");
+    }
+
+    #[rstest]
+    #[case::deleted_records_only("numDeletedRecordsOpt")]
+    #[case::deletion_vectors_only("numDeletionVectorsOpt")]
+    fn de_unpaired_deletion_totals_are_rejected(#[case] field: &str) {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
+        crc[field] = 0.into();
+
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("both be present or absent"),
+            "{error}"
+        );
     }
 
     #[test]
