@@ -290,6 +290,7 @@ mod tests {
                 Scalar::Long(base_row_id),
                 Scalar::Long(commit_version),
                 null_of("clusteringProvider"),
+                null_of("backReference"),
             ],
         )
         .unwrap();
