@@ -32,11 +32,6 @@ enum BinaryPredicateOp {
   BINARY_PREDICATE_OP_IN = 5;
 }
 
-enum UnaryExpressionOp {
-  UNARY_EXPRESSION_OP_UNSPECIFIED = 0;
-  UNARY_EXPRESSION_OP_TO_JSON = 1;
-}
-
 enum BinaryExpressionOp {
   BINARY_EXPRESSION_OP_UNSPECIFIED = 0;
   BINARY_EXPRESSION_OP_PLUS = 1;
@@ -123,11 +118,6 @@ message ColumnName {
 // Composite expression bodies
 // ============================================================================
 
-message UnaryExpression {
-  UnaryExpressionOp op = 1;
-  Expression expr = 2;
-}
-
 message BinaryExpression {
   BinaryExpressionOp op = 1;
   Expression left = 2;
@@ -143,6 +133,11 @@ message IfExpression {
   Predicate condition = 1;
   Expression then_expr = 2;
   Expression else_expr = 3;
+}
+
+message ToJsonExpression {
+  Expression expr = 1;
+  delta.kernel.schema.StructType input_schema = 2;
 }
 
 message ParseJsonExpression {
@@ -238,7 +233,6 @@ message Expression {
     Predicate predicate = 3;
     StructExpression struct_expr = 4;
     Transform transform = 5;
-    UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
     // TODO: IfExpression is not yet available in Kernel but will be needed in the future.
@@ -247,5 +241,8 @@ message Expression {
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    ToJsonExpression to_json = 14;
   }
+  // Field 6 held UnaryExpression, whose only operator became ToJsonExpression above.
+  reserved 6;
 }

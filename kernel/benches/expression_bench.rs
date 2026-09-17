@@ -20,8 +20,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use delta_kernel::arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringBuilder, StructArray,
 };
-use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
+use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
+use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
+use delta_kernel::schema::StructType;
 
 /// Creates a test struct array with realistic data for benchmarking.
 fn create_test_struct_array(num_rows: usize) -> StructArray {
@@ -120,6 +122,14 @@ fn create_nested_struct_array(num_rows: usize) -> StructArray {
     StructArray::new(fields, arrays, None)
 }
 
+/// The kernel schema of a benchmark fixture, which `to_json` requires. Derived from Arrow because
+/// no fixture carries a VARIANT, and computed outside the measured loop.
+fn schema_of(array: &StructArray) -> StructType {
+    (&Schema::new(array.fields().clone()))
+        .try_into_kernel()
+        .expect("kernel schema")
+}
+
 fn to_json_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("to_json");
 
@@ -131,12 +141,13 @@ fn to_json_benchmark(c: &mut Criterion) {
 
         // Benchmark simple struct array
         let simple_struct = create_simple_struct_array(size);
+        let simple_schema = schema_of(&simple_struct);
         group.bench_with_input(
             BenchmarkId::new("simple_struct", size),
             &simple_struct,
             |b, struct_array| {
                 b.iter(|| {
-                    let result = to_json(black_box(struct_array));
+                    let result = to_json(black_box(struct_array), &simple_schema);
                     black_box(result).unwrap()
                 })
             },
@@ -144,12 +155,13 @@ fn to_json_benchmark(c: &mut Criterion) {
 
         // Benchmark complex struct array
         let complex_struct = create_test_struct_array(size);
+        let complex_schema = schema_of(&complex_struct);
         group.bench_with_input(
             BenchmarkId::new("complex_struct", size),
             &complex_struct,
             |b, struct_array| {
                 b.iter(|| {
-                    let result = to_json(black_box(struct_array));
+                    let result = to_json(black_box(struct_array), &complex_schema);
                     black_box(result).unwrap()
                 })
             },
@@ -157,12 +169,13 @@ fn to_json_benchmark(c: &mut Criterion) {
 
         // Benchmark nested struct array
         let nested_struct = create_nested_struct_array(size);
+        let nested_schema = schema_of(&nested_struct);
         group.bench_with_input(
             BenchmarkId::new("nested_struct", size),
             &nested_struct,
             |b, struct_array| {
                 b.iter(|| {
-                    let result = to_json(black_box(struct_array));
+                    let result = to_json(black_box(struct_array), &nested_schema);
                     black_box(result).unwrap()
                 })
             },

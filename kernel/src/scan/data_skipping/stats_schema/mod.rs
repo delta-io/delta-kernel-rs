@@ -27,11 +27,12 @@ use crate::DeltaResult;
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
 ///
-/// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful
-/// for these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping).
-/// They count as leaf columns against the indexed column limit. The `nullCount` schema also
-/// includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null
-/// counts are still meaningful for those types.
+/// Note: Array and Map types are included in `nullCount` (null counts are meaningful for these
+/// types) but excluded from `minValues`/`maxValues` (not eligible for data skipping). A Variant
+/// appears in all three: its min/max statistic is one variant value per file, keyed by shredded
+/// path. All of them count as leaf columns against the indexed column limit. The `nullCount` schema
+/// also includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since
+/// null counts are still meaningful for those types.
 ///
 /// The `minValues`/`maxValues` struct fields are also nested structures mirroring the table's
 /// column hierarchy. They additionally filter out leaf fields with non-eligible data types
@@ -350,16 +351,23 @@ struct MinMaxStatsTransform;
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    // Array, Map, and Variant fields pass through BaseStatsTransform (for nullCount) but must
-    // be excluded from min/max stats.
+    // Array and Map fields pass through BaseStatsTransform (for nullCount) but must be excluded
+    // from min/max stats.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
     }
     fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
         None
     }
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        None
+
+    /// A VARIANT column's min/max statistic is one VARIANT value per file: an object keyed by the
+    /// normalized JSON path of each shredded leaf, holding that leaf's bound. The leaf therefore
+    /// stays at the variant type rather than being dropped like an Array or Map.
+    ///
+    /// Not recursed into: the `metadata` and `value` binaries are the statistic's own encoding, not
+    /// columns that carry statistics of their own.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        Some(Cow::Borrowed(stype))
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
@@ -844,15 +852,50 @@ mod tests {
             nullable "v": LONG,
         };
 
-        // minValues/maxValues: all 3 complex types are excluded by MinMaxStatsTransform,
-        // and col1/col2 are past the limit, so no min/max fields at all.
-        let expected = schema! {
-            nullable NUM_RECORDS: LONG,
-            nullable NULL_COUNT: (expected_null_count),
-            nullable TIGHT_BOUNDS: BOOLEAN,
+        // minValues/maxValues: the array and map are excluded by MinMaxStatsTransform and
+        // col1/col2 are past the limit, leaving only the variant's own statistic.
+        let expected_min_max = schema! {
+            nullable "v": unshredded_variant(),
         };
 
-        assert_eq!(&expected, &stats_schema);
+        assert_eq!(
+            stats_schema,
+            expected_stats(expected_null_count, expected_min_max),
+        );
+    }
+
+    /// A VARIANT's min/max statistic is the only place a shredded variant's per-path bounds live,
+    /// so the leaf stays in `minValues`/`maxValues` at the variant type. `nullCount` is a
+    /// scalar LONG, as it is for every other leaf.
+    #[test]
+    fn test_stats_schema_keeps_variant_min_max() {
+        let properties: TableProperties = [("key", "value")].into();
+        let file_schema = schema! {
+            nullable "id": LONG,
+            nullable "v": unshredded_variant(),
+        };
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats_schema,
+            expected_stats(
+                schema! {
+                    nullable "id": LONG,
+                    nullable "v": LONG,
+                },
+                schema! {
+                    nullable "id": LONG,
+                    nullable "v": unshredded_variant(),
+                },
+            ),
+        );
     }
 
     #[test]

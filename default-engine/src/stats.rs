@@ -1925,8 +1925,14 @@ mod tests {
         let merged = acc.finish().unwrap().unwrap();
 
         assert_eq!(
-            to_json(&merged).unwrap().as_string::<i32>().value(0),
-            to_json(&single).unwrap().as_string::<i32>().value(0),
+            to_json(&merged, &stats_schema_of(&merged))
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            to_json(&single, &stats_schema_of(&single))
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
         );
     }
 
@@ -2229,9 +2235,16 @@ mod tests {
         (whole, spark_stats)
     }
 
+    /// The kernel schema of a stats struct assembled from Arrow data, which `to_json` needs to know
+    /// the Delta type of each leaf. No test stats carry a VARIANT, so the Arrow type is faithful.
+    fn stats_schema_of(stats: &StructArray) -> StructType {
+        StructType::try_from_arrow(&Schema::new(stats.fields().clone())).expect("stats schema")
+    }
+
     /// Asserts kernel's stats agree with Spark's on numRecords and every key Spark published.
     fn assert_matches_spark_stats(kernel_stats: &StructArray, spark_stats: &serde_json::Value) {
-        let json_array = to_json(kernel_stats).expect("convert stats to JSON");
+        let json_array =
+            to_json(kernel_stats, &stats_schema_of(kernel_stats)).expect("convert stats to JSON");
         let json_strings = json_array.as_string::<i32>();
         assert_eq!(json_strings.len(), 1, "should have exactly one stats row");
         let kernel_stats: serde_json::Value =
@@ -2434,8 +2447,14 @@ mod tests {
         // single-shot collection covers those.
         let single = super::collect_stats(&whole, &stats_columns, &physical_schema).unwrap();
         assert_eq!(
-            to_json(&merged).unwrap().as_string::<i32>().value(0),
-            to_json(&single).unwrap().as_string::<i32>().value(0),
+            to_json(&merged, &stats_schema_of(&merged))
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            to_json(&single, &stats_schema_of(&single))
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
         );
     }
 
@@ -2525,8 +2544,14 @@ mod tests {
         let single = collect_stats(&whole, &[column_name!("t")]).unwrap();
 
         assert_eq!(
-            to_json(&merged).unwrap().as_string::<i32>().value(0),
-            to_json(&single).unwrap().as_string::<i32>().value(0),
+            to_json(&merged, &stats_schema_of(&merged))
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            to_json(&single, &stats_schema_of(&single))
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
         );
     }
 

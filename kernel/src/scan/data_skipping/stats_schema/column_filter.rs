@@ -231,8 +231,8 @@ impl<'col> StatsColumnFilter<'col> {
                 }
             }
             // All non-struct types are leaf columns for stats purposes: they count against
-            // the column limit and are included in nullCount. Array, Map, and Variant are
-            // excluded from min/max by MinMaxStatsTransform.
+            // the column limit and are included in nullCount. Array and Map are excluded from
+            // min/max by MinMaxStatsTransform.
             _ => {
                 if self.should_include_for_table() {
                     result.push(ColumnName::new(&self.path));

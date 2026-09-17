@@ -913,6 +913,19 @@ fn test_apply_schema_column_count_mismatch() {
     );
 }
 
+/// The kernel schema of a struct array, which `to_json` needs to know each leaf's Delta type. None
+/// of these fixtures carries a VARIANT, so the Arrow type round-trips faithfully.
+fn to_json_schema(array: &StructArray) -> StructType {
+    (&Schema::new(array.fields().clone()))
+        .try_into_kernel()
+        .expect("kernel schema")
+}
+
+/// `to_json` rejects a non-struct input before it consults the schema.
+fn unused_to_json_schema() -> StructType {
+    StructType::try_new(Vec::<StructField>::new()).expect("empty schema")
+}
+
 #[test]
 fn test_to_json_with_struct_array() {
     // Create a test struct array
@@ -945,7 +958,7 @@ fn test_to_json_with_struct_array() {
     );
 
     // Test the to_json function
-    let result = to_json(&struct_array).unwrap();
+    let result = to_json(&struct_array, &to_json_schema(&struct_array)).unwrap();
     let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
 
     assert_eq!(json_array.len(), 5);
@@ -982,7 +995,7 @@ fn test_to_json_with_null_struct() {
     );
 
     // Test the to_json function
-    let result = to_json(&struct_array).unwrap();
+    let result = to_json(&struct_array, &to_json_schema(&struct_array)).unwrap();
     let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
 
     assert_eq!(json_array.len(), 2);
@@ -995,15 +1008,15 @@ fn test_to_json_with_null_struct() {
 fn test_to_json_with_non_struct_array() {
     // Test that to_json fails when input is not a StructArray
     let int_array = Int32Array::from(vec![1, 2, 3]);
-    let result = to_json(&int_array);
+    let result = to_json(&int_array, &unused_to_json_schema());
     assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
 
     let string_array = StringArray::from(vec!["hello", "world"]);
-    let result = to_json(&string_array);
+    let result = to_json(&string_array, &unused_to_json_schema());
     assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
 
     let boolean_array = BooleanArray::from(vec![true, false]);
-    let result = to_json(&boolean_array);
+    let result = to_json(&boolean_array, &unused_to_json_schema());
     assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
 }
 
@@ -1015,7 +1028,7 @@ fn test_to_json_with_empty_struct_array() {
 
     let struct_array = StructArray::new(vec![int_field].into(), vec![int_array], None);
 
-    let result = to_json(&struct_array).unwrap();
+    let result = to_json(&struct_array, &to_json_schema(&struct_array)).unwrap();
     let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(json_array.len(), 0);
 }
@@ -1056,7 +1069,7 @@ fn test_to_json_with_nested_struct() {
         None,
     );
 
-    let result = to_json(&struct_array).unwrap();
+    let result = to_json(&struct_array, &to_json_schema(&struct_array)).unwrap();
     let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
 
     assert_eq!(json_array.len(), 2);

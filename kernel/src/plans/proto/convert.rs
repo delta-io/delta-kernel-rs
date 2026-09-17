@@ -15,8 +15,7 @@ use crate::expressions::{
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
     JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions,
     OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    ToJsonExpression, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
@@ -316,11 +315,11 @@ impl From<&Expression> for proto_expr::Expression {
                 }))
             }
             Expression::StructPatch(patch) => Kind::Transform(patch.into()),
-            Expression::Unary(unary) => Kind::Unary(Box::new(unary.into())),
             Expression::Binary(binary) => Kind::Binary(Box::new(binary.into())),
             Expression::Variadic(variadic) => Kind::Variadic(variadic.into()),
             Expression::Opaque(opaque) => Kind::Opaque(opaque.into()),
             Expression::Unknown(name) => Kind::Unknown(name.clone()),
+            Expression::ToJson(to_json) => Kind::ToJson(Box::new(to_json.into())),
             Expression::ParseJson(parse_json) => Kind::ParseJson(Box::new(parse_json.into())),
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
@@ -356,15 +355,6 @@ impl From<&ColumnName> for proto_expr::ColumnName {
     }
 }
 
-impl From<&UnaryExpression> for proto_expr::UnaryExpression {
-    fn from(unary: &UnaryExpression) -> Self {
-        proto_expr::UnaryExpression {
-            op: proto_expr::UnaryExpressionOp::from(unary.op) as i32,
-            expr: Some(Box::new(unary.expr.as_ref().into())),
-        }
-    }
-}
-
 impl From<&BinaryExpression> for proto_expr::BinaryExpression {
     fn from(binary: &BinaryExpression) -> Self {
         proto_expr::BinaryExpression {
@@ -389,6 +379,15 @@ impl From<&OpaqueExpression> for proto_expr::OpaqueExpression {
         proto_expr::OpaqueExpression {
             name: opaque.op.name().to_string(),
             exprs: convert_vec(&opaque.exprs),
+        }
+    }
+}
+
+impl From<&ToJsonExpression> for proto_expr::ToJsonExpression {
+    fn from(to_json: &ToJsonExpression) -> Self {
+        proto_expr::ToJsonExpression {
+            expr: Some(Box::new(to_json.expr.as_ref().into())),
+            input_schema: Some(to_json.input_schema.as_ref().into()),
         }
     }
 }
@@ -480,14 +479,6 @@ impl From<&ExpressionFieldPatch> for proto_expr::FieldTransform {
             exprs: convert_expr_vec(&field_patch.insertions),
             is_replace: !field_patch.keep_input,
             optional: field_patch.optional,
-        }
-    }
-}
-
-impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
-    fn from(op: UnaryExpressionOp) -> Self {
-        match op {
-            UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
         }
     }
 }
@@ -989,8 +980,7 @@ mod tests {
         col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
         DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
         MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
-        VariadicExpressionOp,
+        ScalarExpressionEvaluator, StructData, UnaryPredicateOp, VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1579,7 +1569,7 @@ mod tests {
         ),
         "transform"
     )]
-    #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
+    #[case(Expression::to_json(col!("s"), sample_schema()), "to_json")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
     #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
@@ -1604,11 +1594,11 @@ mod tests {
             Kind::Predicate(_) => "predicate",
             Kind::StructExpr(_) => "struct_expr",
             Kind::Transform(_) => "transform",
-            Kind::Unary(_) => "unary",
             Kind::Binary(_) => "binary",
             Kind::Variadic(_) => "variadic",
             Kind::IfExpr(_) => "if_expr",
             Kind::Opaque(_) => "opaque",
+            Kind::ToJson(_) => "to_json",
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
             Kind::Unknown(_) => "unknown",
@@ -1664,14 +1654,14 @@ mod tests {
     }
 
     #[test]
-    fn from_unary_expression() {
-        let proto_expr::expression::Kind::Unary(unary) =
-            expr_kind_of(Expression::unary(UnaryExpressionOp::ToJson, lit(1)))
+    fn from_to_json_expression() {
+        let proto_expr::expression::Kind::ToJson(to_json) =
+            expr_kind_of(Expression::to_json(col!("s"), sample_schema()))
         else {
-            panic!("expected a unary expression");
+            panic!("expected a to_json expression");
         };
-        assert_eq!(unary.op, proto_expr::UnaryExpressionOp::ToJson as i32);
-        assert!(unary.expr.is_some());
+        assert!(to_json.expr.is_some());
+        assert!(to_json.input_schema.is_some());
     }
 
     #[test]
@@ -1821,18 +1811,6 @@ mod tests {
     }
 
     // === Expression and predicate operators ===
-
-    #[rstest]
-    #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
-    fn from_unary_expression_op(
-        #[case] op: UnaryExpressionOp,
-        #[case] expected: proto_expr::UnaryExpressionOp,
-    ) {
-        assert_eq!(
-            proto_expr::UnaryExpressionOp::from(op) as i32,
-            expected as i32
-        );
-    }
 
     #[rstest]
     #[case(BinaryExpressionOp::Plus, proto_expr::BinaryExpressionOp::Plus)]

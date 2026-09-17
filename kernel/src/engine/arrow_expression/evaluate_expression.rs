@@ -34,16 +34,18 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_RO
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
+use crate::engine::arrow_utils::{
+    encode_variant_stats, list_type_with_element, parse_json_impl, prim_array_cmp,
+};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    OpaquePredicate, Predicate, Scalar, ToJsonExpression, UnaryPredicate, UnaryPredicateOp,
+    VariadicExpression, VariadicExpressionOp,
 };
-use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::schema::{DataType, PrimitiveType, Schema, StructField, StructType};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -281,7 +283,6 @@ pub fn evaluate_expression(
 ) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
-    use UnaryExpressionOp::*;
     use VariadicExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => {
@@ -307,10 +308,10 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
-        (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
+        (ToJson(ToJsonExpression { expr, input_schema }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
                 let input = evaluate_expression(expr, batch, None)?;
-                Ok(to_json(&input)?)
+                to_json(&input, input_schema)
             }
             Some(data_type) => Err(Error::generic(format!(
                 "ToJson operator requires STRING output, but got {data_type:?}"
@@ -785,9 +786,16 @@ pub fn evaluate_predicate(
 const STATS_TIMESTAMP_TZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
 
-/// Converts a StructArray to JSON-encoded strings
+/// Converts a StructArray to JSON-encoded strings.
+///
+/// `input_schema` is the kernel schema of `input`, which names the Delta type of each leaf. Leaves
+/// whose encoding the Arrow type alone does not determine are rewritten first: a VARIANT becomes
+/// the single Z85 string the stats JSON format carries. See [`ToJsonExpression`] for the full
+/// encoding contract.
+///
+/// [`ToJsonExpression`]: crate::expressions::ToJsonExpression
 #[internal_api]
-pub(crate) fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+pub(crate) fn to_json(input: &dyn Datum, input_schema: &Schema) -> DeltaResult<ArrayRef> {
     let (array_ref, _is_scalar) = input.get();
     match array_ref.data_type() {
         ArrowDataType::Struct(_) => {
@@ -797,6 +805,8 @@ pub(crate) fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
                     array_ref.data_type(),
                 ))
             })?;
+            let encoded = encode_variant_stats(struct_array, input_schema)?;
+            let struct_array = encoded.as_ref().unwrap_or(struct_array);
 
             let num_rows = struct_array.len();
             if num_rows == 0 {
@@ -848,7 +858,8 @@ pub(crate) fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
         _ => Err(ArrowError::InvalidArgumentError(format!(
             "TO_JSON can only be applied to struct arrays, got {:?}",
             array_ref.data_type()
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -1129,7 +1140,7 @@ mod tests {
         MapToStructOptions, Predicate as Pred, StructData,
     };
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
+        schema, schema_ref, ArrayType, DataType, MapType, SchemaRef, StructField, StructType,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -2208,8 +2219,12 @@ mod tests {
 
         // A UTC-annotated array renders the protocol's `Z` suffix; NTZ has no offset at all.
         let suffix = if timezone.is_some() { "Z" } else { "" };
+        let input_schema = match timezone {
+            Some(_) => schema_ref! { nullable "ts": TIMESTAMP },
+            None => schema_ref! { nullable "ts": TIMESTAMP_NTZ },
+        };
         assert_eq!(
-            to_json_string(value),
+            to_json_string(value, input_schema),
             format!(r#"{{"ts":"{expected}{suffix}"}}"#)
         );
     }
@@ -2234,22 +2249,64 @@ mod tests {
             Arc::new(inner.clone()) as ArrayRef,
         )]);
 
-        for (value, expected) in [
-            (inner, format!(r#"{{"ts":"{expected}"}}"#)),
-            (outer, format!(r#"{{"minValues":{{"ts":"{expected}"}}}}"#)),
+        let inner_schema = schema_ref! { nullable "ts": TIMESTAMP };
+        let outer_schema = schema_ref! { nullable "minValues": { nullable "ts": TIMESTAMP } };
+        for (value, schema, expected) in [
+            (inner, inner_schema, format!(r#"{{"ts":"{expected}"}}"#)),
+            (
+                outer,
+                outer_schema,
+                format!(r#"{{"minValues":{{"ts":"{expected}"}}}}"#),
+            ),
         ] {
-            assert_eq!(to_json_string(value), expected, "timezone {timezone}");
+            assert_eq!(
+                to_json_string(value, schema),
+                expected,
+                "timezone {timezone}"
+            );
         }
     }
 
     /// Evaluates `ToJson` over a one-column batch wrapping `value` and returns the encoded row.
-    fn to_json_string(value: StructArray) -> String {
+    /// `input_schema` is `value`'s kernel schema, which `ToJson` requires.
+    fn to_json_string(value: StructArray, input_schema: SchemaRef) -> String {
         let schema = ArrowSchema::new(vec![ArrowField::new("s", value.data_type().clone(), true)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
-        let expr = Expr::unary(UnaryExpressionOp::ToJson, col!("s"));
+        let expr = Expr::to_json(col!("s"), input_schema);
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
         let result = result.as_any().downcast_ref::<StringArray>().unwrap();
         result.value(0).to_string()
+    }
+
+    /// A VARIANT leaf is Arrow `struct<metadata, value>`, which the generic encoder would render as
+    /// a nested object of hex. `input_schema` is what tells `ToJson` to emit the one Z85 string the
+    /// stats JSON format carries instead.
+    #[test]
+    fn test_to_json_encodes_a_variant_leaf_as_one_z85_string() {
+        let metadata = [0x01u8, 0x00, 0x00];
+        let value = [0x0cu8];
+        let variant = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("metadata", ArrowDataType::Binary, true)),
+                Arc::new(BinaryArray::from(vec![&metadata[..]])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("value", ArrowDataType::Binary, true)),
+                Arc::new(BinaryArray::from(vec![&value[..]])) as ArrayRef,
+            ),
+        ]);
+        let field = ArrowField::new("v", variant.data_type().clone(), true);
+        let stats = StructArray::from(vec![(Arc::new(field), Arc::new(variant) as ArrayRef)]);
+
+        // The halves concatenate to 4 bytes, exactly one Z85 group, so no fill is added.
+        let expected = z85::encode([0x01, 0x00, 0x00, 0x0c]);
+        assert_eq!(
+            to_json_string(
+                stats,
+                schema_ref! { nullable "v": (DataType::unshredded_variant()) },
+            ),
+            format!(r#"{{"v":"{expected}"}}"#)
+        );
     }
 
     /// Base64 would render `0xABCD` as `q80=`.
@@ -2286,17 +2343,16 @@ mod tests {
             ],
             None,
         );
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            ArrowDataType::Struct(fields),
-            true,
-        )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
+        let input_schema = schema_ref! {
+            nullable "b": BINARY,
+            nullable "l": (ArrayType::new(DataType::INTEGER, true)),
+            nullable "n": { nullable "z": INTEGER },
+        };
 
-        let expr = Expr::unary(UnaryExpressionOp::ToJson, col!("s"));
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
-        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(result.value(0), r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#);
+        assert_eq!(
+            to_json_string(value, input_schema),
+            r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#
+        );
     }
 
     /// An empty string is not valid JSON, so it does not parse to an empty struct. A NULL input

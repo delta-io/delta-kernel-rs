@@ -13,10 +13,10 @@
 //! This module provides transforms to populate these fields using COALESCE expressions,
 //! ensuring that values are preserved regardless of the source format (commits vs checkpoints).
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{col, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp};
+use crate::expressions::{col, Expression, ExpressionRef, MapToStructOptions};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
@@ -91,8 +91,8 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_json {
         // Populate stats from stats_parsed if needed (for old checkpoints that only had
         // stats_parsed)
-        patch_builder =
-            patch_builder.replace_expr_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
+        let stats_json_expr = build_stats_json_expr(stats_schema);
+        patch_builder = patch_builder.replace_expr_at([ADD_NAME], STATS_FIELD, stats_json_expr);
     } else {
         // Drop stats field when not writing as JSON
         patch_builder = patch_builder.drop_at([ADD_NAME], STATS_FIELD);
@@ -223,19 +223,16 @@ fn build_partition_values_parsed_expr() -> ExpressionRef {
     ]))
 }
 
-/// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
+/// Builds expression: `stats = COALESCE(stats, ToJson(stats_parsed, stats_schema))`
 ///
 /// This expression prefers existing JSON stats, falling back to converting stats_parsed.
 /// Column paths are relative to the full batch, not the nested Add struct.
-static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+fn build_stats_json_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, STATS_FIELD),
-        Expression::unary(
-            UnaryExpressionOp::ToJson,
-            col!(ADD_NAME, STATS_PARSED_FIELD),
-        ),
+        Expression::to_json(col!(ADD_NAME, STATS_PARSED_FIELD), stats_schema.clone()),
     ]))
-});
+}
 
 /// Transforms the Add action schema within a checkpoint schema.
 ///

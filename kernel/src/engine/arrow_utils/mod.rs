@@ -1,6 +1,7 @@
 //! Some utilities for working with arrow data types
 
 pub(crate) mod apply_schema;
+mod variant_stats;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,10 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
+use self::variant_stats::decode_variant_stats;
+#[cfg(feature = "internal-api")]
+pub use self::variant_stats::decode_z85_variant_stats;
+pub(crate) use self::variant_stats::encode_variant_stats;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
@@ -1258,10 +1263,12 @@ fn parse_json_inner<'a>(
     num_rows: usize,
     schema: SchemaRef,
 ) -> DeltaResult<RecordBatch> {
-    // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
-    // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
-    // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
-    match StringifyFailureProneLeaves.transform_struct(schema.as_ref()) {
+    // Some leaves cannot be read at their declared type: arrow-json's typed
+    // Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch on a single bad cell, and
+    // a VARIANT statistic is a Z85-encoded string in the log. Both are read as `String` and
+    // converted afterwards. `Cow::Borrowed` means nothing was rewritten; skip the conversion
+    // passes.
+    match StringifyIndirectLeaves.transform_struct(schema.as_ref()) {
         Cow::Borrowed(_) => {
             let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
             decode_with_arrow_json(json_strings, num_rows, arrow_target)
@@ -1270,6 +1277,9 @@ fn parse_json_inner<'a>(
             let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
             let arrow_relaxed = Arc::new(ArrowSchema::try_from_kernel(&relaxed)?);
             let decoded = decode_with_arrow_json(json_strings, num_rows, arrow_relaxed)?;
+            // Before the cast pass: a decoded variant already has its target type, so the cast
+            // passes it through untouched.
+            let decoded = decode_variant_stats(decoded, schema.as_ref())?;
             safe_cast_back(decoded, &arrow_target)
         }
     }
@@ -1324,15 +1334,32 @@ fn decode_with_arrow_json<'a>(
     ))
 }
 
-/// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to
-/// `String` so the typed decoder accepts any well-formed JSON string for those cells.
+/// Rewrites to `String` the leaves the typed JSON decoder cannot read at their declared type:
+/// failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`), so the decoder
+/// accepts any well-formed JSON string for those cells, and `Variant`, whose statistic the log
+/// stores Z85-encoded in a string. [`decode_variant_stats`] and [`safe_cast_back`] convert them
+/// back.
 ///
-/// `Array`/`Map`/`Variant` are not visited: Delta doesn't track min/max stats for them,
-/// so a failure-prone leaf only ever shows up inside a `Struct` for our callers.
-struct StringifyFailureProneLeaves;
+/// `Array`/`Map` are not visited: Delta doesn't track min/max stats for them, so a rewritten leaf
+/// only ever shows up inside a `Struct` for our callers.
+struct StringifyIndirectLeaves;
 
-impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
+impl<'a> SchemaTransform<'a> for StringifyIndirectLeaves {
     transform_output_type!(|'a, T| Cow<'a, T>);
+
+    /// A variant's type is a struct, so relaxing it has to replace the whole field rather than
+    /// recurse into it the way a primitive leaf does.
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        match field.data_type() {
+            DataType::Variant(_) => Cow::Owned(StructField {
+                name: field.name.clone(),
+                data_type: DataType::STRING,
+                nullable: field.nullable,
+                metadata: field.metadata.clone(),
+            }),
+            _ => self.recurse_into_struct_field(field),
+        }
+    }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Cow<'a, PrimitiveType> {
         use PrimitiveType::*;
@@ -1348,10 +1375,6 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
 
     fn transform_map(&mut self, mtype: &'a MapType) -> Cow<'a, MapType> {
         Cow::Borrowed(mtype)
-    }
-
-    fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
-        Cow::Borrowed(stype)
     }
 }
 

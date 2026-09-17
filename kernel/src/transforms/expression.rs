@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, CastExpression, ColumnName, Expression, ExpressionRef,
     ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
-    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
+    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, ToJsonExpression, UnaryPredicate,
     VariadicExpression,
 };
 use crate::transforms::{
@@ -121,6 +121,15 @@ pub trait ExpressionTransform<'a> {
         Carrier::from_inner(Cow::Borrowed(patch))
     }
 
+    /// Called for each to-json expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_to_json`].
+    fn transform_expr_to_json(
+        &mut self,
+        expr: &'a ToJsonExpression,
+    ) -> Self::Output<ToJsonExpression> {
+        self.recurse_into_expr_to_json(expr)
+    }
+
     /// Called for each parse-json expression encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_expr_parse_json`].
     fn transform_expr_parse_json(
@@ -155,12 +164,6 @@ pub trait ExpressionTransform<'a> {
     /// traversal. The provided implementation just forwards to [`Self::recurse_into_pred_not`].
     fn transform_pred_not(&mut self, pred: &'a Predicate) -> Self::Output<Predicate> {
         self.recurse_into_pred_not(pred)
-    }
-
-    /// Called for each unary expression encountered during the traversal. The provided
-    /// implementation just forwards to [`Self::recurse_into_expr_unary`].
-    fn transform_expr_unary(&mut self, expr: &'a UnaryExpression) -> Self::Output<UnaryExpression> {
-        self.recurse_into_expr_unary(expr)
     }
 
     /// Called for each unary predicate encountered during the traversal. The provided
@@ -244,10 +247,6 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_expr_struct_patch(t);
                 map_owned_or_else(expr, child, Expression::StructPatch)
             }
-            Expression::Unary(u) => {
-                let child = self.transform_expr_unary(u);
-                map_owned_or_else(expr, child, Expression::Unary)
-            }
             Expression::Binary(b) => {
                 let child = self.transform_expr_binary(b);
                 map_owned_or_else(expr, child, Expression::Binary)
@@ -259,6 +258,10 @@ pub trait ExpressionTransform<'a> {
             Expression::Opaque(o) => {
                 let child = self.transform_expr_opaque(o);
                 map_owned_or_else(expr, child, Expression::Opaque)
+            }
+            Expression::ToJson(t) => {
+                let child = self.transform_expr_to_json(t);
+                map_owned_or_else(expr, child, Expression::ToJson)
             }
             Expression::ParseJson(p) => {
                 let child = self.transform_expr_parse_json(p);
@@ -329,6 +332,15 @@ pub trait ExpressionTransform<'a> {
         map_owned_children_or_else(fields, children, |fields| fields)
     }
 
+    /// Recursively transforms the child expression of a to-json expression (unary).
+    fn recurse_into_expr_to_json(
+        &mut self,
+        expr: &'a ToJsonExpression,
+    ) -> Self::Output<ToJsonExpression> {
+        let f = |child| ToJsonExpression::new(child, expr.input_schema.clone());
+        map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
+    }
+
     /// Recursively transforms the child expression of a parse-json expression (unary).
     fn recurse_into_expr_parse_json(
         &mut self,
@@ -389,12 +401,6 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right);
         let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
         map_owned_pair_or_else(b, left, right, f)
-    }
-
-    /// Recursively transforms a unary expression's child (unary).
-    fn recurse_into_expr_unary(&mut self, u: &'a UnaryExpression) -> Self::Output<UnaryExpression> {
-        let nested = self.transform_expr(&u.expr);
-        map_owned_or_else(u, nested, |expr| UnaryExpression::new(u.op, expr))
     }
 
     /// Recursively transforms a binary expression's children (binary).

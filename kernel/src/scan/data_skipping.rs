@@ -520,10 +520,12 @@ fn is_partition_value_reference(expr: &Expr) -> bool {
 }
 
 /// A column carries min/max stats iff it's a primitive whose type supports min/max skipping.
-/// Boolean / Binary, Array, Map, and Variant leaves carry nullCount only. Struct columns
-/// have no per-struct stats; only their primitive leaves do, recursively.
-/// Must match `MinMaxStatsTransform`'s acceptance rule. Otherwise the predicate creator
-/// emits refs to min/max fields the stats schema doesn't contain.
+/// Boolean / Binary, Array, and Map leaves carry nullCount only. Struct columns have no per-struct
+/// stats; only their primitive leaves do, recursively.
+/// Must accept no more than `MinMaxStatsTransform` does. Otherwise the predicate creator emits refs
+/// to min/max fields the stats schema doesn't contain. Accepting less is fine, and a VARIANT leaf
+/// always does: its statistic is in the schema, but a kernel predicate has no way to compare
+/// against a variant value, so no predicate may reference it.
 fn has_min_max_stats(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
 }
