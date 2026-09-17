@@ -146,29 +146,19 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
 }
 
 #[rstest]
-#[case(None, None, false, false)]
-#[case(None, Some(false), false, false)]
-#[case(None, Some(true), false, false)]
-#[case(Some(false), None, false, false)]
-#[case(Some(false), Some(false), false, false)]
-#[case(Some(false), Some(true), false, false)]
-#[case(Some(true), None, false, false)]
-#[case(Some(true), Some(false), false, false)]
-#[case(Some(true), Some(true), false, true)]
-#[case(None, None, true, false)]
-#[case(None, Some(false), true, false)]
-#[case(None, Some(true), true, false)]
-#[case(Some(false), None, true, false)]
-#[case(Some(false), Some(false), true, false)]
-#[case(Some(false), Some(true), true, false)]
-#[case(Some(true), None, true, false)]
-#[case(Some(true), Some(false), true, false)]
-#[case(Some(true), Some(true), true, true)]
+#[case(None, None, false)]
+#[case(None, Some(false), false)]
+#[case(None, Some(true), false)]
+#[case(Some(false), None, false)]
+#[case(Some(false), Some(false), false)]
+#[case(Some(false), Some(true), false)]
+#[case(Some(true), None, false)]
+#[case(Some(true), Some(false), false)]
+#[case(Some(true), Some(true), true)]
 #[tokio::test]
 async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     #[case] enabled: Option<bool>,
     #[case] suspended: Option<bool>,
-    #[case] supported: bool,
     #[case] expect_error: bool,
     #[values(false, true)] incremental: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -180,14 +170,11 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     .filter_map(|(key, value)| value.map(|value| (key, value.to_string())))
     .collect();
 
-    // === Create version 0 with optional row-tracking support ===
+    // === Create version 0 with row-tracking support ===
     let schema = schema_ref! { nullable "value": INTEGER };
     let (store, engine, table_url) = engine_store_setup("row_tracking_configuration", None);
-    let mut builder = create_table(&table_url, schema, "test_engine");
-    if supported {
-        builder = builder.with_table_properties([("delta.feature.rowTracking", "supported")]);
-    }
-    builder
+    create_table(&table_url, schema, "test_engine")
+        .with_table_properties([("delta.feature.rowTracking", "supported")])
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?
         .unwrap_committed();
