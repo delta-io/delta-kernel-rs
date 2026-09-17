@@ -13,7 +13,8 @@ use delta_kernel::expressions::{
 
 use super::kernel_visitor::NullTypeTag;
 use crate::expressions::{
-    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
+    FfiMapToStructOptions, SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp,
+    SharedPredicate,
 };
 use crate::handle::Handle;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
@@ -30,6 +31,12 @@ type VisitParseJsonFn = extern "C" fn(
     sibling_list_id: usize,
     child_list_id: usize,
     output_schema: Handle<SharedSchema>,
+);
+type VisitMapToStructFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    options: *const FfiMapToStructOptions,
 );
 type VisitColumnFn = extern "C" fn(
     data: *mut c_void,
@@ -174,10 +181,9 @@ pub struct EngineExpressionVisitor {
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
     /// into.
     pub visit_parse_json: VisitParseJsonFn,
-    /// Visits a `MapToStruct` expression with default options. Expressions with configured options
-    /// are reported through `visit_unknown` without visiting the child expression. The
-    /// sub-expression is in the one-item list identified by `child_list_id`.
-    pub visit_map_to_struct: VisitUnaryFn,
+    /// Visits a `MapToStruct` expression. The sub-expression is in the one-item list identified by
+    /// `child_list_id`. `options` and its contents are borrowed for the duration of the callback.
+    pub visit_map_to_struct: VisitMapToStructFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by
     /// `sibling_list_id`. The operands will be in a _two_ item list identified by
     /// `child_list_id`
@@ -696,13 +702,17 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
-        Expression::MapToStruct(map_to_struct) if !map_to_struct.options.is_default() => {
-            visit_unknown(visitor, sibling_list_id, "configured_map_to_struct")
-        }
-        Expression::MapToStruct(MapToStructExpression { map_expr, .. }) => {
+        Expression::MapToStruct(MapToStructExpression { map_expr, options }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, map_expr, child_list_id);
-            call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
+            let options = FfiMapToStructOptions::from_kernel(options);
+            call!(
+                visitor,
+                visit_map_to_struct,
+                sibling_list_id,
+                child_list_id,
+                &raw const options
+            );
         }
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
         Expression::Cast(cast) => visit_unknown(
@@ -778,6 +788,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::FfiMapToStructOptions;
     use crate::TryFromStringSlice;
 
     #[derive(Debug, PartialEq, Eq)]
@@ -801,6 +812,7 @@ mod tests {
         MapToStruct {
             sibling_list_id: usize,
             child_list_id: usize,
+            timestamp_timezone: Option<String>,
         },
     }
 
@@ -815,6 +827,23 @@ mod tests {
         let list_id = builder.next_list_id;
         builder.next_list_id += 1;
         list_id
+    }
+
+    extern "C" fn visit_map_to_struct(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        child_list_id: usize,
+        options: *const FfiMapToStructOptions,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let options = unsafe { &*options };
+        let timestamp_timezone = Option::<&KernelStringSlice>::from(&options.timestamp_timezone)
+            .map(|timezone| unsafe { String::try_from_slice(timezone).unwrap() });
+        builder.events.push(LiteralEvent::MapToStruct {
+            sibling_list_id,
+            child_list_id,
+            timestamp_timezone,
+        });
     }
 
     extern "C" fn visit_literal_interval_year_month(
@@ -871,17 +900,6 @@ mod tests {
         });
     }
 
-    extern "C" fn visit_map_to_struct(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        child_list_id: usize,
-    ) {
-        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
-        builder.events.push(LiteralEvent::MapToStruct {
-            sibling_list_id,
-            child_list_id,
-        });
-    }
     macro_rules! ignore_fn {
         ($fn_name:ident $(, $arg_type:ty)*) => {
             extern "C" fn $fn_name(
@@ -1028,33 +1046,15 @@ mod tests {
         assert_eq!(builder.events, vec![expected]);
     }
 
-    #[test]
-    fn timezone_aware_map_to_struct_visits_unknown() {
-        let expression = Expression::map_to_struct(
-            Expression::column(["partitionValues"]),
-            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
-        );
-        let mut builder = TestExpressionBuilder::default();
-        let mut visitor = test_visitor(&mut builder);
-
-        let top_level_id = visit_expression_internal(&expression, &mut visitor);
-
-        assert_eq!(top_level_id, 0);
-        assert_eq!(
-            builder.events,
-            vec![LiteralEvent::Unknown {
-                sibling_list_id: 0,
-                name: "configured_map_to_struct".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn default_map_to_struct_visits_child_then_map_to_struct() {
-        let expression = Expression::map_to_struct(
-            Expression::column(["partitionValues"]),
-            MapToStructOptions::default(),
-        );
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn map_to_struct_visits_options(#[case] timestamp_timezone: Option<&str>) {
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+        let expression =
+            Expression::map_to_struct(Expression::column(["partitionValues"]), options);
         let mut builder = TestExpressionBuilder::default();
         let mut visitor = test_visitor(&mut builder);
 
@@ -1071,7 +1071,8 @@ mod tests {
                 LiteralEvent::MapToStruct {
                     sibling_list_id: 0,
                     child_list_id: 1,
-                },
+                    timestamp_timezone: timestamp_timezone.map(str::to_string),
+                }
             ]
         );
     }
