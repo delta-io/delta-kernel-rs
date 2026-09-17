@@ -17,7 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::validation::validate_schema;
+use crate::schema::validation::{validate_cdf_column_names, validate_schema};
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
     normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
@@ -882,6 +882,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema has `delta.invariants` metadata on any column
+    /// - CDF is enabled and the schema contains a top-level column reserved for CDF
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -916,6 +917,9 @@ impl CreateTableTransactionBuilder {
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
+        if validated.is_property_true(ENABLE_CHANGE_DATA_FEED) {
+            validate_cdf_column_names(&effective_schema)?;
+        }
 
         // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
         // any annotation the caller supplied is newly introduced (see

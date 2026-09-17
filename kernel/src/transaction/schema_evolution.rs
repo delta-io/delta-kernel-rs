@@ -8,13 +8,13 @@ use delta_kernel_derive::internal_api;
 
 use crate::error::Error;
 use crate::expressions::ColumnName;
-use crate::schema::validation::validate_schema;
+use crate::schema::validation::{validate_cdf_column_names, validate_schema};
 use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     find_max_column_id_in_schema, schema_has_column_mapping_metadata,
     strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id, ColumnMappingMode,
+    validate_column_mapping_id, ColumnMappingMode, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -273,6 +273,10 @@ pub(crate) fn evolve_table_config(
         column_mapping_mode,
         current_max_column_id,
     )?;
+
+    if table_config.is_feature_enabled(&TableFeature::ChangeDataFeed) {
+        validate_cdf_column_names(&evolved_schema)?;
+    }
 
     // Only in `None` mode: if this evolution introduced column-mapping annotations into a table
     // that was clean before it, strip them; residual annotations already present on the table are

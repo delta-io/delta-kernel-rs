@@ -5,8 +5,12 @@
 use std::collections::HashSet;
 
 use crate::schema::{StructField, StructType};
+use crate::table_changes::{
+    CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
+};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::SchemaTransform;
+use crate::utils::require;
 use crate::{transform_output_type, DeltaResult, Error};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
@@ -30,6 +34,26 @@ pub(crate) fn validate_schema(
     // collects errors. The return value is intentionally discarded.
     validator.transform_struct(schema);
     validator.into_result()
+}
+
+/// Rejects exact, top-level column names reserved by CDF. Call only when CDF is enabled.
+///
+/// See the [change data reader schema](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#reader-requirements-for-addcdcfile).
+pub(crate) fn validate_cdf_column_names(schema: &StructType) -> DeltaResult<()> {
+    for name in [
+        CHANGE_TYPE_COL_NAME,
+        COMMIT_VERSION_COL_NAME,
+        COMMIT_TIMESTAMP_COL_NAME,
+    ] {
+        require!(
+            !schema.contains(name),
+            Error::schema(format!(
+                "Column '{name}' is reserved for Change Data Feed and cannot appear in the \
+                 table schema when delta.enableChangeDataFeed is true"
+            ))
+        );
+    }
+    Ok(())
 }
 
 /// Schema visitor that validates field names, detects duplicates, and rejects
@@ -311,6 +335,24 @@ mod tests {
     #[case::empty_cm_id(schema! {}, ColumnMappingMode::Id)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
         assert!(validate_schema(&schema, cm).is_ok());
+    }
+
+    #[rstest]
+    #[case::ordinary(schema! { nullable "value": STRING })]
+    #[case::uppercase(schema! {
+        nullable "_CHANGE_TYPE": STRING,
+        nullable "_COMMIT_VERSION": LONG,
+        nullable "_COMMIT_TIMESTAMP": TIMESTAMP,
+    })]
+    #[case::nested(schema! {
+        nullable "nested": {
+            nullable "_change_type": STRING,
+            nullable "_commit_version": LONG,
+            nullable "_commit_timestamp": TIMESTAMP,
+        },
+    })]
+    fn non_reserved_cdf_column_names_accepted(#[case] schema: StructType) {
+        validate_cdf_column_names(&schema).unwrap();
     }
 
     // === Invalid schemas ===
