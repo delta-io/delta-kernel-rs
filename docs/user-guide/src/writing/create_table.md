@@ -13,7 +13,6 @@ The `create_table` function returns a builder that you configure and then commit
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -29,7 +28,7 @@ let schema = Arc::new(StructType::try_new([
 ])?);
 
 create_table(url.as_str(), schema, "my-app/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -40,8 +39,9 @@ The three required arguments are:
 - **`schema`**: The table's column definitions as a `StructType`
 - **`engine_info`**: A string identifying your application (stored in the commit log)
 
-`.build()` validates the inputs and creates a `CreateTableTransaction`. `.commit()` writes
-version 0 of the table, producing the initial Protocol and Metadata actions.
+`.build_with_filesystem_committer()` validates the inputs and creates a transaction bound to a
+`FileSystemCommitter`. `.commit()` writes version 0 of the table, producing the initial Protocol
+and Metadata actions.
 
 ## Defining a schema
 
@@ -96,7 +96,6 @@ You can set custom application properties on the table:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -113,7 +112,7 @@ create_table(url.as_str(), schema, "my-app/1.0")
         ("myapp.version", "2.0"),
         ("myapp.owner", "data-team"),
     ])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -132,7 +131,6 @@ layout for queries that filter on the clustering columns:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -150,7 +148,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0")
     .with_data_layout(DataLayout::clustered(["region", "timestamp"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -188,7 +186,6 @@ entire directories when filtering on those columns.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -207,7 +204,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0")
     .with_data_layout(DataLayout::partitioned(["year", "month"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -215,7 +212,7 @@ create_table(url.as_str(), schema, "my-app/1.0")
 
 ### Validation rules
 
-`build()` validates partition columns against these rules:
+`build_with_filesystem_committer()` validates partition columns against these rules:
 
 - **Top-level only**: partition columns must be top-level fields in the schema. Nested paths
   like `address.city` are not supported.
@@ -242,43 +239,43 @@ features may additionally materialize them into the data files; see
 
 ## The Committer
 
-The `build()` method takes a `Box<dyn Committer>` that controls how the commit is
-persisted:
+Choose the build method based on how the commit is persisted:
 
 - **`FileSystemCommitter`**: For standalone filesystem-based tables. Writes commit files
-  directly to `_delta_log/` using atomic put-if-absent. This is the default for most use
-  cases.
+  directly to `_delta_log/` using atomic put-if-absent. Call
+  `build_with_filesystem_committer(engine)`.
 
 - **Custom `Committer`**: For catalog-managed tables (e.g. Unity Catalog), you implement
-  the `Committer` trait to route commits through the catalog. See
+  the `Committer` trait to route commits through the catalog. Call
+  `build_with_committer(engine, committer)`. See
   [Catalog-Managed Tables](../catalog_managed/overview.md).
 
 ## Handling the result
 
-`commit()` returns a `CommitResult`:
+`commit()` returns its `CommitResult` together with the committer:
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Created table at version {}", committed.commit_version());
     }
-    CommitResult::ConflictedTransaction(_) => {
+    (CommitResult::Conflicted(_), _) => {
         // Another writer created the table concurrently
     }
-    CommitResult::RetryableTransaction(retry) => {
+    (CommitResult::Retryable(retry), _) => {
         // Transient I/O error. Safe to retry.
         println!("Retryable error: {}", retry.error);
     }
 }
 ```
 
-For table creation, `CommittedTransaction` is the expected result (version 0).
-`ConflictedTransaction` means another process created the table between your existence
-check and commit. `RetryableTransaction` indicates a transient error.
+For table creation, `CommitResult::Committed` is the expected result (version 0).  `Conflicted`
+means another process created the table between your existence check and commit. `Retryable`
+indicates a transient error.
 
 ## Validations
 
-`build()` performs these checks before creating the transaction:
+The build methods perform these checks before creating the transaction:
 
 **Path and existence:**
 - The path is a valid URI
@@ -313,7 +310,7 @@ check and commit. `RetryableTransaction` indicates a transient error.
 
 ## Auto-enabled features
 
-`build()` auto-enables certain table features based on the schema, properties, and data
+The build methods auto-enable certain table features based on the schema, properties, and data
 layout, so you do not need to set them manually. The triggers fall into four groups.
 Each enabled feature is either a reader/writer feature (bumps both the reader and writer
 protocol) or a writer-only feature (bumps the writer protocol only).

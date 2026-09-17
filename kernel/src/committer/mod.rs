@@ -1,28 +1,15 @@
-//! The `committer` module provides a [`Committer`] trait which allows different implementations to
-//! define how to commit transactions to a catalog or filesystem. For catalog-managed tables, a
-//! [`Committer`] specific to the managing catalog should be provided. For non-catalog-managed
-//! tables, the [`FileSystemCommitter`] should be used to commit directly to the object store (via
-//! put-if-absent call to storage to atomically write new commit files).
+//! Commit coordination for filesystem-managed and catalog-managed tables.
 //!
-//! By implementing the [`Committer`] trait, different catalogs can define what happens when the
-//! kernel needs to commit a transaction to a table. The goal terminal state of every
-//! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
-//! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes a
-//! single method, [`commit`] which takes an engine, an iterator of actions (as [`EngineData`]
-//! batches), and [`CommitMetadata`] (which includes critical commit metadata like the version to
-//! commit) to allow different catalogs to define what it means to 'commit' the actions to a table.
-//! For some, this may mean writing staged commits to object storage and retaining an in-memory list
-//! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
-//! database.
+//! [`FileSystemCommitter`] writes a new Delta version directly to object storage. A catalog
+//! committer instead stages the commit, asks its catalog to ratify it, and later publishes
+//! ratified commits to the Delta log.
 //!
-//! The implementation of [`commit`] must ensure that the actions are committed atomically to the
-//! table at the given version and either (1) persisted directly to object storage as published
-//! deltas as in non-catalog-managed tables or (2) persisted within the catalog and made available
-//! to readers during snapshot contstruction via the [`log_tail`] API.
+//! [`Committer`] is the Engine compatibility interface: its [`commit`] method receives an
+//! [`Engine`], generated actions as [`EngineData`] batches, and the target [`CommitMetadata`].
+//! Connector-driven transactions emit a prepared [`Commit`] request instead. Its [`CommitActions`]
+//! can be consumed through a parent coroutine channel or started as a generator task.
 //!
-//! [`Transaction`]: crate::transaction::Transaction
 //! [`commit`]: crate::committer::Committer::commit
-//! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
 //! [`EngineData`]: crate::EngineData
 
 mod commit_types;
@@ -30,20 +17,65 @@ mod filesystem;
 mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
+use crate::coroutine::kernel::generator::{
+    BoundGenerator, BoxedGenerator, Generator, GeneratorImpl,
+};
+use crate::coroutine::{Channel, GeneratorTask};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
 
-/// A Committer is the system by which transactions are committed to a table. Transactions are
-/// effectively a collection of actions performed on the table at a specific version. The kernel
-/// exposes this trait so different catalogs can build their own commit implementations. For
-/// example, different catalogs may: commit directly to a database, commit to an object store, or
-/// use another system entirely.
+/// A lazy stream of commit actions that can be consumed directly or started for a connector.
+pub struct CommitActions(BoxedGenerator<FilteredEngineData>);
+
+impl CommitActions {
+    /// Erase the concrete generator body type.
+    pub(crate) fn new<G>(actions: G) -> Self
+    where
+        G: Generator<FilteredEngineData> + 'static,
+    {
+        Self(BoxedGenerator::new(actions))
+    }
+
+    /// Adapt an Engine-based compatibility iterator into lazy commit actions.
+    ///
+    /// Advancing the result calls `actions.next()` inline. Connector-driven paths must construct
+    /// commit actions from kernel generators instead.
+    pub fn from_engine_iterator(actions: DeltaResultIteratorStatic<FilteredEngineData>) -> Self {
+        Self::new(GeneratorImpl::new(async move |yielder| {
+            for action in actions {
+                yielder.yield_item(action?).await?;
+            }
+            Ok(())
+        }))
+    }
+
+    /// Permanently bind these actions to `channel`.
+    pub fn bind(self, channel: &Channel) -> BoundGenerator<'_, FilteredEngineData, ()> {
+        self.0.bind(channel)
+    }
+
+    /// Start a task that exposes commit actions to a connector.
+    pub fn start(self) -> GeneratorTask<FilteredEngineData> {
+        self.0.start()
+    }
+}
+
+/// A prepared transaction whose actions are ready for a committer to persist.
+#[derive(Constructor)]
+pub struct Commit {
+    /// Metadata describing the target version and commit semantics.
+    pub metadata: CommitMetadata,
+    /// Commit actions in Delta log schema order.
+    pub actions: CommitActions,
+}
+
+/// Engine-based compatibility driver for committing and publishing transactions.
 ///
-/// Critically, a Committer must implement [`commit`] which takes an engine and an iterator of
-/// actions (as [`EngineData`] batches) to commit to the table at the given version
-/// ([`CommitMetadata::version`]).
+/// [`commit`] performs the complete legacy write. Coroutine-driven connectors receive a prepared
+/// [`Commit`] through the kernel request protocol instead.
 ///
 /// [`commit`]: Committer::commit
 /// [`EngineData`]: crate::EngineData
@@ -62,7 +94,7 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
 

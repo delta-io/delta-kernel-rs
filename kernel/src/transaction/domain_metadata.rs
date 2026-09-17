@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
-use super::{EngineDataResultIterator, Transaction};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
+use super::Transaction;
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::coroutine::Channel;
 use crate::error::Error;
 use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{create_row, DeltaResult, Engine};
+use crate::{DeltaResult, Snapshot};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -158,29 +159,25 @@ impl<S> Transaction<S> {
     /// This performs an expensive log replay operation to fetch the previous configuration
     /// value for each domain being removed, as required by the Delta spec for tombstones.
     /// Returns an empty vector if there are no domain removals.
-    pub(super) fn generate_user_domain_removal_actions(
-        &self,
-        engine: &dyn Engine,
+    pub(super) async fn generate_user_domain_removal_actions(
+        snapshot: &Snapshot,
+        user_domain_removals: &[String],
+        channel: &Channel,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        if self.user_domain_removals.is_empty() {
+        if user_domain_removals.is_empty() {
             return Ok(vec![]);
         }
 
         // Scan log to fetch existing configurations for tombstones.
         // Pass the specific set of domains to remove so that log replay can terminate early
         // once all target domains have been found, instead of replaying the entire log.
-        let domains: HashSet<&str> = self
-            .user_domain_removals
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let existing_domains = self
-            .read_snapshot()?
-            .get_domain_metadatas_internal(engine, Some(&domains))?;
+        let domains: HashSet<&str> = user_domain_removals.iter().map(String::as_str).collect();
+        let existing_domains = snapshot
+            .get_domain_metadatas_internal(channel, Some(&domains))
+            .await?;
 
         // Create removal tombstones with pre-image configurations
-        Ok(self
-            .user_domain_removals
+        Ok(user_domain_removals
             .iter()
             .filter_map(|domain| {
                 // If domain doesn't exist in the log, this is a no-op (filter it out)
@@ -191,44 +188,27 @@ impl<S> Transaction<S> {
             .collect())
     }
 
-    /// Generate domain metadata actions with validation. Handle both user and system domains.
+    /// Generate user and system domain metadata actions.
     ///
-    /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
-    /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
-    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
-    ///   powers CRC file writes.
-    ///
-    /// This function may perform an expensive log replay operation if there are any domain
-    /// removals. The log replay is required to fetch the previous configuration value for the
-    /// domain to preserve in removal tombstones as mandated by the Delta spec.
-    pub(super) fn generate_domain_metadata_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    /// `removal_actions` contains any pre-image configurations resolved before this call.
+    pub(super) fn generate_domain_metadata_actions(
+        &self,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
+        removal_actions: Vec<DomainMetadata>,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
         let is_create = self.is_create_table();
-
-        // Validate domain operations (includes feature validation)
-        self.validate_domain_metadata_operations()?;
 
         if is_create {
             // user_domain_removals already validated above, but be explicit
             debug_assert!(self.user_domain_removals.is_empty());
         }
 
-        // Generate removal actions (empty for create-table due to validation above)
-        let removal_actions = self.generate_user_domain_removal_actions(engine)?;
-
         let row_tracking_high_watermark =
             if let Some(provided) = self.provided_row_tracking_high_water_mark {
-                let calculated = match row_tracking_high_watermark {
-                    Some(metadata) => metadata.high_water_mark(),
-                    None => self
-                        .read_snapshot()?
-                        .get_row_tracking_high_water_mark(engine)?
-                        .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
-                };
+                let calculated = row_tracking_high_watermark
+                    .as_ref()
+                    .map(|metadata| metadata.high_water_mark())
+                    .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK);
                 if provided < calculated {
                     return Err(Error::generic(format!(
                         "Provided row-tracking high-water mark {provided} cannot be less than the \
@@ -247,23 +227,13 @@ impl<S> Transaction<S> {
             .into_iter();
 
         // Chain all domain actions: system domains, row tracking, user domains, removals
-        let dm_actions_vec: Vec<DomainMetadata> = self
+        Ok(self
             .system_domain_metadata_additions
             .iter()
             .cloned()
             .chain(row_tracking_domain_action)
             .chain(self.user_domain_metadata_additions.iter().cloned())
             .chain(removal_actions)
-            .collect();
-
-        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
-
-        let dm_actions_iter: Vec<_> = dm_actions_vec
-            .iter()
-            .cloned()
-            .map(|dm| create_row(engine, schema.clone(), dm))
-            .collect();
-
-        Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))
+            .collect())
     }
 }

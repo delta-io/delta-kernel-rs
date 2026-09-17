@@ -1,10 +1,16 @@
 //! Commits a caller-supplied root manifest file as the table's content root.
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{
     CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, CHECKPOINT_ACTION_FIELD,
 };
+#[cfg(test)]
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::{Channel, Generator as _};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;
 use crate::log_segment::DomainMetadataMap;
@@ -12,7 +18,9 @@ use crate::schema::StructType;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, DeltaResult, Engine, FileMeta, Version};
+#[cfg(test)]
+use crate::Engine;
+use crate::{version_as_i64, DeltaResult, FileMeta, Version};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -38,16 +46,16 @@ impl RootManifestFile {
     ///
     /// Errors if an existing checkpoint does not already cover the read snapshot's version, meaning
     /// delta log commits are still pending replay since it.
-    pub(super) fn compute_checkpoint_action(
+    pub(super) async fn compute_checkpoint_action_impl(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         commit_version: Version,
         table_config: &TableConfiguration,
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> DeltaResult<CheckpointAction> {
         let (mut domain_metadata, mut transactions, existing_checkpoint) =
-            self.scan_non_content_metadata(engine)?;
+            self.scan_non_content_metadata_impl(channel).await?;
 
         // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
         // app id, so extend overwrites with the newest entry per app.
@@ -98,15 +106,15 @@ impl RootManifestFile {
 
     /// Returns the read snapshot's active domain metadata, set transactions, and latest checkpoint
     /// action.
-    fn scan_non_content_metadata(
+    async fn scan_non_content_metadata_impl(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<(
         DomainMetadataMap,
         SetTransactionMap,
         Option<CheckpointAction>,
     )> {
-        let snapshot = self.read_snapshot.as_ref();
+        let snapshot = &self.read_snapshot;
         let crc = snapshot.crc_at_version();
         let domain_metadata_complete_in_crc = matches!(
             crc.map(|crc| &crc.domain_metadata_state),
@@ -119,9 +127,13 @@ impl RootManifestFile {
 
         let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
         let mut checkpoint_action = None;
-        for batch in snapshot.log_segment().read_actions(engine, schema)? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
-            {
+        let mut actions = snapshot
+            .log_segment()
+            .read_actions(channel, schema)
+            .await?
+            .bind(channel);
+        while let Some(batch) = actions.next().await? {
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch.actions.as_ref())? {
                 checkpoint_action = Some(checkpoint);
                 break;
             }
@@ -153,7 +165,11 @@ impl RootManifestFile {
                 );
                 domain_metadata
             }
-            _ => snapshot.get_domain_metadatas_internal(engine, None)?,
+            _ => {
+                snapshot
+                    .get_domain_metadatas_internal(channel, None)
+                    .await?
+            }
         };
         let transactions = match &checkpoint_action {
             Some(checkpoint) if !transactions_complete_in_crc => checkpoint
@@ -162,10 +178,53 @@ impl RootManifestFile {
                 .cloned()
                 .map(|txn| (txn.app_id.clone(), txn))
                 .collect(),
-            _ => snapshot.get_app_id_versions(engine)?,
+            _ => snapshot.get_app_id_versions(channel).await?,
         };
 
         Ok((domain_metadata, transactions, checkpoint_action))
+    }
+
+    #[cfg(test)]
+    fn compute_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        commit_version: Version,
+        table_config: &TableConfiguration,
+        dm_changes: &[DomainMetadata],
+        set_transactions: &[SetTransaction],
+    ) -> DeltaResult<CheckpointAction> {
+        let root_manifest_file = Self::new(self.file.clone(), Arc::clone(&self.read_snapshot));
+        let table_config = table_config.clone();
+        let dm_changes = dm_changes.to_vec();
+        let set_transactions = set_transactions.to_vec();
+        EngineConnector::run_with(engine, async move |channel| {
+            root_manifest_file
+                .compute_checkpoint_action_impl(
+                    channel,
+                    commit_version,
+                    &table_config,
+                    &dm_changes,
+                    &set_transactions,
+                )
+                .await
+        })
+    }
+
+    #[cfg(test)]
+    fn scan_non_content_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(
+        DomainMetadataMap,
+        SetTransactionMap,
+        Option<CheckpointAction>,
+    )> {
+        let root_manifest_file = Self::new(self.file.clone(), Arc::clone(&self.read_snapshot));
+        EngineConnector::run_with(engine, async move |channel| {
+            root_manifest_file
+                .scan_non_content_metadata_impl(channel)
+                .await
+        })
     }
 }
 
@@ -178,7 +237,6 @@ mod tests {
 
     use super::*;
     use crate::actions::{Metadata, Protocol, Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
-    use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
@@ -189,9 +247,10 @@ mod tests {
     use crate::table_features::TableFeature;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
+        assert_result_error_with_message, create_row, MockProtocolBuilder,
+        MockTableConfigurationBuilder,
     };
-    use crate::{create_row, Engine};
+    use crate::Engine;
 
     fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
         let table_config = MockTableConfigurationBuilder::new()
@@ -224,7 +283,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(&engine)?
             .commit(&engine)?;
         let table_root = Snapshot::builder_for("memory:///")
             .build(&engine)?
@@ -445,7 +504,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(&engine)?
             .commit(&engine)?;
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 

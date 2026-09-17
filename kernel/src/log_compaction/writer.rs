@@ -1,6 +1,8 @@
 // TODO(#2337): remove dead_code allows when log compaction is re-enabled
 #![allow(dead_code, unused_imports)]
 
+use std::sync::Arc;
+
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
@@ -110,16 +112,16 @@ impl LogCompactionWriter {
 
         // Create a log segment specifically for the compaction range
         // This ensures we only process commits in [start_version, end_version]
-        let compaction_log_segment = LogSegment::for_table_changes(
+        let compaction_log_segment = Arc::new(LogSegment::for_table_changes_with_storage(
             engine.storage_handler().as_ref(),
             self.snapshot.log_segment().log_root.clone(),
             self.start_version,
             Some(self.end_version),
-        )?;
+        )?);
 
         // Read actions from the version-filtered log segment
-        let actions_iter =
-            compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
+        let actions_iter = compaction_log_segment
+            .read_actions_with_engine(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 

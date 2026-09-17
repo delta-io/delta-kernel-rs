@@ -32,7 +32,6 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # extern crate tokio;
 # use std::collections::HashMap;
 # use delta_kernel::arrow::array::RecordBatch;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
@@ -44,7 +43,7 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 

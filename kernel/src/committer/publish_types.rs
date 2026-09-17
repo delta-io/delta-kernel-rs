@@ -17,13 +17,17 @@ use crate::{DeltaResult, Error, FileMeta, Version};
 /// [`Committer::publish`]: super::Committer::publish
 #[derive(Debug, Clone)]
 pub struct CatalogCommit {
-    version: Version,
-    location: Url,
-    published_location: Url,
+    /// Version of this catalog commit.
+    pub version: Version,
+    /// Staged catalog commit file
+    /// (e.g., `s3://bucket/table/_delta_log/_staged_commits/00000000000000000001.uuid.json`).
+    pub location: Url,
+    /// Target location where this commit should be published
+    /// (e.g., `s3://bucket/table/_delta_log/00000000000000000001.json`).
+    pub published_location: Url,
 }
 
 impl CatalogCommit {
-    #[allow(dead_code)] // pub(crate) constructor will be used in future PRs
     pub(crate) fn try_new(
         log_root: &Url,
         catalog_commit: &ParsedLogPath<FileMeta>,
@@ -40,23 +44,6 @@ impl CatalogCommit {
             location: catalog_commit.location.location.clone(),
             published_location: log_root.join(&format!("{:020}.json", catalog_commit.version))?,
         })
-    }
-
-    /// The version of this catalog commit.
-    pub fn version(&self) -> Version {
-        self.version
-    }
-
-    /// The location of the staged catalog commit file
-    /// (e.g., `s3://bucket/table/_delta_log/_staged_commits/00000000000000000001.uuid.json`).
-    pub fn location(&self) -> &Url {
-        &self.location
-    }
-
-    /// The target location where this commit should be published
-    /// (e.g., `s3://bucket/table/_delta_log/00000000000000000001.json`).
-    pub fn published_location(&self) -> &Url {
-        &self.published_location
     }
 }
 
@@ -94,7 +81,6 @@ pub struct PublishMetadata {
 
 impl PublishMetadata {
     /// Creates a new `PublishMetadata` with the given publish to version and catalog commits.
-    #[allow(dead_code)] // constructor will be used in future PRs
     pub fn try_new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
@@ -117,17 +103,22 @@ impl PublishMetadata {
         &self.commits_to_publish
     }
 
+    /// Consume this metadata and return the commits to publish in ascending version order.
+    pub fn into_commits_to_publish(self) -> Vec<CatalogCommit> {
+        self.commits_to_publish
+    }
+
     fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> DeltaResult<()> {
         commits_to_publish
             .windows(2)
-            .all(|c| c[0].version() + 1 == c[1].version())
+            .all(|c| c[0].version + 1 == c[1].version)
             .then_some(())
             .ok_or_else(|| {
                 Error::Generic(format!(
                     "Catalog commits must be contiguous: got versions {:?}",
                     commits_to_publish
                         .iter()
-                        .map(|c| c.version())
+                        .map(|c| c.version)
                         .collect::<Vec<_>>()
                 ))
             })
@@ -137,7 +128,7 @@ impl PublishMetadata {
         commits_to_publish: &[CatalogCommit],
         publish_to_version: Version,
     ) -> DeltaResult<()> {
-        match commits_to_publish.last().map(|c| c.version()) {
+        match commits_to_publish.last().map(|c| c.version) {
             Some(v) if v == publish_to_version => Ok(()),
             Some(v) => Err(Error::Generic(format!(
                 "Catalog commits must end with snapshot version {publish_to_version}, but got {v}"
@@ -166,13 +157,13 @@ mod tests {
     fn test_catalog_commit_try_new_with_valid_staged_commit() {
         let parsed_staged_commit = ParsedLogPath::create_parsed_staged_commit(&table_root(), 10);
         let catalog_commit = CatalogCommit::try_new(&log_root(), &parsed_staged_commit).unwrap();
-        assert_eq!(catalog_commit.version(), 10);
+        assert_eq!(catalog_commit.version, 10);
         assert!(catalog_commit
-            .location()
+            .location
             .as_str()
             .starts_with("memory:///_delta_log/_staged_commits/00000000000000000010"));
         assert_eq!(
-            catalog_commit.published_location().as_str(),
+            catalog_commit.published_location.as_str(),
             "memory:///_delta_log/00000000000000000010.json"
         );
     }

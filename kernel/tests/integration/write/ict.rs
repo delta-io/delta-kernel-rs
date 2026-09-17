@@ -116,21 +116,21 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     // First commit
     let commit_result = txn.commit(&engine)?;
-    match commit_result {
-        CommitResult::CommittedTransaction(committed) => {
+    match commit_result.0 {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 1,
                 "First commit should result in version 1"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "First commit should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("First commit should not be retryable error");
         }
     }
@@ -161,21 +161,21 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     // Second commit
     let commit_result2 = txn2.commit(&engine)?;
-    match commit_result2 {
-        CommitResult::CommittedTransaction(committed) => {
+    match commit_result2.0 {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 2,
                 "Second commit should result in version 2"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "Second commit should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("Second commit should not be retryable error");
         }
     }

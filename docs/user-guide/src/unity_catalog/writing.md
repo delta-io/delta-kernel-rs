@@ -78,7 +78,9 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
+let mut txn = snapshot
+    .clone()
+    .transaction_with_committer(committer, &engine)?
     .with_operation("INSERT".to_string());
 ```
 
@@ -120,32 +122,34 @@ Call `txn.commit()` to stage the commit and ratify it through UC.
 
 ```rust,ignore
 use delta_kernel::transaction::CommitResult;
+use delta_kernel::Error;
 
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    (CommitResult::Committed(committed), committer) => {
         let version = committed.commit_version();
-        let post_commit_snapshot = committed
+        let snapshot = committed
             .post_commit_snapshot()
-            .expect("post-commit snapshot");
-        // Proceed to publish (next step)
+            .ok_or_else(|| Error::generic("missing post-commit snapshot"))?;
+        let published_snapshot = snapshot.publish(&engine, committer.as_ref())?;
     }
-    CommitResult::ConflictedTransaction(conflicted) => {
+    (CommitResult::Conflicted(conflicted), committer) => {
         // Another writer committed this version first. Rebase onto the new
-        // snapshot and retry. UCCommitter does not retry at this level.
+        // snapshot, bind `committer`, and retry. UCCommitter does not retry at
+        // this level.
     }
-    CommitResult::RetryableTransaction(_retryable) => {
+    (CommitResult::Retryable(retryable), committer) => {
         // Transient I/O or server error after the UC HTTP client's own retry
-        // budget was exhausted. Retry the commit from scratch.
+        // budget was exhausted. Rebind `committer` to
+        // `retryable.transaction` and retry without rebasing.
     }
 }
 ```
 
-The REST client automatically retries transport-level failures (HTTP 5xx,
-connection errors) according to the retry knobs on `ClientConfigBuilder`. See
-[Client configuration and retries](./overview.md#client-configuration-and-retries).
-Once that budget is exhausted, `UCCommitter` surfaces the failure as
-`CommitResult::RetryableTransaction`. Transaction-level retries (including
-rebasing after a `ConflictedTransaction`) are the connector's responsibility;
+The REST client automatically retries transport-level failures (HTTP 5xx, connection errors)
+according to the retry knobs on `ClientConfigBuilder`. See [Client configuration and
+retries](./overview.md#client-configuration-and-retries).  Once that budget is exhausted,
+`UCCommitter` surfaces the failure as `CommitResult::Retryable`. Transaction-level retries
+(including rebasing after a `CommitResult::Conflicted`) are the connector's responsibility;
 `UCCommitter` does not retry commits itself.
 
 Under the hood, `UCCommitter::commit` does two things for versions >= 1:
@@ -172,21 +176,6 @@ generic ratification flow.
 After a successful commit, publish the staged commit so it becomes visible as a
 normal delta file in `_delta_log/`. Without publishing, only catalog-aware
 readers can see the commit.
-
-```rust,ignore
-use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::TableIdentifier;
-
-// Build a committer to drive publishing
-let committer: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
-    update_client.clone(),
-    table_id.clone(),
-    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-
-let published_snapshot = post_commit_snapshot
-    .publish(&engine, committer.as_ref())?;
-```
 
 Publishing copies each staged commit from `_staged_commits/<version>.<uuid>.json`
 to `_delta_log/<version>.json`. If a published file already exists (from a
@@ -253,6 +242,7 @@ checkpointing fails because it can only operate on published versions.
 ```rust,ignore
 use std::sync::Arc;
 use delta_kernel::transaction::CommitResult;
+use delta_kernel::Error;
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
@@ -286,7 +276,9 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
+let mut txn = snapshot
+    .clone()
+    .transaction_with_committer(committer, &engine)?
     .with_operation("INSERT".to_string());
 
 // 6. Write data
@@ -296,27 +288,19 @@ let write_context = write_state.write_context_builder().build()?;
 txn.add_files(file_metadata);
 
 // 7. Commit, publish, and checkpoint
-let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
-    update_client.clone(),
-    table_id.clone(),
-    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
-));
-
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
-        let post_commit_snapshot = committed
-            .post_commit_snapshot()
-            .expect("post-commit snapshot");
-
+    (CommitResult::Committed(committed), committer) => {
         // Publish staged commits to _delta_log/
-        let published_snapshot = post_commit_snapshot
-            .publish(&engine, committer_for_publish.as_ref())?;
+        let snapshot = committed
+            .post_commit_snapshot()
+            .ok_or_else(|| Error::generic("missing post-commit snapshot"))?;
+        let published_snapshot = snapshot.publish(&engine, committer.as_ref())?;
 
         // Checkpoint the published snapshot
         published_snapshot.checkpoint(&engine, None)?;
     }
-    CommitResult::ConflictedTransaction(_) => { /* rebase and retry */ }
-    CommitResult::RetryableTransaction(_) => { /* retry the commit */ }
+    (CommitResult::Conflicted(_), committer) => { /* rebase and retry */ }
+    (CommitResult::Retryable(retryable), committer) => { /* retry the commit */ }
 }
 ```
 

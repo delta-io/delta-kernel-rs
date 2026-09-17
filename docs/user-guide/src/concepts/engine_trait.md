@@ -1,10 +1,9 @@
 # The Engine trait
 
-The `Engine` trait is the integration point between Delta Kernel and your connector. Kernel
-implements the Delta protocol and gives you scan and write APIs, but it needs help with the
-mechanics: listing files, reading and writing JSON and Parquet, and evaluating expressions for
-data skipping and logical-to-physical transformations. Kernel never does any of this directly.
-Instead, it calls into the `Engine` trait, which your connector implements.
+The `Engine` trait is Delta Kernel's synchronous compatibility interface for connector I/O and
+evaluation. Engine-compatible entry points use it to list files, read and write JSON and Parquet,
+and evaluate expressions for data skipping and logical-to-physical transformations. Kernel never
+performs those operations directly.
 
 This matters because it lets Kernel stay format-agnostic and runtime-agnostic. You control
 how I/O happens, what columnar format you use, and how expressions are evaluated.
@@ -12,6 +11,10 @@ how I/O happens, what columnar format you use, and how expressions are evaluated
 A [DefaultEngine](#the-default-engine) is provided that you can use out of the box. If you
 need better performance or want to use your own data formats, you can build a custom engine.
 See [Building a Connector](../connector/overview.md) for details.
+
+If your connector should retain control instead of receiving synchronous callbacks, drive lazy
+workflows through `AsyncEngineConnector` or your own request loop. See
+[Driving connector workflows](../connector/coroutines.md).
 
 ## The trait
 
@@ -24,8 +27,8 @@ trait Engine: AsAny {
 }
 ```
 
-Kernel calls these methods whenever it needs to interact with the outside world. Each returns
-a handler trait object that Kernel uses for a specific category of work. The four handlers
+The Engine compatibility adapter calls these methods whenever it needs to interact with the
+outside world. Each returns a handler trait object for one category of work. The four handlers
 cover storage, JSON, Parquet, and expression evaluation. For observability, see
 [Observability](../observability/observability.md).
 
@@ -117,9 +120,16 @@ mapping).
 The expression and predicate evaluators are reusable objects that you can call repeatedly on
 different batches of `EngineData`.
 
-## The Default Engine
+## The default execution implementations
 
-The `DefaultEngine` is a batteries-included implementation that works out of the box:
+The default-engine crate provides two Arrow and `object_store` integrations:
+
+- `DefaultEngine` implements this synchronous compatibility trait and runs asynchronous I/O through
+  a `TaskExecutor`.
+- `AsyncEngineConnector` drives workflows directly through native asynchronous I/O without an
+  `Engine` or `TaskExecutor`.
+
+Both implementations:
 
 - Uses **Apache Arrow** as the in-memory data format
 - Uses **`object_store`** for I/O (supports local FS, S3, GCS, Azure)
@@ -173,9 +183,9 @@ fully functional engine with sensible defaults.
 
 ### The TaskExecutor trait
 
-`DefaultEngine` uses asynchronous I/O internally, but Kernel's public APIs are synchronous.
-The `TaskExecutor` trait bridges this gap by defining how async work gets scheduled and
-awaited. It has four methods:
+`DefaultEngine` uses asynchronous I/O internally, but Engine-compatible entry points are
+synchronous. The `TaskExecutor` trait bridges this gap by defining how async work gets scheduled
+and awaited. It has four methods:
 
 | Method | Purpose |
 |--------|---------|
@@ -297,6 +307,7 @@ For a guide on implementing `Engine`, see
 
 - [Building a Connector](../connector/overview.md) explains the role of a connector and how
   the `Engine` fits into the bigger picture.
+- [Driving Connector Workflows](../connector/coroutines.md) covers native asynchronous execution.
 - [Implementing the Engine Trait](../connector/implementing_engine.md) walks through building
   a custom `Engine` from scratch.
 - [Configuring Storage](../storage/configuring_storage.md) shows how to point `DefaultEngine`

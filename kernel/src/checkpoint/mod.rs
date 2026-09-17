@@ -114,6 +114,7 @@ use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
+use crate::coroutine::{drive_workflow, Channel, WorkflowImpl};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -378,6 +379,13 @@ impl RetentionCalculator for CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
+        drive_workflow(
+            engine,
+            WorkflowImpl::new(async move |channel| Self::try_new_impl(snapshot, channel).await),
+        )
+    }
+
+    async fn try_new_impl(snapshot: SnapshotRef, channel: &Channel) -> DeltaResult<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;
@@ -386,7 +394,7 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
-        let schema_context = Self::checkpoint_schema_context(&snapshot, engine)?;
+        let schema_context = Self::checkpoint_schema_context(&snapshot, channel).await?;
         let read_schema = build_checkpoint_read_schema(
             &schema_context.checkpoint_base_schema,
             &schema_context.stats_schema,
@@ -468,7 +476,7 @@ impl CheckpointWriter {
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+            .read_actions_with_engine(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
@@ -716,10 +724,10 @@ impl CheckpointWriter {
         })
     }
 
-    /// Helper for computing the checkpoint schema context from the snapshot and engine.
-    fn checkpoint_schema_context(
+    /// Helper for computing the checkpoint schema context from the snapshot.
+    async fn checkpoint_schema_context(
         snapshot: &SnapshotRef,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
         let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
@@ -733,7 +741,7 @@ impl CheckpointWriter {
         };
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        let physical_clustering_columns = snapshot.get_physical_clustering_columns(engine)?;
+        let physical_clustering_columns = snapshot.get_physical_clustering_columns(channel).await?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.

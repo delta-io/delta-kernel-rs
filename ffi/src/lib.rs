@@ -1329,7 +1329,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     } = builder;
     let engine = engine.engine();
 
-    fn build<Mode>(
+    fn build<Mode: 'static>(
         mut builder: delta_kernel::snapshot::SnapshotBuilder<Mode>,
         engine: &dyn Engine,
         version: Option<Version>,
@@ -1495,7 +1495,7 @@ pub unsafe extern "C" fn snapshot_timestamp(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     snapshot
         .get_timestamp(engine_ref.engine().as_ref())
         .into_extern_result(&engine_ref)
@@ -1702,9 +1702,9 @@ pub unsafe extern "C" fn latest_version_as_of(
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     kernel_latest_version_as_of(
-        snapshot,
+        &snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
@@ -1732,9 +1732,9 @@ pub unsafe extern "C" fn first_version_after(
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     kernel_first_version_after(
-        snapshot,
+        &snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),

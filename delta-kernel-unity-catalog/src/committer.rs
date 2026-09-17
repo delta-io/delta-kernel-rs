@@ -2,10 +2,12 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use delta_kernel::committer::{
-    CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
+    CommitActions, CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
+use delta_kernel::coroutine::write_json_file_with_engine;
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
+    DeltaResult, DeltaResultIteratorStatic, Engine, Error as DeltaError, FileMeta,
+    FilteredEngineData,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
@@ -16,6 +18,10 @@ use unity_catalog_delta_client_api::{
 use crate::constants::{
     CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
+};
+use crate::coroutine::{
+    write_commit_file, Channel, CommitStep, CommitTask, PublishStep, PublishTask,
+    Request as WorkflowRequest, UpdateTable,
 };
 use crate::errors;
 
@@ -40,11 +46,22 @@ macro_rules! require {
 /// implementation consumes the Committer to commit to the table, must call `commit` from within a
 /// multi-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UCCommitter<C: UpdateTableClient> {
     update_table_client: Arc<C>,
     table_id: String,
     table: TableIdentifier,
+}
+
+// Hand-written so cloning does not require `C: Clone`: the client is shared behind an `Arc`.
+impl<C: UpdateTableClient> Clone for UCCommitter<C> {
+    fn clone(&self) -> Self {
+        Self {
+            update_table_client: Arc::clone(&self.update_table_client),
+            table_id: self.table_id.clone(),
+            table: self.table.clone(),
+        }
+    }
 }
 
 impl<C: UpdateTableClient> UCCommitter<C> {
@@ -130,12 +147,24 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         Ok(())
     }
 
+    /// Execute one catalog table update.
+    ///
+    /// Catalog failures are currently returned as [`DeltaError::Generic`].
+    pub async fn execute_update_table(&self, operation: UpdateTable) -> DeltaResult<()> {
+        self.update_table_client
+            .update_table(&operation.target, operation.request)
+            .await
+            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
+            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
+            .map_err(|err| DeltaError::Generic(format!("UC update_table error: {err}")))
+    }
+
     /// Commit version 0 (table creation). Validates that all required UC properties are present,
     /// then writes the version 0 commit file directly to the published commit path.
-    fn commit_version_0(
+    pub(crate) async fn commit_version_0(
         &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        channel: &Channel,
+        actions: CommitActions,
         commit_metadata: &CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         debug_assert!(
@@ -145,18 +174,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         );
         self.validate_catalog_managed_state(commit_metadata)?;
         let published_commit_path = commit_metadata.published_commit_path()?;
-        match engine.json_handler().write_json_file(
-            &published_commit_path,
-            Box::new(actions),
-            false,
-        ) {
-            Ok(written_size) => {
+        match write_commit_file(channel, actions, published_commit_path).await {
+            Ok(mut file_meta) => {
                 info!("wrote version 0 commit file for UC table creation");
-                let file_meta = FileMeta::new(
-                    published_commit_path,
-                    commit_metadata.in_commit_timestamp(),
-                    written_size,
-                );
+                file_meta.last_modified = commit_metadata.in_commit_timestamp();
                 Ok(CommitResponse::Committed { file_meta })
             }
             Err(DeltaError::FileAlreadyExists(_)) => {
@@ -169,15 +190,12 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Commit version >= 1. Validates catalog-managed status hasn't changed, writes a staged
     /// commit file, and calls the UC commit API to ratify it.
-    fn commit_version_non_zero(
+    pub(crate) async fn commit_version_non_zero(
         &self,
-        engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        channel: &Channel,
+        actions: CommitActions,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse>
-    where
-        C: 'static,
-    {
+    ) -> DeltaResult<CommitResponse> {
         debug_assert!(
             commit_metadata.version() != 0,
             "commit_version_non_zero called with version 0"
@@ -185,18 +203,25 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         self.validate_catalog_managed_state(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
-        engine
-            .json_handler()
-            .write_json_file(&staged_commit_path, Box::new(actions), false)?;
+        let committed = write_commit_file(channel, actions, staged_commit_path).await?;
+        debug!("wrote staged commit file: {committed:?}");
+        self.ratify_commit(channel, commit_metadata, committed)
+            .await
+    }
 
-        let committed = engine.storage_handler().head(&staged_commit_path)?;
-        debug!("wrote staged commit file: {:?}", committed);
-
+    async fn ratify_commit(
+        &self,
+        channel: &Channel,
+        commit_metadata: CommitMetadata,
+        committed: FileMeta,
+    ) -> DeltaResult<CommitResponse> {
+        self.validate_catalog_managed_state(&commit_metadata)?;
+        Self::validate_no_alter_table_changes(&commit_metadata)?;
         let mut updates = vec![DeltaTableUpdate::AddCommit {
             commit: Commit {
                 version: u64_to_wire_i64(commit_metadata.version(), "commit version")?,
                 timestamp: commit_metadata.in_commit_timestamp(),
-                file_name: staged_commit_file_name(&staged_commit_path)?,
+                file_name: staged_commit_file_name(&committed.location)?,
                 file_size: u64_to_wire_i64(committed.size, "committed size")?,
                 file_modification_timestamp: committed.last_modified,
             },
@@ -206,15 +231,22 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 latest_published_version: u64_to_wire_i64(max_pub, "max published version")?,
             });
         }
-        let update_req = UpdateTableRequest::new(
+        let request = UpdateTableRequest::new(
             vec![DeltaTableRequirement::AssertTableUuid {
                 uuid: self.table_id.clone(),
             }],
             updates,
         )
         .map_err(|e| DeltaError::generic(format!("invalid UC update_table request: {e}")))?;
-        let target = self.table.clone();
+        channel.update_table(self.table.clone(), request).await?;
+        Ok(CommitResponse::Committed {
+            file_meta: committed,
+        })
+    }
 
+    // Bridge the async client into the blocking Committer path. A multi-threaded tokio runtime is
+    // required by block_in_place.
+    fn execute_update_table_blocking(&self, operation: UpdateTable) -> DeltaResult<()> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
@@ -222,14 +254,8 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
         // panics) apart from the FFI case (single-threaded on top of multi-threaded, where it's
         // fine). So we let it run and catch the panic.
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
-                    self.update_table_client
-                        .update_table(&target, update_req)
-                        .await
-                })
-            })
+        catch_unwind(AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| handle.block_on(self.execute_update_table(operation)))
         }))
         .map_err(|panic| {
             let msg = panic
@@ -240,15 +266,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             DeltaError::generic(format!(
                 "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
             ))
-        })?;
-        match result {
-            Ok(_) => Ok(CommitResponse::Committed {
-                file_meta: committed,
-            }),
-            // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
-            // transaction layer can rebase/retry, instead of collapsing every error to Generic.
-            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
-        }
+        })?
     }
 }
 
@@ -262,13 +280,12 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
-        if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
-        }
-        self.commit_version_non_zero(engine, actions, commit_metadata)
+        let actions = CommitActions::from_engine_iterator(actions);
+        let workflow = self.commit_workflow(commit_metadata, actions);
+        self.legacy_commit(engine, workflow.start())
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -276,21 +293,57 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
-        if publish_metadata.commits_to_publish().is_empty() {
-            return Ok(());
-        }
+        self.legacy_publish(engine, self.publish_workflow(publish_metadata).start())
+    }
+}
 
-        for catalog_commit in publish_metadata.commits_to_publish() {
-            let src = catalog_commit.location();
-            let dest = catalog_commit.published_location();
-            match engine.storage_handler().copy_atomic(src, dest) {
-                Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
-                Err(e) => return Err(e),
+impl<C: UpdateTableClient + 'static> UCCommitter<C> {
+    fn legacy_commit(
+        &self,
+        engine: &dyn Engine,
+        mut task: CommitTask,
+    ) -> DeltaResult<CommitResponse> {
+        loop {
+            match task.advance()? {
+                CommitStep::Done(response) => return Ok(response),
+                CommitStep::Request(WorkflowRequest::WriteJson(operation, reply)) => {
+                    reply.send(write_json_file_with_engine(engine, *operation))?;
+                }
+                CommitStep::Request(WorkflowRequest::CopyAtomic(operation, reply)) => {
+                    let result = engine
+                        .storage_handler()
+                        .copy_atomic(&operation.source, &operation.destination);
+                    reply.send(result)?;
+                }
+                CommitStep::Request(WorkflowRequest::UpdateTable(operation, reply)) => {
+                    reply.send(self.execute_update_table_blocking(operation))?;
+                }
             }
         }
+    }
 
-        Ok(())
+    fn legacy_publish(&self, engine: &dyn Engine, mut task: PublishTask) -> DeltaResult<()> {
+        loop {
+            match task.advance()? {
+                PublishStep::Done(()) => return Ok(()),
+                PublishStep::Request(WorkflowRequest::CopyAtomic(operation, reply)) => {
+                    let result = engine
+                        .storage_handler()
+                        .copy_atomic(&operation.source, &operation.destination);
+                    reply.send(result)?;
+                }
+                PublishStep::Request(WorkflowRequest::WriteJson(..)) => {
+                    return Err(DeltaError::internal_error(
+                        "publish workflow requested a JSON write",
+                    ));
+                }
+                PublishStep::Request(WorkflowRequest::UpdateTable(..)) => {
+                    return Err(DeltaError::internal_error(
+                        "publish workflow requested UpdateTable",
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -647,8 +700,8 @@ mod tests {
         // Write staged commit files to disk
         fs::create_dir_all(&staged_dir).unwrap();
         for commit in &catalog_commits {
-            let path = commit.location().to_file_path().unwrap();
-            fs::write(&path, format!("version: {}", commit.version())).unwrap();
+            let path = commit.location.to_file_path().unwrap();
+            fs::write(&path, format!("version: {}", commit.version)).unwrap();
         }
 
         // Write 10.json file to disk (should be skipped, not error)

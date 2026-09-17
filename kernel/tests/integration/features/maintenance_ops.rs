@@ -1,7 +1,6 @@
 //! Integration tests for table maintenance operations (checkpoint, checksum).
 
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
@@ -27,8 +26,9 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
@@ -84,8 +84,9 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 

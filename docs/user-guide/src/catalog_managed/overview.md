@@ -102,47 +102,46 @@ IDs, catalog APIs, or catalog servers. Instead:
   enforcement) without knowing or caring whether a catalog exists.
 
 ```text
-+-----------------------------------------------------------+
-|                   Compute Engine                          |
-|         (Spark, Flink, DuckDB, Polars, ...)               |
-+---------------------------+-------------------------------+
-                            | table name
-                            v
-+-----------------------------------------------------------+
-|                   Catalog Client                          |
-|                                                           |
-|  1. Resolves table name -> path + credentials             |
-|  2. Calls catalog API to get ratified commits             |
-|  3. Translates commits into LogPath entries (log tail)    |
-|  4. Provides a Committer for writing                      |
-+---------------------------+-------------------------------+
-                            | path, log tail, committer
-                            v
-+-----------------------------------------------------------+
-|               Your Delta Connector                        |
-|                                                           |
-|  Uses Kernel APIs to read and write:                      |
-|    Snapshot::builder_for(path)                            |
-|      .with_log_tail(commits)                              |
-|      .with_max_catalog_version(version)                   |
-|      .build(&engine)                                      |
-|    snapshot.transaction(committer, &engine)                |
-+---------------------------+-------------------------------+
-                            | calls Kernel APIs
-                            v
-+-----------------------------------------------------------+
-|                   Delta Kernel                            |
-|                                                           |
-|  Knows nothing about catalogs, table names, or IDs.       |
-|  Sees: a path, log files, and a Committer trait.          |
-|  Handles: log replay, data skipping, protocol compliance  |
-+-----------------------------------------------------------+
++----------------------------------------------------------------+
+|                         Compute Engine                         |
+|               (Spark, Flink, DuckDB, Polars, ...)              |
++--------------------------------+-------------------------------+
+                                 | table name
+                                 v
++----------------------------------------------------------------+
+|                         Catalog Client                         |
+|                                                                |
+|  1. Resolves table name -> path + credentials                  |
+|  2. Calls catalog API to get ratified commits                  |
+|  3. Translates commits into LogPath entries (log tail)         |
+|  4. Provides a Committer for writing                           |
++--------------------------------+-------------------------------+
+                                 | path, log tail, committer
+                                 v
++----------------------------------------------------------------+
+|                      Your Delta Connector                      |
+|                                                                |
+|  Uses Kernel APIs to read and write:                           |
+|    Snapshot::builder_for(path)                                 |
+|      .with_log_tail(commits)                                   |
+|      .with_max_catalog_version(version)                        |
+|      .build(&engine)                                           |
+|    snapshot.transaction_with_committer(committer, &engine)     |
++--------------------------------+-------------------------------+
+                                 | calls Kernel APIs
+                                 v
++----------------------------------------------------------------+
+|                         Delta Kernel                           |
+|                                                                |
+|  Knows nothing about catalogs, table names, or IDs.            |
+|  Sees: a path, log files, and a Committer trait.               |
+|  Handles: log replay, data skipping, protocol compliance       |
++----------------------------------------------------------------+
 ```
 
 ### Key Kernel APIs for catalog-managed tables
 
-Four Kernel APIs form the integration surface between the catalog client and
-Kernel:
+The following Kernel APIs form the integration surface between the catalog client and Kernel:
 
 - **`SnapshotBuilder::with_log_tail(Vec<LogPath>)`** accepts a contiguous run of
   commits from version `M` to version `N` inclusive (published or staged). The
@@ -159,6 +158,9 @@ Kernel:
 - **`Committer` trait** defines how transactions are committed. A catalog
   committer implements `commit()` to stage and ratify commits through the
   catalog API, and `publish()` to copy ratified commits to the Delta log.
+
+- **`Snapshot::transaction_with_committer()`** binds a committer when the connector creates the
+  transaction.
 
 - **`Snapshot::publish()`** publishes all unpublished catalog commits at the
   current snapshot version. Published commits become visible to filesystem-based

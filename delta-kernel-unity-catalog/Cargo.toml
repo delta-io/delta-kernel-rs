@@ -25,6 +25,7 @@ integration-test = []
 
 [dependencies]
 delta_kernel = { path = "../kernel", version = "0.28.0", features = ["internal-api"] }
+derive_more = { version = "~2.1", default-features = false, features = ["constructor", "from"] }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", version = "0.1.0" }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }

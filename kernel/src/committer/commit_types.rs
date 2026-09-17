@@ -8,7 +8,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{DeltaResult, Version};
+use crate::{DeltaResult, Error, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -119,13 +119,12 @@ impl CommitProtocolMetadata {
 /// version, and protocol/metadata state of the table being committed to. Catalog committers can
 /// use the protocol and metadata getters to validate or inspect the commit.
 ///
-/// Note that this struct cannot be constructed. It is handed to the [`Committer`] (in the
-/// [`commit`] method) by the kernel when a transaction is being committed.
+/// Note that this struct cannot be constructed. Kernel hands it to the connector or legacy
+/// [`Committer`] when a transaction is being committed.
 ///
 /// See the [module-level documentation] for more details.
 ///
 /// [`Committer`]: super::Committer
-/// [`commit`]: super::Committer::commit
 /// [module-level documentation]: crate::committer
 #[derive(Debug)]
 pub struct CommitMetadata {
@@ -185,6 +184,24 @@ impl CommitMetadata {
     /// The type of commit operation being performed.
     pub fn commit_type(&self) -> CommitType {
         self.commit_type
+    }
+
+    /// Validates that the committer type matches the commit type. A catalog committer must be
+    /// used for catalog-managed operations, and a non-catalog committer for path-based operations.
+    pub fn validate_committer(&self, is_catalog_committer: bool) -> DeltaResult<()> {
+        match (
+            is_catalog_committer,
+            self.commit_type.requires_catalog_committer(),
+        ) {
+            (true, true) | (false, false) => Ok(()),
+            (false, true) => Err(Error::generic(
+                "This table is catalog-managed and requires a catalog committer. \
+                 Please provide a catalog committer via Transaction::with_committer().",
+            )),
+            (true, false) => Err(Error::generic(
+                "This table is path-based and cannot be committed to with a catalog committer.",
+            )),
+        }
     }
 
     /// The in-commit timestamp for the commit. Note that this may differ from the actual commit

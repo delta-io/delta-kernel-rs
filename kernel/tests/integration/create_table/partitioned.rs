@@ -1,8 +1,6 @@
 //! Partition integration tests for the CreateTable API.
 //!
 //! TODO(#2201): Add end-to-end tests for insert + scan + checkpoint on partitioned tables.
-
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -22,7 +20,7 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResu
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::partitioned([partition_col]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -32,7 +30,7 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResu
     let partition_cols = snapshot.table_configuration().logical_partition_columns();
     assert_eq!(partition_cols, &["date"]);
 
-    let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering = snapshot.get_physical_clustering_columns_with_engine(engine.as_ref())?;
     assert!(
         clustering.is_none(),
         "Partitioned table should not have clustering columns"
@@ -64,7 +62,7 @@ fn test_create_table_with_materialize_partition_columns_partitioned_and_not(
         builder = builder.with_data_layout(DataLayout::partitioned(["date"]));
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;

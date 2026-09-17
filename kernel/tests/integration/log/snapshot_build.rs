@@ -65,6 +65,7 @@ async fn append_row<E: TaskExecutor>(
         false, /* is_blind_append */
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot())
 }
 
@@ -86,8 +87,9 @@ async fn setup_multi_version_table<E: TaskExecutor>(
         ]),
     };
     let create_snapshot = builder
-        .build(engine.as_ref(), kind.committer())?
+        .build_with_committer(engine.as_ref(), kind.committer())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // The create-table snapshot is built as latest (version 0 is necessarily the latest).

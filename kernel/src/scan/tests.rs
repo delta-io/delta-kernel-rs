@@ -14,7 +14,6 @@ use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::display::array_value_to_string;
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
@@ -338,10 +337,11 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         nullable "a_float": FLOAT,
     };
     create_table(url, schema, "DefaultEngine")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
@@ -369,10 +369,11 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
 
     let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap()
+        .0
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())

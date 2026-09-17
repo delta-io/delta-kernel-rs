@@ -35,7 +35,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
-        assert!(txn.commit(&engine)?.is_committed());
+        assert!(txn.commit(&engine)?.0.is_committed());
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)

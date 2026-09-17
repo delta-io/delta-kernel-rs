@@ -37,25 +37,26 @@ using Delta Kernel to fulfill them:
 │  Uses Kernel to fulfill those interfaces:               │
 │    Snapshot  ->  table metadata, schema, version        │
 │    Scan      ->  which files to read, data skipping     │
-│    Transaction -> write files, commit atomically        │
+│    Transaction -> describe a table write                │
+│    Committer   -> commit atomically                      │
 └───────────────────────┬─────────────────────────────────┘
                         │ calls Kernel APIs
                         ▼
 ┌─────────────────────────────────────────────────────────┐
-│                    Delta Kernel                          │
+│                    Delta Kernel                         │
 │                                                         │
 │  Protocol logic, log replay, data skipping,             │
 │  schema enforcement, transaction coordination           │
 │                                                         │
-│  Calls into Engine trait for I/O and compute            │
+│  Returns typed requests or uses Engine compatibility    │
 └───────────────────────┬─────────────────────────────────┘
                         │
                         ▼
 ┌─────────────────────────────────────────────────────────┐
-│              Engine trait implementation                  │
+│                  Connector execution                    │
 │                                                         │
-│  DefaultEngine (Arrow + object_store)                   │
-│  ...or your custom Engine with native I/O & formats     │
+│  AsyncEngineConnector or your request driver            │
+│  DefaultEngine or your custom Engine                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -91,7 +92,7 @@ From a snapshot, you can:
 |-----------|-----------|-------------------------------|
 | Get schema and metadata | `snapshot.schema()`, `snapshot.table_properties()` | Table schema discovery |
 | Read data | `snapshot.scan_builder()` | Scan / PartitionReader |
-| Write data | `snapshot.transaction(committer, &engine)` | Writer / Committer |
+| Write data | `snapshot.transaction_with_filesystem_committer(&engine)` | Writer / Committer |
 | Checkpoint | `snapshot.create_checkpoint_writer(&engine)` | Maintenance task |
 
 ## What your connector does vs. what Kernel does
@@ -112,17 +113,27 @@ The key principle: **Kernel handles the Delta protocol, your connector handles e
 - Query planning integration (pushing filters and projections down to Kernel)
 - Resource management (memory budgets, connection pooling)
 
-## The Engine trait: pluggable I/O and compute
+## Choose an execution surface
 
-Kernel never does I/O directly. When it needs to list files, read Parquet, parse JSON, or
-evaluate expressions, it calls into the `Engine` trait. This is where you can plug in your
-engine's native implementations for maximum performance.
+Connector-driven entry points return lazy `Workflow` and `Generator` values. Your connector starts
+a root task and serves each `Request`, so Kernel never calls into your runtime. Use this surface
+when your connector should control asynchronous scheduling, cancellation, or catalog requests. See
+[Driving connector workflows](./coroutines.md).
+
+Engine-compatible entry points accept `&dyn Engine`. Kernel's synchronous compatibility adapter
+calls the Engine handlers on your connector's behalf. Use this surface when a blocking API fits
+your runtime or when you need to preserve an existing Engine implementation.
+
+## The Engine trait compatibility surface
+
+Kernel never does I/O directly. Engine-compatible methods call the `Engine` trait when they need
+to list files, read Parquet, parse JSON, or evaluate expressions.
 
 Kernel provides a `DefaultEngine` (Arrow + `object_store` + Tokio). Many connectors
 start here and only replace specific handlers when they need better performance. See
 [The Engine trait](../concepts/engine_trait.md) for details on the four required handlers
 (`StorageHandler`, `JsonHandler`, `ParquetHandler`, `EvaluationHandler`) and the optional
-`MetricsReporter`.
+`PlanExecutor`. Metrics use standard rust tracing layers rather than an Engine handler.
 
 You need a custom `Engine` when:
 
@@ -140,8 +151,10 @@ To use different cloud storage (S3, Azure, GCS), you do not need a custom engine
 
 Building a connector typically involves these steps:
 
-1. **Choose or implement an Engine.** Start with `DefaultEngine` unless you have a reason
-   not to. See [Implementing the Engine trait](./implementing_engine.md).
+1. **Choose the execution surface.** Use `AsyncEngineConnector` or your own request loop for
+   connector-driven execution. Use `DefaultEngine` or a custom Engine for synchronous
+   compatibility. See [Driving connector workflows](./coroutines.md) and
+   [Implementing the Engine trait](./implementing_engine.md).
 
 2. **Implement your DataSource's read interfaces** using Kernel's Scan API:
    - Create a `Snapshot` to discover the table schema and version

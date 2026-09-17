@@ -1,4 +1,4 @@
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::DeltaResult;
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -28,15 +28,15 @@ pub unsafe extern "C" fn get_domain_metadata(
     engine: Handle<SharedExternEngine>,
     allocate_fn: AllocateStringFn,
 ) -> ExternResult<NullableCvoid> {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+    get_domain_metadata_impl(&snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
 }
 
 fn get_domain_metadata_impl(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     domain: DeltaResult<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
@@ -62,7 +62,7 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<i64>> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     snapshot
         .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
         .map(OptionalValue::from)
@@ -120,19 +120,21 @@ pub unsafe extern "C" fn visit_clustering_columns(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> ExternResult<OptionalValue<usize>> {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
-    visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
+    visit_clustering_columns_impl(&snapshot, engine, engine_context, visitor)
         .into_extern_result(&engine)
 }
 
 fn visit_clustering_columns_impl(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> DeltaResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+    let Some(infos) =
+        snapshot.get_clustering_column_infos_with_engine(extern_engine.engine().as_ref())?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -168,15 +170,15 @@ pub unsafe extern "C" fn visit_domain_metadata(
         configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
 
-    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
+    visit_domain_metadata_impl(&snapshot, engine, engine_context, visitor)
         .into_extern_result(&engine)
 }
 
 fn visit_domain_metadata_impl(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: extern "C" fn(
@@ -185,7 +187,7 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> DeltaResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let res = snapshot.get_all_domain_metadata_with_engine(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();

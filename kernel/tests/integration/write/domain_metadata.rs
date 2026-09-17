@@ -47,6 +47,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
         .with_domain_metadata(domain1.to_string(), config1.to_string())
         .with_domain_metadata(domain2.to_string(), config2.to_string())
         .commit(&engine)?
+        .0
         .is_committed());
 
     let commit_data = store
@@ -276,43 +277,45 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = txn
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata_removed("app.config".to_string())
-        .commit(&engine)
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("already specified in this transaction"));
+        .commit(&engine);
+    assert!(matches!(
+        err,
+        Err(e) if e.to_string().contains("already specified in this transaction")
+    ));
 
     // remove then set same domain
     let txn2 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn2
         .with_domain_metadata_removed("test.domain".to_string())
         .with_domain_metadata("test.domain".to_string(), "v1".to_string())
-        .commit(&engine)
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("already specified in this transaction"));
+        .commit(&engine);
+    assert!(matches!(
+        err,
+        Err(e) if e.to_string().contains("already specified in this transaction")
+    ));
 
     // remove same domain twice
     let txn3 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn3
         .with_domain_metadata_removed("another.domain".to_string())
         .with_domain_metadata_removed("another.domain".to_string())
-        .commit(&engine)
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("already specified in this transaction"));
+        .commit(&engine);
+    assert!(matches!(
+        err,
+        Err(e) if e.to_string().contains("already specified in this transaction")
+    ));
 
     // remove system domain
     let txn4 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn4
         .with_domain_metadata_removed("delta.system".to_string())
-        .commit(&engine)
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Cannot modify domains that start with 'delta.' as those are system controlled"));
+        .commit(&engine);
+    assert!(matches!(
+        err,
+        Err(e) if e
+            .to_string()
+            .contains("Cannot modify domains that start with 'delta.' as those are system controlled")
+    ));
 
     Ok(())
 }

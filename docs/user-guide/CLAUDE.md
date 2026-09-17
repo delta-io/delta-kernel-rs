@@ -153,6 +153,7 @@ full trait signatures rather than inlining them all.
 | `catalog_managed/committer.md` | How-to | "To implement a catalog committer, do this" |
 | `catalog_managed/reading.md`, `writing.md` | How-to | "To read/write catalog-managed tables, do this" |
 | `connector/overview.md` | Explanation | What a connector is, Kernel vs. connector responsibilities |
+| `connector/coroutines.md` | How-to | Drive workflows while retaining connector control |
 | `configuring_storage.md` | How-to | "To configure S3/GCS/Azure storage, pass these options" |
 | `checkpointing.md` | How-to | "To checkpoint a table, call these APIs" |
 | `ffi/overview.md` | Explanation + Reference | Consider splitting if it grows |

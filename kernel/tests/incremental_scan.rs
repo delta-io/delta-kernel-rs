@@ -1534,7 +1534,7 @@ async fn against_base_classification_composes_with_predicate(
 // Newest-wins holds when the newest Add of a key is pruned but an older Add of the same key
 // (with a matching range) exists earlier in the range. The pruned newest Add still records the
 // key as `seen`, so the older duplicate must not leak into `live_adds`. The file's live (newest)
-// metadata does not match the predicate, so a cold scan at the target would exclude it too --
+// metadata does not match the predicate, so a fresh scan at the target would exclude it too --
 // net zero live Adds. Guards the "record seen regardless of the mask" invariant.
 #[tokio::test]
 async fn pruned_newest_add_suppresses_older_matching_duplicate(

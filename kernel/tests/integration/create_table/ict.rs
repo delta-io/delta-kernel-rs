@@ -6,8 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
@@ -17,7 +16,7 @@ use test_utils::test_table_setup;
 
 /// Asserts the ICT protocol and enablement state of a snapshot, returning the ICT value.
 fn assert_ict_state(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     engine: &dyn Engine,
     expect_supported: bool,
     expect_enabled: bool,
@@ -52,7 +51,7 @@ fn assert_ict_state(
         );
     }
 
-    let ict = snapshot.get_in_commit_timestamp(engine)?;
+    let ict = snapshot.get_in_commit_timestamp_with_engine(engine)?;
     if expect_enabled {
         let ts = ict.expect("ICT should be present when enabled");
         assert!(
@@ -83,8 +82,9 @@ fn test_create_table_ict(
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties(properties.iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Verify via post-commit snapshot (reads ICT from in-memory CRC delta)

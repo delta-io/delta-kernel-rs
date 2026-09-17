@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use url::Url;
 
 use crate::commit_range::CommitRange;
+use crate::coroutine::{drive_workflow, Channel, Workflow, WorkflowImpl};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
@@ -14,6 +17,7 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// commit-file metadata in a snapshot-based builder, then validates contiguity.
 // TODO(#2781): support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
 // `with_max_catalog_version(self, Version)`
+#[derive(Clone)]
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
@@ -66,6 +70,16 @@ impl CommitRangeBuilder {
     /// invalid (start > end), the listed commits are non-contiguous, or the requested start version
     /// is not present on the filesystem.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
+        drive_workflow(engine, self.workflow())
+    }
+
+    /// Return a lazy workflow that lists and validates this commit range.
+    pub fn workflow(&self) -> impl Workflow<Output = CommitRange> {
+        let builder = self.clone();
+        WorkflowImpl::new(async move |channel| builder.build_impl(channel).await)
+    }
+
+    async fn build_impl(&self, channel: &Channel) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
@@ -73,13 +87,11 @@ impl CommitRangeBuilder {
         let end_version = self.end_version;
 
         let log_segment = match &self.snapshot {
-            Some(snapshot) => snapshot.log_segment().clone(),
-            None => LogSegment::for_table_changes(
-                engine.storage_handler().as_ref(),
-                log_root,
-                start_version,
-                end_version,
-            )?,
+            Some(snapshot) => Arc::clone(snapshot.log_segment()),
+            None => Arc::new(
+                LogSegment::for_table_changes(channel, log_root, start_version, end_version)
+                    .await?,
+            ),
         };
 
         // Preserve invalid-input errors for an explicitly reversed range. When no end was
@@ -93,8 +105,9 @@ impl CommitRangeBuilder {
         let mut commit_files: Vec<ParsedLogPath> = log_segment
             .listed
             .ascending_commit_files
-            .into_iter()
+            .iter()
             .filter(|f| f.version >= start_version && f.version <= end_version)
+            .cloned()
             .collect();
 
         if self.snapshot.is_some() {

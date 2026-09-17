@@ -127,7 +127,7 @@ async fn test_checkpoint_stats_config_with_real_data(
         ],
     )
     .await?;
-    assert!(result.is_committed());
+    assert!(result.0.is_committed());
 
     // Checkpoint 1 with (json1, struct1) settings
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -144,7 +144,7 @@ async fn test_checkpoint_stats_config_with_real_data(
         ],
     )
     .await?;
-    assert!(result.is_committed());
+    assert!(result.0.is_committed());
 
     // Version 3: change stats config
     write_commit(
@@ -571,7 +571,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
         ],
     )
     .await?;
-    assert!(result.is_committed());
+    assert!(result.0.is_committed());
 
     // Checkpoint at V1: stats_parsed covers only [id, name]
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -597,7 +597,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
         ],
     )
     .await?;
-    assert!(result.is_committed());
+    assert!(result.0.is_committed());
 
     // Scan with predicate on `id` (present in checkpoint stats_parsed) should work
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;

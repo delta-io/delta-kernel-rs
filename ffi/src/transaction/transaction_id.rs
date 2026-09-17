@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use delta_kernel::transaction::Transaction;
+use delta_kernel::transaction::TransactionWithCommitter;
 use delta_kernel::{DeltaResult, Snapshot};
 
 use crate::error::ExternResult;
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn with_transaction_id(
 }
 
 fn with_transaction_id_impl(
-    txn: Transaction,
+    txn: TransactionWithCommitter,
     app_id_res: DeltaResult<String>,
     version: i64,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {

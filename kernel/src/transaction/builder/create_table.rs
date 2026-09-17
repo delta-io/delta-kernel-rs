@@ -44,7 +44,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
+use crate::transaction::{CreateTable, Transaction, TransactionWithCommitter};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -852,7 +852,8 @@ impl CreateTableTransactionBuilder {
         self
     }
 
-    /// Builds a [`CreateTableTransaction`] that can be committed to create the table.
+    /// Builds a [`CreateTableTransaction`] that can be bound to a committer and committed to
+    /// create the table.
     ///
     /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
     /// table creation. Operations like removing files, removing domain metadata, or updating
@@ -874,8 +875,6 @@ impl CreateTableTransactionBuilder {
     /// # Arguments
     ///
     /// * `engine` - The engine instance to use for validation
-    /// * `committer` - The committer to use for the transaction
-    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -884,11 +883,7 @@ impl CreateTableTransactionBuilder {
     /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
-    pub fn build(
-        self,
-        engine: &dyn Engine,
-        committer: Box<dyn Committer>,
-    ) -> DeltaResult<CreateTableTransaction> {
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
@@ -982,11 +977,28 @@ impl CreateTableTransactionBuilder {
         Transaction::try_new_create_table(
             table_configuration,
             self.engine_info,
-            committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.correlation_id,
         )
+    }
+
+    /// Binds `committer` to the transaction produced by [`Self::build`].
+    pub fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<TransactionWithCommitter<CreateTable>> {
+        Ok(self.build(engine)?.with_committer(committer))
+    }
+
+    /// Binds a [`FileSystemCommitter`](crate::committer::FileSystemCommitter) to the transaction
+    /// produced by [`Self::build`].
+    pub fn build_with_filesystem_committer(
+        self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<TransactionWithCommitter<CreateTable>> {
+        Ok(self.build(engine)?.with_filesystem_committer())
     }
 }
 

@@ -129,14 +129,14 @@ The following diagram shows how data flows through the three crates when your
 connector reads or writes a UC-managed table.
 
 ```text
- ┌───────────────────────────────────────────────────────────┐
- │  Your Connector                                           │
- │                                                           │
- │  1. UCClient::load_table("cat", "schema", "table")        │
- │  2. UCClient::get_table_credentials(.., ReadWrite)        │
- │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
- │  4. snapshot.transaction(UCCommitter).commit(engine)?     │
- └──────┬─────────────────────────┬──────────────────────────┘
+ ┌───────────────────────────────────────────────────────────────┐
+ │  Your Connector                                               │
+ │                                                               │
+ │  1. UCClient::load_table("cat", "schema", "table")            │
+ │  2. UCClient::get_table_credentials(.., ReadWrite)            │
+ │  3. snapshot_builder_from_load_table(&resp)?.build(..)        │
+ │  4. snapshot.transaction_with_committer(committer, engine)    │
+ └──────┬─────────────────────────────┬──────────────────────────┘
         │                         │
         ▼                         ▼
  ┌──────────────────┐  ┌─────────────────────────────────────┐
@@ -256,13 +256,12 @@ let config = ClientConfig::build(&endpoint, &token)
     .build()?;
 ```
 
-The REST client automatically retries requests that fail with server errors
-(HTTP 5xx) or transient network errors, using linear backoff bounded by
-`retry_base_delay` and `retry_max_delay`. Successful 2xx and client errors
-(HTTP 4xx) are not retried. These retries apply to transport-level failures
-only. Transaction-level conflicts (another writer won the version) must be
-handled by the connector through the `CommitResult::ConflictedTransaction`
-branch. See [Writing to UC Tables](./writing.md) for the full retry model.
+The REST client automatically retries requests that fail with server errors (HTTP 5xx) or transient
+network errors, using linear backoff bounded by `retry_base_delay` and `retry_max_delay`. Successful
+2xx and client errors (HTTP 4xx) are not retried. These retries apply to transport-level failures
+only. Transaction-level conflicts (another writer won the version) must be handled by the connector
+through the `CommitResult::Conflicted` branch. See [Writing to UC Tables](./writing.md) for the full
+retry model.
 
 ## When not to use this
 

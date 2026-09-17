@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::{DeltaResult, DeltaResultIterator};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FilteredEngineData};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -168,13 +168,11 @@ struct FfiUCCommitter<C: UpdateTableClient> {
     inner: UCCommitter<C>,
 }
 
-impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
-    fn commit(
-        &self,
-        engine: &dyn delta_kernel::Engine,
-        actions: DeltaResultIterator<'_, delta_kernel::FilteredEngineData>,
-        commit_metadata: delta_kernel::committer::CommitMetadata,
-    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+impl<C: UpdateTableClient> FfiUCCommitter<C> {
+    fn with_engine<T>(
+        engine: &dyn Engine,
+        operation: impl FnOnce() -> DeltaResult<T>,
+    ) -> DeltaResult<T> {
         // We hold this guard until the end of the function so we stay in the tokio context until
         // we're done
         let _guard = engine
@@ -188,11 +186,22 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                     .map(|e| e.enter())
             })
             .ok_or_else(|| {
-                delta_kernel::Error::generic(
-                    "FFIUCCommitter can only be used with the default engine",
-                )
+                Error::generic("FFIUCCommitter can only be used with the default engine")
             })?;
-        self.inner.commit(engine, actions, commit_metadata)
+        operation()
+    }
+}
+
+impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
+    fn commit(
+        &self,
+        engine: &dyn delta_kernel::Engine,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
+        commit_metadata: delta_kernel::committer::CommitMetadata,
+    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+        Self::with_engine(engine, || {
+            self.inner.commit(engine, actions, commit_metadata)
+        })
     }
 
     fn is_catalog_committer(&self) -> bool {

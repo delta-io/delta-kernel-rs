@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -63,7 +62,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -95,6 +94,7 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
     begin_transaction(snapshot, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // ===== THEN =====
@@ -143,6 +143,7 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
     for i in 1..=5i32 {
         snapshot = insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![i]))])
             .await?
+            .0
             .unwrap_committed()
             .post_commit_snapshot()
             .unwrap()
@@ -205,7 +206,7 @@ async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> DeltaResult<()>
 
     let schema = schema_ref! { nullable "id": INTEGER };
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // Plant a garbage CRC file at the table version.
@@ -266,7 +267,7 @@ async fn test_crc_returns_none_when_no_crc() -> DeltaResult<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -289,10 +290,10 @@ fn create_table_and_commit(
     let schema = schema_ref! { nullable "id": INTEGER };
     let txn = create_table(table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine)?
         .with_domain_metadata("zip".to_string(), "zap0".to_string());
 
-    Ok(txn.commit(engine)?.unwrap_committed())
+    Ok(txn.commit(engine)?.0.unwrap_committed())
 }
 
 #[tokio::test]
@@ -343,6 +344,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // The new post-commit snapshot should only have a CRC if the read snapshot had one.
@@ -391,6 +393,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     let col1: ArrayRef = Arc::new(Int32Array::from((1..=10).collect::<Vec<_>>()));
     let committed = insert_data(snapshot_v0, &engine, vec![col1])
         .await?
+        .0
         .unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with right file stats =====
@@ -405,6 +408,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     let col2: ArrayRef = Arc::new(Int32Array::from((11..=20).collect::<Vec<_>>()));
     let committed = insert_data(snapshot_v1.clone(), &engine, vec![col2])
         .await?
+        .0
         .unwrap_committed();
 
     // ===== THEN: should have CRC at v2 with right file stats =====
@@ -424,7 +428,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // ===== THEN: should have CRC at v3 with right file stats =====
     assert_eq!(committed.commit_version(), 3);
@@ -455,7 +459,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string()) // <-- set to zap1
         .with_domain_metadata("foo".to_string(), "bar".to_string()); // <-- add foo
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
@@ -468,7 +472,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     let txn = begin_transaction(snapshot_v1.clone(), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata_removed("zip".to_string()); // <-- remove zip
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // ===== THEN: should have CRC at v2 with zip gone, foo still there =====
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
@@ -492,6 +496,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
     let committed = insert_data(snapshot_v0, &engine, vec![col])
         .await?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
@@ -499,6 +504,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     let committed = begin_transaction(snapshot_v1.clone(), engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // ===== THEN: CRC at v2 has indeterminate file stats =====
@@ -597,8 +603,9 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         builder = builder.with_table_properties([("delta.enableInCommitTimestamps", "true")]);
     }
     let mut snap = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     const CHECKPOINT_OR_CRC_VERSION: i64 = 4;
@@ -625,7 +632,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         )
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
         let mut txn = snap
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction_with_filesystem_committer(engine.as_ref())?
             .with_operation("WRITE".to_string())
             .with_data_change(true)
             .with_domain_metadata(format!("d{v}"), format!("cfg{v}"))
@@ -638,7 +645,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
         txn.add_files(adds);
-        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        snap = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
 
         if checkpoint_or_crc_version == Some(v) {
             match root {
@@ -733,6 +740,7 @@ async fn test_disabled_load_retains_stale_crc_as_base() -> DeltaResult<()> {
     begin_transaction(snap0, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Default Disabled load at v1: the stale CRC@0 is not advanced, but it is retained as a base.
@@ -773,6 +781,7 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
     begin_transaction(snap0, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Disabled load retains stale CRC@0 as base; checkpoint at v1 carries state forward and drops
@@ -805,8 +814,9 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
 ) -> DeltaResult<SnapshotRef> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     for v in 1..=3i32 {
         let arrow_schema = TryFromKernel::try_from_kernel(snap.schema().as_ref())?;
@@ -816,7 +826,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
         )
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
         let mut txn = snap
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction_with_filesystem_committer(engine.as_ref())?
             .with_operation("WRITE".to_string())
             .with_data_change(true);
         let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -824,7 +834,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
         txn.add_files(adds);
-        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        snap = txn.commit(engine.as_ref())?.0.unwrap_post_commit_snapshot();
         if v == 1 {
             snap.write_checksum(engine.as_ref())?;
         }
@@ -907,8 +917,9 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
             ("delta.feature.inCommitTimestamp", "supported"),
             ("delta.enableInCommitTimestamps", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let snap = insert_data(
         snap,
@@ -916,6 +927,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
     let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
     let checkpoint_version = snap.version();
@@ -945,8 +957,9 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
 
     let schema = schema_ref! { nullable "id": INTEGER };
     let snap = create_table(&table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
     let snap = insert_data(
         snap,
@@ -954,12 +967,14 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
     let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
     // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
     begin_transaction(snap, engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -984,6 +999,7 @@ async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> Delt
         let col: ArrayRef = Arc::new(Int32Array::from(vec![i]));
         let committed = insert_data(snapshot, &engine, vec![col])
             .await?
+            .0
             .unwrap_committed();
         snapshot = committed.post_commit_snapshot().unwrap().clone();
         assert!(
@@ -1023,6 +1039,7 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
     let committed_v1 = insert_data(snapshot_v0.clone(), &engine, vec![col])
         .await?
+        .0
         .unwrap_committed();
     committed_v1
         .post_commit_snapshot()
@@ -1051,6 +1068,7 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
     let col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
     let committed_v2 = insert_data(incremental_v1, &engine, vec![col])
         .await?
+        .0
         .unwrap_committed();
     assert_eq!(committed_v2.commit_version(), 2);
     let snapshot_v2 = committed_v2.post_commit_snapshot().unwrap();
@@ -1084,6 +1102,7 @@ async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
         vec![col],
     )
     .await?
+    .0
     .unwrap_committed();
     assert_eq!(committed_v1.commit_version(), 1);
 
@@ -1135,13 +1154,14 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         builder = builder.with_table_properties(properties);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let snapshot = committed.post_commit_snapshot().unwrap();
     assert!(snapshot
-        .get_all_domain_metadata(engine.as_ref())?
+        .get_all_domain_metadata_with_engine(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
     // CREATE TABLE without any DM actions produces an authoritative empty map.
@@ -1189,10 +1209,11 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
         .with_domain_metadata("zip".to_string(), "zap1".to_string())
         .with_domain_metadata("foo".to_string(), "bar".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Asserts domain metadata on any snapshot, regardless of how it was loaded.
-    let assert_domain_metadata = |snapshot: &Snapshot, engine: &dyn delta_kernel::Engine| {
+    let assert_domain_metadata = |snapshot: &SnapshotRef, engine: &dyn delta_kernel::Engine| {
         assert_eq!(
             snapshot.get_domain_metadata("zip", engine).unwrap(),
             Some("zap1".to_string())
@@ -1207,12 +1228,12 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
             None
         );
         assert!(snapshot
-            .get_domain_metadata_internal("delta.clustering", engine)
+            .get_domain_metadata_internal_with_engine("delta.clustering", engine)
             .unwrap()
             .is_some());
         assert_eq!(
             snapshot
-                .get_domain_metadatas_internal(engine, None)
+                .get_domain_metadatas_internal_with_engine(engine, None)
                 .unwrap()
                 .len(),
             3
@@ -1287,6 +1308,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
         .with_operation("WRITE".to_string())
         .with_domain_metadata("foo".to_string(), "bar".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
@@ -1319,14 +1341,15 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
     // Multi-key filter with a mixed hit ("foo") and miss ("zip"): the first miss
     // short-circuits the cache lookup and the full result comes from log replay.
     let filter = HashSet::from(["foo", "zip"]);
-    let map = snapshot_v1.get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
+    let map =
+        snapshot_v1.get_domain_metadatas_internal_with_engine(engine.as_ref(), Some(&filter))?;
     assert_eq!(map.len(), 2);
     assert_eq!(map["foo"].configuration(), "bar");
     assert_eq!(map["zip"].configuration(), "zap0");
 
     // "All" queries against Partial always fall through. The replay-derived set must
     // include BOTH entries.
-    let mut all = snapshot_v1.get_all_domain_metadata(engine.as_ref())?;
+    let mut all = snapshot_v1.get_all_domain_metadata_with_engine(engine.as_ref())?;
     all.sort_by(|a, b| a.domain().cmp(b.domain()));
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].domain(), "foo");
@@ -1372,6 +1395,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
@@ -1416,6 +1440,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
         .with_transaction_id("my-app".to_string(), 2)
         .with_transaction_id("other-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
 
@@ -1467,6 +1492,7 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Delt
         .with_operation("WRITE".to_string())
         .with_transaction_id("v1-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     snapshot_v1.write_checksum(engine.as_ref())?;
@@ -1488,6 +1514,7 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Delt
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
 
@@ -1556,8 +1583,9 @@ async fn test_set_txn_expiration_via_crc_fast_path(
         builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: commit a set transaction for "my-app" (lastUpdated = now)
@@ -1566,6 +1594,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // Write CRC at v1 so the fast path is used on reload
@@ -1603,8 +1632,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaR
             "delta.setTransactionRetentionDuration",
             "interval 0 seconds",
         )])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: commit my-app=1, write CRC at v1.
@@ -1613,6 +1643,7 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaR
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     committed
         .post_commit_snapshot()
@@ -1628,6 +1659,7 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaR
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 2)
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
 
@@ -1660,8 +1692,9 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
             "delta.setTransactionRetentionDuration",
             "interval 0 seconds",
         )])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // v1: raw commit with txn action that omits lastUpdated
@@ -1698,8 +1731,9 @@ async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> 
     let schema = schema_ref! { nullable "id": INTEGER };
     create_table(&table_path, schema, "test_engine")
         .with_table_properties([("delta.setTransactionRetentionDuration", "interval 365 days")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let store = Arc::new(LocalFileSystem::new());
@@ -1821,8 +1855,9 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
 
     // ===== v0: empty table =====
     let committed = create_table(&table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
     let crc_v0 = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
@@ -1833,6 +1868,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     let data: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
     let committed = insert_data(snapshot.clone(), &engine, vec![ids, data])
         .await?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
     let disk_sizes = parquet_file_sizes_on_disk(&table_path);
@@ -1853,6 +1889,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     let data: ArrayRef = Arc::new(StringArray::from(strings));
     let committed = insert_data(snapshot.clone(), &engine, vec![ids, data])
         .await?
+        .0
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
@@ -1899,7 +1936,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
     // Delete physical parquet files so disk ground truth reflects the empty table
@@ -1926,6 +1963,7 @@ async fn test_file_histogram_survives_disk_round_trip_then_delta_merge() -> Delt
     let col1: ArrayRef = Arc::new(Int32Array::from((1..=10).collect::<Vec<_>>()));
     let committed = insert_data(snapshot_v0.clone(), &engine, vec![col1])
         .await?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     let v1_bytes = snapshot_v1
@@ -1946,6 +1984,7 @@ async fn test_file_histogram_survives_disk_round_trip_then_delta_merge() -> Delt
     let col2: ArrayRef = Arc::new(Int32Array::from((11..=20).collect::<Vec<_>>()));
     let committed = insert_data(fresh_v1, &engine, vec![col2])
         .await?
+        .0
         .unwrap_committed();
     assert_eq!(committed.commit_version(), 2);
 
@@ -2010,6 +2049,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
     let committed = insert_data(snapshot_v0.clone(), &engine, vec![col])
         .await?
+        .0
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     snapshot_v1.write_checksum(engine.as_ref())?;
@@ -2031,6 +2071,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         let col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
         let committed = insert_data(fresh_v1, &engine, vec![col])
             .await?
+            .0
             .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
         committed.post_commit_snapshot().unwrap().clone()
@@ -2038,6 +2079,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         let committed = begin_transaction(fresh_v1, engine.as_ref())?
             .with_operation("ANALYZE STATS".to_string())
             .commit(engine.as_ref())?
+            .0
             .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
         committed.post_commit_snapshot().unwrap().clone()
@@ -2113,7 +2155,7 @@ async fn commit_data<E: TaskExecutor>(
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let mut txn = customize(txn);
@@ -2122,7 +2164,11 @@ async fn commit_data<E: TaskExecutor>(
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(adds);
-    Ok(txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot())
+    Ok(txn
+        .with_filesystem_committer()
+        .commit(engine.as_ref())?
+        .0
+        .unwrap_post_commit_snapshot())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2160,10 +2206,11 @@ async fn test_stale_crc_fresh_build_advance_matrix(
             ("delta.enableRowTracking", "true"),
             ("delta.enableInCommitTimestamps", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .with_domain_metadata("domain_at_create".to_string(), "value_0".to_string())
         .with_transaction_id("app_at_create".to_string(), 0)
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     // === Step 2: Commits up to CHECKPOINT_VERSION, followed by a checkpoint. ===
@@ -2238,7 +2285,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // - If no CRC, then we must re-read the latest commit -> need real engine.
     // - Else, we did CRC replay and cached the result -> use fake engine.
     assert!(fresh
-        .get_in_commit_timestamp(real_engine_iff_crc_missing)?
+        .get_in_commit_timestamp_with_engine(real_engine_iff_crc_missing)?
         .is_some());
 
     // For both domain metadata and set transaction checks below:
@@ -2252,7 +2299,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *before* the CRC ===
     for domain in ["domain_at_create", "delta.clustering"] {
         assert!(fresh
-            .get_domain_metadata_internal(
+            .get_domain_metadata_internal_with_engine(
                 domain,
                 real_engine_iff_crc_missing_or_crc_missing_opt_fields
             )?
@@ -2262,7 +2309,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *after* the CRC ===
     for domain in ["domain", "delta.rowTracking"] {
         assert!(fresh
-            .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
+            .get_domain_metadata_internal_with_engine(domain, real_engine_iff_crc_missing)?
             .is_some());
     }
 
@@ -2300,12 +2347,14 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
+    .0
     .unwrap_post_commit_snapshot();
 
     // ===== WHEN: a non-incremental operation (ANALYZE STATS) commits at v2 =====
     begin_transaction(snap, engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     // ===== THEN: advancing the stale CRC trips file stats to Indeterminate, so they are not
@@ -2343,6 +2392,7 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
+    .0
     .unwrap_committed();
 
     let commit_v1 = _temp_dir
@@ -2428,8 +2478,9 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     for v in 1..=20i64 {
@@ -2513,7 +2564,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Del
         Query::Filter(keys) => {
             let filter = keys.iter().copied().collect();
             let got: HashMap<String, String> = fresh
-                .get_domain_metadatas_internal(&engine, Some(&filter))?
+                .get_domain_metadatas_internal_with_engine(&engine, Some(&filter))?
                 .into_iter()
                 .map(|(domain, dm)| (domain, dm.configuration().to_string()))
                 .collect();
@@ -2521,7 +2572,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Del
         }
         Query::All => {
             let all: HashMap<String, String> = fresh
-                .get_all_domain_metadata(&engine)?
+                .get_all_domain_metadata_with_engine(&engine)?
                 .into_iter()
                 .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
                 .collect();
@@ -2583,8 +2634,9 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
 ) -> DeltaResult<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_post_commit_snapshot();
 
     for v in 1..=20i64 {
