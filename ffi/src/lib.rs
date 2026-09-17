@@ -53,7 +53,10 @@ pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
 mod domain_metadata;
-pub use domain_metadata::get_domain_metadata;
+pub use domain_metadata::{
+    get_domain_metadata, snapshot_row_tracking_high_water_mark,
+    ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+};
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -1495,28 +1498,6 @@ pub unsafe extern "C" fn snapshot_timestamp(
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot
         .get_timestamp(engine_ref.engine().as_ref())
-        .into_extern_result(&engine_ref)
-}
-
-/// Get the highest row ID assigned in this snapshot.
-///
-/// Returns [`OptionalValue::None`] when the snapshot has no active `delta.rowTracking` domain
-/// metadata. Returns an error if the domain metadata cannot be read or its JSON configuration is
-/// malformed.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid snapshot and engine handles.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
-    snapshot: Handle<SharedSnapshot>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<OptionalValue<i64>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
-        .map(OptionalValue::from)
         .into_extern_result(&engine_ref)
 }
 
