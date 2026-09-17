@@ -59,7 +59,15 @@ fn max_column_id(snap: &Snapshot) -> Option<i64> {
 async fn add_column_validates_cdf_column_names(
     #[case] cdf_enabled: Option<&str>,
     #[case] expected_error: Option<&str>,
-    #[values("_change_type", "_commit_version", "_commit_timestamp")] column_name: &str,
+    #[values(
+        "_change_type",
+        "_commit_version",
+        "_commit_timestamp",
+        "_CHANGE_TYPE",
+        "_COMMIT_VERSION",
+        "_COMMIT_TIMESTAMP"
+    )]
+    column_name: &str,
     #[values("none", "name", "id")] cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
