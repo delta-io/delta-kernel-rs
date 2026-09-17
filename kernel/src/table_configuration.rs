@@ -221,8 +221,10 @@ impl TableConfiguration {
 
         validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
 
-        // This is a `should` requirement in the protocol. Kernel chooses to enforce it.
-        // Spark enforces this constraint as well.
+        // The protocol does not define behavior when row tracking is both enabled and suspended.
+        // Although row tracking is a writer-only feature, Kernel scans can read stable row IDs and
+        // row commit versions. As a conservative choice, reject such tables for both reads and
+        // writes.
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
                 && table_config.is_row_tracking_suspended()),
