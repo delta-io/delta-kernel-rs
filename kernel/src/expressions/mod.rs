@@ -315,12 +315,17 @@ pub struct VariadicExpression {
 /// `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except timestamps, whose
 /// sub-millisecond precision this expression discards (see below).
 ///
-/// `input_schema` is the kernel schema of `expr`'s output. It is required rather than inferred
-/// because several Delta types share one Arrow representation, so the Arrow data alone does not say
-/// how to encode them. A VARIANT is the case that forces this: it is Arrow
+/// `input_schema` describes `expr`'s output. It is required rather than inferred because several
+/// Delta types share one Arrow representation, so the Arrow data alone does not say how to encode
+/// them. A VARIANT is the case that forces this: it is Arrow
 /// `struct<metadata: binary, value: binary>`, indistinguishable from a user struct of two binaries,
 /// and the stats JSON format demands the two halves be concatenated and Z85-encoded into a single
 /// string rather than written as a nested object of hex.
+///
+/// Leaves are matched by name, so `input_schema` may be a superset of what `expr` actually produces
+/// -- a caller that knows only the widest schema its input can have may pass that. A leaf the
+/// schema does not name is encoded from its Arrow type alone, which is correct for everything but a
+/// VARIANT.
 ///
 /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase hex
 /// rather than base64, two digits per byte in the order the bytes appear, so
@@ -346,7 +351,8 @@ pub struct VariadicExpression {
 pub struct ToJsonExpression {
     /// The expression that evaluates to the struct to encode.
     pub expr: Box<Expression>,
-    /// The schema of `expr`'s output, naming the Delta type of every leaf to encode.
+    /// Describes `expr`'s output, naming the Delta type of the leaves to encode. Matched by name,
+    /// so it may name more leaves than `expr` produces.
     pub input_schema: SchemaRef,
 }
 
@@ -363,6 +369,11 @@ pub struct ToJsonExpression {
 /// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
 /// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
 ///
+/// A VARIANT leaf of `output_schema` is not a JSON object of hex halves but the single Z85 string
+/// [`ToJsonExpression`] writes, so it must be Z85-decoded and split back into the variant's
+/// `metadata` and `value`. A string that does not decode to a well-formed variant yields NULL for
+/// that leaf, like any other unparseable value.
+///
 /// # Default engine behavior
 ///
 /// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
@@ -370,8 +381,9 @@ pub struct ToJsonExpression {
 /// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
 /// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
 /// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
-/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
-/// rest of the batch.
+/// the offending row. A VARIANT leaf is decoded as a string, so a value that is not one (an object
+/// or array from a writer that disagrees on the encoding) is such a type mismatch. A NULL input
+/// decodes as `{}`, leaving every field NULL without disturbing the rest of the batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.

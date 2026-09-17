@@ -36,7 +36,7 @@ use crate::table_features::{
     LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
-use crate::table_properties::TableProperties;
+use crate::table_properties::{DataSkippingNumIndexedCols, TableProperties};
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
@@ -345,6 +345,27 @@ impl TableConfiguration {
         Ok(ExpectedStatsSchemas {
             physical: physical_stats_schema,
         })
+    }
+
+    /// The stats schema covering every non-partition column, ignoring `dataSkippingStatsColumns`
+    /// and `dataSkippingNumIndexedCols`.
+    ///
+    /// This is a superset of every stats schema the table's own settings can produce, which is what
+    /// a caller needs when it must interpret a `stats_parsed` whose exact schema it does not know
+    /// (a scan may have projected a narrower one). Consumers must therefore match by name and
+    /// tolerate fields the data does not carry.
+    pub(crate) fn all_columns_stats_schema(&self) -> DeltaResult<SchemaRef> {
+        let config = StatsConfig {
+            data_skipping_stats_columns: None,
+            data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
+        };
+        let schema = Arc::new(expected_stats_schema(
+            &self.physical_data_schema_without_partition_columns(),
+            &config,
+            None,
+            None,
+        )?);
+        Ok(strip_metadata(schema))
     }
 
     /// Returns the list of physical column names that should have statistics collected.
@@ -935,6 +956,7 @@ mod test {
 
     use std::collections::HashMap;
 
+    use itertools::Itertools as _;
     use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
@@ -2146,6 +2168,35 @@ mod test {
         assert!(
             inner.field("phys_part_b").is_none(),
             "Partition column b should be excluded"
+        );
+    }
+
+    /// The all-columns schema is a superset by construction, so neither the explicit stats-column
+    /// list nor the indexed-column cap may narrow it.
+    #[test]
+    fn test_all_columns_stats_schema_ignores_stats_column_settings() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema_ref! {
+                nullable "a": LONG,
+                nullable "b": LONG,
+                nullable "c": LONG,
+            })
+            .with_properties([
+                ("delta.dataSkippingStatsColumns", "a"),
+                ("delta.dataSkippingNumIndexedCols", "1"),
+            ])
+            .build();
+
+        let stats_schema = config.all_columns_stats_schema().unwrap();
+
+        let DataType::Struct(min_values) = stats_schema.field(MIN_VALUES).unwrap().data_type()
+        else {
+            panic!("Expected minValues to be a struct");
+        };
+        assert_eq!(
+            min_values.field_names().collect_vec(),
+            vec!["a", "b", "c"],
+            "every column must survive both settings"
         );
     }
 

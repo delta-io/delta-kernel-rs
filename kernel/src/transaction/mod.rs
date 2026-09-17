@@ -1557,11 +1557,10 @@ impl<S> Transaction<S> {
             .collect();
 
         // `ToJson` needs the schema of the `stats_parsed` it re-serializes. The input schema does
-        // not carry it (see the TODO above), so derive the table's own stats schema.
-        let stats_schema = self
-            .effective_table_config
-            .build_expected_stats_schemas(self.physical_clustering_columns.as_deref(), None)?
-            .physical;
+        // not carry it (see the TODO above), and the scan that produced these rows may have
+        // projected any subset of the table's stats columns, so pass the all-columns superset:
+        // `ToJson` matches leaves by name and ignores the ones the rows do not carry.
+        let stats_schema = self.effective_table_config.all_columns_stats_schema()?;
         let make_eval = |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(

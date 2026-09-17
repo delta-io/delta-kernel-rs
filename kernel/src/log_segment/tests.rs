@@ -4236,6 +4236,54 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     ));
 }
 
+/// Parquet has no variant type, so a checkpoint footer reports a `stats_parsed` variant bound as
+/// the plain struct of binaries it is physically stored as. A needed VARIANT must accept that
+/// struct, or kernel refuses to read the parsed stats it wrote itself.
+#[test]
+fn test_schema_has_compatible_stats_parsed_variant_against_physical_struct() {
+    let physical_variant = schema! {
+        not_null "metadata": BINARY,
+        not_null "value": BINARY,
+    };
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("v", physical_variant),
+    ]);
+
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("v", DataType::unshredded_variant()),
+    ]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+/// A struct that is not a variant's physical shape must still be rejected for a needed VARIANT.
+#[test]
+fn test_schema_has_compatible_stats_parsed_variant_against_wrong_struct_rejected() {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "v",
+            schema! {
+                not_null "metadata": BINARY,
+                not_null "value": STRING,
+            },
+        )]);
+
+    let stats_schema = create_stats_schema(vec![StructField::nullable(
+        "v",
+        DataType::unshredded_variant(),
+    )]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
 #[test]
 fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
     // Checkpoint stores timestamp stats as Int64 (no logical type annotation)

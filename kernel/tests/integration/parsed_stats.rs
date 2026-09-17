@@ -1,21 +1,30 @@
 //! Integration tests for parsed-stats output.
 
+use std::sync::Arc;
+
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
 use delta_kernel::arrow::array::{
-    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
+    Array, AsArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::arrow::util::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::parquet::variant::VariantBuilder;
 use delta_kernel::scan::StatsOptions;
+use delta_kernel::schema::{schema_ref, DataType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{unpartitioned, version_latest, FeatureSet, LogState, TableConfig};
-use test_utils::{get_column, test_context};
+use test_utils::{
+    add_commit, create_table_and_load_snapshot, get_column, test_context, test_table_setup_mt,
+};
+use url::Url;
 
 /// Validate that JSON stats object values match the corresponding parsed struct array.
 ///
@@ -274,4 +283,97 @@ fn json_stats_truncate_timestamps_to_milliseconds() {
         }
     }
     assert!(checked > 0, "no timestamp stats were checked");
+}
+
+/// The VARIANT bound must survive the full log round trip: kernel writes it into `stats_parsed`
+/// when it checkpoints, and must still recognize its own checkpoint as carrying usable parsed stats
+/// when it reads it back. `writeStatsAsJson=false` removes the JSON fallback, so a checkpoint whose
+/// `stats_parsed` kernel rejects leaves every statistic NULL and data skipping stops pruning.
+#[tokio::test(flavor = "multi_thread")]
+async fn variant_min_max_survives_a_struct_stats_only_checkpoint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "v": (DataType::unshredded_variant()),
+    };
+    let _ = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "false"),
+        ],
+    )?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // The statistic is a variant object keyed by shredded path, carried in the stats JSON as the
+    // Z85 encoding of `metadata || value` zero-filled to a four-byte group.
+    let (metadata, value) = {
+        let mut builder = VariantBuilder::new();
+        let mut object = builder.new_object();
+        object.insert("$.a", 1i32);
+        object.finish();
+        builder.finish()
+    };
+    let mut combined = [metadata.as_slice(), value.as_slice()].concat();
+    combined.resize(combined.len().next_multiple_of(4), 0);
+    let encoded = z85::encode(&combined);
+    let stats = format!(
+        r#"{{"numRecords":10,"minValues":{{"id":1,"v":"{encoded}"}},"maxValues":{{"id":9,"v":"{encoded}"}},"nullCount":{{"id":0,"v":0}},"tightBounds":true}}"#
+    );
+    let stats = serde_json::Value::String(stats).to_string();
+    let commit = format!(
+        r#"{{"commitInfo":{{"timestamp":1700000000000,"operation":"WRITE","version":1}}}}
+{{"add":{{"path":"part-0.parquet","size":1024,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{}},"stats":{stats}}}}}"#
+    );
+    add_commit(&table_url.to_string(), store.as_ref(), 1, commit).await?;
+
+    Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .checkpoint(engine.as_ref(), None)?;
+
+    // Reload past the checkpoint and read the parsed stats back. `all_struct` requests no JSON
+    // stats, and the checkpoint carries none either, so `stats_parsed` is the only source left.
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()?;
+
+    let mut files = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        let (data, selection_vector) = scan_metadata?.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection_vector))?;
+
+        let stats_parsed = get_column!(batch, STATS_PARSED, StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+        for bound in [MIN_VALUES, MAX_VALUES] {
+            let bounds = get_column!(stats_parsed, bound, StructArray);
+            let id = get_column!(bounds, "id", Int64Array);
+            let variant = get_column!(bounds, "v", StructArray);
+            let variant_bytes = |field| {
+                variant
+                    .column_by_name(field)
+                    .unwrap_or_else(|| panic!("{bound}.v should be the variant's physical struct"))
+                    .as_binary::<i32>()
+                    .value(0)
+                    .to_vec()
+            };
+            for row in 0..batch.num_rows() {
+                assert_eq!(num_records.value(row), 10, "{bound}: numRecords");
+                assert!(!id.is_null(row), "{bound}: id bound should not be null");
+                assert!(!variant.is_null(row), "{bound}: variant bound was dropped");
+                assert_eq!(variant_bytes("metadata"), metadata, "{bound}.v.metadata");
+                assert_eq!(variant_bytes("value"), value, "{bound}.v.value");
+                files += 1;
+            }
+        }
+    }
+    assert_eq!(files, 2, "one file, checked for both bounds");
+
+    Ok(())
 }

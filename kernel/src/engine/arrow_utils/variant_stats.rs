@@ -14,6 +14,7 @@ use crate::arrow::array::{
     new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, AsArray, BinaryBuilder,
     NullBufferBuilder, RecordBatch, RecordBatchOptions, StringBuilder, StructArray,
 };
+use crate::arrow::compute::kernels::cast::cast;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Schema as ArrowSchema,
@@ -58,17 +59,19 @@ pub(crate) fn decode_variant_stats(
 /// Decodes a column of Z85-encoded VARIANT statistics into the physical variant encoding described
 /// by `fields`. The children are matched by name, so either field order works.
 ///
-/// A row whose statistic is absent, is not a string, or does not decode to a well-formed variant
-/// becomes NULL.
+/// `array` may be any Arrow string representation kernel accepts for `STRING`. A row whose
+/// statistic is absent, or does not decode to a well-formed variant, becomes NULL, and so does
+/// every row of a column that is not a string at all.
 #[internal_api]
 pub(crate) fn decode_z85_variant_stats(
     array: &dyn ArrowArray,
     fields: &ArrowFields,
 ) -> DeltaResult<ArrowArrayRef> {
     let num_rows = array.len();
-    let Some(strings) = array.as_string_opt::<i32>() else {
+    let Some(strings) = as_delta_type(array, &ArrowDataType::Utf8) else {
         return Ok(Arc::new(StructArray::new_null(fields.clone(), num_rows)));
     };
+    let strings = strings.as_string::<i32>();
 
     let mut metadatas = BinaryBuilder::new();
     let mut values = BinaryBuilder::new();
@@ -142,9 +145,10 @@ fn decode_z85_variant(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 /// Rewrites every VARIANT leaf of `array` from the variant's physical struct into the single Z85
 /// string the stats JSON format carries, the inverse of [`decode_variant_stats`].
 ///
-/// `schema` is the kernel schema of `array` and names which leaves are VARIANT. Returns `None` when
-/// `schema` holds no VARIANT, so a caller can keep the array it already has. A row whose statistic
-/// is absent, or whose physical struct is not the expected pair of binaries, becomes NULL.
+/// `schema` names which of `array`'s leaves are VARIANT, matched by name, so it may name leaves
+/// `array` does not carry. Returns `None` when `schema` holds no VARIANT, so a caller can keep the
+/// array it already has. A row whose statistic is absent, or whose physical struct is not the
+/// expected pair of binaries, becomes NULL.
 pub(crate) fn encode_variant_stats(
     array: &StructArray,
     schema: &Schema,
@@ -159,7 +163,8 @@ pub(crate) fn encode_variant_stats(
 }
 
 /// Encodes a column of VARIANT statistics held as the physical variant struct into the Z85 strings
-/// the stats JSON format carries. The children are matched by name, so either field order works.
+/// the stats JSON format carries. The children are matched by name, so either field order works,
+/// and each may be any Arrow binary representation kernel accepts for `BINARY`.
 ///
 /// A row that is NULL, or whose `metadata`/`value` children are missing, not binary, or NULL,
 /// becomes NULL.
@@ -172,7 +177,7 @@ fn encode_z85_variant_stats(array: &dyn ArrowArray) -> ArrowArrayRef {
     let binary_child = |name| {
         struct_array
             .column_by_name(name)
-            .and_then(|column| column.as_binary_opt::<i32>())
+            .and_then(|column| as_delta_type(column, &ArrowDataType::Binary))
     };
     let (Some(metadatas), Some(values)) = (
         binary_child(VARIANT_METADATA_FIELD),
@@ -180,6 +185,7 @@ fn encode_z85_variant_stats(array: &dyn ArrowArray) -> ArrowArrayRef {
     ) else {
         return null_column();
     };
+    let (metadatas, values) = (metadatas.as_binary::<i32>(), values.as_binary::<i32>());
 
     let mut encoded = StringBuilder::new();
     for row in 0..num_rows {
@@ -209,24 +215,28 @@ fn encode_z85_variant(metadata: &[u8], value: &[u8]) -> String {
 // === Shared traversal ===
 
 /// Rewrites the VARIANT leaves of one struct level, pairing each Arrow column with the kernel field
-/// that says whether it is one. `encode` picks the direction.
+/// of the same name. `encode` picks the direction.
 ///
-/// Passes the level through untouched when `columns`, `arrow_fields`, and `schema` disagree on
-/// width. That never happens for data matching `schema`, and it is safer than zipping the two and
-/// silently dropping the surplus.
+/// Pairing is by name rather than position, because a caller cannot always name the exact schema of
+/// the data it holds: `Transaction`'s remove path knows only the table's own stats schema, not the
+/// narrower one a scan projected into the rows it is re-serializing. A column `schema` does not
+/// name passes through, which is right for everything but a VARIANT, whose Arrow type alone is
+/// indistinguishable from a user struct of two binaries.
 fn rewrite_fields(
     arrow_fields: &ArrowFields,
     columns: Vec<ArrowArrayRef>,
     schema: &Schema,
     encode: bool,
 ) -> DeltaResult<(ArrowFields, Vec<ArrowArrayRef>)> {
-    if columns.len() != schema.num_fields() || columns.len() != arrow_fields.len() {
-        return Ok((arrow_fields.clone(), columns));
-    }
-    let columns = columns
-        .into_iter()
-        .zip(schema.fields())
-        .map(|(column, field)| rewrite_field(column, field, encode))
+    let columns = arrow_fields
+        .iter()
+        .zip(columns)
+        .map(
+            |(arrow_field, column)| match schema.field(arrow_field.name()) {
+                Some(field) => rewrite_field(column, field, encode),
+                None => Ok(column),
+            },
+        )
         .collect::<DeltaResult<Vec<_>>>()?;
     let fields = arrow_fields
         .iter()
@@ -270,10 +280,27 @@ fn rewrite_field(
     }
 }
 
+/// Casts `array` to `to`, but only from the Arrow representations kernel treats as identical to
+/// `to`'s Delta type (see `ensure_data_types`). Returns `None` for anything else, including a type
+/// Arrow would happily cast but Delta would not: an integer column is not a `STRING`.
+fn as_delta_type(array: &dyn ArrowArray, to: &ArrowDataType) -> Option<ArrowArrayRef> {
+    use ArrowDataType::*;
+    let compatible = match to {
+        Utf8 => matches!(array.data_type(), Utf8 | LargeUtf8 | Utf8View),
+        Binary => matches!(array.data_type(), Binary | LargeBinary | BinaryView),
+        _ => false,
+    };
+    // Arrow's cast short-circuits when the types already match, so the common case copies nothing.
+    compatible.then(|| cast(array, to).ok()).flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{BinaryArray, Int64Array, StringArray};
+    use crate::arrow::array::{
+        BinaryArray, BinaryViewArray, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+        StringViewArray,
+    };
     use crate::parquet::variant::VariantBuilder;
     use crate::schema::schema;
 
@@ -284,6 +311,18 @@ mod tests {
         object.insert("$.a", 1i32);
         object.finish();
         builder.finish()
+    }
+
+    /// A variant's physical struct over one row's `metadata` and `value` columns.
+    fn variant_struct_array(metadata: ArrowArrayRef, value: ArrowArrayRef) -> ArrowArrayRef {
+        struct_array(vec![
+            (
+                VARIANT_METADATA_FIELD,
+                metadata.data_type().clone(),
+                metadata,
+            ),
+            (VARIANT_VALUE_FIELD, value.data_type().clone(), value),
+        ])
     }
 
     fn struct_array(fields: Vec<(&str, ArrowDataType, ArrowArrayRef)>) -> ArrowArrayRef {
@@ -446,6 +485,108 @@ mod tests {
         assert!(
             payload.is_null(1),
             "a NULL statistic encodes as a NULL string"
+        );
+    }
+
+    /// Leaves pair by name, so a caller that can only name the widest schema its input might have
+    /// still encodes the variant it does carry: here the data holds a subset of the schema's
+    /// leaves, in a different order.
+    #[test]
+    fn test_encode_variant_stats_matches_a_wider_schema_by_name() {
+        let stats_schema = schema! {
+            nullable "minValues": {
+                nullable "id": LONG,
+                nullable "payload": (DataType::unshredded_variant()),
+                nullable "extra": STRING,
+            },
+        };
+        let (metadata, value) = variant_object();
+        let payload = variant_struct_array(
+            Arc::new(BinaryArray::from(vec![Some(metadata.as_slice())])),
+            Arc::new(BinaryArray::from(vec![Some(value.as_slice())])),
+        );
+        let min_values = struct_array(vec![
+            ("payload", payload.data_type().clone(), payload),
+            (
+                "id",
+                ArrowDataType::Int64,
+                Arc::new(Int64Array::from(vec![Some(1)])) as ArrowArrayRef,
+            ),
+        ]);
+        let input = struct_array(vec![(
+            "minValues",
+            min_values.data_type().clone(),
+            min_values,
+        )]);
+
+        let encoded = encode_variant_stats(input.as_struct(), &stats_schema)
+            .unwrap()
+            .expect("schema holds a variant");
+        let min_values = encoded.column(0).as_struct();
+        assert_eq!(
+            min_values
+                .column_by_name("payload")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            encode_z85_variant(&metadata, &value)
+        );
+        assert_eq!(
+            min_values.column_by_name("id").unwrap().data_type(),
+            &ArrowDataType::Int64
+        );
+    }
+
+    /// Kernel accepts three Arrow spellings of `BINARY`, so the encoder must read the variant's
+    /// halves out of any of them rather than silently dropping the statistic.
+    #[rstest::rstest]
+    #[case::binary(|b: &[u8]| Arc::new(BinaryArray::from(vec![Some(b)])) as ArrowArrayRef)]
+    #[case::large_binary(|b: &[u8]| Arc::new(LargeBinaryArray::from(vec![Some(b)])) as ArrowArrayRef)]
+    #[case::binary_view(|b: &[u8]| Arc::new(BinaryViewArray::from(vec![Some(b)])) as ArrowArrayRef)]
+    fn test_encode_variant_stats_reads_every_binary_representation(
+        #[case] make_binary: fn(&[u8]) -> ArrowArrayRef,
+    ) {
+        let stats_schema = schema! { nullable "payload": (DataType::unshredded_variant()) };
+        let (metadata, value) = variant_object();
+        let payload = variant_struct_array(make_binary(&metadata), make_binary(&value));
+        let input = struct_array(vec![("payload", payload.data_type().clone(), payload)]);
+
+        let encoded = encode_variant_stats(input.as_struct(), &stats_schema)
+            .unwrap()
+            .expect("schema holds a variant");
+        assert_eq!(
+            encoded.column(0).as_string::<i32>().value(0),
+            encode_z85_variant(&metadata, &value)
+        );
+    }
+
+    /// The same for the three Arrow spellings of `STRING` on the decode side, which
+    /// `decode_z85_variant_stats` is exported for engines to call directly.
+    #[rstest::rstest]
+    #[case::utf8(|s: &str| Arc::new(StringArray::from(vec![Some(s)])) as ArrowArrayRef)]
+    #[case::large_utf8(|s: &str| Arc::new(LargeStringArray::from(vec![Some(s)])) as ArrowArrayRef)]
+    #[case::utf8_view(|s: &str| Arc::new(StringViewArray::from(vec![Some(s)])) as ArrowArrayRef)]
+    fn test_decode_variant_stats_reads_every_string_representation(
+        #[case] make_string: fn(&str) -> ArrowArrayRef,
+    ) {
+        let (metadata, value) = variant_object();
+        let encoded = make_string(&encode_z85_variant(&metadata, &value));
+        let ArrowDataType::Struct(fields) =
+            ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap()
+        else {
+            panic!("a variant is an Arrow struct");
+        };
+
+        let decoded = decode_z85_variant_stats(encoded.as_ref(), &fields).unwrap();
+        let decoded = decoded.as_struct();
+        assert_eq!(decoded.null_count(), 0);
+        assert_eq!(
+            decoded
+                .column_by_name(VARIANT_METADATA_FIELD)
+                .unwrap()
+                .as_binary::<i32>()
+                .value(0),
+            metadata
         );
     }
 

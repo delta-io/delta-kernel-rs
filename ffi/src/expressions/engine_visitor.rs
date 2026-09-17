@@ -181,6 +181,10 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
     /// into.
+    /// See [`ParseJsonExpression`] for the decoding the implementation must produce; in
+    /// particular, unparseable input must yield NULL rather than an error, and a VARIANT leaf
+    /// arrives as one Z85 string to split back into the variant's `metadata` and `value`
+    /// rather than as a nested object of hex.
     pub visit_parse_json: VisitParseJsonFn,
     /// Visits a `MapToStruct` expression with default options. Expressions with configured options
     /// are reported through `visit_unknown` without visiting the child expression. The
