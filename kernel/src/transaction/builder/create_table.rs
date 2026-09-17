@@ -20,8 +20,8 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, ColumnMetadataKey,
-    DataType, SchemaRef, StructType,
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
+    StructType,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -413,71 +413,30 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     }
 }
 
-/// Detects Concurrent Identity Columns (CIC) in the schema and, if any are present,
-/// validates them and adds the `identityColumnsCic` writer feature.
+/// Validates Concurrent Identity Columns (CIC) in the schema and, if any are present, adds the
+/// `identityColumnsCic` writer feature.
 ///
-/// Validation:
-/// - Each identity column must carry all three CIC metadata keys (enforced by
-///   [`detect_identity_columns`], which surfaces missing-key errors).
-/// - Each identity column must be of type `LONG`.
-/// - Step must be non-zero. A zero step would produce reservations with `count() == 0`, which would
-///   silently fail every subsequent write.
-/// - The column must NOT also carry legacy `delta.identity.{start,step,highWaterMark}` metadata.
+/// Validation is shared with the ALTER path via
+/// [`validate_cic_columns`](crate::identity_columns::validate_cic_columns): each identity column
+/// must be a non-nullable `LONG` with a non-zero step, must not also carry legacy
+/// `delta.identity.*` metadata, and must not be a partition column; CIC metadata is rejected on
+/// nested fields.
 ///
-/// Engines are expected to call create on the sequence service the commit to actually create the
-/// sequences on the service. See [`cic_column`] for more details.
-/// [`detect_identity_columns`]: crate::identity_columns::detect_identity_columns
-/// [`cic_column`]: crate::identity_columns::cic_column
+/// Engines register the sequences with the sequence service *after* the CREATE-table commit
+/// succeeds. See [`cic_column`](crate::identity_columns::cic_column) for the per-column metadata
+/// layout.
 fn maybe_enable_identity_columns_cic(
     schema: &SchemaRef,
+    partition_columns: &[String],
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
-    let identity_cols = crate::identity_columns::detect_identity_columns(schema)?;
-    if identity_cols.is_empty() {
-        return Ok(());
+    if crate::identity_columns::validate_cic_columns(schema, partition_columns)? {
+        add_feature_to_lists(
+            TableFeature::IdentityColumnsCic,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
     }
-    const LEGACY_KEYS: &[ColumnMetadataKey] = &[
-        ColumnMetadataKey::IdentityStart,
-        ColumnMetadataKey::IdentityStep,
-        ColumnMetadataKey::IdentityHighWaterMark,
-    ];
-    for info in &identity_cols {
-        // Already found by `detect_identity_columns`.
-        let field = schema.field(&info.column_name).ok_or_else(|| {
-            Error::generic(format!(
-                "Identity column '{}' detected but not found in schema",
-                info.column_name
-            ))
-        })?;
-        if field.data_type() != &DataType::LONG {
-            return Err(Error::generic(format!(
-                "Identity column '{}' must be of type LONG, got {}",
-                info.column_name,
-                field.data_type()
-            )));
-        }
-        if info.step == 0 {
-            return Err(Error::generic(format!(
-                "Identity column '{}' has step 0, which is not allowed",
-                info.column_name,
-            )));
-        }
-        for legacy in LEGACY_KEYS {
-            if field.get_config_value(legacy).is_some() {
-                return Err(Error::generic(format!(
-                    "Identity column '{}' carries both CIC metadata and legacy '{}'. \
-                     These two cannot be mixed.",
-                    info.column_name,
-                    legacy.as_ref(),
-                )));
-            }
-        }
-    }
-    add_feature_to_lists(
-        TableFeature::IdentityColumnsCic,
-        &mut validated.reader_features,
-        &mut validated.writer_features,
-    );
     Ok(())
 }
 
@@ -1009,7 +968,18 @@ impl CreateTableTransactionBuilder {
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
-        maybe_enable_identity_columns_cic(&effective_schema, &mut validated)?;
+        let cic_partition_columns: Vec<String> = data_layout_result
+            .partition_columns
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        maybe_enable_identity_columns_cic(
+            &effective_schema,
+            &cic_partition_columns,
+            &mut validated,
+        )?;
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
@@ -1651,7 +1621,7 @@ mod tests {
             writer_features: vec![],
         };
 
-        maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap();
+        maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap();
 
         assert!(validated
             .writer_features
@@ -1671,7 +1641,7 @@ mod tests {
             writer_features: vec![],
         };
 
-        maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap();
+        maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap();
 
         assert!(!validated
             .writer_features
@@ -1708,7 +1678,7 @@ mod tests {
             writer_features: vec![],
         };
 
-        let err = maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap_err();
+        let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
         assert!(
             err.to_string().contains("must be of type LONG"),
             "unexpected error: {err}"
@@ -1729,7 +1699,7 @@ mod tests {
             reader_features: vec![],
             writer_features: vec![],
         };
-        let err = maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap_err();
+        let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
         assert!(err.to_string().contains("step 0"), "unexpected: {err}");
         assert!(!validated
             .writer_features
@@ -1752,13 +1722,81 @@ mod tests {
             reader_features: vec![],
             writer_features: vec![],
         };
-        let err = maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap_err();
+        let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cannot be mixed"), "{msg}");
         assert!(msg.contains(legacy_key.as_ref()), "{msg}");
         assert!(!validated
             .writer_features
             .contains(&TableFeature::IdentityColumnsCic));
+    }
+
+    #[test]
+    fn identity_columns_cic_rejects_nullable_column() {
+        // A nullable field carrying CIC metadata (cic_column always builds non-nullable).
+        let field = StructField::new("id", DataType::LONG, true).with_metadata(vec![
+            (
+                ColumnMetadataKey::IdentityCicSequenceId
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::String("seq-abc".to_string()),
+            ),
+            (
+                ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+                MetadataValue::Number(1),
+            ),
+        ]);
+        let schema = Arc::new(StructType::new_unchecked(vec![field]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+        let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
+        assert!(
+            err.to_string().contains("non-nullable"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_columns_cic_rejects_partition_column() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            cic_column("id", "seq-abc", 1, 1),
+            StructField::new("name", DataType::STRING, true),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+        let err = maybe_enable_identity_columns_cic(&schema, &["id".to_string()], &mut validated)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("partition column"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_columns_cic_rejects_nested_column() {
+        // A CIC column nested inside a struct is rejected (CIC is top-level only).
+        let nested = StructField::nullable(
+            "nested",
+            StructType::new_unchecked(vec![cic_column("id", "seq-abc", 1, 1)]),
+        );
+        let schema = Arc::new(StructType::new_unchecked(vec![nested]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+        let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
+        assert!(err.to_string().contains("nested"), "unexpected: {err}");
     }
 
     #[test]

@@ -5,9 +5,6 @@
 //! [`delta_kernel::identity_columns::cic_column`] and commits the CREATE-table
 //! transaction first, then calls [`register_identity_sequences`] to register them all with the UC
 //! Identity Sequence Service in one batch.
-//!
-//! This is a one-shot setup phase, separate from the write-time reserve/fill path
-//! ([`crate::IdentityColumnWriter`]), which is built later from the already-stamped schema.
 
 use delta_kernel::identity_columns::IdentityColumnInfo;
 use unity_catalog_delta_client_api::{
