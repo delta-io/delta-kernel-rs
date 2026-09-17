@@ -4,8 +4,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
@@ -28,8 +26,7 @@ use crate::DeltaResult;
 /// have been applied.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[internal_api]
-pub(crate) enum SchemaOperation {
+pub enum SchemaOperation {
     /// Add a column or nested field to the table schema.
     AddColumn {
         /// Receiving struct; `None` selects the root schema.
@@ -43,7 +40,7 @@ pub(crate) enum SchemaOperation {
 
 impl SchemaOperation {
     /// Creates an add-column operation under `parent`; `None` selects the root schema.
-    pub(crate) fn add_column(parent: impl Into<Option<ColumnName>>, field: StructField) -> Self {
+    pub fn add_column(parent: impl Into<Option<ColumnName>>, field: StructField) -> Self {
         Self::AddColumn {
             parent: parent.into(),
             field,

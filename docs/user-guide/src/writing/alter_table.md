@@ -1,9 +1,8 @@
 # Altering a table
 
-To add a column to an existing Delta table, you build an `AlterTableTransaction`
-from a `Snapshot`, queue one or more schema operations, and commit. The result
-is a metadata-only commit that updates the table's schema without rewriting any
-data files.
+To add a column to an existing Delta table, you configure an existing-table transaction with one
+or more schema operations and commit it. A standalone ALTER commit updates the table's schema
+without rewriting data files. The same builder also supports schema evolution alongside a write.
 
 Before reading this page, make sure you understand
 [Creating a Table](./create_table.md) and
@@ -23,9 +22,9 @@ schema to existing files without scanning them, and writers that are only
 concerned with data changes can ignore the commit.
 
 > [!NOTE]
-> The first supported operation is `add_column()`. Other schema operations
+> The supported operations are adding columns and making columns nullable. Other schema operations
 > (drop column, rename, type changes) are not yet available through the
-> `AlterTableTransaction` API.
+> transaction builder.
 
 ## Adding a column
 
@@ -34,9 +33,10 @@ STRING` with rows for Alice, Bob, and Carol, and you want to add a `country`
 column. The flow is:
 
 1. Load a `Snapshot` of the table.
-2. Call `snapshot.alter_table()` to get an `AlterTableTransactionBuilder`.
+2. Call `snapshot.alter_table()` to get an `ExistingTableTransactionBuilder` configured for
+   `Operation::AlterTable`.
 3. Call `add_column()` with the new field.
-4. Call `build()` to produce an `AlterTableTransaction`.
+4. Call `build()` to produce a `Transaction`.
 5. Call `commit()` to atomically apply the schema change.
 
 ```rust,no_run
@@ -46,7 +46,7 @@ column. The flow is:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -58,8 +58,8 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
     .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .with_engine_info("my-app/1.0")
     .commit(&engine)?;
 
 match result {
@@ -109,26 +109,27 @@ let result = snapshot
     .commit(&engine)?;
 ```
 
-The builder uses a type-state pattern to enforce that at least one operation is
-queued before `build()` is callable. Calling `.build()` directly on
-`snapshot.alter_table()` without first calling `add_column()` is a compile
-error.
+Calling `.build()` directly on `snapshot.alter_table()` without adding a schema operation returns
+an error. The unified builder performs this check at runtime because other operations may combine
+schema evolution with data-file actions.
 
-## What you cannot do on an alter-table transaction
+## Evolving a schema while writing
 
-`AlterTableTransaction` is a metadata-only transaction. It does not implement
-`SupportsDataFiles`, so the data-file methods are not available at compile
-time. In particular, the following are not callable on an `AlterTableTransaction`:
+Use `transaction_builder()` when the same transaction evolves the schema and writes files. Kernel
+applies the schema operations during `build()`, so the transaction's `WriteState` uses the evolved
+schema.
 
-| Method | Used for |
-|--------|----------|
-| `write_state()` | Creating the `WriteState` used to bind a `BoundWriteContext` |
-| `add_files()` | Registering newly written data files |
-| `stats_schema()` | Retrieving the statistics schema for written files |
+```rust,ignore
+let mut transaction = snapshot
+    .transaction_builder()
+    .with_operation(Operation::Write)
+    .add_column(StructField::nullable("country", DataType::STRING))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
-If you need to add data and evolve the schema, run two transactions: an
-alter-table transaction first, then a write transaction against the post-commit
-snapshot. See [Appending Data](./append.md) for the write flow.
+let write_state = transaction.write_state()?;
+let write_context = write_state.write_context_builder().build()?;
+// Write files using the evolved schema, add their metadata, and commit.
+```
 
 ## What's next
 

@@ -42,7 +42,7 @@ use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CreateTable, Operation, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
 
@@ -160,7 +160,9 @@ impl CreateTableTransaction {
             should_emit_protocol: true,
             should_emit_metadata: true,
             committer,
-            operation: Some("CREATE TABLE".to_string()),
+            operation: Some(Operation::CreateTable),
+            operation_parameters: std::collections::HashMap::new(),
+            operation_metrics: std::collections::HashMap::new(),
             engine_info: Some(engine_info),
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
