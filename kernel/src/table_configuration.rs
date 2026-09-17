@@ -221,7 +221,7 @@ impl TableConfiguration {
 
         validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
 
-        // This is a `should` requirement in the protocol, but Kernel chooses to enforce it.
+        // This is a `should` requirement in the protocol. Kernel chooses to enforce it.
         // Spark enforces this constraint as well.
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
