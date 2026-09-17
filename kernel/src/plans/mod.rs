@@ -24,6 +24,40 @@
 //! LEFT ANTI JOIN commit_keys k ON c.file_key = k.file_key
 //! ```
 //!
+//! # Expression boundary
+//!
+//! [`Expression`](crate::expressions::Expression) and
+//! [`Predicate`](crate::expressions::Predicate) are broad source types. A connector creates a
+//! predicate such as `price / 2 > 50` and passes it to a scan; Kernel also creates expressions for
+//! imperative [`EvaluationHandler`](crate::EvaluationHandler) work. These trees contain syntax and
+//! literal types, but column nodes do not carry their resolved type or effective nullability.
+//!
+//! A mandatory plan carries a smaller contract. [`PlanBuilder::project`] and
+//! [`PlanBuilder::filter`] resolve broad inputs against the current schema into
+//! [`PlanExpression`](ir::expression::PlanExpression) and
+//! [`PlanPredicate`](ir::expression::PlanPredicate). Resolution proves column paths, exact types,
+//! effective nested nullability, Boolean filters, and project assignment. It rejects arithmetic,
+//! casts, arrays, `IN`, opaque callbacks, and unknown nodes because replay does not require them.
+//!
+//! ```text
+//! connector or Kernel Expression/Predicate
+//!                 |
+//!                 v
+//!       Kernel resolution + validation
+//!                 |
+//!                 v
+//!       PlanExpression/PlanPredicate
+//!                 |
+//!                 v
+//!             PlanExecutor
+//! ```
+//!
+//! Data skipping is intentionally separate. A [`DataSkippingSite`](ir::nodes::DataSkippingSite)
+//! is an optional identity operation containing the broad source predicate, resolved statistics
+//! locations, protected-row rules, and possibly Kernel's portable keep predicate. An executor may
+//! apply that predicate, derive a richer conservative native filter, or keep every row. Thus an
+//! engine can analyze `price / 2 > 50` without making division mandatory for metadata replay.
+//!
 //! # Writing an executor
 //!
 //! An executor implements [`PlanExecutor::execute_op`], dispatching on the [`Operation`] it
@@ -35,9 +69,10 @@
 //!   evaluate [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted
 //!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
 //!
-//! Every operator, expression, and predicate a plan contains must be handled; returning an error
-//! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
-//! `SyncPlanExecutor` is a complete reference implementation.
+//! Every mandatory operator, expression, and predicate a plan contains must be handled. A
+//! [`DataSkippingSite`](ir::nodes::DataSkippingSite) may be treated as identity, because it affects
+//! performance rather than correctness. The sync engine's `SyncPlanExecutor` is a reference
+//! implementation.
 //!
 //! # Consuming terminal results
 //!
@@ -65,8 +100,9 @@
 //!   its operator with a runnable example.
 //! - [`ir::nodes`] is the operator catalog: each [`Operator`](ir::nodes::Operator) variant's
 //!   payload struct carries its semantics, invariants, and worked examples.
-//! - [`crate::expressions`] defines the expressions and predicates operators evaluate, including
-//!   the type and null semantics an executor must match.
+//! - [`ir::expression`] defines the closed, resolved expressions and predicates executors match.
+//! - [`crate::expressions`] defines the broader public source language accepted at scan and
+//!   imperative-evaluation boundaries.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
 mod builder;

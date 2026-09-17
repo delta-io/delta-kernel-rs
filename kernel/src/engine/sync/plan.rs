@@ -133,8 +133,8 @@ impl SyncPlanExecutor {
     /// Evaluates `query` by materializing each node's output in slice (topological) order, then
     /// streams the terminal (last) node's batches to the caller.
     fn execute_query(&self, query: Plan) -> DeltaResult<PlanResult> {
-        let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(query.nodes.len());
-        for node in query.nodes {
+        let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(query.nodes().len());
+        for node in query.into_nodes() {
             let output = self.eval_node(node, &outputs)?;
             outputs.push(output);
         }
@@ -154,7 +154,7 @@ impl SyncPlanExecutor {
         node: PlanNode,
         results: &[Vec<RecordBatch>],
     ) -> DeltaResult<Vec<RecordBatch>> {
-        let PlanNode { op, inputs } = node;
+        let (op, inputs) = node.into_parts();
         match op {
             Operator::ScanJson(ScanJson {
                 files,
@@ -171,7 +171,17 @@ impl SyncPlanExecutor {
                 inputs.iter().flat_map(|&i| results[i].iter().cloned()),
             )),
             Operator::Project(project) => eval_project(project, &results[inputs[0]]),
-            Operator::Filter(filter) => eval_filter(filter.predicate, &results[inputs[0]]),
+            Operator::Filter(filter) => eval_filter(
+                Arc::clone(filter.predicate().source_predicate()),
+                &results[inputs[0]],
+            ),
+            Operator::DataSkipping(site) => match site.kernel_keep_predicate() {
+                Some(predicate) => eval_filter(
+                    Arc::clone(predicate.source_predicate()),
+                    &results[inputs[0]],
+                ),
+                None => Ok(results[inputs[0]].clone()),
+            },
             Operator::DynamicScan(dynamic_scan) => {
                 self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
             }
@@ -353,8 +363,8 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<Reco
     let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
     let evaluator = ArrowEvaluationHandler.new_expression_evaluator(
         input_schema,
-        project.expr,
-        project.schema.as_ref().clone().into(),
+        Arc::clone(project.expression().source_expression()),
+        project.schema().as_ref().clone().into(),
     )?;
     input
         .iter()

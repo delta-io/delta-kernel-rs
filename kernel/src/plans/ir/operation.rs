@@ -7,7 +7,7 @@ use bytes::Bytes;
 use url::Url;
 
 use super::plan::Plan;
-use crate::{FileMeta, FileSlice};
+use crate::{DeltaResult, FileMeta, FileSlice};
 
 /// Represents a set of instructions that the
 /// [`PlanExecutor`](crate::plans::PlanExecutor) should perform.
@@ -25,9 +25,16 @@ pub enum Operation {
 
 impl Operation {
     /// Serializes this [`Operation`] into its proto wire representation.
-    pub fn to_proto_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a query plan is invalid or cannot be represented by the wire format.
+    pub fn to_proto_bytes(&self) -> DeltaResult<Vec<u8>> {
         use prost::Message as _;
-        crate::plans::proto::operation::Operation::from(self).encode_to_vec()
+        if let Self::QueryPlan(plan) = self {
+            plan.validate()?;
+        }
+        Ok(crate::plans::proto::operation::Operation::from(self).encode_to_vec())
     }
 }
 

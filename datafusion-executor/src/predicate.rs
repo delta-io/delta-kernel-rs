@@ -13,10 +13,11 @@ use delta_kernel::expressions::{
     Scalar as KernelScalar, UnaryPredicate as KernelUnaryPredicate,
     UnaryPredicateOp as KernelUnaryPredicateOp,
 };
+use delta_kernel::plans::ir::expression::{PlanComparison, PlanPredicate, PlanPredicateKind};
 use delta_kernel::schema::{DataType, StructType};
 use delta_kernel::{DeltaResult, Error};
 
-use crate::expression::to_df_expr;
+use crate::expression::{to_df_expr, to_df_plan_expr};
 use crate::scalar::to_df_scalar;
 
 /// Converts a kernel [`Predicate`](KernelPredicate) into a boolean-valued DataFusion
@@ -48,6 +49,68 @@ pub fn to_df_predicate_expr(
         KernelPredicate::Unknown(name) => Err(Error::unsupported(format!(
             "cannot convert Unknown predicate {name:?}"
         ))),
+    }
+}
+
+/// Converts a resolved plan predicate into its DataFusion equivalent.
+///
+/// Kernel has already proved operand types, Boolean inputs, and membership in the mandatory plan
+/// dialect. This lowering therefore performs no source-language inference or fallback.
+///
+/// # Errors
+///
+/// Returns an error when a resolved child cannot be represented by DataFusion. An empty junction
+/// indicates an invalid resolved plan.
+pub(crate) fn to_df_plan_predicate_expr(
+    predicate: &PlanPredicate,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    match predicate.kind() {
+        PlanPredicateKind::Boolean(expression) => to_df_plan_expr(expression, input_schema),
+        PlanPredicateKind::Not(inner) => Ok(DFExpr::Not(Box::new(to_df_plan_predicate_expr(
+            inner,
+            input_schema,
+        )?))),
+        PlanPredicateKind::IsNull {
+            expression,
+            inverted,
+        } => {
+            let expression = to_df_plan_expr(expression, input_schema)?;
+            if inverted {
+                Ok(DFExpr::IsNotNull(Box::new(expression)))
+            } else {
+                Ok(DFExpr::IsNull(Box::new(expression)))
+            }
+        }
+        PlanPredicateKind::Compare { op, left, right } => {
+            let op = match op {
+                PlanComparison::LessThan => Operator::Lt,
+                PlanComparison::GreaterThan => Operator::Gt,
+                PlanComparison::Equal => Operator::Eq,
+                PlanComparison::Distinct => Operator::IsDistinctFrom,
+            };
+            Ok(binary_expr(
+                to_df_plan_expr(left, input_schema)?,
+                op,
+                to_df_plan_expr(right, input_schema)?,
+            ))
+        }
+        PlanPredicateKind::And(predicates) => {
+            let expressions = predicates
+                .iter()
+                .map(|predicate| to_df_plan_predicate_expr(predicate, input_schema))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            conjunction(expressions)
+                .ok_or_else(|| Error::internal_error("resolved plan AND predicate has no children"))
+        }
+        PlanPredicateKind::Or(predicates) => {
+            let expressions = predicates
+                .iter()
+                .map(|predicate| to_df_plan_predicate_expr(predicate, input_schema))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            disjunction(expressions)
+                .ok_or_else(|| Error::internal_error("resolved plan OR predicate has no children"))
+        }
     }
 }
 
