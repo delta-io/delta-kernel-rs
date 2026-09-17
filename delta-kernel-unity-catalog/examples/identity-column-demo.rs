@@ -2,7 +2,7 @@
 //!
 //! Drives the full flow -- mint sequence ids, register them in UC, stamp them
 //! into a Delta schema, create the table, reserve ranges and fill a data batch
-//! via an `IdentityColumnWriter`, write a Parquet file, commit v1, and read the
+//! via `fill_batch`, write a Parquet file, commit v1, and read the
 //! table back -- printing every step so you can verify what kernel does on disk.
 //!
 //! This example uses the [`InMemorySequenceClient`] — no external services
@@ -21,13 +21,15 @@ use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use delta_kernel::arrow::array::{ArrayRef, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::identity_columns::{cic_column, detect_identity_columns, IdentityColumnInfo};
+use delta_kernel::identity_columns::{
+    cic_column, detect_identity_columns, IdentityColumnInfo, ReservedRange,
+};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -37,8 +39,10 @@ use delta_kernel::Engine as KernelEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel_unity_catalog::{register_identity_sequences, IdentityColumnWriter};
-use unity_catalog_delta_client_api::{InMemorySequenceClient, SequenceClient};
+use delta_kernel_unity_catalog::register_identity_sequences;
+use unity_catalog_delta_client_api::{
+    IdentityReservation, InMemorySequenceClient, ReserveIdentityRanges, SequenceClient,
+};
 use uuid::Uuid;
 
 type DemoEngine = DefaultEngine<TokioMultiThreadExecutor>;
@@ -162,36 +166,68 @@ where
     }
 
     println!("\n[5/6] Writing a Parquet file and committing v1");
-    // The writer hides the sequence client: the engine only reserves and fills.
-    let writer = IdentityColumnWriter::new(&read_schema, client.clone(), table_id)?;
+
+    // Build the write transaction, then ask kernel which columns the connector must fill.
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("cic-demo/0.1")
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
 
     const BATCH_ROWS: u64 = 3;
-    // Ensure enough is reserved for this batch (reserves the deficit if nothing was prefetched).
-    writer.ensure_available(BATCH_ROWS).await?;
+    let payload = ["hello", "world", "!"];
 
-    // Engine-side batch: only the non-identity columns. Kernel fills the rest.
-    let payload: ArrayRef = Arc::new(StringArray::from(vec![
-        "hello".to_string(),
-        "world".to_string(),
-        "!".to_string(),
-    ]));
-    let input_batch = RecordBatch::try_new(
-        Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "payload",
-            ArrowDataType::Utf8,
-            true,
-        )])),
-        vec![payload],
-    )?;
+    // Connector-owned: reserve BATCH_ROWS from every CIC in one batched RPC, then generate the
+    // values with kernel's ReservedRange arithmetic, keyed by logical column name. Kernel neither
+    // reserves nor inserts values.
+    let cics = txn.concurrent_identity_columns()?;
+    let response = client
+        .reserve_identity_ranges(ReserveIdentityRanges {
+            table_id: table_id.to_string(),
+            reservations: cics
+                .iter()
+                .map(|c| IdentityReservation {
+                    sequence_id: c.sequence_id().to_string(),
+                    count: BATCH_ROWS as i64,
+                    step: Some(c.step()),
+                })
+                .collect(),
+        })
+        .await?;
+    let ranges: std::collections::HashMap<&str, _> = response
+        .ranges
+        .iter()
+        .map(|r| (r.sequence_id.as_str(), r))
+        .collect();
+    let mut generated: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for c in &cics {
+        let r = ranges[c.sequence_id()];
+        let values = ReservedRange {
+            range_start: r.range_start,
+            range_end: r.range_end,
+            step: r.step,
+        }
+        .values(c.column_name(), 0, BATCH_ROWS)?;
+        generated.insert(c.column_name().to_string(), values);
+    }
+    drop(cics); // release the borrow of `txn` before mutating it
 
-    let filled_data = writer.fill_engine_batch(
-        engine.evaluation_handler().as_ref(),
-        &ArrowEngineData::new(input_batch),
-        &read_schema,
+    // The connector assembles the full batch itself (kernel does not insert values). Columns must
+    // be in the table's schema order: id, payload, row_id.
+    let filled = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("payload", ArrowDataType::Utf8, true),
+            ArrowField::new("row_id", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(generated["id"].clone())) as ArrayRef,
+            Arc::new(StringArray::from(payload.to_vec())),
+            Arc::new(Int64Array::from(generated["row_id"].clone())),
+        ],
     )?;
-    let filled = ArrowEngineData::try_from_engine_data(filled_data)?
-        .record_batch()
-        .clone();
     println!(
         "    filled batch ({} rows x {} columns):",
         filled.num_rows(),
@@ -202,14 +238,10 @@ where
         delta_kernel::arrow::util::pretty::pretty_format_batches(std::slice::from_ref(&filled))?
     );
 
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("cic-demo/0.1")
-        .with_operation("WRITE".to_string())
-        .with_data_change(true);
+    // Acknowledge that the connector filled the identity columns, then write through the normal
+    // path.
+    txn.ack_concurrent_identity_columns();
     let write_context = txn.write_state()?.write_context_builder().build()?;
-
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(filled), &write_context)
         .await?;
