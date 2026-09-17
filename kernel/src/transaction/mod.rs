@@ -1330,7 +1330,8 @@ impl<S> Transaction<S> {
         let row_id_high_water_mark = if self.is_create_table() {
             None
         } else {
-            RowTrackingDomainMetadata::get_high_water_mark(self.read_snapshot()?, engine)?
+            self.read_snapshot()?
+                .get_row_tracking_high_water_mark(engine)?
         };
 
         // Create a row tracking visitor and visit all files to collect row tracking information

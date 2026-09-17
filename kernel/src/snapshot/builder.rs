@@ -153,7 +153,7 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     max_catalog_version: Option<Version>,
     incremental_replay: IncrementalReplay,
     checkpoint_handling: CheckpointHandling,
-    snapshot_hint: Option<SnapshotHint>,
+    snapshot_hint: Option<Box<SnapshotHint>>,
     /// Kernel-minted id correlating this build's metric events with its child events.
     operation_id: MetricId,
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
@@ -277,8 +277,8 @@ impl SnapshotBuilder<FromTableRoot> {
     /// failures retain their normal error variants.
     #[allow(dead_code)]
     #[internal_api]
-    pub(crate) fn with_snapshot_hint(mut self, hint: SnapshotHint) -> Self {
-        self.snapshot_hint = Some(hint);
+    pub(crate) fn with_snapshot_hint(mut self, hint: impl Into<Box<SnapshotHint>>) -> Self {
+        self.snapshot_hint = Some(hint.into());
         self
     }
 }
@@ -550,7 +550,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
-        snapshot_hint: SnapshotHint,
+        snapshot_hint: Box<SnapshotHint>,
     ) -> DeltaResult<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
@@ -590,7 +590,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             last_checkpoint_hint,
             crc,
             freshness,
-        } = snapshot_hint;
+        } = *snapshot_hint;
         if freshness == SnapshotHintFreshness::Latest {
             require!(
                 max_catalog_version.is_none_or(|max| max <= version),

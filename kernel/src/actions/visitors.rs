@@ -580,9 +580,9 @@ pub(crate) fn visit_metadata_at<'a>(
 
     let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
     let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
-    // get format out of primitives
     let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-    // options for format is always empty, so skip getters[4]
+    let format_options: Option<HashMap<_, _>> =
+        getters[4].get_opt(row_index, "metadata.format.options")?;
     let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
@@ -596,7 +596,7 @@ pub(crate) fn visit_metadata_at<'a>(
         description,
         format: Format {
             provider: format_provider,
-            options: HashMap::new(),
+            options: format_options.unwrap_or_default(),
         },
         schema_string,
         partition_columns,
@@ -963,8 +963,9 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{column_expr_ref, Expression};
+    use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{action_batch, parse_json_batch, string_array_to_engine_data};
     use crate::Engine;
 
     #[rstest::rstest]
@@ -994,6 +995,65 @@ mod tests {
             writer_features: Some(vec![TableFeature::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::populated(Some(HashMap::from([
+        ("compression".to_string(), "zstd".to_string()),
+        ("custom.option".to_string(), "arbitrary value".to_string()),
+    ])))]
+    #[case::empty(Some(HashMap::new()))]
+    #[case::missing(None)]
+    fn test_parse_metadata_format_options(
+        #[case] format_options: Option<HashMap<String, String>>,
+    ) -> DeltaResult<()> {
+        let mut format = serde_json::Map::from_iter([(
+            "provider".to_string(),
+            serde_json::Value::String("parquet".to_string()),
+        )]);
+        if let Some(options) = &format_options {
+            format.insert(
+                "options".to_string(),
+                serde_json::to_value(options).unwrap(),
+            );
+        }
+        let metadata_json = serde_json::json!({
+            "metaData": {
+                "id": "test-id",
+                "format": format,
+                "schemaString": r#"{"type":"struct","fields":[]}"#,
+                "partitionColumns": [],
+                "configuration": {},
+            }
+        })
+        .to_string();
+        // The action schema requires `options`. Making it nullable here lets the missing case
+        // reach the visitor as `None` instead of failing during JSON decoding.
+        let output_schema = schema_ref! {
+            nullable "metaData": {
+                not_null "id": STRING,
+                nullable "name": STRING,
+                nullable "description": STRING,
+                not_null "format": {
+                    not_null "provider": STRING,
+                    nullable "options": { STRING => not_null STRING },
+                },
+                not_null "schemaString": STRING,
+                not_null "partitionColumns": [ not_null STRING ],
+                nullable "createdTime": LONG,
+                not_null "configuration": { STRING => not_null STRING },
+            },
+        };
+        let engine = SyncEngine::new();
+        let data = engine.json_handler().parse_json(
+            string_array_to_engine_data(StringArray::from(vec![metadata_json])),
+            output_schema,
+        )?;
+
+        let metadata = Metadata::try_new_from_data(data.as_ref())?.unwrap();
+
+        assert_eq!(metadata.format.options, format_options.unwrap_or_default());
         Ok(())
     }
 
