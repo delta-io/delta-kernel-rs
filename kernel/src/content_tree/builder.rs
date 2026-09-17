@@ -1,11 +1,9 @@
 //! Write-side translation for the Adaptive Metadata Tree (AMT).
 //!
 //! Translates Delta file write-metadata into content-tree entry [`EngineData`] -- the columnar
-//! form of an AMT root or leaf manifest. This is the minimal blind-append path: it produces `Data`
-//! entries only, with deletion vectors, tags, and leaf-manifest information left null, and
-//! statistics and partition values omitted from the schema. A [`ManifestKind`] selects whether the
-//! manifest-inherited tracking fields (`sequenceNumber`, `fileSequenceNumber`, `firstRowId`) are
-//! written explicitly (root) or left null to be inherited/assigned from the parent manifest (leaf).
+//! form of an AMT manifest. This is the minimal blind-append path: it produces `Data` entries only,
+//! with deletion vectors, tags, and leaf-manifest information left null, and statistics and
+//! partition values omitted from the schema.
 
 use std::sync::{Arc, LazyLock};
 
@@ -22,57 +20,28 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
 use crate::schema::{
-    ColumnNamesAndTypes, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
-use crate::transaction::{with_row_tracking_cols, BASE_ADD_FILES_SCHEMA};
 use crate::{DeltaResult, Engine, Error};
 
 /// The AMT/Iceberg adaptive-metadata format version stamped onto each written entry: Iceberg
 /// format version 4 (the "V4 adaptive metadata tree").
 const AMT_FORMAT_VERSION: i32 = 4;
 
-/// Which AMT manifest level a batch of `Data` entries belongs to.
-///
-/// Governs the manifest-inherited tracking fields: a [`ManifestKind::Root`] entry writes
-/// `sequenceNumber`, `fileSequenceNumber`, and `firstRowId` explicitly; a [`ManifestKind::Leaf`]
-/// entry leaves them null so they are inherited (sequence numbers) or assigned (firstRowId) from
-/// its parent manifest entry. `snapshotId` is written explicitly in both.
-#[derive(Debug, Clone, Copy)]
-enum ManifestKind {
-    Root,
-    Leaf,
-}
-
-/// The write-metadata input schema consumed by [`convert_append_metadata_to_entry_batch`]: the
-/// canonical row-tracking-augmented add-file write-metadata schema (`BASE_ADD_FILES_SCHEMA`
-/// extended with the row-tracking columns), projected to the columns this path reads and with
-/// `stats` narrowed to `numRecords`. Derived from that single source of truth so it cannot drift.
-fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
-    let augmented = with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?;
-    let projected = augmented.project(&[
-        PATH_NAME,
-        SIZE_NAME,
-        STATS_NAME,
-        BASE_ROW_ID_NAME,
-        DEFAULT_ROW_COMMIT_VERSION_NAME,
-    ])?;
-    let narrowed_stats = match projected.field(STATS_NAME).map(StructField::data_type) {
-        Some(DataType::Struct(stats)) => stats.project_as_struct(&[NUM_RECORDS])?,
-        _ => {
-            return Err(Error::generic(
-                "add-file write-metadata schema is missing the `stats` struct",
-            ))
-        }
-    };
-    let narrowed = SchemaStructPatchBuilder::new()
-        .replace(
-            STATS_NAME,
-            StructField::nullable(STATS_NAME, narrowed_stats),
-        )
-        .build(&projected)?;
-    Ok(Arc::new(narrowed))
-}
+/// The write-metadata input schema consumed by [`convert_append_metadata_to_entry_batch`]: a
+/// projection of the row-tracking-augmented add-file write-metadata schema, with `stats` narrowed
+/// to `numRecords`. Kept in lockstep with the canonical `BASE_ADD_FILES_SCHEMA` by
+/// `write_metadata_input_schema_matches_add_file_projection`, which fails if the two drift.
+static WRITE_METADATA_INPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null PATH_NAME: STRING,
+    not_null SIZE_NAME: LONG,
+    nullable STATS_NAME: {
+        nullable NUM_RECORDS: LONG,
+    },
+    nullable BASE_ROW_ID_NAME: LONG,
+    nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+};
 
 /// The write-metadata leaf columns the ROOT path requires to be non-null on every row, in leaf
 /// order: `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion` (the root path writes
@@ -143,7 +112,7 @@ pub(crate) fn convert_append_metadata_to_entry_batch(
         engine,
         write_metadata,
         snapshot_id,
-        ManifestKind::Root,
+        AppendEntrySpec::root(),
     )
 }
 
@@ -167,42 +136,27 @@ pub(crate) fn convert_append_metadata_to_leaf_entry_batch(
         engine,
         write_metadata,
         snapshot_id,
-        ManifestKind::Leaf,
+        AppendEntrySpec::leaf(),
     )
 }
 
-/// Shared body of the root and leaf append-to-entry paths; `kind` selects which
-/// manifest-inherited tracking fields are written (see [`ManifestKind`]).
+/// Shared body of the root and leaf append-to-entry paths; `spec` supplies the per-manifest-level
+/// differences (see [`AppendEntrySpec`]).
 fn convert_append_metadata_to_entry_batch_impl(
     engine: &dyn Engine,
     write_metadata: &dyn EngineData,
     snapshot_id: i64,
-    kind: ManifestKind,
+    spec: AppendEntrySpec,
 ) -> DeltaResult<FilteredEngineData> {
     // Row tracking guarantees these are assigned, but the evaluator does not enforce the input
     // schema's non-nullability, so a missing assignment would otherwise emit an entry with a null
-    // required field. Reject it up front. The required set depends on which fields `kind` writes.
-    let required_columns = match kind {
-        ManifestKind::Root => &*ROOT_REQUIRED_NON_NULL_COLUMNS,
-        ManifestKind::Leaf => &*LEAF_REQUIRED_NON_NULL_COLUMNS,
-    };
+    // required field. Reject it up front.
     let mut validator = RequiredFieldsNonNullVisitor {
-        columns: required_columns,
+        columns: spec.required_non_null_columns,
     };
     validator.visit_rows_of(write_metadata)?;
 
     let output_schema = ContentTreeNodeEntry::to_schema();
-
-    // Root writes the sequence numbers (from `defaultRowCommitVersion`) and `firstRowId` (from
-    // `baseRowId`) explicitly; leaf leaves them null so they are inherited/assigned from the parent
-    // manifest entry.
-    let (sequence_number, first_row_id) = match kind {
-        ManifestKind::Root => (
-            Some(Expression::column([DEFAULT_ROW_COMMIT_VERSION_NAME])),
-            Some(Expression::column([BASE_ROW_ID_NAME])),
-        ),
-        ManifestKind::Leaf => (None, None),
-    };
 
     let projections = ContentTreeEntryProjections {
         status: TrackingStatus::Added,
@@ -212,14 +166,14 @@ fn convert_append_metadata_to_entry_batch_impl(
         // A decode step is needed once kernel has an expression-level percent-decode op.
         location: Expression::column([PATH_NAME]),
         file_size_in_bytes: Expression::column([SIZE_NAME]),
-        sequence_number,
+        sequence_number: spec.sequence_number,
         record_count: Expression::column([STATS_NAME, NUM_RECORDS]),
-        first_row_id,
+        first_row_id: spec.first_row_id,
     };
 
     let expr = build_content_tree_entry_expression(&output_schema, &projections)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        write_metadata_input_schema()?,
+        WRITE_METADATA_INPUT_SCHEMA.clone(),
         Arc::new(expr),
         DataType::from(output_schema),
     )?;
@@ -229,8 +183,42 @@ fn convert_append_metadata_to_entry_batch_impl(
 
 // === Helpers ===
 
-/// Rejects any write-metadata row whose required row-tracking/statistic fields (per the manifest
-/// kind, via `columns`) are null.
+/// Per-manifest-level inputs for the append-to-entry path: which input columns must be non-null and
+/// how the manifest-inherited tracking fields are filled. All other entry fields are identical
+/// across levels.
+struct AppendEntrySpec {
+    /// Columns required non-null on every input row for this level.
+    required_non_null_columns: &'static ColumnNamesAndTypes,
+    /// Source for `sequenceNumber`/`fileSequenceNumber`; `None` emits null (inherited).
+    sequence_number: Option<Expression>,
+    /// Source for `firstRowId`; `None` emits null (assigned by the parent manifest).
+    first_row_id: Option<Expression>,
+}
+
+impl AppendEntrySpec {
+    /// Root manifest: sequence numbers (from `defaultRowCommitVersion`) and `firstRowId` (from
+    /// `baseRowId`) are written explicitly.
+    fn root() -> Self {
+        Self {
+            required_non_null_columns: &ROOT_REQUIRED_NON_NULL_COLUMNS,
+            sequence_number: Some(Expression::column([DEFAULT_ROW_COMMIT_VERSION_NAME])),
+            first_row_id: Some(Expression::column([BASE_ROW_ID_NAME])),
+        }
+    }
+
+    /// Leaf manifest: sequence numbers and `firstRowId` are left null to be inherited/assigned from
+    /// the parent manifest entry.
+    fn leaf() -> Self {
+        Self {
+            required_non_null_columns: &LEAF_REQUIRED_NON_NULL_COLUMNS,
+            sequence_number: None,
+            first_row_id: None,
+        }
+    }
+}
+
+/// Rejects any write-metadata row whose required row-tracking/statistic fields (via `columns`) are
+/// null.
 struct RequiredFieldsNonNullVisitor {
     columns: &'static ColumnNamesAndTypes,
 }
@@ -323,6 +311,8 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
+    use crate::schema::SchemaStructPatchBuilder;
+    use crate::transaction::BASE_ADD_FILES_SCHEMA;
     use crate::Engine;
 
     /// A row of write-metadata input, where any field may be null (to exercise null rejection).
@@ -404,46 +394,53 @@ mod tests {
             .collect();
         engine
             .evaluation_handler()
-            .create_many(write_metadata_input_schema().unwrap(), scalars)
+            .create_many(WRITE_METADATA_INPUT_SCHEMA.clone(), scalars)
             .unwrap()
     }
 
-    /// Dispatches to the root or leaf append-to-entry path per `kind`.
-    fn convert(
-        engine: &dyn Engine,
-        write_metadata: &dyn EngineData,
-        snapshot_id: i64,
-        kind: ManifestKind,
-    ) -> DeltaResult<FilteredEngineData> {
-        match kind {
-            ManifestKind::Root => {
-                convert_append_metadata_to_entry_batch(engine, write_metadata, snapshot_id)
-            }
-            ManifestKind::Leaf => {
-                convert_append_metadata_to_leaf_entry_batch(engine, write_metadata, snapshot_id)
-            }
-        }
+    /// An append-to-entry entry point under test.
+    type ConvertFn = fn(&dyn Engine, &dyn EngineData, i64) -> DeltaResult<FilteredEngineData>;
+
+    /// One append path under test, as data: the entry point plus the tracking versions it is
+    /// expected to produce for an added file with a given `(base_row_id, commit_version)`. Root
+    /// writes both explicitly; leaf leaves them null.
+    #[derive(Clone, Copy)]
+    struct EntryPath {
+        convert: ConvertFn,
+        expected_versions: fn(base_row_id: i64, commit_version: i64) -> (Option<i64>, Option<i64>),
     }
 
+    const ROOT_PATH: EntryPath = EntryPath {
+        convert: convert_append_metadata_to_entry_batch,
+        expected_versions: |base_row_id, commit_version| (Some(commit_version), Some(base_row_id)),
+    };
+
+    const LEAF_PATH: EntryPath = EntryPath {
+        convert: convert_append_metadata_to_leaf_entry_batch,
+        expected_versions: |_, _| (None, None),
+    };
+
     /// Builds the expected content-tree entry batch for `files` from explicit
-    /// [`ContentTreeNodeEntry`] values, for the given manifest `kind`.
+    /// [`ContentTreeNodeEntry`] values, using `expected_versions` for the per-level tracking
+    /// fields.
     fn expected_entries(
         engine: &dyn Engine,
         files: &[(&'static str, i64, i64, i64, i64)],
         snapshot_id: i64,
-        kind: ManifestKind,
+        expected_versions: fn(i64, i64) -> (Option<i64>, Option<i64>),
     ) -> Box<dyn EngineData> {
         let entries: Vec<StructData> = files
             .iter()
             .map(|&(path, size, num_records, base_row_id, commit_version)| {
+                let (sequence_number, first_row_id) =
+                    expected_versions(base_row_id, commit_version);
                 expected_entry(
                     path,
                     size,
                     num_records,
-                    base_row_id,
-                    commit_version,
                     snapshot_id,
-                    kind,
+                    sequence_number,
+                    first_row_id,
                 )
                 .into()
             })
@@ -455,23 +452,17 @@ mod tests {
             .unwrap()
     }
 
-    /// The expected `Added` `Data` entry for one input file. Root entries carry explicit sequence
-    /// numbers (from `commit_version`) and `firstRowId` (from `base_row_id`); leaf entries leave
-    /// those null so they are inherited/assigned from the parent manifest. `snapshotId` is set in
-    /// both.
+    /// The expected `Added` `Data` entry for one input file, with the given tracking
+    /// `sequence_number` (used for both `sequenceNumber` and `fileSequenceNumber`) and
+    /// `first_row_id`. `snapshotId` is always set.
     fn expected_entry(
         path: &str,
         size: i64,
         num_records: i64,
-        base_row_id: i64,
-        commit_version: i64,
         snapshot_id: i64,
-        kind: ManifestKind,
+        sequence_number: Option<i64>,
+        first_row_id: Option<i64>,
     ) -> ContentTreeNodeEntry {
-        let (sequence_number, first_row_id) = match kind {
-            ManifestKind::Root => (Some(commit_version), Some(base_row_id)),
-            ManifestKind::Leaf => (None, None),
-        };
         ContentTreeNodeEntry {
             content_type: DataContentType::Data,
             location: path.to_string(),
@@ -513,10 +504,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case::root(ManifestKind::Root)]
-    #[case::leaf(ManifestKind::Leaf)]
+    #[case::root(ROOT_PATH)]
+    #[case::leaf(LEAF_PATH)]
     fn convert_append_metadata_to_entry_batch_produces_added_data_entries(
-        #[case] kind: ManifestKind,
+        #[case] entry_path: EntryPath,
     ) {
         let engine = SyncEngine::new();
         // (path, size, numRecords, baseRowId, defaultRowCommitVersion)
@@ -524,15 +515,14 @@ mod tests {
         let snapshot_id = 42;
 
         let out = all_selected_data(
-            convert(
+            (entry_path.convert)(
                 &engine,
                 write_metadata_input(&engine, &files).as_ref(),
                 snapshot_id,
-                kind,
             )
             .unwrap(),
         );
-        let expected = expected_entries(&engine, &files, snapshot_id, kind);
+        let expected = expected_entries(&engine, &files, snapshot_id, entry_path.expected_versions);
 
         assert_eq!(
             out.try_into_record_batch().unwrap(),
@@ -543,23 +533,18 @@ mod tests {
     #[rstest]
     fn convert_append_metadata_to_entry_batch_location_is_verbatim(
         #[values("a b.parquet", "a%20b.parquet")] path: &'static str,
-        #[values(ManifestKind::Root, ManifestKind::Leaf)] kind: ManifestKind,
+        #[values(ROOT_PATH, LEAF_PATH)] entry_path: EntryPath,
     ) {
         // Pins the current contract: `location` carries the raw path byte-for-byte.
         let engine = SyncEngine::new();
         let files = [(path, 1, 1, 0, 0)];
         let out = all_selected_data(
-            convert(
-                &engine,
-                write_metadata_input(&engine, &files).as_ref(),
-                0,
-                kind,
-            )
-            .unwrap(),
+            (entry_path.convert)(&engine, write_metadata_input(&engine, &files).as_ref(), 0)
+                .unwrap(),
         );
         assert_eq!(
             out.try_into_record_batch().unwrap(),
-            expected_entries(&engine, &files, 0, kind)
+            expected_entries(&engine, &files, 0, entry_path.expected_versions)
                 .try_into_record_batch()
                 .unwrap()
         );
@@ -571,38 +556,38 @@ mod tests {
     // mention.
     #[rstest]
     #[case::root_num_records(
-        ManifestKind::Root,
+        convert_append_metadata_to_entry_batch,
         InputRow { path: Some("a.parquet"), size: Some(1), num_records: None, base_row_id: Some(0), commit_version: Some(0) },
         Err("stats.numRecords")
     )]
     #[case::root_base_row_id(
-        ManifestKind::Root,
+        convert_append_metadata_to_entry_batch,
         InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: None, commit_version: Some(0) },
         Err(BASE_ROW_ID_NAME)
     )]
     #[case::root_commit_version(
-        ManifestKind::Root,
+        convert_append_metadata_to_entry_batch,
         InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: Some(0), commit_version: None },
         Err(DEFAULT_ROW_COMMIT_VERSION_NAME)
     )]
     #[case::leaf_num_records(
-        ManifestKind::Leaf,
+        convert_append_metadata_to_leaf_entry_batch,
         InputRow { path: Some("a.parquet"), size: Some(1), num_records: None, base_row_id: Some(0), commit_version: Some(0) },
         Err("stats.numRecords")
     )]
     #[case::leaf_null_base_row_id_accepted(
-        ManifestKind::Leaf,
+        convert_append_metadata_to_leaf_entry_batch,
         InputRow { path: Some("a.parquet"), size: Some(1), num_records: Some(1), base_row_id: None, commit_version: None },
         Ok(())
     )]
     fn convert_append_metadata_to_entry_batch_required_field_validation(
-        #[case] kind: ManifestKind,
+        #[case] convert: ConvertFn,
         #[case] row: InputRow,
         #[case] expected: Result<(), &str>,
     ) {
         let engine = SyncEngine::new();
         let input = write_metadata_input_nullable(&engine, &[row]);
-        let result = convert(&engine, input.as_ref(), 0, kind);
+        let result = convert(&engine, input.as_ref(), 0);
         match expected {
             Ok(()) => {
                 result.expect("row with only unused fields null should be accepted");
@@ -620,12 +605,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::root(ManifestKind::Root)]
-    #[case::leaf(ManifestKind::Leaf)]
-    fn write_metadata_output_schema_matches_entry_schema(#[case] kind: ManifestKind) {
+    #[case::root(ROOT_PATH)]
+    #[case::leaf(LEAF_PATH)]
+    fn write_metadata_output_schema_matches_entry_schema(#[case] entry_path: EntryPath) {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[("a.parquet", 1, 1, 0, 0)]);
-        let out = all_selected_data(convert(&engine, input.as_ref(), 0, kind).unwrap())
+        let out = all_selected_data((entry_path.convert)(&engine, input.as_ref(), 0).unwrap())
             .try_into_record_batch()
             .unwrap();
 
@@ -636,14 +621,50 @@ mod tests {
     }
 
     #[rstest]
-    #[case::root(ManifestKind::Root)]
-    #[case::leaf(ManifestKind::Leaf)]
+    #[case::root(ROOT_PATH)]
+    #[case::leaf(LEAF_PATH)]
     fn convert_append_metadata_to_entry_batch_empty_input_yields_empty_batch(
-        #[case] kind: ManifestKind,
+        #[case] entry_path: EntryPath,
     ) {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[]);
-        let out = all_selected_data(convert(&engine, input.as_ref(), 0, kind).unwrap());
+        let out = all_selected_data((entry_path.convert)(&engine, input.as_ref(), 0).unwrap());
         assert_eq!(out.len(), 0);
+    }
+
+    /// Guards [`WRITE_METADATA_INPUT_SCHEMA`] against silent drift from the canonical add-file
+    /// write-metadata schema: it must equal `BASE_ADD_FILES_SCHEMA` extended with the row-tracking
+    /// columns, projected to the columns this path reads, with `stats` narrowed to `numRecords`. If
+    /// that schema changes a field's identity, type, or nullability, this fails and the literal
+    /// must be updated to match.
+    #[test]
+    fn write_metadata_input_schema_matches_add_file_projection() -> DeltaResult<()> {
+        let augmented = SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG))
+            .append(StructField::nullable(
+                DEFAULT_ROW_COMMIT_VERSION_NAME,
+                DataType::LONG,
+            ))
+            .build(&BASE_ADD_FILES_SCHEMA)?;
+        let projected = augmented.project(&[
+            PATH_NAME,
+            SIZE_NAME,
+            STATS_NAME,
+            BASE_ROW_ID_NAME,
+            DEFAULT_ROW_COMMIT_VERSION_NAME,
+        ])?;
+        let narrowed_stats = match projected.field(STATS_NAME).map(StructField::data_type) {
+            Some(DataType::Struct(stats)) => stats.project_as_struct(&[NUM_RECORDS])?,
+            _ => panic!("add-file write-metadata schema is missing the `stats` struct"),
+        };
+        let derived = SchemaStructPatchBuilder::new()
+            .replace(
+                STATS_NAME,
+                StructField::nullable(STATS_NAME, narrowed_stats),
+            )
+            .build(&projected)?;
+
+        assert_eq!(*WRITE_METADATA_INPUT_SCHEMA, Arc::new(derived));
+        Ok(())
     }
 }
