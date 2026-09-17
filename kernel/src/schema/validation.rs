@@ -369,7 +369,7 @@ mod tests {
     #[rstest]
     #[case::cdf_enabled(true, Some("reserved for Change Data Feed"))]
     #[case::cdf_disabled(false, None)]
-    fn reserved_cdf_column_names_accepted_or_rejected(
+    fn reserved_cdf_column_names_rejected_when_cdf_enabled(
         #[case] cdf_enabled: bool,
         #[case] expected_error: Option<&str>,
         #[values(
