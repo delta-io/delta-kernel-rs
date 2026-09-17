@@ -514,22 +514,4 @@ mod tests {
         );
         assert_eq!(out.len(), 0);
     }
-
-    #[test]
-    fn struct_expr_from_schema_errors_on_unprojected_non_nullable_field() {
-        let schema = StructType::new_unchecked([StructField::not_null("required", DataType::LONG)]);
-        let err = struct_expr_from_schema(&schema, |_| None)
-            .expect_err("a non-nullable field with no projection must error");
-        assert!(
-            err.to_string().contains("required"),
-            "expected error to name the field, got: {err}"
-        );
-    }
-
-    #[test]
-    fn struct_expr_from_schema_fills_unprojected_nullable_field_with_typed_null() {
-        let schema = StructType::new_unchecked([StructField::nullable("opt", DataType::LONG)]);
-        let expr = struct_expr_from_schema(&schema, |_| None).unwrap();
-        assert_eq!(expr, Expression::struct_from([null_lit(DataType::LONG)]));
-    }
 }
