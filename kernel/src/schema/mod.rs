@@ -280,6 +280,15 @@ pub enum ColumnMetadataKey {
     IdentityStep,
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
+    /// CIC (Concurrent Identity Columns) sequence ID for the column. The presence of this
+    /// key on a field marks it as a CIC identity column.
+    IdentityCicSequenceId,
+    /// CIC start value.
+    IdentityCicStart,
+    /// CIC step value.
+    IdentityCicStep,
+    /// CIC allowExplicitInsert flag.
+    IdentityCicAllowExplicitInsert,
     InternalColumn,
     Invariants,
     MetadataSpec,
@@ -307,6 +316,10 @@ impl AsRef<str> for ColumnMetadataKey {
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
             Self::IdentityStep => "delta.identity.step",
+            Self::IdentityCicSequenceId => "delta.identity.v2.sequenceId",
+            Self::IdentityCicStart => "delta.identity.v2.start",
+            Self::IdentityCicStep => "delta.identity.v2.step",
+            Self::IdentityCicAllowExplicitInsert => "delta.identity.v2.allowExplicitInsert",
             Self::InternalColumn => "delta.isInternalColumn",
             Self::Invariants => "delta.invariants",
             Self::MetadataSpec => "delta.metadataSpec",

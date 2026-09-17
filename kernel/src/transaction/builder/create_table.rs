@@ -20,8 +20,8 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
-    StructType,
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, ColumnMetadataKey,
+    DataType, SchemaRef, StructType,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -411,6 +411,74 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
             &mut validated.writer_features,
         );
     }
+}
+
+/// Detects Concurrent Identity Columns (CIC) in the schema and, if any are present,
+/// validates them and adds the `identityColumnsCic` writer feature.
+///
+/// Validation:
+/// - Each identity column must carry all three CIC metadata keys (enforced by
+///   [`detect_identity_columns`], which surfaces missing-key errors).
+/// - Each identity column must be of type `LONG`.
+/// - Step must be non-zero. A zero step would produce reservations with `count() == 0`, which would
+///   silently fail every subsequent write.
+/// - The column must NOT also carry legacy `delta.identity.{start,step,highWaterMark}` metadata.
+///
+/// Engines are expected to call create on the sequence service the commit to actually create the
+/// sequences on the service. See [`cic_column`] for more details.
+/// [`detect_identity_columns`]: crate::identity_columns::detect_identity_columns
+/// [`cic_column`]: crate::identity_columns::cic_column
+fn maybe_enable_identity_columns_cic(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<()> {
+    let identity_cols = crate::identity_columns::detect_identity_columns(schema)?;
+    if identity_cols.is_empty() {
+        return Ok(());
+    }
+    const LEGACY_KEYS: &[ColumnMetadataKey] = &[
+        ColumnMetadataKey::IdentityStart,
+        ColumnMetadataKey::IdentityStep,
+        ColumnMetadataKey::IdentityHighWaterMark,
+    ];
+    for info in &identity_cols {
+        // Already found by `detect_identity_columns`.
+        let field = schema.field(&info.column_name).ok_or_else(|| {
+            Error::generic(format!(
+                "Identity column '{}' detected but not found in schema",
+                info.column_name
+            ))
+        })?;
+        if field.data_type() != &DataType::LONG {
+            return Err(Error::generic(format!(
+                "Identity column '{}' must be of type LONG, got {}",
+                info.column_name,
+                field.data_type()
+            )));
+        }
+        if info.step == 0 {
+            return Err(Error::generic(format!(
+                "Identity column '{}' has step 0, which is not allowed",
+                info.column_name,
+            )));
+        }
+        for legacy in LEGACY_KEYS {
+            if field.get_config_value(legacy).is_some() {
+                return Err(Error::generic(format!(
+                    "Identity column '{}' carries both CIC metadata and legacy '{}'. \
+                     These two cannot be mixed.",
+                    info.column_name,
+                    legacy.as_ref(),
+                )));
+            }
+        }
+    }
+    add_feature_to_lists(
+        TableFeature::IdentityColumnsCic,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
+    Ok(())
 }
 
 /// Auto-enables allowed property-driven features from the table properties (see
@@ -941,6 +1009,7 @@ impl CreateTableTransactionBuilder {
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
+        maybe_enable_identity_columns_cic(&effective_schema, &mut validated)?;
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
@@ -998,9 +1067,11 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_name, ColumnName};
+    use crate::identity_columns::cic_column;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
         schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
+        StructType,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1566,6 +1637,141 @@ mod tests {
         assert!(validated
             .writer_features
             .contains(&TableFeature::VariantShredding));
+    }
+
+    #[test]
+    fn identity_columns_cic_auto_enabled_when_schema_has_cic_column() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            cic_column("id", "seq-abc", 1, 1),
+            StructField::new("name", DataType::STRING, true),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap();
+
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::IdentityColumnsCic));
+        assert!(
+            validated.reader_features.is_empty(),
+            "identityColumnsCic is writer-only, reader_features should be empty"
+        );
+    }
+
+    #[test]
+    fn identity_columns_cic_not_enabled_when_schema_has_no_cic_column() {
+        let schema = test_schema();
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap();
+
+        assert!(!validated
+            .writer_features
+            .contains(&TableFeature::IdentityColumnsCic));
+    }
+
+    #[test]
+    fn identity_columns_cic_rejects_non_long_type() {
+        // Hand-crafted field with CIC metadata but an INTEGER type.
+        let bad_field = StructField::new("id", DataType::INTEGER, false).with_metadata(vec![
+            (
+                ColumnMetadataKey::IdentityCicSequenceId
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::String("seq-abc".to_string()),
+            ),
+            (
+                ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+                MetadataValue::Number(1),
+            ),
+        ]);
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            bad_field,
+            // Include a valid CIC column too.
+            cic_column("ok", "seq-def", 0, 1),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        let err = maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap_err();
+        assert!(
+            err.to_string().contains("must be of type LONG"),
+            "unexpected error: {err}"
+        );
+        // And the feature should NOT have been added on the failure path.
+        assert!(!validated
+            .writer_features
+            .contains(&TableFeature::IdentityColumnsCic));
+    }
+
+    #[test]
+    fn identity_columns_cic_rejects_step_zero() {
+        let schema = Arc::new(StructType::new_unchecked(vec![cic_column(
+            "id", "seq-abc", 1, 0,
+        )]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+        let err = maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap_err();
+        assert!(err.to_string().contains("step 0"), "unexpected: {err}");
+        assert!(!validated
+            .writer_features
+            .contains(&TableFeature::IdentityColumnsCic));
+    }
+
+    #[rstest::rstest]
+    #[case::legacy_start(ColumnMetadataKey::IdentityStart, MetadataValue::Number(1))]
+    #[case::legacy_step(ColumnMetadataKey::IdentityStep, MetadataValue::Number(1))]
+    #[case::legacy_hwm(ColumnMetadataKey::IdentityHighWaterMark, MetadataValue::Number(0))]
+    fn identity_columns_cic_rejects_mixing_legacy_metadata(
+        #[case] legacy_key: ColumnMetadataKey,
+        #[case] legacy_value: MetadataValue,
+    ) {
+        let field = cic_column("id", "seq-abc", 1, 1)
+            .add_metadata(vec![(legacy_key.as_ref().to_string(), legacy_value)]);
+        let schema = Arc::new(StructType::new_unchecked(vec![field]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+        let err = maybe_enable_identity_columns_cic(&schema, &mut validated).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot be mixed"), "{msg}");
+        assert!(msg.contains(legacy_key.as_ref()), "{msg}");
+        assert!(!validated
+            .writer_features
+            .contains(&TableFeature::IdentityColumnsCic));
+    }
+
+    #[test]
+    fn identity_columns_cic_feature_signal_is_rejected() {
+        // CIC must be auto-enabled by schema metadata only.
+        let properties = HashMap::from([(
+            "delta.feature.identityColumnsCic".to_string(),
+            "supported".to_string(),
+        )]);
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Enabling feature 'identityColumnsCic'",
+        );
     }
 
     fn multi_column_schema() -> SchemaRef {
