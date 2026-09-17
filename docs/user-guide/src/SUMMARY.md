@@ -30,6 +30,7 @@
 
 - [Creating a Table](./writing/create_table.md)
 - [Appending Data](./writing/append.md)
+- [Column Defaults](./writing/column_defaults.md)
 - [Writing to Partitioned Tables](./writing/partitioned_writes.md)
 - [Removing Data](./writing/removing_files.md)
 - [Domain Metadata](./writing/domain_metadata.md)
