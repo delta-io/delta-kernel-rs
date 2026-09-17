@@ -370,11 +370,13 @@ pub enum IsolationLevel {
     SnapshotIsolation,
 }
 
-/// Compression codec to use when writing Parquet files.
+/// Compression codec an engine's Parquet writer emits, carried by [`ParquetWriterConfig`].
 ///
-/// String parsing is case-insensitive. Only `snappy`, `zstd`, and `uncompressed` are
-/// supported. Unrecognized values are ignored and [`TableProperties::parquet_compression`]
-/// is left unset.
+/// This is the engine-writer view of compression: only the codecs a writer is expected to emit
+/// (`snappy`, `zstd`, `uncompressed`) are represented. It is distinct from the protocol-level
+/// [`ParquetCompressionCodec`] parsed from the `delta.parquet.compression.codec` table property;
+/// [`TableProperties::parquet_writer_config`] maps the latter onto this enum. String parsing is
+/// case-insensitive.
 #[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {
