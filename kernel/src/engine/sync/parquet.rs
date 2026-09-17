@@ -47,6 +47,9 @@ impl From<ParquetCompression> for Compression {
             ParquetCompression::Snappy => Compression::SNAPPY,
             ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
             ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
+            ParquetCompression::Gzip => Compression::GZIP(Default::default()),
+            ParquetCompression::Lz4 => Compression::LZ4,
+            ParquetCompression::Lz4Raw => Compression::LZ4_RAW,
         }
     }
 }

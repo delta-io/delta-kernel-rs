@@ -50,6 +50,9 @@ fn parquet_compression_from(c: ParquetCompression) -> Compression {
         ParquetCompression::Snappy => Compression::SNAPPY,
         ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
         ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
+        ParquetCompression::Gzip => Compression::GZIP(Default::default()),
+        ParquetCompression::Lz4 => Compression::LZ4,
+        ParquetCompression::Lz4Raw => Compression::LZ4_RAW,
     }
 }
 
@@ -1087,6 +1090,9 @@ mod tests {
     #[case(ParquetCompression::Snappy)]
     #[case(ParquetCompression::Zstd)]
     #[case(ParquetCompression::Uncompressed)]
+    #[case(ParquetCompression::Gzip)]
+    #[case(ParquetCompression::Lz4)]
+    #[case(ParquetCompression::Lz4Raw)]
     #[tokio::test]
     async fn test_write_parquet_compression(#[case] kernel_compression: ParquetCompression) {
         let store = Arc::new(InMemory::new());

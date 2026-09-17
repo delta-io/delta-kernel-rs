@@ -260,26 +260,16 @@ impl TableProperties {
 
     /// Returns the [`ParquetWriterConfig`] derived from table properties.
     ///
-    /// This maps the protocol-level [`ParquetCompressionCodec`] parsed from
-    /// `delta.parquet.compression.codec` onto the codecs the default engine's Parquet writer can
-    /// emit. Codecs the writer does not support (`Gzip`, `Lz4`, `Lz4Raw`) fall back to
-    /// [`ParquetCompression::Zstd`], as does an absent property. The parsed
-    /// [`ParquetCompressionCodec`] itself is preserved in full fidelity on
-    /// [`TableProperties::parquet_compression_codec`] for connectors that can honor those codecs.
+    /// Maps the protocol-level [`ParquetCompressionCodec`] parsed from
+    /// `delta.parquet.compression.codec` onto the engine-writer [`ParquetCompression`], defaulting
+    /// to [`ParquetCompressionCodec::Zstd`] when the property is absent (or unrecognized, in which
+    /// case it is preserved on [`TableProperties::unknown_properties`]).
     ///
     /// Connectors and engines should apply this config when writing Parquet data files so that
     /// writes respect the table's configured compression.
     pub fn parquet_writer_config(&self) -> ParquetWriterConfig {
         ParquetWriterConfig {
-            compression: match self
-                .parquet_compression_codec
-                .unwrap_or(ParquetCompressionCodec::Zstd)
-            {
-                ParquetCompressionCodec::Snappy => ParquetCompression::Snappy,
-                ParquetCompressionCodec::Zstd => ParquetCompression::Zstd,
-                ParquetCompressionCodec::Uncompressed => ParquetCompression::Uncompressed,
-                _ => ParquetCompression::Zstd,
-            },
+            compression: self.compression_codec_or_default().into(),
         }
     }
 
@@ -372,13 +362,11 @@ pub enum IsolationLevel {
 
 /// Compression codec an engine's Parquet writer emits, carried by [`ParquetWriterConfig`].
 ///
-/// This is the engine-writer view of compression: only the codecs a writer is expected to emit
-/// (`snappy`, `zstd`, `uncompressed`) are represented. It is distinct from the protocol-level
-/// [`ParquetCompressionCodec`] parsed from the `delta.parquet.compression.codec` table property;
-/// [`TableProperties::parquet_writer_config`] maps the latter onto this enum. String parsing is
-/// case-insensitive.
-#[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
-#[strum(ascii_case_insensitive)]
+/// This is the engine-writer view of compression, with one variant per codec the writer can emit.
+/// It is produced from the protocol-level [`ParquetCompressionCodec`] parsed from the
+/// `delta.parquet.compression.codec` table property (via the `From<ParquetCompressionCodec>`
+/// conversion) and carried to the engine by [`TableProperties::parquet_writer_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParquetCompression {
     /// Snappy compression.
     Snappy,
@@ -387,6 +375,25 @@ pub enum ParquetCompression {
     Zstd,
     /// No compression.
     Uncompressed,
+    /// gzip compression.
+    Gzip,
+    /// LZ4 compression (deprecated Hadoop framing).
+    Lz4,
+    /// LZ4 raw (block) compression.
+    Lz4Raw,
+}
+
+impl From<ParquetCompressionCodec> for ParquetCompression {
+    fn from(codec: ParquetCompressionCodec) -> Self {
+        match codec {
+            ParquetCompressionCodec::Snappy => ParquetCompression::Snappy,
+            ParquetCompressionCodec::Zstd => ParquetCompression::Zstd,
+            ParquetCompressionCodec::Uncompressed => ParquetCompression::Uncompressed,
+            ParquetCompressionCodec::Gzip => ParquetCompression::Gzip,
+            ParquetCompressionCodec::Lz4 => ParquetCompression::Lz4,
+            ParquetCompressionCodec::Lz4Raw => ParquetCompression::Lz4Raw,
+        }
+    }
 }
 
 /// Configuration for writing Parquet files.
@@ -725,7 +732,11 @@ mod tests {
     #[case(Some("Zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
     #[case(Some("uncompressed"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
     #[case(Some("UNCOMPRESSED"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
-    // Unrecognized codec falls back to the default
+    #[case(Some("none"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
+    #[case(Some("gzip"), ParquetWriterConfig { compression: ParquetCompression::Gzip })]
+    #[case(Some("lz4"), ParquetWriterConfig { compression: ParquetCompression::Lz4 })]
+    #[case(Some("lz4_raw"), ParquetWriterConfig { compression: ParquetCompression::Lz4Raw })]
+    // Unrecognized codec falls back to the default (reads stay lenient per the Delta protocol)
     #[case(Some("not_a_codec"), ParquetWriterConfig::default())]
     fn test_parquet_writer_config(
         #[case] codec: Option<&str>,

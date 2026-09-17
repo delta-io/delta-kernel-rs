@@ -28,7 +28,7 @@ use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
-    delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig},
+    delta_kernel::table_properties::{ParquetCompressionCodec, ParquetWriterConfig},
     delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
     std::collections::HashMap,
     std::num::NonZero,
@@ -931,7 +931,8 @@ fn set_builder_rest_object_store_impl(
 
 /// Set the Parquet compression codec on the builder.
 ///
-/// Accepted codec names (case-insensitive): `"snappy"`, `"zstd"`, `"uncompressed"`.
+/// Accepted codec names (case-insensitive): `"uncompressed"`/`"none"`, `"snappy"`, `"gzip"`,
+/// `"lz4"`, `"lz4_raw"`, `"zstd"`.
 ///
 /// Returns an error (naming the rejected value) if `codec` is not valid UTF-8 or is not one of the
 /// accepted names; on error the builder's existing configuration is left unchanged.
@@ -956,10 +957,12 @@ unsafe fn set_builder_parquet_compression_impl(
     codec: KernelStringSlice,
 ) -> DeltaResult<bool> {
     let codec = unsafe { String::try_from_slice(&codec) }?;
-    let compression = ParquetCompression::try_from(codec.as_str()).map_err(|_| {
+    let compression = ParquetCompressionCodec::try_from(codec.as_str()).map_err(|_| {
         delta_kernel::Error::generic(format!("unsupported parquet compression codec: {codec}"))
     })?;
-    builder.parquet_writer_config = ParquetWriterConfig { compression };
+    builder.parquet_writer_config = ParquetWriterConfig {
+        compression: compression.into(),
+    };
     Ok(true)
 }
 
@@ -3310,7 +3313,13 @@ mod tests {
     #[case("SNAPPY", ParquetCompression::Snappy)]
     #[case("uncompressed", ParquetCompression::Uncompressed)]
     #[case("UNCOMPRESSED", ParquetCompression::Uncompressed)]
+    #[case("none", ParquetCompression::Uncompressed)]
     #[case("zstd", ParquetCompression::Zstd)]
+    #[case("gzip", ParquetCompression::Gzip)]
+    #[case("GZIP", ParquetCompression::Gzip)]
+    #[case("lz4", ParquetCompression::Lz4)]
+    #[case("lz4_raw", ParquetCompression::Lz4Raw)]
+    #[case("LZ4_RAW", ParquetCompression::Lz4Raw)]
     fn test_set_builder_parquet_valid_codec(
         #[case] codec: &str,
         #[case] expected: ParquetCompression,
@@ -3335,7 +3344,7 @@ mod tests {
                 compression: expected
             }
         );
-        unsafe { drop(Box::from_raw(builder_ptr)) };
+        let _ = unsafe { Box::from_raw(builder_ptr) }; // reclaim to free
     }
 
     // Test that set_builder_parquet_compression rejects an unrecognized codec string with an error
@@ -3362,7 +3371,7 @@ mod tests {
             },
             "rejected codec should leave config unchanged"
         );
-        unsafe { drop(Box::from_raw(builder_ptr)) };
+        let _ = unsafe { Box::from_raw(builder_ptr) }; // reclaim to free
     }
 
     #[tokio::test]
