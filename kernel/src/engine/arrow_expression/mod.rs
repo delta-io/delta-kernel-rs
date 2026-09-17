@@ -20,6 +20,7 @@ use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluat
 
 pub mod evaluate_expression;
 pub mod opaque;
+mod timestamp_timezone;
 
 #[cfg(test)]
 mod tests;
@@ -184,7 +185,10 @@ impl Scalar {
             DataType::Primitive(PrimitiveType::Decimal(_)) => {
                 append_nulls_as!(array::Decimal128Builder)
             }
-            DataType::Struct(ref stype) => {
+            // A variant is physically a struct (`metadata`/`value`, plus any shredded fields), so a
+            // null variant is a null struct and builds through the same StructBuilder path. (Only
+            // the null case is reachable: there is no non-null `Scalar::Variant`.)
+            DataType::Struct(ref stype) | DataType::Variant(ref stype) => {
                 // WARNING: Unlike ArrayBuilder and MapBuilder, StructBuilder always requires us to
                 // insert an entry for each child builder, even when we're inserting NULL.
                 let builder = builder_as!(array::StructBuilder);
@@ -210,11 +214,6 @@ impl Scalar {
                 }
             }
             DataType::VOID => append_nulls_as!(array::NullBuilder),
-            DataType::Variant(_) => {
-                return Err(Error::unsupported(
-                    "Variant is not supported as scalar yet.",
-                ));
-            }
             // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
             DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
             DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
@@ -388,7 +387,6 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }
-
 /// Validates that each expected field exists and has a compatible type at top-level.
 fn validate_data_schema_top_level(
     expected_schema: &SchemaRef,
@@ -509,4 +507,10 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
         (PrimitiveType::IntervalDayTime, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
         _ => false,
     }
+}
+#[cfg(test)]
+fn expected_timestamp_micros(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_micros()
 }

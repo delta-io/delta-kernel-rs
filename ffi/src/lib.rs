@@ -53,7 +53,10 @@ pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
 mod domain_metadata;
-pub use domain_metadata::get_domain_metadata;
+pub use domain_metadata::{
+    get_domain_metadata, snapshot_row_tracking_high_water_mark,
+    ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+};
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -1335,7 +1338,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         snapshot_hint: Option<Box<SnapshotHint>>,
         apply_snapshot_hint: impl FnOnce(
             delta_kernel::snapshot::SnapshotBuilder<Mode>,
-            SnapshotHint,
+            Box<SnapshotHint>,
         )
             -> DeltaResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
     ) -> DeltaResult<SnapshotRef> {
@@ -1349,7 +1352,7 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
             builder = builder.with_max_catalog_version(max_catalog_version);
         }
         if let Some(snapshot_hint) = snapshot_hint {
-            builder = apply_snapshot_hint(builder, *snapshot_hint)?;
+            builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
         builder.build(engine)
     }
@@ -1924,9 +1927,8 @@ pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
     metadata.drop_handle();
 }
 
-/// Visit all fields of the metadata in a single FFI call. String fields are passed as
-/// [`KernelStringSlice`] references that borrow from the metadata handle -- they are only valid
-/// for the duration of the callback.
+/// Visit all fields of the metadata in a single FFI call. String fields borrow from the metadata
+/// handle and are only valid for the duration of the callback.
 ///
 /// The visitor receives:
 /// - `id`: always present
@@ -1938,8 +1940,8 @@ pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
 ///
 /// # Safety
 /// Caller is responsible for providing a valid metadata handle, a valid `context` pointer, and
-/// a valid `visit_metadata_fields` function pointer. String slices must not be retained past
-/// the callback return.
+/// a valid `visit_metadata_fields` function pointer. String slices must not be retained past the
+/// callback return.
 #[no_mangle]
 pub unsafe extern "C" fn visit_metadata(
     metadata: Handle<SharedMetadata>,
@@ -1977,6 +1979,34 @@ pub unsafe extern "C" fn visit_metadata(
         has_created_time,
         created_time_ms,
     );
+}
+
+/// Visit each format option in the metadata by invoking `visitor` once per key/value pair.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid metadata handle, a valid `engine_context` as an
+/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+/// This function borrows the metadata handle, so the caller remains responsible for releasing it
+/// with [`free_metadata`]. String slices must not be retained past the callback return.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_format_options(
+    metadata: Handle<SharedMetadata>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    let metadata = unsafe { metadata.as_ref() };
+    metadata.format_options().iter().for_each(|(key, value)| {
+        visitor(
+            engine_context,
+            kernel_string_slice!(key),
+            kernel_string_slice!(value),
+        );
+    });
 }
 
 // === Snapshot-level computed property FFI ===
@@ -2336,6 +2366,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_snapshot_row_tracking_high_water_mark_present() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::Some(9),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_row_tracking_high_water_mark_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::None,
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_snapshot_file_stats_absent_without_crc() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -2688,6 +2766,29 @@ mod tests {
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(
+        METADATA_WITH_FORMAT_OPTIONS,
+        HashMap::from([
+            (String::from("compression"), String::from("zstd")),
+            (String::from("custom.option"), String::from("arbitrary value")),
+        ])
+    )]
+    #[case(METADATA, HashMap::new())]
+    #[tokio::test]
+    async fn test_visit_metadata_format_options(
+        #[case] metadata: &str,
+        #[case] expected: HashMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
+
+        assert_eq!(collect_metadata_format_options(&snap), expected);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
         Ok(())
     }
 
@@ -3572,6 +3673,20 @@ mod tests {
 
     // === Shared visitor state and callbacks for protocol/metadata tests ===
 
+    const METADATA_WITH_FORMAT_OPTIONS: &str = concat!(
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","#,
+        r#""operationParameters":{},"isBlindAppend":true}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        "\n",
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","#,
+        r#""name":"my_table","description":"A test table","#,
+        r#""format":{"provider":"parquet","options":{"compression":"zstd","#,
+        r#""custom.option":"arbitrary value"}},"#,
+        r#""schemaString":"{\"type\":\"struct\",\"fields\":[]}","#,
+        r#""partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
+    );
+
     struct ProtocolVisitState {
         min_reader: i32,
         min_writer: i32,
@@ -3678,6 +3793,15 @@ mod tests {
         state.created_time_ms = created_time_ms;
     }
 
+    extern "C" fn metadata_format_option_cb(
+        ctx: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ) {
+        let options = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut HashMap<String, String>) };
+        options.insert(slice_to_string(key), slice_to_string(value));
+    }
+
     /// Visit metadata on a snapshot and return the collected state.
     fn collect_metadata_state(snap: &handle::Handle<SharedSnapshot>) -> MetadataVisitState {
         let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
@@ -3686,6 +3810,19 @@ mod tests {
         unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
         unsafe { free_metadata(meta) };
         state
+    }
+
+    fn collect_metadata_format_options(
+        snap: &handle::Handle<SharedSnapshot>,
+    ) -> HashMap<String, String> {
+        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
+        let mut options = HashMap::new();
+        let ctx = NonNull::new(&mut options as *mut HashMap<String, String> as *mut c_void);
+        unsafe {
+            visit_metadata_format_options(meta.shallow_copy(), ctx, metadata_format_option_cb)
+        };
+        unsafe { free_metadata(meta) };
+        options
     }
 
     // === visit_protocol tests ===
@@ -3818,14 +3955,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_visit_metadata_with_description() -> Result<(), Box<dyn std::error::Error>> {
-        let metadata_with_desc = concat!(
-            r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
-            "\n",
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            "\n",
-            r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","name":"my_table","description":"A test table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
-        );
-        let (engine, snap) = setup_snapshot(metadata_with_desc.to_string()).await?;
+        let (engine, snap) = setup_snapshot(METADATA_WITH_FORMAT_OPTIONS.to_string()).await?;
         let state = collect_metadata_state(&snap);
 
         assert_eq!(state.name.as_deref(), Some("my_table"));

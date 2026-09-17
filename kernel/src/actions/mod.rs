@@ -459,6 +459,13 @@ impl Metadata {
         &self.format.provider
     }
 
+    /// Returns the arbitrary format-specific options stored in this metadata action.
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn format_options(&self) -> &HashMap<String, String> {
+        &self.format.options
+    }
+
     #[internal_api]
     pub(crate) fn schema_string(&self) -> &String {
         &self.schema_string
