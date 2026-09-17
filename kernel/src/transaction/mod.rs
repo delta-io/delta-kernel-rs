@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::BackReference;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
@@ -19,6 +21,8 @@ use crate::committer::{
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::null_lit;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     col, column_name, lit, null_lit, ArrayData, ColumnName, ExpressionStructPatch,
@@ -37,6 +41,8 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::validate_schema_for_write;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::ToSchema;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
@@ -1664,6 +1670,13 @@ fn build_remove_struct_patch(
         .drop("modificationTime")
         // Added to scan output when the predicate touches a partition column.
         .drop_if_exists(PARTITION_VALUES_PARSED_NAME);
+
+    // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null to
+    // keep the produced struct aligned with the `backReference` field of LOG_REMOVE_SCHEMA.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    {
+        patch = patch.append(null_lit(BackReference::to_schema()));
+    }
 
     for column_to_drop in columns_to_drop {
         patch = patch.drop(*column_to_drop);

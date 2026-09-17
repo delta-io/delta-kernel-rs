@@ -568,6 +568,10 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
             // row_tracking tests cover having these populated.
             assert!(remove.get("baseRowId").is_none());
             assert!(remove.get("defaultRowCommitVersion").is_none());
+
+            // Kernel never populates adaptive-metadata-tree back references on writes, so a
+            // classic remove must emit the field as null (omitted from the JSON commit).
+            assert!(remove.get("backReference").is_none());
         }
         _ => panic!("Transaction should be committed"),
     }
