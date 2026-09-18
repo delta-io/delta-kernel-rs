@@ -32,6 +32,7 @@ use crate::schema::{
     StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::transaction::data_layout::DataLayout;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
@@ -39,6 +40,32 @@ use crate::{
 
 fn field_names(s: &StructArray) -> Vec<String> {
     s.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+fn stats_struct_field<'a>(schema: &'a StructType, name: &str) -> &'a StructType {
+    let DataType::Struct(inner) = schema
+        .field(name)
+        .unwrap_or_else(|| panic!("stats schema should have {name}"))
+        .data_type()
+    else {
+        panic!("{name} should be a struct");
+    };
+    inner
+}
+
+fn assert_stats_schemas_aligned(logical: &StructType, physical: &StructType) {
+    assert_eq!(logical.num_fields(), physical.num_fields());
+    for (logical_field, physical_field) in logical.fields().zip(physical.fields()) {
+        assert_eq!(logical_field.is_nullable(), physical_field.is_nullable());
+        assert!(logical_field.metadata().is_empty());
+        assert!(physical_field.metadata().is_empty());
+        match (logical_field.data_type(), physical_field.data_type()) {
+            (DataType::Struct(logical), DataType::Struct(physical)) => {
+                assert_stats_schemas_aligned(logical, physical);
+            }
+            (logical, physical) => assert_eq!(logical, physical),
+        }
+    }
 }
 
 #[test]
@@ -2268,6 +2295,169 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
         "unresolvable extra_indexed column should be dropped, not error: {:?}",
         result.err()
     );
+}
+
+#[rstest]
+#[case::no_column_mapping(None)]
+#[case::name_column_mapping(Some("name"))]
+#[case::id_column_mapping(Some("id"))]
+fn snapshot_expected_stats_schemas_match_scan_output(#[case] column_mapping_mode: Option<&str>) {
+    let table_root = "memory:///expected-stats-schemas/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": LONG,
+        nullable "other": LONG,
+    };
+    let mut create_builder = create_table(table_root, schema, "DefaultEngine")
+        .with_table_properties([("delta.dataSkippingNumIndexedCols", "1")]);
+    if let Some(mode) = column_mapping_mode {
+        create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    create_builder
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let extra_indexed_columns = vec![column_name!("value"), column_name!("unresolvable_extra")];
+    let expected = snapshot
+        .expected_stats_schemas(&extra_indexed_columns)
+        .unwrap()
+        .expect("stats should include indexed data columns");
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(
+            extra_indexed_columns,
+        ))
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        scan.physical_stats_output_schema.as_ref(),
+        Some(&expected.physical)
+    );
+
+    assert_stats_schemas_aligned(&expected.logical, &expected.physical);
+
+    let logical_min_values = stats_struct_field(&expected.logical, MIN_VALUES);
+    assert!(logical_min_values.field("id").is_some());
+    assert!(logical_min_values.field("value").is_some());
+    assert!(logical_min_values.field("other").is_none());
+    assert!(logical_min_values.field("unresolvable_extra").is_none());
+
+    let physical_min_values = stats_struct_field(&expected.physical, MIN_VALUES);
+    assert_eq!(physical_min_values.num_fields(), 2);
+    if column_mapping_mode.is_some() {
+        assert!(logical_min_values.fields().all(|field| {
+            field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_none()
+                && field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .is_none()
+        }));
+        assert!(physical_min_values.fields().all(|field| {
+            field.name().starts_with("col-")
+                && field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .is_none()
+        }));
+    } else {
+        assert_eq!(physical_min_values, logical_min_values);
+    }
+}
+
+#[test]
+fn snapshot_expected_stats_schemas_returns_none_without_data_columns() {
+    let table_root = "memory:///expected-stats-schemas-empty/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    create_table(
+        table_root,
+        schema_ref! { nullable "id": LONG },
+        "DefaultEngine",
+    )
+    .with_table_properties([("delta.dataSkippingNumIndexedCols", "0")])
+    .build(&engine, Box::new(FileSystemCommitter::new()))
+    .unwrap()
+    .commit(&engine)
+    .unwrap()
+    .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert!(snapshot.expected_stats_schemas(&[]).unwrap().is_none());
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+    assert!(scan.physical_stats_output_schema.is_none());
+}
+
+#[rstest]
+#[case::no_column_mapping(None)]
+#[case::name_column_mapping(Some("name"))]
+#[case::id_column_mapping(Some("id"))]
+fn snapshot_expected_stats_schemas_respect_explicit_columns_and_partitions(
+    #[case] column_mapping_mode: Option<&str>,
+) {
+    let table_root = "memory:///expected-stats-schemas-explicit/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "info": {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+        },
+        nullable "part": STRING,
+        nullable "other": LONG,
+    };
+    let mut create_builder = create_table(table_root, schema, "DefaultEngine")
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .with_table_properties([("delta.dataSkippingStatsColumns", "info.name")]);
+    if let Some(mode) = column_mapping_mode {
+        create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    create_builder
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let extra_indexed_columns = vec![column_name!("other")];
+    let expected = snapshot
+        .expected_stats_schemas(&extra_indexed_columns)
+        .unwrap()
+        .expect("explicit and extra stats columns should be selected");
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(
+            extra_indexed_columns,
+        ))
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        scan.physical_stats_output_schema.as_ref(),
+        Some(&expected.physical)
+    );
+    assert_stats_schemas_aligned(&expected.logical, &expected.physical);
+
+    let null_count = stats_struct_field(&expected.logical, NULL_COUNT);
+    assert!(null_count.field("id").is_none());
+    assert!(null_count.field("part").is_none());
+    assert!(null_count.field("other").is_some());
+    let info = stats_struct_field(null_count, "info");
+    assert!(info.field("name").is_some());
+    assert!(info.field("age").is_none());
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.

@@ -737,9 +737,8 @@ impl CheckpointWriter {
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
-        let stats_schema = tc
-            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
-            .physical;
+        let stats_schema =
+            tc.build_expected_physical_stats_schema(physical_clustering_columns.as_deref(), None)?;
 
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
         let partition_schema = tc.build_partition_values_parsed_schema();

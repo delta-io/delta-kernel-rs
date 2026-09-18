@@ -172,11 +172,11 @@ fn build_data_skipping_schemas(
         resolve_physical_columns(table_configuration, predicate_column_names_logical);
 
     // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
-    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
+    // `build_expected_physical_stats_schema` always emits) has nothing to prune by. Return `None`
     // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
     // per-column stats wrapper, so its presence is the signal that at least one data
     // column survived. The Delta protocol allows `minValues` / `maxValues` without
-    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
+    // `nullCount`, but `build_expected_physical_stats_schema` always emits `nullCount` whenever it
     // emits min/max; this check relies on that implementation property.
     let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
         stats_schema
@@ -188,8 +188,7 @@ fn build_data_skipping_schemas(
     let stats_schema = match (struct_stats, physical_predicate) {
         (StructStats::AllIndexed { .. }, _) => with_data_cols(
             table_configuration
-                .build_expected_stats_schemas(requested_physical_stats_columns, None)?
-                .physical,
+                .build_expected_physical_stats_schema(requested_physical_stats_columns, None)?,
         ),
         // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
         // the schema so kernel can still prune.
@@ -198,18 +197,16 @@ fn build_data_skipping_schemas(
                 .unwrap_or_default()
                 .to_vec();
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
-            with_data_cols(
-                table_configuration
-                    .build_expected_stats_schemas(requested_physical_stats_columns, Some(&filter))?
-                    .physical,
-            )
+            with_data_cols(table_configuration.build_expected_physical_stats_schema(
+                requested_physical_stats_columns,
+                Some(&filter),
+            )?)
         }
         // No requested columns, but a predicate is present. Use just the predicate refs so the
         // stats schema is trimmed to what the rewritten predicate needs.
         (_, PhysicalPredicate::Some(_, _)) => with_data_cols(
             table_configuration
-                .build_expected_stats_schemas(None, Some(&predicate_refs_physical))?
-                .physical,
+                .build_expected_physical_stats_schema(None, Some(&predicate_refs_physical))?,
         ),
         // No struct stats requested and no predicate: nothing to read or emit, so no stats schema.
         (_, _) => None,

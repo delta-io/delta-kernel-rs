@@ -33,7 +33,9 @@ use crate::path::ParsedLogPath;
 use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
-use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
+use crate::table_configuration::{
+    ExpectedStatsSchemas, InCommitTimestampEnablement, TableConfiguration,
+};
 use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
@@ -370,6 +372,32 @@ impl Snapshot {
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.logical_schema()
+    }
+
+    /// Returns aligned schemas for scans using all indexed structured statistics.
+    ///
+    /// `extra_indexed_columns` are logical column paths that may have statistics even when they
+    /// fall outside the table's configured indexed-column set. Pass the same columns to
+    /// [`StatsOptions::all_struct_with_extra_indexed`] when building the scan. Partition columns
+    /// and unresolvable paths are omitted.
+    ///
+    /// The returned schemas have the same shape and field order. The logical schema uses table
+    /// column names, while the physical schema applies the table's column-mapping mode. Returns
+    /// `None` when no data columns are selected and the scan will not emit `stats_parsed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a selected logical column cannot be mapped to the physical schema or
+    /// the selected fields cannot form a valid stats schema.
+    ///
+    /// [`StatsOptions::all_struct_with_extra_indexed`]:
+    /// crate::scan::StatsOptions::all_struct_with_extra_indexed
+    pub fn expected_stats_schemas(
+        &self,
+        extra_indexed_columns: &[ColumnName],
+    ) -> DeltaResult<Option<ExpectedStatsSchemas>> {
+        self.table_configuration
+            .build_expected_stats_schemas(extra_indexed_columns)
     }
 
     /// Estimated owned heap size in bytes for this snapshot. Best-effort estimate
