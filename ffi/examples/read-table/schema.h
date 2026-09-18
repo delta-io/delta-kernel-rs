@@ -38,6 +38,7 @@ typedef struct
   bool is_nullable;
   uintptr_t children;
   char* column_mapping_id;
+  char* column_mapping_physical_name;
 } SchemaItem;
 
 typedef struct SchemaItemList
@@ -68,6 +69,7 @@ SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nu
   list->list[idx].type = type;
   list->list[idx].is_nullable = is_nullable;
   list->list[idx].column_mapping_id = NULL;
+  list->list[idx].column_mapping_physical_name = NULL;
   list->len++;
   return &list->list[idx];
 }
@@ -122,13 +124,14 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
   }
 }
 
-// Read the column-mapping id back out of a field's typed metadata, across the FFI. Returns a
-// freshly-allocated string (owned by the caller) when the field carries `delta.columnMapping.id`,
-// or NULL when it does not. This exercises the typed metadata path end-to-end: the value crosses
-// as a `MetadataNumber`, and we assert that kind before rendering it.
-char* read_column_mapping_id(const CMetadataMap* metadata, SharedExternEngine* engine)
+// Read a column-mapping value out of a field's typed metadata. Returns a freshly allocated string
+// owned by the caller, or NULL when the key is absent or has the wrong kind.
+char* read_column_mapping_value(
+  const CMetadataMap* metadata,
+  SharedExternEngine* engine,
+  const char* key_str,
+  CMetadataValueKind expected_kind)
 {
-  char* key_str = "delta.columnMapping.id";
   KernelStringSlice key = { key_str, strlen(key_str) };
   CMetadataValueKind kind;
   ExternResultNullableCvoid res = get_from_metadata_map(metadata, key, &kind, allocate_string, engine);
@@ -137,13 +140,23 @@ char* read_column_mapping_id(const CMetadataMap* metadata, SharedExternEngine* e
     return NULL;
   }
   char* value = res.ok;
-  if (value && kind != MetadataNumber) {
-    // The kernel types column-mapping ids as numbers; a different kind means the FFI lost the type.
-    printf("Unexpected kind %d for delta.columnMapping.id\n", (int)kind);
+  if (value && kind != expected_kind) {
+    printf("Unexpected metadata kind %d for %s\n", (int)kind, key_str);
     free(value);
     return NULL;
   }
   return value;
+}
+
+void read_column_mapping_metadata(
+  SchemaItem* item,
+  const CMetadataMap* metadata,
+  SharedExternEngine* engine)
+{
+  item->column_mapping_id = read_column_mapping_value(
+    metadata, engine, "delta.columnMapping.id", MetadataNumber);
+  item->column_mapping_physical_name = read_column_mapping_value(
+    metadata, engine, "delta.columnMapping.physicalName", MetadataString);
 }
 
 // declare all our visitor methods
@@ -178,7 +191,7 @@ void visit_struct(
   PRINT_CHILD_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
   SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct", is_nullable);
   struct_item->children = child_list_id;
-  struct_item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(struct_item, metadata, builder->engine);
 }
 
 void visit_array(
@@ -194,7 +207,7 @@ void visit_array(
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
-  array_item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(array_item, metadata, builder->engine);
 }
 
 void visit_map(
@@ -210,7 +223,7 @@ void visit_map(
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;
-  map_item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(map_item, metadata, builder->engine);
 }
 
 void visit_decimal(
@@ -228,7 +241,7 @@ void visit_decimal(
   snprintf(type, 19, "decimal(%u)(%d)", precision, scale);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
-  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(item, metadata, builder->engine);
 }
 
 void visit_simple_type(
@@ -243,7 +256,7 @@ void visit_simple_type(
   char* name_ptr = allocate_string(name);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
-  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(item, metadata, builder->engine);
 }
 
 #define DEFINE_VISIT_SIMPLE_TYPE(typename)                                                                                                  \
@@ -299,7 +312,7 @@ void visit_geometry(void* data,
   snprintf(type, type_size, "geometry(%.*s)", (int)crs.len, crs.ptr);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
-  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(item, metadata, builder->engine);
 }
 
 void visit_geography(void* data,
@@ -324,7 +337,7 @@ void visit_geography(void* data,
     algorithm.ptr);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
-  item->column_mapping_id = read_column_mapping_id(metadata, builder->engine);
+  read_column_mapping_metadata(item, metadata, builder->engine);
 }
 
 // free all the data in the builder and the builder itself
@@ -336,6 +349,7 @@ void free_builder(SchemaBuilder* builder)
       SchemaItem* item = list->list + j;
       free(item->name);
       free(item->column_mapping_id); // NULL when the field carried no column-mapping id; free(NULL) is a no-op
+      free(item->column_mapping_physical_name);
       // don't free item->type, those are static strings
       if (field_type_needs_free(item->type)) {
         // except decimal and geo types, we malloc'd those :)
