@@ -720,7 +720,7 @@ pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
+    use std::cell::RefCell;
 
     use tracing::field::Empty;
     use tracing::{debug, info, trace};
@@ -729,10 +729,11 @@ mod tests {
     use super::*;
     use crate::TryFromStringSlice;
 
-    // Because we have to access a global messages buffer, we have to force tests to run one at a
-    // time
-    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    static MESSAGES: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    // The process-global subscriber may invoke callbacks from any test thread. Thread-local
+    // storage keeps unrelated log events out of this test's expected messages.
+    thread_local! {
+        static MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
 
     // Local dispatch builders used with `with_default` so tests can exercise each layer in
     // isolation without consuming the once-only global default subscriber.
@@ -781,10 +782,11 @@ mod tests {
                 .iter()
                 .any(|expected_log_line| line_str.ends_with(expected_log_line));
         if ok {
-            let mut lock = MESSAGES.lock().unwrap();
-            if let Some(ref mut msgs) = *lock {
-                msgs.push(line_str);
-            }
+            MESSAGES.with(|messages| {
+                if let Some(messages) = messages.borrow_mut().as_mut() {
+                    messages.push(line_str);
+                }
+            });
         }
     }
 
@@ -799,7 +801,11 @@ mod tests {
     }
 
     fn setup_messages() {
-        *MESSAGES.lock().unwrap() = Some(vec![]);
+        MESSAGES.with(|messages| *messages.borrow_mut() = Some(vec![]));
+    }
+
+    fn with_messages<T>(f: impl FnOnce(Option<&[String]>) -> T) -> T {
+        MESSAGES.with(|messages| f(messages.borrow().as_deref()))
     }
 
     /// Format the current time as a string using the same formatter that tracing uses, trimmed
@@ -844,17 +850,18 @@ mod tests {
         time_after: &str,
         expected_level_str: &str,
     ) {
-        let lock = MESSAGES.lock().unwrap();
-        let Some(ref msgs) = *lock else {
-            panic!("Messages wasn't Some");
-        };
-        assert_eq!(msgs.len(), expected_lines.len());
-        for (got, expect) in msgs.iter().zip(expected_lines) {
-            assert!(got.ends_with(expect));
-            assert!(got.contains(expected_level_str));
-            assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-            assert_timestamp_in_range(got, time_before, time_after);
-        }
+        with_messages(|messages| {
+            let Some(messages) = messages else {
+                panic!("Messages wasn't Some");
+            };
+            assert_eq!(messages.len(), expected_lines.len());
+            for (got, expect) in messages.iter().zip(expected_lines) {
+                assert!(got.ends_with(expect));
+                assert!(got.contains(expected_level_str));
+                assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
+                assert_timestamp_in_range(got, time_before, time_after);
+            }
+        });
     }
 
     /// Assert that the log line contains a timestamp within [time_before, time_after].
@@ -885,7 +892,6 @@ mod tests {
     // `get_X_dispatcher` and set it locally using `with_default`
     #[test]
     fn test_enable_log_line_tracing() {
-        let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
         unsafe {
             // record_callback_with_filter_1 filters only "Testing 1\n", "Another line\n"
@@ -928,7 +934,6 @@ mod tests {
 
     #[test]
     fn info_logs_with_formatted_log_line_tracing() {
-        let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
         let dispatch = create_log_line_dispatch(
             record_callback_with_filter_1,
@@ -947,24 +952,35 @@ mod tests {
                 info!("{}", &line[..(line.len() - 1)]);
             }
             let time_after = get_time_test_str();
-            let lock = MESSAGES.lock().unwrap();
-            if let Some(ref msgs) = *lock {
-                assert_eq!(msgs.len(), lines.len());
-                for (got, expect) in msgs.iter().zip(lines) {
-                    assert!(got.ends_with(expect));
-                    assert!(!got.contains("INFO"));
-                    assert!(!got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-                    assert_timestamp_in_range(got, &time_before, &time_after);
+            with_messages(|messages| {
+                if let Some(messages) = messages {
+                    assert_eq!(messages.len(), lines.len());
+                    for (got, expect) in messages.iter().zip(lines) {
+                        assert!(got.ends_with(expect));
+                        assert!(!got.contains("INFO"));
+                        assert!(!got.contains("delta_kernel_ffi::ffi_tracing::tests"));
+                        assert_timestamp_in_range(got, &time_before, &time_after);
+                    }
+                } else {
+                    panic!("Messages wasn't Some");
                 }
-            } else {
-                panic!("Messages wasn't Some");
-            }
+            });
         })
     }
 
-    static EVENTS_OK: Mutex<Option<Vec<(String, tracing::Level)>>> = Mutex::new(None);
+    // The process-global subscriber may invoke callbacks from any test thread. Thread-local
+    // storage keeps unrelated tracing events out of this test's expected events.
+    thread_local! {
+        static EVENTS_OK: RefCell<Option<Vec<(String, tracing::Level)>>> =
+            const { RefCell::new(None) };
+    }
+
     fn setup_events() {
-        *EVENTS_OK.lock().unwrap() = Some(vec![]);
+        EVENTS_OK.with(|events| *events.borrow_mut() = Some(vec![]));
+    }
+
+    fn with_events<T>(f: impl FnOnce(Option<&[(String, tracing::Level)]>) -> T) -> T {
+        EVENTS_OK.with(|events| f(events.borrow().as_deref()))
     }
 
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
@@ -999,10 +1015,11 @@ mod tests {
             && file == expected_file
             && expected_log_lines.contains(&msg);
         if ok {
-            let mut lock = EVENTS_OK.lock().unwrap();
-            if let Some(ref mut events) = *lock {
-                events.push((msg.to_string(), convert_level(event.level)));
-            }
+            EVENTS_OK.with(|events| {
+                if let Some(events) = events.borrow_mut().as_mut() {
+                    events.push((msg.to_string(), convert_level(event.level)));
+                }
+            });
         }
     }
 
@@ -1015,29 +1032,28 @@ mod tests {
     }
 
     fn check_events(expected_level: tracing::Level, expected_messages: Vec<&str>) {
-        let lock = EVENTS_OK.lock().unwrap();
-        if let Some(ref results) = *lock {
-            assert!(!results.is_empty(), "No events were captured");
+        with_events(|events| {
+            let Some(events) = events else {
+                panic!("Events wasn't Some");
+            };
+            assert!(!events.is_empty(), "No events were captured");
 
             assert!(
-                results.iter().all(|(_msg, lvl)| *lvl == expected_level),
+                events.iter().all(|(_msg, lvl)| *lvl == expected_level),
                 "Not all events were {expected_level}"
             );
-            let events_str = events_to_string(results.to_vec());
+            let events_str = events_to_string(events.to_vec());
             assert!(
-                results
+                events
                     .iter()
                     .all(|(msg, _lvl)| expected_messages.contains(&msg.as_str())),
                 "Not all messages have expected format: {events_str}"
             )
-        } else {
-            panic!("Events wasn't Some");
-        }
+        });
     }
 
     #[test]
     fn trace_event_tracking() {
-        let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
         let dispatch = create_event_dispatch(event_callback_with_filter_1, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
@@ -1053,7 +1069,6 @@ mod tests {
     #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see
               // comment there, however this test works if run individually.
     fn test_enable_event_tracing() {
-        let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
         unsafe {
             // Filters only "Testing 1", "Another line"
@@ -1068,11 +1083,7 @@ mod tests {
 
         check_events(tracing::Level::INFO, expected_lines);
         setup_events();
-        assert!(EVENTS_OK
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_none_or(|v| v.is_empty()));
+        with_events(|events| assert!(events.is_none_or(|events| events.is_empty())));
 
         // Ensure we can setup again with a new callback and a new tracing level
         unsafe {
@@ -1104,7 +1115,15 @@ mod tests {
         assert_eq!(error, Level::ERROR);
     }
 
-    static METRIC_EVENTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    // Metric callbacks run on the emitting thread. Thread-local storage keeps unrelated metrics
+    // out of this test's expected events.
+    thread_local! {
+        static METRIC_EVENTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    fn with_metric_events<T>(f: impl FnOnce(Option<&[String]>) -> T) -> T {
+        METRIC_EVENTS.with(|events| f(events.borrow().as_deref()))
+    }
 
     extern "C" fn capture_metric_event(event: MetricEvent) {
         let desc = match event {
@@ -1114,27 +1133,27 @@ mod tests {
             }
             _ => "other".to_string(),
         };
-        if let Ok(mut lock) = METRIC_EVENTS.lock() {
-            if let Some(events) = lock.as_mut() {
+        METRIC_EVENTS.with(|events| {
+            if let Some(events) = events.borrow_mut().as_mut() {
                 events.push(desc);
             }
-        }
+        });
     }
 
     #[test]
     fn metrics_reporting_delivers_structured_events() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        *METRIC_EVENTS.lock().unwrap() = Some(vec![]);
+        METRIC_EVENTS.with(|events| *events.borrow_mut() = Some(vec![]));
         let dispatch = create_metrics_dispatch(capture_metric_event);
         tracing_core::dispatcher::with_default(&dispatch, || {
             delta_kernel::metrics::emit_json_read_completed(3, 100);
             delta_kernel::metrics::emit_parquet_read_completed(2, 50);
         });
-        let lock = METRIC_EVENTS.lock().unwrap();
-        assert_eq!(
-            lock.as_deref(),
-            Some(["json:3:100".to_string(), "parquet:2:50".to_string()].as_slice())
-        );
+        with_metric_events(|events| {
+            assert_eq!(
+                events,
+                Some(["json:3:100".to_string(), "parquet:2:50".to_string()].as_slice())
+            );
+        });
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1144,7 +1163,11 @@ mod tests {
         name: Option<String>,
     }
 
-    static FRAME_EVENTS: Mutex<Vec<CapturedFrameEvent>> = Mutex::new(vec![]);
+    // Frame callbacks run on the span's thread, including when the process-global subscriber
+    // observes other tests. Thread-local storage isolates each test's expected lifecycle.
+    thread_local! {
+        static FRAME_EVENTS: RefCell<Vec<CapturedFrameEvent>> = const { RefCell::new(vec![]) };
+    }
 
     extern "C" fn capture_frame_event(event: FrameEvent) {
         let (is_open, span_id, name) = match event {
@@ -1154,11 +1177,23 @@ mod tests {
             }
             FrameEvent::CLOSE(FrameClose { span_id }) => (false, span_id, None),
         };
-        FRAME_EVENTS.lock().unwrap().push(CapturedFrameEvent {
-            is_open,
-            span_id,
-            name,
+        FRAME_EVENTS.with(|events| {
+            events.borrow_mut().push(CapturedFrameEvent {
+                is_open,
+                span_id,
+                name,
+            });
         });
+    }
+
+    fn capture_frame_events(f: impl FnOnce()) -> Vec<CapturedFrameEvent> {
+        FRAME_EVENTS.with(|events| events.borrow_mut().clear());
+        f();
+        FRAME_EVENTS.with(RefCell::take)
+    }
+
+    fn frame_event_count() -> usize {
+        FRAME_EVENTS.with(|events| events.borrow().len())
     }
 
     fn emit_reloadable_frame_span() {
@@ -1168,28 +1203,27 @@ mod tests {
 
     #[test]
     fn frame_reporting_delivers_nested_lifecycle_events_synchronously() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        FRAME_EVENTS.lock().unwrap().clear();
-        let dispatch = create_frame_dispatch(capture_frame_event);
+        let events = capture_frame_events(|| {
+            let dispatch = create_frame_dispatch(capture_frame_event);
 
-        tracing_core::dispatcher::with_default(&dispatch, || {
-            let ignored = tracing::info_span!("ignored");
-            let _ignored_guard = ignored.enter();
+            tracing_core::dispatcher::with_default(&dispatch, || {
+                let ignored = tracing::info_span!("ignored");
+                let _ignored_guard = ignored.enter();
 
-            let outer = tracing::info_span!("outer", enable_call_frame = Empty);
-            let outer_guard = outer.enter();
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 1);
+                let outer = tracing::info_span!("outer", enable_call_frame = Empty);
+                let outer_guard = outer.enter();
+                assert_eq!(frame_event_count(), 1);
 
-            let inner = tracing::info_span!("inner", enable_call_frame = Empty);
-            let inner_guard = inner.enter();
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 2);
-            drop(inner_guard);
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 3);
-            drop(outer_guard);
-            assert_eq!(FRAME_EVENTS.lock().unwrap().len(), 4);
+                let inner = tracing::info_span!("inner", enable_call_frame = Empty);
+                let inner_guard = inner.enter();
+                assert_eq!(frame_event_count(), 2);
+                drop(inner_guard);
+                assert_eq!(frame_event_count(), 3);
+                drop(outer_guard);
+                assert_eq!(frame_event_count(), 4);
+            });
         });
 
-        let events = FRAME_EVENTS.lock().unwrap();
         assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("outer"));
         assert!(events[1].is_open);
@@ -1204,16 +1238,15 @@ mod tests {
 
     #[test]
     fn frame_reporter_callback_can_only_be_registered_once() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        FRAME_EVENTS.lock().unwrap().clear();
-        assert!(unsafe { enable_frame_reporting(capture_frame_event) });
-        assert!(!unsafe { enable_frame_reporting(capture_frame_event) });
+        let events = capture_frame_events(|| {
+            assert!(unsafe { enable_frame_reporting(capture_frame_event) });
+            assert!(!unsafe { enable_frame_reporting(capture_frame_event) });
 
-        let captured = tracing::info_span!("captured", enable_call_frame = Empty);
-        let captured_guard = captured.enter();
-        drop(captured_guard);
+            let captured = tracing::info_span!("captured", enable_call_frame = Empty);
+            let captured_guard = captured.enter();
+            drop(captured_guard);
+        });
 
-        let events = FRAME_EVENTS.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("captured"));
@@ -1223,24 +1256,23 @@ mod tests {
 
     #[test]
     fn frame_filter_enables_existing_trace_callsites_when_reloaded() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        FRAME_EVENTS.lock().unwrap().clear();
-        let reporter = Arc::new(FfiFrameReporter {
-            callback: Arc::new(OnceLock::from(capture_frame_event as FrameEventFn)),
+        let events = capture_frame_events(|| {
+            let reporter = Arc::new(FfiFrameReporter {
+                callback: Arc::new(OnceLock::from(capture_frame_event as FrameEventFn)),
+            });
+            let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::OFF);
+            let layer = FrameReporterLayer::new(reporter).with_filter(filter_layer);
+            let dispatch = Dispatch::new(Registry::default().with(layer));
+
+            tracing_core::dispatcher::with_default(&dispatch, || {
+                emit_reloadable_frame_span();
+                assert_eq!(frame_event_count(), 0);
+
+                filter_handle.reload(LevelFilter::TRACE).unwrap();
+                emit_reloadable_frame_span();
+            });
         });
-        let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::OFF);
-        let layer = FrameReporterLayer::new(reporter).with_filter(filter_layer);
-        let dispatch = Dispatch::new(Registry::default().with(layer));
 
-        tracing_core::dispatcher::with_default(&dispatch, || {
-            emit_reloadable_frame_span();
-            assert!(FRAME_EVENTS.lock().unwrap().is_empty());
-
-            filter_handle.reload(LevelFilter::TRACE).unwrap();
-            emit_reloadable_frame_span();
-        });
-
-        let events = FRAME_EVENTS.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events[0].is_open);
         assert_eq!(events[0].name.as_deref(), Some("reloadable"));

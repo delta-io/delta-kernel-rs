@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
     lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, MapToStructOptions, Predicate, Scalar, UnaryPredicateOp,
+    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
@@ -15,7 +15,7 @@ use delta_kernel::DeltaResult;
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
-use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -685,17 +685,29 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
-/// Visit a MapToStruct expression. The `child_expr` is the map expression.
+/// Builds a `MapToStruct` expression from its map child and options.
+///
+/// The options and any contained string are copied into the expression before this function
+/// returns.
+///
+/// Returns zero when `child_expr` is invalid or the timezone is not valid UTF-8.
+///
+/// # Safety
+///
+/// `options` must reference a valid [`FfiMapToStructOptions`] for this call. A configured timezone
+/// slice must point to its declared number of initialized bytes.
 #[no_mangle]
-pub extern "C" fn visit_expression_map_to_struct(
+pub unsafe extern "C" fn visit_expression_map_to_struct(
     state: &mut KernelExpressionVisitorState,
     child_expr: usize,
+    options: *const FfiMapToStructOptions,
 ) -> usize {
+    let options = unsafe { &*options };
+    let Ok(options) = (unsafe { options.try_to_kernel() }) else {
+        return 0;
+    };
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
-        wrap_expression(
-            state,
-            Expression::map_to_struct(expr, MapToStructOptions::default()),
-        )
+        wrap_expression(state, Expression::map_to_struct(expr, options))
     })
 }
 
@@ -865,11 +877,56 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, Scalar};
+    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
     use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::FfiMapToStructOptions;
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn map_to_struct_preserves_options(#[case] timestamp_timezone: Option<&str>) {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+        let ffi_timezone = timestamp_timezone
+            .map(|timezone| crate::kernel_string_slice!(timezone))
+            .into();
+        let ffi_options = FfiMapToStructOptions {
+            timestamp_timezone: ffi_timezone,
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, &raw const ffi_options) };
+        let expression = unwrap_kernel_expression(&mut state, expression_id).unwrap();
+
+        assert_eq!(
+            expression,
+            Expression::map_to_struct(col!("partitionValues"), options)
+        );
+    }
+
+    #[test]
+    fn map_to_struct_rejects_invalid_timezone_utf8() {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let invalid_utf8 = [0xff_u8];
+        let options = FfiMapToStructOptions {
+            timestamp_timezone: crate::OptionalValue::Some(KernelStringSlice {
+                ptr: invalid_utf8.as_ptr().cast(),
+                len: invalid_utf8.len(),
+            }),
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, &raw const options) };
+
+        assert_eq!(expression_id, 0);
+    }
 
     // ============================================================================
     // NullTypeTag::from_data_type

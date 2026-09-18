@@ -119,6 +119,7 @@ pub mod transforms;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
+pub use row_tracking::ROW_TRACKING_INITIAL_HIGH_WATER_MARK;
 
 // Public under test-utils so integration tests can call get_high_water_mark via snapshot.
 #[cfg(feature = "test-utils")]
