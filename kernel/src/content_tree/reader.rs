@@ -58,9 +58,7 @@ static LEAF_NORMALIZE_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 ///
 /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its tracking
 /// status is [live](TrackingStatus::is_live); every other entry is dropped via the returned
-/// selection vector. Leaf-manifest batches also reach this path, once
-/// [`LeafReadContext::convert_leaf_entries_to_add_actions`] has materialized their inherited
-/// tracking fields so they meet the same expectations as a root batch.
+/// selection vector.
 ///
 /// # Parameters
 /// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transform.
@@ -352,8 +350,8 @@ impl RowVisitor for AddSelectionVisitor {
 struct FirstRowIdVisitor {
     /// Next unassigned `firstRowId`; seeded from the parent and advanced per fresh assignment.
     next_first_row_id: i64,
-    /// Assigned `firstRowId` per row, in entry order.
-    first_row_ids: Vec<i64>,
+    /// Assigned `firstRowId` per row, in entry order, as the [`Scalar`]s of the helper column.
+    first_row_ids: Vec<Scalar>,
 }
 
 impl FirstRowIdVisitor {
@@ -398,7 +396,7 @@ impl RowVisitor for FirstRowIdVisitor {
                     assigned
                 }
             };
-            self.first_row_ids.push(assigned);
+            self.first_row_ids.push(Scalar::Long(assigned));
         }
         Ok(())
     }
