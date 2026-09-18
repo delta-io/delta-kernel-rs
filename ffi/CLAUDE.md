@@ -15,6 +15,10 @@ FFI boundary, or when the type is not representable in C/C++ (dyn trait referenc
 options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelError`,
 `KernelStringSlice`, and `EngineIterator` do not need handles.
 
+Borrowed record arrays use `FfiSlice<T>`: empty slices accept null or non-null pointers, while
+non-empty slices require a non-null pointer. The pointed-to storage is never owned.
+Descriptive aliases identify each public array's element type.
+
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
 
 Handle parameters follow one of two ownership contracts:
