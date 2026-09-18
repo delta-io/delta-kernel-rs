@@ -632,8 +632,9 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
-// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// Dependencies and mutual exclusions per the adaptiveMetadata RFC (delta-io/delta#6978) "Table
+// Feature Enablement" section. Enforcement is covered by
+// `test_adaptive_metadata_feature_requirements`.
 // TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
 static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
@@ -653,6 +654,10 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Enabled(TableFeature::DomainMetadata),
         FeatureRequirement::Enabled(TableFeature::DeletionVectors),
         FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+        // adaptiveMetadata and v2Checkpoint are mutually exclusive: once adaptiveMetadata is
+        // enabled, checkpoint state is carried by the `checkpoint` action rather than by V2
+        // checkpoint files, so a table must not enable both.
+        FeatureRequirement::NotSupported(TableFeature::V2Checkpoint),
     ],
     #[cfg(feature = "adaptive-metadata-in-dev")]
     kernel_support: KernelSupport::Supported,
