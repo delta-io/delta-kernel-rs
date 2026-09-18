@@ -58,7 +58,7 @@ struct FileToScan {
 }
 
 // This is the callback that will be called for each valid scan row
-fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
+fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) -> bool {
     let scan_file = FileToScan {
         path: scan_file.path.to_string(),
         size: scan_file.size,
@@ -66,6 +66,7 @@ fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
         dv_info: scan_file.dv_info,
     };
     scan_tx.send(scan_file).unwrap();
+    true
 }
 
 struct ScanState {
