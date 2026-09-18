@@ -3,9 +3,9 @@
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{transform_output_type, DeltaResult, Error};
+use crate::{DeltaResult, Error};
 
 /// Validates that if a table schema contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns,
 /// the table must have the TimestampNanos and TimestampNtz features in both reader and writer
@@ -38,8 +38,7 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNanos {
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
         match ptype {
-            PrimitiveType::TimestampNanos => Err(()),
-            PrimitiveType::TimestampNanosNtz => Err(()),
+            PrimitiveType::TimestampNanos | PrimitiveType::TimestampNanosNtz => Err(()),
             _ => Ok(()),
         }
     }
@@ -47,89 +46,71 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNanos {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use crate::actions::Protocol;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{schema, DataType};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_schema_feature_validation;
 
-    #[rstest::rstest]
-    #[case::nanos(PrimitiveType::TimestampNanos)]
-    #[case::nanos_ntz(PrimitiveType::TimestampNanosNtz)]
-    fn test_timestamp_nanos_feature_validation(#[case] ptype: PrimitiveType) {
-        let schema_with_timestamp_nanos = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::Primitive(ptype.clone()), true),
-        ]);
+    // Nanos columns nested in structs, arrays, and map keys/values must all be detected: the
+    // traversal has to short-circuit out of every container kind, not just the top level.
+    #[rstest]
+    fn test_timestamp_nanos_feature_validation(
+        #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] ts_type: DataType,
+        #[values(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::TimestampWithoutTimezone],
+            vec![TableFeature::TimestampNanos]
+        )]
+        features_without: Vec<TableFeature>,
+    ) {
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "ts": (ts_type.clone()),
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let nested_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "nested": {
+                nullable "inner_ts": (ts_type.clone()),
+            },
+        };
+        let array_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "arr": [ nullable (ts_type.clone()) ],
+        };
+        let map_key_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "map": { (ts_type.clone()) => nullable STRING },
+        };
+        let map_value_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "map": { STRING => nullable (ts_type) },
+        };
+        let features_with = [
+            TableFeature::TimestampNanos,
+            TableFeature::TimestampWithoutTimezone,
+        ];
+        let protocol_with = Protocol::try_new_modern(features_with.clone(), features_with).unwrap();
+        let protocol_without =
+            Protocol::try_new_modern(features_without.clone(), features_without).unwrap();
 
-        let schema_without_timestamp_nanos = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
-
-        let nested_schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
-                    "inner_nanos",
-                    DataType::Primitive(ptype),
-                    true,
-                )]))),
-                true,
-            ),
-        ]);
-
-        let protocol_with_features = Protocol::try_new(
-            3,
-            7,
-            Some([
-                TableFeature::TimestampNanos,
-                TableFeature::TimestampWithoutTimezone,
-            ]),
-            Some([
-                TableFeature::TimestampNanos,
-                TableFeature::TimestampWithoutTimezone,
-            ]),
-        )
-        .unwrap();
-
-        let protocol_without_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
-
-        let protocol_without_nanos = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
-        )
-        .unwrap();
-
-        let protocol_without_ntz = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampNanos]),
-            Some([TableFeature::TimestampNanos]),
-        )
-        .unwrap();
-
-        for protocol in &[
-            protocol_without_features,
-            protocol_without_nanos,
-            protocol_without_ntz,
-        ] {
-            assert_schema_feature_validation(
-                &schema_with_timestamp_nanos,
-                &schema_without_timestamp_nanos,
-                &protocol_with_features,
-                protocol,
-                &[&nested_schema_with],
-                "Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
-            );
-        }
+        assert_schema_feature_validation(
+            &schema_with,
+            &schema_without,
+            &protocol_with,
+            &protocol_without,
+            &[
+                &nested_schema_with,
+                &array_schema_with,
+                &map_key_schema_with,
+                &map_value_schema_with,
+            ],
+            "Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
+        );
     }
 }
