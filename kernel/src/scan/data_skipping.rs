@@ -244,11 +244,13 @@ impl DataSkippingFilter {
     /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
     ///   gate.
     /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
+    /// - `partition_options`: Options used to parse raw partition values.
     pub(crate) fn for_raw_action_batch(
         engine: &dyn Engine,
         physical_predicate: PredicateRef,
         table_configuration: &TableConfiguration,
         input_schema: SchemaRef,
+        partition_options: MapToStructOptions,
     ) -> Option<Self> {
         // Predicate refs become the `requested_physical_columns` filter; refs outside
         // `physical_stats_columns` fold to NULL via the gate below. Clustering columns are
@@ -275,7 +277,7 @@ impl DataSkippingFilter {
         ));
         let partition_expr = Arc::new(Expr::map_to_struct(
             col!("add.partitionValues"),
-            MapToStructOptions::default(),
+            partition_options,
         ));
         let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(

@@ -236,14 +236,14 @@ impl StatsOptions {
     }
 }
 
-/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
-/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
-/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] or
+/// [`crate::incremental_scan::IncrementalScanBuilder::with_partition_values`] to request a typed
+/// `partitionValues_parsed` struct alongside the raw string map, which is always preserved.
 ///
-/// When the typed struct is requested, scan metadata output gains a top-level
-/// `partitionValues_parsed` struct column with one typed nullable field per partition column
-/// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values are parsed from the canonical string map for both commits and checkpoints.
+/// Full scan metadata emits the struct at the top level; incremental Add batches emit it as
+/// `add.partitionValues_parsed`. It contains one typed nullable field per partition column using
+/// physical names and table partition-column order. On non-partitioned tables it is omitted.
+/// Values are parsed from the canonical string map.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
@@ -258,8 +258,7 @@ impl PartitionValuesOptions {
         Self::default()
     }
 
-    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map. Lets engines
-    /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
+    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
@@ -272,10 +271,10 @@ impl PartitionValuesOptions {
     /// `timestamp_timezone` must be an IANA time zone identifier recognized by Kernel or a
     /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
     /// value takes precedence. This option does not affect `TIMESTAMP_NTZ`. It applies to typed
-    /// scan metadata and final partition predicate evaluation. Partition-column row transforms
-    /// used by [`Scan::execute`] retain UTC parsing. Native checkpoint pruning remains enabled for
-    /// timezone-independent fields but defers zoned `TIMESTAMP` predicates until after reparsing.
-    /// Incremental scans continue to expose the raw partition-value map. Without this option,
+    /// full scan metadata and final partition predicate evaluation, as well as incremental typed
+    /// output and predicate skipping. Partition-column row transforms used by [`Scan::execute`]
+    /// retain UTC parsing. Native checkpoint pruning remains enabled for timezone-independent
+    /// fields but defers zoned `TIMESTAMP` predicates until after reparsing. Without this option,
     /// Kernel interprets offset-less timestamps as UTC. Invalid values are reported when the scan
     /// is built.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
