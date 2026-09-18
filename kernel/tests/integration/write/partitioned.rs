@@ -60,7 +60,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
             .table_configuration()
             .logical_partition_columns()
             .len(),
-        13 + 2 * cfg!(feature = "nanosecond-timestamps") as usize
+        13 + 4 * cfg!(feature = "nanosecond-timestamps") as usize
     );
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
@@ -517,6 +517,11 @@ fn all_types_schema() -> Arc<StructType> {
         vec![
             StructField::nullable("p_timestamp_nanos", DataType::TIMESTAMP_NANOS),
             StructField::nullable("p_timestamp_nanos_ntz", DataType::TIMESTAMP_NANOS_NTZ),
+            StructField::nullable("p_timestamp_nanos_pre_epoch", DataType::TIMESTAMP_NANOS),
+            StructField::nullable(
+                "p_timestamp_nanos_ntz_pre_epoch",
+                DataType::TIMESTAMP_NANOS_NTZ,
+            ),
         ]
     }
 
@@ -562,6 +567,10 @@ const PARTITION_COLS: &[&str] = &[
     "p_timestamp_nanos",
     #[cfg(feature = "nanosecond-timestamps")]
     "p_timestamp_nanos_ntz",
+    #[cfg(feature = "nanosecond-timestamps")]
+    "p_timestamp_nanos_pre_epoch",
+    #[cfg(feature = "nanosecond-timestamps")]
+    "p_timestamp_nanos_ntz_pre_epoch",
 ];
 
 // ==============================================================================
@@ -571,6 +580,9 @@ const PARTITION_COLS: &[&str] = &[
 /// Arrow columns for one row with normal everyday values for all 13 partition types.
 fn normal_arrow_columns() -> Vec<ArrayRef> {
     let ts = ts_to_micros("2025-03-31 15:30:00.123456");
+    // Pre-epoch with a sub-second part, so the negative div_euclid/rem_euclid path round-trips.
+    #[cfg(feature = "nanosecond-timestamps")]
+    let pre_epoch_ts = ts_to_micros("1969-07-20 20:17:40.123456");
     vec![
         Arc::new(Int32Array::from(vec![1])),
         Arc::new(StringArray::from(vec!["hello"])),
@@ -590,12 +602,22 @@ fn normal_arrow_columns() -> Vec<ArrayRef> {
         Arc::new(TimestampNanosecondArray::from(vec![ts * 1000 + 123]).with_timezone("UTC")),
         #[cfg(feature = "nanosecond-timestamps")]
         Arc::new(TimestampNanosecondArray::from(vec![ts * 1000 + 456])),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(
+            TimestampNanosecondArray::from(vec![pre_epoch_ts * 1000 + 123]).with_timezone("UTC"),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![
+            pre_epoch_ts * 1000 + 456,
+        ])),
     ]
 }
 
 /// Typed partition values matching `normal_arrow_columns`.
 fn normal_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error::Error>> {
     let ts = ts_to_micros("2025-03-31 15:30:00.123456");
+    #[cfg(feature = "nanosecond-timestamps")]
+    let pre_epoch_ts = ts_to_micros("1969-07-20 20:17:40.123456");
     Ok(HashMap::from([
         ("p_string".into(), Scalar::String("hello".into())),
         ("p_int".into(), Scalar::Integer(42)),
@@ -620,6 +642,16 @@ fn normal_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::err
             "p_timestamp_nanos_ntz".into(),
             Scalar::TimestampNanosNtz(ts * 1000 + 456),
         ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_pre_epoch".into(),
+            Scalar::TimestampNanos(pre_epoch_ts * 1000 + 123),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_ntz_pre_epoch".into(),
+            Scalar::TimestampNanosNtz(pre_epoch_ts * 1000 + 456),
+        ),
     ]))
 }
 
@@ -642,6 +674,16 @@ const EXPECTED_NORMAL_PVS: &[(&str, &str)] = &[
     ("p_timestamp_nanos", "2025-03-31T15:30:00.123456123Z"),
     #[cfg(feature = "nanosecond-timestamps")]
     ("p_timestamp_nanos_ntz", "2025-03-31 15:30:00.123456456"),
+    #[cfg(feature = "nanosecond-timestamps")]
+    (
+        "p_timestamp_nanos_pre_epoch",
+        "1969-07-20T20:17:40.123456123Z",
+    ),
+    #[cfg(feature = "nanosecond-timestamps")]
+    (
+        "p_timestamp_nanos_ntz_pre_epoch",
+        "1969-07-20 20:17:40.123456456",
+    ),
 ];
 
 // ==============================================================================
@@ -669,6 +711,10 @@ fn null_arrow_columns() -> Vec<ArrayRef> {
         ),
         Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
         Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>])),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+        #[cfg(feature = "nanosecond-timestamps")]
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>])),
         #[cfg(feature = "nanosecond-timestamps")]
         Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
         #[cfg(feature = "nanosecond-timestamps")]
@@ -703,6 +749,16 @@ fn null_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error
         #[cfg(feature = "nanosecond-timestamps")]
         (
             "p_timestamp_nanos_ntz".into(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS_NTZ),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_pre_epoch".into(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS),
+        ),
+        #[cfg(feature = "nanosecond-timestamps")]
+        (
+            "p_timestamp_nanos_ntz_pre_epoch".into(),
             Scalar::Null(DataType::TIMESTAMP_NANOS_NTZ),
         ),
     ]))
@@ -753,6 +809,8 @@ fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scal
 /// Asserts the normal-values row reads back correctly (1 row, all 13 partition columns).
 fn assert_normal_values(sorted: &RecordBatch) {
     let ts = ts_to_micros("2025-03-31 15:30:00.123456");
+    #[cfg(feature = "nanosecond-timestamps")]
+    let pre_epoch_ts = ts_to_micros("1969-07-20 20:17:40.123456");
     assert_eq!(sorted.num_rows(), 1);
     assert_col!(sorted, 0, Int32Array, 1); // value
     assert_col!(sorted, 1, StringArray, "hello"); // p_string
@@ -781,6 +839,20 @@ fn assert_normal_values(sorted: &RecordBatch) {
     assert_col!(sorted, 14, TimestampNanosecondArray, ts * 1000 + 123); // p_timestamp_nanos
     #[cfg(feature = "nanosecond-timestamps")]
     assert_col!(sorted, 15, TimestampNanosecondArray, ts * 1000 + 456); // p_timestamp_nanos_ntz
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_col!(
+        sorted,
+        16,
+        TimestampNanosecondArray,
+        pre_epoch_ts * 1000 + 123
+    );
+    #[cfg(feature = "nanosecond-timestamps")]
+    assert_col!(
+        sorted,
+        17,
+        TimestampNanosecondArray,
+        pre_epoch_ts * 1000 + 456
+    );
 }
 
 /// Asserts all partition columns (indices 1-13) are null for the single row.
@@ -788,7 +860,7 @@ fn assert_all_partition_columns_null(sorted: &RecordBatch) {
     assert_eq!(sorted.num_rows(), 1);
     let mut num_columns = 13;
     if cfg!(feature = "nanosecond-timestamps") {
-        num_columns += 2;
+        num_columns += 4;
     }
     for col_idx in 1..=num_columns {
         assert!(
