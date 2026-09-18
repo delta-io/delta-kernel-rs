@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use super::{EngineDataResultIterator, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::error::Error;
-use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
+use crate::row_tracking::{
+    RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+};
 use crate::table_features::TableFeature;
 use crate::{create_row, DeltaResult, Engine};
 
@@ -218,26 +220,25 @@ impl<S> Transaction<S> {
         // Generate removal actions (empty for create-table due to validation above)
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
-        let row_tracking_high_watermark = if let Some(provided) =
-            self.provided_row_tracking_high_water_mark
-        {
-            let calculated = match row_tracking_high_watermark {
-                Some(metadata) => metadata.high_water_mark(),
-                None => {
-                    RowTrackingDomainMetadata::get_high_water_mark(self.read_snapshot()?, engine)?
-                        .unwrap_or(RowTrackingDomainMetadata::MISSING_ROW_ID_HIGH_WATERMARK)
-                }
-            };
-            if provided < calculated {
-                return Err(Error::generic(format!(
-                    "Provided row-tracking high-water mark {provided} cannot be less than the \
+        let row_tracking_high_watermark =
+            if let Some(provided) = self.provided_row_tracking_high_water_mark {
+                let calculated = match row_tracking_high_watermark {
+                    Some(metadata) => metadata.high_water_mark(),
+                    None => self
+                        .read_snapshot()?
+                        .get_row_tracking_high_water_mark(engine)?
+                        .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
+                };
+                if provided < calculated {
+                    return Err(Error::generic(format!(
+                        "Provided row-tracking high-water mark {provided} cannot be less than the \
                          calculated value {calculated}",
-                )));
-            }
-            Some(RowTrackingDomainMetadata::new(provided))
-        } else {
-            row_tracking_high_watermark
-        };
+                    )));
+                }
+                Some(RowTrackingDomainMetadata::new(provided))
+            } else {
+                row_tracking_high_watermark
+            };
 
         // Generate the single row-tracking domain action, if any.
         let row_tracking_domain_action = row_tracking_high_watermark

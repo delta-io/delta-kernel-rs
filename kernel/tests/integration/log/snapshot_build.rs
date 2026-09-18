@@ -1,5 +1,6 @@
 //! Integration tests for [`Snapshot`] build semantics.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
@@ -141,6 +142,64 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
         error => error,
     };
     assert!(matches!(error, Error::Schema(_)));
+    Ok(())
+}
+
+#[rstest]
+#[case(None, None, false)]
+#[case(None, Some(false), false)]
+#[case(None, Some(true), false)]
+#[case(Some(false), None, false)]
+#[case(Some(false), Some(false), false)]
+#[case(Some(false), Some(true), false)]
+#[case(Some(true), None, false)]
+#[case(Some(true), Some(false), false)]
+#[case(Some(true), Some(true), true)]
+#[tokio::test]
+async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
+    #[case] enabled: Option<bool>,
+    #[case] suspended: Option<bool>,
+    #[case] expect_error: bool,
+    #[values(false, true)] incremental: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configuration: HashMap<_, _> = [
+        ("delta.enableRowTracking", enabled),
+        ("delta.rowTrackingSuspended", suspended),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key, value.to_string())))
+    .collect();
+
+    // === Create version 0 with row-tracking support ===
+    let schema = schema_ref! { nullable "value": INTEGER };
+    let (store, engine, table_url) = engine_store_setup("row_tracking_configuration", None);
+    create_table(&table_url, schema, "test_engine")
+        .with_table_properties([("delta.feature.rowTracking", "supported")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    let base = Snapshot::builder_for(&table_url).build(&engine)?;
+
+    // === Commit the case's enabled and suspended properties at version 1 ===
+    let mut metadata = json!({"metaData": base.table_configuration().metadata()});
+    metadata["metaData"]["configuration"] = json!(configuration);
+    add_commit(table_url.as_str(), store.as_ref(), 1, metadata.to_string()).await?;
+
+    // === Version 1 loads successfully unless row tracking is both enabled and suspended ===
+    let result = if incremental {
+        Snapshot::builder_from(base).build(&engine)
+    } else {
+        Snapshot::builder_for(table_url).build(&engine)
+    };
+    if expect_error {
+        assert_result_error_with_message(
+            result,
+            "Row tracking cannot be enabled and suspended at the same time",
+        );
+    } else {
+        assert_eq!(result.unwrap().version(), 1);
+    }
     Ok(())
 }
 

@@ -55,7 +55,10 @@ pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
 mod domain_metadata;
-pub use domain_metadata::get_domain_metadata;
+pub use domain_metadata::{
+    get_domain_metadata, snapshot_row_tracking_high_water_mark,
+    ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+};
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -2413,6 +2416,54 @@ mod tests {
         assert_eq!(&histogram.sorted_bin_boundaries[..3], &[0, 8192, 16384]);
         assert_eq!(histogram.file_counts.iter().sum::<i64>(), 10);
         assert_eq!(histogram.total_bytes.iter().sum::<i64>(), 5259);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_row_tracking_high_water_mark_present() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::Some(9),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_row_tracking_high_water_mark_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe {
+                ok_or_panic(snapshot_row_tracking_high_water_mark(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                ))
+            },
+            OptionalValue::None,
+        );
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
