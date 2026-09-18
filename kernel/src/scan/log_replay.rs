@@ -839,6 +839,13 @@ fn build_scan_output_projection(
 ) -> DeltaResult<(SchemaRef, ExpressionRef)> {
     let mut projection = ProjectionStructPatchBuilder::new(input_schema);
     match output_stats_schema {
+        Some(requested)
+            if input_schema.field(STATS_PARSED_NAME).is_some_and(|field| {
+                matches!(
+                    field.data_type(),
+                    DataType::Struct(source) if source.as_ref() == requested
+                )
+            }) => {}
         Some(requested) => {
             projection = projection.replace(
                 STATS_PARSED_NAME,
@@ -1212,7 +1219,8 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
+        build_scan_output_projection, get_add_transform_expr, scan_action_iter,
+        scan_row_schema_with_parsed_columns, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::engine::sync::SyncEngine;
@@ -1244,6 +1252,25 @@ mod tests {
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
+    }
+
+    #[test]
+    fn identical_requested_stats_schema_does_not_add_projection() -> DeltaResult<()> {
+        let stats_schema = schema_ref! { nullable "numRecords": LONG };
+        let input_schema = scan_row_schema_with_parsed_columns(Some(stats_schema.clone()), None)?;
+        let (_, projection) = build_scan_output_projection(
+            input_schema.as_ref(),
+            Some(stats_schema.as_ref()),
+            false,
+        )?;
+        let Expr::StructPatch(patch) = projection.as_ref() else {
+            panic!("expected struct patch")
+        };
+
+        assert!(patch.prepended_fields.is_empty());
+        assert!(patch.field_patches.is_empty());
+        assert!(patch.appended_fields.is_empty());
+        Ok(())
     }
 
     /// A minimal opaque predicate op for testing serialization behavior

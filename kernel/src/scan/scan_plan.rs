@@ -274,7 +274,7 @@ impl Scan {
     ///   size: long,
     ///   modificationTime: long,
     ///   dataChange: boolean,
-    ///   stats: string,                         // NULL when JSON stats are disabled
+    ///   stats: string,                         // when JSON stats are requested
     ///   tags: map<string, string>,
     ///   deletionVector: struct<...>,
     ///   baseRowId: long,
@@ -284,9 +284,9 @@ impl Scan {
     ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
     /// >
     /// ```
-    /// The fixed nullable JSON field contains values only when requested. Parsed stats may be
-    /// absent or present independently. Parsed partition values are selected independently and
-    /// omitted for unpartitioned tables. Fields needed only for pruning are omitted.
+    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
+    /// partition values are selected independently and omitted for unpartitioned tables. Fields
+    /// needed only for pruning are omitted.
     fn metadata_output_projection(
         &self,
         add_field: &StructField,
@@ -294,6 +294,18 @@ impl Scan {
         let input_schema = schema_ref! { (add_field.clone()) };
         let has_stats_parsed = input_schema.contains_col([ADD_NAME, STATS_PARSED_NAME]);
         let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
+
+        // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
+        let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
+        let projection = match (self.stats.emit_json, has_json_stats) {
+            (true, true) | (false, false) => projection,
+            (true, false) => {
+                return Err(Error::internal_error(
+                    "JSON stats were requested, but add.stats is missing from the metadata schema",
+                ));
+            }
+            (false, true) => projection.drop(STATS),
+        };
 
         // Parsed stats output.
         let projection = match (self.physical_stats_output_schema.as_ref(), has_stats_parsed) {
