@@ -368,6 +368,15 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    PrimitiveType::TimestampNanos => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some("UTC".into()),
+                    )),
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    PrimitiveType::TimestampNanosNtz => {
+                        Ok(ArrowDataType::Timestamp(TimeUnit::Nanosecond, None))
+                    }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
@@ -588,7 +597,19 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // timestampNanos is adjusted to UTC, which Arrow expresses as any non-empty timezone;
+            // an empty timezone is equivalent to None. Matches `arrow_primitive_to_kernel_type`.
+            #[cfg(feature = "nanosecond-timestamps")]
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if !tz.is_empty() => {
+                Ok(DataType::TIMESTAMP_NANOS)
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(DataType::TIMESTAMP_NANOS_NTZ),
+            // Fall back to converting nanosecond timestamps to microsecond when the
+            // nanosecond-timestamp feature is not enabled.
+            #[cfg(not(feature = "nanosecond-timestamps"))]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            #[cfg(not(feature = "nanosecond-timestamps"))]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
             {

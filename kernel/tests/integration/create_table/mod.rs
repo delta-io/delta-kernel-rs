@@ -8,6 +8,8 @@ mod ict;
 mod interval;
 mod partitioned;
 mod row_tracking;
+#[cfg(feature = "nanosecond-timestamps")]
+mod timestamp_nanos;
 mod timestamp_ntz;
 mod variant;
 

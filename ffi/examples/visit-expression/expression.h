@@ -45,6 +45,8 @@ enum LitType {
   Boolean,
   Timestamp,
   TimestampNtz,
+  TimestampNanos,
+  TimestampNanosNtz,
   Date,
   IntervalYearMonth,
   IntervalDayTime,
@@ -247,6 +249,12 @@ DEFINE_SIMPLE_SCALAR(visit_expr_double_literal, Double, double, double_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_boolean_literal, Boolean, _Bool, boolean_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_literal, Timestamp, int64_t, long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_ntz_literal, TimestampNtz, int64_t, long_data);
+DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_nanos_literal, TimestampNanos, int64_t, long_data);
+DEFINE_SIMPLE_SCALAR(
+    visit_expr_timestamp_nanos_ntz_literal,
+    TimestampNanosNtz,
+    int64_t,
+    long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_date_literal, Date, int32_t, integer_data);
 DEFINE_SIMPLE_SCALAR(
     visit_expr_interval_year_month_literal,
@@ -526,6 +534,8 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_literal_bool = visit_expr_boolean_literal,
     .visit_literal_timestamp = visit_expr_timestamp_literal,
     .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
+    .visit_literal_timestamp_nanos = visit_expr_timestamp_nanos_literal,
+    .visit_literal_timestamp_nanos_ntz = visit_expr_timestamp_nanos_ntz_literal,
     .visit_literal_date = visit_expr_date_literal,
     .visit_literal_interval_year_month = visit_expr_interval_year_month_literal,
     .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
@@ -580,6 +590,8 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_literal_bool = visit_expr_boolean_literal,
     .visit_literal_timestamp = visit_expr_timestamp_literal,
     .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
+    .visit_literal_timestamp_nanos = visit_expr_timestamp_nanos_literal,
+    .visit_literal_timestamp_nanos_ntz = visit_expr_timestamp_nanos_ntz_literal,
     .visit_literal_date = visit_expr_date_literal,
     .visit_literal_interval_year_month = visit_expr_interval_year_month_literal,
     .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
@@ -706,6 +718,8 @@ void free_expression_item(ExpressionItem ref) {
         case Boolean:
         case Timestamp:
         case TimestampNtz:
+        case TimestampNanos:
+        case TimestampNanosNtz:
         case Date:
         case IntervalYearMonth:
         case IntervalDayTime:

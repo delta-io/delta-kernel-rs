@@ -176,7 +176,7 @@ pub struct EngineSchemaVisitor {
         metadata: &CMetadataMap,
     ),
 
-    /// Visit a `timestamp` belonging to the list identified by `sibling_list_id`.
+    /// Visit a microsecond `timestamp` belonging to the list identified by `sibling_list_id`.
     pub visit_timestamp: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -185,7 +185,8 @@ pub struct EngineSchemaVisitor {
         metadata: &CMetadataMap,
     ),
 
-    /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
+    /// Visit a microsecond `timestamp` with no timezone belonging to the list identified by
+    /// `sibling_list_id`.
     pub visit_timestamp_ntz: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -255,6 +256,25 @@ pub struct EngineSchemaVisitor {
         metadata: &CMetadataMap,
         crs: KernelStringSlice,
         algorithm: KernelStringSlice,
+    ),
+
+    /// Visit a nanosecond `timestamp` belonging to the list identified by `sibling_list_id`.
+    pub visit_timestamp_nanos: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CMetadataMap,
+    ),
+
+    /// Visit a nanosecond `timestamp` with no timezone belonging to the list identified
+    /// by `sibling_list_id`.
+    pub visit_timestamp_nanos_ntz: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CMetadataMap,
     ),
 }
 
@@ -384,6 +404,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            &DataType::TIMESTAMP_NANOS => call!(visit_timestamp_nanos),
+            #[cfg(feature = "nanosecond-timestamps")]
+            &DataType::TIMESTAMP_NANOS_NTZ => call!(visit_timestamp_nanos_ntz),
             &DataType::INTERVAL_YEAR_MONTH => call!(visit_interval_year_month),
             &DataType::INTERVAL_DAY_TIME => call!(visit_interval_day_time),
             &DataType::VOID => call!(visit_void),
@@ -566,6 +590,8 @@ mod tests {
     visit_simple_type!(visit_date, "date");
     visit_simple_type!(visit_timestamp, "timestamp");
     visit_simple_type!(visit_timestamp_ntz, "timestamp_ntz");
+    visit_simple_type!(visit_timestamp_nanos, "timestamp_nanos");
+    visit_simple_type!(visit_timestamp_nanos_ntz, "timestamp_nanos_ntz");
     visit_simple_type!(visit_interval_year_month, "interval year to month");
     visit_simple_type!(visit_interval_day_time, "interval day to second");
     visit_simple_type!(visit_void, "void");
@@ -639,6 +665,8 @@ mod tests {
             visit_variant,
             visit_geometry,
             visit_geography,
+            visit_timestamp_nanos,
+            visit_timestamp_nanos_ntz,
         }
     }
 

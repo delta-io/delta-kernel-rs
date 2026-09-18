@@ -381,6 +381,14 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 ///
 /// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
 pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
+    #[cfg(feature = "nanosecond-timestamps")]
+    let is_nanos = matches!(
+        data_type,
+        &PrimitiveType::TimestampNanos | &PrimitiveType::TimestampNanosNtz
+    );
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    let is_nanos = false;
+
     matches!(
         data_type,
         &PrimitiveType::Byte
@@ -394,7 +402,7 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::TimestampNtz
             | &PrimitiveType::String
             | PrimitiveType::Decimal(_)
-    )
+    ) || is_nanos
 }
 
 #[cfg(test)]
