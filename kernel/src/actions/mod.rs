@@ -1419,7 +1419,7 @@ impl CheckpointAction {
 ///
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn has_scheme(location: &str) -> bool {
+pub(crate) fn has_scheme(location: &str) -> bool {
     for (position, ch) in location.char_indices() {
         if ch == ':' {
             return position > 0;
@@ -1467,29 +1467,8 @@ impl ContentRoot {
     /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
     pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        let path = &self.path;
-        let location = if has_scheme(path) {
-            // A URI scheme means the path is absolute and used as-is.
-            Url::parse(path).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
-                ))
-            })?
-        } else {
-            // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
-            let mut base = table_root.as_str().to_string();
-            if !base.ends_with('/') {
-                base.push('/');
-            }
-            Url::parse(&format!("{base}{path}")).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                     root {base}: {e}"
-                ))
-            })?
-        };
         Ok(FileMeta {
-            location,
+            location: crate::content_tree::resolve_amt_location(&self.path, table_root)?,
             last_modified: i64::MAX,
             size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
         })

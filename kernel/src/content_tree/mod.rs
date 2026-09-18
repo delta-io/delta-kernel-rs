@@ -5,19 +5,22 @@
 #![allow(unreachable_pub)]
 
 mod dv_conversion;
+mod reader;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use delta_kernel_derive::{IntoStructData, ToSchema};
+pub(crate) use reader::read_content_tree_add_actions;
 use url::Url;
 
+use crate::actions::has_scheme;
 use crate::engine_data::EngineData;
 use crate::expressions::{Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
-use crate::Version;
+use crate::{DeltaResult, Error, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
 pub(crate) const CONTENT_TYPE: &str = "contentType";
@@ -338,6 +341,31 @@ pub(crate) struct ManifestInfo {
     /// Number of set bits (deleted rows) in [`Self::dv`], or `None` when `dv` is absent.
     #[field_id = 523]
     pub(crate) dv_cardinality: Option<i64>,
+}
+
+/// Resolves an AMT entry `path` to an absolute [`Url`], following Iceberg V4's relative-path
+/// rules: a `path` carrying a URI scheme is absolute and parsed as-is; otherwise it is resolved
+/// relative to `table_root` by concatenation with a single `/` separator. Mirrors
+/// [`ContentRoot::to_filemeta`] so manifest entries and the content root resolve identically.
+///
+/// Returns an error if the resolved location fails to parse as a [`Url`].
+///
+/// [`ContentRoot::to_filemeta`]: crate::actions::ContentRoot::to_filemeta
+pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<Url> {
+    if has_scheme(path) {
+        Url::parse(path)
+            .map_err(|e| Error::generic(format!("Failed to parse absolute AMT path {path:?}: {e}")))
+    } else {
+        let mut base = table_root.as_str().to_string();
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        Url::parse(&format!("{base}{path}")).map_err(|e| {
+            Error::generic(format!(
+                "Failed to resolve relative AMT path {path:?} against table root {base}: {e}"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
