@@ -31,7 +31,7 @@ pub(crate) fn reader_options() -> ArrowReaderOptions {
 /// emits.
 ///
 /// Lives here (not in an engine crate) because kernel owns [`ParquetCompressionCodec`]: the orphan
-/// rule forbids either engine crate from implementing this conversion on the foreign
+/// rule forbids the default-engine crate from implementing this conversion on the foreign
 /// [`Compression`].
 #[cfg(feature = "arrow-expression")]
 impl From<ParquetCompressionCodec> for Compression {
@@ -62,6 +62,7 @@ pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions
         .with_properties(props)
         .with_skip_arrow_metadata(true)
 }
+
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
 
@@ -99,3 +100,25 @@ pub(crate) mod ensure_data_types;
 pub mod parquet_row_group_skipping;
 #[cfg(all(test, feature = "default-engine-base"))]
 pub(crate) mod test_utils;
+
+#[cfg(all(test, feature = "arrow-expression"))]
+mod tests {
+    use crate::parquet::basic::Compression;
+    use crate::table_properties::ParquetCompressionCodec;
+
+    // Literal expected values (not `Compression::from(codec)`) so a swapped arm is caught: the
+    // round-trip engine tests assert against this same conversion and would not notice.
+    #[rstest::rstest]
+    #[case(ParquetCompressionCodec::Snappy, Compression::SNAPPY)]
+    #[case(ParquetCompressionCodec::Zstd, Compression::ZSTD(Default::default()))]
+    #[case(ParquetCompressionCodec::Uncompressed, Compression::UNCOMPRESSED)]
+    #[case(ParquetCompressionCodec::Gzip, Compression::GZIP(Default::default()))]
+    #[case(ParquetCompressionCodec::Lz4, Compression::LZ4)]
+    #[case(ParquetCompressionCodec::Lz4Raw, Compression::LZ4_RAW)]
+    fn parquet_codec_maps_to_expected_compression(
+        #[case] codec: ParquetCompressionCodec,
+        #[case] expected: Compression,
+    ) {
+        assert_eq!(Compression::from(codec), expected);
+    }
+}

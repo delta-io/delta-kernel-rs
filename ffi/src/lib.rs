@@ -960,12 +960,8 @@ unsafe fn set_builder_parquet_compression_impl(
     codec: KernelStringSlice,
 ) -> DeltaResult<bool> {
     let codec = unsafe { String::try_from_slice(&codec) }?;
-    let compression = ParquetCompressionCodec::try_from(codec.as_str()).map_err(|_| {
-        delta_kernel::Error::generic(format!("unsupported parquet compression codec: {codec}"))
-    })?;
-    let mut writer_config = ParquetWriterConfig::default();
-    writer_config.compression = compression;
-    builder.parquet_writer_config = writer_config;
+    let compression = ParquetCompressionCodec::try_from_property(&codec)?;
+    builder.parquet_writer_config = ParquetWriterConfig::new(compression);
     Ok(true)
 }
 
@@ -3381,7 +3377,7 @@ mod tests {
                 allocate_err,
             ))
         };
-        // Reclaim ownership so the builder is freed when it drops at end of scope.
+        // Reclaim ownership so the test doesn't leak the builder.
         let mut builder = unsafe { Box::from_raw(builder_ptr) };
         unsafe {
             ok_or_panic(set_builder_parquet_compression(
@@ -3389,9 +3385,10 @@ mod tests {
                 kernel_string_slice!(codec),
             ))
         };
-        let mut expected_config = ParquetWriterConfig::default();
-        expected_config.compression = expected;
-        assert_eq!(builder.parquet_writer_config, expected_config);
+        assert_eq!(
+            builder.parquet_writer_config,
+            ParquetWriterConfig::new(expected)
+        );
     }
 
     #[cfg(feature = "default-engine-base")]
@@ -3404,7 +3401,7 @@ mod tests {
                 allocate_err,
             ))
         };
-        // Reclaim ownership so the builder is freed when it drops at end of scope.
+        // Reclaim ownership so the test doesn't leak the builder.
         let mut builder = unsafe { Box::from_raw(builder_ptr) };
         let codec = "invalid_codec";
         let result =

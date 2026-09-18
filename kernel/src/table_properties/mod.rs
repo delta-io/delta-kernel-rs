@@ -222,9 +222,11 @@ pub struct TableProperties {
     pub parquet_format_version: Option<String>,
 
     /// Compression codec to use when writing new Parquet data and checkpoint files. Connectors
-    /// SHOULD honor this property when configuring their Parquet writer. Use
-    /// [`TableProperties::compression_codec_or_default`] to apply the protocol-recommended
-    /// fallback ([`ParquetCompressionCodec::Zstd`]) when this field is `None`.
+    /// SHOULD honor this property when configuring their Parquet writer, via
+    /// [`TableProperties::parquet_writer_config`] (the strict accessor that rejects an
+    /// unrecognized codec). [`TableProperties::compression_codec_or_default`] is the lenient
+    /// alternative, applying the protocol-recommended fallback
+    /// ([`ParquetCompressionCodec::Zstd`]) when this field is `None`.
     pub parquet_compression_codec: Option<ParquetCompressionCodec>,
 
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
@@ -266,19 +268,19 @@ impl TableProperties {
     /// [`TableProperties::unknown_properties`]) is rejected with an error naming the value,
     /// matching create-table validation. Use [`Self::compression_codec_or_default`] for the
     /// lenient view.
+    ///
+    /// Kernel does not apply this to its own checkpoint or data writes: a connector must call this
+    /// and build its engine with the returned config (e.g. the default engine builder's
+    /// `with_parquet_writer_config`) for the codec to take effect.
     pub fn parquet_writer_config(&self) -> DeltaResult<ParquetWriterConfig> {
-        let compression = match self.parquet_compression_codec {
-            Some(codec) => codec,
-            None => match self.unknown_properties.get(PARQUET_COMPRESSION_CODEC) {
-                Some(value) => {
-                    return Err(Error::generic(format!(
-                        "unsupported parquet compression codec: {value}"
-                    )))
-                }
-                None => ParquetCompressionCodec::Zstd,
-            },
+        if let Some(codec) = self.parquet_compression_codec {
+            return Ok(ParquetWriterConfig::new(codec));
+        }
+        let compression = match self.unknown_properties.get(PARQUET_COMPRESSION_CODEC) {
+            Some(value) => ParquetCompressionCodec::try_from_property(value)?,
+            None => ParquetCompressionCodec::Zstd,
         };
-        Ok(ParquetWriterConfig { compression })
+        Ok(ParquetWriterConfig::new(compression))
     }
 
     /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column
@@ -370,15 +372,21 @@ pub enum IsolationLevel {
 
 /// Configuration for writing Parquet files.
 ///
-/// This is the engine-writer view of a table's Parquet write settings, carried to the engine by
-/// [`TableProperties::parquet_writer_config`].
-///
-/// Construct via [`Self::default`] and set fields directly; this type is `#[non_exhaustive]`.
+/// Carries the Parquet compression codec to the engine (via
+/// [`TableProperties::parquet_writer_config`]) and is the extension point for future parquet-writer
+/// settings. `#[non_exhaustive]`, so construct via [`Self::new`] or [`Self::default`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ParquetWriterConfig {
     /// Compression codec to use. Defaults to [`ParquetCompressionCodec::Zstd`].
     pub compression: ParquetCompressionCodec,
+}
+
+impl ParquetWriterConfig {
+    /// Creates a [`ParquetWriterConfig`] with the given compression codec.
+    pub fn new(compression: ParquetCompressionCodec) -> Self {
+        Self { compression }
+    }
 }
 
 /// The checkpoint policy applied when writing checkpoints
@@ -418,6 +426,15 @@ pub enum ParquetCompressionCodec {
     Lz4,
     /// `lz4_raw`. LZ4 block format.
     Lz4Raw,
+}
+
+impl ParquetCompressionCodec {
+    /// Parses a `delta.parquet.compression.codec` property value, returning an error that names the
+    /// rejected value when it is not a recognized codec.
+    pub fn try_from_property(value: &str) -> DeltaResult<Self> {
+        Self::try_from(value)
+            .map_err(|_| Error::generic(format!("unsupported parquet compression codec: {value}")))
+    }
 }
 
 #[cfg(test)]

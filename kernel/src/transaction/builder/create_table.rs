@@ -728,11 +728,9 @@ fn validate_extract_table_features_and_properties(
 
     // Reject an unrecognized compression codec at create time. Per the Delta protocol a writer
     // SHOULD abort on a codec it does not recognize; reads stay lenient (see
-    // `TableProperties::parquet_writer_config`).
+    // `TableProperties::compression_codec_or_default`).
     if let Some(codec) = properties.get(PARQUET_COMPRESSION_CODEC) {
-        ParquetCompressionCodec::try_from(codec.as_str()).map_err(|_| {
-            Error::generic(format!("unsupported parquet compression codec: {codec}"))
-        })?;
+        ParquetCompressionCodec::try_from_property(codec)?;
     }
 
     Ok(ValidatedTableProperties {

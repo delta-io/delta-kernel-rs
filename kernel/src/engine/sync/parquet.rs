@@ -350,7 +350,6 @@ mod tests {
 
         handler.write_parquet_file(url, test_data_iter()).unwrap();
 
-        // Read the footer and confirm the configured codec was applied to the column chunk.
         let file = File::open(&file_path).unwrap();
         let metadata = ParquetRecordBatchReaderBuilder::try_new(file)
             .unwrap()
