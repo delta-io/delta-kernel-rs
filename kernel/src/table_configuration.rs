@@ -939,14 +939,13 @@ impl TableConfiguration {
 mod test {
 
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
+        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1349,12 +1348,10 @@ mod test {
     #[case::nanos(DataType::TIMESTAMP_NANOS)]
     #[case::nanos_ntz(DataType::TIMESTAMP_NANOS_NTZ)]
     fn test_timestamp_nanos_validation_integration(#[case] ts_type: DataType) {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "ts", ts_type,
-        )]));
+        let schema = schema_ref! { nullable "ts": (ts_type) };
         let config = |features: &[TableFeature]| {
             MockTableConfigurationBuilder::new()
-                .with_schema(Arc::clone(&schema))
+                .with_schema(schema.clone())
                 .with_protocol(MockProtocolBuilder::new().with_features(features).build())
                 .try_build()
         };
