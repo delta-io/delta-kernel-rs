@@ -549,10 +549,8 @@ mod tests {
     // Because tests compile as binaries against packages, this test can only run correctly if we
     // use the `internal-api` feature to make mod handle public. Otherwise it's inaccessible for
     // testing.
-    // Disabled if nanosecond-timestamps is enabled, because trybuild doesn't correctly pass
-    // through this feature to the test_utils crate when compiling.
     #[test]
-    #[cfg(all(feature = "internal-api", not(feature = "nanosecond-timestamps")))]
+    #[cfg(feature = "internal-api")]
     fn invalid_handle_code() {
         let t = trybuild::TestCases::new();
         t.compile_fail("tests/invalid-handle-code/*.rs");
