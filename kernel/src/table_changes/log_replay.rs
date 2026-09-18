@@ -115,11 +115,11 @@ pub(crate) fn table_changes_action_iter_with_mode(
     let json = engine.json_handler();
     let prepare_reader = CommitBatchReader::new(
         file_indices.clone(),
-        json.read_json_files(&locations, prepare_schema, None)?,
+        json.read_json_files(&locations, prepare_schema, None /* predicate */)?,
     );
     let scan_reader = CommitBatchReader::new(
         file_indices,
-        json.read_json_files(&locations, scan_schema.clone(), None)?,
+        json.read_json_files(&locations, scan_schema.clone(), None /* predicate */)?,
     );
     let mut replay = Some(TableChangesReplay {
         engine,
