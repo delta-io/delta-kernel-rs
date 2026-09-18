@@ -957,8 +957,8 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(test, derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
 pub(crate) struct BackReference {
     /// Path to the leaf manifest containing this file, relative to the table root
     /// (e.g. `metadata/leaf-m1.parquet`). Resolved by joining the table location and this path
@@ -968,9 +968,12 @@ pub(crate) struct BackReference {
     pub(crate) pos: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
-#[cfg_attr(test, derive(Default))]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -1004,7 +1007,7 @@ pub(crate) struct Add {
     /// logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
@@ -1013,31 +1016,31 @@ pub(crate) struct Add {
     /// drops null values when that attribute is present.
     ///
     /// [`MapItem::materialize`]: crate::engine_data::MapItem::materialize
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub tags: Option<HashMap<String, Option<String>>>,
 
     /// Information about deletion vector (DV) associated with this add action
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub deletion_vector: Option<DeletionVectorDescriptor>,
 
     /// Default generated Row ID of the first row in the file. The default generated Row IDs
     /// of the other rows in the file can be reconstructed by adding the physical index of the
     /// row within the file to the base Row ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub base_row_id: Option<i64>,
 
     /// First commit version in which an add action with the same path was committed to the table.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub default_row_commit_version: Option<i64>,
 
     /// The name of the clustering implementation
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub clustering_provider: Option<String>,
 
     /// Back reference into the adaptive metadata tree. Present only when this `add` re-adds a file
     /// that has no paired `remove` (e.g. stats backfilling); otherwise absent.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) back_reference: Option<BackReference>,
 }
 
