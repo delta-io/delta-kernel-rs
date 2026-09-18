@@ -230,13 +230,14 @@ impl CommitActionsIterator {
     }
 }
 
-/// Prepend `commit v={version}` context to `err`, preserving the original variant for the two
-/// kernel error kinds that protocol validation surfaces ([`Error::Unsupported`] and
-/// [`Error::InvalidProtocol`]). Other variants fall back to [`Error::generic`].
+/// Prepend `commit v={version}` context to string-backed protocol validation errors. Structured
+/// unsupported-protocol errors retain their fields unchanged. Other variants fall back to
+/// [`Error::generic`].
 fn with_version_context(version: Version, err: Error) -> Error {
     match err {
         Error::Unsupported(msg) => Error::Unsupported(format!("commit v={version}: {msg}")),
         Error::InvalidProtocol(msg) => Error::InvalidProtocol(format!("commit v={version}: {msg}")),
+        protocol @ Error::UnsupportedProtocolVersion { .. } => protocol,
         other => Error::generic(format!("commit v={version}: {other}")),
     }
 }
@@ -323,6 +324,7 @@ mod tests {
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;
+    use crate::error::ProtocolVersionType;
     use crate::object_store::memory::InMemory;
     use crate::Snapshot;
 
@@ -690,8 +692,15 @@ mod tests {
 
     #[rstest::rstest]
     #[case::too_high_reader_version(
-        r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &Error| matches!(err, Error::Unsupported(_)),
+        r#"{"protocol":{"minReaderVersion":2147483647,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}"#,
+        |err: &Error| matches!(
+            err,
+            Error::UnsupportedProtocolVersion {
+                version_type: ProtocolVersionType::Reader,
+                min_reader_version: i32::MAX,
+                min_writer_version: 7,
+            }
+        ),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
@@ -954,8 +963,8 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, Error::Unsupported(_)),
-                "expected Error::Unsupported, got: {err:?}",
+                matches!(err, Error::UnsupportedProtocolVersion { .. }),
+                "expected Error::UnsupportedProtocolVersion, got: {err:?}",
             );
         } else {
             result.expect("snapshot-less range must drain cleanly");

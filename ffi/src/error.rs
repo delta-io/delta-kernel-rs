@@ -77,6 +77,7 @@ pub enum KernelError {
     UnpublishedVersionError = 48,
     EmptyLogError = 49,
     InvalidSnapshotHint = 50,
+    UnsupportedProtocolVersionError = 51,
 }
 
 impl From<Error> for KernelError {
@@ -114,6 +115,9 @@ impl From<Error> for KernelError {
             Error::MissingMetadata => KernelError::MissingMetadataError,
             Error::MissingProtocol => KernelError::MissingProtocolError,
             Error::InvalidProtocol(_) => KernelError::InvalidProtocolError,
+            Error::UnsupportedProtocolVersion { .. } => {
+                KernelError::UnsupportedProtocolVersionError
+            }
             Error::MissingMetadataAndProtocol => KernelError::MissingMetadataAndProtocolError,
             Error::ParseError(..) => KernelError::ParseError,
             Error::JoinFailure(_) => KernelError::JoinFailureError,
@@ -328,6 +332,9 @@ impl From<EngineExecError> for Error {
             .into(),
             KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
             KernelError::UnsupportedError => Error::Unsupported(message),
+            // EngineExecError does not retain the version fields needed to reconstruct the
+            // structured error, so this intentionally collapses to Unsupported.
+            KernelError::UnsupportedProtocolVersionError => Error::Unsupported(message),
             KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
             KernelError::SchemaError => Error::Schema(message),
             KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
@@ -380,6 +387,8 @@ impl From<EngineExecError> for Error {
 
 #[cfg(test)]
 mod error_code_tests {
+    use delta_kernel::error::ProtocolVersionType;
+
     use super::*;
 
     fn exec_error(etype: KernelError, message: &str) -> EngineExecError {
@@ -456,6 +465,20 @@ mod error_code_tests {
         );
         assert_eq!(KernelError::InvalidSnapshotHint as i32, 50);
     }
+
+    #[test]
+    fn unsupported_protocol_version_has_stable_ffi_mapping() {
+        let error = Error::UnsupportedProtocolVersion {
+            version_type: ProtocolVersionType::Reader,
+            min_reader_version: i32::MAX,
+            min_writer_version: 7,
+        };
+        assert_eq!(
+            KernelError::from(error),
+            KernelError::UnsupportedProtocolVersionError
+        );
+        assert_eq!(KernelError::UnsupportedProtocolVersionError as i32, 51);
+    }
 }
 
 #[cfg(all(test, feature = "declarative-plans"))]
@@ -475,6 +498,7 @@ mod tests {
     #[case::file_not_found(KernelError::FileNotFoundError, "File not found: boom")]
     #[case::schema(KernelError::SchemaError, "Schema error: boom")]
     #[case::unsupported(KernelError::UnsupportedError, "Unsupported: boom")]
+    #[case::unsupported_protocol(KernelError::UnsupportedProtocolVersionError, "Unsupported: boom")]
     #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
     #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
     #[case::invalid_log_segment(KernelError::InvalidLogSegment, "Invalid log segment: boom")]
