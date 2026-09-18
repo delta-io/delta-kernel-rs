@@ -145,42 +145,54 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
 }
 
 #[rstest]
-#[case::supported(SnapshotLoadFeatureCase {
+#[case::supported(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
     reader_features: &["deletionVectors"],
     writer_features: &["deletionVectors"],
     expected_error: None,
 })]
-#[case::unknown_reader(SnapshotLoadFeatureCase {
+#[case::unknown_reader(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
     reader_features: &["futureFeature"],
     writer_features: &["futureFeature"],
     expected_error: Some("Feature 'futureFeature' is not supported"),
 })]
-#[case::mixed_reader(SnapshotLoadFeatureCase {
+#[case::mixed_reader(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
     reader_features: &["deletionVectors", "futureFeature"],
     writer_features: &["deletionVectors", "futureFeature"],
     expected_error: Some("Feature 'futureFeature' is not supported"),
 })]
-#[case::unknown_writer_only(SnapshotLoadFeatureCase {
+#[case::unknown_writer_only(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
     reader_features: &["deletionVectors"],
     writer_features: &["deletionVectors", "futureFeature"],
     expected_error: None,
 })]
-#[case::unsupported_writer_only(SnapshotLoadFeatureCase {
+#[case::unsupported_writer_only(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
     reader_features: &["deletionVectors"],
     writer_features: &["deletionVectors", "generatedColumns"],
     expected_error: None,
 })]
+#[case::future_reader_version(SnapshotLoadProtocolCase {
+    min_reader_version: 4,
+    reader_features: &[],
+    writer_features: &[],
+    expected_error: Some("Unsupported minimum reader version 4"),
+})]
 #[cfg_attr(
     not(feature = "adaptive-metadata-in-dev"),
-    case::adaptive_metadata(SnapshotLoadFeatureCase {
+    case::adaptive_metadata(SnapshotLoadProtocolCase {
+        min_reader_version: 3,
         reader_features: &["adaptiveMetadata-preview"],
         writer_features: &["adaptiveMetadata-preview"],
         expected_error: Some("Feature 'adaptiveMetadata-preview' is not supported"),
     })
 )]
 #[tokio::test]
-async fn snapshot_load_rejects_unsupported_reader_features(
-    #[case] case: SnapshotLoadFeatureCase,
+async fn snapshot_load_validates_reader_protocol(
+    #[case] case: SnapshotLoadProtocolCase,
     #[values(false, true)] incremental: bool,
     #[values(false, true)] time_travel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -196,15 +208,17 @@ async fn snapshot_load_rejects_unsupported_reader_features(
     let base = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
     assert_eq!(base.version(), 0);
 
-    // Unsupported features cannot be introduced through Kernel's write APIs.
-    let commit = json!({
+    // Unsupported protocols cannot be introduced through Kernel's write APIs.
+    let mut commit = json!({
         "protocol": {
-            "minReaderVersion": 3,
+            "minReaderVersion": case.min_reader_version,
             "minWriterVersion": 7,
-            "readerFeatures": case.reader_features,
             "writerFeatures": case.writer_features,
         }
     });
+    if case.min_reader_version == 3 {
+        commit["protocol"]["readerFeatures"] = json!(case.reader_features);
+    }
     add_commit(table_url.as_str(), store.as_ref(), 1, commit.to_string()).await?;
 
     let result = match (incremental, time_travel) {
@@ -327,7 +341,8 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     Ok(())
 }
 
-struct SnapshotLoadFeatureCase {
+struct SnapshotLoadProtocolCase {
+    min_reader_version: i32,
     reader_features: &'static [&'static str],
     writer_features: &'static [&'static str],
     expected_error: Option<&'static str>,

@@ -112,8 +112,7 @@ async fn check_manifest_commit_checkpoint<E: Engine>(make_engine: impl FnOnce(Ar
     2,
     3
 )]
-// Both protocols are reader v3, so only version ordering can pick the winner. The newer checkpoint
-// action lists an extra reader feature, and that count is what the assertion checks.
+// Feature count distinguishes protocols with the same reader version.
 #[case::newer_checkpoint_protocol_wins(
     checkpoint_commit(0, &[], one_column_schema()),
     checkpoint_commit(1, &[TableFeature::TimestampWithoutTimezone], one_column_schema()),

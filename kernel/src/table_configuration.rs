@@ -712,8 +712,9 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
         match operation {
-            Operation::SnapshotLoad => self.ensure_snapshot_load_supported(),
-            Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
+            Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
+                self.ensure_read_supported(operation)
+            }
             Operation::Write => self.ensure_write_supported(),
         }
     }
@@ -724,17 +725,7 @@ impl TableConfiguration {
         self.ensure_operation_supported(Operation::Write)
     }
 
-    fn ensure_snapshot_load_supported(&self) -> DeltaResult<()> {
-        check_reader_version_range(&self.protocol)?;
-
-        for feature in self.get_enabled_reader_features() {
-            self.check_feature_support(&feature, Operation::SnapshotLoad)?;
-        }
-
-        Ok(())
-    }
-
-    /// Internal helper for read operations (Scan, Cdf)
+    /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
         check_reader_version_range(&self.protocol)?;
 
