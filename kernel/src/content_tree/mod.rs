@@ -344,8 +344,9 @@ pub(crate) struct ManifestInfo {
 
 /// Resolves an AMT entry `path` to an absolute [`Url`], following Iceberg V4's relative-path
 /// rules: a `path` carrying a URI scheme is absolute and parsed as-is; otherwise it is resolved
-/// relative to `table_root` by concatenation with a single `/` separator. Mirrors
-/// [`ContentRoot::to_filemeta`] so manifest entries and the content root resolve identically.
+/// relative to `table_root` by concatenation with a single `/` separator. Used by
+/// [`resolve_amt_filemeta`] (and thus [`ContentRoot::to_filemeta`]) so manifest entries and the
+/// content root resolve identically.
 ///
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 ///
@@ -365,6 +366,29 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<
             ))
         })
     }
+}
+
+/// Resolves an AMT node's `path` and `size_in_bytes` into a [`FileMeta`] to read. The location
+/// follows the same relative-path rules as [`resolve_amt_location`], and `last_modified` is set to
+/// [`i64::MAX`] since AMT nodes carry no modification time. Used for both the checkpoint
+/// `contentRoot` and child `DataManifest` entries so the [`FileMeta`] invariant lives in one place.
+///
+/// Returns an error if the location fails to parse as a [`Url`], or if `size_in_bytes` is negative
+/// (does not fit a [`crate::FileSize`]).
+pub(crate) fn resolve_amt_filemeta(
+    path: &str,
+    size_in_bytes: i64,
+    table_root: &Url,
+) -> DeltaResult<crate::FileMeta> {
+    Ok(crate::FileMeta {
+        location: resolve_amt_location(path, table_root)?,
+        last_modified: i64::MAX,
+        size: size_in_bytes.try_into().map_err(|_| {
+            Error::generic(format!(
+                "Failed to convert AMT content-tree node size {size_in_bytes} to FileSize"
+            ))
+        })?,
+    })
 }
 
 /// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:

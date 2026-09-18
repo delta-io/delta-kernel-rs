@@ -1241,8 +1241,15 @@ impl Scan {
                     .map(|s| s.as_ref()),
                 self.cancellation_token.as_ref(),
             )?;
+        // The AMT arm above returns a boxed iterator, so when that feature is enabled the classic
+        // path must type-erase to the same type to unify the `impl Iterator` return. When the
+        // feature is off, the AMT arm is compiled out and the classic path keeps its concrete
+        // iterator, avoiding the per-scan heap allocation and dynamic dispatch.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
         let actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send> =
             Box::new(normal.actions);
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let actions = normal.actions;
         Ok(ActionsWithCheckpointInfo {
             actions,
             checkpoint_info: normal.checkpoint_info,

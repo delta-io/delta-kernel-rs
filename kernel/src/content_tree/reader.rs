@@ -19,7 +19,7 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{Add, ContentRoot, LOG_ADD_SCHEMA};
-use crate::content_tree::{resolve_amt_location, DataContentType, TrackingStatus};
+use crate::content_tree::{resolve_amt_filemeta, DataContentType, TrackingStatus};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr_ref, lit, null_lit, Expression, ExpressionRef, MapData, Scalar,
@@ -44,8 +44,8 @@ static MANIFEST_READ_SCHEMA: LazyLock<SchemaRef> =
 /// Walks the manifest tree depth-first from the root manifest, following `DataManifest` entries to
 /// child manifests. Each manifest batch is transformed to `add` actions columnar via a reused
 /// [`ExpressionEvaluator`] (see [`add_transform_expr`]); `ManifestEntryVisitor` supplies the
-/// per-row selection so only live `Data` rows survive (`Deleted` data rows and `DataManifest`
-/// pointers are filtered out).
+/// per-row selection so only live `Data` rows survive (`Deleted`/`Replaced` data rows and
+/// `DataManifest` pointers are filtered out).
 ///
 /// `add.path` is the manifest `location` verbatim (relative), resolved later by the scan against
 /// the table root, matching how Delta `add.path` is normally handled.
@@ -119,12 +119,18 @@ fn add_transform_expr() -> DeltaResult<ExpressionRef> {
             // TODO: Wire in partition
             "partitionValues" => Arc::new(lit(empty_partition_values.clone())),
             // AMT entries carry no modification time; scans do not use it.
-            "modificationTime" => Arc::new(lit(0i64)),
-            // Checkpoint-derived adds describe reconciled state, not a change in this version.
-            "dataChange" => Arc::new(lit(false)),
+            "modificationTime" => Arc::new(lit(i64::MAX)),
+            // TODO: `dataChange` is hard-coded true; carry the real value once the entry (or the
+            // commit context) provides it.
+            "dataChange" => Arc::new(lit(true)),
             // Everything else (stats, tags, deletionVector, ...) is a typed null for now.
             // TODO: carry AMT deletion vectors and stats through; DV-bearing entries are rejected
             // during parsing until then.
+            // TODO: `defaultRowCommitVersion` also falls through to this null. Since AMT tables
+            // always enable row tracking, a scan selecting the row-commit-version column will hit
+            // the downstream `Missing defaultRowCommitVersion` error. Either reject row-commit-
+            // version selection up front (like the DV/partition rejections) or derive it from the
+            // checkpoint version.
             _ => Arc::new(null_lit(field.data_type().clone())),
         })
         .collect();
@@ -132,20 +138,6 @@ fn add_transform_expr() -> DeltaResult<ExpressionRef> {
     Ok(Arc::new(Expression::struct_from([Arc::new(
         Expression::struct_from(add_fields),
     )])))
-}
-
-/// Resolves a child `DataManifest` entry's `location` and size to a [`FileMeta`] to recurse into.
-fn manifest_filemeta(
-    location: &str,
-    file_size_in_bytes: i64,
-    table_root: &Url,
-) -> DeltaResult<FileMeta> {
-    Ok(FileMeta {
-        location: resolve_amt_location(location, table_root)?,
-        last_modified: i64::MAX,
-        size: u64::try_from(file_size_in_bytes)
-            .map_err(|_| Error::generic("manifest file size does not fit in u64"))?,
-    })
 }
 
 /// Classifies the rows of one manifest node in a single lightweight pass, producing the per-row
@@ -293,7 +285,7 @@ impl RowVisitor for ManifestEntryVisitor {
                     )));
                 }
                 let file_size_in_bytes: i64 = getters[4].get(i, "fileSizeInBytes")?;
-                self.child_manifests.push(manifest_filemeta(
+                self.child_manifests.push(resolve_amt_filemeta(
                     &location,
                     file_size_in_bytes,
                     &self.table_root,

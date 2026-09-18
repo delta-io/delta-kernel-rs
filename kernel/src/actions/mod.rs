@@ -1437,11 +1437,7 @@ impl ContentRoot {
     /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
     pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        Ok(FileMeta {
-            location: crate::content_tree::resolve_amt_location(&self.path, table_root)?,
-            last_modified: i64::MAX,
-            size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        crate::content_tree::resolve_amt_filemeta(&self.path, self.size_in_bytes, table_root)
     }
 }
 
