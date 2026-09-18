@@ -377,25 +377,79 @@ pub extern "C" fn visit_expression_literal_timestamp(
     wrap_expression(state, lit(Scalar::Timestamp(value)))
 }
 
-#[cfg(feature = "nanosecond-timestamps")]
-/// visit a timestamp literal expression 'value' (i64 representing nanoseconds since unix epoch)
+/// Visit a timestamp literal expression 'value' (i64 representing nanoseconds since unix epoch)
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_timestamp_nanos(
     state: &mut KernelExpressionVisitorState,
     value: i64,
-) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::TimestampNanos(value)))
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
+    unsafe {
+        visit_expression_literal_timestamp_nanos_impl(state, value)
+            .into_extern_result(&allocate_error)
+    }
 }
 
 #[cfg(feature = "nanosecond-timestamps")]
-/// visit a timestamp literal expression 'value' (i64 representing nanoseconds since
+fn visit_expression_literal_timestamp_nanos_impl(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> DeltaResult<usize> {
+    Ok(wrap_expression(
+        state,
+        Expression::literal(Scalar::TimestampNanos(value)),
+    ))
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_expression_literal_timestamp_nanos_impl(
+    _state: &mut KernelExpressionVisitorState,
+    _value: i64,
+) -> DeltaResult<usize> {
+    Err(delta_kernel::Error::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
+/// Visit a timestamp literal expression 'value' (i64 representing nanoseconds since
 /// unix epoch, with no timezone)
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_timestamp_nanos_ntz(
     state: &mut KernelExpressionVisitorState,
     value: i64,
-) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::TimestampNanosNtz(value)))
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
+    unsafe {
+        visit_expression_literal_timestamp_nanos_ntz_impl(state, value)
+            .into_extern_result(&allocate_error)
+    }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_expression_literal_timestamp_nanos_ntz_impl(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> DeltaResult<usize> {
+    Ok(wrap_expression(
+        state,
+        Expression::literal(Scalar::TimestampNanosNtz(value)),
+    ))
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_expression_literal_timestamp_nanos_ntz_impl(
+    _state: &mut KernelExpressionVisitorState,
+    _value: i64,
+) -> DeltaResult<usize> {
+    Err(delta_kernel::Error::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
 }
 
 /// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix

@@ -96,12 +96,6 @@ pub struct EngineExpressionVisitor {
     /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
     /// The timestamp is microsecond precision with no timezone.
     pub visit_literal_timestamp_ntz: VisitLiteralFn<i64>,
-    /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
-    /// The timestamp is nanosecond precision and adjusted to UTC.
-    pub visit_literal_timestamp_nanos: VisitLiteralFn<i64>,
-    /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
-    /// The timestamp is nanosecond precision with no timezone.
-    pub visit_literal_timestamp_nanos_ntz: VisitLiteralFn<i64>,
     /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date`
     /// belongs to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
@@ -281,6 +275,12 @@ pub struct EngineExpressionVisitor {
     /// list identified by `sibling_list_id`.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
+    /// The timestamp is nanosecond precision and adjusted to UTC.
+    pub visit_literal_timestamp_nanos: VisitLiteralFn<i64>,
+    /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
+    /// The timestamp is nanosecond precision with no timezone.
+    pub visit_literal_timestamp_nanos_ntz: VisitLiteralFn<i64>,
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.

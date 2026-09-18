@@ -344,8 +344,9 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
         .into_extern_result(&allocate_error)
 }
 
-#[cfg(feature = "nanosecond-timestamps")]
 /// Visit a timestamp_nanos field. Similar to timestamp but nanosecond resolution.
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
 ///
 /// # Safety
 ///
@@ -359,12 +360,32 @@ pub unsafe extern "C" fn visit_field_timestamp_nanos(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNanos, nullable)
-        .into_extern_result(&allocate_error)
+    visit_field_timestamp_nanos_impl(state, name_str, nullable).into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "nanosecond-timestamps")]
+fn visit_field_timestamp_nanos_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    nullable: bool,
+) -> DeltaResult<usize> {
+    visit_field_primitive_impl(state, name, PrimitiveType::TimestampNanos, nullable)
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_field_timestamp_nanos_impl(
+    _state: &mut KernelSchemaVisitorState,
+    _name: DeltaResult<&str>,
+    _nullable: bool,
+) -> DeltaResult<usize> {
+    Err(Error::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
 /// Visit a timestamp_nanos_ntz field. Similar to timestamp_ntz but nanosecond resolution.
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
 ///
 /// # Safety
 ///
@@ -378,8 +399,28 @@ pub unsafe extern "C" fn visit_field_timestamp_nanos_ntz(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNanosNtz, nullable)
+    visit_field_timestamp_nanos_ntz_impl(state, name_str, nullable)
         .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_field_timestamp_nanos_ntz_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    nullable: bool,
+) -> DeltaResult<usize> {
+    visit_field_primitive_impl(state, name, PrimitiveType::TimestampNanosNtz, nullable)
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_field_timestamp_nanos_ntz_impl(
+    _state: &mut KernelSchemaVisitorState,
+    _name: DeltaResult<&str>,
+    _nullable: bool,
+) -> DeltaResult<usize> {
+    Err(Error::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
 }
 
 /// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
