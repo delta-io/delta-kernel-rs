@@ -1,10 +1,15 @@
 //! Read-side translation for the Adaptive Metadata Tree (AMT).
 //!
-//! Translates the content-tree entries of an AMT root manifest into `Add` file actions -- the
-//! inverse of [`super::builder`]. This is the minimal read path: it surfaces live `Data` entries as
-//! `Add` actions and drops everything else. Statistics, partition values, tags, deletion vectors,
-//! and the data-file modification time are not yet carried across (see the per-field TODOs); the
-//! only entry data that flows into the action is the file location, size, and row-tracking numbers.
+//! Translates AMT content-tree entries into `Add` file actions -- the inverse of [`super::builder`].
+//! [`convert_entries_to_add_actions`] handles a normalized (root-manifest, or already-inherited)
+//! entry batch: it surfaces live `Data` entries as `Add` actions and drops everything else.
+//! [`LeafReadContext`] wraps that for leaf manifests, first materializing the tracking fields a leaf
+//! entry inherits from its parent (`snapshotId`/`sequenceNumber`/`fileSequenceNumber` by coalesce,
+//! `firstRowId` by a cross-batch prefix sum).
+//!
+//! This is the minimal read path: statistics, partition values, tags, deletion vectors, and the
+//! data-file modification time are not yet carried across (see the per-field TODOs); the only entry
+//! data that flows into the action is the file location, size, and row-tracking numbers.
 
 use std::sync::{Arc, LazyLock};
 
@@ -12,20 +17,33 @@ use crate::actions::{
     ADD_NAME, ADD_SCHEMA, DATA_CHANGE_NAME, LOG_ADD_SCHEMA, MODIFICATION_TIME_NAME,
 };
 use crate::content_tree::{
-    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, TrackingStatus, CONTENT_TYPE,
-    DV_INFO, DV_SNAPSHOT_ID, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, SEQUENCE_NUMBER, TRACKING,
-    TRACKING_STATUS,
+    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, TrackingInfo, TrackingStatus,
+    CONTENT_TYPE, DV_INFO, DV_SNAPSHOT_ID, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID,
+    LOCATION, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, ColumnName, Expression, MapData, Scalar};
+use crate::expressions::{lit, ArrayData, ColumnName, Expression, MapData, Scalar};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
+use crate::schema::{
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, StructField, StructType, ToSchema as _,
+};
 use crate::{DeltaResult, Engine, Error};
 
-/// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
-/// only the rows that read as live data files.
+/// Helper column name carrying the prefix-summed `firstRowId` values while normalizing a leaf
+/// entry batch. It is appended to the entry batch, consumed by the normalize expression, and
+/// dropped from the output.
+const FIRST_ROW_ID_HELPER: &str = "_firstRowId";
+
+/// Translates a normalized content-tree entry batch into an `Add`-action batch, keeping only the
+/// rows that read as live data files.
+///
+/// The input must be a *normalized* entry batch: every inherited tracking field (`snapshotId`,
+/// `sequenceNumber`, `fileSequenceNumber`, `firstRowId`) already materialized. A root-manifest
+/// batch is normalized by construction; a leaf-manifest batch must first be run through
+/// [`LeafReadContext::convert_leaf_entries_to_add_actions`], which applies inheritance and then
+/// delegates here.
 ///
 /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its tracking
 /// status is [live](TrackingStatus::is_live); every other entry is dropped via the returned
@@ -46,7 +64,7 @@ use crate::{DeltaResult, Engine, Error};
 /// Returns an error if a row carries an unknown tracking-status value, if a selected (live `Data`)
 /// entry carries a deletion vector (not yet supported by the read path), if the evaluator cannot be
 /// constructed or fails to evaluate, or if the selection vector length exceeds the batch.
-pub(crate) fn convert_root_entries_to_add_actions(
+pub(crate) fn convert_entries_to_add_actions(
     engine: &dyn Engine,
     entries: &dyn EngineData,
 ) -> DeltaResult<FilteredEngineData> {
@@ -63,6 +81,162 @@ pub(crate) fn convert_root_entries_to_add_actions(
     )?;
     let actions = evaluator.evaluate(entries)?;
     FilteredEngineData::try_new(actions, selector.selection)
+}
+
+/// Reads the leaf manifests of a single parent `DataManifest` entry, applying the tracking-field
+/// inheritance a leaf entry defers to its parent.
+///
+/// A leaf entry leaves `snapshotId`, `sequenceNumber`, and `fileSequenceNumber` null to inherit
+/// them from the parent, and leaves `firstRowId` null to be assigned by a prefix sum of
+/// `recordCount` seeded from the parent's `firstRowId`. Because a leaf manifest is read as a
+/// sequence of batches, the `firstRowId` cursor is carried on the context across
+/// [`Self::convert_leaf_entries_to_add_actions`] calls, so successive batches of the same leaf
+/// continue the prefix sum.
+///
+/// The inherited literals and the cursor are seeded from the parent entry once, in [`Self::new`].
+pub(crate) struct LeafReadContext {
+    /// Inherited `snapshotId` for entries that leave it null.
+    parent_snapshot_id: i64,
+    /// Inherited `sequenceNumber` for entries that leave it null.
+    parent_sequence_number: i64,
+    /// Inherited `fileSequenceNumber` for entries that leave it null.
+    parent_file_sequence_number: i64,
+    /// Next unassigned `firstRowId`. Seeded from the parent entry's `firstRowId` and advanced by
+    /// `recordCount` for each entry that receives a fresh (was-null) assignment.
+    next_first_row_id: i64,
+}
+
+impl LeafReadContext {
+    /// Builds the inheritance context from a parent `DataManifest` entry's tracking info.
+    ///
+    /// # Errors
+    /// Returns an error if any field a leaf entry inherits (`snapshotId`, `sequenceNumber`,
+    /// `fileSequenceNumber`, `firstRowId`) is null on the parent: the Delta/Iceberg protocol
+    /// requires the root-level entry to carry these, so a null indicates a malformed root manifest.
+    pub(crate) fn new(parent: &TrackingInfo) -> DeltaResult<Self> {
+        let require = |value: Option<i64>, field: &str| {
+            value.ok_or_else(|| {
+                Error::missing_data(format!(
+                    "AMT parent DataManifest entry is missing required tracking field '{field}'"
+                ))
+            })
+        };
+        Ok(Self {
+            parent_snapshot_id: require(parent.snapshot_id, TRACKING_SNAPSHOT_ID)?,
+            parent_sequence_number: require(parent.sequence_number, SEQUENCE_NUMBER)?,
+            parent_file_sequence_number: require(
+                parent.file_sequence_number,
+                FILE_SEQUENCE_NUMBER,
+            )?,
+            next_first_row_id: require(parent.first_row_id, FIRST_ROW_ID)?,
+        })
+    }
+
+    /// Converts one batch of leaf entries into an `Add`-action batch, advancing the `firstRowId`
+    /// cursor over the batch.
+    ///
+    /// Materializes the inherited tracking fields (coalescing each null against the parent's value,
+    /// and each null `firstRowId` against its prefix-sum assignment) into a normalized entry batch,
+    /// then delegates to [`convert_entries_to_add_actions`] for selection and the entry-to-`Add`
+    /// transform.
+    ///
+    /// Call once per batch of the same leaf manifest, in order: the cursor carried on `self` makes
+    /// the prefix sum continue across batches.
+    ///
+    /// # Parameters
+    /// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transforms.
+    /// - `entries`: a leaf-manifest entry batch matching [`ContentTreeNodeEntry::to_schema`].
+    ///
+    /// # Returns
+    /// A [`FilteredEngineData`] over an `Add`-action batch, as [`convert_entries_to_add_actions`].
+    ///
+    /// # Errors
+    /// Returns an error if a row has a null `recordCount`, or for any error surfaced by
+    /// [`convert_entries_to_add_actions`].
+    pub(crate) fn convert_leaf_entries_to_add_actions(
+        &mut self,
+        engine: &dyn Engine,
+        entries: &dyn EngineData,
+    ) -> DeltaResult<FilteredEngineData> {
+        let mut visitor = FirstRowIdVisitor::default();
+        visitor.visit_rows_of(entries)?;
+
+        // Assign a `firstRowId` per row, preserving existing (non-null) values and advancing the
+        // cursor only for the entries that receive a fresh assignment. The pass runs over the full
+        // batch in entry order (before selection), so dropped rows keep their ordinal position and
+        // the prefix sum stays aligned.
+        let first_row_ids: Vec<Scalar> = visitor
+            .record_counts
+            .iter()
+            .zip(&visitor.existing_first_row_ids)
+            .map(|(&record_count, existing)| match existing {
+                Some(id) => Scalar::from(*id),
+                None => {
+                    let assigned = self.next_first_row_id;
+                    self.next_first_row_id += record_count;
+                    Scalar::from(assigned)
+                }
+            })
+            .collect();
+
+        let helper_column =
+            ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
+        let append_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            FIRST_ROW_ID_HELPER,
+            DataType::LONG,
+        )]));
+        let augmented = entries.append_columns(append_schema, vec![helper_column])?;
+
+        let entry_schema = ContentTreeNodeEntry::to_schema();
+        let mut input_fields: Vec<StructField> = entry_schema.fields().cloned().collect();
+        input_fields.push(StructField::nullable(FIRST_ROW_ID_HELPER, DataType::LONG));
+        let input_schema = Arc::new(StructType::new_unchecked(input_fields));
+
+        let expr = self.build_leaf_normalize_expression(&entry_schema)?;
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            input_schema,
+            Arc::new(expr),
+            DataType::from(entry_schema),
+        )?;
+        let normalized = evaluator.evaluate(augmented.as_ref())?;
+        convert_entries_to_add_actions(engine, normalized.as_ref())
+    }
+
+    /// Builds the transform that rewrites a leaf entry (augmented with the [`FIRST_ROW_ID_HELPER`]
+    /// column) into a normalized [`ContentTreeNodeEntry`]: the inherited tracking fields are
+    /// coalesced against the parent's literals and the prefix-sum column, and every other field is
+    /// passed through unchanged.
+    fn build_leaf_normalize_expression(
+        &self,
+        entry_schema: &StructType,
+    ) -> DeltaResult<Expression> {
+        let inherit = |field: &str, parent: i64| {
+            Expression::coalesce([Expression::column([TRACKING, field]), lit(parent)])
+        };
+        // Every field is passed through by column; only the inherited tracking fields are
+        // coalesced. Unlike the write path, no field may fall through to a typed null --
+        // that would erase real entry data.
+        let tracking = struct_expr_from_schema(&TrackingInfo::to_schema(), |name| {
+            Some(match name {
+                TRACKING_SNAPSHOT_ID => inherit(TRACKING_SNAPSHOT_ID, self.parent_snapshot_id),
+                SEQUENCE_NUMBER => inherit(SEQUENCE_NUMBER, self.parent_sequence_number),
+                FILE_SEQUENCE_NUMBER => {
+                    inherit(FILE_SEQUENCE_NUMBER, self.parent_file_sequence_number)
+                }
+                FIRST_ROW_ID => Expression::coalesce([
+                    Expression::column([TRACKING, FIRST_ROW_ID]),
+                    Expression::column([FIRST_ROW_ID_HELPER]),
+                ]),
+                other => Expression::column([TRACKING, other]),
+            })
+        })?;
+        struct_expr_from_schema(entry_schema, |name| {
+            Some(match name {
+                TRACKING => tracking.clone(),
+                other => Expression::column([other]),
+            })
+        })
+    }
 }
 
 // === Helpers ===
@@ -199,12 +373,55 @@ impl RowVisitor for AddSelectionVisitor {
     }
 }
 
+/// Collects the per-row `recordCount` and any existing `tracking.firstRowId` from a leaf entry
+/// batch, so [`LeafReadContext::convert_leaf_entries_to_add_actions`] can compute the prefix-sum
+/// `firstRowId` assignments.
+#[derive(Default)]
+struct FirstRowIdVisitor {
+    /// `recordCount` per row, in entry order.
+    record_counts: Vec<i64>,
+    /// Existing `tracking.firstRowId` per row (`None` when the entry defers assignment).
+    existing_first_row_ids: Vec<Option<i64>>,
+}
+
+impl RowVisitor for FirstRowIdVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![
+                    ColumnName::new([RECORD_COUNT]),
+                    ColumnName::new([TRACKING, FIRST_ROW_ID]),
+                ],
+                vec![DataType::LONG, DataType::LONG],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        self.record_counts.reserve(row_count);
+        self.existing_first_row_ids.reserve(row_count);
+        for row in 0..row_count {
+            let record_count: i64 = getters[0].get_opt(row, RECORD_COUNT)?.ok_or_else(|| {
+                Error::missing_data(format!(
+                    "AMT content-tree leaf entry has a null required field '{RECORD_COUNT}'"
+                ))
+            })?;
+            self.record_counts.push(record_count);
+            self.existing_first_row_ids
+                .push(getters[1].get_opt(row, FIRST_ROW_ID)?);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::content_tree::{DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo};
+    use crate::content_tree::{DataFileFormat, DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
@@ -318,7 +535,7 @@ mod tests {
             added_data_entry("b.parquet", 200, 20, 10, 5),
         ];
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
+            convert_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
                 .unwrap(),
         );
 
@@ -341,7 +558,7 @@ mod tests {
         let engine = SyncEngine::new();
         let entries = [added_data_entry("a.parquet", 1, 1, 0, 0)];
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
+            convert_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
                 .unwrap(),
         )
         .try_into_record_batch()
@@ -361,7 +578,7 @@ mod tests {
         let live = added_data_entry("live.parquet", 42, 7, 3, 9);
 
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(
+            convert_entries_to_add_actions(
                 &engine,
                 entry_batch(&engine, &[deleted, manifest, live]).as_ref(),
             )
@@ -386,7 +603,7 @@ mod tests {
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
         entry.tracking.status = status;
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
+            convert_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
                 .unwrap(),
         );
         assert_eq!(out.len(), usize::from(kept));
@@ -413,7 +630,7 @@ mod tests {
             entry.tracking.dv_snapshot_id = Some(1);
         }
         let result =
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
+            convert_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, "deletion vector");
     }
 
@@ -421,10 +638,278 @@ mod tests {
     fn empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
-                .unwrap(),
+            convert_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref()).unwrap(),
         );
         assert_eq!(out.len(), 0);
+    }
+
+    // === Leaf read path ===
+
+    /// A leaf `Data`/`Added` entry whose inherited tracking fields (`snapshotId`,
+    /// `sequenceNumber`/`fileSequenceNumber`, `firstRowId`) may be left null to exercise
+    /// inheritance. `sequence_number` sets both sequence fields.
+    fn leaf_entry(
+        path: &str,
+        size: i64,
+        num_records: i64,
+        snapshot_id: Option<i64>,
+        sequence_number: Option<i64>,
+        first_row_id: Option<i64>,
+    ) -> ContentTreeNodeEntry {
+        let mut entry = added_data_entry(path, size, num_records, 0, 0);
+        entry.tracking.snapshot_id = snapshot_id;
+        entry.tracking.sequence_number = sequence_number;
+        entry.tracking.file_sequence_number = sequence_number;
+        entry.tracking.first_row_id = first_row_id;
+        entry
+    }
+
+    /// A parent `DataManifest` entry's tracking info supplying the values leaf entries inherit.
+    fn parent_tracking(
+        snapshot_id: Option<i64>,
+        sequence_number: Option<i64>,
+        file_sequence_number: Option<i64>,
+        first_row_id: Option<i64>,
+    ) -> TrackingInfo {
+        TrackingInfo {
+            status: TrackingStatus::Added,
+            snapshot_id,
+            dv_snapshot_id: None,
+            sequence_number,
+            file_sequence_number,
+            first_row_id,
+            deleted_positions: None,
+            replaced_positions: None,
+        }
+    }
+
+    /// A fully-populated parent (`snapshotId` 7, sequence 5, `firstRowId` 100) for the common case.
+    fn valid_parent() -> TrackingInfo {
+        parent_tracking(Some(7), Some(5), Some(5), Some(100))
+    }
+
+    #[test]
+    fn leaf_inherits_sequence_and_assigns_first_row_id() {
+        let engine = SyncEngine::new();
+        let entries = [
+            leaf_entry("a.parquet", 100, 10, None, None, None),
+            leaf_entry("b.parquet", 200, 20, None, None, None),
+        ];
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+        let out = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+            )
+            .unwrap(),
+        );
+        // baseRowId is prefix-summed from the parent's 100 by recordCount; defaultRowCommitVersion
+        // inherits the parent's sequence number 5.
+        let expected = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 100, 100, 5),
+                expected_add_row("b.parquet", 200, 110, 5),
+            ],
+        );
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[test]
+    fn leaf_preserves_its_own_non_null_inherited_fields() {
+        let engine = SyncEngine::new();
+        // The entry carries its own sequence 99 and firstRowId 500, which win over the parent's.
+        let entries = [leaf_entry(
+            "a.parquet",
+            100,
+            10,
+            Some(3),
+            Some(99),
+            Some(500),
+        )];
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+        let out = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+            )
+            .unwrap(),
+        );
+        let expected = expected_batch(&engine, &[expected_add_row("a.parquet", 100, 500, 99)]);
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[test]
+    fn existing_first_row_id_is_preserved_and_does_not_advance_cursor() {
+        let engine = SyncEngine::new();
+        // The first entry keeps its own firstRowId 500 and must NOT advance the cursor, so the
+        // second (was-null) entry is still assigned the seeded 100.
+        let entries = [
+            leaf_entry("a.parquet", 1, 7, None, None, Some(500)),
+            leaf_entry("b.parquet", 1, 10, None, None, None),
+        ];
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+        let out = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+            )
+            .unwrap(),
+        );
+        let expected = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 1, 500, 5),
+                expected_add_row("b.parquet", 1, 100, 5),
+            ],
+        );
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[test]
+    fn first_row_id_cursor_forwards_across_batches() {
+        let engine = SyncEngine::new();
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+
+        let batch1 = [
+            leaf_entry("a.parquet", 1, 10, None, None, None),
+            leaf_entry("b.parquet", 1, 20, None, None, None),
+        ];
+        let out1 = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &batch1).as_ref(),
+            )
+            .unwrap(),
+        );
+        let expected1 = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 1, 100, 5),
+                expected_add_row("b.parquet", 1, 110, 5),
+            ],
+        );
+        assert_eq!(
+            out1.try_into_record_batch().unwrap(),
+            expected1.try_into_record_batch().unwrap()
+        );
+
+        // The cursor persists on the context: 100 + 10 + 20 = 130.
+        let batch2 = [leaf_entry("c.parquet", 1, 5, None, None, None)];
+        let out2 = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &batch2).as_ref(),
+            )
+            .unwrap(),
+        );
+        let expected2 = expected_batch(&engine, &[expected_add_row("c.parquet", 1, 130, 5)]);
+        assert_eq!(
+            out2.try_into_record_batch().unwrap(),
+            expected2.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[test]
+    fn deleted_leaf_entry_is_dropped_and_keeps_prefix_sum_ordinal() {
+        let engine = SyncEngine::new();
+        let a = leaf_entry("a.parquet", 1, 10, None, None, None);
+        // A dropped Deleted entry carries its own firstRowId, so it neither reassigns nor advances.
+        let mut deleted = leaf_entry("del.parquet", 1, 7, None, None, Some(999));
+        deleted.tracking.status = TrackingStatus::Deleted;
+        let c = leaf_entry("c.parquet", 1, 20, None, None, None);
+
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+        let out = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &[a, deleted, c]).as_ref(),
+            )
+            .unwrap(),
+        );
+        // `a` -> 100; the Deleted entry is dropped and does not advance; `c` -> 110.
+        let expected = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 1, 100, 5),
+                expected_add_row("c.parquet", 1, 110, 5),
+            ],
+        );
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::snapshot(None, Some(5), Some(5), Some(100), TRACKING_SNAPSHOT_ID)]
+    #[case::sequence(Some(7), None, Some(5), Some(100), SEQUENCE_NUMBER)]
+    #[case::file_sequence(Some(7), Some(5), None, Some(100), FILE_SEQUENCE_NUMBER)]
+    #[case::first_row_id(Some(7), Some(5), Some(5), None, FIRST_ROW_ID)]
+    fn leaf_read_context_rejects_null_parent_field(
+        #[case] snapshot_id: Option<i64>,
+        #[case] sequence_number: Option<i64>,
+        #[case] file_sequence_number: Option<i64>,
+        #[case] first_row_id: Option<i64>,
+        #[case] expected_field: &str,
+    ) {
+        let result = LeafReadContext::new(&parent_tracking(
+            snapshot_id,
+            sequence_number,
+            file_sequence_number,
+            first_row_id,
+        ));
+        assert_result_error_with_message(result, expected_field);
+    }
+
+    #[test]
+    fn leaf_live_entry_with_deletion_vector_errors() {
+        let engine = SyncEngine::new();
+        let mut entry = leaf_entry("f.parquet", 10, 5, None, None, None);
+        entry.deletion_vector = Some(DeletionVectorInfo {
+            location: "dv.bin".to_string(),
+            offset: 0,
+            size_in_bytes: 1,
+            cardinality: 1,
+        });
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+        let result = ctx
+            .convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
+        assert_result_error_with_message(result, "deletion vector");
+    }
+
+    #[test]
+    fn leaf_empty_batch_yields_empty_and_preserves_cursor() {
+        let engine = SyncEngine::new();
+        let mut ctx = LeafReadContext::new(&valid_parent()).unwrap();
+        let empty = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
+                .unwrap(),
+        );
+        assert_eq!(empty.len(), 0);
+
+        // The seeded cursor is untouched by the empty batch, so the next entry still starts at 100.
+        let out = filtered_to_batch(
+            ctx.convert_leaf_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &[leaf_entry("a.parquet", 1, 10, None, None, None)]).as_ref(),
+            )
+            .unwrap(),
+        );
+        let expected = expected_batch(&engine, &[expected_add_row("a.parquet", 1, 100, 5)]);
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
     }
 
     /// Materializes a [`FilteredEngineData`] by applying its selection vector, so tests can compare
