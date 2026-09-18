@@ -1414,36 +1414,6 @@ impl CheckpointAction {
     }
 }
 
-/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) fn has_scheme(location: &str) -> bool {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return position > 0;
-        }
-        if !is_scheme_char(ch, position) {
-            return false;
-        }
-    }
-    false
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
-}
-
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
     /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.

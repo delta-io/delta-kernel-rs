@@ -2,6 +2,9 @@
 // read tests.
 mod scan_cancellation;
 
+// adaptiveMetadata content-tree scan dispatch (feature-gated).
+mod adaptive_metadata_scan;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::vec;

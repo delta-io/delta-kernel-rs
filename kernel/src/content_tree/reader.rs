@@ -6,7 +6,8 @@
 //! and turns each live `Data` entry into an `add` action so the normal scan log-replay
 //! ([`crate::scan::log_replay`]) can consume it. Anything the read path cannot yet represent is
 //! rejected rather than silently dropped: entries with a deletion vector, entries with tracked
-//! position deletes/replaces, manifests with a manifest-level deletion vector, and delete-oriented
+//! position deletes/replaces, entries whose `firstRowId` would be inherited from the parent
+//! `DataManifest` (null), manifests with a manifest-level deletion vector, and delete-oriented
 //! entries (`PositionDeletes`/`EqualityDeletes`/`DeleteManifest`), all error. Per-file statistics
 //! are not yet emitted either (data skipping over AMT scans is a follow-up).
 //!
@@ -51,7 +52,8 @@ static MANIFEST_READ_SCHEMA: LazyLock<SchemaRef> =
 ///
 /// Returns an empty vector when the tree contains no live data files. Errors if a manifest cannot
 /// be read, or if an entry cannot yet be represented as an `add` action: a data entry carrying a
-/// deletion vector, any live entry with tracked position deletes/replaces, a manifest with a
+/// deletion vector, a live data entry with a null `firstRowId` (baseRowId inheritance is not yet
+/// wired in), any live entry with tracked position deletes/replaces, a manifest with a
 /// manifest-level deletion vector, or a `PositionDeletes`/`EqualityDeletes`/`DeleteManifest` entry.
 ///
 /// [`ExpressionEvaluator`]: crate::ExpressionEvaluator
@@ -67,20 +69,25 @@ pub(crate) fn read_content_tree_add_actions(
         LOG_ADD_SCHEMA.clone().into(),
     )?;
 
-    let mut pending_manifests = vec![content_root.to_filemeta(table_root)?];
+    // Each pending manifest carries whether it is the root: `DataManifest` entries are only
+    // allowed in the root, so tracking this both enforces the spec and prevents cycles (only the
+    // once-processed root can reference child manifests, so the walk always terminates).
+    let mut pending_manifests = vec![(content_root.to_filemeta(table_root)?, true)];
     let mut add_batches: Vec<Box<dyn EngineData>> = Vec::new();
 
     // TODO: Switch to async processing
-    while let Some(manifest) = pending_manifests.pop() {
+    while let Some((manifest, is_root)) = pending_manifests.pop() {
         for batch in engine.parquet_handler().read_parquet_files(
             std::slice::from_ref(&manifest),
             MANIFEST_READ_SCHEMA.clone(),
             None,
         )? {
             let batch = batch?;
-            let mut visitor = ManifestEntryVisitor::new(table_root);
+            let mut visitor = ManifestEntryVisitor::new(table_root, is_root);
             visitor.visit_rows_of(batch.as_ref())?;
-            pending_manifests.extend(visitor.child_manifests);
+            // Child manifests are never root, so any nested `DataManifest` they contain is
+            // rejected.
+            pending_manifests.extend(visitor.child_manifests.into_iter().map(|m| (m, false)));
             // Transform the whole batch columnar, then keep only the live data-file rows.
             if visitor.selection.iter().any(|&selected| selected) {
                 let adds = add_transform.evaluate(batch.as_ref())?;
@@ -145,24 +152,28 @@ fn manifest_filemeta(
 /// `selection` the columnar transform is filtered by, plus the child manifest [`FileMeta`]s to
 /// recurse into. `Deleted`-status rows are unselected (not live). Anything the read path cannot
 /// yet represent is rejected with an error rather than dropped: a live data entry carrying a
-/// deletion vector, any live entry with tracked position deletes/replaces, a manifest with a
-/// manifest-level deletion vector, and `PositionDeletes`/`EqualityDeletes`/`DeleteManifest`
-/// entries.
+/// deletion vector, a live data entry with a null `firstRowId`, any live entry with tracked
+/// position deletes/replaces, a manifest with a manifest-level deletion vector, and
+/// `PositionDeletes`/`EqualityDeletes`/`DeleteManifest` entries.
 struct ManifestEntryVisitor {
     /// Base URL for resolving `DataManifest` locations into child [`FileMeta`]s.
     table_root: Url,
+    /// Whether the manifest being visited is the root. `DataManifest` entries are only allowed in
+    /// the root; encountering one in a non-root manifest is rejected.
+    is_root: bool,
     /// One entry per manifest row: `true` for a live `Data` file (emitted as an `add`), `false`
-    /// for `Deleted` data rows and `DataManifest` pointers. Aligns with the batch the transform
-    /// evaluates, so it can drive [`EngineData::apply_selection_vector`].
+    /// for non-live data rows (`Deleted`/`Replaced`) and `DataManifest` pointers. Aligns with the
+    /// batch the transform evaluates, so it can drive [`EngineData::apply_selection_vector`].
     selection: Vec<bool>,
     /// The child `DataManifest` entries to recurse into, resolved to [`FileMeta`]s.
     child_manifests: Vec<FileMeta>,
 }
 
 impl ManifestEntryVisitor {
-    fn new(table_root: &Url) -> Self {
+    fn new(table_root: &Url, is_root: bool) -> Self {
         Self {
             table_root: table_root.clone(),
+            is_root,
             selection: Vec::new(),
             child_manifests: Vec::new(),
         }
@@ -182,6 +193,7 @@ impl RowVisitor for ManifestEntryVisitor {
                     column_name!("tracking.deletedPositions"),
                     column_name!("tracking.replacedPositions"),
                     column_name!("manifestInfo.dv"),
+                    column_name!("tracking.firstRowId"),
                 ],
                 vec![
                     DataType::INTEGER,
@@ -192,6 +204,7 @@ impl RowVisitor for ManifestEntryVisitor {
                     DataType::BINARY,
                     DataType::BINARY,
                     DataType::BINARY,
+                    DataType::LONG,
                 ],
             )
                 .into()
@@ -202,11 +215,19 @@ impl RowVisitor for ManifestEntryVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require_getters(getters.len())?;
         for i in 0..row_count {
+            // Only `Added` and `Existing` entries are live. `Deleted` and `Replaced` are not, so
+            // drop them without inspecting their content; any other status is unrecognized and
+            // rejected rather than silently treated as live.
             let status: i32 = getters[2].get(i, "tracking.status")?;
-            if status == TrackingStatus::Deleted as i32 {
-                // Deleted entries of any content type are not live; drop without inspecting them.
+            if status == TrackingStatus::Deleted as i32 || status == TrackingStatus::Replaced as i32
+            {
                 self.selection.push(false);
                 continue;
+            }
+            if status != TrackingStatus::Added as i32 && status != TrackingStatus::Existing as i32 {
+                return Err(Error::generic(format!(
+                    "content tree entry has unrecognized tracking status {status}"
+                )));
             }
             let content_type: i32 = getters[0].get(i, "contentType")?;
             let location: String = getters[1].get(i, "location")?;
@@ -238,8 +259,29 @@ impl RowVisitor for ManifestEntryVisitor {
                          scan read path does not yet support"
                     )));
                 }
+                // adaptiveMetadata tables always enable row tracking, so a live data file must
+                // carry a `firstRowId`. A null one is inherited from the parent `DataManifest`
+                // entry; without that inheritance the emitted `add.baseRowId` would be silently
+                // wrong, so reject rather than drop it.
+                // TODO: inherit firstRowId/defaultRowCommitVersion from the parent DataManifest.
+                let first_row_id: Option<i64> = getters[8].get_opt(i, "tracking.firstRowId")?;
+                if first_row_id.is_none() {
+                    return Err(Error::unsupported(format!(
+                        "content tree data file {location:?} has no firstRowId; baseRowId \
+                         inheritance from the parent DataManifest entry is not yet supported by \
+                         the AMT scan read path"
+                    )));
+                }
                 self.selection.push(true);
             } else if content_type == DataContentType::DataManifest as i32 {
+                // `DataManifest` entries are only allowed in the root manifest. Rejecting a nested
+                // one enforces the spec and guarantees the walk terminates (no manifest cycles).
+                if !self.is_root {
+                    return Err(Error::unsupported(format!(
+                        "content tree references a nested DataManifest {location:?}, but \
+                         DataManifest entries are only allowed in the root manifest"
+                    )));
+                }
                 // A manifest-level deletion vector marks child entries as deleted; we cannot yet
                 // apply it, so reject rather than return the child files as if none were deleted.
                 // TODO: carry AMT manifest-level deletion vectors through to the scan.
@@ -270,11 +312,11 @@ impl RowVisitor for ManifestEntryVisitor {
 }
 
 fn require_getters(len: usize) -> DeltaResult<()> {
-    if len == 8 {
+    if len == 9 {
         Ok(())
     } else {
         Err(Error::InternalError(format!(
-            "ManifestEntryVisitor expects 8 getters, got {len}"
+            "ManifestEntryVisitor expects 9 getters, got {len}"
         )))
     }
 }
@@ -330,6 +372,26 @@ mod tests {
         deleted_positions: Option<&[u8]>,
         replaced_positions: Option<&[u8]>,
     ) -> Scalar {
+        tracking_raw(
+            status as i32,
+            first_row_id,
+            deleted_positions,
+            replaced_positions,
+        )
+    }
+
+    /// A `tracking` struct scalar with all fields null except `status`, set to a raw `i32` (so a
+    /// test can inject a value outside the defined [`TrackingStatus`] range).
+    fn tracking_with_status_value(status: i32) -> Scalar {
+        tracking_raw(status, None, None, None)
+    }
+
+    fn tracking_raw(
+        status: i32,
+        first_row_id: Option<i64>,
+        deleted_positions: Option<&[u8]>,
+        replaced_positions: Option<&[u8]>,
+    ) -> Scalar {
         Scalar::Struct(
             StructData::try_new(
                 vec![
@@ -339,7 +401,7 @@ mod tests {
                     StructField::nullable("replacedPositions", DataType::BINARY),
                 ],
                 vec![
-                    Scalar::from(status as i32),
+                    Scalar::from(status),
                     first_row_id.map_or(Scalar::Null(DataType::LONG), Scalar::from),
                     binary_or_null(deleted_positions),
                     binary_or_null(replaced_positions),
@@ -442,13 +504,19 @@ mod tests {
     /// Table root child `DataManifest` locations resolve against in the visitor tests.
     const TEST_TABLE_ROOT: &str = "file:///tmp/table/";
 
-    /// Runs [`ManifestEntryVisitor`] over `rows`, returning the visitor or the visit error.
+    /// Runs [`ManifestEntryVisitor`] over `rows` as the root manifest, returning the visitor or the
+    /// visit error.
     fn try_visit(rows: Vec<Vec<Scalar>>) -> DeltaResult<ManifestEntryVisitor> {
+        try_visit_at(rows, true)
+    }
+
+    /// Like [`try_visit`], but lets the caller choose whether the manifest is the root.
+    fn try_visit_at(rows: Vec<Vec<Scalar>>, is_root: bool) -> DeltaResult<ManifestEntryVisitor> {
         let table_root = Url::parse(TEST_TABLE_ROOT).unwrap();
         let data = SyncEngine::new()
             .evaluation_handler()
             .create_many(manifest_schema(), rows)?;
-        let mut visitor = ManifestEntryVisitor::new(&table_root);
+        let mut visitor = ManifestEntryVisitor::new(&table_root, is_root);
         visitor.visit_rows_of(data.as_ref())?;
         Ok(visitor)
     }
@@ -488,19 +556,47 @@ mod tests {
         assert_eq!(visitor.child_manifests[0].size, 2048);
     }
 
-    #[test]
-    fn visitor_skips_deleted_data_entries() {
-        // A `Deleted`-status data file is legitimately not live: unselected, no error.
+    #[rstest]
+    #[case::deleted(TrackingStatus::Deleted)]
+    #[case::replaced(TrackingStatus::Replaced)]
+    fn visitor_skips_non_live_data_entries(#[case] status: TrackingStatus) {
+        // Only `Added`/`Existing` are live; `Deleted` and `Replaced` are legitimately not live, so
+        // they are unselected without error.
         let visitor = visit(vec![row(
             DataContentType::Data,
-            "data/deleted.parquet",
-            TrackingStatus::Deleted,
+            "data/non-live.parquet",
+            status,
             None,
             None,
             1,
         )]);
         assert_eq!(visitor.selection, vec![false]);
         assert!(visitor.child_manifests.is_empty());
+    }
+
+    #[test]
+    fn visitor_rejects_unrecognized_tracking_status() {
+        // A status outside the defined set cannot be classified as live or not, so reject it
+        // rather than guess. `TrackingStatus` defines 0..=3; 99 is unrecognized.
+        let mut row = row(
+            DataContentType::Data,
+            "data/f1.parquet",
+            TrackingStatus::Added,
+            None,
+            None,
+            1,
+        );
+        row[2] = tracking_with_status_value(99);
+        let result = try_visit(vec![row]);
+        assert_result_error_with_message(result, "unrecognized tracking status");
+    }
+
+    #[test]
+    fn visitor_rejects_nested_data_manifest() {
+        // `DataManifest` entries are root-only; a non-root manifest containing one is rejected
+        // (this is also what guarantees the manifest walk cannot cycle).
+        let result = try_visit_at(vec![manifest_row_with_dv(None)], false);
+        assert_result_error_with_message(result, "nested DataManifest");
     }
 
     #[rstest]
@@ -536,6 +632,21 @@ mod tests {
             1024,
         )]);
         assert_result_error_with_message(result, "has a deletion vector");
+    }
+
+    #[test]
+    fn visitor_rejects_live_data_entry_with_null_first_row_id() {
+        // A live data file with no `firstRowId` would inherit it from the parent DataManifest; that
+        // inheritance is not wired in, so emitting a null `baseRowId` would be silently wrong.
+        let result = try_visit(vec![row(
+            DataContentType::Data,
+            "data/f1.parquet",
+            TrackingStatus::Added,
+            None,
+            None,
+            1024,
+        )]);
+        assert_result_error_with_message(result, "has no firstRowId");
     }
 
     #[rstest]
@@ -637,15 +748,15 @@ mod tests {
             .len()
     }
 
-    /// Reads all `add` paths produced by [`read_content_tree_add_actions`], sorted.
-    fn collect_add_paths(batches: &[Box<dyn EngineData>]) -> DeltaResult<Vec<String>> {
+    /// Reads all `add` actions produced by [`read_content_tree_add_actions`], sorted by path.
+    fn collect_adds(batches: &[Box<dyn EngineData>]) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
         for batch in batches {
             visitor.visit_rows_of(batch.as_ref())?;
         }
-        let mut paths: Vec<String> = visitor.adds.into_iter().map(|a| a.path).collect();
-        paths.sort();
-        Ok(paths)
+        let mut adds = visitor.adds;
+        adds.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(adds)
     }
 
     #[test]
@@ -702,17 +813,26 @@ mod tests {
         let content_root =
             ContentRoot::new("metadata/root.parquet".to_string(), root_size as i64, 0);
         let batches = read_content_tree_add_actions(&engine, &table_root, &content_root)?;
-        let paths = collect_add_paths(&batches)?;
+        let adds = collect_adds(&batches)?;
 
-        // `add.path` is the manifest `location` verbatim (relative); the scan resolves it against
-        // the table root at read time.
-        assert_eq!(
-            paths,
-            vec![
-                "data/leaf-f1.parquet".to_string(),
-                "data/root-f1.parquet".to_string(),
-            ]
-        );
+        // The two live data files (leaf + root) surface; the deleted one does not.
+        let paths: Vec<&str> = adds.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, vec!["data/leaf-f1.parquet", "data/root-f1.parquet"]);
+
+        // `add.path` is the manifest `location` verbatim (relative); `size` and `baseRowId` come
+        // from the entry, while `modificationTime`/`dataChange` are broadcast constants. Assert the
+        // full remap, not just the path.
+        let leaf = &adds[0];
+        assert_eq!(leaf.size, 2048);
+        assert_eq!(leaf.base_row_id, Some(200));
+        assert_eq!(leaf.modification_time, 0);
+        assert!(!leaf.data_change);
+
+        let root = &adds[1];
+        assert_eq!(root.size, 1024);
+        assert_eq!(root.base_row_id, Some(100));
+        assert_eq!(root.modification_time, 0);
+        assert!(!root.data_change);
         Ok(())
     }
 }

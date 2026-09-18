@@ -16,8 +16,6 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -1168,46 +1166,60 @@ impl Scan {
         // adaptiveMetadata tables describe their live files via a `checkpoint` action's
         // `contentRoot` manifest tree rather than a classic checkpoint. When such an action is
         // present, replay the content tree into `add` actions instead of the normal log replay.
+        // The feature check keeps classic tables off the detection path entirely (which would
+        // otherwise be an extra full log pass per scan).
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = self.find_latest_checkpoint_action(engine)? {
-            // TODO: support partitioned adaptiveMetadata tables (read the entry `partition` column
-            // into partition values); until then, reject them rather than return wrong results.
-            if !self
+        if self
+            .snapshot
+            .table_configuration()
+            .is_feature_supported(&crate::table_features::TableFeature::AdaptiveMetadataPreview)
+        {
+            if let Some(checkpoint) = self
                 .snapshot
-                .table_configuration()
-                .metadata()
-                .partition_columns()
-                .is_empty()
+                .log_segment()
+                .latest_checkpoint_action(engine)?
             {
-                return Err(Error::unsupported(
-                    "scanning partitioned adaptiveMetadata tables is not yet supported",
-                ));
+                // TODO: support partitioned adaptiveMetadata tables (read the entry `partition`
+                // column into partition values); until then, reject them rather than return wrong
+                // results.
+                if !self
+                    .snapshot
+                    .table_configuration()
+                    .metadata()
+                    .partition_columns()
+                    .is_empty()
+                {
+                    return Err(Error::unsupported(
+                        "scanning partitioned adaptiveMetadata tables is not yet supported",
+                    ));
+                }
+                // TODO: replay commits after the checkpoint. Until then require the checkpoint to
+                // cover the snapshot version so the content tree alone describes the full state.
+                let snapshot_version = crate::version_as_i64(self.snapshot.version())?;
+                if checkpoint.version() != snapshot_version {
+                    return Err(Error::unsupported(format!(
+                        "scanning adaptiveMetadata tables requires the checkpoint version ({}) to \
+                         cover the snapshot version ({}); post-checkpoint commit replay is not yet \
+                         supported",
+                        checkpoint.version(),
+                        self.snapshot.version()
+                    )));
+                }
+                let batches = crate::content_tree::read_content_tree_add_actions(
+                    engine,
+                    self.snapshot.table_root(),
+                    &checkpoint.content_root,
+                )?;
+                // Content-tree batches are reconciled state, like checkpoint batches, so
+                // `is_log_batch` is false. No parsed stats are emitted yet, so use the stats-less
+                // config.
+                let actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send> =
+                    Box::new(batches.into_iter().map(|d| Ok(ActionsBatch::new(d, false))));
+                return Ok(ActionsWithCheckpointInfo {
+                    actions,
+                    checkpoint_info: CheckpointReadInfo::without_stats_parsed(),
+                });
             }
-            // TODO: replay commits after the checkpoint. Until then require the checkpoint to cover
-            // the snapshot version so the content tree alone describes the full state.
-            if checkpoint.version() != self.snapshot.version() as i64 {
-                return Err(Error::unsupported(format!(
-                    "scanning adaptiveMetadata tables requires the checkpoint version ({}) to \
-                     cover the snapshot version ({}); post-checkpoint commit replay is not yet \
-                     supported",
-                    checkpoint.version(),
-                    self.snapshot.version()
-                )));
-            }
-            let batches = crate::content_tree::read_content_tree_add_actions(
-                engine,
-                self.snapshot.table_root(),
-                &checkpoint.content_root,
-            )?;
-            // Content-tree batches are reconciled state, like checkpoint batches, so
-            // `is_log_batch` is false. No parsed stats are emitted yet, so use the stats-less
-            // config.
-            let actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send> =
-                Box::new(batches.into_iter().map(|d| Ok(ActionsBatch::new(d, false))));
-            return Ok(ActionsWithCheckpointInfo {
-                actions,
-                checkpoint_info: CheckpointReadInfo::without_stats_parsed(),
-            });
         }
 
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
@@ -1235,26 +1247,6 @@ impl Scan {
             actions,
             checkpoint_info: normal.checkpoint_info,
         })
-    }
-
-    /// Scans the log segment for the most recent `checkpoint` action, returning `None` when the
-    /// table has none. Mirrors the detection in
-    /// [`root_manifest_file`](crate::transaction::root_manifest_file)'s non-content-metadata scan.
-    /// TODO: Implement more efficient ways, for example, using the hint file:
-    /// https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#last-checkpoint-file
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn find_latest_checkpoint_action(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Option<CheckpointAction>> {
-        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
-        for batch in self.snapshot.log_segment().read_actions(engine, schema)? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
-            {
-                return Ok(Some(checkpoint));
-            }
-        }
-        Ok(None)
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.

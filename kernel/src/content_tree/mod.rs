@@ -15,7 +15,6 @@ use delta_kernel_derive::{IntoStructData, ToSchema};
 pub(crate) use reader::read_content_tree_add_actions;
 use url::Url;
 
-use crate::actions::has_scheme;
 use crate::engine_data::EngineData;
 use crate::expressions::{Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
@@ -366,6 +365,34 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<
             ))
         })
     }
+}
+
+/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+fn has_scheme(location: &str) -> bool {
+    for (position, ch) in location.char_indices() {
+        if ch == ':' {
+            return position > 0;
+        }
+        if !is_scheme_char(ch, position) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
+/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
+/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+fn is_scheme_char(ch: char, position: usize) -> bool {
+    if ch.is_ascii_alphabetic() {
+        return true;
+    }
+    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
 }
 
 #[cfg(test)]
