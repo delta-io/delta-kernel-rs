@@ -259,6 +259,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         Expr::binary(BinaryExpressionOp::Multiply, lit(5), lit(6)),
         Expr::binary(BinaryExpressionOp::Divide, lit(100), lit(4)),
         Expr::struct_from([lit(1_i32), lit(2_i64), lit(3.0_f64)]),
+        Expr::struct_with_nullability_from([lit(4_i32)], col!("keep_struct")),
         Expr::map_to_struct(col!("partitionValues"), MapToStructOptions::default()),
         Expr::map_to_struct(
             col!("partitionValues"),

@@ -32,6 +32,7 @@ use crate::schema::{
     StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::transaction::data_layout::DataLayout;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
     ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
@@ -1121,6 +1122,40 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         scan.build_actions_meta_predicate().is_none(),
         "StaticSkipAll predicate should return None"
     );
+}
+
+#[test]
+fn checkpoint_meta_predicate_defers_timestamp_partitions_with_default_utc() {
+    let url = "memory:///timestamp-checkpoint-pushdown/";
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    create_table(
+        url,
+        schema_ref! {
+            nullable "value": INTEGER,
+            nullable "p_ts": TIMESTAMP,
+        },
+        "test",
+    )
+    .with_data_layout(DataLayout::partitioned(["p_ts"]))
+    .build(&engine, Box::new(FileSystemCommitter::new()))
+    .unwrap()
+    .commit(&engine)
+    .unwrap()
+    .unwrap_committed();
+    let snapshot = Snapshot::builder_for(Url::parse(url).unwrap())
+        .build(&engine)
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::eq(
+            col!("p_ts"),
+            Scalar::Timestamp(1_705_321_845_000_000),
+        )))
+        .build()
+        .unwrap();
+
+    let meta_predicate = scan.build_actions_meta_predicate();
+    assert_eq!(meta_predicate.as_deref(), Some(&Pred::NULL));
 }
 
 // Partition-only scans have no stats schema, so the partition schema must enable the rewrite.

@@ -12,8 +12,9 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
-    MapToStructOptions, Predicate, PredicateRef, UnaryExpressionOp,
+    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionFieldPatch,
+    ExpressionRef, ExpressionStructPatch, MapToStructOptions, Predicate, PredicateRef,
+    UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -30,7 +31,7 @@ use crate::schema::{
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, Error, EvaluationHandler, ExpressionEvaluator};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -165,8 +166,8 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
     commit_transform: Arc<dyn ExpressionEvaluator>,
-    /// StructPatch for checkpoint batches - reuses compatible parsed stats and parses partition
-    /// values from the canonical raw map.
+    /// Transform for checkpoint batches - reuses compatible parsed fields and reparses zoned
+    /// timestamps using the reader timezone.
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
@@ -181,6 +182,18 @@ pub struct ScanLogReplayProcessor {
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
     metrics: Arc<ScanMetrics>,
+}
+
+struct ChainedExpressionEvaluator {
+    first: Arc<dyn ExpressionEvaluator>,
+    second: Arc<dyn ExpressionEvaluator>,
+}
+
+impl ExpressionEvaluator for ChainedExpressionEvaluator {
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        let intermediate = self.first.evaluate(batch)?;
+        self.second.evaluate(intermediate.as_ref())
+    }
 }
 
 struct RetryTransformAndDataSkipOutput {
@@ -246,8 +259,9 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
-            has_partition_values_parsed: _,
+            can_reuse_partition_values_parsed,
             checkpoint_read_schema,
+            ..
         } = checkpoint_info.clone();
         let ScanStatsOptions {
             skip_stats,
@@ -315,35 +329,37 @@ impl ScanLogReplayProcessor {
             )
         };
 
+        let evaluation_handler = engine.evaluation_handler();
+        let commit_transform = evaluation_handler.new_expression_evaluator(
+            COMMIT_READ_SCHEMA.clone(),
+            get_add_transform_expr(
+                stats_schema_for_transform.clone(),
+                false,
+                skip_stats,
+                synthesize_json,
+                partition_schema_for_transform.clone(),
+                timestamp_timezone_name,
+                None,
+            ),
+            output_schema.clone().into(),
+        )?;
+        let checkpoint_transform = new_checkpoint_transform(
+            evaluation_handler.as_ref(),
+            checkpoint_read_schema,
+            output_schema,
+            stats_schema_for_transform,
+            has_stats_parsed,
+            skip_stats,
+            synthesize_json,
+            partition_schema_for_transform,
+            can_reuse_partition_values_parsed,
+            timestamp_timezone_name,
+        )?;
+
         Ok(Self {
             data_skipping_filter,
-            // Commit transform: parse JSON for stats, MapToStruct for partition values
-            commit_transform: engine.evaluation_handler().new_expression_evaluator(
-                COMMIT_READ_SCHEMA.clone(),
-                get_add_transform_expr(
-                    stats_schema_for_transform.clone(),
-                    false,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform.clone(),
-                    timestamp_timezone_name,
-                ),
-                output_schema.clone().into(),
-            )?,
-            // Checkpoint transform: reuse compatible parsed stats and parse partition values from
-            // the canonical raw map.
-            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
-                checkpoint_read_schema,
-                get_add_transform_expr(
-                    stats_schema_for_transform,
-                    has_stats_parsed,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform,
-                    timestamp_timezone_name,
-                ),
-                output_schema.into(),
-            )?,
+            commit_transform,
+            checkpoint_transform,
             seen_file_keys,
             state_info,
             stats_options,
@@ -807,8 +823,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// These typed columns are appended at the top level (siblings of `fileConstantValues`) rather than
 /// nested inside it. This mirrors `stats_parsed`, keeps `fileConstantValues` a fixed shape
 /// regardless of the engine's options, and keeps data-skipping paths uniform:
-/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. Both commit and
-/// checkpoint inputs derive it from the canonical raw partition map.
+/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. Commits derive it from
+/// the raw map; compatible checkpoints reuse native fields that are timezone-independent.
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
@@ -830,6 +846,123 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
+const REPARSED_TIMESTAMPS_NAME: &str = "__kernel_reparsed_partition_timestamps";
+const PARTITION_VALUES_FALLBACK_NAME: &str = "__kernel_partition_values_fallback";
+
+struct CheckpointPartitionValues {
+    native: ColumnName,
+    reparsed_timestamps: Option<ColumnName>,
+    raw_fallback: ColumnName,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_checkpoint_transform(
+    evaluation_handler: &dyn EvaluationHandler,
+    checkpoint_read_schema: SchemaRef,
+    output_schema: SchemaRef,
+    physical_stats_schema: Option<SchemaRef>,
+    has_stats_parsed: bool,
+    skip_stats: bool,
+    synthesize_json: bool,
+    partition_schema: Option<SchemaRef>,
+    can_reuse_partition_values_parsed: bool,
+    timestamp_timezone: Option<&str>,
+) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    let timestamp_schema = partition_schema.as_ref().and_then(|schema| {
+        let fields: Vec<_> = schema
+            .fields()
+            .filter(|field| field.data_type() == &DataType::TIMESTAMP)
+            .cloned()
+            .collect();
+        (!fields.is_empty()).then(|| Arc::new(StructType::new_unchecked(fields)))
+    });
+    if !can_reuse_partition_values_parsed || partition_schema.is_none() {
+        return evaluation_handler.new_expression_evaluator(
+            checkpoint_read_schema,
+            get_add_transform_expr(
+                physical_stats_schema,
+                has_stats_parsed,
+                skip_stats,
+                synthesize_json,
+                partition_schema,
+                timestamp_timezone,
+                None,
+            ),
+            output_schema.into(),
+        );
+    }
+
+    let add_field = checkpoint_read_schema
+        .field("add")
+        .ok_or_else(|| Error::internal_error("checkpoint read schema is missing add"))?
+        .clone();
+    let DataType::Struct(add_schema) = add_field.data_type() else {
+        return Err(Error::internal_error(
+            "checkpoint add field must have struct type",
+        ));
+    };
+    let raw_partition_values_field = add_schema
+        .field("partitionValues")
+        .ok_or_else(|| Error::internal_error("checkpoint add field is missing partitionValues"))?
+        .clone();
+    let fallback_schema = StructType::new_unchecked([raw_partition_values_field]);
+
+    let mut intermediate_fields = vec![add_field];
+    let mut intermediate_exprs = vec![Arc::new(col!("add"))];
+    if let Some(timestamp_schema) = &timestamp_schema {
+        intermediate_fields.push(StructField::nullable(
+            REPARSED_TIMESTAMPS_NAME,
+            timestamp_schema.as_ref().clone(),
+        ));
+        intermediate_exprs.push(Arc::new(parsed_partition_values_expr(
+            col!("add.partitionValues"),
+            timestamp_timezone,
+        )));
+    }
+    intermediate_fields.push(StructField::nullable(
+        PARTITION_VALUES_FALLBACK_NAME,
+        fallback_schema,
+    ));
+    // The guard makes the nested map null on reusable rows, so eager evaluators do not parse it.
+    intermediate_exprs.push(Arc::new(Expression::struct_with_nullability_from(
+        [col!("add.partitionValues")],
+        Arc::new(Expression::from_pred(Predicate::and(
+            Predicate::is_not_null(col!("add.path")),
+            Predicate::is_null(col!("add.partitionValues_parsed")),
+        ))),
+    )));
+
+    let intermediate_schema = Arc::new(StructType::new_unchecked(intermediate_fields));
+    let prepare_partition_values = evaluation_handler.new_expression_evaluator(
+        checkpoint_read_schema,
+        Arc::new(Expression::struct_from(intermediate_exprs)),
+        intermediate_schema.clone().into(),
+    )?;
+    let merge_partition_values = evaluation_handler.new_expression_evaluator(
+        intermediate_schema,
+        get_add_transform_expr(
+            physical_stats_schema,
+            has_stats_parsed,
+            skip_stats,
+            synthesize_json,
+            partition_schema,
+            timestamp_timezone,
+            Some(CheckpointPartitionValues {
+                native: column_name!("add.partitionValues_parsed"),
+                reparsed_timestamps: timestamp_schema
+                    .is_some()
+                    .then(|| ColumnName::new([REPARSED_TIMESTAMPS_NAME])),
+                raw_fallback: ColumnName::new([PARTITION_VALUES_FALLBACK_NAME, "partitionValues"]),
+            }),
+        ),
+        output_schema.into(),
+    )?;
+    Ok(Arc::new(ChainedExpressionEvaluator {
+        first: prepare_partition_values,
+        second: merge_partition_values,
+    }))
+}
+
 /// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
@@ -847,6 +980,9 @@ fn scan_row_schema_with_parsed_columns(
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `timestamp_timezone`: Reader timezone for offset-less zoned timestamp partition strings.
+/// - `checkpoint_partition_values`: Native checkpoint struct, optional timestamp-only replacement,
+///   and the row-masked raw map used when the native struct is null. `None` reconstructs the
+///   complete struct from `add.partitionValues`.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -858,6 +994,7 @@ fn get_add_transform_expr(
     synthesize_json: bool,
     partition_schema: Option<SchemaRef>,
     timestamp_timezone: Option<&str>,
+    checkpoint_partition_values: Option<CheckpointPartitionValues>,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(null_lit(DataType::STRING))
@@ -903,9 +1040,17 @@ fn get_add_transform_expr(
 
     // Add partitionValues_parsed when partition columns are needed for data skipping or for the
     // engine-facing typed output column.
-    if partition_schema.is_some() {
-        let pv_parsed_expr =
-            parsed_partition_values_expr(col!("add.partitionValues"), timestamp_timezone);
+    if let Some(partition_schema) = partition_schema {
+        let pv_parsed_expr = match checkpoint_partition_values {
+            Some(checkpoint) => checkpoint_partition_values_expr(
+                Expression::from(checkpoint.raw_fallback),
+                checkpoint.native,
+                checkpoint.reparsed_timestamps,
+                partition_schema.as_ref(),
+                timestamp_timezone,
+            ),
+            None => parsed_partition_values_expr(col!("add.partitionValues"), timestamp_timezone),
+        };
         fields.push(Arc::new(pv_parsed_expr));
     }
 
@@ -924,6 +1069,46 @@ fn parsed_partition_values_expr(
         ),
         None => Expression::map_to_struct(raw_partition_values, MapToStructOptions::default()),
     }
+}
+
+fn checkpoint_partition_values_expr(
+    raw_partition_values: Expression,
+    native_partition_values: ColumnName,
+    reparsed_timestamps: Option<ColumnName>,
+    partition_schema: &StructType,
+    timestamp_timezone: Option<&str>,
+) -> Expression {
+    let native_or_patched = match reparsed_timestamps {
+        Some(reparsed_timestamps) => {
+            let field_patches = partition_schema
+                .fields()
+                .filter(|field| field.data_type() == &DataType::TIMESTAMP)
+                .map(|field| {
+                    let replacement =
+                        reparsed_timestamps.join(&ColumnName::new([field.name().to_string()]));
+                    (
+                        field.name().to_string(),
+                        ExpressionFieldPatch {
+                            keep_input: false,
+                            insertions: vec![Arc::new(Expression::from(replacement))],
+                            optional: false,
+                        },
+                    )
+                })
+                .collect();
+            Expression::StructPatch(ExpressionStructPatch {
+                input_path: Some(native_partition_values),
+                field_patches,
+                ..Default::default()
+            })
+        }
+        None => Expression::from(native_partition_values),
+    };
+
+    Expression::coalesce([
+        native_or_patched,
+        parsed_partition_values_expr(raw_partition_values, timestamp_timezone),
+    ])
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -1075,7 +1260,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // type. In that case, we get a ParseError and retry after deduplication.
         // The transform depends on the batch type:
         // - Log batches: parse JSON for stats, MapToStruct for partition values
-        // - Checkpoint batches: reuse compatible parsed stats and parse raw partition values
+        // - Checkpoint batches: reuse compatible parsed values and reparse only zoned timestamps or
+        //   rows whose native partition struct is null
         // This avoids double JSON parsing -- the transform already parsed the stats.
         // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
         // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
@@ -1205,6 +1391,11 @@ mod tests {
         ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
         SerializableScanState,
     };
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::arrow::array::{Int32Array, StringArray, StructArray, TimestampMicrosecondArray};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::json::SyncJsonHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, MapToStructOptions,
@@ -1227,10 +1418,10 @@ mod tests {
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
-    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
+    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef, ToSchema};
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{DeltaResult, Expression as Expr, ExpressionRef};
+    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::{DeltaResult, Expression as Expr, ExpressionRef, JsonHandler};
 
     #[test]
     fn partition_values_options_serde_preserves_timezone_and_defaults_when_absent() {
@@ -1266,6 +1457,195 @@ mod tests {
                 raw,
                 MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
             )
+        );
+    }
+
+    fn evaluate_checkpoint_partition_value_rows(
+        rows: &[(&str, serde_json::Value)],
+        timestamp_timezone: Option<&str>,
+    ) -> RecordBatch {
+        let partition_schema = schema_ref! {
+            nullable "p_ts": TIMESTAMP,
+            nullable "p_int": INTEGER,
+        };
+        let checkpoint_schema = schema_ref! {
+            nullable "add": {
+                nullable "path": STRING,
+                nullable "partitionValues": { STRING => nullable STRING },
+                nullable "size": LONG,
+                nullable "modificationTime": LONG,
+                nullable "stats": STRING,
+                nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+                nullable "tags": { STRING => nullable STRING },
+                nullable "clusteringProvider": STRING,
+                nullable "partitionValues_parsed": {
+                    nullable "p_ts": TIMESTAMP,
+                    nullable "p_int": INTEGER,
+                },
+            },
+        };
+        let adds = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (raw_integer, native))| {
+                serde_json::json!({
+                    "add": {
+                        "path": format!("part-{index}.parquet"),
+                        "partitionValues": {
+                            "p_ts": "2024-01-15 12:30:45",
+                            "p_int": raw_integer,
+                        },
+                        "partitionValues_parsed": native,
+                        "size": 1,
+                        "modificationTime": 0,
+                    }
+                })
+                .to_string()
+            });
+        let json = StringArray::from_iter_values(adds.chain(["{}".to_string()]));
+        let batch = SyncJsonHandler::new(None)
+            .parse_json(string_array_to_engine_data(json), checkpoint_schema.clone())
+            .unwrap();
+
+        let mut state_info = get_simple_state_info(
+            partition_schema.clone(),
+            vec!["p_ts".to_string(), "p_int".to_string()],
+        )
+        .unwrap();
+        state_info.physical_partition_schema = Some(partition_schema);
+        let processor = ScanLogReplayProcessor::new(
+            &SyncEngine::new(),
+            Arc::new(state_info),
+            CheckpointReadInfo {
+                has_stats_parsed: false,
+                has_partition_values_parsed: true,
+                can_reuse_partition_values_parsed: true,
+                checkpoint_read_schema: checkpoint_schema,
+            },
+            ScanStatsOptions {
+                skip_stats: true,
+                ..Default::default()
+            },
+            ScanPartitionValuesOptions {
+                parsed_struct: true,
+                timestamp_timezone: timestamp_timezone.map(str::to_string),
+            },
+        )
+        .unwrap();
+
+        let output = processor
+            .checkpoint_transform
+            .evaluate(batch.as_ref())
+            .unwrap();
+        let output = ArrowEngineData::try_from_engine_data(output).unwrap();
+        output.into()
+    }
+
+    fn evaluate_checkpoint_partition_values(
+        raw_integer: &str,
+        native_partition_values: serde_json::Value,
+        timestamp_timezone: Option<&str>,
+    ) -> RecordBatch {
+        evaluate_checkpoint_partition_value_rows(
+            &[(raw_integer, native_partition_values)],
+            timestamp_timezone,
+        )
+    }
+
+    #[rstest]
+    #[case::reuse_non_timestamp(
+        "invalid",
+        serde_json::json!({"p_ts": "2024-01-15T12:30:45Z", "p_int": 7}),
+        Some("America/Los_Angeles"),
+        1_705_350_645_000_000,
+        7,
+    )]
+    #[case::default_utc_reparses_timestamp(
+        "7",
+        serde_json::json!({"p_ts": "1970-01-01T00:00:00Z", "p_int": 7}),
+        None,
+        1_705_321_845_000_000,
+        7,
+    )]
+    #[case::projected_missing_timestamp_is_patched(
+        "invalid",
+        serde_json::json!({"p_int": 7}),
+        Some("America/Los_Angeles"),
+        1_705_350_645_000_000,
+        7,
+    )]
+    #[case::null_native_struct_falls_back_to_raw(
+        "8",
+        serde_json::Value::Null,
+        Some("America/Los_Angeles"),
+        1_705_350_645_000_000,
+        8
+    )]
+    fn checkpoint_reuses_partition_values_and_reparses_timestamps(
+        #[case] raw_integer: &str,
+        #[case] native_partition_values: serde_json::Value,
+        #[case] timestamp_timezone: Option<&str>,
+        #[case] expected_timestamp: i64,
+        #[case] expected_integer: i32,
+    ) {
+        let output = evaluate_checkpoint_partition_values(
+            raw_integer,
+            native_partition_values,
+            timestamp_timezone,
+        );
+        let parsed = output
+            .column_by_name("partitionValues_parsed")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let timestamps = parsed
+            .column_by_name("p_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let integers = parsed
+            .column_by_name("p_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(timestamps.value(0), expected_timestamp);
+        assert_eq!(integers.value(0), expected_integer);
+    }
+
+    #[test]
+    fn checkpoint_fallback_parses_only_rows_with_null_native_values() {
+        let output = evaluate_checkpoint_partition_value_rows(
+            &[
+                ("8", serde_json::Value::Null),
+                (
+                    "invalid",
+                    serde_json::json!({"p_ts": "1970-01-01T00:00:00Z", "p_int": 7}),
+                ),
+            ],
+            Some("America/Los_Angeles"),
+        );
+        let parsed = output
+            .column_by_name("partitionValues_parsed")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let integers = parsed
+            .column_by_name("p_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(
+            integers.iter().take(2).collect::<Vec<_>>(),
+            [Some(8), Some(7)]
         );
     }
 
@@ -2188,6 +2568,7 @@ mod tests {
             true,  // synthesize_json
             partition_schema.clone(),
             None, // timestamp_timezone
+            None, // native_partition_values
         );
         assert_eq!(
             count_to_json(&with_synthesis),
@@ -2203,6 +2584,7 @@ mod tests {
             false, // synthesize_json
             partition_schema,
             None, // timestamp_timezone
+            None, // native_partition_values
         );
         assert_eq!(
             count_to_json(&without_synthesis),

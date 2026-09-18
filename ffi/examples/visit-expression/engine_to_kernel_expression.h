@@ -182,8 +182,16 @@ uintptr_t convert_engine_to_kernel_variadic(
       return visit_predicate_and(state, &iterator);
     case Or:
       return visit_predicate_or(state, &iterator);
-    case StructExpression:
-      return visit_expression_struct(state, &iterator);
+    case StructExpression: {
+      assert(variadic->nullability_predicate.len <= 1);
+      if (variadic->nullability_predicate.len == 0) {
+        return visit_expression_struct(state, &iterator);
+      }
+      uintptr_t nullability_predicate = convert_engine_to_kernel_expression_item(
+          state, variadic->nullability_predicate.list[0]);
+      return visit_expression_struct_with_nullability(
+          state, &iterator, nullability_predicate);
+    }
     default:
       fprintf(stderr,
           "Error: Unknown variadic op in convert_engine_to_kernel_variadic\n");

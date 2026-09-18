@@ -49,6 +49,7 @@ use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 pub(crate) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
+    fn column_by_name_owned(&self, name: &str) -> Option<ArrayRef>;
 }
 
 impl ProvidesColumnByName for RecordBatch {
@@ -58,6 +59,10 @@ impl ProvidesColumnByName for RecordBatch {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
         self.column_by_name(name)
     }
+
+    fn column_by_name_owned(&self, name: &str) -> Option<ArrayRef> {
+        self.column_by_name(name).cloned()
+    }
 }
 
 impl ProvidesColumnByName for StructArray {
@@ -66,6 +71,22 @@ impl ProvidesColumnByName for StructArray {
     }
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
         self.column_by_name(name)
+    }
+
+    fn column_by_name_owned(&self, name: &str) -> Option<ArrayRef> {
+        let (index, _) = self.fields().find(name)?;
+        let child = self.column(index);
+        let Some(parent_nulls) = self.nulls() else {
+            return Some(child.clone());
+        };
+        if child.data_type() == &ArrowDataType::Null {
+            return Some(child.clone());
+        }
+        let nulls = NullBuffer::union(Some(parent_nulls), child.nulls());
+        let builder = child.to_data().into_builder().nulls(nulls);
+        // SAFETY: The buffers come from `child`; replacing its null buffer with the union of its
+        // own and its same-length parent's null buffer can only make more rows null.
+        Some(make_array(unsafe { builder.build_unchecked() }))
     }
 }
 
@@ -89,10 +110,30 @@ pub(crate) fn extract_column(
     parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
 ) -> DeltaResult<ArrayRef> {
-    Ok(extract_column_ref(parent, col)?.clone())
+    let mut field_names = col.iter();
+    let first = field_names
+        .next()
+        .ok_or_else(|| ArrowError::SchemaError("Empty column path".to_string()))?;
+    let mut child = parent
+        .column_by_name_owned(first.as_ref())
+        .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {}", first.as_ref())))?;
+
+    for field_name in field_names {
+        let field_name = field_name.as_ref();
+        let parent = child
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))?;
+        child = parent
+            .column_by_name_owned(field_name)
+            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
+    }
+    Ok(child)
 }
 
-/// Like [`extract_column`], but returns a borrowed [`ArrayRef`] reference.
+/// Returns a borrowed [`ArrayRef`] without applying ancestor struct null masks.
+///
+/// Use this only when the input has already had its nested null masks normalized.
 #[internal_api]
 pub(crate) fn extract_column_ref<'a>(
     mut parent: &'a dyn ProvidesColumnByName,
@@ -257,7 +298,7 @@ fn evaluate_struct_patch_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable,
             )
         })
         .collect();

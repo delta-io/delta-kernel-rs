@@ -9,7 +9,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
+use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::arrow::ArrowWriter;
@@ -612,6 +612,65 @@ async fn timezone_aware_parsed_partition_values_across_json_and_checkpoint(
         rows += batch.num_rows();
     }
     assert_eq!(rows, 1);
+}
+
+#[rstest]
+#[case::matching("2024-01-15T20:30:45Z", 1)]
+#[case::not_matching("2024-01-15T12:30:45Z", 0)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timestamp_partition_predicates_use_reader_timezone(
+    #[case] predicate_timestamp: &str,
+    #[case] expected_files: usize,
+    #[values(false, true)] native_checkpoint: bool,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let url = write_timezone_partition_table(
+        temp_dir.path(),
+        "2024-01-15 12:30:45",
+        ColumnMappingMode::None,
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+    if native_checkpoint {
+        Snapshot::builder_for(url.clone())
+            .build(engine.as_ref())
+            .unwrap()
+            .checkpoint(engine.as_ref(), None)
+            .unwrap();
+    }
+
+    let predicate_timestamp = chrono::DateTime::parse_from_rfc3339(predicate_timestamp)
+        .unwrap()
+        .timestamp_micros();
+    let scan = Snapshot::builder_for(url)
+        .build(engine.as_ref())
+        .unwrap()
+        .scan_builder()
+        .with_predicate(Arc::new(Predicate::eq(
+            col!("p_ts"),
+            Scalar::Timestamp(predicate_timestamp),
+        )))
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone("America/Los_Angeles"),
+        )
+        .build()
+        .unwrap();
+    let selected_files = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map(|metadata| {
+            metadata
+                .unwrap()
+                .scan_files
+                .into_parts()
+                .1
+                .into_iter()
+                .filter(|selected| *selected)
+                .count()
+        })
+        .sum::<usize>();
+
+    assert_eq!(selected_files, expected_files);
 }
 
 #[rstest]

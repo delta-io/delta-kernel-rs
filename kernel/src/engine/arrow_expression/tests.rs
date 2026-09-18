@@ -475,6 +475,28 @@ fn test_extract_column() {
 }
 
 #[test]
+fn test_extract_column_applies_parent_struct_nulls() {
+    let values = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+    let field = Arc::new(Field::new("a", DataType::Int32, false));
+    let parent_nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false, true]));
+    let struct_array = StructArray::new(
+        Fields::from([field.clone()]),
+        vec![values],
+        Some(parent_nulls),
+    );
+    let schema = Schema::new(vec![Field::new(
+        "b",
+        DataType::Struct(Fields::from([field])),
+        true,
+    )]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
+
+    let result = evaluate_expression(&col!("b.a"), &batch, None).unwrap();
+    let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(result, &Int32Array::from(vec![Some(1), None, Some(3)]));
+}
+
+#[test]
 fn test_binary_op_scalar() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
