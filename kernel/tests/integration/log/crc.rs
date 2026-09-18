@@ -1851,6 +1851,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     // ===== v2: insert large file (>= 8KB -> bin 1+) =====
     let n = LARGE_FILE_ROW_COUNT;
     let ids: ArrayRef = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()));
+    // Random (incompressible) values so Zstd can't shrink the file below the 8KB bin boundary.
     let mut rng = StdRng::seed_from_u64(0);
     let strings: Vec<String> = (0..n)
         .map(|_| {

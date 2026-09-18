@@ -185,9 +185,7 @@ mod tests {
 
         // Read it back to verify
         let file = File::open(&file_path).unwrap();
-        let reader =
-            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         let schema = reader.schema().clone();
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
@@ -231,80 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_write_parquet_file_with_filter() {
-        let handler = SyncParquetHandler::new(None, Default::default());
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_filtered.parquet");
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![
-                (
-                    "id",
-                    Arc::new(Int64Array::from(vec![1, 3, 5])) as Arc<dyn Array>,
-                ),
-                (
-                    "name",
-                    Arc::new(StringArray::from(vec!["a", "c", "e"])) as Arc<dyn Array>,
-                ),
-            ])
-            .unwrap(),
-        ));
-
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
-        > = Box::new(std::iter::once(Ok(engine_data)));
-
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
-        assert!(file_path.exists());
-
-        let file = File::open(&file_path).unwrap();
-        let reader =
-            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .unwrap();
-        let schema = reader.schema().clone();
-        let file_size = std::fs::metadata(&file_path).unwrap().len();
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let mut result = handler
-            .read_parquet_files(
-                &[file_meta],
-                Arc::new(schema.try_into_kernel().unwrap()),
-                None,
-            )
-            .unwrap();
-
-        let engine_data = result.next().unwrap().unwrap();
-        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
-        let record_batch = batch.record_batch();
-
-        assert_eq!(record_batch.num_rows(), 3);
-        assert_eq!(record_batch.num_columns(), 2);
-
-        let id_col = record_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(id_col.values(), &[1, 3, 5]);
-
-        let name_col = record_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(name_col.value(0), "a");
-        assert_eq!(name_col.value(1), "c");
-        assert_eq!(name_col.value(2), "e");
-
-        assert!(result.next().is_none());
-    }
-
-    #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
         let handler = SyncParquetHandler::new(None, Default::default());
         let temp_dir = tempdir().unwrap();
@@ -341,9 +265,7 @@ mod tests {
         assert!(file_path.exists());
 
         let file = File::open(&file_path).unwrap();
-        let reader =
-            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         let schema = reader.schema().clone();
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {

@@ -3328,10 +3328,11 @@ mod tests {
                 allocate_err,
             ))
         };
-        let builder = unsafe { builder_ptr.as_mut().unwrap() };
+        // Reclaim ownership so the builder is freed when it drops at end of scope.
+        let mut builder = unsafe { Box::from_raw(builder_ptr) };
         unsafe {
             ok_or_panic(set_builder_parquet_compression(
-                builder,
+                &mut builder,
                 kernel_string_slice!(codec),
             ))
         };
@@ -3341,7 +3342,6 @@ mod tests {
                 compression: expected
             }
         );
-        let _ = unsafe { Box::from_raw(builder_ptr) }; // reclaim to free
     }
 
     #[cfg(feature = "default-engine-base")]
@@ -3354,10 +3354,11 @@ mod tests {
                 allocate_err,
             ))
         };
-        let builder = unsafe { builder_ptr.as_mut().unwrap() };
+        // Reclaim ownership so the builder is freed when it drops at end of scope.
+        let mut builder = unsafe { Box::from_raw(builder_ptr) };
         let codec = "invalid_codec";
         let result =
-            unsafe { set_builder_parquet_compression(builder, kernel_string_slice!(codec)) };
+            unsafe { set_builder_parquet_compression(&mut builder, kernel_string_slice!(codec)) };
         assert_extern_result_error_contains(result, KernelError::GenericError, "invalid_codec");
         assert_eq!(
             builder.parquet_writer_config,
@@ -3366,7 +3367,6 @@ mod tests {
             },
             "rejected codec should leave config unchanged"
         );
-        let _ = unsafe { Box::from_raw(builder_ptr) }; // reclaim to free
     }
 
     #[tokio::test]
