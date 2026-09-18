@@ -102,10 +102,14 @@ pub(crate) fn validate_clustering_columns(
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
+                #[cfg(feature = "nanosecond-timestamps")]
+                let nanos = ", TimestampNanos, TimestampNanosNtz";
+                #[cfg(not(feature = "nanosecond-timestamps"))]
+                let nanos = "";
                 return Err(Error::generic(format!(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
-                     Decimal, Date, Timestamp, TimestampNtz, TimestampNanos, TimestampNanosNtz, String"
+                     Decimal, Date, Timestamp, TimestampNtz{nanos}, String"
                 )));
             }
         }
