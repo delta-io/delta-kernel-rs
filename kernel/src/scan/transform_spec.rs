@@ -92,6 +92,7 @@ pub(crate) fn parse_partition_value(
     logical_schema: &SchemaRef,
     partition_values: &HashMap<String, String>,
     column_mapping_mode: ColumnMappingMode,
+    timestamp_timezone: TimestampTimezone,
 ) -> DeltaResult<(usize, (String, Scalar))> {
     let Some(field) = logical_schema.field_at_index(field_idx) else {
         return Err(Error::InternalError(format!(
@@ -99,7 +100,11 @@ pub(crate) fn parse_partition_value(
         )));
     };
     let name = field.physical_name(column_mapping_mode);
-    let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
+    let partition_value = parse_partition_value_raw(
+        partition_values.get(name),
+        field.data_type(),
+        timestamp_timezone,
+    )?;
     Ok((field_idx, (name.to_string(), partition_value)))
 }
 
@@ -109,6 +114,7 @@ pub(crate) fn parse_partition_values(
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
     column_mapping_mode: ColumnMappingMode,
+    timestamp_timezone: TimestampTimezone,
 ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
     transform_spec
         .iter()
@@ -119,6 +125,7 @@ pub(crate) fn parse_partition_values(
                     logical_schema,
                     partition_values,
                     column_mapping_mode,
+                    timestamp_timezone,
                 ))
             }
             FieldTransformSpec::DynamicColumn { .. }
@@ -240,16 +247,16 @@ fn apply_insert_after(
 /// Parse a partition value from the raw string representation.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `TIMESTAMP` uses the shared partition timestamp parser with its UTC default; all other types
-/// retain [`PrimitiveType::parse_scalar`] semantics.
+/// `timestamp_timezone` applies only to `TIMESTAMP`; all other types retain
+/// [`PrimitiveType::parse_scalar`] semantics.
 ///
 /// [`PrimitiveType::empty_string_partition_cast`]: crate::schema::PrimitiveType::empty_string_partition_cast
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
+    timestamp_timezone: TimestampTimezone,
 ) -> DeltaResult<Scalar> {
-    let timestamp_timezone = TimestampTimezone::default();
     match (raw, data_type.as_primitive_opt()) {
         (Some(value), Some(PrimitiveType::Timestamp)) if !value.is_empty() => timestamp_timezone
             .parse_timestamp(value)
@@ -283,7 +290,13 @@ mod tests {
         };
         let partition_values = HashMap::new();
 
-        let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
+        let result = parse_partition_value(
+            5,
+            &schema,
+            &partition_values,
+            ColumnMappingMode::None,
+            TimestampTimezone::default(),
+        );
         assert_result_error_with_message(result, "out of bounds");
     }
 
@@ -323,6 +336,7 @@ mod tests {
             &transform_spec,
             &partition_values,
             ColumnMappingMode::None,
+            TimestampTimezone::default(),
         )
         .unwrap();
         assert_eq!(result.len(), 2);
@@ -349,6 +363,7 @@ mod tests {
             &transform_spec,
             &partition_values,
             ColumnMappingMode::None,
+            TimestampTimezone::default(),
         )
         .unwrap();
         assert!(result.is_empty());
@@ -357,8 +372,12 @@ mod tests {
     // Tests for parse_partition_value_raw function
     #[test]
     fn test_parse_partition_value_raw_string() {
-        let result =
-            parse_partition_value_raw(Some(&"test_string".to_string()), &DataType::STRING).unwrap();
+        let result = parse_partition_value_raw(
+            Some(&"test_string".to_string()),
+            &DataType::STRING,
+            TimestampTimezone::default(),
+        )
+        .unwrap();
         assert_eq!(result, Scalar::String("test_string".to_string()));
     }
 
@@ -367,6 +386,7 @@ mod tests {
         let result = parse_partition_value_raw(
             Some(&"42".to_string()),
             &DataType::Primitive(PrimitiveType::Integer),
+            TimestampTimezone::default(),
         )
         .unwrap();
         assert_eq!(result, Scalar::Integer(42));
@@ -376,24 +396,51 @@ mod tests {
     fn test_parse_partition_value_raw_protocol_timestamp() {
         let timestamp = "2024-01-15T12:30:45Z".to_string();
         assert_eq!(
-            parse_partition_value_raw(Some(&timestamp), &DataType::TIMESTAMP).unwrap(),
+            parse_partition_value_raw(
+                Some(&timestamp),
+                &DataType::TIMESTAMP,
+                TimestampTimezone::default(),
+            )
+            .unwrap(),
             Scalar::Timestamp(1_705_321_845_000_000)
         );
 
         let invalid_timestamp = "2024-01-15 123045".to_string();
-        assert!(parse_partition_value_raw(Some(&invalid_timestamp), &DataType::TIMESTAMP).is_err());
+        assert!(parse_partition_value_raw(
+            Some(&invalid_timestamp),
+            &DataType::TIMESTAMP,
+            TimestampTimezone::default(),
+        )
+        .is_err());
 
         for (data_type, raw) in [
             (DataType::DATE, "20240115"),
             (DataType::TIMESTAMP_NTZ, "2024-01-15T12:30:45+02:00"),
         ] {
-            assert!(parse_partition_value_raw(Some(&raw.to_string()), &data_type).is_err());
+            assert!(parse_partition_value_raw(
+                Some(&raw.to_string()),
+                &data_type,
+                TimestampTimezone::default(),
+            )
+            .is_err());
         }
     }
 
     #[test]
+    fn test_parse_partition_value_raw_uses_configured_timestamp_timezone() {
+        let timezone = "America/Los_Angeles".parse().unwrap();
+        let timestamp = "2024-01-15 12:30:45".to_string();
+        assert_eq!(
+            parse_partition_value_raw(Some(&timestamp), &DataType::TIMESTAMP, timezone).unwrap(),
+            Scalar::Timestamp(1_705_350_645_000_000)
+        );
+    }
+
+    #[test]
     fn test_parse_partition_value_raw_null() {
-        let result = parse_partition_value_raw(None, &DataType::STRING).unwrap();
+        let result =
+            parse_partition_value_raw(None, &DataType::STRING, TimestampTimezone::default())
+                .unwrap();
         assert!(result.is_null());
     }
 
@@ -404,19 +451,36 @@ mod tests {
         // writer, since kernel serializes its own empty and null partition values to JSON null.
         let empty = String::new();
 
-        let string_value = parse_partition_value_raw(Some(&empty), &DataType::STRING).unwrap();
+        let string_value = parse_partition_value_raw(
+            Some(&empty),
+            &DataType::STRING,
+            TimestampTimezone::default(),
+        )
+        .unwrap();
         assert_eq!(string_value, Scalar::String(String::new()));
 
-        let binary_value = parse_partition_value_raw(Some(&empty), &DataType::BINARY).unwrap();
+        let binary_value = parse_partition_value_raw(
+            Some(&empty),
+            &DataType::BINARY,
+            TimestampTimezone::default(),
+        )
+        .unwrap();
         assert_eq!(binary_value, Scalar::Binary(Vec::new()));
 
-        let int_value =
-            parse_partition_value_raw(Some(&empty), &DataType::Primitive(PrimitiveType::Integer))
-                .unwrap();
+        let int_value = parse_partition_value_raw(
+            Some(&empty),
+            &DataType::Primitive(PrimitiveType::Integer),
+            TimestampTimezone::default(),
+        )
+        .unwrap();
         assert!(int_value.is_null());
 
-        let timestamp_value =
-            parse_partition_value_raw(Some(&empty), &DataType::TIMESTAMP).unwrap();
+        let timestamp_value = parse_partition_value_raw(
+            Some(&empty),
+            &DataType::TIMESTAMP,
+            TimestampTimezone::default(),
+        )
+        .unwrap();
         assert!(timestamp_value.is_null());
     }
 
@@ -425,6 +489,7 @@ mod tests {
         let result = parse_partition_value_raw(
             Some(&"value".to_string()),
             &DataType::from(schema! {}), // Non-primitive type
+            TimestampTimezone::default(),
         );
         assert_result_error_with_message(result, "Unexpected partition column type");
     }
@@ -434,6 +499,7 @@ mod tests {
         let result = parse_partition_value_raw(
             Some(&"not_a_number".to_string()),
             &DataType::Primitive(PrimitiveType::Integer),
+            TimestampTimezone::default(),
         );
         assert_result_error_with_message(result, "Failed to parse value");
     }

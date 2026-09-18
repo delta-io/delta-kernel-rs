@@ -684,6 +684,78 @@ async fn timezone_aware_partition_values_use_physical_column_names(
 }
 
 #[rstest]
+#[case::timezone(
+    "2024-01-15 12:30:45.123456",
+    "America/Los_Angeles",
+    "2024-01-15T20:30:45.123456Z"
+)]
+#[case::explicit_offset_wins(
+    "2024-01-15T12:30:45+02:00",
+    "America/Los_Angeles",
+    "2024-01-15T10:30:45Z"
+)]
+#[case::dst_overlap_uses_earlier_instant(
+    "2024-11-03 01:30:00",
+    "America/Los_Angeles",
+    "2024-11-03T08:30:00Z"
+)]
+#[case::dst_gap_uses_pre_transition_offset(
+    "2024-03-10 02:30:00",
+    "America/Los_Angeles",
+    "2024-03-10T10:30:00Z"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_execute_partition_row_transform_respects_timestamp_timezone(
+    #[case] raw_timestamp: &str,
+    #[case] timestamp_timezone: &str,
+    #[case] expected_timestamp: &str,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let url =
+        write_timezone_partition_table(temp_dir.path(), raw_timestamp, ColumnMappingMode::None)
+            .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::string_map_only().with_timestamp_timezone(timestamp_timezone),
+        )
+        .build()
+        .unwrap();
+
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine)
+        .unwrap()
+        .map(|result| {
+            ArrowEngineData::try_from_engine_data(result.unwrap())
+                .unwrap()
+                .into()
+        })
+        .collect();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    let timestamp = get_column!(batch, "p_ts", TimestampMicrosecondArray);
+    let timestamp_ntz = get_column!(batch, "p_ntz", TimestampMicrosecondArray);
+    let integer = get_column!(batch, "p_int", Int32Array);
+    assert_eq!(
+        timestamp.value(0),
+        chrono::DateTime::parse_from_rfc3339(expected_timestamp)
+            .unwrap()
+            .timestamp_micros()
+    );
+    assert_eq!(
+        timestamp_ntz.value(0),
+        chrono::DateTime::parse_from_rfc3339("2024-01-15T12:30:45.123456Z")
+            .unwrap()
+            .timestamp_micros(),
+        "timestamp timezone must not affect TIMESTAMP_NTZ"
+    );
+    assert_eq!(integer.value(0), 7);
+}
+
+#[rstest]
 #[case::invalid_zone("2024-01-15 12:30:45", "Not/AZone", "Not/AZone")]
 #[case::invalid_timestamp("not a timestamp", "America/Los_Angeles", "not a timestamp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
