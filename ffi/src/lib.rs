@@ -963,7 +963,9 @@ unsafe fn set_builder_parquet_compression_impl(
     let compression = ParquetCompressionCodec::try_from(codec.as_str()).map_err(|_| {
         delta_kernel::Error::generic(format!("unsupported parquet compression codec: {codec}"))
     })?;
-    builder.parquet_writer_config = ParquetWriterConfig { compression };
+    let mut writer_config = ParquetWriterConfig::default();
+    writer_config.compression = compression;
+    builder.parquet_writer_config = writer_config;
     Ok(true)
 }
 
@@ -3387,12 +3389,9 @@ mod tests {
                 kernel_string_slice!(codec),
             ))
         };
-        assert_eq!(
-            builder.parquet_writer_config,
-            ParquetWriterConfig {
-                compression: expected
-            }
-        );
+        let mut expected_config = ParquetWriterConfig::default();
+        expected_config.compression = expected;
+        assert_eq!(builder.parquet_writer_config, expected_config);
     }
 
     #[cfg(feature = "default-engine-base")]
@@ -3413,9 +3412,7 @@ mod tests {
         assert_extern_result_error_contains(result, KernelError::GenericError, "invalid_codec");
         assert_eq!(
             builder.parquet_writer_config,
-            ParquetWriterConfig {
-                compression: ParquetCompressionCodec::Zstd
-            },
+            ParquetWriterConfig::default(),
             "rejected codec should leave config unchanged"
         );
     }

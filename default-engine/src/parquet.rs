@@ -1070,12 +1070,12 @@ mod tests {
     #[tokio::test]
     async fn test_write_parquet_compression(#[case] kernel_compression: ParquetCompressionCodec) {
         let store = Arc::new(InMemory::new());
+        let mut writer_config = ParquetWriterConfig::default();
+        writer_config.compression = kernel_compression;
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
-            ParquetWriterConfig {
-                compression: kernel_compression,
-            },
+            writer_config,
         ));
 
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(

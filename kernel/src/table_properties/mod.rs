@@ -372,7 +372,10 @@ pub enum IsolationLevel {
 ///
 /// This is the engine-writer view of a table's Parquet write settings, carried to the engine by
 /// [`TableProperties::parquet_writer_config`].
+///
+/// Construct via [`Self::default`] and set fields directly; this type is `#[non_exhaustive]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParquetWriterConfig {
     /// Compression codec to use. Defaults to [`ParquetCompressionCodec::Zstd`].
     pub compression: ParquetCompressionCodec,
