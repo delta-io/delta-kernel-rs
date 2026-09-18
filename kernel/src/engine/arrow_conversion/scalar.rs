@@ -392,6 +392,36 @@ mod tests {
         );
     }
 
+    // Schema inference and scalar extraction must agree on the kernel type for every timezone
+    // annotation, not just "UTC".
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case::no_tz(None, DataType::TIMESTAMP_NANOS_NTZ)]
+    #[case::empty_tz(Some(""), DataType::TIMESTAMP_NANOS_NTZ)]
+    #[case::utc(Some("UTC"), DataType::TIMESTAMP_NANOS)]
+    #[case::utc_lowercase(Some("utc"), DataType::TIMESTAMP_NANOS)]
+    #[case::utc_offset(Some("+00:00"), DataType::TIMESTAMP_NANOS)]
+    #[case::etc_utc(Some("Etc/UTC"), DataType::TIMESTAMP_NANOS)]
+    #[case::us_eastern(Some("America/New_York"), DataType::TIMESTAMP_NANOS)]
+    fn test_timestamp_nanos_schema_and_scalar_conversion_agree(
+        #[case] tz: Option<&str>,
+        #[case] expected: DataType,
+    ) {
+        let array = TimestampNanosecondArray::from(vec![1_000_000i64])
+            .fold_with(tz, TimestampNanosecondArray::with_timezone);
+        let arrow_type = array.data_type();
+
+        assert_eq!(DataType::try_from_arrow(arrow_type).unwrap(), expected);
+        assert_eq!(
+            arrow_primitive_to_kernel_type(arrow_type).unwrap(),
+            expected
+        );
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap().data_type(),
+            expected
+        );
+    }
+
     #[rstest]
     #[case::utc("UTC")]
     #[case::us_eastern("America/New_York")]

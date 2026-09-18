@@ -597,16 +597,14 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // timestampNanos is adjusted to UTC, which Arrow expresses as any non-empty timezone;
+            // an empty timezone is equivalent to None. Matches `arrow_primitive_to_kernel_type`.
             #[cfg(feature = "nanosecond-timestamps")]
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => {
-                Ok(DataType::TIMESTAMP_NANOS_NTZ)
-            }
-            #[cfg(feature = "nanosecond-timestamps")]
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
-                if tz.eq_ignore_ascii_case("utc") =>
-            {
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if !tz.is_empty() => {
                 Ok(DataType::TIMESTAMP_NANOS)
             }
+            #[cfg(feature = "nanosecond-timestamps")]
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(DataType::TIMESTAMP_NANOS_NTZ),
             // Fall back to converting nanosecond timestamps to microsecond when the
             // nanosecond-timestamp feature is not enabled.
             #[cfg(not(feature = "nanosecond-timestamps"))]
