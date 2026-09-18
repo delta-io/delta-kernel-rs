@@ -42,6 +42,45 @@ fn field_names(s: &StructArray) -> Vec<String> {
 }
 
 #[test]
+fn partition_values_options_carry_optional_timestamp_timezone() {
+    let default = PartitionValuesOptions::with_struct();
+    assert!(default.parsed_struct);
+    assert_eq!(default.timestamp_timezone, None);
+
+    let zoned = default.with_timestamp_timezone("America/Los_Angeles");
+    assert_eq!(
+        zoned.timestamp_timezone.as_deref(),
+        Some("America/Los_Angeles")
+    );
+}
+
+#[test]
+fn scan_builder_rejects_invalid_timestamp_timezone_for_unpartitioned_table() {
+    let url = "memory:///invalid-timezone/";
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    create_table(url, schema_ref! { nullable "value": INTEGER }, "test")
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+    let snapshot = Snapshot::builder_for(Url::parse(url).unwrap())
+        .build(&engine)
+        .unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::string_map_only().with_timestamp_timezone("Not/AZone"),
+        )
+        .build();
+    let Err(error) = result else {
+        panic!("invalid timezone must fail scan construction");
+    };
+    assert!(error.to_string().contains("Not/AZone"), "{error}");
+}
+
+#[test]
 fn test_static_skipping() {
     let test_cases = [
         (false, column_pred!("a")),
