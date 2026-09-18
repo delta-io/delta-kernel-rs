@@ -265,13 +265,11 @@ impl TableProperties {
     /// `delta.parquet.compression.codec` is absent.
     ///
     /// This is the strict, connector-facing accessor: an unrecognized codec (preserved on
-    /// [`TableProperties::unknown_properties`]) is rejected with an error naming the value,
-    /// matching create-table validation. Use [`Self::compression_codec_or_default`] for the
-    /// lenient view.
+    /// [`TableProperties::unknown_properties`]) is rejected with an error naming the value. Use
+    /// [`Self::compression_codec_or_default`] for the lenient view.
     ///
-    /// Kernel does not apply this to its own checkpoint or data writes: a connector must call this
-    /// and build its engine with the returned config (e.g. the default engine builder's
-    /// `with_parquet_writer_config`) for the codec to take effect.
+    /// A connector applies the codec by building its engine with the returned config (e.g. the
+    /// default engine builder's `with_parquet_writer_config`).
     pub fn parquet_writer_config(&self) -> DeltaResult<ParquetWriterConfig> {
         if let Some(codec) = self.parquet_compression_codec {
             return Ok(ParquetWriterConfig::new(codec));
@@ -373,8 +371,7 @@ pub enum IsolationLevel {
 /// Configuration for writing Parquet files.
 ///
 /// Carries the Parquet compression codec to the engine (via
-/// [`TableProperties::parquet_writer_config`]) and is the extension point for future parquet-writer
-/// settings. `#[non_exhaustive]`, so construct via [`Self::new`] or [`Self::default`].
+/// [`TableProperties::parquet_writer_config`]). Construct via [`Self::new`] or [`Self::default`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ParquetWriterConfig {

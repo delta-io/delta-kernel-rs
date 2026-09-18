@@ -262,12 +262,8 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
 }
 
 impl<E> DefaultEngineBuilder<E> {
-    /// Set a custom Parquet writer configuration for all writes performed by this engine.
-    ///
-    /// Controls the compression codec used for all Parquet writes. Defaults to Zstd.
-    ///
-    /// Kernel does not auto-apply a table's `delta.parquet.compression.codec`: to honor it, a
-    /// connector reads `TableProperties::parquet_writer_config` and passes the result here.
+    /// Set the Parquet writer configuration (compression codec) for all writes by this engine.
+    /// Defaults to Zstd.
     pub fn with_parquet_writer_config(mut self, config: ParquetWriterConfig) -> Self {
         self.parquet_writer_config = config;
         self

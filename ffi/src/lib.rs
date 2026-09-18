@@ -2183,8 +2183,8 @@ mod tests {
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_contains,
-        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
-        setup_snapshot,
+        assert_extern_result_error_with_message, build_snapshot, invalid_utf8, ok_or_panic,
+        recover_string, setup_snapshot,
     };
 
     #[no_mangle]
@@ -3411,6 +3411,27 @@ mod tests {
             builder.parquet_writer_config,
             ParquetWriterConfig::default(),
             "rejected codec should leave config unchanged"
+        );
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn test_set_builder_parquet_invalid_utf8_codec_errors() {
+        let table_root = "memory:///test_table/";
+        let builder_ptr = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        // Reclaim ownership so the test doesn't leak the builder.
+        let mut builder = unsafe { Box::from_raw(builder_ptr) };
+        let result = unsafe { set_builder_parquet_compression(&mut builder, invalid_utf8()) };
+        assert_extern_result_error_contains(result, KernelError::Utf8Error, "utf-8");
+        assert_eq!(
+            builder.parquet_writer_config,
+            ParquetWriterConfig::default(),
+            "invalid utf-8 codec should leave config unchanged"
         );
     }
 
