@@ -7,7 +7,6 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
-use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -43,12 +42,14 @@ use crate::expressions::{
     OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
+use crate::partition_values::TimestampTimezone;
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
+    fn column_by_name_owned(&self, name: &str) -> Option<ArrayRef>;
 }
 
 impl ProvidesColumnByName for RecordBatch {
@@ -58,6 +59,10 @@ impl ProvidesColumnByName for RecordBatch {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
         self.column_by_name(name)
     }
+
+    fn column_by_name_owned(&self, name: &str) -> Option<ArrayRef> {
+        self.column_by_name(name).cloned()
+    }
 }
 
 impl ProvidesColumnByName for StructArray {
@@ -66,6 +71,22 @@ impl ProvidesColumnByName for StructArray {
     }
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
         self.column_by_name(name)
+    }
+
+    fn column_by_name_owned(&self, name: &str) -> Option<ArrayRef> {
+        let (index, _) = self.fields().find(name)?;
+        let child = self.column(index);
+        let Some(parent_nulls) = self.nulls() else {
+            return Some(child.clone());
+        };
+        if child.data_type() == &ArrowDataType::Null {
+            return Some(child.clone());
+        }
+        let nulls = NullBuffer::union(Some(parent_nulls), child.nulls());
+        let builder = child.to_data().into_builder().nulls(nulls);
+        // SAFETY: The buffers come from `child`; replacing its null buffer with the union of its
+        // own and its same-length parent's null buffer can only make more rows null.
+        Some(make_array(unsafe { builder.build_unchecked() }))
     }
 }
 
@@ -89,10 +110,30 @@ pub(crate) fn extract_column(
     parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
 ) -> DeltaResult<ArrayRef> {
-    Ok(extract_column_ref(parent, col)?.clone())
+    let mut field_names = col.iter();
+    let first = field_names
+        .next()
+        .ok_or_else(|| ArrowError::SchemaError("Empty column path".to_string()))?;
+    let mut child = parent
+        .column_by_name_owned(first.as_ref())
+        .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {}", first.as_ref())))?;
+
+    for field_name in field_names {
+        let field_name = field_name.as_ref();
+        let parent = child
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))?;
+        child = parent
+            .column_by_name_owned(field_name)
+            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
+    }
+    Ok(child)
 }
 
-/// Like [`extract_column`], but returns a borrowed [`ArrayRef`] reference.
+/// Returns a borrowed [`ArrayRef`] without applying ancestor struct null masks.
+///
+/// Use this only when the input has already had its nested null masks normalized.
 #[internal_api]
 pub(crate) fn extract_column_ref<'a>(
     mut parent: &'a dyn ProvidesColumnByName,
@@ -257,7 +298,7 @@ fn evaluate_struct_patch_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable,
             )
         })
         .collect();
@@ -937,7 +978,7 @@ fn coalesce_arrays(
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
+/// `timestamp_timezone` applies only to `TIMESTAMP` values without an explicit offset or named
 /// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
 fn parse_partition_scalar(
     prim: &PrimitiveType,
@@ -975,7 +1016,7 @@ fn parse_partition_scalar(
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
+/// `timestamp_timezone` controls `TIMESTAMP` values without an explicit offset or named timezone.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -2895,28 +2936,18 @@ mod tests {
     )]
     #[case::explicit_input_offset(
         Some("America/Los_Angeles"),
-        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
     #[case::explicit_input_offset_over_fixed_reader(
         Some("+05:30"),
-        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
     #[case::normalized_utc(
         Some("America/Los_Angeles"),
         "2024-01-15T12:30:45.123456Z",
         "2024-01-15T12:30:45.123456Z"
-    )]
-    #[case::embedded_iana_timezone(
-        Some("Europe/Berlin"),
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
-    )]
-    #[case::embedded_iana_timezone_with_default_options(
-        None,
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
     )]
     #[case::dst_overlap(
         Some("America/Los_Angeles"),

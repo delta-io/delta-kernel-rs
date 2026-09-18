@@ -216,6 +216,10 @@ StructExpression
     Integer(1)
     Long(2)
     Double(3.000000)
+  StructExpression
+    Integer(4)
+    nullability_predicate
+      Column(keep_struct)
   MapToStruct
     Column(partitionValues)
   MapToStruct(timestamp_timezone=America/Los_Angeles)

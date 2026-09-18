@@ -104,6 +104,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           break;
       }
       print_expression_item_list(var->exprs, depth + 1);
+      print_non_empty_expression_item_list_field(
+          "nullability_predicate", var->nullability_predicate, depth + 1);
       break;
     }
     case StructPatch: {

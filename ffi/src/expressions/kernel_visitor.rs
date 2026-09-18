@@ -685,6 +685,35 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
+/// Builds a struct expression whose rows are null when `nullability_predicate` is false or null.
+///
+/// # Parameters
+///
+/// - `state`: Visitor state that owns the in-flight child expressions.
+/// - `children`: Struct field expressions in output order.
+/// - `nullability_predicate`: In-flight boolean expression controlling struct validity.
+///
+/// # Returns
+///
+/// The new in-flight expression identifier, or zero if `nullability_predicate` is invalid.
+#[no_mangle]
+pub extern "C" fn visit_expression_struct_with_nullability(
+    state: &mut KernelExpressionVisitorState,
+    children: &mut EngineIterator,
+    nullability_predicate: usize,
+) -> usize {
+    let Some(nullability_predicate) = unwrap_kernel_expression(state, nullability_predicate) else {
+        return 0;
+    };
+    let exprs: Vec<Expression> = children
+        .flat_map(|child| unwrap_kernel_expression(state, child as usize))
+        .collect();
+    wrap_expression(
+        state,
+        Expression::struct_with_nullability_from(exprs, nullability_predicate),
+    )
+}
+
 /// Builds a `MapToStruct` expression from its map child and options.
 ///
 /// The options and any contained string are copied into the expression before this function
