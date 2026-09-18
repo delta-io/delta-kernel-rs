@@ -78,9 +78,11 @@ def write_log(log_dir: Path, file_name: str, file_size: int) -> None:
 
     stats = json.dumps(
         {
+            # Timestamp min/max stats must be truncated to millisecond precision
+            # according to the Delta protocol.
             "numRecords": 4,
-            "minValues": {"id": 0, "ts": "1969-12-31T23:59:59.999999877Z", "ts_ntz": "1969-12-31 23:59:59.999999877"},
-            "maxValues": {"id": 3, "ts": "1970-01-01T00:00:00.000000123Z", "ts_ntz": "1970-01-01 00:00:00.000000123"},
+            "minValues": {"id": 0, "ts": "1969-12-31T23:59:59.999Z", "ts_ntz": "1969-12-31T23:59:59.999"},
+            "maxValues": {"id": 3, "ts": "1970-01-01T00:00:00.000Z", "ts_ntz": "1970-01-01T00:00:00.000"},
             "nullCount": {"id": 0, "ts": 1, "ts_ntz": 1},
         }
     )

@@ -17,6 +17,8 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+#[cfg(feature = "nanosecond-timestamps")]
+use delta_kernel::expressions::BinaryPredicateOp;
 use delta_kernel::expressions::{
     col, column_pred, lit, null_lit, Expression as Expr, ExpressionRef, Predicate as Pred,
     PredicateRef, Scalar,
@@ -1623,6 +1625,44 @@ fn timestamp_nanos() -> Result<(), Box<dyn std::error::Error>> {
         "+----+--------------------------------+-------------------------------+",
     ];
     read_table_data_str("./tests/data/timestamp-nanos/", None, None, expected)?;
+    Ok(())
+}
+
+/// Test file-skipping on the nanosecond timestamp test table.
+/// Nanosecond timestamp min/max stats are truncated to millisecond precision when writing,
+/// so file-skipping must account for this and widen by 999_999ns.
+#[cfg(feature = "nanosecond-timestamps")]
+#[rstest::rstest]
+#[case::gt_past_widened_max_skips(BinaryPredicateOp::GreaterThan, 1_000_000, 0)]
+#[case::gt_within_widened_max_keeps(BinaryPredicateOp::GreaterThan, 123, 1)]
+#[case::lt_truncated_min_skips(BinaryPredicateOp::LessThan, -1_000_000, 0)]
+#[case::lt_above_truncated_min_keeps(BinaryPredicateOp::LessThan, -123, 1)]
+fn timestamp_nanos_stats_skipping_scan_file_count(
+    #[case] op: BinaryPredicateOp,
+    #[case] nanos: i64,
+    #[case] expected_files: usize,
+    #[values("ts", "ts_ntz")] column: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = match column {
+        "ts" => Scalar::TimestampNanos(nanos),
+        _ => Scalar::TimestampNanosNtz(nanos),
+    };
+    let predicate = Pred::binary(op, Expr::column([column]), lit(value));
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/timestamp-nanos"))?;
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut scan_files: Vec<ScanFile> = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        scan_files = res?.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+    assert_eq!(scan_files.len(), expected_files);
     Ok(())
 }
 
