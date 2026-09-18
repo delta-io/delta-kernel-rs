@@ -541,7 +541,7 @@ impl Crc {
             .metadata
             .configuration()
             .get(ENABLE_IN_COMMIT_TIMESTAMPS)
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            .is_some_and(|value| value == "true")
             && self.in_commit_timestamp_opt.is_none()
         {
             return Err(Error::generic(
@@ -1368,6 +1368,17 @@ mod tests {
         assert!(error.to_string().contains("overflow"), "{error}");
     }
 
+    #[test]
+    fn de_deleted_record_histogram_file_count_mismatch_is_rejected() {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(0, 2, 1, 1)).unwrap();
+        crc["deletedRecordCountsHistogramOpt"] = serde_json::json!({
+            "deletedRecordCounts": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        });
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(error.to_string().contains("file count"), "{error}");
+    }
+
     #[rstest]
     #[case::file_count("numFiles", 2, 5, None, None)]
     #[case::table_size("tableSizeBytes", 1, 6, None, None)]
@@ -1685,15 +1696,11 @@ mod tests {
     }
 
     #[test]
-    fn de_ict_enablement_value_is_case_insensitive() {
+    fn de_ict_enablement_value_is_case_sensitive() {
         let mut crc: serde_json::Value =
             serde_json::from_str(&crc_json_with_counts(0, 0, 1, 1)).unwrap();
         crc["metadata"]["configuration"][ENABLE_IN_COMMIT_TIMESTAMPS] = serde_json::json!("True");
-        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
-        assert!(
-            error.to_string().contains("inCommitTimestampOpt"),
-            "{error}"
-        );
+        Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap();
     }
 
     // ===== protocol validation on the CRC deserialization path =====
