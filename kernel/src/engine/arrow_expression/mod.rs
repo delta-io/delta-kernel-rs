@@ -20,7 +20,6 @@ use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluat
 
 pub mod evaluate_expression;
 pub mod opaque;
-mod timestamp_timezone;
 
 #[cfg(test)]
 mod tests;

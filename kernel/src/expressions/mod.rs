@@ -662,8 +662,8 @@ impl ParseJsonExpression {
 /// Connector-supplied options controlling how a [`MapToStructExpression`] parses map values.
 ///
 /// Kernel does not infer these settings from the host environment or table metadata.
-/// Expression producers must use one reader timezone for all partition-value expressions in a
-/// scan so materialization and pruning cannot interpret the same value differently.
+/// Expression producers must use one timezone for all partition-value expressions in a scan so
+/// materialization and pruning cannot interpret the same value differently.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -738,18 +738,18 @@ impl MapToStructOptions {
 ///   round or rescale.
 /// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
 /// - DATE: parse `{year}-{month}-{day}`.
-/// - TIMESTAMP: accept date-only values and timestamps with a space, `T`, or `t` separator,
-///   optional fractional seconds, an optional numeric offset, or a trailing IANA timezone. Parse
-///   values with an offset or timezone as absolute instants; parse offset-less values in the reader
-///   timezone from [`MapToStructOptions`], or UTC by default.
+/// - TIMESTAMP: accept the protocol encodings plus compatible date-only, `T`-separated,
+///   compact-offset, and named-timezone forms. Values without an explicit offset or named timezone
+///   use the timezone from [`MapToStructOptions`], or UTC by default; embedded zone information
+///   takes precedence.
 /// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
 ///   wall-clock value.
 /// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
 /// - VOID: reject every non-empty value.
 ///
-/// The reader timezone does not affect a timestamp carrying its own time zone or offset. Modern
-/// writers use the protocol's UTC-adjusted ISO 8601 form, which therefore reads independently of
-/// the configured reader timezone.
+/// The configured timezone does not affect a timestamp carrying an explicit offset or named
+/// timezone. The protocol's UTC-adjusted ISO 8601 form therefore reads independently of the
+/// configured timezone.
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
