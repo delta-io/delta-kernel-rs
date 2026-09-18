@@ -16,7 +16,7 @@
 // but pub(crate) otherwise.
 #![allow(unreachable_pub)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 mod delta;
 mod file_size_histogram;
@@ -41,9 +41,6 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
-use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::BackReference;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::{DeltaResult, Error, Version};
@@ -202,7 +199,7 @@ struct CrcRaw {
     #[serde(default)]
     domain_metadata: Option<Vec<DomainMetadata>>,
     #[serde(default, skip_serializing)]
-    all_files: Option<Vec<AddRaw>>,
+    all_files: Option<Vec<Add>>,
     #[serde(default, skip_serializing)]
     num_deleted_records_opt: Option<i64>,
     #[serde(default, skip_serializing)]
@@ -222,92 +219,6 @@ struct CrcRaw {
         skip_serializing_if = "Option::is_none"
     )]
     file_size_histogram: Option<FileSizeHistogram>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AddRaw {
-    path: String,
-    partition_values: HashMap<String, Option<String>>,
-    size: i64,
-    modification_time: i64,
-    data_change: bool,
-    stats: Option<String>,
-    tags: Option<HashMap<String, Option<String>>>,
-    deletion_vector: Option<DeletionVectorRaw>,
-    base_row_id: Option<i64>,
-    default_row_commit_version: Option<i64>,
-    clustering_provider: Option<String>,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    back_reference: Option<BackReferenceRaw>,
-}
-
-impl TryFrom<AddRaw> for Add {
-    type Error = Error;
-
-    fn try_from(raw: AddRaw) -> DeltaResult<Self> {
-        Ok(Self {
-            path: raw.path,
-            partition_values: raw
-                .partition_values
-                .into_iter()
-                .filter_map(|(key, value)| value.map(|value| (key, value)))
-                .collect(),
-            size: raw.size,
-            modification_time: raw.modification_time,
-            data_change: raw.data_change,
-            stats: raw.stats,
-            tags: raw.tags,
-            deletion_vector: raw.deletion_vector.map(TryInto::try_into).transpose()?,
-            base_row_id: raw.base_row_id,
-            default_row_commit_version: raw.default_row_commit_version,
-            clustering_provider: raw.clustering_provider,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            back_reference: raw.back_reference.map(Into::into),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeletionVectorRaw {
-    storage_type: String,
-    path_or_inline_dv: String,
-    offset: Option<i32>,
-    size_in_bytes: i32,
-    cardinality: i64,
-}
-
-impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
-    type Error = Error;
-
-    fn try_from(raw: DeletionVectorRaw) -> DeltaResult<Self> {
-        DeletionVectorDescriptor::try_new(
-            raw.storage_type.parse::<DeletionVectorStorageType>()?,
-            raw.path_or_inline_dv,
-            raw.offset,
-            raw.size_in_bytes,
-            raw.cardinality,
-        )
-    }
-}
-
-#[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BackReferenceRaw {
-    manifest: String,
-    pos: i32,
-}
-
-#[cfg(feature = "adaptive-metadata-in-dev")]
-impl From<BackReferenceRaw> for BackReference {
-    fn from(raw: BackReferenceRaw) -> Self {
-        Self {
-            manifest: raw.manifest,
-            pos: raw.pos,
-        }
-    }
 }
 
 impl Crc {
@@ -366,9 +277,7 @@ impl Crc {
                 None => DomainMetadataState::try_partial(Vec::new())?,
             },
             raw.txn_id,
-            raw.all_files
-                .map(|files| files.into_iter().map(TryInto::try_into).collect())
-                .transpose()?,
+            raw.all_files,
             raw.num_deleted_records_opt,
             raw.num_deletion_vectors_opt,
             raw.deleted_record_counts_histogram_opt
