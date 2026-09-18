@@ -9,6 +9,7 @@
 //! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
 //! - [`SetTransactionState`] tracks set-transaction completeness (Complete / Partial).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use delta_kernel_derive::internal_api;
@@ -128,10 +129,16 @@ fn domain_metadata_map(
                 "complete CRC state contains domain-metadata tombstone for {domain}"
             )));
         }
-        if result.insert(domain.clone(), value).is_some() {
-            return Err(Error::generic(format!(
-                "CRC state contains duplicate domain {domain}"
-            )));
+        match result.entry(domain) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            Entry::Occupied(entry) => {
+                return Err(Error::generic(format!(
+                    "CRC state contains duplicate domain {}",
+                    entry.key()
+                )));
+            }
         }
     }
     Ok(result)
@@ -208,10 +215,16 @@ fn transaction_map(
     let mut result = HashMap::with_capacity(values.size_hint().0);
     for value in values {
         let app_id = value.app_id.clone();
-        if result.insert(app_id.clone(), value).is_some() {
-            return Err(Error::generic(format!(
-                "CRC state contains duplicate transaction application id {app_id}"
-            )));
+        match result.entry(app_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            Entry::Occupied(entry) => {
+                return Err(Error::generic(format!(
+                    "CRC state contains duplicate transaction application id {}",
+                    entry.key()
+                )));
+            }
         }
     }
     Ok(result)

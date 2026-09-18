@@ -17,7 +17,6 @@
 #![allow(unreachable_pub)]
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 mod delta;
 mod file_size_histogram;
@@ -36,10 +35,9 @@ pub(crate) use file_stats::{is_incremental_safe_operation, size_to_u64, FileStat
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]
 pub(crate) use reader::try_read_crc_file;
-use serde::de::{Deserializer, IgnoredAny, SeqAccess, Visitor};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
-use tracing::warn;
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
@@ -49,12 +47,6 @@ use crate::actions::BackReference;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::{DeltaResult, Error, Version};
-
-/// Maximum number of `allFiles` entries retained from a CRC.
-///
-/// Treat tables with at most 8,000 files as small tables. Larger enumerations are ignored so
-/// a faulty writer cannot make Kernel retain an unbounded decoded file list.
-const MAX_ALL_FILES_NUM_FILES: usize = 8_000;
 
 // ============================================================================
 // Crc: in-memory representation
@@ -209,8 +201,8 @@ struct CrcRaw {
     set_transactions: Option<Vec<SetTransaction>>,
     #[serde(default)]
     domain_metadata: Option<Vec<DomainMetadata>>,
-    #[serde(default, deserialize_with = "deserialize_all_files", skip_serializing)]
-    all_files: Option<Vec<Add>>,
+    #[serde(default, skip_serializing)]
+    all_files: Option<Vec<AddRaw>>,
     #[serde(default, skip_serializing)]
     num_deleted_records_opt: Option<i64>,
     #[serde(default, skip_serializing)]
@@ -318,72 +310,6 @@ impl From<BackReferenceRaw> for BackReference {
     }
 }
 
-fn deserialize_all_files<'de, D>(deserializer: D) -> Result<Option<Vec<Add>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_option(AllFilesOptionVisitor)
-}
-
-struct AllFilesOptionVisitor;
-
-impl<'de> Visitor<'de> for AllFilesOptionVisitor {
-    type Value = Option<Vec<Add>>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("null or an array of Add actions")
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(AllFilesVisitor)
-    }
-}
-
-struct AllFilesVisitor;
-
-impl<'de> Visitor<'de> for AllFilesVisitor {
-    type Value = Option<Vec<Add>>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an array of Add actions")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut files = Vec::new();
-        while files.len() < MAX_ALL_FILES_NUM_FILES {
-            let Some(raw) = sequence.next_element::<AddRaw>()? else {
-                return Ok(Some(files));
-            };
-            files.push(raw.try_into().map_err(serde::de::Error::custom)?);
-        }
-
-        if sequence.next_element::<IgnoredAny>()?.is_none() {
-            return Ok(Some(files));
-        }
-
-        drop(files);
-        while sequence.next_element::<IgnoredAny>()?.is_some() {}
-        warn!(
-            "allFiles exceeds the {MAX_ALL_FILES_NUM_FILES}-entry read limit; dropping the field"
-        );
-        Ok(None)
-    }
-}
-
 impl Crc {
     /// Parses a `.crc` file body for `version`, which comes from the filename because the body does
     /// not carry it.
@@ -440,7 +366,9 @@ impl Crc {
                 None => DomainMetadataState::try_partial(Vec::new())?,
             },
             raw.txn_id,
-            raw.all_files,
+            raw.all_files
+                .map(|files| files.into_iter().map(TryInto::try_into).collect())
+                .transpose()?,
             raw.num_deleted_records_opt,
             raw.num_deletion_vectors_opt,
             raw.deleted_record_counts_histogram_opt
@@ -737,14 +665,14 @@ pub struct DeletedRecordCountsHistogram {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeletedRecordCountsHistogramRaw {
-    deleted_record_counts: Vec<i64>,
+    deleted_record_counts: [i64; 10],
 }
 
 impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
     type Error = Error;
 
     fn try_from(value: DeletedRecordCountsHistogramRaw) -> DeltaResult<Self> {
-        Self::try_new(value.deleted_record_counts)
+        Self::try_new(value.deleted_record_counts.into())
     }
 }
 
@@ -815,7 +743,7 @@ mod tests {
 
     use super::{
         Crc, CrcRaw, DeletedRecordCountsHistogram, DomainMetadataState, FileStats, FileStatsState,
-        SetTransactionState, ENABLE_IN_COMMIT_TIMESTAMPS, MAX_ALL_FILES_NUM_FILES,
+        SetTransactionState, ENABLE_IN_COMMIT_TIMESTAMPS,
     };
     use crate::actions::{Add, DomainMetadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
@@ -1315,8 +1243,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::too_few(vec![0; 9], "exactly 10 bins")]
-    #[case::too_many(vec![0; 11], "exactly 10 bins")]
+    #[case::too_few(vec![0; 9], "invalid length")]
+    #[case::too_many(vec![0; 11], "trailing characters")]
     #[case::negative(vec![0, 0, -1, 0, 0, 0, 0, 0, 0, 0], "negative file count")]
     fn de_deleted_record_histogram_shape_is_validated(
         #[case] bins: Vec<i64>,
@@ -1567,38 +1495,6 @@ mod tests {
         assert!(error.to_string().contains(message), "{error}");
     }
 
-    fn crc_json_with_all_files(num_files: usize) -> String {
-        let files = (0..num_files)
-            .map(|index| {
-                serde_json::json!({
-                    "path": format!("part-{index}.parquet"),
-                    "partitionValues": {},
-                    "size": 1,
-                    "modificationTime": 0,
-                    "dataChange": false
-                })
-            })
-            .collect();
-        let mut crc: serde_json::Value = serde_json::from_str(&crc_json_with_counts(
-            num_files as i64,
-            num_files as i64,
-            1,
-            1,
-        ))
-        .unwrap();
-        crc["allFiles"] = serde_json::Value::Array(files);
-        crc.to_string()
-    }
-
-    #[rstest]
-    #[case::at_limit(MAX_ALL_FILES_NUM_FILES, true)]
-    #[case::over_limit(MAX_ALL_FILES_NUM_FILES + 1, false)]
-    fn de_all_files_retention_is_bounded(#[case] count: usize, #[case] retained: bool) {
-        let json = crc_json_with_all_files(count);
-        let crc = Crc::try_from_json_bytes(json.as_bytes(), 0).unwrap();
-        assert_eq!(crc.all_files.is_some(), retained);
-    }
-
     #[test]
     fn ser_does_not_emit_newly_read_extended_fields() {
         let crc = Crc {
@@ -1653,6 +1549,33 @@ mod tests {
         );
         let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[test]
+    fn de_all_files_deleted_record_total_overflow_is_rejected() {
+        let mut crc: serde_json::Value =
+            serde_json::from_str(&crc_json_with_counts(2, 2, 1, 1)).unwrap();
+        crc["allFiles"] = serde_json::json!([
+            {
+                "path": "part-0.parquet", "partitionValues": {}, "size": 1,
+                "modificationTime": 0, "dataChange": false,
+                "deletionVector": {
+                    "storageType": "i", "pathOrInlineDv": "", "sizeInBytes": 0,
+                    "cardinality": i64::MAX
+                }
+            },
+            {
+                "path": "part-1.parquet", "partitionValues": {}, "size": 1,
+                "modificationTime": 0, "dataChange": false,
+                "deletionVector": {
+                    "storageType": "i", "pathOrInlineDv": "", "sizeInBytes": 0,
+                    "cardinality": 1
+                }
+            }
+        ]);
+
+        let error = Crc::try_from_json_bytes(crc.to_string().as_bytes(), 0).unwrap_err();
+        assert!(error.to_string().contains("overflow"), "{error}");
     }
 
     #[rstest]
