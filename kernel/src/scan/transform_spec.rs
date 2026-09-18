@@ -11,7 +11,8 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::partition_values::TimestampTimezone;
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
@@ -239,17 +240,25 @@ fn apply_insert_after(
 /// Parse a partition value from the raw string representation.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
+/// `TIMESTAMP` uses the shared partition timestamp parser with its UTC default; all other types
+/// retain [`PrimitiveType::parse_scalar`] semantics.
 ///
 /// [`PrimitiveType::empty_string_partition_cast`]: crate::schema::PrimitiveType::empty_string_partition_cast
+/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
+    let timestamp_timezone = TimestampTimezone::default();
     match (raw, data_type.as_primitive_opt()) {
-        (Some(v), Some(primitive)) if v.is_empty() => Ok(primitive
+        (Some(value), Some(PrimitiveType::Timestamp)) if !value.is_empty() => timestamp_timezone
+            .parse_timestamp(value)
+            .map(Scalar::Timestamp)
+            .ok_or_else(|| Error::ParseError(value.clone(), data_type.clone())),
+        (Some(value), Some(primitive)) if value.is_empty() => Ok(primitive
             .empty_string_partition_cast()
             .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
-        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
+        (Some(value), Some(primitive)) => primitive.parse_scalar(value),
         (Some(_), None) => Err(Error::generic(format!(
             "Unexpected partition column type: {data_type:?}"
         ))),
@@ -263,7 +272,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, BinaryExpressionOp};
-    use crate::schema::{schema, schema_ref, DataType, PrimitiveType};
+    use crate::schema::{schema, schema_ref, DataType};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
@@ -364,6 +373,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_partition_value_raw_protocol_timestamp() {
+        let timestamp = "2024-01-15T12:30:45Z".to_string();
+        assert_eq!(
+            parse_partition_value_raw(Some(&timestamp), &DataType::TIMESTAMP).unwrap(),
+            Scalar::Timestamp(1_705_321_845_000_000)
+        );
+
+        let invalid_timestamp = "2024-01-15 123045".to_string();
+        assert!(parse_partition_value_raw(Some(&invalid_timestamp), &DataType::TIMESTAMP).is_err());
+
+        for (data_type, raw) in [
+            (DataType::DATE, "20240115"),
+            (DataType::TIMESTAMP_NTZ, "2024-01-15T12:30:45+02:00"),
+        ] {
+            assert!(parse_partition_value_raw(Some(&raw.to_string()), &data_type).is_err());
+        }
+    }
+
+    #[test]
     fn test_parse_partition_value_raw_null() {
         let result = parse_partition_value_raw(None, &DataType::STRING).unwrap();
         assert!(result.is_null());
@@ -386,6 +414,10 @@ mod tests {
             parse_partition_value_raw(Some(&empty), &DataType::Primitive(PrimitiveType::Integer))
                 .unwrap();
         assert!(int_value.is_null());
+
+        let timestamp_value =
+            parse_partition_value_raw(Some(&empty), &DataType::TIMESTAMP).unwrap();
+        assert!(timestamp_value.is_null());
     }
 
     #[test]

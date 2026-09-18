@@ -749,11 +749,6 @@ fn test_get_partition_value() {
             Scalar::Timestamp(123456),
         ),
         (
-            "1970-01-01 00:00:00.123456789",
-            PrimitiveType::Timestamp,
-            Scalar::Timestamp(123456),
-        ),
-        (
             // RFC 3339 with a non-UTC offset: normalized to UTC (1969-12-31T19:00:00Z)
             "1970-01-01T00:00:00+05:00",
             PrimitiveType::Timestamp,

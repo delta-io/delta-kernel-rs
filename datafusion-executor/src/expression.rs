@@ -407,7 +407,7 @@ fn struct_columns_from_patch(
 /// - A timestamp with a trailing named timezone is accepted by the kernel parser but not by the
 ///   native DataFusion cast.
 ///
-/// Configured options use a kernel-backed UDF so reader-timezone parsing follows kernel semantics.
+/// Configured options use a kernel-backed UDF so timezone parsing follows kernel semantics.
 ///
 /// # Errors
 ///
