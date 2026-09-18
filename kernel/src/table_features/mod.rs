@@ -566,7 +566,6 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
 };
 
 #[cfg(feature = "nanosecond-timestamps")]
-#[allow(dead_code)]
 static TIMESTAMP_NANOSECOND_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -577,7 +576,6 @@ static TIMESTAMP_NANOSECOND_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
