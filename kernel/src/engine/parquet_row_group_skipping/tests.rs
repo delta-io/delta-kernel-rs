@@ -487,6 +487,80 @@ fn test_row_group_filter_is_null_prunes_when_nullcount_is_zero() {
     ));
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+#[test]
+fn test_row_group_filter_reads_timestamp_nanos_footer_stats() {
+    use crate::arrow::array::TimestampNanosecondArray;
+    use crate::arrow::datatypes::TimeUnit;
+
+    let values = vec![1_000_000_001i64, 1_000_000_500, 1_000_000_999];
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(
+            "ts",
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new(
+            "ts_ntz",
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampNanosecondArray::from(values.clone()).with_timezone("UTC")),
+            Arc::new(TimestampNanosecondArray::from(values)),
+        ],
+    )
+    .unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer =
+        ArrowWriter::try_new(tmp.as_file().try_clone().unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let metadata = ArrowReaderMetadata::load(tmp.as_file(), Default::default()).unwrap();
+    let row_group = metadata.metadata().row_group(0);
+
+    // Parquet stats for nanosecond timestamp columns are read at full precision,
+    // not widened like checkpoint stats.
+    let columns = Predicate::and_from(vec![column_pred!("ts"), column_pred!("ts_ntz")]);
+    let filter = RowGroupFilter::new(row_group, &columns);
+    assert_eq!(
+        filter.get_min_stat(&column_name!("ts"), &DataType::TIMESTAMP_NANOS),
+        Some(Scalar::TimestampNanos(1_000_000_001))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("ts"), &DataType::TIMESTAMP_NANOS),
+        Some(Scalar::TimestampNanos(1_000_000_999))
+    );
+    assert_eq!(
+        filter.get_min_stat(&column_name!("ts_ntz"), &DataType::TIMESTAMP_NANOS_NTZ),
+        Some(Scalar::TimestampNanosNtz(1_000_000_001))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("ts_ntz"), &DataType::TIMESTAMP_NANOS_NTZ),
+        Some(Scalar::TimestampNanosNtz(1_000_000_999))
+    );
+
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::gt(col!("ts"), lit(Scalar::TimestampNanos(1_000_000_999)))
+    ));
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::lt(
+            col!("ts_ntz"),
+            lit(Scalar::TimestampNanosNtz(1_000_000_001))
+        )
+    ));
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::gt(col!("ts"), lit(Scalar::TimestampNanos(1_000_000_500)))
+    ));
+}
+
 // Intervals are unsupported for skipping under any footer encoding, so extraction returns None.
 #[test]
 fn test_interval_skipping_unsupported_for_any_footer_stats() {
