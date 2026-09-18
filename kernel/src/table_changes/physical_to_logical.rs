@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
 use crate::expressions::Scalar;
+use crate::partition_values::TimestampTimezone;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{
     get_transform_expr, parse_partition_values, FileRowTrackingMetadata,
@@ -112,6 +113,7 @@ pub(crate) fn get_cdf_transform_expr(
         transform_spec,
         &scan_file.partition_values,
         state_info.column_mapping_mode,
+        TimestampTimezone::default(),
     )?;
     partition_values.extend(parsed_values);
 
