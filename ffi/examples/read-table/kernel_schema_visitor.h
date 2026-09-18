@@ -38,6 +38,10 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     visit_res = visit_field_timestamp(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "timestamp_ntz") == 0) {
     visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, allocate_error);
+  } else if (strcmp(item->type, "timestamp_nanos") == 0) {
+    visit_res = visit_field_timestamp_nanos(state, name, item->is_nullable, allocate_error);
+  } else if (strcmp(item->type, "timestamp_nanos_ntz") == 0) {
+    visit_res = visit_field_timestamp_nanos_ntz(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "interval year to month") == 0) {
     visit_res = visit_field_interval_year_month(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "interval day to second") == 0) {
