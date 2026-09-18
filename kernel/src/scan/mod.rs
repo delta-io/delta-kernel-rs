@@ -30,6 +30,7 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
+use crate::partition_values::TimestampTimezone;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
@@ -235,19 +236,20 @@ impl StatsOptions {
     }
 }
 
-/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
-/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
-/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] or
+/// [`crate::incremental_scan::IncrementalScanBuilder::with_partition_values`] to request a typed
+/// `partitionValues_parsed` struct alongside the raw string map, which is always preserved.
 ///
-/// When the typed struct is requested, scan metadata output gains a top-level
-/// `partitionValues_parsed` struct column with one typed nullable field per partition column
-/// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// Full scan metadata emits the struct at the top level; incremental Add batches emit it as
+/// `add.partitionValues_parsed`. It contains one typed nullable field per partition column using
+/// physical names and table partition-column order. On non-partitioned tables it is omitted.
+/// Values are parsed from the canonical string map.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
+    /// Reader timezone used to interpret offset-less zoned timestamp partition strings.
+    pub(crate) timestamp_timezone: Option<String>,
 }
 
 impl PartitionValuesOptions {
@@ -256,12 +258,28 @@ impl PartitionValuesOptions {
         Self::default()
     }
 
-    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map. Lets engines
-    /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
+    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
+            timestamp_timezone: None,
         }
+    }
+
+    /// Interpret offset-less zoned `TIMESTAMP` partition strings in `timestamp_timezone`.
+    ///
+    /// `timestamp_timezone` must be an IANA time zone identifier recognized by Kernel or a
+    /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
+    /// value takes precedence. This option does not affect `TIMESTAMP_NTZ`. It applies to typed
+    /// full scan metadata and final partition predicate evaluation, as well as incremental typed
+    /// output and predicate skipping. Partition-column row transforms used by [`Scan::execute`]
+    /// retain UTC parsing. Native checkpoint pruning remains enabled for timezone-independent
+    /// fields but defers zoned `TIMESTAMP` predicates until after reparsing. Without this option,
+    /// Kernel interprets offset-less timestamps as UTC. Invalid values are reported when the scan
+    /// is built.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
     }
 }
 
@@ -425,6 +443,10 @@ impl ScanBuilder {
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
     pub fn build(self) -> DeltaResult<Scan> {
+        if let Some(timestamp_timezone) = self.partition_values.timestamp_timezone.as_deref() {
+            timestamp_timezone.parse::<TimestampTimezone>()?;
+        }
+
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -841,6 +863,7 @@ impl Scan {
     fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
         log_replay::ScanPartitionValuesOptions {
             parsed_struct: self.partition_values.parsed_struct,
+            timestamp_timezone: self.partition_values.timestamp_timezone.clone(),
         }
     }
 
@@ -1146,7 +1169,7 @@ impl Scan {
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
-        // whether the checkpoint carries a compatible parsed-stats column.
+        // whether the checkpoint carries compatible parsed stats.
         let plan_executor = engine.require_plan_executor()?;
         let shape = CheckpointShape::try_new(
             plan_executor.as_ref(),
@@ -1201,6 +1224,7 @@ impl Scan {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
+
         // Skipping needs either data-column stats or partition values to rewrite against; a
         // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
         // unpartitioned table has no partition schema.
@@ -1217,6 +1241,13 @@ impl Scan {
         let mut floating_partition_columns = HashSet::new();
         if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
             for field in schema.fields() {
+                // Native checkpoint values may encode a different instant than reader-timezone
+                // parsing, so they cannot safely prune zoned timestamp partitions.
+                if self.partition_values.timestamp_timezone.is_some()
+                    && field.data_type() == &DataType::TIMESTAMP
+                {
+                    continue;
+                }
                 let column = ColumnName::new([field.name()]);
                 if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
                     floating_partition_columns.insert(column.clone());

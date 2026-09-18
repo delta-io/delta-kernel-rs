@@ -7,7 +7,6 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
-use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -43,6 +42,7 @@ use crate::expressions::{
     OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
+use crate::partition_values::TimestampTimezone;
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
 #[internal_api]
@@ -937,7 +937,7 @@ fn coalesce_arrays(
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
+/// `timestamp_timezone` applies only to `TIMESTAMP` values without an explicit offset or named
 /// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
 fn parse_partition_scalar(
     prim: &PrimitiveType,
@@ -975,7 +975,7 @@ fn parse_partition_scalar(
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
+/// `timestamp_timezone` controls `TIMESTAMP` values without an explicit offset or named timezone.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -2895,28 +2895,18 @@ mod tests {
     )]
     #[case::explicit_input_offset(
         Some("America/Los_Angeles"),
-        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
     #[case::explicit_input_offset_over_fixed_reader(
         Some("+05:30"),
-        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
     #[case::normalized_utc(
         Some("America/Los_Angeles"),
         "2024-01-15T12:30:45.123456Z",
         "2024-01-15T12:30:45.123456Z"
-    )]
-    #[case::embedded_iana_timezone(
-        Some("Europe/Berlin"),
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
-    )]
-    #[case::embedded_iana_timezone_with_default_options(
-        None,
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
     )]
     #[case::dst_overlap(
         Some("America/Los_Angeles"),

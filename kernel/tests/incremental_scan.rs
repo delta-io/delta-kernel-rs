@@ -8,10 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::array::{
+    Int32Array, MapArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::expressions::{col, lit, Predicate as Pred, PredicateRef};
+use delta_kernel::expressions::{col, lit, Predicate as Pred, PredicateRef, Scalar};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
@@ -21,6 +23,7 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::scan::state::ScanFile;
+use delta_kernel::scan::PartitionValuesOptions;
 use delta_kernel::schema::{schema_ref, StructType};
 use delta_kernel::{
     Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, SnapshotRef, StorageHandler,
@@ -35,7 +38,8 @@ use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
     add_commit, add_staged_commit, assert_result_error_with_message,
     compacted_log_path_for_versions, create_log_path, create_table_and_load_snapshot,
-    delta_path_for_version, test_table_setup_mt, write_batch_to_table, TestAction,
+    delta_path_for_version, into_record_batch, test_table_setup_mt, write_batch_to_table,
+    TestAction,
 };
 use url::Url;
 
@@ -1219,6 +1223,135 @@ fn add_partitioned(path: &str, val: &str) -> String {
         "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{\"val\":\"{val}\"}},\"size\":100,\
          \"modificationTime\":1700000000000,\"dataChange\":true}}}}"
     )
+}
+
+async fn timestamp_partition_snapshot(
+) -> Result<(Arc<DefaultEngine<TokioBackgroundExecutor>>, SnapshotRef), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let schema_string = serde_json::json!({
+        "type": "struct",
+        "fields": [
+            {"name": "p_ts", "type": "timestamp", "nullable": true, "metadata": {}},
+            {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
+        ],
+    })
+    .to_string();
+    let metadata = serde_json::json!({
+        "metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": ["p_ts"],
+            "configuration": {},
+        },
+    });
+    add_commit(
+        table_url.as_str(),
+        storage.as_ref(),
+        0,
+        format!(
+            "{}\n{metadata}",
+            serde_json::json!({
+                "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            })
+        ),
+    )
+    .await?;
+    add_commit(
+        table_url.as_str(),
+        storage.as_ref(),
+        1,
+        serde_json::json!({
+            "add": {
+                "path": "part.parquet",
+                "partitionValues": {"p_ts": "2024-01-15 12:30:45.123456"},
+                "size": 1,
+                "modificationTime": 1700000000000_i64,
+                "dataChange": true,
+            },
+        })
+        .to_string(),
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    Ok((engine, snapshot))
+}
+
+#[tokio::test]
+async fn configured_partition_values_use_timezone_for_output_and_skipping(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, target) = timestamp_partition_snapshot().await?;
+    let predicate: PredicateRef =
+        Arc::new(col!("p_ts").gt(lit(Scalar::Timestamp(1_705_334_400_000_000))));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .with_partition_values(
+                PartitionValuesOptions::with_struct()
+                    .with_timestamp_timezone("America/Los_Angeles"),
+            )
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("part.parquet")])
+    );
+    let filtered = listing
+        .add_files
+        .into_iter()
+        .next()
+        .expect("expected one incremental Add batch");
+    let batch = into_record_batch(filtered.apply_selection_vector()?);
+    let add = batch
+        .column_by_name("add")
+        .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+        .expect("add should be a struct");
+    let raw = add
+        .column_by_name("partitionValues")
+        .and_then(|column| column.as_any().downcast_ref::<MapArray>())
+        .expect("raw partition values should be preserved");
+    let raw_keys = raw
+        .entries()
+        .column_by_name("key")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .expect("partition keys should be strings");
+    let raw_values = raw
+        .entries()
+        .column_by_name("value")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .expect("partition values should be strings");
+    assert_eq!(raw_keys.value(0), "p_ts");
+    assert_eq!(raw_values.value(0), "2024-01-15 12:30:45.123456");
+    let parsed = add
+        .column_by_name("partitionValues_parsed")
+        .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+        .expect("parsed partition values should be a struct");
+    let timestamp = parsed
+        .column_by_name("p_ts")
+        .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
+        .expect("p_ts should be a timestamp");
+    assert_eq!(timestamp.value(0), 1_705_350_645_123_456);
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_scan_rejects_invalid_timestamp_timezone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, target) = timestamp_partition_snapshot().await?;
+    let result = target
+        .incremental_scan_builder(0)
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone("Not/AZone"),
+        )
+        .build(engine.as_ref());
+
+    assert_result_error_with_message(result, "Not/AZone");
+    Ok(())
 }
 
 // Build a raw Add carrying both a `val` partition value and `id` stats over `[id_min, id_max]`,
