@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use tracing::{debug, enabled, warn, Level};
 
-use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
+use crate::scan::{
+    stats_schema_has_data_columns, PartitionValuesOptions, PhysicalPredicate, StatsOptions,
+    StructStats,
+};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
@@ -148,6 +150,7 @@ fn validate_metadata_columns<'a>(
 /// schema. Predicate references may add other indexed columns.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
+    emit_json: bool,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     requested_physical_stats_columns: Option<&[ColumnName]>,
@@ -171,21 +174,18 @@ fn build_data_skipping_schemas(
     let predicate_refs_physical =
         resolve_physical_columns(table_configuration, predicate_column_names_logical);
 
-    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
-    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
-    // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
-    // per-column stats wrapper, so its presence is the signal that at least one data
-    // column survived. The Delta protocol allows `minValues` / `maxValues` without
-    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
-    // emits min/max; this check relies on that implementation property.
     let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
-        stats_schema
-            .field(NULL_COUNT)
-            .is_some()
-            .then_some(stats_schema)
+        stats_schema_has_data_columns(&stats_schema).then_some(stats_schema)
     };
 
     let stats_schema = match (struct_stats, physical_predicate) {
+        // JSON output may need to be synthesized from a structured-only checkpoint. Preserve the
+        // bookkeeping fields even when the table has no indexed data columns.
+        _ if emit_json => Some(
+            table_configuration
+                .build_expected_stats_schemas(requested_physical_stats_columns, None)?
+                .physical,
+        ),
         (StructStats::AllIndexed { .. }, _) => with_data_cols(
             table_configuration
                 .build_expected_stats_schemas(requested_physical_stats_columns, None)?
@@ -486,6 +486,7 @@ impl StateInfo {
 
         let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
             &stats.struct_stats,
+            stats.emit_json,
             &physical_predicate,
             &predicate_column_names,
             requested_physical_stats_columns_ref,
@@ -1244,7 +1245,7 @@ pub(crate) mod tests {
             HashMap::new(),
             vec![],
             StatsOptions {
-                synthesize_json: true,
+                emit_json: false,
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("value")],
                 },
@@ -1292,7 +1293,7 @@ pub(crate) mod tests {
             HashMap::new(),
             vec![],
             StatsOptions {
-                synthesize_json: true,
+                emit_json: false,
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("value")],
                 },
@@ -1450,7 +1451,7 @@ pub(crate) mod tests {
             props,
             vec![],
             StatsOptions {
-                synthesize_json: true,
+                emit_json: false,
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("col_a")],
                 },
@@ -1516,6 +1517,30 @@ pub(crate) mod tests {
         m
     }
 
+    #[rstest]
+    #[case::json_only(StatsOptions::json_only(), true)]
+    #[case::all_struct(StatsOptions::all_struct(), false)]
+    fn bookkeeping_only_stats_schema_is_retained_only_for_json_synthesis(
+        #[case] stats: StatsOptions,
+        #[case] expect_schema: bool,
+    ) {
+        let state_info = get_state_info_with_stats(
+            flat_long_schema(2),
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(0),
+            vec![],
+            stats,
+        )
+        .unwrap();
+
+        assert_eq!(state_info.physical_stats_schema.is_some(), expect_schema);
+        if let Some(schema) = state_info.physical_stats_schema {
+            assert!(!stats_schema_has_data_columns(&schema));
+        }
+    }
+
     /// `delta.dataSkippingStatsColumns=<cols joined by ",">` configuration map.
     fn stats_columns_config(cols: &[&str]) -> HashMap<String, String> {
         let mut m = HashMap::new();
@@ -1559,13 +1584,14 @@ pub(crate) mod tests {
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
         let predicate = Arc::new(col!("c4").gt(lit(10i64)));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             &[],
             num_indexed_cols_config(2),
             vec![],
+            StatsOptions::none(),
         )
         .unwrap();
         assert!(
@@ -1588,13 +1614,14 @@ pub(crate) mod tests {
             col!("c0").gt(lit(10i64)),
             col!("c4").gt(lit(10i64)),
         ));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             &[],
             num_indexed_cols_config(2),
             vec![],
+            StatsOptions::none(),
         )
         .unwrap();
         let stats_schema = state_info
@@ -1619,13 +1646,14 @@ pub(crate) mod tests {
         };
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
         let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             &[],
             num_indexed_cols_config(2),
             vec![],
+            StatsOptions::none(),
         )
         .unwrap();
         assert!(state_info.physical_stats_schema.is_none());

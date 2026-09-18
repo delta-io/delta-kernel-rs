@@ -6,6 +6,7 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
+use crate::actions::{ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
@@ -26,31 +27,36 @@ pub(crate) struct CheckpointManifestReader {
 impl CheckpointManifestReader {
     /// Creates a manifest reader for a single-part checkpoint.
     ///
-    /// `read_schema` must include the `sidecar` action field so this reader can discover sidecar
-    /// files.
-    ///
     /// # Parameters
     ///
     /// - `engine`: Engine for reading the checkpoint manifest.
     /// - `manifest`: Checkpoint manifest to process.
     /// - `log_root`: Root URL for resolving sidecar paths.
-    /// - `read_schema`: Schema for reading the manifest actions.
+    /// - `checkpoint_read_schema`: Projected checkpoint schema required by scan replay.
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
         log_root: Url,
-        read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
+        // Preserve the scan's projected Add schema so unneeded stats stay unread. Replay still
+        // needs full Remove actions, while sidecar discovery needs Sidecar actions. The read stays
+        // unfiltered because sidecar rows have null Add fields.
+        let manifest_read_schema = checkpoint_read_schema
+            .project_as_struct(&[ADD_NAME])?
+            .add([(*REMOVE_FIELD).clone(), (*SIDECAR_FIELD).clone()])?;
+        let manifest_read_schema = Arc::new(manifest_read_schema);
+
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                read_schema.clone(),
+                manifest_read_schema.clone(),
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                read_schema,
+                manifest_read_schema,
                 None,
             )?,
             extension => {
