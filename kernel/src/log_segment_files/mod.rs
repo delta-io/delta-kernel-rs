@@ -61,6 +61,8 @@ pub(crate) struct LogSegmentFiles {
 /// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
 /// underlying listing at the first path past the version-named region, so directories like
 /// `_staged_commits/` and `_sidecars/` are never paged through.
+/// This also defensively tolerates a recursive storage listing by treating its first nested path
+/// past the version-named region as the end of the relevant listing.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
