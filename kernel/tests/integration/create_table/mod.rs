@@ -105,6 +105,52 @@ async fn test_create_simple_table() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::cdf_enabled(Some("true"), Some("reserved for Change Data Feed"))]
+#[case::cdf_supported_only(None, None)]
+#[tokio::test]
+async fn create_table_validates_cdf_column_names(
+    #[case] cdf_enabled: Option<&str>,
+    #[case] expected_error: Option<&str>,
+    #[values(
+        "_change_type",
+        "_commit_version",
+        "_commit_timestamp",
+        "_CHANGE_TYPE",
+        "_COMMIT_VERSION",
+        "_COMMIT_TIMESTAMP"
+    )]
+    column_name: &str,
+    #[values("none", "name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! { (StructField::nullable(column_name, DataType::STRING)) };
+    let mut properties = vec![
+        ("delta.feature.changeDataFeed", "supported"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    if let Some(value) = cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", value));
+    }
+    let result = create_table(&table_path, schema, "test")
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(snapshot.schema().contains(column_name));
+        assert_eq!(
+            snapshot.table_properties().enable_change_data_feed,
+            cdf_enabled.map(|v| v == "true")
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
