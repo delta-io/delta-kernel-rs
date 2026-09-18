@@ -2735,7 +2735,7 @@ mod tests {
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
+        Err("Failed to convert AMT content-tree node size -1 to FileSize")
     )]
     #[case::table_root_without_trailing_slash_gets_one(
         "memory:///table",

@@ -817,14 +817,14 @@ mod tests {
         let leaf = &adds[0];
         assert_eq!(leaf.size, 2048);
         assert_eq!(leaf.base_row_id, Some(200));
-        assert_eq!(leaf.modification_time, 0);
-        assert!(!leaf.data_change);
+        assert_eq!(leaf.modification_time, i64::MAX);
+        assert!(leaf.data_change);
 
         let root = &adds[1];
         assert_eq!(root.size, 1024);
         assert_eq!(root.base_row_id, Some(100));
-        assert_eq!(root.modification_time, 0);
-        assert!(!root.data_change);
+        assert_eq!(root.modification_time, i64::MAX);
+        assert!(root.data_change);
         Ok(())
     }
 }
