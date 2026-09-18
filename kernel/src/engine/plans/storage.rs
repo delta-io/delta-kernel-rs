@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use itertools::Itertools as _;
 use url::Url;
 
@@ -10,15 +11,12 @@ use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::{DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
+#[derive(Constructor)]
 pub struct PlanBasedStorageHandler {
     executor: Arc<dyn PlanExecutor>,
 }
 
 impl PlanBasedStorageHandler {
-    pub fn new(executor: Arc<dyn PlanExecutor>) -> Self {
-        Self { executor }
-    }
-
     fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
         self.executor.execute_op(Operation::IoOperation(op))
     }

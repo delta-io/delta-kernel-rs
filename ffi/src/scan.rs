@@ -10,6 +10,7 @@ use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
+use derive_more::From;
 use tracing::debug;
 use url::Url;
 
@@ -639,15 +640,9 @@ type CScanCallback = extern "C" fn(
     partition_map: &CStringMap,
 );
 
-#[derive(Default)]
+#[derive(Default, From)]
 pub struct CStringMap {
     values: HashMap<String, String>,
-}
-
-impl From<HashMap<String, String>> for CStringMap {
-    fn from(val: HashMap<String, String>) -> Self {
-        Self { values: val }
-    }
 }
 
 #[no_mangle]
@@ -731,15 +726,9 @@ impl From<&MetadataValue> for CMetadataValueKind {
 /// A field-metadata map that preserves each value's [`MetadataValue`] type. Used for schema field
 /// metadata, where the kernel knows each value's type; the engine recovers that type via
 /// [`CMetadataValueKind`] rather than inferring it from the key name.
-#[derive(Default)]
+#[derive(Default, From)]
 pub struct CMetadataMap {
     values: HashMap<String, MetadataValue>,
-}
-
-impl From<HashMap<String, MetadataValue>> for CMetadataMap {
-    fn from(values: HashMap<String, MetadataValue>) -> Self {
-        Self { values }
-    }
 }
 
 /// Probe a [`CMetadataMap`] for a single key. If the key is present, kernel calls `allocate_fn`

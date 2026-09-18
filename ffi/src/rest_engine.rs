@@ -21,6 +21,7 @@ use delta_kernel_default_engine::rest_store::{
     build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
 };
+use derive_more::Constructor;
 use url::Url;
 
 use crate::error::AllocateErrorFn;
@@ -157,7 +158,7 @@ pub(crate) struct RestBuilderState {
 /// Upcalls a [`CAuthHeaderCallback`] whenever the REST client needs fresh auth headers.
 ///
 /// Registered via [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Constructor)]
 pub(crate) struct FfiAuthHeaderProvider {
     callback: CAuthHeaderCallback,
     context: NullableCvoid,
@@ -169,18 +170,6 @@ unsafe impl Send for FfiAuthHeaderProvider {}
 unsafe impl Sync for FfiAuthHeaderProvider {}
 
 impl FfiAuthHeaderProvider {
-    pub(crate) fn new(
-        callback: CAuthHeaderCallback,
-        context: NullableCvoid,
-        allocate_error: AllocateErrorFn,
-    ) -> Self {
-        Self {
-            callback,
-            context,
-            allocate_error,
-        }
-    }
-
     fn collect(&self) -> DeltaResult<(HeaderMap, Option<Duration>)> {
         let mut headers = MaybeUninit::<CAuthHeaders>::uninit();
         let out = headers.as_mut_ptr();

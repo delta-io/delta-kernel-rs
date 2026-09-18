@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use futures::StreamExt as _;
 use url::Url;
 
@@ -9,15 +10,12 @@ use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler};
 
+#[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
 }
 
 impl SyncStorageHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
-    }
-
     /// The backing store, or `None` for the per-URL [`LocalFileSystem`] fallback.
     ///
     /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem

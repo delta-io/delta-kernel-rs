@@ -5,6 +5,7 @@ use std::hash::Hash;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use delta_kernel_derive::internal_api;
+use derive_more::From;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::AsRefStr;
@@ -318,24 +319,32 @@ impl StructData {
 ///
 /// NOTE: `PartialEq` uses physical (structural) comparison semantics.
 /// For SQL NULL semantics, use [`Scalar::logical_eq`] or [`Scalar::logical_partial_cmp`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AsRefStr)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AsRefStr, From)]
 #[strum(serialize_all = "snake_case")]
 pub enum Scalar {
     /// 32bit integer
+    #[from]
     Integer(i32),
     /// 64bit integer
+    #[from]
     Long(i64),
     /// 16bit integer
+    #[from]
     Short(i16),
     /// 8bit integer
+    #[from]
     Byte(i8),
     /// 32bit floating point
+    #[from]
     Float(f32),
     /// 64bit floating point
+    #[from]
     Double(f64),
     /// utf-8 encoded string.
+    #[from(String, &str)]
     String(String),
     /// true or false value
+    #[from]
     Boolean(bool),
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp(i64),
@@ -348,16 +357,21 @@ pub enum Scalar {
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     /// Binary data
+    #[from(Vec<u8>, &[u8], bytes::Bytes)]
     Binary(Vec<u8>),
     /// Decimal value with a given precision and scale.
+    #[from]
     Decimal(DecimalData),
     /// Null value with a given data type.
     Null(DataType),
     /// Struct value
+    #[from]
     Struct(StructData),
     /// Array Value
+    #[from]
     Array(ArrayData),
     /// Map Value
+    #[from]
     Map(MapData),
 }
 
@@ -633,87 +647,9 @@ impl Scalar {
     }
 }
 
-impl From<i8> for Scalar {
-    fn from(i: i8) -> Self {
-        Self::Byte(i)
-    }
-}
-
-impl From<i16> for Scalar {
-    fn from(i: i16) -> Self {
-        Self::Short(i)
-    }
-}
-
-impl From<i32> for Scalar {
-    fn from(i: i32) -> Self {
-        Self::Integer(i)
-    }
-}
-
-impl From<i64> for Scalar {
-    fn from(i: i64) -> Self {
-        Self::Long(i)
-    }
-}
-
-impl From<f32> for Scalar {
-    fn from(i: f32) -> Self {
-        Self::Float(i)
-    }
-}
-
-impl From<f64> for Scalar {
-    fn from(i: f64) -> Self {
-        Self::Double(i)
-    }
-}
-
-impl From<bool> for Scalar {
-    fn from(b: bool) -> Self {
-        Self::Boolean(b)
-    }
-}
-
-impl From<DecimalData> for Scalar {
-    fn from(d: DecimalData) -> Self {
-        Self::Decimal(d)
-    }
-}
-
-impl From<&str> for Scalar {
-    fn from(s: &str) -> Self {
-        Self::String(s.into())
-    }
-}
-
-impl From<String> for Scalar {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
 impl<T: Into<Scalar> + Copy> From<&T> for Scalar {
     fn from(t: &T) -> Self {
         (*t).into()
-    }
-}
-
-impl From<&[u8]> for Scalar {
-    fn from(b: &[u8]) -> Self {
-        Self::Binary(b.into())
-    }
-}
-
-impl From<Vec<u8>> for Scalar {
-    fn from(b: Vec<u8>) -> Self {
-        Self::Binary(b)
-    }
-}
-
-impl From<bytes::Bytes> for Scalar {
-    fn from(b: bytes::Bytes) -> Self {
-        Self::Binary(b.into())
     }
 }
 
@@ -742,24 +678,6 @@ impl<T: IntoScalar> From<Option<T>> for Scalar {
             Some(t) => t.into(),
             None => Self::Null(T::to_data_type()),
         }
-    }
-}
-
-impl From<ArrayData> for Scalar {
-    fn from(array_data: ArrayData) -> Self {
-        Self::Array(array_data)
-    }
-}
-
-impl From<MapData> for Scalar {
-    fn from(map_data: MapData) -> Self {
-        Self::Map(map_data)
-    }
-}
-
-impl From<StructData> for Scalar {
-    fn from(struct_data: StructData) -> Self {
-        Self::Struct(struct_data)
     }
 }
 

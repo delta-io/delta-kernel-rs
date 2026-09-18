@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use derive_more::From;
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
@@ -18,16 +19,10 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, From)]
+#[from(DeletionVectorDescriptor)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
-}
-
-impl From<DeletionVectorDescriptor> for DvInfo {
-    fn from(deletion_vector: DeletionVectorDescriptor) -> Self {
-        let deletion_vector = Some(deletion_vector);
-        DvInfo { deletion_vector }
-    }
 }
 
 /// Give engines an easy way to consume stats
