@@ -72,7 +72,7 @@ impl SyncEngine {
             #[cfg(feature = "declarative-plans")]
             plan_executor: Arc::new(plan::SyncPlanExecutor::new(store.clone())),
             json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
-            parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store, Default::default())),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }

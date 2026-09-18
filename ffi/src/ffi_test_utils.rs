@@ -71,6 +71,16 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
     }
 }
 
+/// A `KernelStringSlice` over bytes that are not valid UTF-8, for testing string-decode failures.
+#[cfg(test)]
+pub(crate) fn invalid_utf8() -> KernelStringSlice {
+    static INVALID_UTF8: [u8; 1] = [0xff];
+    KernelStringSlice {
+        ptr: INVALID_UTF8.as_ptr().cast(),
+        len: INVALID_UTF8.len(),
+    }
+}
+
 /// Build a latest-version snapshot via the FFI builder API. Panics on error.
 #[cfg(test)]
 pub(crate) unsafe fn build_snapshot(
