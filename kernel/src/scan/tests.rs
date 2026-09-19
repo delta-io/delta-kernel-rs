@@ -34,7 +34,7 @@ use crate::schema::{
 use crate::transaction::create_table::create_table;
 use crate::{
     DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    ParquetFooter, ParquetHandler, ParquetWriteResult, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -1723,7 +1723,7 @@ impl ParquetHandler for RecordingParquetHandler {
         &self,
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<ParquetWriteResult> {
         self.inner.write_parquet_file(location, data)
     }
 }
@@ -2292,7 +2292,7 @@ impl ParquetHandler for EmptyParquetHandler {
         &self,
         _location: url::Url,
         _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<ParquetWriteResult> {
         unimplemented!()
     }
 }

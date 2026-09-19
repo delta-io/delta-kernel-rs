@@ -768,6 +768,13 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
+/// The result of writing a parquet file via [`ParquetHandler::write_parquet_file`].
+#[derive(Debug)]
+pub struct ParquetWriteResult {
+    /// The number of bytes written to the parquet file.
+    pub size_in_bytes: u64,
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -991,7 +998,8 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// A [`DeltaResult`] containing a [`ParquetWriteResult`] with metadata about the written file,
+    /// including its `size_in_bytes`.
     ///
     /// [`StructField`]: crate::schema::StructField
     /// [`ColumnMetadataKey::ColumnMappingId`]: crate::schema::ColumnMetadataKey::ColumnMappingId
@@ -1003,7 +1011,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<ParquetWriteResult>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///
