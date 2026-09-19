@@ -329,7 +329,13 @@ impl TableChanges {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
                 .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+            // Pin the end snapshot to the version the log segment listed: a
+            // concurrent commit between the listing above and this build would
+            // otherwise load a newer snapshot than the CDF range ends at, and
+            // the range would be validated against metadata that is not its own.
+            None => Snapshot::builder_from(start_snapshot.clone())
+                .at_version(log_segment.end_version)
+                .build(engine)?,
         };
         end_snapshot
             .table_configuration()
