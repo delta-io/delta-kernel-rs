@@ -5,19 +5,21 @@
 #![allow(unreachable_pub)]
 
 mod dv_conversion;
+mod reader;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use delta_kernel_derive::{IntoStructData, ToSchema};
+pub(crate) use reader::read_content_tree_add_actions;
 use url::Url;
 
 use crate::engine_data::EngineData;
 use crate::expressions::{Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
-use crate::Version;
+use crate::{DeltaResult, Error, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
 pub(crate) const CONTENT_TYPE: &str = "contentType";
@@ -338,6 +340,83 @@ pub(crate) struct ManifestInfo {
     /// Number of set bits (deleted rows) in [`Self::dv`], or `None` when `dv` is absent.
     #[field_id = 523]
     pub(crate) dv_cardinality: Option<i64>,
+}
+
+/// Resolves an AMT entry `path` to an absolute [`Url`], following Iceberg V4's relative-path
+/// rules: a `path` carrying a URI scheme is absolute and parsed as-is; otherwise it is resolved
+/// relative to `table_root` by concatenation with a single `/` separator. Used by
+/// [`resolve_amt_filemeta`] (and thus [`ContentRoot::to_filemeta`]) so manifest entries and the
+/// content root resolve identically.
+///
+/// Returns an error if the resolved location fails to parse as a [`Url`].
+///
+/// [`ContentRoot::to_filemeta`]: crate::actions::ContentRoot::to_filemeta
+pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<Url> {
+    if has_scheme(path) {
+        Url::parse(path)
+            .map_err(|e| Error::generic(format!("Failed to parse absolute AMT path {path:?}: {e}")))
+    } else {
+        let mut base = table_root.as_str().to_string();
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        Url::parse(&format!("{base}{path}")).map_err(|e| {
+            Error::generic(format!(
+                "Failed to resolve relative AMT path {path:?} against table root {base}: {e}"
+            ))
+        })
+    }
+}
+
+/// Resolves an AMT node's `path` and `size_in_bytes` into a [`FileMeta`] to read. The location
+/// follows the same relative-path rules as [`resolve_amt_location`], and `last_modified` is set to
+/// [`i64::MAX`] since AMT nodes carry no modification time. Used for both the checkpoint
+/// `contentRoot` and child `DataManifest` entries so the [`FileMeta`] invariant lives in one place.
+///
+/// Returns an error if the location fails to parse as a [`Url`], or if `size_in_bytes` is negative
+/// (does not fit a [`crate::FileSize`]).
+pub(crate) fn resolve_amt_filemeta(
+    path: &str,
+    size_in_bytes: i64,
+    table_root: &Url,
+) -> DeltaResult<crate::FileMeta> {
+    Ok(crate::FileMeta {
+        location: resolve_amt_location(path, table_root)?,
+        last_modified: i64::MAX,
+        size: size_in_bytes.try_into().map_err(|_| {
+            Error::generic(format!(
+                "Failed to convert AMT content-tree node size {size_in_bytes} to FileSize"
+            ))
+        })?,
+    })
+}
+
+/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+fn has_scheme(location: &str) -> bool {
+    for (position, ch) in location.char_indices() {
+        if ch == ':' {
+            return position > 0;
+        }
+        if !is_scheme_char(ch, position) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
+/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
+/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+fn is_scheme_char(ch: char, position: usize) -> bool {
+    if ch.is_ascii_alphabetic() {
+        return true;
+    }
+    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
 }
 
 #[cfg(test)]

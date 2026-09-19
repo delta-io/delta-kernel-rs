@@ -1452,36 +1452,6 @@ impl CheckpointAction {
     }
 }
 
-/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn has_scheme(location: &str) -> bool {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return position > 0;
-        }
-        if !is_scheme_char(ch, position) {
-            return false;
-        }
-    }
-    false
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
-}
-
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
     /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.
@@ -1505,32 +1475,7 @@ impl ContentRoot {
     /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
     pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        let path = &self.path;
-        let location = if has_scheme(path) {
-            // A URI scheme means the path is absolute and used as-is.
-            Url::parse(path).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
-                ))
-            })?
-        } else {
-            // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
-            let mut base = table_root.as_str().to_string();
-            if !base.ends_with('/') {
-                base.push('/');
-            }
-            Url::parse(&format!("{base}{path}")).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                     root {base}: {e}"
-                ))
-            })?
-        };
-        Ok(FileMeta {
-            location,
-            last_modified: i64::MAX,
-            size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        crate::content_tree::resolve_amt_filemeta(&self.path, self.size_in_bytes, table_root)
     }
 }
 
@@ -2894,7 +2839,7 @@ mod tests {
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
+        Err("Failed to convert AMT content-tree node size -1 to FileSize")
     )]
     #[case::table_root_without_trailing_slash_gets_one(
         "memory:///table",

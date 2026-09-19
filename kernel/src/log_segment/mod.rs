@@ -785,6 +785,29 @@ impl LogSegment {
         Ok(result.actions)
     }
 
+    /// Scans the log segment for the most recent `checkpoint` action, returning `None` when the
+    /// segment contains none.
+    ///
+    /// This is the single detection site for adaptiveMetadata `checkpoint` actions, shared by the
+    /// scan read path and the root-manifest write path.
+    /// TODO: Implement more efficient detection, e.g. using the hint file:
+    /// https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#last-checkpoint-file
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<crate::actions::CheckpointAction>> {
+        let schema = StructType::try_new([crate::actions::CHECKPOINT_ACTION_FIELD.clone()])?.into();
+        for batch in self.read_actions(engine, schema)? {
+            if let Some(checkpoint) =
+                crate::actions::CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
+            {
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
     /// true`).
     ///
