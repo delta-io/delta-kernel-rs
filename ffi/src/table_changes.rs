@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, EngineData, Error, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, EngineData, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -310,10 +310,7 @@ pub unsafe extern "C" fn scan_table_changes_next(
 }
 
 fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
-    let mut data = data
-        .data
-        .lock()
-        .map_err(|_| Error::generic("poisoned scan table changes iterator mutex"))?;
+    let mut data = data.data.lock()?;
 
     let Some(data) = data.next().transpose()? else {
         return Ok(std::ptr::null_mut());

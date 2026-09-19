@@ -612,11 +612,7 @@ impl GlobalTracingState {
     /// `INFO`.
     fn register_metrics_callback(&mut self, callback: MetricsEventFn) -> DeltaResult<()> {
         self.ensure_installed()?;
-        *self
-            .metrics_callback
-            .lock()
-            .map_err(|_| Error::generic("Failed to lock metrics callback (mutex poisoned)."))? =
-            Some(callback);
+        *self.metrics_callback.lock()? = Some(callback);
         self.metrics_filter
             .as_ref()
             .ok_or_else(|| Error::generic("metrics filter not installed"))?
@@ -642,9 +638,7 @@ static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
     LazyLock::new(|| Mutex::new(GlobalTracingState::uninitialized()));
 
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up event subscriber"))?;
+    let mut state = TRACING_STATE.lock()?;
     state.register_event_callback(callback, max_level)
 }
 
@@ -657,10 +651,7 @@ fn setup_log_line_subscriber(
     with_level: bool,
     with_target: bool,
 ) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up log_line_subscriber"))?;
-    state.register_log_line_callback(
+    TRACING_STATE.lock()?.register_log_line_callback(
         callback,
         max_level,
         format,
@@ -686,9 +677,7 @@ pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> b
 }
 
 fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up metrics reporter"))?;
+    let mut state = TRACING_STATE.lock()?;
     state.register_metrics_callback(callback)
 }
 
