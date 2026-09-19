@@ -13,6 +13,8 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
+// TODO(#3211): Align expression lowering and evaluation with Kernel's standard expression
+// contract.
 mod expression;
 mod operator;
 mod plan;
