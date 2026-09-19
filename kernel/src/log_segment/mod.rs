@@ -461,6 +461,17 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
+        Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+    }
+
+    /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
+    pub(crate) fn for_table_changes_with_log_tail(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        start_version: Version,
+        end_version: impl Into<Option<Version>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> DeltaResult<Self> {
         let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
@@ -471,12 +482,10 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        // TODO(#2796): table-changes does not supply a log_tail yet. CDF over a catalog-managed
-        // table will need the catalog's commits passed here to see unbackfilled staged commits.
         let listed_files = LogSegmentFiles::list_commits(
             storage,
             &log_root,
-            vec![], // log-tail
+            log_tail,
             Some(start_version),
             end_version,
             None, // table-changes does not thread a cancellation token
