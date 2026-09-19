@@ -33,6 +33,10 @@ Ignore line-level bugs and all style. Evaluate ONLY the shape of the change:
 - **Duplicated concepts.** Does this introduce a concept that already has a home in the crate under a different name? Two names for one concept costs more than either name being imperfect.
 - **Layering.** Does the change put logic at the wrong altitude, e.g. policy decisions inside a mechanism layer, or engine concerns inside protocol code?
 - **Placement & form.** Does a new helper/type/pub item live in the right crate/module and take the right form (inherent method vs free fn vs trait), judged against how sibling items on the same type are organized? This is shape, not idiom: where code lives and what form it takes is yours; what it is named is the style reviewers'.
+- **Resource ownership & layout.** Does the abstraction that accepts externally sized input own
+  or enforce the bound, or can lower layers materialize it first? Do large inline optional or
+  nested fields inflate stack frames or every instance of a common object when indirection would
+  keep the common case small?
 
 ## What you do NOT review
 
