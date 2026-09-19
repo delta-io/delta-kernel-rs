@@ -32,6 +32,8 @@ For each changed file, identify:
 - **Modified logic branches** — changed if/else, match arms, error paths, loop conditions
 - **New error conditions** — new `Err(...)` returns, `?` propagation through new paths, panic guards
 - **Edge cases introduced** — boundary conditions, empty inputs, None/null handling, overflow
+- **Resource bounds introduced** — at-limit and over-limit inputs, peak allocation before
+  rejection, and stack or heap footprint regressions where practical
 - **New public API surface** — any new `pub` items that callers will depend on
 
 ### Step 2: Find existing tests
@@ -51,6 +53,8 @@ For each new/changed logic path identified in Step 1, determine:
 - Is there an **integration test** that exercises this path end-to-end?
 - Are **edge cases** covered (empty table, single row, null values, boundary conditions)?
 - Are **error paths** tested (invalid input, missing files, corrupt data)?
+- Are externally controlled sizes tested at and beyond their limits, including limits enforced
+  before full materialization rather than only on retained state?
 
 ### Step 4: Delta-specific test scenarios
 
