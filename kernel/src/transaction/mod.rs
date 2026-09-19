@@ -70,17 +70,16 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
-pub(crate) mod alter_table;
-pub use alter_table::AlterTableTransaction;
+pub use builder::update::ExistingTableTransactionBuilder;
 mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
+mod operation;
+pub use operation::Operation;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
-#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
-#[internal_api]
-pub(crate) use schema_evolution::SchemaOperation;
+pub use schema_evolution::SchemaOperation;
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
@@ -172,21 +171,143 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-/// Marker type for alter-table (schema evolution) transactions.
-///
-/// Transactions in this state perform metadata-only commits. Data file operations are not
-/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
-#[derive(Debug)]
-pub struct AlterTable;
-
 /// Marker trait for transaction states that support data file operations.
 ///
-/// Only transaction types that implement this trait can access methods for adding, removing, or
-/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
-/// only perform metadata-only commits.
+/// Only transaction types that implement this trait can access data-file methods.
 pub trait SupportsDataFiles {}
 impl SupportsDataFiles for ExistingTable {}
 impl SupportsDataFiles for CreateTable {}
+
+/// Options shared by create-table and existing-table transaction builders.
+///
+/// These options describe connector-provided provenance and commit metadata. Repeated calls to a
+/// builder's `with_options` method replace the complete options value.
+#[derive(Default)]
+pub struct TransactionOptions {
+    correlation_id: Option<Arc<str>>,
+    operation_parameters: Option<HashMap<String, String>>,
+    operation_metrics: Option<HashMap<String, String>>,
+    engine_info: Option<String>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    transaction_ids: Vec<(String, i64)>,
+    domain_metadata_additions: Vec<DomainMetadata>,
+}
+
+impl std::fmt::Debug for TransactionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionOptions")
+            .field("correlation_id", &self.correlation_id)
+            .field("operation_parameters", &self.operation_parameters)
+            .field("operation_metrics", &self.operation_metrics)
+            .field("engine_info", &self.engine_info)
+            .field("engine_commit_info", &self.engine_commit_info.is_some())
+            .field("transaction_ids", &self.transaction_ids)
+            .field("domain_metadata_additions", &self.domain_metadata_additions)
+            .finish()
+    }
+}
+
+impl TransactionOptions {
+    /// Creates empty transaction options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the engine information recorded in `commitInfo`.
+    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
+        self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Attaches an opaque identifier to the transaction's metric events.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Sets operation parameters recorded in `commitInfo`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = Some(collect_operation_metadata("parameter", parameters)?);
+        Ok(self)
+    }
+
+    /// Sets operation metrics recorded in `commitInfo`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_operation_metadata("metric", metrics)?);
+        Ok(self)
+    }
+
+    /// Supplies one arbitrary connector-provided `commitInfo` row.
+    pub fn with_commit_info(
+        mut self,
+        commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((commit_info, commit_info_schema));
+        self
+    }
+
+    /// Adds an application transaction identifier.
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.transaction_ids.push((app_id.into(), version));
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.domain_metadata_additions
+            .push(DomainMetadata::new(domain.into(), configuration.into()));
+        self
+    }
+}
+
+fn collect_operation_metadata<I, K, V>(
+    kind: &str,
+    entries: I,
+) -> DeltaResult<HashMap<String, String>>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    let mut values = HashMap::new();
+    for (key, value) in entries {
+        let key = key.into();
+        require!(
+            !key.is_empty(),
+            Error::generic(format!("operation {kind} key cannot be empty"))
+        );
+        require!(
+            values.insert(key.clone(), value.into()).is_none(),
+            Error::generic(format!(
+                "operation {kind} key '{key}' appears more than once"
+            ))
+        );
+    }
+    Ok(values)
+}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -226,7 +347,9 @@ pub struct Transaction<S = ExistingTable> {
     // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
-    operation: Option<String>,
+    operation: Option<Operation>,
+    operation_parameters: HashMap<String, String>,
+    operation_metrics: HashMap<String, String>,
     engine_info: Option<String>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -466,10 +589,22 @@ impl<S> Transaction<S> {
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
-            self.operation.clone(),
+            self.operation.as_ref().map(ToString::to_string),
             self.engine_info.clone(),
             self.is_blind_append,
         );
+        kernel_commit_info.operation_parameters = Some(
+            self.operation_parameters
+                .iter()
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect(),
+        );
+        kernel_commit_info.operation_metrics = (!self.operation_metrics.is_empty()).then(|| {
+            self.operation_metrics
+                .iter()
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect()
+        });
 
         // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
         // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
@@ -620,8 +755,8 @@ impl<S> Transaction<S> {
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
         span.record("data_change", self.data_change);
-        if let Some(operation) = self.operation.as_deref() {
-            span.record("operation", operation);
+        if let Some(operation) = &self.operation {
+            span.record("operation", operation.metric_label());
         }
         span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
         span.record(
@@ -716,6 +851,55 @@ impl<S> Transaction<S> {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
         self
+    }
+
+    pub(crate) fn with_transaction_options(
+        mut self,
+        options: TransactionOptions,
+    ) -> DeltaResult<Self> {
+        let TransactionOptions {
+            correlation_id,
+            operation_parameters,
+            operation_metrics,
+            engine_info,
+            engine_commit_info,
+            transaction_ids,
+            domain_metadata_additions,
+        } = options;
+
+        let mut app_ids = HashSet::with_capacity(transaction_ids.len());
+        if let Some((app_id, _)) = transaction_ids
+            .iter()
+            .find(|(app_id, _)| !app_ids.insert(app_id.as_str()))
+        {
+            return Err(Error::generic(format!(
+                "app_id {app_id} already exists in transaction options"
+            )));
+        }
+        let mut domains = HashSet::with_capacity(domain_metadata_additions.len());
+        if let Some(domain) = domain_metadata_additions
+            .iter()
+            .map(DomainMetadata::domain)
+            .find(|domain| !domains.insert(*domain))
+        {
+            return Err(Error::generic(format!(
+                "domain metadata '{domain}' appears more than once in transaction options"
+            )));
+        }
+
+        self.correlation_id = correlation_id;
+        self.operation_parameters = operation_parameters.unwrap_or_default();
+        self.operation_metrics = operation_metrics.unwrap_or_default();
+        self.engine_info = engine_info;
+        self.engine_commit_info = engine_commit_info;
+        self.set_transactions = transaction_ids
+            .into_iter()
+            .map(|(app_id, version)| {
+                SetTransaction::new(app_id, version, Some(self.commit_timestamp))
+            })
+            .collect();
+        self.user_domain_metadata_additions = domain_metadata_additions;
+        Ok(self)
     }
 
     /// Determines the commit type based on whether this is a create-table operation and whether
@@ -974,7 +1158,8 @@ impl<S> Transaction<S> {
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
         debug_assert!(
-            self.operation.as_deref() != Some("CREATE TABLE") || self.read_snapshot_opt.is_none(),
+            self.operation.as_ref() != Some(&Operation::CreateTable)
+                || self.read_snapshot_opt.is_none(),
             "CREATE TABLE operation should not have a read snapshot"
         );
         self.read_snapshot_opt.is_none()
@@ -1469,8 +1654,8 @@ impl<S> Transaction<S> {
         // present, and only operation classification can flip `is_incremental_safe`.
         let is_incremental_safe = self
             .operation
-            .as_deref()
-            .is_some_and(is_incremental_safe_operation);
+            .as_ref()
+            .is_some_and(|operation| is_incremental_safe_operation(operation.as_str()));
         Ok(CrcDelta {
             file_stats,
             protocol: self

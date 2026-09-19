@@ -18,7 +18,7 @@ use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::root_manifest_file::RootManifestFile;
-use super::Transaction;
+use super::{Operation as TransactionOperation, Transaction};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
@@ -108,6 +108,8 @@ impl Transaction {
             should_emit_metadata: false,
             committer,
             operation: None,
+            operation_parameters: HashMap::new(),
+            operation_metrics: HashMap::new(),
             engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
@@ -147,7 +149,7 @@ impl Transaction {
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
+        self.operation = Some(TransactionOperation::from(operation));
         self
     }
 
