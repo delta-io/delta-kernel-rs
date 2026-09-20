@@ -331,6 +331,12 @@ fn leaf_stats_field(
         // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant,
         // and its bounds are always recorded as unshredded variants regardless of physical
         // shredding.
+        //
+        // TODO: kernel's Delta stats do not produce variant min/max (variants are min/max-
+        // ineligible per protocol -- see `MinMaxStatsTransform`), so the reserved variant
+        // `lower_bound`/`upper_bound` are null-filled in practice. The pivot passes through any
+        // source that appears, so this becomes populated for free if kernel ever derives variant
+        // bounds (e.g. from shredded sub-fields).
         DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
         }
@@ -604,37 +610,49 @@ fn collect_stats_schema<'a>(
 /// example, `{stats: {numRecords, minValues: {id}, ...}, ...}` becomes
 /// `{content_stats: {id: {lower_bound, value_count, ...}}, ...}`.
 ///
-/// Returns `Ok(None)` (leaving `content_stats` null, which disables manifest-level data skipping)
-/// when `input_schema`'s stats column is not Delta-stats shape (no `numRecords`) or when evaluation
-/// fails. `table_schema` must be physical (carrying `parquet.field.id`, as [`stats_schema`]
-/// requires); precondition violations in *building* the pivot propagate as errors.
-pub(crate) fn try_preconvert_stats_column(
+/// # Schemas
+///
+/// - `input_schema` is the schema of `data`, the batch being converted. Its `stats_column_name`
+///   column must be in Delta-stats shape -- a struct carrying `numRecords` and (nested to mirror
+///   the table) `tightBounds`/`minValues`/`maxValues`/`nullCount`; all other columns pass through
+///   unchanged. It is the Delta-stats *source*, so its nested category paths mirror `table_schema`.
+/// - `table_schema` is the physical table layout (carrying `parquet.field.id`, as [`stats_schema`]
+///   requires) that determines the AMT output leaves and their field IDs.
+///
+/// The output stats column always conforms to the full [`stats_schema`] of `table_schema`: every
+/// leaf and type-eligible sub-field is present. Stats `input_schema` does not carry (an unindexed
+/// column, a column only in `nullCount`, variant bounds) become typed nulls; `value_count` (from
+/// `numRecords`) and `tight_bounds` are always populated. Leaves and sub-fields are never dropped.
+///
+/// # Errors
+///
+/// A stats column that is not Delta-stats shape, a precondition violation in *building* the pivot,
+/// or a failure to evaluate it are returned so the caller decides how to handle them (e.g. skip the
+/// batch or leave `content_stats` null); this function never swallows them.
+pub(crate) fn convert_delta_stats_to_amt_stats(
     engine: &dyn Engine,
     data: &dyn EngineData,
     stats_column_name: &str,
     table_schema: &StructType,
     input_schema: &StructType,
-) -> DeltaResult<Option<Box<dyn EngineData>>> {
-    if !is_delta_json_stats_schema(input_schema, stats_column_name) {
-        return Ok(None);
-    }
-    // Reference only the stat sources `input_schema` declares. `is_delta_json_stats_schema`
-    // guarantees the stats column is a struct, so `declared_stats` is always `Some`.
-    let Some(known) = input_schema
-        .field(stats_column_name)
-        .and_then(|f| match f.data_type() {
-            DataType::Struct(s) => Some(s.as_ref()),
-            _ => None,
-        })
-    else {
-        return Ok(None);
+) -> DeltaResult<Box<dyn EngineData>> {
+    // Reference only the stat sources `input_schema` declares. A non-Delta-stats-shape column is a
+    // caller precondition violation, so surface it (with the found type) rather than skipping.
+    let Some(known) = delta_json_stats_struct(input_schema, stats_column_name) else {
+        let found = input_schema
+            .field(stats_column_name)
+            .map(StructField::data_type);
+        return Err(Error::generic(format!(
+            "stats column '{stats_column_name}' is not in Delta-stats shape \
+             (expected a struct with '{NUM_RECORDS}'), found: {found:?}"
+        )));
     };
 
     // Building the pivot fails only on deterministic precondition violations (a non-physical
     // `table_schema`, a leaf missing its field id, or an unsupported column type) independent of
-    // the input data, so those errors propagate rather than silently disabling data skipping.
+    // the input data.
     let (expr, amt_stats_schema) =
-        build_delta_to_amt_pivot_expression(table_schema, stats_column_name, Some(known))?;
+        build_delta_to_amt_pivot_expression(table_schema, stats_column_name, known)?;
     // Output schema is the input with the stats column's type swapped for the AMT struct.
     let output_fields = input_schema.fields().map(|f| {
         if f.name() == stats_column_name {
@@ -650,28 +668,19 @@ pub(crate) fn try_preconvert_stats_column(
         Arc::new(expr),
         output_schema.into(),
     )?;
-    match evaluator.evaluate(data) {
-        Ok(result) => Ok(Some(result)),
-        Err(e) => {
-            warn!(
-                "AMT stats pivot failed; leaving content_stats null (data skipping disabled): {e}"
-            );
-            Ok(None)
-        }
-    }
+    evaluator.evaluate(data)
 }
 
 /// Builds a [`struct_patch`](Expression::struct_patch) replacing `stats_column_name` with the flat
 /// AMT `content_stats` struct, returning the expression and the schema it produces (see
 /// [`stats_schema`]).
 ///
-/// `known_stats_schema` guards which Delta stat sources are referenced: `None` references every
-/// stat the AMT layout can source; `Some(schema)` references only fields present in it and nulls
-/// the rest. It never changes which AMT leaves are emitted.
+/// `known_stats_schema` guards which Delta stat sources are referenced: only fields present in it
+/// are read and the rest are nulled. It never changes which AMT leaves are emitted.
 fn build_delta_to_amt_pivot_expression(
     table_schema: &StructType,
     stats_column_name: &str,
-    known_stats_schema: Option<&StructType>,
+    known_stats_schema: &StructType,
 ) -> DeltaResult<(Expression, StructType)> {
     let (amt_struct_expr, amt_stats_schema) =
         build_amt_flat_stats_expr(table_schema, stats_column_name, known_stats_schema)?;
@@ -687,7 +696,7 @@ fn build_delta_to_amt_pivot_expression(
 fn build_amt_flat_stats_expr<'a>(
     table_schema: &'a StructType,
     stats_col: &str,
-    known_stats_schema: Option<&StructType>,
+    known_stats_schema: &StructType,
 ) -> DeltaResult<(Expression, StructType)> {
     let mut fields: Vec<StructField> = Vec::new();
     let mut exprs: Vec<ExpressionRef> = Vec::new();
@@ -699,6 +708,9 @@ fn build_amt_flat_stats_expr<'a>(
                 let Some(leaf_field) = leaf_stats_field(field, path, categories)? else {
                     return Ok(());
                 };
+                // A stat-eligible leaf's stats field is always a struct (its per-leaf stats
+                // sub-fields); a non-struct would mean `leaf_stats_field` broke that invariant, so
+                // skip it rather than emit a malformed leaf.
                 let DataType::Struct(stats_struct) = leaf_field.data_type() else {
                     return Ok(());
                 };
@@ -725,22 +737,19 @@ fn build_amt_flat_stats_expr<'a>(
 /// Builds one leaf's AMT stats struct expression, filling each sub-field of `stats_struct` from the
 /// parsed Delta stats under `stats_col`. `leaf_type` drives the `tight_bounds` rule; `path` is the
 /// leaf's root-to-leaf path, so its Delta bounds/counts live at `<stats_col>.<category>.<path>`.
-/// With `known_stats_schema = Some`, only stat columns it declares are referenced; absent sources
-/// become null literals.
+/// Only stat columns `known_stats_schema` declares are referenced; absent sources become null
+/// literals.
 fn build_leaf_pivot_expr(
     stats_struct: &StructType,
     leaf_type: &DataType,
     stats_col: &str,
     path: &[String],
-    known_stats_schema: Option<&StructType>,
+    known_stats_schema: &StructType,
 ) -> Expression {
     let leaf_path: Vec<&str> = path.iter().map(String::as_str).collect();
-    // Whether a Delta stat at `segments` (within the stats sub-schema) is present; always true when
-    // unprojected. A nested category mirrors the table, so its path is the category plus
-    // `leaf_path`.
-    let exists = |segments: &[&str]| {
-        known_stats_schema.is_none_or(|schema| has_nested_field(schema, segments))
-    };
+    // Whether a Delta stat at `segments` is present in `known_stats_schema`. A nested category
+    // mirrors the table, so its path is the category plus `leaf_path`.
+    let exists = |segments: &[&str]| has_nested_field(known_stats_schema, segments);
     let nested_path = |category: &'static str| -> Vec<&str> {
         std::iter::once(category)
             .chain(leaf_path.iter().copied())
@@ -782,14 +791,15 @@ fn build_leaf_pivot_expr(
 
 /// Builds the `tight_bounds` expression for a leaf.
 ///
-/// String, binary, `TIMESTAMP`, and `TIMESTAMP_NTZ` bounds may be truncated by Delta, so they are
-/// never tight. Every other type takes the file's Delta `tightBounds`, defaulting to `true` when
-/// the column is absent (`tight_bounds_present == false`) or null in a row -- preserving the
-/// invariant that a `false` file value forces `false` for every column.
+/// Types whose Delta bounds may not be tight ([`tight_bounds_forced_false`]: string, binary,
+/// `TIMESTAMP`, `TIMESTAMP_NTZ`, `FLOAT`, `DOUBLE`) always resolve to `false`. Every other type
+/// takes the file's Delta `tightBounds`, defaulting to `true` when the column is absent
+/// (`tight_bounds_present == false`) or null in a row -- preserving the invariant that a `false`
+/// file value forces `false` for every column.
 ///
-/// TODO: a conservative subset of the full rules. Float/double leaves whose Delta bounds include
-/// NaN are not yet handled (see [`build_leaf_pivot_expr`]), and MDV -> `tight_bounds = false` is
-/// applied by the write-path caller, not here.
+/// TODO: a conservative subset of the full rules. Float/double are forced `false` pending NaN
+/// handling (see [`tight_bounds_forced_false`]), and MDV -> `tight_bounds = false` is applied by
+/// the write-path caller, not here.
 fn tight_bounds_expr(
     leaf_type: &DataType,
     stats_col: &str,
@@ -810,8 +820,13 @@ fn tight_bounds_expr(
     )
 }
 
-/// Whether a leaf's `tight_bounds` must be forced to `false` because Delta may store truncated
-/// (non-tight) bounds for it: string, binary, `TIMESTAMP`, and `TIMESTAMP_NTZ` columns.
+/// Whether a leaf's `tight_bounds` must be forced to `false` because Delta may store bounds that
+/// are not tight for it: string, binary, `TIMESTAMP`, and `TIMESTAMP_NTZ` columns (truncated
+/// bounds), plus `FLOAT` and `DOUBLE` columns.
+///
+/// TODO: float/double are forced conservatively because Delta records NaN in min/max while Iceberg
+/// bounds exclude it (see [`build_leaf_pivot_expr`]); once a NaN-detection expression exists we can
+/// take the file's `tightBounds` when the column has no NaN instead of always forcing `false`.
 ///
 /// Variant and geospatial leaves never reach here: variants get no `tight_bounds` sub-field
 /// ([`build_stats_struct`] excludes it via `!is_variant`), and geospatial leaves error earlier in
@@ -824,6 +839,8 @@ fn tight_bounds_forced_false(data_type: &DataType) -> bool {
                 | PrimitiveType::Binary
                 | PrimitiveType::Timestamp
                 | PrimitiveType::TimestampNtz
+                | PrimitiveType::Float
+                | PrimitiveType::Double
         )
     )
 }
@@ -844,16 +861,16 @@ fn has_nested_field(schema: &StructType, path: &[&str]) -> bool {
     }
 }
 
-/// Whether `stats_column_name` in `schema` is a Delta stats struct, identified by a `numRecords`
-/// field.
-fn is_delta_json_stats_schema(schema: &StructType, stats_column_name: &str) -> bool {
-    schema
-        .field(stats_column_name)
-        .and_then(|f| match f.data_type() {
-            DataType::Struct(s) => Some(s),
-            _ => None,
-        })
-        .is_some_and(|s| s.field(NUM_RECORDS).is_some())
+/// The `stats_column_name` column's struct if it is a Delta stats struct (identified by a
+/// `numRecords` field), else `None`.
+fn delta_json_stats_struct<'a>(
+    schema: &'a StructType,
+    stats_column_name: &str,
+) -> Option<&'a StructType> {
+    match schema.field(stats_column_name).map(StructField::data_type) {
+        Some(DataType::Struct(s)) if s.field(NUM_RECORDS).is_some() => Some(s),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1964,17 +1981,21 @@ mod tests {
     }
 
     /// Runs the pivot for `table` over a one-row batch whose `stats` column is `stats` (its schema
-    /// is taken from the scalar), returning the resulting `content_stats` struct array (`None`
-    /// when the pivot leaves it null).
-    fn run_pivot(table: &StructType, stats: Scalar) -> DeltaResult<Option<StructArray>> {
+    /// is taken from the scalar), returning the resulting `content_stats` struct array (`Err` when
+    /// the pivot fails).
+    fn run_pivot(table: &StructType, stats: Scalar) -> DeltaResult<StructArray> {
         let input_schema =
             StructType::new_unchecked([StructField::nullable("stats", stats.data_type())]);
         let engine = SyncEngine::new();
         let data = create_row(&engine, Arc::new(input_schema.clone()), stats).expect("create_row");
-        Ok(
-            try_preconvert_stats_column(&engine, data.as_ref(), "stats", table, &input_schema)?
-                .map(stats_column),
-        )
+        let result = convert_delta_stats_to_amt_stats(
+            &engine,
+            data.as_ref(),
+            "stats",
+            table,
+            &input_schema,
+        )?;
+        Ok(stats_column(result))
     }
 
     /// The `content_stats` (AMT) struct column of a batch whose stats column is named `stats`.
@@ -2031,20 +2052,20 @@ mod tests {
     }
 
     #[test]
-    fn is_delta_json_stats_schema_detects_num_records() {
+    fn delta_json_stats_struct_detects_num_records() {
         let with = StructType::new_unchecked([StructField::nullable(
             "stats",
             StructType::new_unchecked([StructField::nullable(NUM_RECORDS, DataType::LONG)]),
         )]);
-        assert!(is_delta_json_stats_schema(&with, "stats"));
+        assert!(delta_json_stats_struct(&with, "stats").is_some());
         // Missing stats column, non-struct column, and a struct without numRecords are all
         // rejected.
-        assert!(!is_delta_json_stats_schema(&with, "absent"));
+        assert!(delta_json_stats_struct(&with, "absent").is_none());
         let no_num = StructType::new_unchecked([StructField::nullable(
             "stats",
             StructType::new_unchecked([StructField::nullable(MIN_VALUES, DataType::INTEGER)]),
         )]);
-        assert!(!is_delta_json_stats_schema(&no_num, "stats"));
+        assert!(delta_json_stats_struct(&no_num, "stats").is_none());
     }
 
     #[test]
@@ -2063,33 +2084,36 @@ mod tests {
     #[test]
     fn pivot_expression_schema_matches_flat_stats_schema() {
         let table = pivot_table_schema();
+        // A partial known-stats schema (only nullCount declared) still emits every AMT leaf: the
+        // projection guards which sources are read, never which leaves the schema contains.
+        let known_stats = delta_stats(Some(stat_cols(["id", "name"])), None, None);
         let (expr, amt_schema) =
-            build_delta_to_amt_pivot_expression(&table, "stats", None).expect("pivot expr");
+            build_delta_to_amt_pivot_expression(&table, "stats", &known_stats).expect("pivot expr");
         // The pivot's output schema is exactly the (full) flat stats schema, spliced in via a
         // patch.
         assert_eq!(amt_schema, stats_schema(&table).expect("stats schema"));
         assert!(matches!(expr, Expression::StructPatch(_)));
     }
 
-    /// End-to-end `tight_bounds` by leaf type with the file's `tightBounds = true`: truncatable
-    /// types (string/binary/timestamp/timestamp_ntz) force `false`; exact types follow the file.
+    /// End-to-end `tight_bounds` by leaf type with the file's `tightBounds = true`: types whose
+    /// Delta bounds may not be tight (string/binary/timestamp/timestamp_ntz truncation,
+    /// float/double NaN) force `false`; exact types follow the file.
     #[rstest]
     #[case::string(DataType::STRING, false)]
     #[case::binary(DataType::BINARY, false)]
     #[case::timestamp(DataType::TIMESTAMP, false)]
     #[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, false)]
+    #[case::float(DataType::FLOAT, false)]
+    #[case::double(DataType::DOUBLE, false)]
     #[case::int(DataType::INTEGER, true)]
     #[case::long(DataType::LONG, true)]
-    #[case::double(DataType::DOUBLE, true)]
     fn pivot_tight_bounds_by_leaf_type(#[case] leaf_type: DataType, #[case] expected_tight: bool) {
         let table = StructType::new_unchecked([field_with_id("c", leaf_type, true, 0)]);
         let stats = struct_scalar(&[
             (NUM_RECORDS, 4i64.into()),
             (DELTA_TIGHT_BOUNDS, true.into()),
         ]);
-        let actual = run_pivot(&table, stats)
-            .expect("pivot ok")
-            .expect("pivot produced data");
+        let actual = run_pivot(&table, stats).expect("pivot ok");
         let expected = expected_stats_column(
             &table,
             &[(
@@ -2138,9 +2162,7 @@ mod tests {
         ));
 
         let table = pivot_table_schema();
-        let actual = run_pivot(&table, struct_scalar(&entries))
-            .expect("pivot ok")
-            .expect("pivot produced data");
+        let actual = run_pivot(&table, struct_scalar(&entries)).expect("pivot ok");
 
         let mut id = vec![
             (TIGHT_BOUNDS, true.into()),
@@ -2181,9 +2203,7 @@ mod tests {
             (MAX_VALUES, nest(9i32.into())),
             (NULL_COUNT, nest(1i64.into())),
         ]);
-        let actual = run_pivot(&table, stats)
-            .expect("pivot ok")
-            .expect("pivot produced data");
+        let actual = run_pivot(&table, stats).expect("pivot ok");
         let expected = expected_stats_column(
             &table,
             &[(
@@ -2219,9 +2239,7 @@ mod tests {
                 struct_scalar(&[("id", 0i64.into()), ("v", 3i64.into())]),
             ),
         ]);
-        let actual = run_pivot(&table, stats)
-            .expect("pivot ok")
-            .expect("variant table must not be dropped");
+        let actual = run_pivot(&table, stats).expect("variant table must not be dropped");
         // The variant leaf keeps variant-typed bounds (both null, since Delta records no variant
         // bounds) and its counts; id has null bounds and a defaulted-true numeric tight_bounds.
         let expected = expected_stats_column(
