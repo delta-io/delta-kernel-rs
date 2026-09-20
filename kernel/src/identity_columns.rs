@@ -1,8 +1,10 @@
 //! Support for Concurrent Identity Columns (CIC).
 //!
-//! Concurrent Identity Columns store their high water mark in a UC Sequence Service instead of
-//! Delta metadata, allowing multiple concurrent writers to generate unique BIGINT identity values
-//! without conflicting.
+//! A Concurrent Identity Column draws its values from a monotonic sequence hosted by the table's
+//! catalog instead of from the Delta-log `delta.identity.highWaterMark`, allowing multiple
+//! concurrent writers to generate unique BIGINT identity values without conflicting. A column is
+//! concurrent iff its metadata carries `delta.identity.concurrent.sequenceId`; its `start`, `step`,
+//! and `allowExplicitInsert` reuse the classic `delta.identity.*` keys.
 //!
 //! Kernel owns only the Delta protocol; it neither talks to the sequence service, generates
 //! identity values, nor inserts them into a batch. A connector discovers the columns it must fill
@@ -36,9 +38,9 @@ pub struct IdentityColumnInfo {
     pub step: i64,
     /// Whether explicit inserts are allowed for this column.
     ///
-    /// Parsed from `delta.identity.v2.allowExplicitInsert` and surfaced for callers that inspect
-    /// column metadata, but **not yet enforced**: the connector always generates identity values
-    /// today, and [`cic_column`] cannot stamp this key.
+    /// Parsed from the classic `delta.identity.allowExplicitInsert` key and surfaced for callers
+    /// that inspect column metadata, but **not yet enforced**: the connector always generates
+    /// identity values today, and [`cic_column`] cannot stamp this key.
     pub allow_explicit_insert: bool,
 }
 
@@ -86,7 +88,8 @@ impl<'a> ConcurrentIdentityColumn<'a> {
     }
 }
 
-/// Builds a CIC identity column field with all three required metadata keys stamped on it.
+/// Builds a CIC identity column field with the sequence-id marker plus the classic `start`/`step`
+/// metadata keys stamped on it.
 ///
 /// Engines call this after minting a `sequence_id`. The returned [`StructField`] is a non-nullable
 /// `LONG` column ready to be passed to `create_table`.
@@ -98,17 +101,17 @@ pub fn cic_column(
 ) -> StructField {
     StructField::new(name, DataType::LONG, false).with_metadata(vec![
         (
-            ColumnMetadataKey::IdentityCicSequenceId
+            ColumnMetadataKey::IdentityConcurrentSequenceId
                 .as_ref()
                 .to_string(),
             MetadataValue::String(sequence_id.into()),
         ),
         (
-            ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+            ColumnMetadataKey::IdentityStart.as_ref().to_string(),
             MetadataValue::Number(start),
         ),
         (
-            ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+            ColumnMetadataKey::IdentityStep.as_ref().to_string(),
             MetadataValue::Number(step),
         ),
     ])
@@ -116,8 +119,9 @@ pub fn cic_column(
 
 /// Scans the (top-level) schema for Concurrent Identity Columns (CIC).
 ///
-/// A column is a CIC if it has the `delta.identity.v2.sequenceId` metadata key. When that
-/// key is present, `delta.identity.v2.start` and `delta.identity.v2.step` are also required.
+/// A column is a CIC if it has the `delta.identity.concurrent.sequenceId` metadata key. When that
+/// key is present, the classic `delta.identity.start` and `delta.identity.step` keys are also
+/// required.
 ///
 /// Returns owned [`IdentityColumnInfo`] for each detected CIC, or an error if required metadata is
 /// missing or malformed. `Transaction::concurrent_identity_columns` exposes a borrowed-view
@@ -126,16 +130,19 @@ pub fn detect_identity_columns(schema: &SchemaRef) -> DeltaResult<Vec<IdentityCo
     let mut result = Vec::new();
     for field in schema.fields() {
         if field
-            .get_config_value(&ColumnMetadataKey::IdentityCicSequenceId)
+            .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
             .is_none()
         {
             continue;
         }
         result.push(IdentityColumnInfo {
             column_name: field.name().to_string(),
-            sequence_id: get_required_string(field, &ColumnMetadataKey::IdentityCicSequenceId)?,
-            start: get_required_i64(field, &ColumnMetadataKey::IdentityCicStart)?,
-            step: get_required_i64(field, &ColumnMetadataKey::IdentityCicStep)?,
+            sequence_id: get_required_string(
+                field,
+                &ColumnMetadataKey::IdentityConcurrentSequenceId,
+            )?,
+            start: get_required_i64(field, &ColumnMetadataKey::IdentityStart)?,
+            step: get_required_i64(field, &ColumnMetadataKey::IdentityStep)?,
             allow_explicit_insert: parse_allow_explicit_insert(field)?,
         });
     }
@@ -152,16 +159,16 @@ pub(crate) fn concurrent_identity_columns(
     let mut result = Vec::new();
     for field in schema.fields() {
         if field
-            .get_config_value(&ColumnMetadataKey::IdentityCicSequenceId)
+            .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
             .is_none()
         {
             continue;
         }
         result.push(ConcurrentIdentityColumn {
             column_name: field.name(),
-            sequence_id: get_required_str(field, &ColumnMetadataKey::IdentityCicSequenceId)?,
-            start: get_required_i64(field, &ColumnMetadataKey::IdentityCicStart)?,
-            step: get_required_i64(field, &ColumnMetadataKey::IdentityCicStep)?,
+            sequence_id: get_required_str(field, &ColumnMetadataKey::IdentityConcurrentSequenceId)?,
+            start: get_required_i64(field, &ColumnMetadataKey::IdentityStart)?,
+            step: get_required_i64(field, &ColumnMetadataKey::IdentityStep)?,
             allow_explicit_insert: parse_allow_explicit_insert(field)?,
         });
     }
@@ -171,9 +178,9 @@ pub(crate) fn concurrent_identity_columns(
 /// Validates every top-level Concurrent Identity Column in `schema`, returning whether any exist.
 ///
 /// Shared by the CREATE and ALTER paths. Each top-level CIC column must be a non-nullable `LONG`
-/// with a non-zero step, must not also carry legacy `delta.identity.*` metadata, and must not be a
-/// partition column. CIC is only supported at the top level, so CIC metadata found on any nested
-/// field is rejected.
+/// with a non-zero step, must not also carry `delta.identity.highWaterMark` (a sequence id and a
+/// high-water mark are mutually exclusive), and must not be a partition column. CIC is only
+/// supported at the top level, so CIC metadata found on any nested field is rejected.
 ///
 /// # Errors
 ///
@@ -183,11 +190,6 @@ pub(crate) fn validate_cic_columns(
     schema: &SchemaRef,
     partition_columns: &[String],
 ) -> DeltaResult<bool> {
-    const LEGACY_KEYS: &[ColumnMetadataKey] = &[
-        ColumnMetadataKey::IdentityStart,
-        ColumnMetadataKey::IdentityStep,
-        ColumnMetadataKey::IdentityHighWaterMark,
-    ];
     let identity_cols = detect_identity_columns(schema)?;
     for info in &identity_cols {
         // Present by construction: `detect_identity_columns` found it in this schema.
@@ -216,15 +218,18 @@ pub(crate) fn validate_cic_columns(
                 info.column_name,
             )));
         }
-        for legacy in LEGACY_KEYS {
-            if field.get_config_value(legacy).is_some() {
-                return Err(Error::generic(format!(
-                    "Identity column '{}' carries both CIC metadata and legacy '{}'. \
-                     These two cannot be mixed.",
-                    info.column_name,
-                    legacy.as_ref(),
-                )));
-            }
+        // A sequence id and a high-water mark are mutually exclusive (RFC): the value is either
+        // allocated from the sequence or derived from the mark, never both.
+        if field
+            .get_config_value(&ColumnMetadataKey::IdentityHighWaterMark)
+            .is_some()
+        {
+            return Err(Error::generic(format!(
+                "Identity column '{}' carries both a concurrent sequence id and a \
+                 '{}'; these are mutually exclusive.",
+                info.column_name,
+                ColumnMetadataKey::IdentityHighWaterMark.as_ref(),
+            )));
         }
         if partition_columns
             .iter()
@@ -249,7 +254,7 @@ fn reject_nested_cic(data_type: &DataType) -> DeltaResult<()> {
         DataType::Struct(fields) => {
             for field in fields.fields() {
                 if field
-                    .get_config_value(&ColumnMetadataKey::IdentityCicSequenceId)
+                    .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
                     .is_some()
                 {
                     return Err(Error::generic(format!(
@@ -271,21 +276,21 @@ fn reject_nested_cic(data_type: &DataType) -> DeltaResult<()> {
     Ok(())
 }
 
-/// Parses the optional `delta.identity.v2.allowExplicitInsert` flag (default false).
+/// Parses the optional classic `delta.identity.allowExplicitInsert` flag (default false).
 fn parse_allow_explicit_insert(field: &StructField) -> DeltaResult<bool> {
-    match field.get_config_value(&ColumnMetadataKey::IdentityCicAllowExplicitInsert) {
+    match field.get_config_value(&ColumnMetadataKey::IdentityAllowExplicitInsert) {
         Some(MetadataValue::Boolean(b)) => Ok(*b),
         Some(MetadataValue::String(s)) => s.parse::<bool>().map_err(|_| {
             Error::generic(format!(
                 "Identity column '{}': invalid boolean for '{}': {s}",
                 field.name(),
-                ColumnMetadataKey::IdentityCicAllowExplicitInsert.as_ref(),
+                ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
             ))
         }),
         Some(other) => Err(Error::generic(format!(
             "Identity column '{}': expected boolean for '{}', got: {other}",
             field.name(),
-            ColumnMetadataKey::IdentityCicAllowExplicitInsert.as_ref(),
+            ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
         ))),
         None => Ok(false),
     }
@@ -344,15 +349,15 @@ mod tests {
         assert_eq!(field.data_type(), &DataType::LONG);
         assert!(!field.is_nullable());
         assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityCicSequenceId),
+            field.get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId),
             Some(&MetadataValue::String("seq-123".to_string()))
         );
         assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityCicStart),
+            field.get_config_value(&ColumnMetadataKey::IdentityStart),
             Some(&MetadataValue::Number(5))
         );
         assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityCicStep),
+            field.get_config_value(&ColumnMetadataKey::IdentityStep),
             Some(&MetadataValue::Number(2))
         );
     }
@@ -409,7 +414,7 @@ mod tests {
     #[test]
     fn detect_identity_column_with_explicit_insert() {
         let field = cic_column("id", "seq-1", 1, 1).add_metadata(vec![(
-            ColumnMetadataKey::IdentityCicAllowExplicitInsert
+            ColumnMetadataKey::IdentityAllowExplicitInsert
                 .as_ref()
                 .to_string(),
             MetadataValue::Boolean(true),
@@ -442,17 +447,17 @@ mod tests {
     #[rstest::rstest]
     #[case::missing_start(
         &[
-            (ColumnMetadataKey::IdentityCicSequenceId, MetadataValue::String("seq-1".to_string())),
-            (ColumnMetadataKey::IdentityCicStep, MetadataValue::Number(1)),
+            (ColumnMetadataKey::IdentityConcurrentSequenceId, MetadataValue::String("seq-1".to_string())),
+            (ColumnMetadataKey::IdentityStep, MetadataValue::Number(1)),
         ],
-        "delta.identity.v2.start",
+        "delta.identity.start",
     )]
     #[case::missing_step(
         &[
-            (ColumnMetadataKey::IdentityCicSequenceId, MetadataValue::String("seq-1".to_string())),
-            (ColumnMetadataKey::IdentityCicStart, MetadataValue::Number(1)),
+            (ColumnMetadataKey::IdentityConcurrentSequenceId, MetadataValue::String("seq-1".to_string())),
+            (ColumnMetadataKey::IdentityStart, MetadataValue::Number(1)),
         ],
-        "delta.identity.v2.step",
+        "delta.identity.step",
     )]
     fn detect_identity_column_missing_required_key_returns_error(
         #[case] metadata: &[(ColumnMetadataKey, MetadataValue)],

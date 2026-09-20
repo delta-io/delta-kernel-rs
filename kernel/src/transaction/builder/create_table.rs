@@ -414,12 +414,12 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
 }
 
 /// Validates Concurrent Identity Columns (CIC) in the schema and, if any are present, adds the
-/// `identityColumnsCic` writer feature.
+/// `concurrentIdentityColumns` writer feature.
 ///
 /// Validation is shared with the ALTER path via
 /// [`validate_cic_columns`](crate::identity_columns::validate_cic_columns): each identity column
-/// must be a non-nullable `LONG` with a non-zero step, must not also carry legacy
-/// `delta.identity.*` metadata, and must not be a partition column; CIC metadata is rejected on
+/// must be a non-nullable `LONG` with a non-zero step, must not also carry a
+/// `delta.identity.highWaterMark`, and must not be a partition column; CIC metadata is rejected on
 /// nested fields.
 ///
 /// Engines register the sequences with the sequence service *after* the CREATE-table commit
@@ -432,7 +432,7 @@ fn maybe_enable_identity_columns_cic(
 ) -> DeltaResult<()> {
     if crate::identity_columns::validate_cic_columns(schema, partition_columns)? {
         add_feature_to_lists(
-            TableFeature::IdentityColumnsCic,
+            TableFeature::ConcurrentIdentityColumns,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -1625,10 +1625,10 @@ mod tests {
 
         assert!(validated
             .writer_features
-            .contains(&TableFeature::IdentityColumnsCic));
+            .contains(&TableFeature::ConcurrentIdentityColumns));
         assert!(
             validated.reader_features.is_empty(),
-            "identityColumnsCic is writer-only, reader_features should be empty"
+            "concurrentIdentityColumns is writer-only, reader_features should be empty"
         );
     }
 
@@ -1645,24 +1645,24 @@ mod tests {
 
         assert!(!validated
             .writer_features
-            .contains(&TableFeature::IdentityColumnsCic));
+            .contains(&TableFeature::ConcurrentIdentityColumns));
     }
 
     #[test]
     fn identity_columns_cic_rejects_non_long_type() {
         let bad_field = StructField::new("id", DataType::INTEGER, false).with_metadata(vec![
             (
-                ColumnMetadataKey::IdentityCicSequenceId
+                ColumnMetadataKey::IdentityConcurrentSequenceId
                     .as_ref()
                     .to_string(),
                 MetadataValue::String("seq-abc".to_string()),
             ),
             (
-                ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+                ColumnMetadataKey::IdentityStart.as_ref().to_string(),
                 MetadataValue::Number(1),
             ),
             (
-                ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+                ColumnMetadataKey::IdentityStep.as_ref().to_string(),
                 MetadataValue::Number(1),
             ),
         ]);
@@ -1683,7 +1683,7 @@ mod tests {
         );
         assert!(!validated
             .writer_features
-            .contains(&TableFeature::IdentityColumnsCic));
+            .contains(&TableFeature::ConcurrentIdentityColumns));
     }
 
     #[test]
@@ -1700,19 +1700,19 @@ mod tests {
         assert!(err.to_string().contains("step 0"), "unexpected: {err}");
         assert!(!validated
             .writer_features
-            .contains(&TableFeature::IdentityColumnsCic));
+            .contains(&TableFeature::ConcurrentIdentityColumns));
     }
 
-    #[rstest::rstest]
-    #[case::legacy_start(ColumnMetadataKey::IdentityStart, MetadataValue::Number(1))]
-    #[case::legacy_step(ColumnMetadataKey::IdentityStep, MetadataValue::Number(1))]
-    #[case::legacy_hwm(ColumnMetadataKey::IdentityHighWaterMark, MetadataValue::Number(0))]
-    fn identity_columns_cic_rejects_mixing_legacy_metadata(
-        #[case] legacy_key: ColumnMetadataKey,
-        #[case] legacy_value: MetadataValue,
-    ) {
-        let field = cic_column("id", "seq-abc", 1, 1)
-            .add_metadata(vec![(legacy_key.as_ref().to_string(), legacy_value)]);
+    #[test]
+    fn identity_columns_cic_rejects_high_water_mark() {
+        // A sequence id and a high-water mark are mutually exclusive (RFC). start/step are NOT
+        // rejected -- a concurrent identity column reuses those classic keys and requires them.
+        let field = cic_column("id", "seq-abc", 1, 1).add_metadata(vec![(
+            ColumnMetadataKey::IdentityHighWaterMark
+                .as_ref()
+                .to_string(),
+            MetadataValue::Number(0),
+        )]);
         let schema = Arc::new(StructType::new_unchecked(vec![field]));
         let mut validated = ValidatedTableProperties {
             properties: HashMap::new(),
@@ -1721,11 +1721,14 @@ mod tests {
         };
         let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cannot be mixed"), "{msg}");
-        assert!(msg.contains(legacy_key.as_ref()), "{msg}");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+        assert!(
+            msg.contains(ColumnMetadataKey::IdentityHighWaterMark.as_ref()),
+            "{msg}"
+        );
         assert!(!validated
             .writer_features
-            .contains(&TableFeature::IdentityColumnsCic));
+            .contains(&TableFeature::ConcurrentIdentityColumns));
     }
 
     #[test]
@@ -1733,17 +1736,17 @@ mod tests {
         // Built by hand rather than via cic_column, which always produces a non-nullable field.
         let field = StructField::new("id", DataType::LONG, true).with_metadata(vec![
             (
-                ColumnMetadataKey::IdentityCicSequenceId
+                ColumnMetadataKey::IdentityConcurrentSequenceId
                     .as_ref()
                     .to_string(),
                 MetadataValue::String("seq-abc".to_string()),
             ),
             (
-                ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+                ColumnMetadataKey::IdentityStart.as_ref().to_string(),
                 MetadataValue::Number(1),
             ),
             (
-                ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+                ColumnMetadataKey::IdentityStep.as_ref().to_string(),
                 MetadataValue::Number(1),
             ),
         ]);
@@ -1799,12 +1802,12 @@ mod tests {
     fn identity_columns_cic_feature_signal_is_rejected() {
         // CIC must be auto-enabled by schema metadata only.
         let properties = HashMap::from([(
-            "delta.feature.identityColumnsCic".to_string(),
+            "delta.feature.concurrentIdentityColumns".to_string(),
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Enabling feature 'identityColumnsCic'",
+            "Enabling feature 'concurrentIdentityColumns'",
         );
     }
 

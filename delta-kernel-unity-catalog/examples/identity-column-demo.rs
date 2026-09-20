@@ -154,15 +154,17 @@ where
     println!("\n[3/6] Delta log on disk:");
     println!("    {log_path}");
     println!("    Look for:");
-    println!("      * 'protocol' action -> writerFeatures should include 'identityColumnsCic'");
-    println!("      * 'metaData' action -> schemaString contains delta.identity.v2.* keys");
+    println!(
+        "      * 'protocol' action -> writerFeatures should include 'concurrentIdentityColumns'"
+    );
+    println!("      * 'metaData' action -> schemaString contains delta.identity.concurrent.sequenceId + delta.identity.start/step");
 
     println!("\n[4/6] Reloading snapshot");
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
     println!(
-        "    identityColumnsCic in protocol: {}",
-        table_config.is_feature_supported(&TableFeature::IdentityColumnsCic)
+        "    concurrentIdentityColumns in protocol: {}",
+        table_config.is_feature_supported(&TableFeature::ConcurrentIdentityColumns)
     );
     let read_schema = snapshot.schema();
     let detected = detect_identity_columns(&read_schema)?;

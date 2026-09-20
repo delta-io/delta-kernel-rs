@@ -2,8 +2,8 @@
 //!
 //! Covers both ends of the CIC write flow through the public API:
 //! - CREATE TABLE orchestration: mint sequence ids, stamp them into the schema via [`cic_column`],
-//!   commit a table with the `identityColumnsCic` writer feature auto-enabled, then register the
-//!   sequences with the service.
+//!   commit a table with the `concurrentIdentityColumns` writer feature auto-enabled, then register
+//!   the sequences with the service.
 //! - Write: the connector discovers the columns to fill via
 //!   [`Transaction::concurrent_identity_columns`], reserves ranges through a `SequenceClient`,
 //!   generates values itself (`range_start + step * i`), fills the batch, and acknowledges via
@@ -205,8 +205,8 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
     let client = Arc::new(InMemorySequenceClient::new());
     let cols = [column("id", 1, 1), column("row_id", 1000, 10)];
 
-    // CREATE TABLE first (auto-enables identityColumnsCic), then register the sequences in UC --
-    // the connector builds the batch from the columns it just minted.
+    // CREATE TABLE first (auto-enables concurrentIdentityColumns), then register the sequences in
+    // UC -- the connector builds the batch from the columns it just minted.
     let _ = create_table(&table_path, schema_for(&cols), "cic-test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -228,7 +228,7 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert!(snapshot
         .table_configuration()
-        .is_feature_supported(&TableFeature::IdentityColumnsCic));
+        .is_feature_supported(&TableFeature::ConcurrentIdentityColumns));
 
     // Connector: discover CIC columns, reserve + generate, fill the batch, ack, write.
     let mut txn = snapshot
@@ -294,17 +294,17 @@ async fn alter_table_rejects_adding_cic_column() -> Result<(), TestError> {
     // then the ALTER-path CIC validation rejects it because CIC columns must be non-nullable.
     let nullable_cic = StructField::new("id", DataType::LONG, true).with_metadata(vec![
         (
-            ColumnMetadataKey::IdentityCicSequenceId
+            ColumnMetadataKey::IdentityConcurrentSequenceId
                 .as_ref()
                 .to_string(),
             MetadataValue::String("seq-x".to_string()),
         ),
         (
-            ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+            ColumnMetadataKey::IdentityStart.as_ref().to_string(),
             MetadataValue::Number(1),
         ),
         (
-            ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+            ColumnMetadataKey::IdentityStep.as_ref().to_string(),
             MetadataValue::Number(1),
         ),
     ]);
@@ -328,17 +328,17 @@ async fn create_table_rejects_non_long_identity_column() -> Result<(), TestError
 
     let bad_field = StructField::new("id", DataType::INTEGER, false).with_metadata(vec![
         (
-            ColumnMetadataKey::IdentityCicSequenceId
+            ColumnMetadataKey::IdentityConcurrentSequenceId
                 .as_ref()
                 .to_string(),
             MetadataValue::String("seq-bogus".to_string()),
         ),
         (
-            ColumnMetadataKey::IdentityCicStart.as_ref().to_string(),
+            ColumnMetadataKey::IdentityStart.as_ref().to_string(),
             MetadataValue::Number(1),
         ),
         (
-            ColumnMetadataKey::IdentityCicStep.as_ref().to_string(),
+            ColumnMetadataKey::IdentityStep.as_ref().to_string(),
             MetadataValue::Number(1),
         ),
     ]);

@@ -280,15 +280,11 @@ pub enum ColumnMetadataKey {
     IdentityStep,
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
-    /// CIC (Concurrent Identity Columns) sequence ID for the column. The presence of this
-    /// key on a field marks it as a CIC identity column.
-    IdentityCicSequenceId,
-    /// CIC start value.
-    IdentityCicStart,
-    /// CIC step value.
-    IdentityCicStep,
-    /// CIC allowExplicitInsert flag.
-    IdentityCicAllowExplicitInsert,
+    /// Concurrent Identity Columns: the id of the catalog-hosted sequence that allocates this
+    /// column's values. Its presence marks the column as concurrent, and it is mutually exclusive
+    /// with `delta.identity.highWaterMark`. `start`, `step`, and `allowExplicitInsert` reuse the
+    /// classic `delta.identity.*` keys.
+    IdentityConcurrentSequenceId,
     InternalColumn,
     Invariants,
     MetadataSpec,
@@ -316,10 +312,7 @@ impl AsRef<str> for ColumnMetadataKey {
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
             Self::IdentityStep => "delta.identity.step",
-            Self::IdentityCicSequenceId => "delta.identity.v2.sequenceId",
-            Self::IdentityCicStart => "delta.identity.v2.start",
-            Self::IdentityCicStep => "delta.identity.v2.step",
-            Self::IdentityCicAllowExplicitInsert => "delta.identity.v2.allowExplicitInsert",
+            Self::IdentityConcurrentSequenceId => "delta.identity.concurrent.sequenceId",
             Self::InternalColumn => "delta.isInternalColumn",
             Self::Invariants => "delta.invariants",
             Self::MetadataSpec => "delta.metadataSpec",

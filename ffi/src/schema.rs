@@ -769,8 +769,8 @@ mod tests {
 ///
 /// Field metadata values may be strings, numbers, or booleans and are
 /// preserved as-is on the resulting kernel schema. This matters for
-/// identity-column metadata keys (`delta.identity.v2.{sequenceId,start,step}`)
-/// where `start`/`step` are numbers and `sequenceId` is a string.
+/// identity-column metadata keys (`delta.identity.concurrent.sequenceId +
+/// delta.identity.start/step`) where `start`/`step` are numbers and `sequenceId` is a string.
 ///
 /// # Safety
 ///
@@ -827,9 +827,9 @@ mod schema_from_json_tests {
     fn schema_from_json_preserves_cic_metadata() {
         let json = r#"{"type":"struct","fields":[
             {"name":"id","type":"long","nullable":false,"metadata":{
-                "delta.identity.v2.sequenceId":"seq-abc",
-                "delta.identity.v2.start":1,
-                "delta.identity.v2.step":1
+                "delta.identity.concurrent.sequenceId":"seq-abc",
+                "delta.identity.start":1,
+                "delta.identity.step":1
             }}
         ]}"#;
         let tmp = tempdir().unwrap();
@@ -843,15 +843,15 @@ mod schema_from_json_tests {
             let schema = unsafe { schema_handle.as_ref() };
             let field = schema.field("id").expect("id field present");
             assert!(matches!(
-                field.get_config_value(&ColumnMetadataKey::IdentityCicSequenceId),
+                field.get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId),
                 Some(MetadataValue::String(s)) if s == "seq-abc"
             ));
             assert!(matches!(
-                field.get_config_value(&ColumnMetadataKey::IdentityCicStart),
+                field.get_config_value(&ColumnMetadataKey::IdentityStart),
                 Some(MetadataValue::Number(1))
             ));
             assert!(matches!(
-                field.get_config_value(&ColumnMetadataKey::IdentityCicStep),
+                field.get_config_value(&ColumnMetadataKey::IdentityStep),
                 Some(MetadataValue::Number(1))
             ));
         }
