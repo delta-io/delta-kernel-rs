@@ -213,9 +213,8 @@ impl InMemorySequenceClient {
         }
     }
 
-    /// Registers a single sequence under a table. Returns an error if the id is empty, too long,
-    /// the step is zero, or the sequence already exists under the table.
-    /// Helper for tests.
+    /// Test setup helper: registers a single sequence under a table. Errors if the id is empty or
+    /// too long, the step is zero, or the sequence already exists under the table.
     pub fn seed_sequence(
         &self,
         table_id: impl Into<String>,
@@ -230,7 +229,6 @@ impl InMemorySequenceClient {
                 "step must be non-zero".to_string(),
             ));
         }
-        // Acquire the write lock to mutate the sequences map.
         let mut sequences = self.sequences.write().unwrap();
         match sequences.entry((table_id.into(), sequence_id)) {
             Entry::Vacant(e) => {
@@ -289,7 +287,6 @@ impl SequenceClient for InMemorySequenceClient {
             }
         }
 
-        // Acquire the write lock to mutate the sequences map.
         let mut sequences = self.sequences.write().unwrap();
         // Detect a conflicting redefinition against a stored sequence before applying any insert.
         for spec in &req.sequences {
@@ -340,10 +337,10 @@ impl SequenceClient for InMemorySequenceClient {
             }
         }
 
-        // Acquire the write lock to mutate the sequences map.
         let mut sequences = self.sequences.write().unwrap();
 
-        // First validate the reservations, then compute the ranges and advances.
+        // Compute every range up front and defer the cursor advances, so a mid-batch overflow
+        // leaves no sequence partially advanced (the batch is atomic).
         let mut ranges = Vec::with_capacity(req.reservations.len());
         let mut advances = Vec::with_capacity(req.reservations.len());
         for r in &req.reservations {
@@ -391,7 +388,6 @@ impl SequenceClient for InMemorySequenceClient {
             advances.push((key, next_current));
         }
 
-        // Now apply the advances.
         for (key, next_current) in advances {
             sequences.get_mut(&key).unwrap().current = next_current;
         }
@@ -408,12 +404,10 @@ impl SequenceClient for InMemorySequenceClient {
                 "drop request must contain at least one sequence id".to_string(),
             ));
         }
-        // Acquire the write lock to mutate the sequences map.
         let mut sequences = self.sequences.write().unwrap();
         let mut seen = HashSet::new();
         let mut results = Vec::new();
         for id in &req.sequence_ids {
-            // De-duplicate the results.
             if !seen.insert(id.as_str()) {
                 continue;
             }

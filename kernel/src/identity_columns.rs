@@ -4,17 +4,16 @@
 //! Delta metadata, allowing multiple concurrent writers to generate unique BIGINT identity values
 //! without conflicting.
 //!
-//! Kernel owns only the Delta protocol and the pure value arithmetic; it neither talks to the
-//! sequence service nor inserts values into a batch. A connector discovers the columns it must
-//! fill via [`Transaction::concurrent_identity_columns`], reserves ranges from its own client,
-//! generates the values (reusing [`ReservedRange`] for the overflow-checked arithmetic), fills the
-//! columns into its batch, and acknowledges responsibility via
-//! [`Transaction::ack_concurrent_identity_columns`]. This module provides:
+//! Kernel owns only the Delta protocol; it neither talks to the sequence service, generates
+//! identity values, nor inserts them into a batch. A connector discovers the columns it must fill
+//! via [`Transaction::concurrent_identity_columns`], reserves ranges from its own client, generates
+//! the values (a reserved range enumerates as `range_start + step * i`), fills the columns into its
+//! batch, and acknowledges responsibility via [`Transaction::ack_concurrent_identity_columns`].
+//! This module provides:
 //! - [`IdentityColumnInfo`]: owned metadata about a CIC identity column detected from schema
 //! - [`ConcurrentIdentityColumn`]: a borrowed view of a CIC column, surfaced on a transaction
 //! - [`detect_identity_columns`]: scans a schema for CIC identity columns
 //! - [`cic_column`]: stamps the CIC metadata onto a schema field at CREATE-table time
-//! - [`ReservedRange`]: a reserved range of identity values plus the arithmetic to enumerate it
 //!
 //! [`Transaction::concurrent_identity_columns`]: crate::transaction::Transaction::concurrent_identity_columns
 //! [`Transaction::ack_concurrent_identity_columns`]: crate::transaction::Transaction::ack_concurrent_identity_columns
@@ -47,11 +46,10 @@ pub struct IdentityColumnInfo {
 /// [`Transaction::concurrent_identity_columns`](crate::transaction::Transaction::concurrent_identity_columns).
 ///
 /// A connector reserves values from its sequence service for [`Self::sequence_id`], generates them
-/// from the declared [`Self::start`] / [`Self::step`] (reusing [`ReservedRange`] for the
-/// overflow-checked arithmetic), fills the [`Self::column_name`] column into its batch itself, and
-/// then acknowledges via
+/// from the reserved range (`range_start + step * i`), fills the [`Self::column_name`] column into
+/// its batch itself, and then acknowledges via
 /// [`Transaction::ack_concurrent_identity_columns`](crate::transaction::Transaction::ack_concurrent_identity_columns).
-/// Kernel neither reserves nor inserts values.
+/// Kernel neither reserves, generates, nor inserts values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConcurrentIdentityColumn<'a> {
     column_name: &'a str,
@@ -85,129 +83,6 @@ impl<'a> ConcurrentIdentityColumn<'a> {
     /// Whether user-supplied values are permitted. Parsed from metadata but not yet enforced.
     pub fn allow_explicit_insert(&self) -> bool {
         self.allow_explicit_insert
-    }
-}
-
-/// A reserved, inclusive range of identity values.
-///
-/// Consumers emit `range_start + i * step` for `i` in `[0, count)` and must not assume
-/// `range_start <= range_end`, since a negative step produces a descending range.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReservedRange {
-    /// The first value in the reserved range (inclusive).
-    pub range_start: i64,
-    /// The last value in the reserved range (inclusive).
-    pub range_end: i64,
-    /// The step between consecutive identity values.
-    pub step: i64,
-}
-
-// Classification of a range's available row count.
-enum CountResult {
-    /// The range is structurally invalid (e.g. zero step).
-    Malformed,
-    /// The range is well-formed but its row count cannot be represented in i64.
-    UnrepresentableRowCount,
-    Ok(u64),
-}
-
-impl ReservedRange {
-    /// Returns the number of distinct identity values in this range.
-    ///
-    /// Returns 0 for any range that cannot produce values. Callers that need to distinguish these
-    /// cases should call [`Self::values`], which surfaces them as errors.
-    pub fn count(&self) -> u64 {
-        match self.count_inner() {
-            CountResult::Ok(n) => n,
-            CountResult::Malformed | CountResult::UnrepresentableRowCount => 0,
-        }
-    }
-
-    /// Returns `count` consecutive identity values starting at `offset` rows into the range. That
-    /// is, value `i` of the result is `range_start + step * (offset + i)`.
-    ///
-    /// A connector pooling a reservation across several batches tracks its own `offset` and calls
-    /// this per batch; kernel keeps the overflow-checked arithmetic so the connector need not
-    /// reimplement it.
-    ///
-    /// # Errors
-    ///
-    /// - "malformed reservation" if the range is structurally invalid (zero step, sign-mismatched
-    ///   bounds, or a range whose width overflows i64).
-    /// - "row count overflow" if the range is well-formed but too large to enumerate (row count + 1
-    ///   does not fit in i64).
-    /// - "reservation exhausted" if `offset + count` exceeds the row count.
-    /// - i64 overflow on the per-element `range_start + step * stride` arithmetic.
-    pub fn values(&self, column_name: &str, offset: u64, count: u64) -> DeltaResult<Vec<i64>> {
-        let available = match self.count_inner() {
-            CountResult::Malformed => {
-                return Err(Error::generic(format!(
-                    "identity column '{}': malformed reservation \
-                     (step={}, range_start={}, range_end={})",
-                    column_name, self.step, self.range_start, self.range_end,
-                )));
-            }
-            CountResult::UnrepresentableRowCount => {
-                return Err(Error::generic(format!(
-                    "identity column '{}': row count overflow \
-                     -- range too large to enumerate (range_start={}, range_end={}, step={})",
-                    column_name, self.range_start, self.range_end, self.step,
-                )));
-            }
-            CountResult::Ok(n) => n,
-        };
-        let end = offset.checked_add(count).ok_or_else(|| {
-            Error::generic(format!(
-                "identity column '{column_name}': offset + count overflows u64"
-            ))
-        })?;
-        if end > available {
-            return Err(Error::generic(format!(
-                "identity column '{column_name}' reservation exhausted: offset {offset} + count \
-                 {count} > available {available}"
-            )));
-        }
-        let mut out = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let stride: i64 = (offset + i).try_into().map_err(|_| {
-                Error::generic(format!(
-                    "identity column '{column_name}': index does not fit into i64"
-                ))
-            })?;
-            let step_times = self.step.checked_mul(stride).ok_or_else(|| {
-                Error::generic(format!(
-                    "identity column '{column_name}': step * index overflows i64"
-                ))
-            })?;
-            let v = self.range_start.checked_add(step_times).ok_or_else(|| {
-                Error::generic(format!(
-                    "identity column '{column_name}': value overflows i64"
-                ))
-            })?;
-            out.push(v);
-        }
-        Ok(out)
-    }
-
-    /// Validates a range and computes its row count.
-    fn count_inner(&self) -> CountResult {
-        if self.step == 0 {
-            return CountResult::Malformed;
-        }
-        let Some(range) = self.range_end.checked_sub(self.range_start) else {
-            return CountResult::Malformed;
-        };
-        if (range > 0 && self.step < 0) || (range < 0 && self.step > 0) {
-            return CountResult::Malformed;
-        }
-        // step != 0 and signs match. checked_div catches `i64::MIN / -1`.
-        let Some(q) = range.checked_div(self.step) else {
-            return CountResult::UnrepresentableRowCount;
-        };
-        match q.checked_add(1).and_then(|n| u64::try_from(n).ok()) {
-            Some(n) => CountResult::Ok(n),
-            None => CountResult::UnrepresentableRowCount,
-        }
     }
 }
 
@@ -594,135 +469,5 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("missing required metadata key"), "{msg}");
         assert!(msg.contains(missing_key), "{msg}");
-    }
-
-    // === ReservedRange ===
-
-    // Note: cases that expect 0 fall into two distinct internal categories (malformed vs.
-    // unrepresentable row count).
-    #[rstest::rstest]
-    #[case::step_1(1, 10, 1, 10)]
-    #[case::step_greater_than_1(0, 20, 5, 5)]
-    #[case::negative_step(10, 0, -2, 6)]
-    #[case::step_zero_is_invalid(1, 10, 0, 0)]
-    #[case::single_value(5, 5, 1, 1)]
-    #[case::positive_range_negative_step_is_invalid(1, 10, -1, 0)]
-    #[case::negative_range_positive_step_is_invalid(10, 1, 1, 0)]
-    #[case::full_i64_range_overflows_to_zero(i64::MIN, i64::MAX, 1, 0)]
-    #[case::near_i64_max_step_1(i64::MAX - 4, i64::MAX, 1, 5)]
-    #[case::near_i64_min_step_1(i64::MIN, i64::MIN + 4, 1, 5)]
-    #[case::row_count_plus_one_overflows_to_zero(0, i64::MAX, 1, 0)]
-    #[case::division_overflow_i64_min_div_neg_one(0, i64::MIN, -1, 0)]
-    fn range_count(
-        #[case] range_start: i64,
-        #[case] range_end: i64,
-        #[case] step: i64,
-        #[case] expected: u64,
-    ) {
-        let r = ReservedRange {
-            range_start,
-            range_end,
-            step,
-        };
-        assert_eq!(r.count(), expected);
-    }
-
-    fn res(range_start: i64, range_end: i64, step: i64) -> ReservedRange {
-        ReservedRange {
-            range_start,
-            range_end,
-            step,
-        }
-    }
-
-    #[rstest::rstest]
-    // Step 1 produces sequential values across multiple offsets within the range.
-    #[case::step_1_first_chunk(res(1, 10, 1), 0, 3, vec![1, 2, 3])]
-    #[case::step_1_middle_chunk(res(1, 10, 1), 3, 4, vec![4, 5, 6, 7])]
-    #[case::step_1_last_value(res(1, 10, 1), 9, 1, vec![10])]
-    // Step >1 strides correctly.
-    #[case::step_5_full(res(0, 20, 5), 0, 5, vec![0, 5, 10, 15, 20])]
-    #[case::step_5_partial(res(0, 20, 5), 2, 2, vec![10, 15])]
-    // Negative step descends.
-    #[case::neg_step_full(res(10, 0, -2), 0, 6, vec![10, 8, 6, 4, 2, 0])]
-    #[case::neg_step_offset(res(10, 0, -2), 1, 3, vec![8, 6, 4])]
-    // Exact-fit is allowed.
-    #[case::exact_fit(res(1, 3, 1), 0, 3, vec![1, 2, 3])]
-    fn range_values_returns_expected(
-        #[case] r: ReservedRange,
-        #[case] offset: u64,
-        #[case] count: u64,
-        #[case] expected: Vec<i64>,
-    ) {
-        assert_eq!(r.values("id", offset, count).unwrap(), expected);
-    }
-
-    #[test]
-    fn range_values_rejects_exhausted_range() {
-        let r = res(1, 3, 1); // count = 3
-        let err = r.values("id", 0, 4).unwrap_err();
-        assert!(
-            err.to_string().contains("reservation exhausted"),
-            "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn range_values_rejects_request_past_capacity_at_i64_boundary() {
-        // count() returns 2 for this range (i64::MAX - 2, i64::MAX), so values(0, 3) trips the
-        // bounds check rather than the per-element arithmetic.
-        let r = res(i64::MAX - 2, i64::MAX, 2);
-        let err = r.values("id", 0, 3).unwrap_err();
-        assert!(
-            err.to_string().contains("reservation exhausted"),
-            "unexpected: {err}"
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::zero_step(1, 10, 0)]
-    #[case::ascending_range_negative_step(1, 10, -1)]
-    #[case::descending_range_positive_step(10, 1, 1)]
-    #[case::full_i64_range(i64::MIN, i64::MAX, 1)]
-    fn range_values_rejects_malformed_range(
-        #[case] range_start: i64,
-        #[case] range_end: i64,
-        #[case] step: i64,
-    ) {
-        let r = res(range_start, range_end, step);
-        let err = r.values("id", 0, 1).unwrap_err();
-        assert!(
-            err.to_string().contains("malformed reservation"),
-            "unexpected: {err}"
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::positive_step(0, i64::MAX, 1)]
-    #[case::negative_step(0, i64::MIN, -1)]
-    fn range_values_rejects_unrepresentable_row_count(
-        #[case] range_start: i64,
-        #[case] range_end: i64,
-        #[case] step: i64,
-    ) {
-        // Range fits in i64, step is nonzero, signs match. But enumerating it would overflow i64
-        // either at `range / step` (the negative case is i64::MIN / -1) or at
-        // `(range / step) + 1` (the positive case).
-        let r = res(range_start, range_end, step);
-        let err = r.values("id", 0, 1).unwrap_err();
-        assert!(
-            err.to_string().contains("row count overflow"),
-            "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn exhausted_range_error_includes_column_name() {
-        let r = res(1, 3, 1);
-        let err = r.values("user_id", 0, 4).unwrap_err();
-        assert!(
-            err.to_string().contains("user_id"),
-            "error should name the column: {err}"
-        );
     }
 }

@@ -1131,10 +1131,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// A CIC column's values are issued by a UC Identity Sequence Service, not stored in the Delta
     /// log, so the connector must fill them before writing. Use this to discover which columns to
     /// fill and their sequence parameters, reserve ranges from your sequence client, generate the
-    /// values (reusing [`ReservedRange`](crate::identity_columns::ReservedRange) for the
-    /// overflow-checked arithmetic), fill each column into your batch, and then call
+    /// values (a reserved range enumerates as `range_start + step * i`), fill each column into your
+    /// batch, and then call
     /// [`ack_concurrent_identity_columns`](Self::ack_concurrent_identity_columns) before requesting
-    /// write state. Kernel neither reserves nor inserts values.
+    /// write state. Kernel neither reserves, generates, nor inserts values.
     ///
     /// # Errors
     ///

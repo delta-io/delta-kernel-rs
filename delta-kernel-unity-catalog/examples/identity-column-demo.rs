@@ -1,8 +1,8 @@
 //! End-to-end walkthrough of Concurrent Identity Columns (CIC).
 //!
 //! Drives the full flow -- mint sequence ids, register them in UC, stamp them
-//! into a Delta schema, create the table, reserve ranges and fill a data batch
-//! via `fill_batch`, write a Parquet file, commit v1, and read the
+//! into a Delta schema, create the table, reserve ranges and fill the identity
+//! columns into a data batch, write a Parquet file, commit v1, and read the
 //! table back -- printing every step so you can verify what kernel does on disk.
 //!
 //! This example uses the [`InMemorySequenceClient`] — no external services
@@ -27,9 +27,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::identity_columns::{
-    cic_column, detect_identity_columns, IdentityColumnInfo, ReservedRange,
-};
+use delta_kernel::identity_columns::{cic_column, detect_identity_columns, IdentityColumnInfo};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -39,9 +37,9 @@ use delta_kernel::Engine as KernelEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel_unity_catalog::register_identity_sequences;
 use unity_catalog_delta_client_api::{
-    IdentityReservation, InMemorySequenceClient, ReserveIdentityRanges, SequenceClient,
+    CreateIdentitySequences, IdentityReservation, IdentitySequenceSpec, InMemorySequenceClient,
+    ReserveIdentityRanges, SequenceClient,
 };
 use uuid::Uuid;
 
@@ -135,7 +133,21 @@ where
         .commit(engine.as_ref())?;
     println!("    committed version 0");
 
-    register_identity_sequences(client.as_ref(), table_id, &infos).await?;
+    // Register the minted sequences with the service *after* the commit, so a failed create never
+    // orphans a sequence. The connector builds the batch from the columns it minted above.
+    client
+        .create_identity_sequences(CreateIdentitySequences {
+            table_id: table_id.to_string(),
+            sequences: infos
+                .iter()
+                .map(|c| IdentitySequenceSpec {
+                    sequence_id: c.sequence_id.clone(),
+                    start: c.start,
+                    step: c.step,
+                })
+                .collect(),
+        })
+        .await?;
     println!("    registered sequences in UC (after commit)");
 
     let log_path = format!("{table_path}/_delta_log/00000000000000000000.json");
@@ -175,12 +187,12 @@ where
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
-    const BATCH_ROWS: u64 = 3;
+    const BATCH_ROWS: i64 = 3;
     let payload = ["hello", "world", "!"];
 
     // Connector-owned: reserve BATCH_ROWS from every CIC in one batched RPC, then generate the
-    // values with kernel's ReservedRange arithmetic, keyed by logical column name. Kernel neither
-    // reserves nor inserts values.
+    // values by enumerating each reserved range (`range_start + step * i`), keyed by logical column
+    // name. Kernel neither reserves, generates, nor inserts values.
     let cics = txn.concurrent_identity_columns()?;
     let response = client
         .reserve_identity_ranges(ReserveIdentityRanges {
@@ -189,7 +201,7 @@ where
                 .iter()
                 .map(|c| IdentityReservation {
                     sequence_id: c.sequence_id().to_string(),
-                    count: BATCH_ROWS as i64,
+                    count: BATCH_ROWS,
                     step: Some(c.step()),
                 })
                 .collect(),
@@ -204,12 +216,9 @@ where
         std::collections::HashMap::new();
     for c in &cics {
         let r = ranges[c.sequence_id()];
-        let values = ReservedRange {
-            range_start: r.range_start,
-            range_end: r.range_end,
-            step: r.step,
-        }
-        .values(c.column_name(), 0, BATCH_ROWS)?;
+        let values = (0..BATCH_ROWS)
+            .map(|i| r.range_start + r.step * i)
+            .collect();
         generated.insert(c.column_name().to_string(), values);
     }
     drop(cics); // release the borrow of `txn` before mutating it

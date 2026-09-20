@@ -1,14 +1,14 @@
 //! Integration tests for Concurrent Identity Columns (CIC).
 //!
 //! Covers both ends of the CIC write flow through the public API:
-//! - CREATE TABLE orchestration: mint sequence ids, register them via
-//!   [`register_identity_sequences`], stamp them into the schema via [`cic_column`], and commit a
-//!   table with the `identityColumnsCic` writer feature auto-enabled.
+//! - CREATE TABLE orchestration: mint sequence ids, stamp them into the schema via [`cic_column`],
+//!   commit a table with the `identityColumnsCic` writer feature auto-enabled, then register the
+//!   sequences with the service.
 //! - Write: the connector discovers the columns to fill via
 //!   [`Transaction::concurrent_identity_columns`], reserves ranges through a `SequenceClient`,
-//!   generates values with [`ReservedRange`], fills the batch itself, and acknowledges via
-//!   [`Transaction::ack_concurrent_identity_columns`]. Kernel neither reserves nor inserts values,
-//!   but gates `write_state` on the acknowledgement.
+//!   generates values itself (`range_start + step * i`), fills the batch, and acknowledges via
+//!   [`Transaction::ack_concurrent_identity_columns`]. Kernel neither reserves, generates, nor
+//!   inserts values, but gates `write_state` on the acknowledgement.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,10 +19,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::identity_columns::{
-    cic_column, detect_identity_columns, ConcurrentIdentityColumn, IdentityColumnInfo,
-    ReservedRange,
-};
+use delta_kernel::identity_columns::{cic_column, ConcurrentIdentityColumn, IdentityColumnInfo};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
@@ -34,9 +31,9 @@ use delta_kernel::{Engine, Error};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel_unity_catalog::register_identity_sequences;
 use unity_catalog_delta_client_api::{
-    IdentityReservation, InMemorySequenceClient, ReserveIdentityRanges, SequenceClient,
+    CreateIdentitySequences, IdentityReservation, IdentitySequenceSpec, InMemorySequenceClient,
+    ReserveIdentityRanges, SequenceClient,
 };
 use uuid::Uuid;
 
@@ -87,14 +84,15 @@ fn build_engine(path: &str) -> Result<Arc<TestEngine>, TestError> {
     ))
 }
 
-/// Connector-side: reserve `n` values for every CIC in one batched RPC and generate them with
-/// kernel's `ReservedRange`, keyed by logical column name. This is orchestration a real connector
-/// owns -- kernel provides only the report ([`ConcurrentIdentityColumn`]) and the arithmetic.
+/// Connector-side: reserve `n` values for every CIC in one batched RPC and generate them by
+/// enumerating each reserved range (`range_start + step * i`), keyed by logical column name. This
+/// is orchestration a real connector owns -- kernel provides only the report
+/// ([`ConcurrentIdentityColumn`]).
 async fn reserve_and_generate<C: SequenceClient>(
     client: &C,
     table_id: &str,
     cics: &[ConcurrentIdentityColumn<'_>],
-    n: u64,
+    n: i64,
 ) -> HashMap<String, Vec<i64>> {
     let response = client
         .reserve_identity_ranges(ReserveIdentityRanges {
@@ -103,7 +101,7 @@ async fn reserve_and_generate<C: SequenceClient>(
                 .iter()
                 .map(|c| IdentityReservation {
                     sequence_id: c.sequence_id().to_string(),
-                    count: n as i64,
+                    count: n,
                     step: Some(c.step()),
                 })
                 .collect(),
@@ -119,13 +117,7 @@ async fn reserve_and_generate<C: SequenceClient>(
     cics.iter()
         .map(|c| {
             let r = ranges[c.sequence_id()];
-            let values = ReservedRange {
-                range_start: r.range_start,
-                range_end: r.range_end,
-                step: r.step,
-            }
-            .values(c.column_name(), 0, n)
-            .unwrap();
+            let values = (0..n).map(|i| r.range_start + r.step * i).collect();
             (c.column_name().to_string(), values)
         })
         .collect()
@@ -199,18 +191,6 @@ async fn concurrent_identity_columns_reports_and_gates_write_state() -> Result<(
     Ok(())
 }
 
-#[test]
-fn table_without_identity_columns_returns_empty() {
-    let schema = Arc::new(
-        StructType::try_new(vec![
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap(),
-    );
-    assert!(detect_identity_columns(&schema).unwrap().is_empty());
-}
-
 // ============================================================================
 // CREATE TABLE + end-to-end write
 // ============================================================================
@@ -225,11 +205,24 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
     let client = Arc::new(InMemorySequenceClient::new());
     let cols = [column("id", 1, 1), column("row_id", 1000, 10)];
 
-    // CREATE TABLE first (auto-enables identityColumnsCic), then register the sequences in UC.
+    // CREATE TABLE first (auto-enables identityColumnsCic), then register the sequences in UC --
+    // the connector builds the batch from the columns it just minted.
     let _ = create_table(&table_path, schema_for(&cols), "cic-test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
-    register_identity_sequences(client.as_ref(), table_id, &cols).await?;
+    client
+        .create_identity_sequences(CreateIdentitySequences {
+            table_id: table_id.to_string(),
+            sequences: cols
+                .iter()
+                .map(|c| IdentitySequenceSpec {
+                    sequence_id: c.sequence_id.clone(),
+                    start: c.start,
+                    step: c.step,
+                })
+                .collect(),
+        })
+        .await?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

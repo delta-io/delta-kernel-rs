@@ -369,13 +369,12 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 /// protocol (reader v3+ / writer v7+).
 ///
 /// `kernel_support: Supported` here means kernel will not block reads or writes on
-/// tables that carry the feature. Kernel does NOT auto-fill identity values during
-/// writes. It exposes only the sync primitives ([`detect_identity_columns`] and
-/// [`ReservedRange`]). Reserving ranges from the UC Sequence Service and filling batches
-/// is handled by `delta-kernel-unity-catalog`'s identity-column manager.
+/// tables that carry the feature. Kernel does NOT generate or fill identity values during
+/// writes. It exposes only detection ([`detect_identity_columns`]) and a report/ack handshake on
+/// `Transaction`. Reserving ranges from the UC Sequence Service, generating the values, and filling
+/// the columns are all the connector's responsibility.
 ///
 /// [`detect_identity_columns`]: crate::identity_columns::detect_identity_columns
-/// [`ReservedRange`]: crate::identity_columns::ReservedRange
 static IDENTITY_COLUMNS_CIC_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,

@@ -1650,7 +1650,6 @@ mod tests {
 
     #[test]
     fn identity_columns_cic_rejects_non_long_type() {
-        // Hand-crafted field with CIC metadata but an INTEGER type.
         let bad_field = StructField::new("id", DataType::INTEGER, false).with_metadata(vec![
             (
                 ColumnMetadataKey::IdentityCicSequenceId
@@ -1669,7 +1668,6 @@ mod tests {
         ]);
         let schema = Arc::new(StructType::new_unchecked(vec![
             bad_field,
-            // Include a valid CIC column too.
             cic_column("ok", "seq-def", 0, 1),
         ]));
         let mut validated = ValidatedTableProperties {
@@ -1683,7 +1681,6 @@ mod tests {
             err.to_string().contains("must be of type LONG"),
             "unexpected error: {err}"
         );
-        // And the feature should NOT have been added on the failure path.
         assert!(!validated
             .writer_features
             .contains(&TableFeature::IdentityColumnsCic));
@@ -1733,7 +1730,7 @@ mod tests {
 
     #[test]
     fn identity_columns_cic_rejects_nullable_column() {
-        // A nullable field carrying CIC metadata (cic_column always builds non-nullable).
+        // Built by hand rather than via cic_column, which always produces a non-nullable field.
         let field = StructField::new("id", DataType::LONG, true).with_metadata(vec![
             (
                 ColumnMetadataKey::IdentityCicSequenceId
@@ -1784,7 +1781,6 @@ mod tests {
 
     #[test]
     fn identity_columns_cic_rejects_nested_column() {
-        // A CIC column nested inside a struct is rejected (CIC is top-level only).
         let nested = StructField::nullable(
             "nested",
             StructType::new_unchecked(vec![cic_column("id", "seq-abc", 1, 1)]),
