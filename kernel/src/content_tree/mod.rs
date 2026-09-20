@@ -7,12 +7,14 @@
 mod builder;
 mod dv_conversion;
 mod reader;
+mod location;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use delta_kernel_derive::ToSchema;
+pub(crate) use location::resolve_amt_location;
 use url::Url;
 
 use crate::engine_data::EngineData;
