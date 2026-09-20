@@ -578,8 +578,7 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
 ) -> Result<(), Box<dyn std::error::Error>> {
     // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
     let (_tmp_dir, table_url, engine, snapshot) =
-        create_number_table_with_row_values(vec!["adaptiveMetadata-preview"], vec![], "id", true)
-            .await?;
+        create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
 
     // v2: remove the file.
     let scan_files = snapshot
@@ -632,7 +631,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     #[case] expected_extended_file_metadata: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_url, engine, snapshot) =
-        create_number_table_with_row_values(vec![], vec![], "none", false).await?;
+        create_number_table(vec![], vec![], "none", true).await?;
 
     let scan = snapshot.clone().scan_builder().build()?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
@@ -2137,7 +2136,7 @@ fn setup_table_with_dv_small() -> Result<DvSmallTableSetup, Box<dyn std::error::
 ///
 /// Returns `(temp_dir, table_url, engine, snapshot)` with `snapshot` at version 1 (post-append).
 /// Backed by a local filesystem store so callers can use `read_actions_from_commit`.
-async fn create_number_table_with_row_values(
+async fn create_number_table(
     reader_features: Vec<&str>,
     writer_features: Vec<&str>,
     column_mapping_mode: &str,
