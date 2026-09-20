@@ -602,7 +602,7 @@ fn collect_stats_schema<'a>(
 /// and `minValues`/`maxValues`/`nullCount` nested to mirror the table); on success it becomes an
 /// AMT `content_stats` struct (see [`stats_schema`]) and every other column passes through. For
 /// example, `{stats: {numRecords, minValues: {id}, ...}, ...}` becomes
-/// `{stats: {id: {lower_bound, value_count, ...}}, ...}`.
+/// `{content_stats: {id: {lower_bound, value_count, ...}}, ...}`.
 ///
 /// Returns `Ok(None)` (leaving `content_stats` null, which disables manifest-level data skipping)
 /// when `input_schema`'s stats column is not Delta-stats shape (no `numRecords`) or when evaluation
