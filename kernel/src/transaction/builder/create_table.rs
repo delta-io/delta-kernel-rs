@@ -414,7 +414,8 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
 }
 
 /// Validates Concurrent Identity Columns (CIC) in the schema and, if any are present, adds the
-/// `concurrentIdentityColumns` writer feature.
+/// `concurrentIdentityColumns` writer feature (plus `identityColumns`, a concurrent identity
+/// column is still an identity column).
 ///
 /// Validation is shared with the ALTER path via
 /// [`validate_cic_columns`](crate::identity_columns::validate_cic_columns): each identity column
@@ -431,11 +432,29 @@ fn maybe_enable_identity_columns_cic(
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
     if crate::identity_columns::validate_cic_columns(schema, partition_columns)? {
-        add_feature_to_lists(
+        // CIC is restricted to catalog-managed tables. Require the caller to have enabled
+        // `catalogManaged` (which auto-enables inCommitTimestamp below); do not enable it
+        // implicitly, since a catalog-managed table must be committed through a catalog committer.
+        if !validated
+            .writer_features
+            .contains(&TableFeature::CatalogManaged)
+        {
+            return Err(Error::unsupported(
+                "Concurrent Identity Columns require a catalog-managed table: enable the \
+                 'catalogManaged' feature (delta.feature.catalogManaged=supported)",
+            ));
+        }
+        // Kernel supports writing an `identityColumns` table only when it is also concurrent.
+        for feature in [
+            TableFeature::IdentityColumns,
             TableFeature::ConcurrentIdentityColumns,
-            &mut validated.reader_features,
-            &mut validated.writer_features,
-        );
+        ] {
+            add_feature_to_lists(
+                feature,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+        }
     }
     Ok(())
 }
@@ -1615,21 +1634,50 @@ mod tests {
             cic_column("id", "seq-abc", 1, 1),
             StructField::new("name", DataType::STRING, true),
         ]));
+        // CIC requires a catalog-managed table, so the caller must have enabled catalogManaged
+        // (a reader+writer feature) first.
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![TableFeature::CatalogManaged],
+            writer_features: vec![TableFeature::CatalogManaged],
+        };
+
+        maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap();
+
+        // Both the concurrent feature and its required `identityColumns` dependency are added,
+        // and neither writer-only feature leaks into reader_features.
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::ConcurrentIdentityColumns));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::IdentityColumns));
+        assert!(!validated
+            .reader_features
+            .contains(&TableFeature::ConcurrentIdentityColumns));
+        assert!(!validated
+            .reader_features
+            .contains(&TableFeature::IdentityColumns));
+    }
+
+    #[test]
+    fn identity_columns_cic_rejected_without_catalog_managed() {
+        let schema = Arc::new(StructType::new_unchecked(vec![cic_column(
+            "id", "seq-abc", 1, 1,
+        )]));
         let mut validated = ValidatedTableProperties {
             properties: HashMap::new(),
             reader_features: vec![],
             writer_features: vec![],
         };
-
-        maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap();
-
-        assert!(validated
+        let err = maybe_enable_identity_columns_cic(&schema, &[], &mut validated).unwrap_err();
+        assert!(
+            err.to_string().contains("catalog-managed"),
+            "unexpected: {err}"
+        );
+        assert!(!validated
             .writer_features
             .contains(&TableFeature::ConcurrentIdentityColumns));
-        assert!(
-            validated.reader_features.is_empty(),
-            "concurrentIdentityColumns is writer-only, reader_features should be empty"
-        );
     }
 
     #[test]

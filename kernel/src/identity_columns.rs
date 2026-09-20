@@ -248,6 +248,15 @@ pub(crate) fn validate_cic_columns(
     Ok(!identity_cols.is_empty())
 }
 
+/// Returns true if any top-level field carries a classic `delta.identity.highWaterMark`.
+pub(crate) fn schema_has_high_water_mark(schema: &StructType) -> bool {
+    schema.fields().any(|field| {
+        field
+            .get_config_value(&ColumnMetadataKey::IdentityHighWaterMark)
+            .is_some()
+    })
+}
+
 /// Rejects CIC `sequenceId` metadata found on any field nested inside `data_type`.
 fn reject_nested_cic(data_type: &DataType) -> DeltaResult<()> {
     match data_type {
@@ -474,5 +483,29 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("missing required metadata key"), "{msg}");
         assert!(msg.contains(missing_key), "{msg}");
+    }
+
+    #[test]
+    fn schema_has_high_water_mark_detects_only_the_classic_key() {
+        // A purely concurrent schema has no high-water mark.
+        let concurrent = StructType::try_new(vec![
+            cic_column("id", "seq-1", 1, 1),
+            StructField::new("payload", DataType::STRING, true),
+        ])
+        .unwrap();
+        assert!(!schema_has_high_water_mark(&concurrent));
+
+        // A surviving classic high-water-mark column is detected.
+        let with_hwm = StructType::try_new(vec![
+            cic_column("id", "seq-1", 1, 1),
+            StructField::new("legacy", DataType::LONG, false).with_metadata(vec![(
+                ColumnMetadataKey::IdentityHighWaterMark
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::Number(7),
+            )]),
+        ])
+        .unwrap();
+        assert!(schema_has_high_water_mark(&with_hwm));
     }
 }

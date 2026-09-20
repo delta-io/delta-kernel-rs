@@ -1,8 +1,12 @@
 //! Integration tests for Concurrent Identity Columns (CIC).
 //!
+//! CIC is restricted to catalog-managed tables, so these tables enable `catalogManaged` and commit
+//! through a catalog committer ([`TestCatalogCommitter`], which writes to the published path so a
+//! plain `Snapshot::builder_for` reads them back).
+//!
 //! Covers both ends of the CIC write flow through the public API:
 //! - CREATE TABLE orchestration: mint sequence ids, stamp them into the schema via [`cic_column`],
-//!   commit a table with the `concurrentIdentityColumns` writer feature auto-enabled, then register
+//!   commit a catalog-managed table with `concurrentIdentityColumns` auto-enabled, then register
 //!   the sequences with the service.
 //! - Write: the connector discovers the columns to fill via
 //!   [`Transaction::concurrent_identity_columns`], reserves ranges through a `SequenceClient`,
@@ -31,6 +35,7 @@ use delta_kernel::{Engine, Error};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use test_utils::TestCatalogCommitter;
 use unity_catalog_delta_client_api::{
     CreateIdentitySequences, IdentityReservation, IdentitySequenceSpec, InMemorySequenceClient,
     ReserveIdentityRanges, SequenceClient,
@@ -70,6 +75,25 @@ fn schema_for(cols: &[IdentityColumnInfo]) -> SchemaRef {
         ])
         .unwrap(),
     )
+}
+
+/// Creates and commits (v0) a catalog-managed table carrying the given CIC columns. CIC requires
+/// `catalogManaged`, so the create enables it (which auto-enables `inCommitTimestamp`) and commits
+/// through a catalog committer.
+fn create_cic_table(
+    engine: &TestEngine,
+    table_path: &str,
+    table_id: &str,
+    cols: &[IdentityColumnInfo],
+) -> Result<(), TestError> {
+    let _ = create_table(table_path, schema_for(cols), "cic-test/1.0")
+        .with_table_properties([
+            ("delta.feature.catalogManaged", "supported"),
+            ("io.unitycatalog.tableId", table_id),
+        ])
+        .build(engine, Box::new(TestCatalogCommitter))?
+        .commit(engine)?;
+    Ok(())
 }
 
 fn build_engine(path: &str) -> Result<Arc<TestEngine>, TestError> {
@@ -160,16 +184,17 @@ async fn concurrent_identity_columns_reports_and_gates_write_state() -> Result<(
     let engine = build_engine(&table_path)?;
 
     let cols = [column("id", 1, 1), column("row_id", 1000, 10)];
-    let _ = create_table(&table_path, schema_for(&cols), "cic-test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+    create_cic_table(engine.as_ref(), &table_path, "tbl-cic-report", &cols)?;
 
+    // Catalog-managed tables load against a catalog watermark; create committed v0.
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url)
+        .with_max_catalog_version(0)
+        .build(engine.as_ref())?;
 
     // The report surfaces both CIC columns with their sequence parameters.
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Box::new(TestCatalogCommitter), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let reported = txn.concurrent_identity_columns()?;
@@ -205,11 +230,9 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
     let client = Arc::new(InMemorySequenceClient::new());
     let cols = [column("id", 1, 1), column("row_id", 1000, 10)];
 
-    // CREATE TABLE first (auto-enables concurrentIdentityColumns), then register the sequences in
-    // UC -- the connector builds the batch from the columns it just minted.
-    let _ = create_table(&table_path, schema_for(&cols), "cic-test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+    // CREATE the catalog-managed table first (auto-enables concurrentIdentityColumns), then
+    // register the sequences in UC -- the connector builds the batch from the columns it minted.
+    create_cic_table(engine.as_ref(), &table_path, table_id, &cols)?;
     client
         .create_identity_sequences(CreateIdentitySequences {
             table_id: table_id.to_string(),
@@ -225,7 +248,9 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
         .await?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone())
+        .with_max_catalog_version(0)
+        .build(engine.as_ref())?;
     assert!(snapshot
         .table_configuration()
         .is_feature_supported(&TableFeature::ConcurrentIdentityColumns));
@@ -233,7 +258,7 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
     // Connector: discover CIC columns, reserve + generate, fill the batch, ack, write.
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Box::new(TestCatalogCommitter), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
@@ -250,8 +275,10 @@ async fn create_write_and_read_back_generates_identity_values() -> Result<(), Te
         return Err("commit did not succeed".into());
     };
 
-    // Read back and assert the generated identity values landed.
-    let snapshot_v1 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    // Read back and assert the generated identity values landed (write committed v1).
+    let snapshot_v1 = Snapshot::builder_for(table_url)
+        .with_max_catalog_version(1)
+        .build(engine.as_ref())?;
     let scan = snapshot_v1.scan_builder().build()?;
     let engine_dyn: Arc<dyn Engine> = engine.clone();
     let mut ids = Vec::new();

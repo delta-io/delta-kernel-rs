@@ -769,6 +769,18 @@ impl TableConfiguration {
             ));
         }
 
+        // While concurrent identity columns are supported, classic high-water-mark identity
+        // columns do not exist.
+        if self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns)
+            && crate::identity_columns::schema_has_high_water_mark(self.logical_schema.as_ref())
+        {
+            return Err(Error::unsupported(
+                "Table supports 'concurrentIdentityColumns' but a column carries \
+                 'delta.identity.highWaterMark'; classic high-water-mark identity generation is \
+                 not supported (every identity column must be concurrent)",
+            ));
+        }
+
         Ok(())
     }
 
@@ -949,8 +961,10 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
+    use crate::identity_columns::cic_column;
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
+        column_name, schema, schema_ref, ColumnMetadataKey, ColumnName, DataType, MetadataValue,
+        SchemaRef, StructField, StructType,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1811,6 +1825,115 @@ mod test {
                 r#"Feature 'geospatial' is not supported for writes"#,
             );
         }
+    }
+
+    // A LONG column carrying a classic `delta.identity.highWaterMark` (and no concurrent
+    // sequenceId).
+    fn high_water_mark_field(name: &str) -> StructField {
+        StructField::new(name, DataType::LONG, false).with_metadata(vec![
+            (
+                ColumnMetadataKey::IdentityStart.as_ref().to_string(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::IdentityStep.as_ref().to_string(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::IdentityHighWaterMark
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::Number(42),
+            ),
+        ])
+    }
+
+    // A valid concurrent-identity table configuration: the CIC features plus their required
+    // `catalogManaged` (and its own `inCommitTimestamp`, enabled via property).
+    fn concurrent_identity_config(schema: StructType) -> TableConfiguration {
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::IdentityColumns,
+                        TableFeature::ConcurrentIdentityColumns,
+                        TableFeature::CatalogManaged,
+                        TableFeature::InCommitTimestamp,
+                    ])
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn concurrent_identity_columns_write_supported_when_all_concurrent() {
+        // The full feature set + only a concurrent column (sequenceId, no high-water mark): writes
+        // are supported. `identityColumns` alone would be rejected, but its Custom check passes
+        // because `concurrentIdentityColumns` is also present.
+        let schema =
+            StructType::try_new(vec![cic_column("id", "seq-abc", 1, 1)]).expect("valid schema");
+        let config = concurrent_identity_config(schema);
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    #[test]
+    fn concurrent_identity_columns_write_requires_catalog_managed() {
+        // Dropping `catalogManaged` (and its inCommitTimestamp) leaves an incomplete CIC protocol;
+        // the write is rejected by the feature-requirement check.
+        let schema =
+            StructType::try_new(vec![cic_column("id", "seq-abc", 1, 1)]).expect("valid schema");
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::IdentityColumns,
+                        TableFeature::ConcurrentIdentityColumns,
+                    ])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "requires 'catalogManaged'",
+        );
+    }
+
+    #[test]
+    fn concurrent_identity_columns_write_rejected_with_surviving_high_water_mark() {
+        // Defense-in-depth: a protocol claiming the features but with a surviving classic
+        // high-water-mark column is internally inconsistent (RFC: every identity column must be
+        // concurrent). Kernel rejects the write rather than silently ignore the classic column.
+        let schema = StructType::try_new(vec![
+            cic_column("id", "seq-abc", 1, 1),
+            high_water_mark_field("legacy_id"),
+        ])
+        .expect("valid schema");
+        let config = concurrent_identity_config(schema);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "delta.identity.highWaterMark",
+        );
+    }
+
+    #[test]
+    fn classic_identity_columns_write_rejected_without_concurrent_feature() {
+        // `identityColumns` without `concurrentIdentityColumns` is classic high-water-mark
+        // identity, which kernel does not implement: writes are rejected at the support layer.
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(StructType::try_new(vec![high_water_mark_field("id")]).unwrap())
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IdentityColumns])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "classic high-water-mark identity",
+        );
     }
 
     #[cfg(not(feature = "geo-type-in-dev"))]

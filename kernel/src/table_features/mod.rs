@@ -358,7 +358,20 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::NotSupported,
+    // If the table has the `concurrentIdentityColumns` feature, kernel supports writing an
+    // `identityColumns` table.
+    kernel_support: KernelSupport::Custom(|protocol, _properties, operation| match operation {
+        Operation::Write
+            if protocol.has_table_feature(&TableFeature::ConcurrentIdentityColumns) =>
+        {
+            Ok(())
+        }
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'identityColumns' (classic high-water-mark identity) is not supported for \
+             writes",
+        )),
+        Operation::Scan | Operation::Cdf => Ok(()),
+    }),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -366,12 +379,16 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 /// rather than tracked by the Delta-log high-water mark. Kernel reports the columns and gates the
 /// write; the connector reserves ranges, generates values, and fills them.
 ///
-/// Per the RFC the feature also requires the `identityColumns` and `catalogManaged` features;
-/// kernel does not yet enforce those dependencies (`feature_requirements` is empty). TODO: enforce.
+/// Per the RFC the feature requires `identityColumns` (a concurrent identity column is still an
+/// identity column) and `catalogManaged` (CIC is restricted to catalog-managed tables, whose
+/// catalog hosts the sequence).
 static CONCURRENT_IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[
+        FeatureRequirement::Supported(TableFeature::IdentityColumns),
+        FeatureRequirement::Supported(TableFeature::CatalogManaged),
+    ],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };

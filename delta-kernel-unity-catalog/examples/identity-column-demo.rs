@@ -25,7 +25,6 @@ use delta_kernel::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray}
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::identity_columns::{cic_column, detect_identity_columns, IdentityColumnInfo};
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -37,6 +36,7 @@ use delta_kernel::Engine as KernelEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use test_utils::TestCatalogCommitter;
 use unity_catalog_delta_client_api::{
     CreateIdentitySequences, IdentityReservation, IdentitySequenceSpec, InMemorySequenceClient,
     ReserveIdentityRanges, SequenceClient,
@@ -128,8 +128,15 @@ where
         ),
     ])?);
 
+    // CIC is restricted to catalog-managed tables, so enable `catalogManaged` (which auto-enables
+    // inCommitTimestamp) and commit through a catalog committer. A real connector uses its UC
+    // committer; this demo uses an in-process test committer that writes to the published path.
     let _commit = create_table(table_path, schema, "cic-demo/0.1")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_table_properties([
+            ("delta.feature.catalogManaged", "supported"),
+            ("io.unitycatalog.tableId", table_id),
+        ])
+        .build(engine.as_ref(), Box::new(TestCatalogCommitter))?
         .commit(engine.as_ref())?;
     println!("    committed version 0");
 
@@ -160,7 +167,10 @@ where
     println!("      * 'metaData' action -> schemaString contains delta.identity.concurrent.sequenceId + delta.identity.start/step");
 
     println!("\n[4/6] Reloading snapshot");
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    // Catalog-managed tables load against a catalog watermark; create committed v0.
+    let snapshot = Snapshot::builder_for(table_url.clone())
+        .with_max_catalog_version(0)
+        .build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
     println!(
         "    concurrentIdentityColumns in protocol: {}",
@@ -184,7 +194,7 @@ where
     // Build the write transaction, then ask kernel which columns the connector must fill.
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Box::new(TestCatalogCommitter), engine.as_ref())?
         .with_engine_info("cic-demo/0.1")
         .with_operation("WRITE".to_string())
         .with_data_change(true);
@@ -271,7 +281,10 @@ where
     }
 
     println!("\n[6/6] Reading the table back");
-    let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    // The write committed v1; load the catalog-managed snapshot at that watermark.
+    let snapshot_v1 = Snapshot::builder_for(table_url.clone())
+        .with_max_catalog_version(1)
+        .build(engine.as_ref())?;
     println!("    snapshot version: {}", snapshot_v1.version());
     let scan = snapshot_v1.scan_builder().build()?;
     let engine_dyn: Arc<dyn KernelEngine> = engine.clone();

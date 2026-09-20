@@ -280,10 +280,6 @@ pub enum ColumnMetadataKey {
     IdentityStep,
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
-    /// Concurrent Identity Columns: the id of the catalog-hosted sequence that allocates this
-    /// column's values. Its presence marks the column as concurrent, and it is mutually exclusive
-    /// with `delta.identity.highWaterMark`. `start`, `step`, and `allowExplicitInsert` reuse the
-    /// classic `delta.identity.*` keys.
     IdentityConcurrentSequenceId,
     InternalColumn,
     Invariants,
