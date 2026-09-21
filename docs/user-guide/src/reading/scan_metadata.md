@@ -295,9 +295,10 @@ checkpoint pruning remains enabled for timezone-independent fields but defers co
 use the earlier instant, and nonexistent local times use the offset from before the transition.
 
 > [!TIP]
-> Kernel reparses surviving commit and checkpoint rows from the raw map for typed output and final
-> predicate evaluation. Checkpoint footer pruning happens first, but it does not evaluate zoned
-> `TIMESTAMP` partition predicates against native values when a timezone is configured.
+> Kernel parses commit rows from the raw map. Compatible checkpoints reuse native parsed fields,
+> replacing only zoned `TIMESTAMP` fields from the raw map. Checkpoint footer pruning happens first,
+> but it does not evaluate those timestamp predicates against native values whose timezone
+> provenance is unknown.
 
 ## Cancelling a scan
 

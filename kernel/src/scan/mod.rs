@@ -243,7 +243,8 @@ impl StatsOptions {
 /// When the typed struct is requested, scan metadata output gains a top-level
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values are parsed from the canonical string map for both commits and checkpoints.
+/// omitted. Commit values are parsed from the canonical string map. Compatible checkpoint values
+/// are reused, except zoned timestamps, whose meaning depends on the reader timezone.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
@@ -1031,6 +1032,7 @@ impl Scan {
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
+                    can_reuse_partition_values_parsed: false,
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
@@ -1086,6 +1088,7 @@ impl Scan {
             checkpoint_info: CheckpointReadInfo {
                 has_stats_parsed: false,
                 has_partition_values_parsed: false,
+                can_reuse_partition_values_parsed: false,
                 checkpoint_read_schema: restored_add_schema().clone(),
             },
         };
@@ -1240,16 +1243,16 @@ impl Scan {
         // partition schema rather than the logical names in table metadata.
         let mut partition_columns = HashSet::new();
         let mut floating_partition_columns = HashSet::new();
+        let mut eligible_stats_columns = self.state_info.eligible_physical_stats_columns.clone();
         if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
             for field in schema.fields() {
                 // Native checkpoint values may encode a different instant than reader-timezone
                 // parsing, so they cannot safely prune zoned timestamp partitions.
-                if self.partition_values.timestamp_timezone.is_some()
-                    && field.data_type() == &DataType::TIMESTAMP
-                {
+                let column = ColumnName::new([field.name()]);
+                if field.data_type() == &DataType::TIMESTAMP {
+                    eligible_stats_columns.remove(&column);
                     continue;
                 }
-                let column = ColumnName::new([field.name()]);
                 if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
                     floating_partition_columns.insert(column.clone());
                 }
@@ -1260,7 +1263,7 @@ impl Scan {
             predicate,
             &partition_columns,
             &floating_partition_columns,
-            &self.state_info.eligible_physical_stats_columns,
+            &eligible_stats_columns,
         )?;
 
         let mut prefixer = PrefixColumns {
@@ -1353,6 +1356,7 @@ impl Scan {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
+            can_reuse_partition_values_parsed: false,
             checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
         let processor = ScanLogReplayProcessor::new(
