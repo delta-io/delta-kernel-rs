@@ -233,8 +233,40 @@ mod tests {
     use super::*;
     use crate::commit_range::DeltaAction;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::test_delegating::DelegatingEngine;
     use crate::utils::FoldWithOption as _;
-    use crate::{Engine, FileMeta, LogPath, Snapshot};
+    use crate::{DeltaResultIteratorStatic, Engine, FileMeta, LogPath, Snapshot, StorageHandler};
+
+    struct NoIoStorageHandler;
+
+    impl StorageHandler for NoIoStorageHandler {
+        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+            panic!("snapshot-based commit ranges must not list storage");
+        }
+
+        fn read_files(
+            &self,
+            _files: Vec<crate::FileSlice>,
+        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+            panic!("commit range construction must not read files");
+        }
+
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+            panic!("unexpected copy");
+        }
+
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+            panic!("unexpected write");
+        }
+
+        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+            panic!("unexpected head");
+        }
+
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            panic!("unexpected delete");
+        }
+    }
 
     /// `table-with-dv-small` has versions 0 and 1 (snapshot version = 1).
     fn dv_small_table_root() -> Url {
@@ -405,6 +437,8 @@ mod tests {
             .at_version(0)
             .build(&engine)
             .unwrap();
+        let engine = DelegatingEngine::new(Arc::new(engine))
+            .with_storage_handler(Arc::new(NoIoStorageHandler));
         let range = CommitRange::builder_from(snapshot, 0)
             .with_log_tail(vec![staged_commit(&table_root, 1)])
             .with_max_catalog_version(1)
@@ -419,8 +453,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_snapshot_based_catalog_tail_supersedes_published_commit() {
+    #[rstest::rstest]
+    #[case::extends_snapshot(None, 2)]
+    #[case::trims_tail(Some(1), 1)]
+    fn test_build_snapshot_based_catalog_tail_supersedes_published_commit(
+        #[case] end_version: Option<Version>,
+        #[case] expected_end: Version,
+    ) {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_root.as_str())
@@ -432,53 +471,36 @@ mod tests {
                 staged_commit(&table_root, 2),
             ])
             .with_max_catalog_version(2)
+            .fold_with(end_version, CommitRangeBuilder::with_end_version)
             .build(&engine)
             .unwrap();
 
-        assert_eq!(range.end_version(), 2);
-        assert_eq!(range.commit_files.len(), 3);
+        assert_eq!(range.end_version(), expected_end);
+        assert_eq!(range.commit_files.len(), expected_end as usize + 1);
         assert_eq!(
             range.commit_files[1].file_type,
             LogPathFileType::StagedCommit
         );
         assert_eq!(range.commit_files[1].version, 1);
-        assert_eq!(range.commit_files[2].version, 2);
-    }
-
-    #[test]
-    fn test_build_snapshot_based_catalog_tail_respects_explicit_end_version() {
-        let table_root = dv_small_table_root();
-        let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(table_root.as_str())
-            .build(&engine)
-            .unwrap();
-        let range = CommitRange::builder_from(snapshot, 0)
-            .with_log_tail(vec![
-                staged_commit(&table_root, 1),
-                staged_commit(&table_root, 2),
-            ])
-            .with_max_catalog_version(2)
-            .with_end_version(1)
-            .build(&engine)
-            .unwrap();
-
-        assert_eq!(range.end_version(), 1);
-        assert_eq!(range.commit_files.len(), 2);
-        assert_eq!(
-            range.commit_files[1].file_type,
-            LogPathFileType::StagedCommit
-        );
-        assert_eq!(range.commit_files[1].version, 1);
+        assert_eq!(range.commit_files.last().unwrap().version, expected_end);
     }
 
     #[rstest::rstest]
-    #[case::tail_covers_explicit_end(Some(1), 2, true)]
-    #[case::tail_shorter_than_explicit_end(Some(2), 2, false)]
-    #[case::tail_does_not_reach_max_catalog_version(None, 2, false)]
+    #[case::tail_covers_explicit_end(Some(1), 2, None)]
+    #[case::tail_shorter_than_explicit_end(
+        Some(2),
+        2,
+        Some("Log tail version 1 is less than requested version 2")
+    )]
+    #[case::tail_does_not_reach_max_catalog_version(
+        None,
+        2,
+        Some("Log tail version 1 does not match max catalog version 2")
+    )]
     fn test_catalog_log_tail_end_version_validation(
         #[case] end_version: Option<Version>,
         #[case] max_catalog_version: Version,
-        #[case] expected_success: bool,
+        #[case] expected_error: Option<&str>,
     ) {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
@@ -488,7 +510,16 @@ mod tests {
             .fold_with(end_version, CommitRangeBuilder::with_end_version)
             .build(&engine);
 
-        assert_eq!(result.is_ok(), expected_success);
+        if let Some(expected_error) = expected_error {
+            assert!(matches!(
+                result.unwrap_err(),
+                Error::MaxCatalogVersion(message) if message.contains(expected_error)
+            ));
+        } else {
+            let range = result.unwrap();
+            assert_eq!(range.end_version(), 1);
+            assert_eq!(range.commit_files.len(), 2);
+        }
     }
 
     #[test]
