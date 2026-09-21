@@ -1,7 +1,7 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
@@ -97,36 +97,48 @@ impl CommitRangeBuilder {
         let log_tail: Vec<ParsedLogPath> =
             self.log_tail.clone().into_iter().map(Into::into).collect();
         self.validate_catalog_managed_inputs(&log_tail)?;
-        let end_version = requested_end_version.or(self.max_catalog_version);
+        let configured_end_version = requested_end_version.or(self.max_catalog_version);
 
-        let uses_snapshot_log_segment = self.snapshot.is_some() && log_tail.is_empty();
-        let log_segment = match (&self.snapshot, log_tail.is_empty()) {
-            (Some(snapshot), true) => snapshot.log_segment().clone(),
-            _ => LogSegment::for_table_changes_with_log_tail(
+        let (mut commit_files, end_version) = if let Some(snapshot) = &self.snapshot {
+            let log_segment = snapshot.log_segment();
+            let end_version = configured_end_version.unwrap_or(log_segment.end_version);
+            let available_end_version = log_tail.last().map_or(log_segment.end_version, |last| {
+                last.version.max(log_segment.end_version)
+            });
+            if end_version > available_end_version {
+                return Err(Error::MissingVersion(available_end_version + 1));
+            }
+
+            let tail_start_version = log_tail.first().map(|path| path.version);
+            let mut commit_files: Vec<_> = log_segment
+                .listed
+                .ascending_commit_files
+                .iter()
+                .filter(|path| tail_start_version.is_none_or(|version| path.version < version))
+                .cloned()
+                .chain(log_tail)
+                .filter(|path| path.version >= start_version && path.version <= end_version)
+                .collect();
+            commit_files.sort_unstable_by_key(|path| path.version);
+            validate_start_version_available(start_version, commit_files.first())?;
+            (commit_files, end_version)
+        } else {
+            let log_segment = LogSegment::for_table_changes_with_log_tail(
                 engine.storage_handler().as_ref(),
                 log_root,
                 start_version,
-                end_version,
+                configured_end_version,
                 log_tail,
-            )?,
+            )?;
+            let end_version = configured_end_version.unwrap_or(log_segment.end_version);
+            let commit_files = log_segment
+                .listed
+                .ascending_commit_files
+                .into_iter()
+                .filter(|path| path.version >= start_version && path.version <= end_version)
+                .collect();
+            (commit_files, end_version)
         };
-
-        let end_version = end_version.unwrap_or(log_segment.end_version);
-
-        // Snapshot's log segment may extend past [start, end]; filter to the requested range.
-        let mut commit_files: Vec<ParsedLogPath> = log_segment
-            .listed
-            .ascending_commit_files
-            .into_iter()
-            .filter(|f| f.version >= start_version && f.version <= end_version)
-            .collect();
-
-        if uses_snapshot_log_segment {
-            validate_start_version_available(start_version, commit_files.first())?;
-            if end_version > log_segment.end_version {
-                return Err(Error::MissingVersion(log_segment.end_version + 1));
-            }
-        }
         validate_number_of_commit_files(start_version, end_version, commit_files.len())?;
 
         if self.commit_ordering == CommitOrdering::DescendingOrder {
@@ -151,25 +163,6 @@ impl CommitRangeBuilder {
                     self.start_version
                 ))
             );
-            if let Some(end_version) = self.end_version {
-                require!(
-                    end_version <= max_catalog_version,
-                    Error::MaxCatalogVersion(format!(
-                        "End version {end_version} exceeds max catalog version \
-                         {max_catalog_version}"
-                    ))
-                );
-            }
-        }
-
-        for pair in log_tail.windows(2) {
-            require!(
-                pair[0].version.checked_add(1) == Some(pair[1].version),
-                Error::LogTailVersionsNotContiguous {
-                    first_version: pair[0].version,
-                    second_version: pair[1].version,
-                }
-            );
         }
         require!(
             log_tail
@@ -177,39 +170,7 @@ impl CommitRangeBuilder {
                 .all(|path| path.file_type == LogPathFileType::StagedCommit),
             Error::generic("Commit range log tail must contain only staged commits")
         );
-        require!(
-            log_tail.is_empty() || self.max_catalog_version.is_some(),
-            Error::MaxCatalogVersion(
-                "Max catalog version is required when providing staged commits. Use \
-                 with_max_catalog_version()."
-                    .to_string()
-            )
-        );
-
-        if let (Some(last), Some(max_catalog_version)) = (log_tail.last(), self.max_catalog_version)
-        {
-            if let Some(end_version) = self.end_version {
-                require!(
-                    last.version >= end_version,
-                    Error::MaxCatalogVersion(format!(
-                        "Log tail version {} is less than requested end version {end_version} for \
-                         max catalog version {max_catalog_version}",
-                        last.version
-                    ))
-                );
-            } else {
-                require!(
-                    last.version == max_catalog_version,
-                    Error::MaxCatalogVersion(format!(
-                        "Log tail version {} does not match max catalog version \
-                         {max_catalog_version}",
-                        last.version
-                    ))
-                );
-            }
-        }
-
-        Ok(())
+        validate_catalog_managed_log_tail(self.end_version, self.max_catalog_version, log_tail)
     }
 
     /// Parse the stored table-root string into a [`Url`].
@@ -433,6 +394,48 @@ mod tests {
             range.commit_files[1].file_type,
             LogPathFileType::StagedCommit
         );
+    }
+
+    #[test]
+    fn test_build_snapshot_based_merges_catalog_log_tail_without_listing() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root.as_str())
+            .at_version(0)
+            .build(&engine)
+            .unwrap();
+        let range = CommitRange::builder_from(snapshot, 0)
+            .with_log_tail(vec![staged_commit(&table_root, 1)])
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), 1);
+        assert_eq!(range.commit_files.len(), 2);
+        assert_eq!(
+            range.commit_files[1].file_type,
+            LogPathFileType::StagedCommit
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::tail_covers_explicit_end(Some(1), 2, true)]
+    #[case::tail_shorter_than_explicit_end(Some(2), 2, false)]
+    #[case::tail_does_not_reach_max_catalog_version(None, 2, false)]
+    fn test_catalog_log_tail_end_version_validation(
+        #[case] end_version: Option<Version>,
+        #[case] max_catalog_version: Version,
+        #[case] expected_success: bool,
+    ) {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let result = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(vec![staged_commit(&table_root, 1)])
+            .with_max_catalog_version(max_catalog_version)
+            .fold_with(end_version, CommitRangeBuilder::with_end_version)
+            .build(&engine);
+
+        assert_eq!(result.is_ok(), expected_success);
     }
 
     #[test]
