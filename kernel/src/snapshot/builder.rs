@@ -1075,6 +1075,49 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::supported(
+        Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap(),
+        None,
+    )]
+    #[case::future_reader_version(
+        Protocol::try_new_legacy(4, 2).unwrap(),
+        Some("Unsupported minimum reader version 4"),
+    )]
+    #[case::unknown_reader_feature(
+        Protocol::try_new_modern(["futureFeature"], ["futureFeature"]).unwrap(),
+        Some("Feature 'futureFeature' is not supported"),
+    )]
+    #[case::missing_feature_requirement(
+        Protocol::try_new_modern(["catalogManaged"], ["catalogManaged"]).unwrap(),
+        Some("Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"),
+    )]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_hint_validates_reader_protocol(
+        #[case] protocol: Protocol,
+        #[case] expected_error: Option<&str>,
+        #[values(false, true)] with_crc: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, snapshot, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        hint.protocol = protocol.clone();
+        if with_crc {
+            Arc::make_mut(hint.crc.as_mut().unwrap()).protocol = protocol;
+        } else {
+            hint.crc = None;
+        }
+
+        let result = SnapshotBuilder::new_for(table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref());
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            assert_eq!(result?.version(), snapshot.version());
+        }
+        Ok(())
+    }
+
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn complete_snapshot_hint_preserves_checkpoint_state(
     ) -> Result<(), Box<dyn std::error::Error>> {

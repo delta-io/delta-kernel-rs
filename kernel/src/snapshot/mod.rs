@@ -34,7 +34,7 @@ use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAI
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
+use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
@@ -179,6 +179,7 @@ impl Snapshot {
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
     ) -> DeltaResult<Self> {
+        table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
         // Will perform version validations.
         let crc = SnapshotCrc::try_new(
             crc,
