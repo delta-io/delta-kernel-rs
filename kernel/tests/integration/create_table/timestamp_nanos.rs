@@ -156,3 +156,51 @@ fn test_create_table_timestamp_nanos_and_variant(
 
     Ok(())
 }
+
+/// A schema with both TimestampNtz and nanosecond timestamp columns results in the `timestampNtz`
+/// feature only being added once.
+#[rstest::rstest]
+fn test_create_table_timestamp_nanos_with_timestamp_ntz_column_no_duplicate_features(
+    #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] nanos_type: DataType,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::nullable("ts_ntz", DataType::TIMESTAMP_NTZ),
+        StructField::nullable("ts_nanos", nanos_type),
+    ])?);
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_timestamp_nanos_protocol(&snapshot);
+
+    let protocol = snapshot.table_configuration().protocol();
+    let reader_features = protocol
+        .reader_features()
+        .expect("reader features should be present");
+    let writer_features = protocol
+        .writer_features()
+        .expect("writer features should be present");
+    for feature in [
+        TableFeature::TimestampWithoutTimezone,
+        TableFeature::TimestampNanos,
+    ] {
+        for (list_name, features) in [
+            ("readerFeatures", reader_features),
+            ("writerFeatures", writer_features),
+        ] {
+            let count = features.iter().filter(|f| **f == feature).count();
+            assert_eq!(
+                count, 1,
+                "{feature} should appear exactly once in {list_name}; got {count}"
+            );
+        }
+    }
+
+    Ok(())
+}
