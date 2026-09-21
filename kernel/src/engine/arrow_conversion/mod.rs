@@ -264,6 +264,10 @@ fn kernel_field_into_arrow(
     datatype: &DataType,
 ) -> Result<ArrowDataType, ArrowError> {
     match datatype {
+        #[cfg(feature = "udt-in-dev")]
+        DataType::UserDefined(_) => Err(ArrowError::SchemaError(
+            "UDT reads are not yet supported".into(),
+        )),
         DataType::Array(a) => {
             let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
             let element_id = lookup_nested_field_id(ancestor, &element_path)?;
@@ -340,6 +344,10 @@ impl TryFromKernel<&MapType> for ArrowField {
 impl TryFromKernel<&DataType> for ArrowDataType {
     fn try_from_kernel(t: &DataType) -> Result<Self, ArrowError> {
         match t {
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => Err(ArrowError::SchemaError(
+                "UDT reads are not yet supported".into(),
+            )),
             DataType::Primitive(p) => {
                 match p {
                     PrimitiveType::String => Ok(ArrowDataType::Utf8),

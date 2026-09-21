@@ -2,6 +2,9 @@ use std::os::raw::c_void;
 
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
+use crate::delta_types::FfiNullableStringMap;
+#[cfg(feature = "udt-in-dev")]
+use crate::delta_types::FfiNullableStringMapEntry;
 use crate::handle::Handle;
 use crate::scan::CMetadataMap;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
@@ -39,6 +42,18 @@ pub struct EngineSchemaVisitor {
     pub data: *mut c_void,
     /// Creates a new field list, optionally reserving capacity up front
     pub make_field_list: extern "C" fn(data: *mut c_void, reserve: usize) -> usize,
+
+    /// Visit a UDT with its physical type in the one-element `child_list_id` list.
+    /// The annotation and its string slices are borrowed for the duration of this callback.
+    pub visit_user_defined: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CMetadataMap,
+        child_list_id: usize,
+        annotation: FfiNullableStringMap,
+    ),
 
     // visitor methods that should instantiate and append the appropriate type to the field list
     /// Indicate that the schema contains a `Struct` type. The top level of a Schema is always a
@@ -358,6 +373,41 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             };
         }
         match data_type {
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(udt) => {
+                let child_list_id = (visitor.make_field_list)(visitor.data, 1);
+                visit_schema_item(
+                    "sqlType",
+                    &udt.sql_type,
+                    is_nullable,
+                    &CMetadataMap::default(),
+                    visitor,
+                    child_list_id,
+                );
+                let entries: Vec<_> = udt
+                    .annotation
+                    .iter()
+                    .map(|(key, value)| FfiNullableStringMapEntry {
+                        key: kernel_string_slice!(key),
+                        value: value
+                            .as_ref()
+                            .map(|value| kernel_string_slice!(value))
+                            .into(),
+                    })
+                    .collect();
+                call!(
+                    visit_user_defined,
+                    child_list_id,
+                    FfiNullableStringMap {
+                        ptr: if entries.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            entries.as_ptr()
+                        },
+                        len: entries.len(),
+                    }
+                );
+            }
             DataType::Struct(st) => call!(visit_struct, visit_struct_fields(visitor, st)),
             DataType::Map(mt) => {
                 call!(
@@ -411,6 +461,8 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use std::collections::HashMap;
 
     use delta_kernel::schema::schema;
     #[cfg(feature = "geo-type-in-dev")]
@@ -475,6 +527,7 @@ mod tests {
     #[derive(Default)]
     struct TestSchemaBuilder {
         lists: Vec<Vec<VisitedField>>,
+        udt_annotations: Vec<HashMap<String, Option<String>>>,
     }
 
     extern "C" fn make_field_list(data: *mut c_void, reserve: usize) -> usize {
@@ -527,6 +580,29 @@ mod tests {
     visit_nested_type!(visit_struct, "struct");
     visit_nested_type!(visit_array, "array");
     visit_nested_type!(visit_map, "map");
+
+    extern "C" fn visit_user_defined(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        _metadata: &CMetadataMap,
+        child_list_id: usize,
+        annotation: FfiNullableStringMap,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestSchemaBuilder) };
+        builder
+            .udt_annotations
+            .push(unsafe { annotation.try_to_hash_map() }.unwrap());
+        add_field(
+            data,
+            sibling_list_id,
+            name,
+            is_nullable,
+            "udt",
+            Some(child_list_id),
+        );
+    }
 
     extern "C" fn visit_decimal(
         data: *mut c_void,
@@ -617,6 +693,7 @@ mod tests {
         EngineSchemaVisitor {
             data: builder as *mut _ as *mut c_void,
             make_field_list,
+            visit_user_defined,
             visit_struct,
             visit_array,
             visit_map,
@@ -678,6 +755,36 @@ mod tests {
         assert_eq!(
             builder.lists[array_child_list_id][0],
             VisitedField::new("array_element", "interval day to second", false, None)
+        );
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[test]
+    fn visit_schema_preserves_udt_physical_type_and_annotation() {
+        let schema: StructType = serde_json::from_value(serde_json::json!({
+            "type": "struct", "fields": [{
+                "name": "id", "nullable": true, "metadata": {},
+                "type": {"type": "udt", "sqlType": "long", "class": "Id", "pyClass": null}
+            }]
+        }))
+        .unwrap();
+        let mut builder = TestSchemaBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+        assert_eq!(visit_schema_impl(&schema, &mut visitor), 0);
+        assert_eq!(
+            builder.lists[0],
+            vec![VisitedField::new("id", "udt", true, Some(1))]
+        );
+        assert_eq!(
+            builder.lists[1],
+            vec![VisitedField::new("sqlType", "long", true, None)]
+        );
+        assert_eq!(
+            builder.udt_annotations,
+            vec![HashMap::from([
+                ("class".into(), Some("Id".into())),
+                ("pyClass".into(), None)
+            ])]
         );
     }
 

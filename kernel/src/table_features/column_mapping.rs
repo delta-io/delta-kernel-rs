@@ -587,6 +587,8 @@ fn flat_cm_info_for_nested_data_type(
         }
         // Primitive and Variant types don't contain nested struct fields - return as-is
         DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+        #[cfg(feature = "udt-in-dev")]
+        DataType::UserDefined(_) => Ok(data_type.clone()),
     }
 }
 
@@ -643,6 +645,8 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
                 )))
             }
             DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => Ok(data_type.clone()),
         }
     }
 

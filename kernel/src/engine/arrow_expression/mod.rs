@@ -169,6 +169,10 @@ impl Scalar {
         }
 
         match *data_type {
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => {
+                return Err(Error::unsupported("UDT expressions are not yet supported"))
+            }
             DataType::INTEGER => append_nulls_as!(array::Int32Builder),
             DataType::LONG => append_nulls_as!(array::Int64Builder),
             DataType::SHORT => append_nulls_as!(array::Int16Builder),

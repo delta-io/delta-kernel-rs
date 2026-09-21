@@ -85,6 +85,15 @@ message StructType {
 
 message VariantType {}
 
+message UserDefinedAnnotationValue {
+  optional string value = 1;
+}
+
+message UserDefinedType {
+  DataType sql_type = 1;
+  map<string, UserDefinedAnnotationValue> annotation = 2;
+}
+
 message MetadataValue {
   oneof value {
     int64 number = 1;
@@ -108,5 +117,6 @@ message DataType {
     StructType struct = 3;
     MapType map = 4;
     VariantType variant = 5;
+    UserDefinedType user_defined = 6;
   }
 }
