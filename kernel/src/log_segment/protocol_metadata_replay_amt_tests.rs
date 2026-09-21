@@ -266,7 +266,7 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     assert_eq!(schema.num_fields(), 2);
 }
 
-// A manifest commit's `checkpoint` action is captured on the loaded snapshot, root manifest path
+// A manifest commit's `checkpoint` action is resolved from the loaded snapshot, root manifest path
 // and version included. Runs on both replay paths.
 #[tokio::test]
 async fn test_captures_latest_checkpoint_action_from_manifest_commit() {
@@ -293,8 +293,9 @@ async fn assert_captures_manifest_checkpoint<E: Engine>(
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     let action = snapshot
-        .latest_checkpoint_action()
-        .expect("checkpoint action captured");
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action resolved");
     assert_eq!(action.version(), 0);
     assert_eq!(action.path(), "metadata/root.parquet");
 }
@@ -334,13 +335,14 @@ async fn assert_captures_newest_checkpoint<E: Engine>(
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     let action = snapshot
-        .latest_checkpoint_action()
-        .expect("checkpoint action captured");
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action resolved");
     assert_eq!(action.version(), 1);
 }
 
-// An adaptiveMetadata table whose commits carry no `checkpoint` action captures `None` (the lookup
-// ran but found nothing).
+// An adaptiveMetadata table whose commits carry no `checkpoint` action resolves to `None` (the
+// lookup ran but found nothing).
 #[tokio::test]
 async fn test_amt_table_without_checkpoint_action_captures_none() {
     let store = Arc::new(InMemory::new());
@@ -357,11 +359,11 @@ async fn test_amt_table_without_checkpoint_action_captures_none() {
     let engine = SyncEngine::new_with_store(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
-    assert!(snapshot.latest_checkpoint_action().is_none());
+    assert!(snapshot.latest_checkpoint_action(&engine).unwrap().is_none());
 }
 
-// A plain (non-adaptiveMetadata) table captures `None`: the lookup is skipped entirely because the
-// `adaptiveMetadata-preview` feature is not supported.
+// A plain (non-adaptiveMetadata) table resolves to `None`: the lookup is skipped entirely because
+// the `adaptiveMetadata-preview` feature is not supported.
 #[tokio::test]
 async fn test_non_amt_table_captures_no_checkpoint_action() {
     let store = Arc::new(InMemory::new());
@@ -373,5 +375,5 @@ async fn test_non_amt_table_captures_no_checkpoint_action() {
     let engine = SyncEngine::new_with_store(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
-    assert!(snapshot.latest_checkpoint_action().is_none());
+    assert!(snapshot.latest_checkpoint_action(&engine).unwrap().is_none());
 }

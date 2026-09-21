@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, info, instrument, warn};
@@ -95,11 +97,13 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
-    /// The newest AMT `checkpoint` action found at load, if this is an adaptiveMetadata table.
-    /// Queried via [`Snapshot::latest_checkpoint_action`]. `None` when the table has no checkpoint
-    /// action or is not an adaptiveMetadata table. Boxed to keep the struct small.
+    /// Cache for the newest AMT `checkpoint` action, resolved lazily on first
+    /// [`Snapshot::latest_checkpoint_action`] call so a plain load never pays for the extra log
+    /// pass. Once resolved, the inner `Option` is `None` when the table has no checkpoint action or
+    /// is not an adaptiveMetadata table (boxed to keep the struct small). May be pre-seeded when the
+    /// action is already known (e.g. from a cheaper `_last_checkpoint` hint).
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    last_checkpoint_action: Option<Box<CheckpointAction>>,
+    latest_checkpoint_action: OnceLock<Option<Box<CheckpointAction>>>,
 }
 
 impl PartialEq for Snapshot {
@@ -127,7 +131,7 @@ impl std::fmt::Debug for Snapshot {
             .field("log_segment", &self.log_segment)
             .field("skipped_new_checkpoints", &self.skipped_new_checkpoints);
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        s.field("checkpoint_action", &self.last_checkpoint_action);
+        s.field("latest_checkpoint_action", &self.latest_checkpoint_action);
         s.finish()
     }
 }
@@ -210,16 +214,8 @@ impl Snapshot {
             built_as_latest,
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            last_checkpoint_action: None,
+            latest_checkpoint_action: OnceLock::new(),
         })
-    }
-
-    /// Attach the newest AMT `checkpoint` action resolved for this snapshot. Kept separate from
-    /// [`Self::new_with_crc`] so its many callers default the field to `None`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn with_checkpoint_action(mut self, action: Option<Box<CheckpointAction>>) -> Self {
-        self.last_checkpoint_action = action;
-        self
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -267,21 +263,6 @@ impl Snapshot {
             built_as_latest,
             false, /* skipped_new_checkpoints */
         )?;
-
-        // For adaptiveMetadata tables, capture the newest `checkpoint` action so downstream AMT
-        // reads can resolve the root manifest without another log pass. Skipped for other tables,
-        // which never carry a checkpoint action.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let snapshot = {
-            let action = snapshot
-                .table_configuration()
-                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview)
-                .then(|| snapshot.log_segment().find_checkpoint_action(engine))
-                .transpose()?
-                .flatten()
-                .map(Box::new);
-            snapshot.with_checkpoint_action(action)
-        };
 
         Ok(snapshot)
     }
@@ -581,13 +562,38 @@ impl Snapshot {
         Ok(version)
     }
 
-    /// The newest AMT `checkpoint` action found at load, or `None` if this is not an
+    /// The newest AMT `checkpoint` action for this table, or `None` if this is not an
     /// adaptiveMetadata table or the table carries no checkpoint action.
+    ///
+    /// Resolved lazily and memoized on first call: only adaptiveMetadata tables pay for the log
+    /// pass ([`LogSegment::find_checkpoint_action`]), and only when a caller actually needs the
+    /// action. Non-adaptiveMetadata tables short-circuit to `None` without reading the log.
+    ///
+    /// TODO: When [_last_checkpoint PR lands](https://github.com/delta-io/delta/pull/7410) lands
+    /// we can set it upfront, otherwise we need to go over the log-segment to find the latest
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[internal_api]
     #[allow(dead_code)]
-    pub(crate) fn latest_checkpoint_action(&self) -> Option<&CheckpointAction> {
-        self.last_checkpoint_action.as_deref()
+    pub(crate) fn latest_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<&CheckpointAction>> {
+        // `OnceLock::get_or_try_init` is unstable, so resolve then `set`; on a lost race the value
+        // we computed is dropped and the winner's value is returned by the final `get`.
+        if self.latest_checkpoint_action.get().is_none() {
+            let action = self
+                .table_configuration()
+                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview)
+                .then(|| self.log_segment().find_checkpoint_action(engine))
+                .transpose()?
+                .flatten()
+                .map(Box::new);
+            let _ = self.latest_checkpoint_action.set(action);
+        }
+        Ok(self
+            .latest_checkpoint_action
+            .get()
+            .and_then(|action| action.as_deref()))
     }
 
     /// Fetch the latest transaction version for every application id in this snapshot.
