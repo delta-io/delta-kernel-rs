@@ -565,9 +565,9 @@ impl Snapshot {
     /// The newest AMT `checkpoint` action for this table, or `None` if this is not an
     /// adaptiveMetadata table or the table carries no checkpoint action.
     ///
-    /// Resolved lazily and memoized on first call: only adaptiveMetadata tables pay for the log
-    /// pass ([`LogSegment::find_checkpoint_action`]), and only when a caller actually needs the
-    /// action. Non-adaptiveMetadata tables short-circuit to `None` without reading the log.
+    /// Resolved lazily and memoized on first call: only adaptiveMetadata tables pay for the extra
+    /// log pass, and only when a caller actually needs the action. Non-adaptiveMetadata tables
+    /// short-circuit to `None` without reading the log.
     ///
     /// TODO: When [_last_checkpoint PR lands](https://github.com/delta-io/delta/pull/7410) lands
     /// we can set it upfront, otherwise we need to go over the log-segment to find the latest
