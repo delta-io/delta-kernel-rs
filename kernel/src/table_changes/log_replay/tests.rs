@@ -376,7 +376,7 @@ async fn cdf_disabled_midstream() {
 #[rstest]
 #[case::disabled(&[(ENABLE_ROW_TRACKING, "false")])]
 #[case::suspended(&[
-    (ENABLE_ROW_TRACKING, "true"),
+    (ENABLE_ROW_TRACKING, "false"),
     (ROW_TRACKING_SUSPENDED, "true"),
 ])]
 #[tokio::test]

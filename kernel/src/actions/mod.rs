@@ -2,10 +2,12 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::LazyLock;
 
 use delta_kernel_derive::{internal_api, IntoStructData, ToSchema, TryFromStructData};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -957,8 +959,9 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(test, derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct BackReference {
     /// Path to the leaf manifest containing this file, relative to the table root
     /// (e.g. `metadata/leaf-m1.parquet`). Resolved by joining the table location and this path
@@ -968,12 +971,9 @@ pub(crate) struct BackReference {
     pub(crate) pos: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(Serialize, Deserialize, Default),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[cfg_attr(test, derive(Serialize, Default))]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -991,6 +991,7 @@ pub(crate) struct Add {
     ///
     /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
+    #[serde(deserialize_with = "deserialize_partition_values")]
     pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
@@ -1042,6 +1043,43 @@ pub(crate) struct Add {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) back_reference: Option<BackReference>,
+}
+
+fn deserialize_partition_values<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PartitionValuesVisitor;
+
+    impl<'de> Visitor<'de> for PartitionValuesVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of nullable partition values")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, Option<String>>()? {
+                match value {
+                    Some(value) => {
+                        values.insert(key, value);
+                    }
+                    None => {
+                        values.remove(&key);
+                    }
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(PartitionValuesVisitor)
 }
 
 impl Add {
@@ -2707,6 +2745,72 @@ mod tests {
             tags.get("MIN_INSERTION_TIME"),
             Some(&Some("1677811178336000".to_string()))
         );
+    }
+
+    #[test]
+    fn test_add_deserializes_complete_wire_shape() {
+        let json = r#"{
+            "path":"file.parquet",
+            "partitionValues":{"present":"value","null_partition":null},
+            "size":300,
+            "modificationTime":1234567890,
+            "dataChange":false,
+            "stats":"{\"numRecords\":1}",
+            "tags":{"tag":"value","nullable":null},
+            "deletionVector":{
+                "storageType":"i",
+                "pathOrInlineDv":"",
+                "sizeInBytes":0,
+                "cardinality":0
+            },
+            "baseRowId":10,
+            "defaultRowCommitVersion":20,
+            "clusteringProvider":"liquid",
+            "backReference":{"manifest":"manifest.parquet","pos":3}
+        }"#;
+
+        let add: Add = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            add.partition_values,
+            HashMap::from([("present".to_string(), "value".to_string())])
+        );
+        assert_eq!(add.stats.as_deref(), Some(r#"{"numRecords":1}"#));
+        assert_eq!(
+            add.tags,
+            Some(HashMap::from([
+                ("tag".to_string(), Some("value".to_string())),
+                ("nullable".to_string(), None),
+            ]))
+        );
+        assert_eq!(
+            add.deletion_vector.unwrap().storage_type,
+            deletion_vector::DeletionVectorStorageType::Inline
+        );
+        assert_eq!(add.base_row_id, Some(10));
+        assert_eq!(add.default_row_commit_version, Some(20));
+        assert_eq!(add.clustering_provider.as_deref(), Some("liquid"));
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert_eq!(
+            add.back_reference,
+            Some(BackReference {
+                manifest: "manifest.parquet".to_string(),
+                pos: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn test_add_partition_values_duplicate_key_uses_last_value() {
+        let json = r#"{
+            "path":"file.parquet",
+            "partitionValues":{"part":"value","part":null},
+            "size":1,
+            "modificationTime":0,
+            "dataChange":false
+        }"#;
+
+        let add: Add = serde_json::from_str(json).unwrap();
+        assert!(add.partition_values.is_empty());
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]

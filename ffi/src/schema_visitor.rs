@@ -21,12 +21,17 @@
 //! elements. Trying to pass an ID more than once to a complex field visitor will result in an
 //! error.
 
+use std::collections::HashMap;
+use std::ffi::c_void;
+
 use delta_kernel::schema::{
-    ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
+    StructType,
 };
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
 
+use crate::scan::{CMetadataMap, CMetadataValueKind};
 use crate::{
     AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
     TryFromStringSlice,
@@ -35,6 +40,90 @@ use crate::{
 #[derive(Default)]
 pub struct KernelSchemaVisitorState {
     elements: ReferenceSet<StructField>,
+}
+
+/// An engine-owned metadata object and the callback that visits its values.
+///
+/// Field visitors may omit this descriptor when a field has no metadata. When provided, they
+/// borrow it for the call and invoke `visitor` synchronously with a fresh Kernel-owned state. Its
+/// opaque `metadata` must satisfy the callback's validity requirements until the callback returns.
+/// The callback must not retain the state or unwind across the C ABI. Returning `false` rejects
+/// the field.
+#[repr(C)]
+pub struct EngineMetadata {
+    /// Opaque engine-owned metadata representation, borrowed for the callback duration.
+    /// The callback may mutate the engine-owned metadata context; Kernel only forwards the
+    /// pointer.
+    pub metadata: *mut c_void,
+    /// Visits metadata values into the provided state and reports whether the visit succeeded.
+    pub visitor: extern "C" fn(metadata: *mut c_void, state: &mut CMetadataMap) -> bool,
+}
+
+/// Visit a metadata value encoded as UTF-8 text and a [`CMetadataValueKind`].
+///
+/// Numbers are signed decimal `i64` values, strings are passed through without JSON decoding, and
+/// Booleans must be `true` or `false`. JSON integers in the `i64` range, strings, and Booleans
+/// become typed metadata values; other JSON values remain opaque JSON. Prefer the matching typed
+/// kind when available; use `MetadataJson` for values without a typed variant.
+///
+/// Returns `Ok(true)` after insertion. Invalid UTF-8, numeric text, or JSON returns an allocated
+/// `Utf8Error`, `ParseIntError`, or `MalformedJsonError`, respectively. Invalid Boolean text and
+/// duplicate keys return `SchemaError`. Errors leave the state unchanged.
+///
+/// # Safety
+///
+/// Caller must pass the active map supplied to `EngineMetadata::visitor`, valid key and value data
+/// for the call duration, a valid `kind` discriminant, and a valid error allocator. The state must
+/// not be aliased or retained beyond the callback.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_value(
+    state: &mut CMetadataMap,
+    key: KernelStringSlice,
+    kind: CMetadataValueKind,
+    value: KernelStringSlice,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<bool> {
+    let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
+    let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
+    visit_metadata_value_impl(state, key, kind, value)
+        .map(|()| true)
+        .into_extern_result(&allocate_error)
+}
+
+fn visit_engine_metadata(
+    engine_metadata: Option<&EngineMetadata>,
+) -> DeltaResult<HashMap<String, MetadataValue>> {
+    let Some(engine_metadata) = engine_metadata else {
+        return Ok(HashMap::new());
+    };
+
+    let mut state = CMetadataMap::default();
+    if !(engine_metadata.visitor)(engine_metadata.metadata, &mut state) {
+        return Err(Error::schema("Engine metadata visitor failed"));
+    }
+
+    Ok(state.into_values())
+}
+
+fn visit_metadata_value_impl(
+    state: &mut CMetadataMap,
+    key: DeltaResult<&str>,
+    kind: CMetadataValueKind,
+    value: DeltaResult<&str>,
+) -> DeltaResult<()> {
+    let key = key?;
+    let value = value?;
+    let value = match kind {
+        CMetadataValueKind::MetadataNumber => MetadataValue::Number(value.parse()?),
+        CMetadataValueKind::MetadataString => MetadataValue::String(value.to_owned()),
+        CMetadataValueKind::MetadataBoolean => {
+            MetadataValue::Boolean(value.parse().map_err(|_| {
+                Error::schema("Invalid Boolean metadata value: expected true or false")
+            })?)
+        }
+        CMetadataValueKind::MetadataJson => serde_json::from_str(value)?,
+    };
+    state.insert(key.to_owned(), value)
 }
 
 /// Extract the final schema from the visitor state.
@@ -84,9 +173,12 @@ fn visit_field_primitive_impl(
     name: DeltaResult<&str>,
     primitive_type: PrimitiveType,
     nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
-    let field = StructField::new(name_str, DataType::Primitive(primitive_type), nullable);
+    let metadata = metadata?;
+    let field = StructField::new(name_str, DataType::Primitive(primitive_type), nullable)
+        .with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -97,16 +189,19 @@ fn visit_field_primitive_impl(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_string(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -115,16 +210,19 @@ pub unsafe extern "C" fn visit_field_string(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_long(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -133,16 +231,19 @@ pub unsafe extern "C" fn visit_field_long(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_integer(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -151,16 +252,19 @@ pub unsafe extern "C" fn visit_field_integer(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_short(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -169,16 +273,19 @@ pub unsafe extern "C" fn visit_field_short(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_byte(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -187,16 +294,19 @@ pub unsafe extern "C" fn visit_field_byte(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_float(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -205,16 +315,19 @@ pub unsafe extern "C" fn visit_field_float(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_double(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -223,16 +336,19 @@ pub unsafe extern "C" fn visit_field_double(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_boolean(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -241,16 +357,19 @@ pub unsafe extern "C" fn visit_field_boolean(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_binary(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -259,16 +378,19 @@ pub unsafe extern "C" fn visit_field_binary(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_date(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -277,17 +399,26 @@ pub unsafe extern "C" fn visit_field_date(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_timestamp(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Timestamp, nullable)
-        .into_extern_result(&allocate_error)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name_str,
+        PrimitiveType::Timestamp,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
@@ -295,17 +426,26 @@ pub unsafe extern "C" fn visit_field_timestamp(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_timestamp_ntz(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNtz, nullable)
-        .into_extern_result(&allocate_error)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name_str,
+        PrimitiveType::TimestampNtz,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit an interval year-month field. Values store signed month counts.
@@ -313,17 +453,26 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_interval_year_month(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::IntervalYearMonth, nullable)
-        .into_extern_result(&allocate_error)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name_str,
+        PrimitiveType::IntervalYearMonth,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit an interval day-time field. Values store signed microsecond durations.
@@ -331,17 +480,26 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_interval_day_time(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::IntervalDayTime, nullable)
-        .into_extern_result(&allocate_error)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name_str,
+        PrimitiveType::IntervalDayTime,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
@@ -349,16 +507,19 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_void(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -368,7 +529,8 @@ pub unsafe extern "C" fn visit_field_void(
 /// # Safety
 ///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_decimal(
     state: &mut KernelSchemaVisitorState,
@@ -376,10 +538,12 @@ pub unsafe extern "C" fn visit_field_decimal(
     precision: u8,
     scale: u8,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_decimal_impl(state, name_str, precision, scale, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_decimal_impl(state, name_str, precision, scale, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -389,15 +553,18 @@ fn visit_field_decimal_impl(
     precision: u8,
     scale: u8,
     nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
 
     let decimal_type = DecimalType::try_new(precision, scale)?;
     let field = StructField::new(
         name_str,
         DataType::Primitive(PrimitiveType::Decimal(decimal_type)),
         nullable,
-    );
+    )
+    .with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -417,6 +584,7 @@ fn visit_field_decimal_impl(
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `field_ids` array pointing
 /// to valid field IDs previously returned by this visitor, and `allocate_error` function pointer.
+/// When non-null, `metadata` must point to a valid descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_struct(
     state: &mut KernelSchemaVisitorState,
@@ -424,12 +592,14 @@ pub unsafe extern "C" fn visit_field_struct(
     field_ids: *const usize,
     field_count: usize,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
-    visit_field_struct_impl(state, name_str, field_ids, nullable)
+    visit_field_struct_impl(state, name_str, field_ids, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -455,10 +625,12 @@ fn visit_field_struct_impl(
     name: DeltaResult<&str>,
     field_ids: &[usize],
     nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let data_type = create_struct_data_type(state, field_ids)?;
-    let field = StructField::new(name_str, data_type, nullable);
+    let field = StructField::new(name_str, data_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -470,17 +642,20 @@ fn visit_field_struct_impl(
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `element_type_id` from
-/// previous `visit_data_type_*` call, and `allocate_error` function pointer.
+/// a previous field visitor call, and `allocate_error` function pointer. When non-null, `metadata`
+/// must point to a valid descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_array(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     element_type_id: usize,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_array_impl(state, name_str, element_type_id, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_array_impl(state, name_str, element_type_id, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -489,8 +664,10 @@ fn visit_field_array_impl(
     name: DeltaResult<&str>,
     element_type_id: usize,
     nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
         Error::generic(format!(
             "Invalid element type ID {element_type_id} for array"
@@ -498,7 +675,7 @@ fn visit_field_array_impl(
     })?;
 
     let array_type = ArrayType::new(element_field.data_type, element_field.nullable);
-    let field = StructField::new(name_str, array_type, nullable);
+    let field = StructField::new(name_str, array_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -512,7 +689,8 @@ fn visit_field_array_impl(
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and
-/// `value_type_id` from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
+/// `value_type_id` from previous field visitor calls, and `allocate_error` function pointer. When
+/// non-null, `metadata` must point to a valid descriptor and callback.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_map(
     state: &mut KernelSchemaVisitorState,
@@ -520,11 +698,20 @@ pub unsafe extern "C" fn visit_field_map(
     key_type_id: usize,
     value_type_id: usize,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_map_impl(state, name_str, key_type_id, value_type_id, nullable)
-        .into_extern_result(&allocate_error)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_map_impl(
+        state,
+        name_str,
+        key_type_id,
+        value_type_id,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_field_map_impl(
@@ -533,8 +720,10 @@ fn visit_field_map_impl(
     key_type_id: usize,
     value_type_id: usize,
     nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
 
     let key_field = unwrap_field(state, key_type_id)
         .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
@@ -551,7 +740,7 @@ fn visit_field_map_impl(
         value_field.data_type,
         value_field.nullable,
     );
-    let field = StructField::new(name_str, map_type, nullable);
+    let field = StructField::new(name_str, map_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -571,10 +760,12 @@ pub unsafe extern "C" fn visit_field_variant(
     name: KernelStringSlice,
     variant_struct_id: usize,
     nullable: bool,
+    metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_field_variant_impl(state, name_str, variant_struct_id, nullable)
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_variant_impl(state, name_str, variant_struct_id, nullable, metadata)
         .into_extern_result(&allocate_error)
 }
 
@@ -583,10 +774,12 @@ fn visit_field_variant_impl(
     name: DeltaResult<&str>,
     variant_struct_id: usize,
     nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
 ) -> DeltaResult<usize> {
     let name_str = name?.to_string();
+    let metadata = metadata?;
     let data_type = create_variant_data_type(state, variant_struct_id)?;
-    let field = StructField::new(name_str, data_type, nullable);
+    let field = StructField::new(name_str, data_type, nullable).with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -607,26 +800,378 @@ fn create_variant_data_type(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::schema::{DataType, PrimitiveType};
+    use std::ffi::c_void;
+    use std::ptr::{null, NonNull};
+
+    use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
+    use rstest::rstest;
 
     use super::*;
     use crate::error::{EngineError, KernelError};
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
-    use crate::KernelStringSlice;
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+    };
+    use crate::scan::visit_metadata_map;
+    use crate::{KernelStringSlice, NullableCvoid};
+
+    #[derive(Default)]
+    struct TestMetadata {
+        visited: bool,
+        values: HashMap<String, MetadataValue>,
+    }
+
+    impl TestMetadata {
+        fn from<K>(values: impl IntoIterator<Item = (K, MetadataValue)>) -> Self
+        where
+            K: Into<String>,
+        {
+            Self {
+                visited: false,
+                values: values
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value))
+                    .collect(),
+            }
+        }
+    }
+
+    extern "C" fn visit_all_metadata(metadata: *mut c_void, state: &mut CMetadataMap) -> bool {
+        let metadata = unsafe { &mut *metadata.cast::<TestMetadata>() };
+        metadata.visited = true;
+
+        for (key, value) in &metadata.values {
+            let encoded = value.to_string();
+            unsafe {
+                ok_or_panic(visit_metadata_value(
+                    state,
+                    KernelStringSlice::new_unsafe(key),
+                    CMetadataValueKind::from(value),
+                    KernelStringSlice::new_unsafe(&encoded),
+                    allocate_err,
+                ));
+            }
+        }
+        true
+    }
+
+    extern "C" fn reject_metadata(_metadata: *mut c_void, _state: &mut CMetadataMap) -> bool {
+        false
+    }
+
+    fn rejected_engine_metadata() -> EngineMetadata {
+        EngineMetadata {
+            metadata: std::ptr::null_mut(),
+            visitor: reject_metadata,
+        }
+    }
+
+    fn test_engine_metadata(metadata: &mut TestMetadata) -> EngineMetadata {
+        EngineMetadata {
+            metadata: std::ptr::from_mut(metadata).cast(),
+            visitor: visit_all_metadata,
+        }
+    }
+
+    #[test]
+    fn rejected_metadata_does_not_insert_field() {
+        let mut state = KernelSchemaVisitorState::default();
+        let result = unsafe {
+            visit_field_string(
+                &mut state,
+                KernelStringSlice::new_unsafe("field"),
+                false,
+                &EngineMetadata {
+                    metadata: std::ptr::null_mut(),
+                    visitor: reject_metadata,
+                },
+                allocate_err,
+            )
+        };
+
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert!(state.elements.is_empty());
+    }
+
+    #[test]
+    fn missing_engine_metadata_creates_field_with_empty_metadata() {
+        let mut state = KernelSchemaVisitorState::default();
+        let field_id = unsafe {
+            ok_or_panic(visit_field_string(
+                &mut state,
+                KernelStringSlice::new_unsafe("field"),
+                false,
+                null(),
+                allocate_err,
+            ))
+        };
+        let field = unwrap_field(&mut state, field_id).unwrap();
+
+        assert!(field.metadata().is_empty());
+    }
+
+    #[rstest]
+    #[case(
+        CMetadataValueKind::MetadataNumber,
+        "9223372036854775808",
+        KernelError::ParseIntError
+    )]
+    #[case(
+        CMetadataValueKind::MetadataNumber,
+        "-9223372036854775809",
+        KernelError::ParseIntError
+    )]
+    #[case(CMetadataValueKind::MetadataNumber, "1.5", KernelError::ParseIntError)]
+    #[case(CMetadataValueKind::MetadataNumber, "", KernelError::ParseIntError)]
+    #[case(
+        CMetadataValueKind::MetadataNumber,
+        "not-a-number",
+        KernelError::ParseIntError
+    )]
+    #[case(CMetadataValueKind::MetadataBoolean, "TRUE", KernelError::SchemaError)]
+    #[case(CMetadataValueKind::MetadataBoolean, "1", KernelError::SchemaError)]
+    #[case(
+        CMetadataValueKind::MetadataBoolean,
+        "false ",
+        KernelError::SchemaError
+    )]
+    #[case(CMetadataValueKind::MetadataBoolean, "", KernelError::SchemaError)]
+    #[case(
+        CMetadataValueKind::MetadataJson,
+        "not-json",
+        KernelError::MalformedJsonError
+    )]
+    fn metadata_value_rejects_invalid_text_without_inserting_value(
+        #[case] kind: CMetadataValueKind,
+        #[case] value: &str,
+        #[case] expected_error: KernelError,
+    ) {
+        let mut state = CMetadataMap::default();
+        let result = unsafe {
+            visit_metadata_value(
+                &mut state,
+                KernelStringSlice::new_unsafe("key"),
+                kind,
+                KernelStringSlice::new_unsafe(value),
+                allocate_err,
+            )
+        };
+
+        assert_extern_result_error_with_message(result, expected_error, None);
+        assert!(state.into_values().is_empty());
+    }
+
+    #[rstest]
+    fn metadata_value_rejects_invalid_utf8_without_inserting_value(
+        #[values(
+            CMetadataValueKind::MetadataNumber,
+            CMetadataValueKind::MetadataString,
+            CMetadataValueKind::MetadataBoolean,
+            CMetadataValueKind::MetadataJson
+        )]
+        kind: CMetadataValueKind,
+        #[values(false, true)] invalid_key: bool,
+    ) {
+        let invalid = [0xff_u8];
+        let invalid_slice = KernelStringSlice {
+            ptr: invalid.as_ptr().cast(),
+            len: invalid.len(),
+        };
+        let mut state = CMetadataMap::default();
+        let result = unsafe {
+            let valid_slice = KernelStringSlice::new_unsafe("1");
+            let (key, value) = if invalid_key {
+                (invalid_slice, valid_slice)
+            } else {
+                (valid_slice, invalid_slice)
+            };
+            visit_metadata_value(&mut state, key, kind, value, allocate_err)
+        };
+
+        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
+        assert!(state.into_values().is_empty());
+    }
+
+    #[rstest]
+    #[case(CMetadataValueKind::MetadataNumber, "2")]
+    #[case(CMetadataValueKind::MetadataString, "replacement")]
+    #[case(CMetadataValueKind::MetadataBoolean, "true")]
+    #[case(CMetadataValueKind::MetadataJson, "{}")]
+    fn duplicate_metadata_key_is_rejected_without_replacing_value(
+        #[case] kind: CMetadataValueKind,
+        #[case] value: &str,
+    ) {
+        let mut state = CMetadataMap::default();
+        unsafe {
+            ok_or_panic(visit_metadata_value(
+                &mut state,
+                KernelStringSlice::new_unsafe("key"),
+                CMetadataValueKind::MetadataNumber,
+                KernelStringSlice::new_unsafe("1"),
+                allocate_err,
+            ));
+        }
+
+        let result = unsafe {
+            visit_metadata_value(
+                &mut state,
+                KernelStringSlice::new_unsafe("key"),
+                kind,
+                KernelStringSlice::new_unsafe(value),
+                allocate_err,
+            )
+        };
+
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_eq!(
+            state.into_values().get("key"),
+            Some(&MetadataValue::Number(1))
+        );
+    }
+
+    #[rstest]
+    #[case(CMetadataValueKind::MetadataNumber, "17", MetadataValue::Number(17))]
+    #[case(CMetadataValueKind::MetadataString, "value", MetadataValue::String("value".to_string()))]
+    #[case(
+        CMetadataValueKind::MetadataBoolean,
+        "true",
+        MetadataValue::Boolean(true)
+    )]
+    #[case(CMetadataValueKind::MetadataJson, "17", MetadataValue::Number(17))]
+    #[case(CMetadataValueKind::MetadataJson, r#""value""#, MetadataValue::String("value".to_string()))]
+    #[case(CMetadataValueKind::MetadataJson, "true", MetadataValue::Boolean(true))]
+    #[case(CMetadataValueKind::MetadataJson, r#"{"nested":1}"#, MetadataValue::Other(serde_json::json!({"nested": 1})))]
+    fn metadata_value_decodes_text_and_normalizes_json_scalars(
+        #[case] kind: CMetadataValueKind,
+        #[case] value: &str,
+        #[case] expected: MetadataValue,
+    ) {
+        let mut state = CMetadataMap::default();
+        unsafe {
+            ok_or_panic(visit_metadata_value(
+                &mut state,
+                KernelStringSlice::new_unsafe("key"),
+                kind,
+                KernelStringSlice::new_unsafe(value),
+                allocate_err,
+            ));
+        }
+        assert_eq!(state.into_values().get("key"), Some(&expected));
+    }
+
+    extern "C" fn copy_metadata_entry(
+        context: NullableCvoid,
+        key: KernelStringSlice,
+        kind: CMetadataValueKind,
+        value: KernelStringSlice,
+    ) {
+        let mut state = context.unwrap().cast::<CMetadataMap>();
+        unsafe {
+            ok_or_panic(visit_metadata_value(
+                state.as_mut(),
+                key,
+                kind,
+                value,
+                allocate_err,
+            ));
+        }
+    }
+
+    extern "C" fn visit_metadata_from_map(metadata: *mut c_void, state: &mut CMetadataMap) -> bool {
+        let source = unsafe { &*metadata.cast::<CMetadataMap>() };
+        unsafe {
+            visit_metadata_map(
+                source,
+                Some(NonNull::from(state).cast()),
+                copy_metadata_entry,
+            );
+        }
+        true
+    }
+
+    #[test]
+    fn outbound_metadata_round_trips_through_field_visitor() {
+        let values = HashMap::from([
+            ("number".to_string(), MetadataValue::Number(17)),
+            (
+                "string".to_string(),
+                MetadataValue::String("true".to_string()),
+            ),
+            ("boolean".to_string(), MetadataValue::Boolean(true)),
+            (
+                "array".to_string(),
+                MetadataValue::Other(serde_json::json!([1, true])),
+            ),
+            (
+                "object".to_string(),
+                MetadataValue::Other(serde_json::json!({"nested": 1})),
+            ),
+            (
+                "float".to_string(),
+                MetadataValue::Other(serde_json::json!(2.5)),
+            ),
+            (
+                "null".to_string(),
+                MetadataValue::Other(serde_json::Value::Null),
+            ),
+            (
+                "large".to_string(),
+                MetadataValue::Other(serde_json::json!(9_223_372_036_854_775_808_u64)),
+            ),
+            (
+                "json_number".to_string(),
+                MetadataValue::Other(serde_json::json!(17)),
+            ),
+            (
+                "json_string".to_string(),
+                MetadataValue::Other(serde_json::json!("value")),
+            ),
+            (
+                "json_boolean".to_string(),
+                MetadataValue::Other(serde_json::json!(true)),
+            ),
+        ]);
+        let mut expected = values.clone();
+        expected.insert("json_number".to_string(), MetadataValue::Number(17));
+        expected.insert(
+            "json_string".to_string(),
+            MetadataValue::String("value".to_string()),
+        );
+        expected.insert("json_boolean".to_string(), MetadataValue::Boolean(true));
+        let mut source = CMetadataMap::from(values.clone());
+        let metadata = EngineMetadata {
+            metadata: std::ptr::from_mut(&mut source).cast(),
+            visitor: visit_metadata_from_map,
+        };
+        let mut state = KernelSchemaVisitorState::default();
+        let field_id = unsafe {
+            ok_or_panic(visit_field_string(
+                &mut state,
+                KernelStringSlice::new_unsafe("field"),
+                false,
+                &metadata,
+                allocate_err,
+            ))
+        };
+        let field = unwrap_field(&mut state, field_id).unwrap();
+
+        assert_eq!(field.metadata(), &expected);
+        assert_eq!(source.into_values(), values);
+    }
 
     macro_rules! visit_field {
-        ($type:ident, $state:ident, $name:expr, $nullable:tt) => {
+        ($type:ident, $state:ident, $name:expr, $nullable:tt, $metadata:expr) => {{
             paste::paste! { ok_or_panic(unsafe {
                 [<visit_field_ $type>](
                     &mut $state,
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
+                    $metadata,
                     allocate_err,
                 )
             }) }
-        };
+        }};
 
-        ($type:ident, $state:ident, $name:expr, $arg1:expr, $nullable:tt) => {
+        ($type:ident, $state:ident, $name:expr, $arg1:expr, $nullable:tt, $metadata:expr) => {{
             paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
                 let arg1 = $arg1;
                 [<visit_field_ $type>](
@@ -634,12 +1179,13 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     arg1,
                     $nullable,
+                    $metadata,
                     allocate_err,
                 )
             }) }
-        };
+        }};
 
-        ($type:ident, $state:ident, $name:expr, $arg1:expr, $arg2:expr, $nullable:tt) => {
+        ($type:ident, $state:ident, $name:expr, $arg1:expr, $arg2:expr, $nullable:tt, $metadata:expr) => {{
             paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
                 let arg1 = $arg1;
                 let arg2 = $arg2;
@@ -649,14 +1195,15 @@ mod tests {
                     arg1,
                     arg2,
                     $nullable,
+                    $metadata,
                     allocate_err,
                 )
             }) }
-        };
+        }};
     }
 
     macro_rules! visit_array_field {
-        ($state:ident, $name:expr, $nullable:tt, $elem_field:expr) => {{
+        ($state:ident, $name:expr, $nullable:tt, $elem_field:expr, $metadata:expr) => {{
             let ef = $elem_field;
             ok_or_panic(unsafe {
                 visit_field_array(
@@ -664,6 +1211,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     ef,
                     $nullable,
+                    $metadata,
                     allocate_err,
                 )
             })
@@ -671,7 +1219,7 @@ mod tests {
     }
 
     macro_rules! visit_map_field {
-        ($state:ident, $name:expr, $nullable:tt, $key_field:expr, $val_field:expr) => {{
+        ($state:ident, $name:expr, $nullable:tt, $key_field:expr, $val_field:expr, $metadata:expr) => {{
             let kf = $key_field;
             let vf = $val_field;
             ok_or_panic(unsafe {
@@ -681,6 +1229,7 @@ mod tests {
                     kf,
                     vf,
                     $nullable,
+                    $metadata,
                     allocate_err,
                 )
             })
@@ -688,7 +1237,7 @@ mod tests {
     }
 
     macro_rules! visit_struct_field {
-        ($state:ident, $name:expr, $nullable:tt, $($fields:expr),* $(,)?) => {{
+        ($state:ident, $name:expr, $nullable:tt, [$($fields:expr),* $(,)?], $metadata:expr) => {{
             let fields = vec![$($fields),*];
             let field_count = fields.len();
             ok_or_panic(unsafe {
@@ -698,6 +1247,7 @@ mod tests {
                     fields.as_ptr(),
                     field_count,
                     $nullable,
+                    $metadata,
                     allocate_err,
                 )
             })
@@ -705,7 +1255,7 @@ mod tests {
     }
 
     macro_rules! visit_variant_field {
-        ($state:ident, $name:expr, $nullable:tt) => {{
+        ($state:ident, $name:expr, $nullable:tt, $metadata:expr) => {{
             visit_field!(
                 variant,
                 $state,
@@ -714,12 +1264,264 @@ mod tests {
                     $state,
                     "variant",
                     false,
-                    visit_field!(binary, $state, "metadata", false),
-                    visit_field!(binary, $state, "value", false),
+                    [
+                        visit_field!(binary, $state, "metadata", false, null()),
+                        visit_field!(binary, $state, "value", false, null()),
+                    ],
+                    null()
                 ),
-                false
+                false,
+                $metadata
             )
         }};
+    }
+
+    #[test]
+    fn field_metadata_preserves_typed_values_and_callback_context() {
+        let mut state = KernelSchemaVisitorState::default();
+        let expected = HashMap::from([
+            ("number".to_string(), MetadataValue::Number(17)),
+            (
+                "string".to_string(),
+                MetadataValue::String("value".to_string()),
+            ),
+            ("boolean".to_string(), MetadataValue::Boolean(true)),
+            (
+                "json".to_string(),
+                MetadataValue::Other(serde_json::json!({
+                    "nested": [1, null, 2.5]
+                })),
+            ),
+        ]);
+        let mut metadata = TestMetadata::from(expected.clone());
+        let field_id = visit_field!(
+            string,
+            state,
+            "mapped",
+            true,
+            &test_engine_metadata(&mut metadata)
+        );
+        let field = unwrap_field(&mut state, field_id).unwrap();
+
+        assert!(metadata.visited);
+        assert_eq!(field.metadata(), &expected);
+    }
+
+    #[test]
+    fn every_primitive_and_decimal_field_preserves_metadata() {
+        macro_rules! assert_field_metadata {
+            ($type:ident, $name:literal $(, $arg:expr)*) => {{
+                let mut state = KernelSchemaVisitorState::default();
+                let field_id = visit_field!(
+                    $type,
+                    state,
+                    $name,
+                    $($arg,)*
+                    false,
+                    &test_engine_metadata(&mut TestMetadata::from([(
+                        "number",
+                        MetadataValue::Number(17),
+                    )]))
+                );
+                let field = unwrap_field(&mut state, field_id).unwrap();
+                assert_eq!(
+                    field.metadata().get("number"),
+                    Some(&MetadataValue::Number(17)),
+                    "{name} field metadata",
+                    name = $name,
+                );
+            }};
+        }
+
+        assert_field_metadata!(string, "string");
+        assert_field_metadata!(long, "long");
+        assert_field_metadata!(integer, "integer");
+        assert_field_metadata!(short, "short");
+        assert_field_metadata!(byte, "byte");
+        assert_field_metadata!(float, "float");
+        assert_field_metadata!(double, "double");
+        assert_field_metadata!(boolean, "boolean");
+        assert_field_metadata!(binary, "binary");
+        assert_field_metadata!(date, "date");
+        assert_field_metadata!(timestamp, "timestamp");
+        assert_field_metadata!(timestamp_ntz, "timestamp_ntz");
+        assert_field_metadata!(interval_year_month, "interval_year_month");
+        assert_field_metadata!(interval_day_time, "interval_day_time");
+        assert_field_metadata!(void, "void");
+        assert_field_metadata!(decimal, "decimal", 10, 2);
+    }
+
+    #[test]
+    fn complex_fields_keep_parent_and_child_metadata_isolated() {
+        let mut state = KernelSchemaVisitorState::default();
+
+        let schema_id = visit_struct_field!(
+            state,
+            "schema",
+            false,
+            [
+                visit_struct_field!(
+                    state,
+                    "parent",
+                    false,
+                    [visit_field!(
+                        string,
+                        state,
+                        "child",
+                        true,
+                        &test_engine_metadata(&mut TestMetadata::from([(
+                            "number",
+                            MetadataValue::Number(1),
+                        )]))
+                    )],
+                    &test_engine_metadata(&mut TestMetadata::from([(
+                        "number",
+                        MetadataValue::Number(2),
+                    )]))
+                ),
+                visit_field!(
+                    array,
+                    state,
+                    "array",
+                    visit_field!(string, state, "element", true, null()),
+                    true,
+                    &test_engine_metadata(&mut TestMetadata::from([(
+                        "number",
+                        MetadataValue::Number(3),
+                    )]))
+                ),
+                visit_field!(
+                    map,
+                    state,
+                    "map",
+                    visit_field!(string, state, "key", false, null()),
+                    visit_field!(long, state, "value", true, null()),
+                    true,
+                    &test_engine_metadata(&mut TestMetadata::from([(
+                        "number",
+                        MetadataValue::Number(4),
+                    )]))
+                ),
+                visit_field!(
+                    variant,
+                    state,
+                    "variant",
+                    visit_struct_field!(
+                        state,
+                        "variant_struct",
+                        false,
+                        [visit_field!(string, state, "value", true, null())],
+                        null()
+                    ),
+                    true,
+                    &test_engine_metadata(&mut TestMetadata::from([(
+                        "number",
+                        MetadataValue::Number(5),
+                    )]))
+                ),
+            ],
+            null()
+        );
+
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
+        let fields: Vec<_> = schema.fields().collect();
+        assert_eq!(fields.len(), 4);
+
+        let DataType::Struct(children) = fields[0].data_type() else {
+            panic!("expected struct")
+        };
+        let child = children.fields().next().unwrap();
+        assert_eq!(
+            child.metadata().get("number"),
+            Some(&MetadataValue::Number(1))
+        );
+
+        let expected_fields = [("parent", 2), ("array", 3), ("map", 4), ("variant", 5)];
+        for (field, (name, expected)) in fields.iter().zip(expected_fields) {
+            assert_eq!(field.name(), name);
+            assert_eq!(
+                field.metadata().get("number"),
+                Some(&MetadataValue::Number(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_complex_field_metadata_preserves_child_ids_for_retry() {
+        let mut state = KernelSchemaVisitorState::default();
+
+        let child = visit_field!(string, state, "child", true, null());
+        let result = unsafe {
+            visit_field_struct(
+                &mut state,
+                KernelStringSlice::new_unsafe("parent"),
+                [child].as_ptr(),
+                1,
+                false,
+                &rejected_engine_metadata(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let parent = visit_struct_field!(state, "parent", false, [child], null());
+
+        let element = visit_field!(string, state, "element", true, null());
+        let result = unsafe {
+            visit_field_array(
+                &mut state,
+                KernelStringSlice::new_unsafe("array"),
+                element,
+                false,
+                &rejected_engine_metadata(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let array = visit_array_field!(state, "array", false, element, null());
+
+        let key = visit_field!(string, state, "key", false, null());
+        let value = visit_field!(long, state, "value", true, null());
+        let result = unsafe {
+            visit_field_map(
+                &mut state,
+                KernelStringSlice::new_unsafe("map"),
+                key,
+                value,
+                false,
+                &rejected_engine_metadata(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let map = visit_map_field!(state, "map", false, key, value, null());
+
+        let child = visit_field!(binary, state, "value", false, null());
+        let variant_struct = visit_struct_field!(state, "variant_struct", false, [child], null());
+        let result = unsafe {
+            visit_field_variant(
+                &mut state,
+                KernelStringSlice::new_unsafe("variant"),
+                variant_struct,
+                false,
+                &rejected_engine_metadata(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        let variant = visit_field!(variant, state, "variant", variant_struct, false, null());
+
+        let schema_id = visit_struct_field!(
+            state,
+            "schema",
+            false,
+            [parent, array, map, variant],
+            null()
+        );
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
+        assert_eq!(
+            schema.fields().map(StructField::name).collect::<Vec<_>>(),
+            ["parent", "array", "map", "variant"]
+        );
     }
 
     fn assert_array(field: &StructField, element_type: DataType, contains_null: bool) {
@@ -803,31 +1605,43 @@ mod tests {
         let mut state = KernelSchemaVisitorState::default();
 
         // Create all primitive fields
-        let col_string = visit_field!(string, state, "col_string", false);
-        let col_long = visit_field!(long, state, "col_long", false);
-        let col_int = visit_field!(integer, state, "col_int", false);
-        let col_short = visit_field!(short, state, "col_short", false);
-        let col_byte = visit_field!(byte, state, "col_byte", false);
-        let col_double = visit_field!(double, state, "col_double", false);
-        let col_float = visit_field!(float, state, "col_float", false);
-        let col_boolean = visit_field!(boolean, state, "col_boolean", false);
-        let col_binary = visit_field!(binary, state, "col_binary", false);
-        let col_date = visit_field!(date, state, "col_date", false);
-        let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false);
-        let col_timestamp_ntz = visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false);
-        let col_interval_year_month =
-            visit_field!(interval_year_month, state, "col_interval_year_month", false);
-        let col_interval_day_time =
-            visit_field!(interval_day_time, state, "col_interval_day_time", false);
-        let col_void = visit_field!(void, state, "col_void", false);
-        let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
+        let col_string = visit_field!(string, state, "col_string", false, null());
+        let col_long = visit_field!(long, state, "col_long", false, null());
+        let col_int = visit_field!(integer, state, "col_int", false, null());
+        let col_short = visit_field!(short, state, "col_short", false, null());
+        let col_byte = visit_field!(byte, state, "col_byte", false, null());
+        let col_double = visit_field!(double, state, "col_double", false, null());
+        let col_float = visit_field!(float, state, "col_float", false, null());
+        let col_boolean = visit_field!(boolean, state, "col_boolean", false, null());
+        let col_binary = visit_field!(binary, state, "col_binary", false, null());
+        let col_date = visit_field!(date, state, "col_date", false, null());
+        let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false, null());
+        let col_timestamp_ntz =
+            visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false, null());
+        let col_interval_year_month = visit_field!(
+            interval_year_month,
+            state,
+            "col_interval_year_month",
+            false,
+            null()
+        );
+        let col_interval_day_time = visit_field!(
+            interval_day_time,
+            state,
+            "col_interval_day_time",
+            false,
+            null()
+        );
+        let col_void = visit_field!(void, state, "col_void", false, null());
+        let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false, null());
 
         // Create array<string>
         let col_array = visit_array_field!(
             state,
             "col_array",
             false,
-            visit_field!(string, state, "element", false)
+            visit_field!(string, state, "element", false, null()),
+            null()
         );
 
         // Create map<string, long>
@@ -835,8 +1649,9 @@ mod tests {
             state,
             "col_map",
             false,
-            visit_field!(string, state, "key", false),
-            visit_field!(long, state, "value", false)
+            visit_field!(string, state, "key", false, null()),
+            visit_field!(long, state, "value", false, null()),
+            null()
         );
 
         // Create struct<inner_name: string>
@@ -844,11 +1659,12 @@ mod tests {
             state,
             "col_struct",
             false,
-            visit_field!(string, state, "inner", false),
+            [visit_field!(string, state, "inner", false, null())],
+            null()
         );
 
         // Create variant<metadata: binary, value: binary>
-        let col_variant = visit_variant_field!(state, "col_variant", false);
+        let col_variant = visit_variant_field!(state, "col_variant", false, null());
 
         // Build the final schema
         let all_columns = [
@@ -880,6 +1696,7 @@ mod tests {
                 all_columns.as_ptr(),
                 all_columns.len(),
                 false,
+                null(),
                 allocate_err,
             )
         });
@@ -982,92 +1799,111 @@ mod tests {
             state,
             "top_struct",
             false,
-            visit_array_field!(
-                // nested field in struct is an array
-                state,
+            [visit_array_field!(
+                state, // nested field in struct is an array
                 "col_nested",
                 true,
                 visit_map_field!(
-                    // array element is a map
-                    state,
+                    state, // array element is a map
                     "element",
                     false,
                     visit_struct_field!(
-                        // map key is a struct
-                        state,
+                        state, // map key is a struct
                         "key",
                         false,
-                        visit_field!(long, state, "key_id", false),
+                        [visit_field!(long, state, "key_id", false, null())],
+                        null()
                     ),
                     visit_struct_field!(
-                        // map value is a struct
-                        state,
+                        state, // map value is a struct
                         "value",
                         true,
-                        visit_array_field!(
-                            // even more nested array
-                            state,
+                        [visit_array_field!(
+                            state, // even more nested array
                             "inner_arrays",
                             false,
                             visit_struct_field!(
-                                // inner array element is a struct
-                                state,
+                                state, // inner array element is a struct
                                 "element",
                                 true,
-                                visit_map_field!(
-                                    // struct field 1 is map
-                                    state,
-                                    "deep_maps",
-                                    true,
-                                    visit_variant_field!(
-                                        // key is variant
-                                        state, "key", false
-                                    ),
-                                    visit_array_field!(
-                                        // value is an array
-                                        state,
-                                        "value",
-                                        false,
-                                        visit_field!(
-                                            // array element is decimal
-                                            decimal, state, "element", 10, 2, true
-                                        )
-                                    )
-                                ),
-                                visit_variant_field!(
-                                    // struct field 2 is variant
-                                    state,
-                                    "variant_data",
-                                    false
-                                ),
-                                visit_struct_field!(
-                                    // struct field 3 is nested_struct
-                                    state,
-                                    "nested_struct",
-                                    true,
-                                    visit_array_field!(
-                                        state,
-                                        "final_array",
-                                        false,
-                                        visit_map_field!(
+                                [
+                                    visit_map_field!(
+                                        state, // struct field 1 is map
+                                        "deep_maps",
+                                        true,
+                                        visit_variant_field!(
                                             state,
-                                            "element",
+                                            "key", // key is variant
                                             false,
-                                            visit_struct_field!(
+                                            null()
+                                        ),
+                                        visit_array_field!(
+                                            state, // value is an array
+                                            "value",
+                                            false,
+                                            visit_field!(
+                                                decimal, // array element is decimal
                                                 state,
-                                                "key",
-                                                false,
-                                                visit_field!(double, state, "coord", false),
+                                                "element",
+                                                10,
+                                                2,
+                                                true,
+                                                null()
                                             ),
-                                            visit_field!(double, state, "value", false)
-                                        )
+                                            null()
+                                        ),
+                                        null()
                                     ),
-                                ),
-                            )
-                        )
-                    )
-                )
-            )
+                                    visit_variant_field!(
+                                        state, // struct field 2 is variant
+                                        "variant_data",
+                                        false,
+                                        null()
+                                    ),
+                                    visit_struct_field!(
+                                        state, // struct field 3 is nested_struct
+                                        "nested_struct",
+                                        true,
+                                        [visit_array_field!(
+                                            state,
+                                            "final_array",
+                                            false,
+                                            visit_map_field!(
+                                                state,
+                                                "element",
+                                                false,
+                                                visit_struct_field!(
+                                                    state,
+                                                    "key",
+                                                    false,
+                                                    [visit_field!(
+                                                        double,
+                                                        state,
+                                                        "coord",
+                                                        false,
+                                                        null()
+                                                    )],
+                                                    null()
+                                                ),
+                                                visit_field!(double, state, "value", false, null()),
+                                                null()
+                                            ),
+                                            null()
+                                        )],
+                                        null()
+                                    ),
+                                ],
+                                null()
+                            ),
+                            null()
+                        )],
+                        null()
+                    ),
+                    null()
+                ),
+                null()
+            )],
+            null()
         );
 
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
@@ -1246,23 +2082,37 @@ mod tests {
         // >
 
         // Required string field
-        let col_required_string = visit_field!(string, state, "col_required_string", false);
-        let col_nullable_string = visit_field!(string, state, "col_nullable_string", true);
+        let col_required_string = visit_field!(string, state, "col_required_string", false, null());
+        let col_nullable_string = visit_field!(string, state, "col_nullable_string", true, null());
 
         // Nullable array with non-null elements: array<string> NULL (elements NOT NULL)
         let col_nullable_array_non_null_elements = visit_array_field!(
             state,
             "col_nullable_array_non_null_elements",
-            true,                                          // array can be null
-            visit_field!(string, state, "element", false)  // elements cannot be null
+            true, // array can be null
+            visit_field!(
+                string,
+                state,
+                "element",
+                false, // elements cannot be null
+                null()
+            ),
+            null()
         );
 
         // Non-null array with nullable elements: array<string> NOT NULL (elements NULL)
         let col_non_null_array_nullable_elements = visit_array_field!(
             state,
             "col_non_null_array_nullable_elements",
-            false,                                        // array not null
-            visit_field!(string, state, "element", true)  // elements can be null
+            false, // array not null
+            visit_field!(
+                string,
+                state,
+                "element",
+                true, // elements can be null
+                null()
+            ),
+            null()
         );
 
         // Nullable map with nullable values: map<string, integer> NULL (values NULL)
@@ -1270,8 +2120,15 @@ mod tests {
             state,
             "col_nullable_map_nullable_values",
             true, // map can be null
-            visit_field!(string, state, "key", false),
-            visit_field!(integer, state, "value", true) // values can be null
+            visit_field!(string, state, "key", false, null()),
+            visit_field!(
+                integer,
+                state,
+                "value",
+                true, // values can be null
+                null()
+            ),
+            null()
         );
 
         // Non-null map with non-null values: map<string, integer> NOT NULL (values NOT NULL)
@@ -1279,23 +2136,44 @@ mod tests {
             state,
             "col_non_null_map_non_null_values",
             false, // map cannot be null
-            visit_field!(string, state, "key", false),
-            visit_field!(integer, state, "value", false) // values cannot be null
+            visit_field!(string, state, "key", false, null()),
+            visit_field!(
+                integer,
+                state,
+                "value",
+                false, // values cannot be null
+                null()
+            ),
+            null()
         );
 
         let col_nullable_struct = visit_struct_field!(
             state,
             "col_nullable_struct",
-            true,                                        // struct is nullable
-            visit_field!(string, state, "inner", false), // inner is not nullable
+            true, // struct is nullable
+            [visit_field!(
+                string,
+                state,
+                "inner",
+                false, // inner is not nullable
+                null()
+            )],
+            null()
         );
 
         // Non-null struct with nullable field: struct<inner: string NULL> NOT NULL
         let col_non_null_struct_nullable_field = visit_struct_field!(
             state,
             "col_non_null_struct_nullable_field",
-            false,                                      // struct not null
-            visit_field!(string, state, "inner", true), // inner is nullable
+            false, // struct not null
+            [visit_field!(
+                string,
+                state,
+                "inner",
+                true, // inner is nullable
+                null()
+            )],
+            null()
         );
 
         // Build final schema
@@ -1303,14 +2181,17 @@ mod tests {
             state,
             "top_struct",
             false,
-            col_required_string,
-            col_nullable_string,
-            col_nullable_array_non_null_elements,
-            col_non_null_array_nullable_elements,
-            col_nullable_map_nullable_values,
-            col_non_null_map_non_null_values,
-            col_nullable_struct,
-            col_non_null_struct_nullable_field,
+            [
+                col_required_string,
+                col_nullable_string,
+                col_nullable_array_non_null_elements,
+                col_non_null_array_nullable_elements,
+                col_nullable_map_nullable_values,
+                col_non_null_map_non_null_values,
+                col_nullable_struct,
+                col_non_null_struct_nullable_field,
+            ],
+            null()
         );
 
         // Verify nullability settings
@@ -1369,8 +2250,8 @@ mod tests {
         }
 
         let mut state = KernelSchemaVisitorState::default();
-        let kf = visit_field!(string, state, "key", true); // should fail due to this being nullable
-        let vf = visit_field!(integer, state, "value", false);
+        let kf = visit_field!(string, state, "key", true, null());
+        let vf = visit_field!(integer, state, "value", false, null());
         let res = unsafe {
             visit_field_map(
                 &mut state,
@@ -1378,6 +2259,7 @@ mod tests {
                 kf,
                 vf,
                 false,
+                null(),
                 ensure_map_err,
             )
         };

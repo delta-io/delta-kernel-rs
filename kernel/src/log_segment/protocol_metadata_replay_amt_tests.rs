@@ -10,43 +10,36 @@ use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
+use crate::schema::SchemaRef;
+use crate::table_features::TableFeature;
+use crate::unit_test_utils::{
+    adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+};
 use crate::{Engine, Snapshot};
 
-const ONE_COLUMN_SCHEMA_STRING: &str =
-    r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
-const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
+fn one_column_schema() -> SchemaRef {
+    test_schema_flat_with_column_mapping()
+        .project(&["id"])
+        .unwrap()
+}
 
 // Builds a commit line with a `checkpoint` action that carries protocol and metadata at
 // `version`. The commit has no top-level protocol/metaData, so P&M comes only from that action.
-fn checkpoint_commit(version: i64, features: &[&str], schema_string: &str) -> String {
+fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: SchemaRef) -> String {
+    let config = adaptive_metadata_table_configuration(schema, extra_features);
     serde_json::json!({ "checkpoint": [
         { "checkpointMetadata": { "version": version } },
         { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": version } },
-        { "protocol": {
-            "minReaderVersion": 3, "minWriterVersion": 7,
-            "readerFeatures": features, "writerFeatures": features,
-        } },
-        { "metaData": {
-            "id": "test-table",
-            "format": { "provider": "parquet", "options": {} },
-            "schemaString": schema_string,
-            "partitionColumns": [],
-            "configuration": {},
-        } },
+        { "protocol": config.protocol() },
+        { "metaData": config.metadata() },
     ] })
     .to_string()
 }
 
 // Builds a top-level `metaData` commit line with the given schema (no protocol).
-fn metadata_commit(schema_string: &str) -> String {
-    serde_json::json!({ "metaData": {
-        "id": "test-table",
-        "format": { "provider": "parquet", "options": {} },
-        "schemaString": schema_string,
-        "partitionColumns": [],
-        "configuration": {},
-    } })
-    .to_string()
+fn metadata_commit(schema: SchemaRef) -> String {
+    let config = adaptive_metadata_table_configuration(schema, &[]);
+    serde_json::json!({ "metaData": config.metadata() }).to_string()
 }
 
 // Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
@@ -83,7 +76,7 @@ async fn check_manifest_commit_checkpoint<E: Engine>(make_engine: impl FnOnce(Ar
         table_root.as_str(),
         store.as_ref(),
         0,
-        checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
+        checkpoint_commit(0, &[], one_column_schema()),
     )
     .await
     .unwrap();
@@ -100,32 +93,31 @@ async fn check_manifest_commit_checkpoint<E: Engine>(make_engine: impl FnOnce(Ar
 #[rstest]
 // A newer checkpoint action beats the older top-level protocol and metaData.
 #[case::newer_checkpoint_beats_older_pm(
-    format!("{}\n{}", protocol_commit(1, 2), metadata_commit(ONE_COLUMN_SCHEMA_STRING)),
-    checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+    format!("{}\n{}", protocol_commit(1, 2), metadata_commit(one_column_schema())),
+    checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
     2,
-    1
+    3
 )]
 // A newer checkpoint action's metaData beats the older top-level metaData.
 #[case::newer_checkpoint_beats_older_metadata(
-    metadata_commit(ONE_COLUMN_SCHEMA_STRING),
-    checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+    metadata_commit(one_column_schema()),
+    checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
     2,
-    1
+    3
 )]
 // A newer top-level metaData beats the older checkpoint action's metaData.
 #[case::newer_metadata_beats_older_checkpoint(
-    checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
-    metadata_commit(TWO_COLUMN_SCHEMA_STRING),
+    checkpoint_commit(0, &[], one_column_schema()),
+    metadata_commit(test_schema_flat_with_column_mapping()),
     2,
-    1
+    3
 )]
-// Both protocols are reader v3, so only version ordering can pick the winner. The newer checkpoint
-// action lists a second reader feature, and that count is what the assertion checks.
+// Feature count distinguishes protocols with the same reader version.
 #[case::newer_checkpoint_protocol_wins(
-    checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
-    checkpoint_commit(1, &["adaptiveMetadata-preview", "deletionVectors"], ONE_COLUMN_SCHEMA_STRING),
+    checkpoint_commit(0, &[], one_column_schema()),
+    checkpoint_commit(1, &[TableFeature::TimestampWithoutTimezone], one_column_schema()),
     1,
-    2
+    4
 )]
 #[tokio::test]
 async fn resolve_pm_newest_action_wins(
@@ -220,7 +212,7 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
         table_root.as_str(),
         store.as_ref(),
         0,
-        checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
+        checkpoint_commit(0, &[], one_column_schema()),
     )
     .await
     .unwrap();
@@ -228,7 +220,7 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
         table_root.as_str(),
         store.as_ref(),
         1,
-        metadata_commit(TWO_COLUMN_SCHEMA_STRING),
+        metadata_commit(test_schema_flat_with_column_mapping()),
     )
     .await
     .unwrap();
@@ -236,7 +228,7 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
         table_root.as_str(),
         store.as_ref(),
         2,
-        checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
+        checkpoint_commit(0, &[], one_column_schema()),
     )
     .await
     .unwrap();

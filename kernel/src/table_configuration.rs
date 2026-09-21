@@ -221,7 +221,17 @@ impl TableConfiguration {
 
         validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
 
-        // TODO(#3240): Validate row-tracking table configuration invariants here.
+        // The protocol does not define behavior when row tracking is both enabled and suspended.
+        // Although row tracking is a writer-only feature, Kernel scans can read stable row IDs and
+        // row commit versions. As a conservative choice, reject such tables for both reads and
+        // writes.
+        require!(
+            !(table_config.table_properties.enable_row_tracking == Some(true)
+                && table_config.is_row_tracking_suspended()),
+            Error::invalid_protocol(
+                "Row tracking cannot be enabled and suspended at the same time"
+            )
+        );
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
@@ -707,12 +717,14 @@ impl TableConfiguration {
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
     /// the protocol's features are all supported for the requested operation type.
     ///
-    /// - For `Scan` and `Cdf` operations: checks reader version and reader features
+    /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
         match operation {
-            Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
+            Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
+                self.ensure_read_supported(operation)
+            }
             Operation::Write => self.ensure_write_supported(),
         }
     }
@@ -723,7 +735,7 @@ impl TableConfiguration {
         self.ensure_operation_supported(Operation::Write)
     }
 
-    /// Internal helper for read operations (Scan, Cdf)
+    /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
         check_reader_version_range(&self.protocol)?;
 
@@ -1469,7 +1481,13 @@ mod test {
             UnknownFeatureShape::ReaderWriter
         )]
         shape: UnknownFeatureShape,
-        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+        #[values(
+            Operation::SnapshotLoad,
+            Operation::Scan,
+            Operation::Cdf,
+            Operation::Write
+        )]
+        operation: Operation,
     ) {
         let (_, config) = create_unknown_feature_config(shape);
         let expected_ok = match shape {
@@ -1719,6 +1737,9 @@ mod test {
     #[test]
     fn test_ensure_operation_supported_reads() {
         let config = MockTableConfigurationBuilder::new().build();
+        assert!(config
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .is_ok());
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
@@ -1756,7 +1777,26 @@ mod test {
                 .build();
             assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
             assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+            assert!(config
+                .ensure_operation_supported(Operation::SnapshotLoad)
+                .is_ok());
         }
+    }
+
+    #[test]
+    fn snapshot_load_validates_reader_feature_requirements() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::CatalogManaged])
+                    .build(),
+            )
+            .build();
+
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::SnapshotLoad),
+            "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
+        );
     }
 
     #[test]
@@ -1803,10 +1843,15 @@ mod test {
 
     #[cfg(not(feature = "geo-type-in-dev"))]
     #[rstest]
-    #[case::scan(Operation::Scan)]
-    #[case::cdf(Operation::Cdf)]
-    #[case::write(Operation::Write)]
-    fn test_geospatial_not_supported_without_cargo_feature(#[case] operation: Operation) {
+    fn test_geospatial_not_supported_without_cargo_feature(
+        #[values(
+            Operation::SnapshotLoad,
+            Operation::Scan,
+            Operation::Cdf,
+            Operation::Write
+        )]
+        operation: Operation,
+    ) {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
@@ -1817,6 +1862,22 @@ mod test {
         assert_result_error_with_message(
             config.ensure_operation_supported(operation),
             "Feature 'geospatial' is not supported",
+        );
+    }
+
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    #[test]
+    fn snapshot_load_rejects_adaptive_metadata_without_cargo_feature() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AdaptiveMetadataPreview])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::SnapshotLoad),
+            "Feature 'adaptiveMetadata-preview' is not supported",
         );
     }
 
@@ -2715,6 +2776,13 @@ mod test {
         all_adaptive_metadata_deps(),
         Some("requires 'inCommitTimestamp' to be enabled")
     )]
+    // adaptiveMetadata and v2Checkpoint are mutually exclusive -> the NotSupported arm fires.
+    #[case::v2_checkpoint_supported_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        adaptive_metadata_deps_with(TableFeature::V2Checkpoint),
+        Some("requires 'v2Checkpoint' to not be supported")
+    )]
     fn test_adaptive_metadata_feature_requirements(
         #[case] props: Vec<(&str, &str)>,
         #[case] cm_mode: Option<ColumnMappingMode>,
@@ -2789,6 +2857,14 @@ mod test {
             .into_iter()
             .filter(|f| *f != excluded)
             .collect()
+    }
+
+    /// The full set of adaptiveMetadata-preview dependencies plus `extra`, to drive the
+    /// "conflicting feature must not be supported" requirement checks.
+    fn adaptive_metadata_deps_with(extra: TableFeature) -> Vec<TableFeature> {
+        let mut deps = all_adaptive_metadata_deps();
+        deps.push(extra);
+        deps
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
