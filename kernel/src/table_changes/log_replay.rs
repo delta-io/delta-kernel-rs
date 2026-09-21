@@ -110,12 +110,11 @@ pub(crate) fn table_changes_action_iter(
 ///       `remove_dvs`. Deletion vector resolution affects whether a remove action is selected in
 ///       the second phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
-///     - Ensure that the mode's required table feature remains enabled on metadata updates.
-///     - Ensure that schema updates satisfy the mode's compatibility policy. Change Data Feed mode
-///       requires equality; row-tracking mode allows additive nullable columns and relaxed
-///       nullability, but rejects datatype changes.
-///     - Require compatible mapping modes and matching ordered logical and physical partition
-///       columns.
+///     - Ensure that the mode's required table feature remains enabled on configuration updates.
+///     - Ensure that updated configurations satisfy the mode's schema compatibility policy. Change
+///       Data Feed mode requires equality; row-tracking mode allows additive nullable columns and
+///       relaxed nullability, but rejects datatype changes.
+///     - Require matching mapping modes and ordered logical and physical partition columns.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
 /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
@@ -239,9 +238,6 @@ impl LogReplayScanner {
                     configuration = ?table_configuration.metadata().configuration(),
                     "Table configuration updated during CDF query"
                 );
-            }
-
-            if has_metadata_update {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(

@@ -610,7 +610,7 @@ fn partition_table() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn cdf_rejects_real_files_across_unmapped_partition_layout_change(
+async fn cdf_rejects_unmapped_partition_layout_change_with_data_files(
 ) -> Result<(), Box<dyn error::Error>> {
     let (store, engine, table_url) = engine_store_setup("cdf_real_unmapped_partition_change", None);
     let schema = schema_ref! {
