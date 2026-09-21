@@ -14,6 +14,7 @@ use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+    MockTableConfigurationBuilder,
 };
 use crate::{Engine, Snapshot};
 
@@ -40,6 +41,29 @@ fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: Sche
 fn metadata_commit(schema: SchemaRef) -> String {
     let config = adaptive_metadata_table_configuration(schema, &[]);
     serde_json::json!({ "metaData": config.metadata() }).to_string()
+}
+
+// Builds a commit carrying an adaptiveMetadata table's protocol and metaData at the top level
+// (not wrapped in a `checkpoint` action). Yields an AMT table with no checkpoint action.
+fn amt_pm_commit(schema: SchemaRef) -> String {
+    let config = adaptive_metadata_table_configuration(schema, &[]);
+    format!(
+        "{}\n{}",
+        serde_json::json!({ "protocol": config.protocol() }),
+        serde_json::json!({ "metaData": config.metadata() }),
+    )
+}
+
+// Builds a commit carrying a plain (non-adaptiveMetadata) table's protocol and metaData. The
+// default mock protocol is reader 3 / writer 7 with no features, so `adaptiveMetadata-preview` is
+// not supported.
+fn plain_pm_commit() -> String {
+    let config = MockTableConfigurationBuilder::new().build();
+    format!(
+        "{}\n{}",
+        serde_json::json!({ "protocol": config.protocol() }),
+        serde_json::json!({ "metaData": config.metadata() }),
+    )
 }
 
 // Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
@@ -240,4 +264,114 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     let schema = snapshot.schema();
     assert!(schema.field("name").is_some());
     assert_eq!(schema.num_fields(), 2);
+}
+
+// A manifest commit's `checkpoint` action is captured on the loaded snapshot, root manifest path
+// and version included. Runs on both replay paths.
+#[tokio::test]
+async fn test_captures_latest_checkpoint_action_from_manifest_commit() {
+    assert_captures_manifest_checkpoint(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_captures_manifest_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn assert_captures_manifest_checkpoint<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    let action = snapshot
+        .latest_checkpoint_action()
+        .expect("checkpoint action captured");
+    assert_eq!(action.version(), 0);
+    assert_eq!(action.path(), "metadata/root.parquet");
+}
+
+// When multiple commits carry checkpoint actions, the newest (by checkpointMetadata.version) wins.
+// Runs on both replay paths.
+#[tokio::test]
+async fn test_captures_newest_checkpoint_action_across_commits() {
+    assert_captures_newest_checkpoint(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_captures_newest_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn assert_captures_newest_checkpoint<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        checkpoint_commit(1, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    let action = snapshot
+        .latest_checkpoint_action()
+        .expect("checkpoint action captured");
+    assert_eq!(action.version(), 1);
+}
+
+// An adaptiveMetadata table whose commits carry no `checkpoint` action captures `None` (the lookup
+// ran but found nothing).
+#[tokio::test]
+async fn test_amt_table_without_checkpoint_action_captures_none() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        amt_pm_commit(test_schema_flat_with_column_mapping()),
+    )
+    .await
+    .unwrap();
+
+    let engine = SyncEngine::new_with_store(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    assert!(snapshot.latest_checkpoint_action().is_none());
+}
+
+// A plain (non-adaptiveMetadata) table captures `None`: the lookup is skipped entirely because the
+// `adaptiveMetadata-preview` feature is not supported.
+#[tokio::test]
+async fn test_non_amt_table_captures_no_checkpoint_action() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(table_root.as_str(), store.as_ref(), 0, plain_pm_commit())
+        .await
+        .unwrap();
+
+    let engine = SyncEngine::new_with_store(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    assert!(snapshot.latest_checkpoint_action().is_none());
 }

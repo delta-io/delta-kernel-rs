@@ -12,6 +12,8 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::CheckpointAction;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -93,6 +95,11 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// The newest AMT `checkpoint` action found at load, if this is an adaptiveMetadata table.
+    /// Queried via [`Snapshot::latest_checkpoint_action`]. `None` when the table has no checkpoint
+    /// action or is not an adaptiveMetadata table. Boxed to keep the struct small.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    last_checkpoint_action: Option<Box<CheckpointAction>>,
 }
 
 impl PartialEq for Snapshot {
@@ -113,13 +120,15 @@ impl Drop for Snapshot {
 
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Snapshot")
-            .field("path", &self.log_segment.log_root.as_str())
+        let mut s = f.debug_struct("Snapshot");
+        s.field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
             .field("metadata", &self.table_configuration().metadata())
             .field("log_segment", &self.log_segment)
-            .field("skipped_new_checkpoints", &self.skipped_new_checkpoints)
-            .finish()
+            .field("skipped_new_checkpoints", &self.skipped_new_checkpoints);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        s.field("checkpoint_action", &self.last_checkpoint_action);
+        s.finish()
     }
 }
 
@@ -200,7 +209,17 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_checkpoint_action: None,
         })
+    }
+
+    /// Attach the newest AMT `checkpoint` action resolved for this snapshot. Kept separate from
+    /// [`Self::new_with_crc`] so its many callers default the field to `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn with_checkpoint_action(mut self, action: Option<Box<CheckpointAction>>) -> Self {
+        self.last_checkpoint_action = action;
+        self
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -241,13 +260,30 @@ impl Snapshot {
         tracing::Span::current().record("version", table_configuration.version());
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(
+        let snapshot = Self::new_with_crc(
             log_segment,
             table_configuration,
             crc,
             built_as_latest,
             false, /* skipped_new_checkpoints */
-        )
+        )?;
+
+        // For adaptiveMetadata tables, capture the newest `checkpoint` action so downstream AMT
+        // reads can resolve the root manifest without another log pass. Skipped for other tables,
+        // which never carry a checkpoint action.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let snapshot = {
+            let action = snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview)
+                .then(|| snapshot.log_segment().find_checkpoint_action(engine))
+                .transpose()?
+                .flatten()
+                .map(Box::new);
+            snapshot.with_checkpoint_action(action)
+        };
+
+        Ok(snapshot)
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -543,6 +579,15 @@ impl Snapshot {
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
+    }
+
+    /// The newest AMT `checkpoint` action found at load, or `None` if this is not an
+    /// adaptiveMetadata table or the table carries no checkpoint action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn latest_checkpoint_action(&self) -> Option<&CheckpointAction> {
+        self.last_checkpoint_action.as_deref()
     }
 
     /// Fetch the latest transaction version for every application id in this snapshot.

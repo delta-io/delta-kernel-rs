@@ -139,6 +139,26 @@ impl LogSegment {
         ))
     }
 
+    /// Find the latest `checkpoint` action in this segment: the one carried by the most recent
+    /// manifest commit. Returns `None` if the table carries no checkpoint action.
+    ///
+    /// Checkpoint actions live only in commit/manifest files, so only the commit cover is read
+    /// (via [`Self::read_commit_actions`], newest-first). Commits are yielded newest-first, so the
+    /// first checkpoint action encountered is the latest, and the scan stops there.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn find_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        let schema = schema_ref! { (&CHECKPOINT_ACTION_FIELD) };
+        for batch in self.read_commit_actions(engine, schema, None)? {
+            if let Some(action) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())? {
+                return Ok(Some(action));
+            }
+        }
+        Ok(None)
+    }
+
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
     fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
