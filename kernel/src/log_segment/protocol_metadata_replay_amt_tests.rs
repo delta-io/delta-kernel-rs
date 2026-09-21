@@ -359,7 +359,10 @@ async fn test_amt_table_without_checkpoint_action_captures_none() {
     let engine = SyncEngine::new_with_store(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
-    assert!(snapshot.latest_checkpoint_action(&engine).unwrap().is_none());
+    assert!(snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .is_none());
 }
 
 // A plain (non-adaptiveMetadata) table resolves to `None`: the lookup is skipped entirely because
@@ -375,5 +378,8 @@ async fn test_non_amt_table_captures_no_checkpoint_action() {
     let engine = SyncEngine::new_with_store(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
-    assert!(snapshot.latest_checkpoint_action(&engine).unwrap().is_none());
+    assert!(snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .is_none());
 }

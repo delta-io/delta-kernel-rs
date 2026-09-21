@@ -99,9 +99,9 @@ pub struct Snapshot {
     skipped_new_checkpoints: bool,
     /// Cache for the newest AMT `checkpoint` action, resolved lazily on first
     /// [`Snapshot::latest_checkpoint_action`] call so a plain load never pays for the extra log
-    /// pass. Once resolved, the inner `Option` is `None` when the table has no checkpoint action or
-    /// is not an adaptiveMetadata table (boxed to keep the struct small). May be pre-seeded when the
-    /// action is already known (e.g. from a cheaper `_last_checkpoint` hint).
+    /// pass. Once resolved, the inner `Option` is `None` when the table has no checkpoint action
+    /// or is not an adaptiveMetadata table (boxed to keep the struct small). May be pre-seeded
+    /// when the action is already known (e.g. from a cheaper `_last_checkpoint` hint).
     #[cfg(feature = "adaptive-metadata-in-dev")]
     latest_checkpoint_action: OnceLock<Option<Box<CheckpointAction>>>,
 }
