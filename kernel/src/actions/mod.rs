@@ -14,6 +14,8 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::resolve_amt_location;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
@@ -1301,7 +1303,7 @@ pub(crate) struct ContentRoot {
     /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     pub(crate) path: String,
     /// Size of the root manifest file in bytes. Not exposed directly -- use
-    /// [`ContentRoot::to_filemeta`] to get a validated [`FileMeta`].
+    /// [`CheckpointAction::root_filemeta`] to get a validated [`FileMeta`].
     size_in_bytes: i64,
     /// The table version the root manifest reflects. Per the adaptiveMetadata RFC this is
     /// `<= checkpointMetadata.version`: equal in a manifest commit, and strictly less in a
@@ -1452,36 +1454,6 @@ impl CheckpointAction {
     }
 }
 
-/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn has_scheme(location: &str) -> bool {
-    for (position, ch) in location.char_indices() {
-        if ch == ':' {
-            return position > 0;
-        }
-        if !is_scheme_char(ch, position) {
-            return false;
-        }
-    }
-    false
-}
-
-/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
-/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
-/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
-///
-/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn is_scheme_char(ch: char, position: usize) -> bool {
-    if ch.is_ascii_alphabetic() {
-        return true;
-    }
-    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
-}
-
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
     /// Builds a reference to a root manifest at `path`, `size_in_bytes`, reflecting `version`.
@@ -1491,46 +1463,6 @@ impl ContentRoot {
             size_in_bytes,
             version,
         }
-    }
-
-    /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
-    ///
-    /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
-    /// `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
-    /// [relative paths specification].
-    ///
-    /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
-    /// not fit a [`crate::FileSize`].
-    ///
-    /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
-    #[internal_api]
-    pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        let path = &self.path;
-        let location = if has_scheme(path) {
-            // A URI scheme means the path is absolute and used as-is.
-            Url::parse(path).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
-                ))
-            })?
-        } else {
-            // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
-            let mut base = table_root.as_str().to_string();
-            if !base.ends_with('/') {
-                base.push('/');
-            }
-            Url::parse(&format!("{base}{path}")).map_err(|e| {
-                Error::generic(format!(
-                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                     root {base}: {e}"
-                ))
-            })?
-        };
-        Ok(FileMeta {
-            location,
-            last_modified: i64::MAX,
-            size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
-        })
     }
 }
 
@@ -1612,11 +1544,24 @@ impl CheckpointAction {
         self.version
     }
 
-    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O (delegates to
-    /// [`ContentRoot::to_filemeta`]).
+    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O.
+    ///
+    /// The `contentRoot` path is absolute if it has a URI scheme, otherwise it is resolved relative
+    /// to `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
+    /// [relative paths specification].
+    ///
+    /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
+    /// not fit a [`crate::FileSize`].
+    ///
+    /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        self.content_root.to_filemeta(table_root)
+        let content_root = &self.content_root;
+        Ok(FileMeta {
+            location: resolve_amt_location(&content_root.path, table_root)?,
+            last_modified: i64::MAX,
+            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
+        })
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -2882,66 +2827,12 @@ mod tests {
         "memory:///table/metadata/root.parquet",
         Ok(2048)
     )]
-    #[case::absolute_path(
-        "memory:///table/",
-        "s3://bucket/table/metadata/root.parquet",
-        2048,
-        "s3://bucket/table/metadata/root.parquet",
-        Ok(2048)
-    )]
     #[case::negative_size(
         "memory:///table/",
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
         Err("Failed to convert checkpoint contentRoot size -1")
-    )]
-    #[case::table_root_without_trailing_slash_gets_one(
-        "memory:///table",
-        "metadata/root.parquet",
-        2048,
-        "memory:///table/metadata/root.parquet",
-        Ok(2048)
-    )]
-    #[case::single_char_scheme_treated_as_absolute(
-        "memory:///table/",
-        "c:/foo/root.parquet",
-        2048,
-        "c:/foo/root.parquet",
-        Ok(2048)
-    )]
-    // A colon inside a relative path segment is not a scheme delimiter (a `/` precedes it), so
-    // the path stays relative.
-    #[case::colon_in_relative_segment_stays_relative(
-        "memory:///table/",
-        "metadata/snap-123:456.parquet",
-        2048,
-        "memory:///table/metadata/snap-123:456.parquet",
-        Ok(2048)
-    )]
-    // RFC 3986 requires the first scheme char to be ALPHA; a leading digit is not a scheme.
-    #[case::leading_digit_scheme_treated_as_relative(
-        "memory:///table/",
-        "3com/root.parquet",
-        2048,
-        "memory:///table/3com/root.parquet",
-        Ok(2048)
-    )]
-    // A non-ASCII leading letter (Greek alpha, U+03B1) is not a valid scheme char.
-    #[case::non_ascii_scheme_treated_as_relative(
-        "memory:///table/",
-        "\u{03b1}scheme/root.parquet",
-        2048,
-        "memory:///table/%CE%B1scheme/root.parquet",
-        Ok(2048)
-    )]
-    // A multi-char, non-alphanumeric scheme (`git+ssh`) is absolute and used as-is.
-    #[case::compound_scheme_treated_as_absolute(
-        "memory:///table/",
-        "git+ssh://host/repo/root.parquet",
-        2048,
-        "git+ssh://host/repo/root.parquet",
-        Ok(2048)
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,
