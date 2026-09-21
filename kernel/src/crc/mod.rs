@@ -92,12 +92,15 @@ pub struct Crc {
     ///       action can exist, so `Partial(_)` is semantically equivalent to
     ///       `Complete(empty)` and both serde paths could collapse the distinction.
     pub domain_metadata_state: DomainMetadataState,
+    /// All live [`Add`] file actions at this version. Present only when read whole from an
+    /// at-version CRC; `Crc::apply` drops it, since incremental advance does not reconstruct the
+    /// set.
+    // TODO(#3361): read-only for now; advancing, writing, and data-skipping use are unsupported.
+    pub(crate) all_files: Option<Vec<Add>>,
 
     // ===== Extended optional fields =====
     /// A unique identifier for the transaction that produced this commit.
     pub(crate) txn_id: Option<String>,
-    /// All live [`Add`] file actions at this version.
-    pub(crate) all_files: Option<Vec<Add>>,
     /// Number of records deleted through Deletion Vectors in this table version.
     pub(crate) num_deleted_records_opt: Option<i64>,
     /// Number of Deletion Vectors active in this table version.
@@ -160,6 +163,16 @@ impl Crc {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn file_stats_state(&self) -> &FileStatsState {
         &self.file_stats_state
+    }
+
+    /// Returns the complete set of live [`Add`] file actions, if this CRC carries one.
+    ///
+    /// `allFiles` is present only when the writer chose to include it (e.g. the table was small
+    /// enough); otherwise this returns `None` and callers reconstruct the file list through log
+    /// replay.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn all_files(&self) -> Option<&[Add]> {
+        self.all_files.as_deref()
     }
 }
 

@@ -2776,6 +2776,13 @@ mod test {
         all_adaptive_metadata_deps(),
         Some("requires 'inCommitTimestamp' to be enabled")
     )]
+    // adaptiveMetadata and v2Checkpoint are mutually exclusive -> the NotSupported arm fires.
+    #[case::v2_checkpoint_supported_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        adaptive_metadata_deps_with(TableFeature::V2Checkpoint),
+        Some("requires 'v2Checkpoint' to not be supported")
+    )]
     fn test_adaptive_metadata_feature_requirements(
         #[case] props: Vec<(&str, &str)>,
         #[case] cm_mode: Option<ColumnMappingMode>,
@@ -2850,6 +2857,14 @@ mod test {
             .into_iter()
             .filter(|f| *f != excluded)
             .collect()
+    }
+
+    /// The full set of adaptiveMetadata-preview dependencies plus `extra`, to drive the
+    /// "conflicting feature must not be supported" requirement checks.
+    fn adaptive_metadata_deps_with(extra: TableFeature) -> Vec<TableFeature> {
+        let mut deps = all_adaptive_metadata_deps();
+        deps.push(extra);
+        deps
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
