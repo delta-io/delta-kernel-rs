@@ -32,6 +32,7 @@ use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
+use crate::scan::data_skipping::stats_schema::VariantMinMaxStats;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -132,6 +133,10 @@ pub struct StatsOptions {
 
     /// Which struct stats columns to request in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
+
+    /// Whether a VARIANT column's min/max statistic is requested. See
+    /// [`Self::with_variant_stats`].
+    pub(crate) variant_stats: bool,
 }
 
 /// Controls which struct stats columns appear in `stats_parsed`.
@@ -167,6 +172,7 @@ impl Default for StatsOptions {
         Self {
             synthesize_json: true,
             struct_stats: StructStats::None,
+            variant_stats: false,
         }
     }
 }
@@ -186,6 +192,7 @@ impl StatsOptions {
             struct_stats: StructStats::AllIndexed {
                 extra_indexed: Vec::new(),
             },
+            variant_stats: false,
         }
     }
 
@@ -197,6 +204,7 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::Columns { requested: cols },
+            variant_stats: false,
         }
     }
 
@@ -208,6 +216,7 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::AllIndexed { extra_indexed },
+            variant_stats: false,
         }
     }
 
@@ -218,7 +227,29 @@ impl StatsOptions {
             struct_stats: StructStats::AllIndexed {
                 extra_indexed: Vec::new(),
             },
+            variant_stats: false,
         }
+    }
+
+    /// Requests a shredded VARIANT column's min/max statistic in `minValues`/`maxValues`.
+    ///
+    /// Off by default. That statistic is itself a VARIANT value rather than a comparable scalar, so
+    /// kernel never prunes with it, and only a caller that knows how to interpret one gains
+    /// anything. Enabling it adds a column per VARIANT to the stats schema.
+    ///
+    /// Kernel does not itself encode or decode the statistic. The Delta protocol does not yet
+    /// specify how a VARIANT value is stored in the stats JSON, so that knowledge has to come from
+    /// the caller: enabling this means supplying an [`EvaluationHandler`] that overrides whichever
+    /// of [`ParseJson`] and [`ToJson`] the stats path uses -- `ParseJson` to read the statistic out
+    /// of the stats JSON, `ToJson` to write it back under `synthesize_json`. A checkpoint's own
+    /// `stats_parsed` needs neither: it holds the variant as binary and passes straight through.
+    ///
+    /// [`ParseJson`]: crate::expressions::ParseJsonExpression
+    /// [`ToJson`]: crate::expressions::UnaryExpressionOp::ToJson
+    /// [`EvaluationHandler`]: crate::EvaluationHandler
+    pub fn with_variant_stats(mut self, variant_stats: bool) -> Self {
+        self.variant_stats = variant_stats;
+        self
     }
 
     /// **Disables all stats work**: no stats output, no internal data skipping (even
@@ -231,6 +262,16 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::None,
+            variant_stats: false,
+        }
+    }
+
+    /// How the stats schema should treat a VARIANT column's min/max statistic.
+    pub(crate) fn variant_min_max(&self) -> VariantMinMaxStats {
+        if self.variant_stats {
+            VariantMinMaxStats::Include
+        } else {
+            VariantMinMaxStats::Omit
         }
     }
 }
@@ -766,7 +807,11 @@ fn build_physical_stats_output_schema(
                 return Ok(None);
             }
             let stats_schema = table_configuration
-                .build_expected_stats_schemas(Some(requested), Some(requested))?
+                .build_expected_stats_schemas(
+                    Some(requested),
+                    Some(requested),
+                    stats.variant_min_max(),
+                )?
                 .physical;
             Ok(stats_schema_with_data_columns(stats_schema))
         }

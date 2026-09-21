@@ -2108,6 +2108,7 @@ fn test_default_stats_options_no_struct_output() {
         struct_stats: StructStats::Columns {
             requested: vec![column_name!("id")],
         },
+        variant_stats: false,
     },
     &["id"],
     None,
@@ -2276,6 +2277,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             struct_stats: StructStats::Columns {
                 requested: vec![column_name!("nonexistent_column")],
             },
+            variant_stats: false,
         })
         .build();
 

@@ -20,6 +20,7 @@ use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
+    VariantMinMaxStats,
 };
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
@@ -334,6 +335,7 @@ impl TableConfiguration {
     ///   statistics, regardless of the above settings.
     /// - **Requested columns**: Optional output filter that limits which columns appear in the
     ///   schema without affecting column counting.
+    /// - **`variant_min_max`**: Whether a VARIANT column's min/max statistic is admitted.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
@@ -343,12 +345,14 @@ impl TableConfiguration {
         &self,
         required_physical_columns: Option<&[ColumnName]>,
         requested_physical_columns: Option<&[ColumnName]>,
+        variant_min_max: VariantMinMaxStats,
     ) -> DeltaResult<ExpectedStatsSchemas> {
         let physical_data_schema = self.physical_data_schema_without_partition_columns();
         let required_physical_stats_columns = self.required_physical_stats_columns();
         let config = StatsConfig {
             data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
+            variant_min_max,
         };
         let physical_stats_schema = Arc::new(expected_stats_schema(
             &physical_data_schema,
@@ -377,6 +381,8 @@ impl TableConfiguration {
         let config = StatsConfig {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
+            // Column names are collected from the base schema; min/max never enters into it.
+            variant_min_max: VariantMinMaxStats::Omit,
         };
         stats_column_names(
             &self.physical_data_schema_without_partition_columns(),
@@ -957,7 +963,7 @@ mod test {
 
     use rstest::rstest;
 
-    use super::{InCommitTimestampEnablement, TableConfiguration};
+    use super::{InCommitTimestampEnablement, TableConfiguration, VariantMinMaxStats};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
         column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
@@ -2025,7 +2031,9 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schemas = config
+            .build_expected_stats_schemas(None, None, VariantMinMaxStats::Omit)
+            .unwrap();
 
         // Verify field names are logical names
         let min_values = stats_schemas
@@ -2053,7 +2061,9 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schemas = config
+            .build_expected_stats_schemas(None, None, VariantMinMaxStats::Omit)
+            .unwrap();
 
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
@@ -2093,7 +2103,9 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schemas = config
+            .build_expected_stats_schemas(None, None, VariantMinMaxStats::Omit)
+            .unwrap();
 
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
@@ -2194,7 +2206,9 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schemas = config
+            .build_expected_stats_schemas(None, None, VariantMinMaxStats::Omit)
+            .unwrap();
 
         let DataType::Struct(inner) = stats_schemas
             .physical

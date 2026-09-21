@@ -1532,6 +1532,9 @@ impl LogSegment {
     /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
     ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
+    /// - A needed VARIANT against an available struct: recursively check against the variant's own
+    ///   physical fields, because Parquet carries no variant type and a checkpoint's footer schema
+    ///   therefore reports the leaf as the plain struct of binaries it is stored as
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
     fn structs_have_compatible_types(
@@ -1545,8 +1548,10 @@ impl LogSegment {
             };
 
             match (available_field.data_type(), needed_field.data_type()) {
-                // Both are structs: recurse
-                (DataType::Struct(avail_struct), DataType::Struct(need_struct)) => {
+                // Both are structs, or a needed variant against the physical struct a checkpoint
+                // stores it as: recurse
+                (DataType::Struct(avail_struct), DataType::Struct(need_struct))
+                | (DataType::Struct(avail_struct), DataType::Variant(need_struct)) => {
                     let nested_context = format!("{}.{}", context, needed_field.name());
                     if !Self::structs_have_compatible_types(
                         avail_struct,

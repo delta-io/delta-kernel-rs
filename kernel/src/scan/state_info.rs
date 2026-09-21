@@ -8,6 +8,7 @@ use tracing::{debug, enabled, warn, Level};
 
 use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
+use crate::scan::data_skipping::stats_schema::VariantMinMaxStats;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
@@ -151,6 +152,7 @@ fn build_data_skipping_schemas(
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     requested_physical_stats_columns: Option<&[ColumnName]>,
+    variant_min_max: VariantMinMaxStats,
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
     // Narrow the table's typed partition schema to the columns the predicate references. The
@@ -188,7 +190,11 @@ fn build_data_skipping_schemas(
     let stats_schema = match (struct_stats, physical_predicate) {
         (StructStats::AllIndexed { .. }, _) => with_data_cols(
             table_configuration
-                .build_expected_stats_schemas(requested_physical_stats_columns, None)?
+                .build_expected_stats_schemas(
+                    requested_physical_stats_columns,
+                    None,
+                    variant_min_max,
+                )?
                 .physical,
         ),
         // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
@@ -200,7 +206,11 @@ fn build_data_skipping_schemas(
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
             with_data_cols(
                 table_configuration
-                    .build_expected_stats_schemas(requested_physical_stats_columns, Some(&filter))?
+                    .build_expected_stats_schemas(
+                        requested_physical_stats_columns,
+                        Some(&filter),
+                        variant_min_max,
+                    )?
                     .physical,
             )
         }
@@ -208,7 +218,11 @@ fn build_data_skipping_schemas(
         // stats schema is trimmed to what the rewritten predicate needs.
         (_, PhysicalPredicate::Some(_, _)) => with_data_cols(
             table_configuration
-                .build_expected_stats_schemas(None, Some(&predicate_refs_physical))?
+                .build_expected_stats_schemas(
+                    None,
+                    Some(&predicate_refs_physical),
+                    variant_min_max,
+                )?
                 .physical,
         ),
         // No struct stats requested and no predicate: nothing to read or emit, so no stats schema.
@@ -489,6 +503,7 @@ impl StateInfo {
             &physical_predicate,
             &predicate_column_names,
             requested_physical_stats_columns_ref,
+            stats.variant_min_max(),
             table_configuration,
         )?;
 
@@ -1248,6 +1263,7 @@ pub(crate) mod tests {
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("value")],
                 },
+                variant_stats: false,
             },
         )
         .unwrap();
@@ -1296,6 +1312,7 @@ pub(crate) mod tests {
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("value")],
                 },
+                variant_stats: false,
             },
         )
         .unwrap();
@@ -1454,6 +1471,7 @@ pub(crate) mod tests {
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("col_a")],
                 },
+                variant_stats: false,
             },
         )
         .unwrap();

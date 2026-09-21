@@ -16,7 +16,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
+use crate::scan::data_skipping::stats_schema::{is_skipping_eligible_datatype, VariantMinMaxStats};
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
@@ -261,7 +261,7 @@ impl DataSkippingFilter {
             .collect();
         let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
         let physical_stats_schema = table_configuration
-            .build_expected_stats_schemas(None, Some(&predicate_refs))
+            .build_expected_stats_schemas(None, Some(&predicate_refs), VariantMinMaxStats::Omit)
             .ok()?
             .physical;
         let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
@@ -520,10 +520,12 @@ fn is_partition_value_reference(expr: &Expr) -> bool {
 }
 
 /// A column carries min/max stats iff it's a primitive whose type supports min/max skipping.
-/// Boolean / Binary, Array, Map, and Variant leaves carry nullCount only. Struct columns
-/// have no per-struct stats; only their primitive leaves do, recursively.
-/// Must match `MinMaxStatsTransform`'s acceptance rule. Otherwise the predicate creator
-/// emits refs to min/max fields the stats schema doesn't contain.
+/// Boolean / Binary, Array, and Map leaves carry nullCount only. Struct columns have no per-struct
+/// stats; only their primitive leaves do, recursively.
+/// Must accept no more than `MinMaxStatsTransform` does. Otherwise the predicate creator emits refs
+/// to min/max fields the stats schema doesn't contain. Accepting less is fine, and a VARIANT leaf
+/// always does: a caller can admit its statistic into the schema, but a kernel predicate has no way
+/// to compare against a variant value, so no predicate may reference it.
 fn has_min_max_stats(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
 }
