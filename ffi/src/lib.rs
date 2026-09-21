@@ -777,7 +777,7 @@ impl FfiEngineBuilder {
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiEngineBuilder`].
 #[cfg(feature = "default-engine-base")]
 #[handle_descriptor(target=FfiEngineBuilder, mutable=true, sized=true)]
-pub struct EngineBuilder;
+pub struct MutableFfiEngineBuilder;
 
 /// Get a builder that can be used to construct an engine. The function
 /// [`set_builder_option`] can be used to set options on the builder prior to constructing the
@@ -791,7 +791,7 @@ pub struct EngineBuilder;
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> ExternResult<Handle<EngineBuilder>> {
+) -> ExternResult<Handle<MutableFfiEngineBuilder>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
 }
@@ -800,7 +800,7 @@ pub unsafe extern "C" fn get_engine_builder(
 fn get_engine_builder_impl(
     url: DeltaResult<Url>,
     allocate_fn: AllocateErrorFn,
-) -> DeltaResult<Handle<EngineBuilder>> {
+) -> DeltaResult<Handle<MutableFfiEngineBuilder>> {
     let builder = Box::new(FfiEngineBuilder {
         url: url?,
         allocate_fn,
@@ -820,7 +820,7 @@ fn get_engine_builder_impl(
 /// be used or freed again after this call.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
-pub unsafe extern "C" fn free_engine_builder(builder: Handle<EngineBuilder>) {
+pub unsafe extern "C" fn free_engine_builder(builder: Handle<MutableFfiEngineBuilder>) {
     unsafe { builder.drop_handle() };
 }
 
@@ -833,7 +833,7 @@ pub unsafe extern "C" fn free_engine_builder(builder: Handle<EngineBuilder>) {
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_option(
-    builder: &mut Handle<EngineBuilder>,
+    builder: &mut Handle<MutableFfiEngineBuilder>,
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> ExternResult<bool> {
@@ -867,7 +867,7 @@ fn set_builder_option_impl(
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
-    builder: &mut Handle<EngineBuilder>,
+    builder: &mut Handle<MutableFfiEngineBuilder>,
     worker_threads: usize,
     max_blocking_threads: usize,
 ) {
@@ -901,7 +901,7 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_with_io_concurrency(
-    builder: &mut Handle<EngineBuilder>,
+    builder: &mut Handle<MutableFfiEngineBuilder>,
     buffer_size: usize,
     batch_size: usize,
 ) {
@@ -924,7 +924,7 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_rest_object_store(
-    builder: &mut Handle<EngineBuilder>,
+    builder: &mut Handle<MutableFfiEngineBuilder>,
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
@@ -965,7 +965,7 @@ fn set_builder_rest_object_store_impl(
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn builder_build(
-    builder: Handle<EngineBuilder>,
+    builder: Handle<MutableFfiEngineBuilder>,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { builder.into_inner() };
     get_default_engine_impl(
