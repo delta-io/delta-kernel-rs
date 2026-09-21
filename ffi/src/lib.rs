@@ -774,9 +774,10 @@ impl EngineBuilder {
     }
 }
 
-/// Get a "builder" that can be used to construct an engine. The function
+/// Get a builder that can be used to construct an engine. The function
 /// [`set_builder_option`] can be used to set options on the builder prior to constructing the
-/// actual engine
+/// actual engine. The caller owns the returned builder and must eventually pass it to either
+/// [`builder_build`] or [`free_engine_builder`].
 ///
 /// # Safety
 /// Caller is responsible for passing a valid path pointer.
@@ -804,6 +805,22 @@ fn get_engine_builder_impl(
         io_config: IoConcurrencyConfig::default(),
     });
     Ok(Box::into_raw(builder))
+}
+
+/// Free an engine builder without building an engine.
+///
+/// A null pointer is accepted and has no effect.
+///
+/// # Safety
+///
+/// `builder` must be null or a valid pointer returned by [`get_engine_builder`]. A non-null
+/// pointer is consumed and must not be used or freed again after this call.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_engine_builder(builder: *mut EngineBuilder) {
+    if !builder.is_null() {
+        drop(unsafe { Box::from_raw(builder) });
+    }
 }
 
 /// Set an option on the builder
@@ -2270,6 +2287,17 @@ mod tests {
         let engine = get_default_engine("memory:///doesntmatter/foo");
         unsafe {
             free_engine(engine);
+        }
+    }
+
+    #[test]
+    fn free_engine_builder_accepts_null_and_unbuilt_builder() {
+        let path = "memory:///doesntmatter/foo";
+        unsafe {
+            free_engine_builder(std::ptr::null_mut());
+
+            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            free_engine_builder(builder);
         }
     }
 
