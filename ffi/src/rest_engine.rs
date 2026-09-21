@@ -1,4 +1,4 @@
-//! REST [`RestObjectStore`] wiring for [`EngineBuilder`](crate::EngineBuilder).
+//! REST [`RestObjectStore`] wiring for [`FfiEngineBuilder`](crate::FfiEngineBuilder).
 //!
 //! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) with a
 //! [`CRestEndpointConfig`] to select the REST backend. The builder `url` must be the REST service
@@ -147,7 +147,8 @@ pub struct CAuthHeaders {
 pub type CAuthHeaderCallback =
     extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders, allocate_error: AllocateErrorFn);
 
-/// State for [`crate::ObjectStoreBackend::Rest`], stored on [`EngineBuilder`](crate::EngineBuilder)
+/// State for [`crate::ObjectStoreBackend::Rest`], stored on
+/// [`FfiEngineBuilder`](crate::FfiEngineBuilder)
 /// after [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 pub(crate) struct RestBuilderState {
     endpoint_config: RestEndpointConfig,

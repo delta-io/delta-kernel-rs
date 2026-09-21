@@ -717,7 +717,7 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
     delta_kernel::try_parse_uri(path)
 }
 
-/// How [`EngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
+/// How [`FfiEngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
 /// build time.
 #[cfg(feature = "default-engine-base")]
 #[derive(Default)]
@@ -735,7 +735,7 @@ pub(crate) enum ObjectStoreBackend {
 /// For REST, call [`set_builder_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
 /// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
 #[cfg(feature = "default-engine-base")]
-pub struct EngineBuilder {
+pub struct FfiEngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
@@ -768,11 +768,15 @@ pub(crate) struct MultithreadedExecutorConfig {
 }
 
 #[cfg(feature = "default-engine-base")]
-impl EngineBuilder {
+impl FfiEngineBuilder {
     fn set_option(&mut self, key: String, val: String) {
         self.options.insert(key, val);
     }
 }
+
+/// An opaque handle with exclusive (Box-like) ownership of a [`FfiEngineBuilder`].
+#[handle_descriptor(target=FfiEngineBuilder, mutable=true, sized=true)]
+pub struct EngineBuilder;
 
 /// Get a builder that can be used to construct an engine. The function
 /// [`set_builder_option`] can be used to set options on the builder prior to constructing the
@@ -786,7 +790,7 @@ impl EngineBuilder {
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> ExternResult<*mut EngineBuilder> {
+) -> ExternResult<Handle<EngineBuilder>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
 }
@@ -795,8 +799,8 @@ pub unsafe extern "C" fn get_engine_builder(
 fn get_engine_builder_impl(
     url: DeltaResult<Url>,
     allocate_fn: AllocateErrorFn,
-) -> DeltaResult<*mut EngineBuilder> {
-    let builder = Box::new(EngineBuilder {
+) -> DeltaResult<Handle<EngineBuilder>> {
+    let builder = Box::new(FfiEngineBuilder {
         url: url?,
         allocate_fn,
         options: HashMap::default(),
@@ -804,42 +808,40 @@ fn get_engine_builder_impl(
         multithreaded_executor_config: None,
         io_config: IoConcurrencyConfig::default(),
     });
-    Ok(Box::into_raw(builder))
+    Ok(builder.into())
 }
 
 /// Free an engine builder without building an engine.
 ///
-/// A null pointer is accepted and has no effect.
-///
 /// # Safety
 ///
-/// `builder` must be null or a valid pointer returned by [`get_engine_builder`]. A non-null
-/// pointer is consumed and must not be used or freed again after this call.
+/// `builder` must be a valid handle returned by [`get_engine_builder`]. It is consumed and must not
+/// be used or freed again after this call.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
-pub unsafe extern "C" fn free_engine_builder(builder: *mut EngineBuilder) {
-    if !builder.is_null() {
-        drop(unsafe { Box::from_raw(builder) });
-    }
+pub unsafe extern "C" fn free_engine_builder(builder: Handle<EngineBuilder>) {
+    unsafe { builder.drop_handle() };
 }
 
 /// Set an option on the builder
 ///
 /// # Safety
 ///
-/// Caller must pass a valid EngineBuilder pointer, and valid slices for key and value
+/// Caller must pass a valid engine builder handle, and valid slices for key and value. The handle
+/// is borrowed and remains owned by the caller regardless of the result.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_option(
-    builder: &mut EngineBuilder,
+    builder: &mut Handle<EngineBuilder>,
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> ExternResult<bool> {
+    let builder = unsafe { builder.as_mut() };
     set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
 }
 #[cfg(feature = "default-engine-base")]
 fn set_builder_option_impl(
-    builder: &mut EngineBuilder,
+    builder: &mut FfiEngineBuilder,
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> DeltaResult<bool> {
@@ -859,14 +861,16 @@ fn set_builder_option_impl(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid EngineBuilder pointer.
+/// Caller must pass a valid engine builder handle. The handle is borrowed and remains owned by the
+/// caller.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
-    builder: &mut EngineBuilder,
+    builder: &mut Handle<EngineBuilder>,
     worker_threads: usize,
     max_blocking_threads: usize,
 ) {
+    let builder = unsafe { builder.as_mut() };
     let worker_threads = (worker_threads != 0).then_some(worker_threads);
     let max_blocking_threads = (max_blocking_threads != 0).then_some(max_blocking_threads);
 
@@ -891,14 +895,16 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid EngineBuilder pointer.
+/// Caller must pass a valid engine builder handle. The handle is borrowed and remains owned by the
+/// caller.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_with_io_concurrency(
-    builder: &mut EngineBuilder,
+    builder: &mut Handle<EngineBuilder>,
     buffer_size: usize,
     batch_size: usize,
 ) {
+    let builder = unsafe { builder.as_mut() };
     // `NonZero::new` maps 0 -> `None`, which the engine reads as "use the default".
     builder.io_config = IoConcurrencyConfig {
         buffer_size: NonZero::new(buffer_size),
@@ -910,24 +916,26 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer and a non-null `endpoint_config`. When `callback` is
-/// non-null, `context` must remain valid for the engine lifetime and the callback must be safe to
-/// invoke from any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
+/// Caller must pass a valid builder handle and a non-null `endpoint_config`. The handle is borrowed
+/// and remains owned by the caller regardless of the result. When `callback` is non-null,
+/// `context` must remain valid for the engine lifetime and the callback must be safe to invoke from
+/// any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_rest_object_store(
-    builder: &mut EngineBuilder,
+    builder: &mut Handle<EngineBuilder>,
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
 ) -> ExternResult<bool> {
+    let builder = unsafe { builder.as_mut() };
     set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
         .into_extern_result(&builder.allocate_fn)
 }
 
 #[cfg(feature = "default-engine-base")]
 fn set_builder_rest_object_store_impl(
-    builder: &mut EngineBuilder,
+    builder: &mut FfiEngineBuilder,
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
@@ -945,20 +953,20 @@ fn set_builder_rest_object_store_impl(
     Ok(true)
 }
 
-/// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
-/// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
-/// drop/free it afterwards.
+/// Consume the builder and return a default engine. The builder is consumed regardless of the
+/// result and must not be used or freed after this call.
 ///
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass a valid EngineBuilder pointer, and to not use it again afterwards
+/// Caller must pass a valid engine builder handle. The handle is consumed before any fallible work
+/// and must not be used or freed after this call, regardless of the result.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn builder_build(
-    builder: *mut EngineBuilder,
+    builder: Handle<EngineBuilder>,
 ) -> ExternResult<Handle<SharedExternEngine>> {
-    let builder_box = unsafe { Box::from_raw(builder) };
+    let builder_box = unsafe { builder.into_inner() };
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
@@ -2291,13 +2299,37 @@ mod tests {
     }
 
     #[test]
-    fn free_engine_builder_accepts_null_and_unbuilt_builder() {
+    fn free_engine_builder_drops_unbuilt_builder() {
         let path = "memory:///doesntmatter/foo";
         unsafe {
-            free_engine_builder(std::ptr::null_mut());
-
             let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
             free_engine_builder(builder);
+        }
+    }
+
+    #[test]
+    fn engine_builder_setter_borrows_builder() {
+        let path = "memory:///doesntmatter/foo";
+        let key = "custom-option";
+        let value = "value";
+        unsafe {
+            let mut builder =
+                ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            assert!(ok_or_panic(set_builder_option(
+                &mut builder,
+                kernel_string_slice!(key),
+                kernel_string_slice!(value),
+            )));
+            free_engine_builder(builder);
+        }
+    }
+
+    #[test]
+    fn builder_build_error_consumes_builder() {
+        let path = "unsupported-scheme:///doesntmatter/foo";
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            assert!(matches!(builder_build(builder), ExternResult::Err(_)));
         }
     }
 
@@ -3216,13 +3248,13 @@ mod tests {
         } // runtime dropped here, before FFI calls
 
         // Build engine using FFI APIs
-        let builder = unsafe {
+        let mut builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
                 allocate_err,
             ))
         };
-        unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
+        unsafe { set_builder_with_multithreaded_executor(&mut builder, 2, 0) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot =
@@ -3295,15 +3327,13 @@ mod tests {
             })?;
         }
 
-        let builder = unsafe {
+        let mut builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
                 allocate_err,
             ))
         };
-        unsafe {
-            set_builder_with_io_concurrency(builder.as_mut().unwrap(), buffer_size, batch_size)
-        };
+        unsafe { set_builder_with_io_concurrency(&mut builder, buffer_size, batch_size) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot =
