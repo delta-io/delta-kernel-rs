@@ -81,10 +81,11 @@ impl CommitRangeBuilder {
     /// path-based builder lists `_delta_log/`; a snapshot-based builder reuses the snapshot's log
     /// segment. Neither path reads commit JSON.
     ///
-    /// Returns [`Error::MissingVersion`] if a snapshot-derived range requires a commit that is not
-    /// available in the snapshot's log segment. Returns an error if the resolved version range is
-    /// invalid (start > end), the listed commits are non-contiguous, or the requested start version
-    /// is unavailable from both the filesystem and the supplied catalog tail.
+    /// Returns [`Error::MissingVersion`] if a snapshot-derived range requires a commit beyond what
+    /// is available from the snapshot's log segment and the supplied catalog tail. Returns an error
+    /// if the resolved version range is invalid (start > end), the listed commits are
+    /// non-contiguous, or the requested start version is unavailable from both the filesystem and
+    /// the supplied catalog tail.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
@@ -105,10 +106,6 @@ impl CommitRangeBuilder {
             let available_end_version = log_tail.last().map_or(log_segment.end_version, |last| {
                 last.version.max(log_segment.end_version)
             });
-            if end_version > available_end_version {
-                return Err(Error::MissingVersion(available_end_version + 1));
-            }
-
             let tail_start_version = log_tail.first().map(|path| path.version);
             let mut commit_files: Vec<_> = log_segment
                 .listed
@@ -121,6 +118,9 @@ impl CommitRangeBuilder {
                 .collect();
             commit_files.sort_unstable_by_key(|path| path.version);
             validate_start_version_available(start_version, commit_files.first())?;
+            if end_version > available_end_version {
+                return Err(Error::MissingVersion(available_end_version + 1));
+            }
             (commit_files, end_version)
         } else {
             let log_segment = LogSegment::for_table_changes_with_log_tail(
@@ -288,6 +288,7 @@ mod tests {
     #[rstest::rstest]
     #[case::start_past_snapshot_version(5, None, 5)]
     #[case::end_past_snapshot_version(0, Some(99), 2)]
+    #[case::start_error_precedes_end_error(5, Some(99), 5)]
     fn test_build_snapshot_based_reports_unavailable_version(
         #[case] start: Version,
         #[case] end: Option<Version>,
@@ -416,6 +417,58 @@ mod tests {
             range.commit_files[1].file_type,
             LogPathFileType::StagedCommit
         );
+    }
+
+    #[test]
+    fn test_build_snapshot_based_catalog_tail_supersedes_published_commit() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root.as_str())
+            .build(&engine)
+            .unwrap();
+        let range = CommitRange::builder_from(snapshot, 0)
+            .with_log_tail(vec![
+                staged_commit(&table_root, 1),
+                staged_commit(&table_root, 2),
+            ])
+            .with_max_catalog_version(2)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), 2);
+        assert_eq!(range.commit_files.len(), 3);
+        assert_eq!(
+            range.commit_files[1].file_type,
+            LogPathFileType::StagedCommit
+        );
+        assert_eq!(range.commit_files[1].version, 1);
+        assert_eq!(range.commit_files[2].version, 2);
+    }
+
+    #[test]
+    fn test_build_snapshot_based_catalog_tail_respects_explicit_end_version() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root.as_str())
+            .build(&engine)
+            .unwrap();
+        let range = CommitRange::builder_from(snapshot, 0)
+            .with_log_tail(vec![
+                staged_commit(&table_root, 1),
+                staged_commit(&table_root, 2),
+            ])
+            .with_max_catalog_version(2)
+            .with_end_version(1)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), 1);
+        assert_eq!(range.commit_files.len(), 2);
+        assert_eq!(
+            range.commit_files[1].file_type,
+            LogPathFileType::StagedCommit
+        );
+        assert_eq!(range.commit_files[1].version, 1);
     }
 
     #[rstest::rstest]
