@@ -775,6 +775,7 @@ impl FfiEngineBuilder {
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiEngineBuilder`].
+#[cfg(feature = "default-engine-base")]
 #[handle_descriptor(target=FfiEngineBuilder, mutable=true, sized=true)]
 pub struct EngineBuilder;
 
@@ -2154,8 +2155,9 @@ mod tests {
     use super::*;
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_string, setup_snapshot,
+        allocate_err, allocate_str, assert_extern_result_error_contains,
+        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
+        setup_snapshot,
     };
 
     #[no_mangle]
@@ -2329,7 +2331,26 @@ mod tests {
         let path = "unsupported-scheme:///doesntmatter/foo";
         unsafe {
             let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
-            assert!(matches!(builder_build(builder), ExternResult::Err(_)));
+            assert_extern_result_error_contains(
+                builder_build(builder),
+                KernelError::ObjectStoreError,
+                "unsupported-scheme",
+            );
+        }
+    }
+
+    #[test]
+    fn rest_object_store_setter_error_keeps_builder_owned() {
+        let path = "memory:///doesntmatter/foo";
+        unsafe {
+            let mut builder =
+                ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            assert_extern_result_error_contains(
+                set_builder_rest_object_store(&mut builder, std::ptr::null(), None, None),
+                KernelError::GenericError,
+                "null CRestEndpointConfig pointer",
+            );
+            free_engine_builder(builder);
         }
     }
 
