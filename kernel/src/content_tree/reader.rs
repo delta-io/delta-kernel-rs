@@ -1,0 +1,540 @@
+//! Read-side translation for the Adaptive Metadata Tree (AMT).
+//!
+//! Translates the content-tree entries of an AMT root manifest into `Add` file actions -- the
+//! inverse of [`super::builder`]. This is the minimal read path: it surfaces live `Data` entries as
+//! `Add` actions and drops everything else. Statistics, partition values, tags, deletion vectors,
+//! and the data-file modification time are not yet carried across (see the per-field TODOs); the
+//! only entry data that flows into the action is the file location, size, and row-tracking numbers.
+
+use std::sync::{Arc, LazyLock};
+
+use crate::actions::{
+    ADD_NAME, ADD_SCHEMA, DATA_CHANGE_NAME, LOG_ADD_SCHEMA, MODIFICATION_TIME_NAME,
+};
+use crate::content_tree::{
+    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, TrackingStatus, CONTENT_TYPE,
+    DV_INFO, DV_SNAPSHOT_ID, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, SEQUENCE_NUMBER, TRACKING,
+    TRACKING_STATUS,
+};
+use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::expressions::{lit, ColumnName, Expression, MapData, Scalar};
+use crate::log_replay::ActionsBatch;
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
+};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
+use crate::{DeltaResult, Engine, Error, ExpressionEvaluator, FileMeta};
+
+/// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
+/// only the rows that read as live data files.
+///
+/// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its tracking
+/// status is [live](TrackingStatus::is_live); every other entry is dropped via the returned
+/// selection vector.
+///
+/// # Parameters
+/// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transform.
+/// - `entries`: a content-tree entry batch matching [`ContentTreeNodeEntry::to_schema`] (the
+///   columnar form produced by [`super::builder`]).
+///
+/// # Returns
+/// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
+/// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read as
+/// live data files. The selection is carried rather than applied so this path is symmetric with the
+/// AMT write path ([`super::builder`]).
+///
+/// # Errors
+/// Returns an error if a row carries an unknown tracking-status value, if a selected (live `Data`)
+/// entry carries a deletion vector (not yet supported by the read path), if the evaluator cannot be
+/// constructed or fails to evaluate, or if the selection vector length exceeds the batch.
+/// Reads an AMT root manifest Parquet file and yields its live data files as `Add`-action batches.
+///
+/// Reads `root_file` as [`ContentTreeNodeEntry`] rows (Parquet field IDs on the schema drive
+/// column mapping), then maps each batch through the same entry->`Add` transform and live-entry
+/// selection as [`convert_root_entries_to_add_actions`] and materializes the selection, so each
+/// returned [`ActionsBatch`] holds only live `Add` rows (schema
+/// [`crate::actions::LOG_ADD_SCHEMA`]). Batches are tagged `is_log_batch = false`: the root
+/// manifest is reconciled, checkpoint-like state, not a commit. The transform evaluator is built
+/// once and reused across batches.
+///
+/// This is the minimal read path -- see [`convert_root_entries_to_add_actions`] for what it does
+/// and does not carry across (only root manifests with inline live `Data` entries; no leaf-manifest
+/// traversal, deletion vectors, partition values, or statistics).
+///
+/// # Errors
+/// Returns an error if the Parquet read fails, if a row carries an unknown tracking-status value,
+/// or if a selected (live `Data`) entry carries a deletion vector (not yet supported).
+pub(crate) fn read_root_manifest_as_add_actions(
+    engine: &dyn Engine,
+    root_file: FileMeta,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    let evaluator = add_action_evaluator(engine)?;
+    let batches = engine.parquet_handler().read_parquet_files(
+        &[root_file],
+        Arc::new(ContentTreeNodeEntry::to_schema()),
+        None,
+    )?;
+    Ok(batches.map(move |batch| {
+        let filtered = filter_entries_to_add(evaluator.as_ref(), batch?.as_ref())?;
+        Ok(ActionsBatch::new(
+            filtered.apply_selection_vector()?,
+            false, /* is_log_batch */
+        ))
+    }))
+}
+
+pub(crate) fn convert_root_entries_to_add_actions(
+    engine: &dyn Engine,
+    entries: &dyn EngineData,
+) -> DeltaResult<FilteredEngineData> {
+    filter_entries_to_add(add_action_evaluator(engine)?.as_ref(), entries)
+}
+
+/// Builds the fixed transform that maps a [`ContentTreeNodeEntry`] batch to a `{ add: Add }` batch
+/// (schema [`crate::actions::LOG_ADD_SCHEMA`]). The transform is data-independent, so it can be
+/// built once and reused across batches.
+fn add_action_evaluator(engine: &dyn Engine) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    let input_schema = Arc::new(ContentTreeNodeEntry::to_schema());
+    let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
+    let expr = build_entry_to_add_expression()?;
+    engine
+        .evaluation_handler()
+        .new_expression_evaluator(input_schema, Arc::new(expr), output_type)
+}
+
+/// Applies `evaluator` to one content-tree entry batch and pairs the resulting `Add`-action batch
+/// with a selection vector keeping only live `Data` entries. See
+/// [`convert_root_entries_to_add_actions`] for the selection rules and errors.
+fn filter_entries_to_add(
+    evaluator: &dyn ExpressionEvaluator,
+    entries: &dyn EngineData,
+) -> DeltaResult<FilteredEngineData> {
+    let mut selector = AddSelectionVisitor::default();
+    selector.visit_rows_of(entries)?;
+    let actions = evaluator.evaluate(entries)?;
+    FilteredEngineData::try_new(actions, selector.selection)
+}
+
+// === Helpers ===
+
+/// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
+/// [`crate::actions::LOG_ADD_SCHEMA`].
+///
+/// Non-null `Add` fields with no AMT source get a placeholder; nullable fields not listed here fall
+/// through to a typed null via [`struct_expr_from_schema`].
+fn build_entry_to_add_expression() -> DeltaResult<Expression> {
+    // TODO: read partition values from the entry's `partition` tuple once the read path carries a
+    // partition spec; the AMT root written by the minimal blind-append path is unpartitioned. The
+    // map type is taken from the action schema so its value-nullability matches
+    // `Add.partitionValues`.
+    let empty_partition_values = lit(Scalar::Map(MapData::try_new(
+        partition_values_map_type()?,
+        Vec::<(Scalar, Scalar)>::new(),
+    )?));
+
+    // `log_replay` field names are `static`, so they cannot be `match` patterns; compare via
+    // guards. `struct_expr_from_schema` fills every unmatched (nullable) field with a typed null,
+    // so `stats`, `tags`, `deletionVector`, and `clusteringProvider` fall through to null until the
+    // read path carries statistics, tags, and inline deletion-vector info across from the entry.
+    let add = struct_expr_from_schema(&ADD_SCHEMA, |name| {
+        Some(match name {
+            // TODO: `location` is the raw path stored in the AMT root; resolving it to a
+            // table-relative `Add.path` (percent-decoding, and relativizing against a manifest
+            // location for non-root entries) is not yet done -- it flows through verbatim, which
+            // round-trips only the minimal-root case that stored the raw path.
+            n if n == PATH_NAME => Expression::column([LOCATION]),
+            // TODO: read partition values from the entry's `partition` tuple once the read path
+            // carries a partition spec.
+            n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
+            n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
+            // TODO: the AMT entry does not carry the data file's modification time; emit a
+            // placeholder until a source (e.g. an entry field or the commit timestamp) is threaded
+            // through.
+            n if n == MODIFICATION_TIME_NAME => lit(i64::MAX),
+            // TODO: `dataChange` is hard-coded true; carry the real value once the entry (or the
+            // commit context) provides it.
+            n if n == DATA_CHANGE_NAME => lit(true),
+            n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
+            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
+                Expression::column([TRACKING, SEQUENCE_NUMBER])
+            }
+            _ => return None,
+        })
+    })?;
+
+    // LOG_ADD_SCHEMA is a single `add` field wrapping the action struct.
+    struct_expr_from_schema(&LOG_ADD_SCHEMA, |name| match name {
+        ADD_NAME => Some(add.clone()),
+        _ => None,
+    })
+}
+
+/// The [`MapType`] of `Add.partitionValues`, read from the action schema so callers match its
+/// declared value-nullability.
+fn partition_values_map_type() -> DeltaResult<MapType> {
+    match ADD_SCHEMA
+        .field(PARTITION_VALUES_NAME)
+        .map(StructField::data_type)
+    {
+        Some(DataType::Map(map)) => Ok(map.as_ref().clone()),
+        other => Err(Error::generic(format!(
+            "Add schema `{PARTITION_VALUES_NAME}` field is not a map: {other:?}"
+        ))),
+    }
+}
+
+/// Builds the selection vector picking the entries that become `Add` actions: a live
+/// ([`TrackingStatus::is_live`]) [`DataContentType::Data`] entry is selected; any other entry is
+/// not.
+///
+/// Errors on a selected entry that carries a deletion vector: the read path does not yet populate
+/// `Add.deletionVector`, so emitting such an entry as a DV-less `Add` would read its logically
+/// deleted rows back as live. Rejecting is conservative until the read path threads DV info across.
+#[derive(Default)]
+struct AddSelectionVisitor {
+    selection: Vec<bool>,
+}
+
+impl RowVisitor for AddSelectionVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![
+                    ColumnName::new([CONTENT_TYPE]),
+                    ColumnName::new([TRACKING, TRACKING_STATUS]),
+                    // `deletionVector.location` is a required field of the DV sub-struct, so it
+                    // reads null iff the `deletionVector` struct itself is null.
+                    ColumnName::new([DV_INFO, LOCATION]),
+                    ColumnName::new([TRACKING, DV_SNAPSHOT_ID]),
+                ],
+                vec![
+                    DataType::INTEGER,
+                    DataType::INTEGER,
+                    DataType::STRING,
+                    DataType::LONG,
+                ],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        const DATA: i32 = DataContentType::Data as i32;
+        self.selection.reserve(row_count);
+        for row in 0..row_count {
+            let content_type: i32 = getters[0].get(row, CONTENT_TYPE)?;
+            let selected = if content_type == DATA {
+                let status: i32 = getters[1].get(row, TRACKING_STATUS)?;
+                TrackingStatus::try_from_repr(status)?.is_live()
+            } else {
+                false
+            };
+            if selected {
+                let dv_location: Option<&str> = getters[2].get_opt(row, LOCATION)?;
+                let dv_snapshot_id: Option<i64> = getters[3].get_opt(row, DV_SNAPSHOT_ID)?;
+                if let Some(field) = dv_location
+                    .map(|_| DV_INFO)
+                    .or_else(|| dv_snapshot_id.map(|_| DV_SNAPSHOT_ID))
+                {
+                    return Err(Error::unsupported(format!(
+                        "AMT content-tree read path does not yet support a live entry with a \
+                         deletion vector (non-null '{field}')"
+                    )));
+                }
+            }
+            self.selection.push(selected);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use url::Url;
+
+    use super::*;
+    use crate::content_tree::{DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo};
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::StructData;
+    use crate::unit_test_utils::assert_result_error_with_message;
+
+    /// AMT/Iceberg format version stamped on entries; irrelevant to the `Add` output but required
+    /// to build a well-formed [`ContentTreeNodeEntry`].
+    const AMT_FORMAT_VERSION: i32 = 4;
+
+    /// A minimal-root `Data`/`Added` entry with the given path, size, and row-tracking numbers.
+    fn added_data_entry(
+        path: &str,
+        size: i64,
+        num_records: i64,
+        base_row_id: i64,
+        commit_version: i64,
+    ) -> ContentTreeNodeEntry {
+        ContentTreeNodeEntry {
+            content_type: DataContentType::Data,
+            location: path.to_string(),
+            file_format: DataFileFormat::Parquet,
+            tracking: TrackingInfo {
+                status: TrackingStatus::Added,
+                snapshot_id: Some(1),
+                dv_snapshot_id: None,
+                sequence_number: Some(commit_version),
+                file_sequence_number: Some(commit_version),
+                first_row_id: Some(base_row_id),
+                deleted_positions: None,
+                replaced_positions: None,
+            },
+            deletion_vector: None,
+            spec_id: 0,
+            partition: None,
+            sort_order_id: None,
+            record_count: num_records,
+            file_size_in_bytes: size,
+            content_stats: None,
+            manifest_info: None,
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            format_version: AMT_FORMAT_VERSION,
+            tags: None,
+        }
+    }
+
+    /// Builds a content-tree entry batch (input to the read path) from explicit entries.
+    fn entry_batch(engine: &dyn Engine, entries: &[ContentTreeNodeEntry]) -> Box<dyn EngineData> {
+        let structs: Vec<StructData> = entries.iter().cloned().map(Into::into).collect();
+        let rows: Vec<Vec<Scalar>> = structs.iter().map(|s| s.values().to_vec()).collect();
+        engine
+            .evaluation_handler()
+            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), rows)
+            .unwrap()
+    }
+
+    /// The expected `{ add: Add }` row for one surviving entry, mirroring
+    /// [`build_entry_to_add_expression`].
+    fn expected_add_row(
+        path: &str,
+        size: i64,
+        base_row_id: i64,
+        commit_version: i64,
+    ) -> Vec<Scalar> {
+        let add = StructData::try_new(
+            ADD_SCHEMA.fields().cloned().collect(),
+            vec![
+                Scalar::from(path),
+                Scalar::Map(
+                    MapData::try_new(
+                        partition_values_map_type().unwrap(),
+                        Vec::<(Scalar, Scalar)>::new(),
+                    )
+                    .unwrap(),
+                ),
+                Scalar::Long(size),
+                Scalar::Long(i64::MAX),
+                Scalar::Boolean(true),
+                null_of("stats"),
+                null_of("tags"),
+                null_of("deletionVector"),
+                Scalar::Long(base_row_id),
+                Scalar::Long(commit_version),
+                null_of("clusteringProvider"),
+                null_of("backReference"),
+            ],
+        )
+        .unwrap();
+        vec![Scalar::Struct(add)]
+    }
+
+    /// A typed null [`Scalar`] for the named `Add` field, so expected values match the schema types
+    /// the transform's null fall-through produces.
+    fn null_of(field: &str) -> Scalar {
+        Scalar::Null(ADD_SCHEMA.field(field).unwrap().data_type().clone())
+    }
+
+    fn expected_batch(engine: &dyn Engine, rows: &[Vec<Scalar>]) -> Box<dyn EngineData> {
+        engine
+            .evaluation_handler()
+            .create_many(LOG_ADD_SCHEMA.clone(), rows.to_vec())
+            .unwrap()
+    }
+
+    #[test]
+    fn converts_added_data_entries_to_add_actions() {
+        let engine = SyncEngine::new();
+        let entries = [
+            added_data_entry("a.parquet", 100, 10, 0, 5),
+            added_data_entry("b.parquet", 200, 20, 10, 5),
+        ];
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
+                .unwrap(),
+        );
+
+        let expected = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 100, 0, 5),
+                expected_add_row("b.parquet", 200, 10, 5),
+            ],
+        );
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[test]
+    fn output_schema_matches_log_add_schema() {
+        use crate::engine::arrow_conversion::TryIntoArrow as _;
+        let engine = SyncEngine::new();
+        let entries = [added_data_entry("a.parquet", 1, 1, 0, 0)];
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
+                .unwrap(),
+        )
+        .try_into_record_batch()
+        .unwrap();
+        let expected = LOG_ADD_SCHEMA.as_ref().try_into_arrow().unwrap();
+        assert_eq!(out.schema().as_ref(), &expected);
+    }
+
+    #[test]
+    fn drops_tombstone_and_non_data_entries() {
+        let engine = SyncEngine::new();
+        let mut deleted = added_data_entry("deleted.parquet", 1, 1, 0, 0);
+        deleted.tracking.status = TrackingStatus::Deleted;
+        let mut manifest = added_data_entry("manifest.parquet", 1, 1, 0, 0);
+        manifest.content_type = DataContentType::DataManifest;
+        manifest.manifest_info = Some(ManifestInfo::default());
+        let live = added_data_entry("live.parquet", 42, 7, 3, 9);
+
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &[deleted, manifest, live]).as_ref(),
+            )
+            .unwrap(),
+        );
+
+        let expected = expected_batch(&engine, &[expected_add_row("live.parquet", 42, 3, 9)]);
+        assert_eq!(
+            out.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(TrackingStatus::Existing, true)]
+    #[case(TrackingStatus::Added, true)]
+    #[case(TrackingStatus::Modified, true)]
+    #[case(TrackingStatus::Deleted, false)]
+    #[case(TrackingStatus::Replaced, false)]
+    fn selects_only_live_data_entries(#[case] status: TrackingStatus, #[case] kept: bool) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
+                .unwrap(),
+        );
+        assert_eq!(out.len(), usize::from(kept));
+    }
+
+    #[rstest]
+    #[case::deletion_vector_struct(true, false)]
+    #[case::dv_snapshot_id(false, true)]
+    fn live_entry_with_deletion_vector_errors(
+        #[case] set_deletion_vector: bool,
+        #[case] set_dv_snapshot_id: bool,
+    ) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        if set_deletion_vector {
+            entry.deletion_vector = Some(DeletionVectorInfo {
+                location: "dv.bin".to_string(),
+                offset: 0,
+                size_in_bytes: 1,
+                cardinality: 1,
+            });
+        }
+        if set_dv_snapshot_id {
+            entry.tracking.dv_snapshot_id = Some(1);
+        }
+        let result =
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
+        assert_result_error_with_message(result, "deletion vector");
+    }
+
+    #[test]
+    fn empty_input_yields_empty_batch() {
+        let engine = SyncEngine::new();
+        let out = filtered_to_batch(
+            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
+                .unwrap(),
+        );
+        assert_eq!(out.len(), 0);
+    }
+
+    /// Materializes a [`FilteredEngineData`] by applying its selection vector, so tests can compare
+    /// against the surviving `Add` rows.
+    fn filtered_to_batch(filtered: FilteredEngineData) -> Box<dyn EngineData> {
+        filtered.apply_selection_vector().unwrap()
+    }
+
+    /// End-to-end: write a content-tree entry batch to a real Parquet file, then read it back
+    /// through [`read_root_manifest_as_add_actions`], exercising the Parquet reader + transform +
+    /// selection together. Tombstone and manifest entries must be dropped.
+    #[test]
+    fn reads_root_manifest_parquet_into_live_add_actions() {
+        let engine = SyncEngine::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.parquet");
+        let url = Url::from_file_path(&path).unwrap();
+
+        let mut deleted = added_data_entry("deleted.parquet", 1, 1, 0, 0);
+        deleted.tracking.status = TrackingStatus::Deleted;
+        let mut manifest = added_data_entry("m.parquet", 1, 1, 0, 0);
+        manifest.content_type = DataContentType::DataManifest;
+        manifest.manifest_info = Some(ManifestInfo::default());
+        let entries = [
+            added_data_entry("a.parquet", 100, 10, 0, 5),
+            deleted,
+            manifest,
+            added_data_entry("b.parquet", 200, 20, 10, 5),
+        ];
+        let batch = entry_batch(&engine, &entries);
+        engine
+            .parquet_handler()
+            .write_parquet_file(url.clone(), Box::new(std::iter::once(Ok(batch))))
+            .unwrap();
+
+        let file = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: std::fs::metadata(&path).unwrap().len(),
+        };
+        let batches: Vec<_> = read_root_manifest_as_add_actions(&engine, file)
+            .unwrap()
+            .collect::<DeltaResult<_>>()
+            .unwrap();
+
+        // A single small write produces one row group, hence one batch of the two live entries.
+        assert_eq!(batches.len(), 1);
+        let batch = batches.into_iter().next().unwrap();
+        assert!(!batch.is_log_batch);
+        let expected = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 100, 0, 5),
+                expected_add_row("b.parquet", 200, 10, 5),
+            ],
+        );
+        assert_eq!(
+            batch.actions.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
+    }
+}

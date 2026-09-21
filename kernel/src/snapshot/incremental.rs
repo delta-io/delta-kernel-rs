@@ -9,6 +9,8 @@ use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
 use crate::cancellation::CancellationTokenRef;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -194,6 +196,8 @@ impl Snapshot {
             .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let checkpoint_action;
         let (new_metadata, new_protocol, source) = match &crc_at_version {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
@@ -202,6 +206,11 @@ impl Snapshot {
                     .then(|| crc.metadata.clone());
                 let new_protocol = (crc.protocol != *existing_table_config.protocol())
                     .then(|| crc.protocol.clone());
+                // Reusing an incremental CRC means no log replay ran.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    checkpoint_action = CheckpointActionResolution::Unknown;
+                }
                 (new_metadata, new_protocol, *source)
             }
             None => {
@@ -212,10 +221,18 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
-                combined_log_segment
+                let resolution = combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
-                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+                // This replay covers only commits after the existing snapshot, so a missing
+                // checkpoint is `Unknown` (`latest_checkpoint_action` falls back to a full log
+                // pass); a captured one is the table's newest.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    checkpoint_action = resolution.checkpoint_action;
+                }
+                (resolution.metadata, resolution.protocol, resolution.source)
             }
         };
         emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
@@ -228,13 +245,16 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
-        Ok(Arc::new(Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
             built_as_latest,
             skipped_new_checkpoints,
-        )?))
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let snapshot = snapshot.with_checkpoint_action(checkpoint_action);
+        Ok(Arc::new(snapshot))
     }
 
     // ============================================================================

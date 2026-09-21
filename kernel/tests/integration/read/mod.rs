@@ -2,6 +2,10 @@
 // read tests.
 mod scan_cancellation;
 
+// AMT (adaptiveMetadata) content-tree scan dispatch. Gated: the file requires the feature.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod adaptive_metadata_scan;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::vec;

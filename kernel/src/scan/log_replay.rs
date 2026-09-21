@@ -773,6 +773,7 @@ pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
 pub(crate) static SIZE_NAME: &str = "size";
 pub(crate) static TAGS_NAME: &str = "tags";
+pub(crate) static STATS_NAME: &str = "stats";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
 pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
@@ -785,13 +786,13 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable PATH_NAME: STRING,
     nullable SIZE_NAME: LONG,
     nullable "modificationTime": LONG,
-    nullable "stats": STRING,
+    nullable STATS_NAME: STRING,
     nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
     nullable FILE_CONSTANT_VALUES_NAME: {
         nullable PARTITION_VALUES_NAME: { STRING => nullable STRING },
         nullable BASE_ROW_ID_NAME: LONG,
         nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
-        nullable "tags": { STRING => nullable STRING },
+        nullable TAGS_NAME: { STRING => nullable STRING },
         nullable CLUSTERING_PROVIDER_NAME: STRING,
     },
 };

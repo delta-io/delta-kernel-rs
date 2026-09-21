@@ -196,6 +196,60 @@ async fn build_and_check_pm<E: Engine>(
     );
 }
 
+// A snapshot built from a manifest commit captures the `checkpoint` action during P&M replay, so
+// `latest_checkpoint_action` serves it without a fallback log pass.
+#[tokio::test]
+async fn latest_checkpoint_action_captured_from_manifest_commit() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &["adaptiveMetadata-preview"], ONE_COLUMN_SCHEMA_STRING),
+    )
+    .await
+    .unwrap();
+
+    let engine = non_plan_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    let checkpoint = snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action should be captured");
+    assert_eq!(checkpoint.version(), 0);
+    assert_eq!(checkpoint.path(), "metadata/root.parquet");
+}
+
+// A table with no `checkpoint` action resolves to `None`: replay breaks early (P&M is complete),
+// leaving the resolution `Unknown`, and the fallback log pass confirms there is none.
+#[tokio::test]
+async fn latest_checkpoint_action_none_without_checkpoint() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        format!(
+            "{}\n{}",
+            protocol_commit(1, 2),
+            metadata_commit(ONE_COLUMN_SCHEMA_STRING)
+        ),
+    )
+    .await
+    .unwrap();
+
+    let engine = non_plan_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    assert!(snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .is_none());
+}
+
 #[tokio::test]
 async fn test_lagging_checkpoint_ranks_by_checkpoint_version() {
     assert_lagging_checkpoint_loses_to_gap_commit(non_plan_engine).await;
