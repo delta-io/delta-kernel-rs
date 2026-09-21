@@ -15,10 +15,14 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LOG_ADD_SCHEMA;
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::read_root_manifest_as_add_actions;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -38,11 +42,15 @@ use crate::scan::log_replay::{
 };
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::scan::transform_spec::FieldTransformSpec;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
     StructField, StructType, ToSchema as _,
 };
 use crate::table_configuration::TableConfiguration;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::TableFeature;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
@@ -1163,6 +1171,41 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
+        // AMT tables record their data files in the checkpoint action's content tree rather than as
+        // `add` actions, so read the root manifest instead of classic replay. Falls through to
+        // classic replay when the table is not AMT or has no checkpoint action yet. The two arms
+        // differ in iterator type; `Either` unifies them without boxing.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let result = match self.try_amt_content_tree_replay(engine)? {
+                Some(amt) => ActionsWithCheckpointInfo {
+                    actions: itertools::Either::Left(amt.actions),
+                    checkpoint_info: amt.checkpoint_info,
+                },
+                None => {
+                    let classic = self.classic_replay_for_scan_metadata(engine)?;
+                    ActionsWithCheckpointInfo {
+                        actions: itertools::Either::Right(classic.actions),
+                        checkpoint_info: classic.checkpoint_info,
+                    }
+                }
+            };
+            Ok(result)
+        }
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        {
+            self.classic_replay_for_scan_metadata(engine)
+        }
+    }
+
+    /// Classic Add/Remove log replay: reads the commit cover and checkpoint, projecting away any
+    /// AMT `checkpoint` action. This is the only path for non-AMT tables.
+    fn classic_replay_for_scan_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
@@ -1181,6 +1224,95 @@ impl Scan {
                     .map(|s| s.as_ref()),
                 self.cancellation_token.as_ref(),
             )
+    }
+
+    /// If this table uses AMT and has a `checkpoint` action, produce the scan's `Add` batches from
+    /// its content-tree root manifest instead of classic log replay. Returns `Ok(None)` to fall
+    /// back to classic replay (feature-supported but the table has no checkpoint action yet).
+    ///
+    /// # Errors
+    /// Returns [`Error::unsupported`] for the cases the minimal read path cannot yet handle
+    /// correctly -- partitioned tables, row-commit-version generation, sidecar-spilled checkpoints,
+    /// or a checkpoint older than the snapshot version -- and propagates manifest-read errors
+    /// (e.g. a live entry with a deletion vector).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn try_amt_content_tree_replay(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<
+        Option<ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>>,
+    > {
+        // Cheap gate first, so classic tables never pay for checkpoint-action detection.
+        if !self
+            .snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::AdaptiveMetadataPreview)
+        {
+            return Ok(None);
+        }
+        let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? else {
+            return Ok(None);
+        };
+
+        // === MVP guards: reject what the minimal read path cannot yet handle correctly. ===
+
+        // Sidecar-spilled txn/domainMetadata entries are not read yet.
+        if !checkpoint.txn_sidecars.is_empty() || !checkpoint.domain_metadata_sidecars.is_empty() {
+            return Err(Error::unsupported(
+                "AMT content-tree scan does not yet support a checkpoint that spills txns or \
+                 domain metadata to sidecars",
+            ));
+        }
+
+        // The reader emits an empty partition-values map, so a partitioned table would lose them.
+        if self.state_info.physical_partition_schema.is_some()
+            || !self
+                .snapshot
+                .table_configuration()
+                .metadata()
+                .partition_columns()
+                .is_empty()
+        {
+            return Err(Error::unsupported(
+                "AMT content-tree scan does not yet support partitioned tables",
+            ));
+        }
+
+        // The reader nulls defaultRowCommitVersion, so a scan generating that column would read
+        // nulls back; reject rather than return wrong data.
+        let generates_row_commit_version =
+            self.state_info.transform_spec.as_ref().is_some_and(|s| {
+                s.iter()
+                    .any(|t| matches!(t, FieldTransformSpec::GenerateRowCommitVersion { .. }))
+            });
+        if generates_row_commit_version {
+            return Err(Error::unsupported(
+                "AMT content-tree scan does not yet support the row commit version column",
+            ));
+        }
+
+        // AMT data files live only in the manifest tree, so classic replay cannot cover commits
+        // after the checkpoint. Require the checkpoint to reflect exactly the snapshot version;
+        // post-checkpoint incremental replay is a follow-up.
+        if !u64::try_from(checkpoint.version()).is_ok_and(|v| v == self.snapshot.version()) {
+            return Err(Error::unsupported(format!(
+                "AMT content-tree scan requires the checkpoint version ({}) to equal the snapshot \
+                 version ({}); post-checkpoint incremental replay is not yet supported",
+                checkpoint.version(),
+                self.snapshot.version()
+            )));
+        }
+
+        let root_file = checkpoint.root_filemeta(self.snapshot.table_root())?;
+        let actions = read_root_manifest_as_add_actions(engine, root_file)?;
+        Ok(Some(ActionsWithCheckpointInfo {
+            actions,
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: false,
+                has_partition_values_parsed: false,
+                checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
+            },
+        }))
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.

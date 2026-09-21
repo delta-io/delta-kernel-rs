@@ -2,13 +2,10 @@
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
-use crate::actions::{
-    CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, CHECKPOINT_ACTION_FIELD,
-};
+use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;
 use crate::log_segment::DomainMetadataMap;
-use crate::schema::StructType;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
@@ -117,15 +114,7 @@ impl RootManifestFile {
             Some(SetTransactionState::Complete(_))
         );
 
-        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
-        let mut checkpoint_action = None;
-        for batch in snapshot.log_segment().read_actions(engine, schema)? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
-            {
-                checkpoint_action = Some(checkpoint);
-                break;
-            }
-        }
+        let checkpoint_action = snapshot.latest_checkpoint_action(engine)?;
 
         // Reject a checkpoint that spilled txns/domain metadata to sidecars, since sidecars aren't
         // read yet and that state would be lost.

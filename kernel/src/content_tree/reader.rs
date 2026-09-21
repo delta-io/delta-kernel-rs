@@ -18,11 +18,12 @@ use crate::content_tree::{
 };
 use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ColumnName, Expression, MapData, Scalar};
+use crate::log_replay::ActionsBatch;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, Error, ExpressionEvaluator, FileMeta};
 
 /// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
 /// only the rows that read as live data files.
@@ -46,21 +47,70 @@ use crate::{DeltaResult, Engine, Error};
 /// Returns an error if a row carries an unknown tracking-status value, if a selected (live `Data`)
 /// entry carries a deletion vector (not yet supported by the read path), if the evaluator cannot be
 /// constructed or fails to evaluate, or if the selection vector length exceeds the batch.
+/// Reads an AMT root manifest Parquet file and yields its live data files as `Add`-action batches.
+///
+/// Reads `root_file` as [`ContentTreeNodeEntry`] rows (Parquet field IDs on the schema drive
+/// column mapping), then maps each batch through the same entry->`Add` transform and live-entry
+/// selection as [`convert_root_entries_to_add_actions`] and materializes the selection, so each
+/// returned [`ActionsBatch`] holds only live `Add` rows (schema
+/// [`crate::actions::LOG_ADD_SCHEMA`]). Batches are tagged `is_log_batch = false`: the root
+/// manifest is reconciled, checkpoint-like state, not a commit. The transform evaluator is built
+/// once and reused across batches.
+///
+/// This is the minimal read path -- see [`convert_root_entries_to_add_actions`] for what it does
+/// and does not carry across (only root manifests with inline live `Data` entries; no leaf-manifest
+/// traversal, deletion vectors, partition values, or statistics).
+///
+/// # Errors
+/// Returns an error if the Parquet read fails, if a row carries an unknown tracking-status value,
+/// or if a selected (live `Data`) entry carries a deletion vector (not yet supported).
+pub(crate) fn read_root_manifest_as_add_actions(
+    engine: &dyn Engine,
+    root_file: FileMeta,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    let evaluator = add_action_evaluator(engine)?;
+    let batches = engine.parquet_handler().read_parquet_files(
+        &[root_file],
+        Arc::new(ContentTreeNodeEntry::to_schema()),
+        None,
+    )?;
+    Ok(batches.map(move |batch| {
+        let filtered = filter_entries_to_add(evaluator.as_ref(), batch?.as_ref())?;
+        Ok(ActionsBatch::new(
+            filtered.apply_selection_vector()?,
+            false, /* is_log_batch */
+        ))
+    }))
+}
+
 pub(crate) fn convert_root_entries_to_add_actions(
     engine: &dyn Engine,
     entries: &dyn EngineData,
 ) -> DeltaResult<FilteredEngineData> {
-    let mut selector = AddSelectionVisitor::default();
-    selector.visit_rows_of(entries)?;
+    filter_entries_to_add(add_action_evaluator(engine)?.as_ref(), entries)
+}
 
+/// Builds the fixed transform that maps a [`ContentTreeNodeEntry`] batch to a `{ add: Add }` batch
+/// (schema [`crate::actions::LOG_ADD_SCHEMA`]). The transform is data-independent, so it can be
+/// built once and reused across batches.
+fn add_action_evaluator(engine: &dyn Engine) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
     let input_schema = Arc::new(ContentTreeNodeEntry::to_schema());
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
     let expr = build_entry_to_add_expression()?;
-    let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        input_schema,
-        Arc::new(expr),
-        output_type,
-    )?;
+    engine
+        .evaluation_handler()
+        .new_expression_evaluator(input_schema, Arc::new(expr), output_type)
+}
+
+/// Applies `evaluator` to one content-tree entry batch and pairs the resulting `Add`-action batch
+/// with a selection vector keeping only live `Data` entries. See
+/// [`convert_root_entries_to_add_actions`] for the selection rules and errors.
+fn filter_entries_to_add(
+    evaluator: &dyn ExpressionEvaluator,
+    entries: &dyn EngineData,
+) -> DeltaResult<FilteredEngineData> {
+    let mut selector = AddSelectionVisitor::default();
+    selector.visit_rows_of(entries)?;
     let actions = evaluator.evaluate(entries)?;
     FilteredEngineData::try_new(actions, selector.selection)
 }
@@ -202,6 +252,7 @@ impl RowVisitor for AddSelectionVisitor {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use url::Url;
 
     use super::*;
     use crate::content_tree::{DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo};
@@ -431,5 +482,59 @@ mod tests {
     /// against the surviving `Add` rows.
     fn filtered_to_batch(filtered: FilteredEngineData) -> Box<dyn EngineData> {
         filtered.apply_selection_vector().unwrap()
+    }
+
+    /// End-to-end: write a content-tree entry batch to a real Parquet file, then read it back
+    /// through [`read_root_manifest_as_add_actions`], exercising the Parquet reader + transform +
+    /// selection together. Tombstone and manifest entries must be dropped.
+    #[test]
+    fn reads_root_manifest_parquet_into_live_add_actions() {
+        let engine = SyncEngine::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.parquet");
+        let url = Url::from_file_path(&path).unwrap();
+
+        let mut deleted = added_data_entry("deleted.parquet", 1, 1, 0, 0);
+        deleted.tracking.status = TrackingStatus::Deleted;
+        let mut manifest = added_data_entry("m.parquet", 1, 1, 0, 0);
+        manifest.content_type = DataContentType::DataManifest;
+        manifest.manifest_info = Some(ManifestInfo::default());
+        let entries = [
+            added_data_entry("a.parquet", 100, 10, 0, 5),
+            deleted,
+            manifest,
+            added_data_entry("b.parquet", 200, 20, 10, 5),
+        ];
+        let batch = entry_batch(&engine, &entries);
+        engine
+            .parquet_handler()
+            .write_parquet_file(url.clone(), Box::new(std::iter::once(Ok(batch))))
+            .unwrap();
+
+        let file = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: std::fs::metadata(&path).unwrap().len(),
+        };
+        let batches: Vec<_> = read_root_manifest_as_add_actions(&engine, file)
+            .unwrap()
+            .collect::<DeltaResult<_>>()
+            .unwrap();
+
+        // A single small write produces one row group, hence one batch of the two live entries.
+        assert_eq!(batches.len(), 1);
+        let batch = batches.into_iter().next().unwrap();
+        assert!(!batch.is_log_batch);
+        let expected = expected_batch(
+            &engine,
+            &[
+                expected_add_row("a.parquet", 100, 0, 5),
+                expected_add_row("b.parquet", 200, 10, 5),
+            ],
+        );
+        assert_eq!(
+            batch.actions.try_into_record_batch().unwrap(),
+            expected.try_into_record_batch().unwrap()
+        );
     }
 }

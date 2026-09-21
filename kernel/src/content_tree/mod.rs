@@ -6,8 +6,8 @@
 
 mod builder;
 mod dv_conversion;
-mod reader;
 mod location;
+mod reader;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use delta_kernel_derive::ToSchema;
 pub(crate) use location::resolve_amt_location;
+pub(crate) use reader::read_root_manifest_as_add_actions;
 use url::Url;
 
 use crate::engine_data::EngineData;

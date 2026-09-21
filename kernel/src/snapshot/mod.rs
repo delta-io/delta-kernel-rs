@@ -12,6 +12,8 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::CheckpointAction;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -24,6 +26,8 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
@@ -93,6 +97,11 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// How the table's latest AMT `checkpoint` action resolved during P&M replay. Consulted by
+    /// [`Snapshot::latest_checkpoint_action`]; defaults to
+    /// [`Unknown`](CheckpointActionResolution::Unknown) for constructors that do no replay.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_action: CheckpointActionResolution,
 }
 
 impl PartialEq for Snapshot {
@@ -199,7 +208,20 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            // No replay has run here; a caller that did replay overrides this via
+            // `with_checkpoint_action`.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: CheckpointActionResolution::Unknown,
         })
+    }
+
+    /// Records how the table's latest AMT `checkpoint` action resolved during this snapshot's P&M
+    /// replay. Only the constructors that perform replay call this; others leave the default
+    /// [`Unknown`](CheckpointActionResolution::Unknown).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn with_checkpoint_action(mut self, checkpoint_action: CheckpointActionResolution) -> Self {
+        self.checkpoint_action = checkpoint_action;
+        self
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -226,11 +248,28 @@ impl Snapshot {
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full).
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let checkpoint_action;
         let (metadata, protocol, source) = match &crc_at_version {
-            Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
-            None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
-                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
+            Some((crc, source)) => {
+                // Using a CRC directly means no log replay ran, so the checkpoint action is
+                // unknown.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    checkpoint_action = CheckpointActionResolution::Unknown;
+                }
+                (crc.metadata.clone(), crc.protocol.clone(), *source)
+            }
+            None => {
+                let resolution = log_segment
+                    .read_protocol_metadata(engine, base_crc.as_ref())
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    checkpoint_action = resolution.checkpoint_action;
+                }
+                (resolution.metadata, resolution.protocol, resolution.source)
+            }
         };
         emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
 
@@ -240,13 +279,16 @@ impl Snapshot {
         tracing::Span::current().record("version", table_configuration.version());
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(
+        let snapshot = Self::new_with_crc(
             log_segment,
             table_configuration,
             crc,
             built_as_latest,
             false, /* skipped_new_checkpoints */
-        )
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let snapshot = snapshot.with_checkpoint_action(checkpoint_action);
+        Ok(snapshot)
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -319,6 +361,23 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
+    }
+
+    /// The table's latest AMT `checkpoint` action, or `None` if the table has none.
+    ///
+    /// Served with zero I/O when P&M replay [captured](CheckpointActionResolution::Captured) the
+    /// action; on an inconclusive [`Unknown`](CheckpointActionResolution::Unknown) resolution (e.g.
+    /// a CRC-at-target load did no replay, or replay broke early before observing one), falls back
+    /// to a fresh log pass via [`LogSegment::find_checkpoint_action`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        match &self.checkpoint_action {
+            CheckpointActionResolution::Captured(checkpoint) => Ok(Some((**checkpoint).clone())),
+            CheckpointActionResolution::Unknown => self.log_segment.find_checkpoint_action(engine),
+        }
     }
 
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
