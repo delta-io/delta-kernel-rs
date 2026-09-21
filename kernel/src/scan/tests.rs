@@ -805,6 +805,7 @@ fn test_get_partition_value() {
         let value = crate::scan::transform_spec::parse_partition_value_raw(
             Some(&raw.to_string()),
             &DataType::Primitive(data_type.clone()),
+            crate::partition_values::TimestampTimezone::default(),
         )
         .unwrap();
         assert_eq!(value, *expected);

@@ -22,6 +22,7 @@ use crate::log_replay::{
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
+use crate::partition_values::TimestampTimezone;
 use crate::scan::transform_spec::{
     get_transform_expr, parse_partition_values, FileRowTrackingMetadata, TransformSpec,
 };
@@ -178,6 +179,8 @@ pub struct ScanLogReplayProcessor {
     stats_options: ScanStatsOptions,
     /// Read-time partition value options.
     partition_values_options: ScanPartitionValuesOptions,
+    /// Validated timezone used by per-file row transforms.
+    timestamp_timezone: TimestampTimezone,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
@@ -268,6 +271,8 @@ impl ScanLogReplayProcessor {
             synthesize_json,
         } = stats_options;
         let timestamp_timezone_name = partition_values_options.timestamp_timezone.as_deref();
+        let timestamp_timezone =
+            timestamp_timezone_name.map_or_else(|| Ok(TimestampTimezone::default()), str::parse)?;
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -364,6 +369,7 @@ impl ScanLogReplayProcessor {
             state_info,
             stats_options,
             partition_values_options,
+            timestamp_timezone,
             checkpoint_info,
             metrics,
         })
@@ -597,6 +603,7 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
+    timestamp_timezone: TimestampTimezone,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     active_add_file_sizes: Vec<u64>,
     metrics: &'a ScanMetrics,
@@ -608,12 +615,14 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         metrics: &'a ScanMetrics,
+        timestamp_timezone: TimestampTimezone,
     ) -> AddRemoveDedupVisitor<'a, D> {
         let active_add_file_sizes = vec![0; selection_vector.len()];
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
             state_info,
+            timestamp_timezone,
             row_transform_exprs: Vec::new(),
             active_add_file_sizes,
             metrics,
@@ -687,6 +696,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                     transform,
                     &partition_values,
                     self.state_info.column_mapping_mode,
+                    self.timestamp_timezone.clone(),
                 )?
             }
             _ => Default::default(),
@@ -1190,6 +1200,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 pre_dedup_selection,
                 self.state_info.clone(),
                 &self.metrics,
+                self.timestamp_timezone.clone(),
             );
             visitor.visit_rows_of(actions.as_ref())?;
             (
@@ -1296,6 +1307,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 pre_dedup_selection,
                 self.state_info.clone(),
                 &self.metrics,
+                self.timestamp_timezone.clone(),
             );
             visitor.visit_rows_of(actions.as_ref())?;
             (
