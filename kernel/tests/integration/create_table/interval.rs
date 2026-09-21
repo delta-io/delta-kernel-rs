@@ -36,7 +36,7 @@ fn test_create_table_rejects_interval_clustering(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![clustering_column],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref());
     test_utils::assert_result_error_with_message(result, "unsupported type");
     Ok(())
 }
@@ -86,8 +86,12 @@ mod supported {
 
         let _ = create_table(&table_path, schema.clone(), "Test/1.0")
             .with_table_properties(cm_properties(cm_mode))
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?;
+            .build(engine.as_ref())?
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?;
 
         let table_url = delta_kernel::try_parse_uri(&table_path)?;
         let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;

@@ -26,8 +26,9 @@
 //       - get_logical_to_physical    -- transform to apply per batch
 //       - get_write_path             -- table root URL (partitioned write
 //                                       directory support tracked by #2355)
-//   - set_data_change(txn, false) because this empty commit does not add data
-//   - commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
+//   - with_data_change(txn, false, engine) because this empty commit does not add data
+//   - commit(txn, engine) to produce an empty commit, returning a commit-result handle
+//   - commit_result_into_committed to consume a successful result
 //   - committed_transaction_version + committed_transaction_post_commit_snapshot to read the
 //     version and the post-commit snapshot directly from the result, avoiding a fresh
 //     snapshot load
@@ -75,10 +76,17 @@ int main(int argc, char* argv[]) {
   }
   ExclusiveTransaction* txn = txn_res.ok;
 
-  // set_data_change does not consume the handle. This commit has no data, so dataChange=false.
-  // Setting it here (before with_engine_info) is fine: the consume-and-return chain below
-  // preserves staged transaction state across handle handoffs.
-  set_data_change(txn, false);
+  // This commit has no data, so dataChange=false. The configuration call consumes and returns
+  // the transaction handle.
+  ExternResultHandleExclusiveTransaction with_data_change_res =
+      with_data_change(txn, false, engine);
+  if (with_data_change_res.tag != OkHandleExclusiveTransaction) {
+    print_error("with_data_change failed.", (Error*)with_data_change_res.err);
+    free_error((Error*)with_data_change_res.err);
+    free_engine(engine);
+    return 1;
+  }
+  txn = with_data_change_res.ok;
 
   // Attach engine_info. CONSUMES and returns the transaction handle.
   const char* engine_info = "write_table_example";
@@ -133,14 +141,29 @@ int main(int argc, char* argv[]) {
   free_write_context(write_context);
 
   // === Commit ===
-  ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
-  if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
+  ExternResultHandleExclusiveCommitResult commit_res = commit(txn, engine);
+  if (commit_res.tag != OkHandleExclusiveCommitResult) {
     print_error("commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);
     free_engine(engine);
     return 1;
   }
-  HandleExclusiveCommittedTransaction committed = commit_res.ok;
+  HandleExclusiveCommitResult result = commit_res.ok;
+  if (commit_result_kind(&result) != Committed) {
+    fprintf(stderr, "Commit did not succeed; result kind: %d\n", commit_result_kind(&result));
+    free_commit_result(result);
+    free_engine(engine);
+    return 1;
+  }
+  ExternResultHandleExclusiveCommittedTransaction committed_res =
+      commit_result_into_committed(result, engine);
+  if (committed_res.tag != OkHandleExclusiveCommittedTransaction) {
+    print_error("Failed to extract committed transaction.", (Error*)committed_res.err);
+    free_error((Error*)committed_res.err);
+    free_engine(engine);
+    return 1;
+  }
+  HandleExclusiveCommittedTransaction committed = committed_res.ok;
   printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
 
   // === Read post-commit snapshot directly from the CommittedTransaction ===

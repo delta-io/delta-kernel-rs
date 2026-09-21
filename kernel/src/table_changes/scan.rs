@@ -534,9 +534,13 @@ mod tests {
         };
         create_table(url_str, schema, "DefaultEngine")
             .with_table_properties([("delta.enableChangeDataFeed", "true")])
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(
+                &engine,
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )
             .unwrap()
             .unwrap_committed();
 

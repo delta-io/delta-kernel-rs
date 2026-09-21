@@ -28,6 +28,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
+use crate::transaction::TransactionOptions;
 use crate::unit_test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
@@ -803,10 +804,18 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let result = txn
-            .with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?;
+        let result = snapshot
+            .transaction_builder()
+            .with_options(
+                TransactionOptions::new()
+                    .with_domain_metadata(domain.to_string(), value.to_string()),
+            )
+            .build(&engine)?
+            .commit(
+                &engine,
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?;
         assert!(result.is_committed());
         Ok(())
     };
@@ -879,10 +888,17 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let result = txn
-        .with_domain_metadata("foo".to_string(), "bar".to_string())
-        .commit(&engine)?;
+    let result = snapshot
+        .transaction_builder()
+        .with_options(
+            TransactionOptions::new().with_domain_metadata("foo".to_string(), "bar".to_string()),
+        )
+        .build(&engine)?
+        .commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
     assert!(result.is_committed());
 
     // Verify domain exists before removal
@@ -894,10 +910,15 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 
     // ===== Remove domain metadata for "foo" (tombstone) =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let result = txn
+    let result = snapshot
+        .transaction_builder()
         .with_domain_metadata_removed("foo".to_string())
-        .commit(&engine)?;
+        .build(&engine)?
+        .commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
     assert!(result.is_committed());
 
     // Verify domain is gone before checkpoint
@@ -928,8 +949,12 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         schema_ref! { nullable "value": INTEGER },
         "test",
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 
     // Version 1
     add_commit(

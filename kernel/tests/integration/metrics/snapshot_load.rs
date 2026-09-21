@@ -21,6 +21,7 @@ use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::TransactionOptions;
 #[cfg(feature = "internal-api")]
 use delta_kernel::LogPath;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -403,8 +404,12 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
 
     // commit 0: create table, then write its CRC (write_checksum needs the post-commit CRC).
     let create_committed = create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?
+        .build(setup_engine.as_ref())?
+        .commit(
+            setup_engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     create_committed
         .post_commit_snapshot()
@@ -559,16 +564,28 @@ async fn setup_table_with_dms_and_set_txns(
     let snap_v0 = create_table(&table_path, simple_schema(), "Test/1.0")
         .with_table_properties(properties)
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            committer().as_ref(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
 
     let snap_v1 = snap_v0
-        .transaction(committer(), engine.as_ref())?
-        .with_operation("WRITE".to_string())
-        .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
-        .with_transaction_id("my-app".to_string(), 1)
-        .commit(engine.as_ref())?
+        .transaction_builder()
+        .with_operation(delta_kernel::transaction::Operation::Write)
+        .with_options(
+            TransactionOptions::new()
+                .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
+                .with_transaction_id("my-app".to_string(), 1),
+        )
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            committer().as_ref(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
 
     if write_crc {

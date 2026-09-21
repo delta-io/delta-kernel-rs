@@ -27,7 +27,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, TransactionOptions};
 use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -36,8 +36,8 @@ use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_add_files_metadata,
     create_default_engine, create_default_engine_mt_executor, insert_data, into_record_batch,
-    load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_table_p37,
-    setup_test_tables, test_table_setup,
+    read_actions_from_commit, replace_array_row, setup_test_table_p37, setup_test_tables,
+    test_table_setup,
 };
 use url::Url;
 
@@ -96,11 +96,19 @@ async fn append_only_enforces_data_change_for_file_actions(
             ("delta.appendOnly", "true"),
             ("delta.enableDeletionVectors", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
     let write_context = txn.write_state()?.write_context_builder().build()?;
+    let mut add_actions = delta_kernel::transaction::CommitActions::new();
     let arrow_schema: Arc<ArrowSchema> = Arc::new(
         write_context
             .physical_data_schema()
@@ -112,9 +120,11 @@ async fn append_only_enforces_data_change_for_file_actions(
             arrow_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![value]))],
         )?);
-        txn.add_files(engine.write_parquet(&data, &write_context).await?);
+        add_actions.add_files(engine.write_parquet(&data, &write_context).await?);
     }
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let snapshot = txn
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), add_actions)?
+        .unwrap_post_commit_snapshot();
 
     let staged_batches = (0..2)
         .map(|index| {
@@ -129,17 +139,20 @@ async fn append_only_enforces_data_change_for_file_actions(
             FilteredEngineData::try_new(data, selection_vector)
         })
         .collect::<DeltaResult<Vec<_>>>()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?
-        .with_operation("DELETE".to_string())
-        .with_data_change(data_change);
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(delta_kernel::transaction::Operation::Delete)
+        .with_data_change(data_change)
+        .build(engine.as_ref())?;
     // NOTE: The data_change=false cases do not preserve removed records in replacement AddFiles.
     // This is not a valid rearrangement, we construct such commit only for testing.
     let commit_result = match operation {
         AppendOnlyWrite::Remove => {
+            let mut actions = delta_kernel::transaction::CommitActions::new();
             for scan_files in staged_batches {
-                txn.remove_files(scan_files);
+                actions.remove_files(scan_files);
             }
-            txn.commit(engine.as_ref())
+            txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)
         }
         AppendOnlyWrite::DeletionVectorUpdate => {
             let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
@@ -163,8 +176,9 @@ async fn append_only_enforces_data_change_for_file_actions(
                     (path, dv)
                 })
                 .collect();
-            txn.update_deletion_vectors(dv_map, staged_batches.into_iter().map(Ok))?;
-            txn.commit(engine.as_ref())
+            let mut actions = delta_kernel::transaction::CommitActions::new();
+            actions.update_deletion_vectors(dv_map, staged_batches.into_iter().map(Ok))?;
+            txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)
         }
     };
 
@@ -338,7 +352,10 @@ async fn commit_validates_staged_remove_fields(
 
     // === Insert files ===
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
     let adds = create_add_files_metadata(
         txn.add_files_schema(),
         vec![
@@ -347,8 +364,8 @@ async fn commit_validates_staged_remove_fields(
             ("file-3.parquet", 3, 3, Some(1)),
         ],
     )?;
-    txn.add_files(adds);
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref(), &FileSystemCommitter::new(), adds.into())?
+        .unwrap_committed();
 
     // === Modify staged remove metadata ===
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -378,12 +395,13 @@ async fn commit_validates_staged_remove_fields(
     let corrupted = modify_staged_remove_file(&batch, modification)?;
 
     // === Commit and assert ===
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
-    txn.remove_files(FilteredEngineData::try_new(
+    let txn = begin_transaction(snapshot, engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.remove_files(FilteredEngineData::try_new(
         Box::new(ArrowEngineData::new(corrupted)),
         selection_vector.to_vec(),
     )?);
-    let result = txn.commit(engine.as_ref());
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions);
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
@@ -437,9 +455,12 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_data_change(true);
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
@@ -447,9 +468,10 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     let (data, selection_vector) = scan_metadata.scan_files.into_parts();
     let remove_metadata = FilteredEngineData::try_new(data, selection_vector)?;
 
-    txn.remove_files(remove_metadata);
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.remove_files(remove_metadata);
 
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
 
     match result {
         CommitResult::CommittedTransaction(committed) => {
@@ -582,8 +604,8 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 /// Verifies that `extendedFileMetadata` is true exactly when `size` and `partitionValues` are
 /// present; `tags` does not affect it.
 ///
-/// `Transaction::remove_files` requires `size`, so only `partitionValues` may be missing from that
-/// pair.
+/// `CommitActions::remove_files` requires `size`, so only `partitionValues` may be missing from
+/// that pair.
 #[rstest::rstest]
 #[case::all_present(&[], true)]
 #[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues], false)]
@@ -602,8 +624,12 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     let schema = schema_ref! { nullable "number": INTEGER };
 
     let snapshot = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
     let snapshot = insert_data(
         snapshot,
@@ -614,15 +640,19 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     .unwrap_post_commit_snapshot();
 
     let scan = snapshot.clone().scan_builder().build()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
     for scan_metadata in scan.scan_metadata(engine.as_ref())? {
-        txn.remove_files(with_missing_extended_metadata_fields(
+        actions.remove_files(with_missing_extended_metadata_fields(
             engine.as_ref(),
             scan_metadata?.scan_files,
             missing_fields,
         )?);
     }
-    let commit_result = txn.commit(engine.as_ref());
+    let commit_result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions);
     commit_result?.unwrap_committed();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
@@ -699,10 +729,13 @@ async fn test_update_deletion_vectors_adds_expected_entries(
         .build(engine.as_ref())?;
 
     // Create transaction with DV update mode enabled
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
+        .with_operation(delta_kernel::transaction::Operation::Update)
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     // Build scan and collect all scan metadata
     let scan = snapshot.clone().scan_builder().build()?;
@@ -731,10 +764,11 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     dv_map.insert(file_path.to_string(), new_dv);
 
     // Call update_deletion_vectors to exercise the API
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
     // Commit the transaction
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
 
     match result {
         CommitResult::CommittedTransaction(committed) => {
@@ -1079,12 +1113,16 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
         .expect("table should contain one scan-file batch");
     let scan_files =
         make_scan_file_batches(scan_file, &modification, invalid_batch_index, BATCH_COUNT);
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .build(engine.as_ref())?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
     let mut descriptors = sequential_dv_descriptors(&file_paths);
     if modification.field_name == "path" {
         if modification.value.is_null(0) {
             assert_result_error_with_message(
-                txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok)),
+                actions.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok)),
                 expected_error,
             );
             return Ok(());
@@ -1095,9 +1133,12 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
             .expect("descriptor for the original path modified by this test");
         descriptors.insert(path.to_string(), descriptor);
     }
-    txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
+    actions.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
 
-    assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions),
+        expected_error,
+    );
     Ok(())
 }
 
@@ -1237,20 +1278,24 @@ async fn test_update_deletion_vectors_multiple_files(
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
+        .with_operation(delta_kernel::transaction::Operation::Update)
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
 
     // Update deletion vectors for all 3 files in a single call
     let dv_map = sequential_dv_descriptors(&file_paths);
 
-    txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    actions.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
 
     // Commit the transaction
-    let result = txn.commit(engine.as_ref())?;
+    let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
 
     match result {
         CommitResult::CommittedTransaction(committed) => {
@@ -1374,29 +1419,35 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     // Attach DV to all files first, if later DV updates incorrectly remove the existing DV,
     // the test will fail.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    let setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    let mut setup_actions = delta_kernel::transaction::CommitActions::new();
     let initial_dvs = sequential_dv_descriptors(&file_paths);
     let initial_dv_ids: HashMap<_, _> = initial_dvs
         .iter()
         .map(|(path, dv)| (path.clone(), dv.unique_id()))
         .collect();
-    setup_txn.update_deletion_vectors(
+    setup_actions.update_deletion_vectors(
         initial_dvs,
         get_scan_files(snapshot, engine.as_ref())?
             .into_iter()
             .map(Ok),
     )?;
-    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+    setup_txn
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), setup_actions)?
+        .unwrap_committed();
 
     let targeted: Vec<String> = target_indexes
         .iter()
         .map(|&index| file_paths[index].clone())
         .collect();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test engine")
-        .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+    let txn = snapshot
+        .clone()
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("test engine"))
+        .with_operation(delta_kernel::transaction::Operation::Update)
+        .with_data_change(true)
+        .build(engine.as_ref())?;
 
     let dv_map: HashMap<String, DeletionVectorDescriptor> = targeted
         .iter()
@@ -1428,7 +1479,8 @@ async fn test_update_deletion_vectors_respects_selection_vector(
         selection_vector.to_vec(),
     )?;
 
-    let update_result = txn.update_deletion_vectors(dv_map, std::iter::once(Ok(scan_files)));
+    let mut actions = delta_kernel::transaction::CommitActions::new();
+    let update_result = actions.update_deletion_vectors(dv_map, std::iter::once(Ok(scan_files)));
     if expect_mismatch {
         assert_result_error_with_message(
             update_result,
@@ -1437,7 +1489,9 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     } else {
         update_result?;
     }
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+        .unwrap_committed();
     let version = committed.commit_version();
 
     // Read the commit directly from the (in-memory) store.
@@ -1552,7 +1606,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         assert!(initial_file_count > 0);
 
         // Now create a transaction to remove files
-        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+        let txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
 
         // Create a new scan to get file metadata for removal
         let scan2 = snapshot.scan_builder().build()?;
@@ -1569,11 +1623,11 @@ async fn test_remove_files_verify_files_excluded_from_scan(
                 .count();
         assert!(file_remove_count > 0);
 
-        // Add remove files to transaction
-        txn.remove_files(scan_metadata2.scan_files);
+        let mut actions = delta_kernel::transaction::CommitActions::new();
+        actions.remove_files(scan_metadata2.scan_files);
 
         // Commit the transaction
-        let result = txn.commit(engine.as_ref());
+        let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions);
 
         match result? {
             CommitResult::CommittedTransaction(committed) => {
@@ -1700,10 +1754,13 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         );
 
         // Create a transaction to remove files in two batches
-        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-            .with_engine_info("selective remove test")
-            .with_operation("DELETE".to_string())
-            .with_data_change(true);
+        let txn = snapshot
+            .clone()
+            .transaction_builder()
+            .with_options(TransactionOptions::new().with_engine_info("selective remove test"))
+            .with_operation(delta_kernel::transaction::Operation::Delete)
+            .with_data_change(true)
+            .build(engine.as_ref())?;
 
         // First batch: Remove only the first file
         let scan2 = snapshot.clone().scan_builder().build()?;
@@ -1726,7 +1783,8 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
             first_batch_removed, 1,
             "Should remove exactly 1 file in first batch"
         );
-        txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+        let mut actions = delta_kernel::transaction::CommitActions::new();
+        actions.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
         // Second batch: Remove only the last file
         let scan3 = snapshot.clone().scan_builder().build()?;
@@ -1753,10 +1811,10 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
             second_batch_removed, 1,
             "Should remove exactly 1 file in second batch"
         );
-        txn.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
+        actions.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
 
         // Commit the transaction
-        let result = txn.commit(engine.as_ref())?;
+        let result = txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?;
 
         match result {
             CommitResult::CommittedTransaction(committed) => {
@@ -1880,15 +1938,21 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+        let txn = snapshot
+            .transaction_builder()
+            .with_data_change(true)
+            .build(engine.as_ref())?;
+        let mut actions = delta_kernel::transaction::CommitActions::new();
 
         // Pass scan metadata (which contains stats_parsed) directly to remove_files.
         // This previously failed with "Too few fields in output schema".
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
-            txn.remove_files(scan_metadata?.scan_files);
+            actions.remove_files(scan_metadata?.scan_files);
         }
 
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), expected_commit_version);
 
         let remove_actions =
@@ -1985,8 +2049,11 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let engine = Arc::new(engine);
 
         // Write two partitions: country="usa" and country="japan".
-        let mut txn =
-            load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())?
+            .transaction_builder()
+            .with_data_change(true)
+            .build(engine.as_ref())?;
         let write_state = txn.write_state()?;
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::DeltaResult<_> {
             let data = RecordBatch::try_new(
@@ -1995,6 +2062,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             )?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
+        let mut actions = delta_kernel::transaction::CommitActions::new();
         for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {
             let ctx = write_state
                 .write_context_builder()
@@ -2004,9 +2072,10 @@ async fn test_remove_files_partitioned_with_parsed_columns(
                 )]))
                 .build()?;
             let add_meta = engine.write_parquet(data?.as_ref(), &ctx).await?;
-            txn.add_files(add_meta);
+            actions.add_files(add_meta);
         }
-        txn.commit(engine.as_ref())?.unwrap_committed();
+        txn.commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+            .unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let mut scan_builder = snapshot
@@ -2019,11 +2088,17 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+        let txn = snapshot
+            .transaction_builder()
+            .with_data_change(true)
+            .build(engine.as_ref())?;
+        let mut actions = delta_kernel::transaction::CommitActions::new();
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
-            txn.remove_files(scan_metadata?.scan_files);
+            actions.remove_files(scan_metadata?.scan_files);
         }
-        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        let committed = txn
+            .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
+            .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
 
         let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;

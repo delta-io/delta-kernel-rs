@@ -338,9 +338,13 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         nullable "a_float": FLOAT,
     };
     create_table(url, schema, "DefaultEngine")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
-        .commit(&engine)
+        .commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )
         .unwrap()
         .unwrap_committed();
 
@@ -369,9 +373,13 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
 
     let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine)
         .unwrap()
-        .commit(&engine)
+        .commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )
         .unwrap()
         .unwrap_committed();
 

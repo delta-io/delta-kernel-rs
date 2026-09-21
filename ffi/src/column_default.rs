@@ -12,8 +12,7 @@
 //! get_unpartitioned_write_context(txn, engine)
 //! ```
 
-use delta_kernel::transaction::Transaction;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, Engine};
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -35,7 +34,7 @@ use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternE
 #[no_mangle]
 pub unsafe extern "C" fn transaction_ack_column_defaults(mut txn: Handle<ExclusiveTransaction>) {
     let txn = unsafe { txn.as_mut() };
-    txn.ack_column_defaults();
+    let _ = txn.ack_column_defaults();
 }
 
 /// Callback invoked once per top-level column default by
@@ -67,22 +66,24 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 /// function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn transaction_visit_top_level_column_defaults(
-    txn: Handle<ExclusiveTransaction>,
+    mut txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
 ) -> ExternResult<usize> {
     let engine = unsafe { engine.as_ref() };
-    let txn = unsafe { txn.as_ref() };
-    visit_top_level_column_defaults_impl(txn, engine_context, visitor).into_extern_result(&engine)
+    let txn = unsafe { txn.as_mut() };
+    visit_top_level_column_defaults_impl(txn, engine.engine().as_ref(), engine_context, visitor)
+        .into_extern_result(&engine)
 }
 
 fn visit_top_level_column_defaults_impl(
-    txn: &Transaction,
+    txn: &mut crate::transaction::FfiTransaction,
+    engine: &dyn Engine,
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
 ) -> DeltaResult<usize> {
-    let defaults = txn.top_level_column_defaults()?;
+    let defaults = txn.transaction(engine)?.top_level_column_defaults()?;
     for (name, column_default) in &defaults {
         let name = name.as_str();
         let raw_sql = column_default.raw_sql();

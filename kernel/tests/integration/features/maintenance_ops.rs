@@ -27,8 +27,12 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 
@@ -84,8 +88,12 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
 

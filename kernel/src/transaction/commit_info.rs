@@ -184,13 +184,11 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
     use crate::transaction::Transaction;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
-    use crate::utils::FoldWithOption as _;
     use crate::{DeltaResult, Engine, EngineData, RowVisitor};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
@@ -284,12 +282,15 @@ mod tests {
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let mut options = super::super::TransactionOptions::new();
+        if let Some((data, schema)) = engine_commit_info {
+            options = options.with_commit_info(data, schema);
+        }
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string())
-            .fold_with(engine_commit_info, |txn, (data, schema)| {
-                txn.with_commit_info(data, schema)
-            });
+            .transaction_builder()
+            .with_operation(crate::transaction::Operation::Write)
+            .with_options(options)
+            .build(engine.as_ref())?;
         Ok((engine, txn))
     }
 

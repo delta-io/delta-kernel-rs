@@ -1,8 +1,8 @@
 # Altering a table
 
-To add a column to an existing Delta table, you configure an existing-table transaction with one
-or more schema operations and commit it. A standalone ALTER commit updates the table's schema
-without rewriting data files. The same builder also supports schema evolution alongside a write.
+To add a column to an existing Delta table, you create an existing-table transaction builder
+from a `Snapshot`, queue one or more schema operations, and commit. The result is a metadata-only
+commit that updates the table's schema without rewriting any data files.
 
 Before reading this page, make sure you understand
 [Creating a Table](./create_table.md) and
@@ -22,9 +22,8 @@ schema to existing files without scanning them, and writers that are only
 concerned with data changes can ignore the commit.
 
 > [!NOTE]
-> The supported operations are adding columns and making columns nullable. Other schema operations
-> (drop column, rename, type changes) are not yet available through the
-> transaction builder.
+> The first supported operation is `add_column()`. Other schema operations
+> (drop column, rename, type changes) are not yet available through `alter_table()`.
 
 ## Adding a column
 
@@ -34,9 +33,9 @@ column. The flow is:
 
 1. Load a `Snapshot` of the table.
 2. Call `snapshot.alter_table()` to get an `ExistingTableTransactionBuilder` configured for
-   `Operation::AlterTable`.
+   schema evolution.
 3. Call `add_column()` with the new field.
-4. Call `build()` to produce a `Transaction`.
+4. Call `build(&engine)` to produce a `Transaction<ExistingTable>`.
 5. Call `commit()` to atomically apply the schema change.
 
 ```rust,no_run
@@ -57,10 +56,14 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Build and commit an alter-table transaction that adds a new column.
 let result = snapshot
     .alter_table()
-    .add_column(StructField::nullable("country", DataType::STRING))
     .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .add_column(StructField::nullable("country", DataType::STRING))
+    .build(&engine)?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 
 match result {
     CommitResult::CommittedTransaction(committed) => {
@@ -105,31 +108,24 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 ```
 
-Calling `.build()` directly on `snapshot.alter_table()` without adding a schema operation returns
-an error. The unified builder performs this check at runtime because other operations may combine
-schema evolution with data-file actions.
+The builder requires at least one schema operation. Calling `.build(&engine)` directly on
+`snapshot.alter_table()` returns an error.
 
-## Evolving a schema while writing
+## Alter-table validation
 
-Use `transaction_builder()` when the same transaction evolves the schema and writes files. Kernel
-applies the schema operations during `build()`, so the transaction's `WriteState` uses the evolved
-schema.
-
-```rust,ignore
-let mut transaction = snapshot
-    .transaction_builder()
-    .with_operation(Operation::Write)
-    .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
-
-let write_state = transaction.write_state()?;
-let write_context = write_state.write_context_builder().build()?;
-// Write files using the evolved schema, add their metadata, and commit.
-```
+`alter_table()` is a convenience entry point for an existing-table transaction. It selects the
+`ALTER TABLE` operation and configures the transaction as a non-data-changing commit. The builder
+validates that the transaction contains a schema change and rejects incompatible options such as
+blind append. The resulting transaction uses the same existing-table API as other updates; it is
+not a separate type-state.
 
 ## What's next
 

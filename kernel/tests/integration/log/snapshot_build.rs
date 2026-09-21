@@ -85,9 +85,14 @@ async fn setup_multi_version_table<E: TaskExecutor>(
             ("io.unitycatalog.tableId", "snapshot-build-test"),
         ]),
     };
+    let committer = kind.committer();
     let create_snapshot = builder
-        .build(engine.as_ref(), kind.committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            committer.as_ref(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_post_commit_snapshot();
 
     // The create-table snapshot is built as latest (version 0 is necessarily the latest).

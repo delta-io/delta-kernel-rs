@@ -119,11 +119,13 @@ mod tests {
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter
-        let committer = Box::new(FileSystemCommitter::new());
-        let err = snapshot
-            .transaction(committer, &engine)
-            .unwrap()
-            .commit(&engine)
+        let txn = snapshot.transaction_builder().build(&engine).unwrap();
+        let err = txn
+            .commit(
+                &engine,
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )
             .unwrap_err();
         assert!(matches!(
             err,

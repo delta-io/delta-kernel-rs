@@ -16,7 +16,7 @@ use crate::{version_as_i64, DeltaResult, Engine, FileMeta, Version};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
-pub(super) struct RootManifestFile {
+pub(crate) struct RootManifestFile {
     pub(super) file: FileMeta,
     /// The snapshot being updated, whose active content the checkpoint action folds in.
     pub(super) read_snapshot: SnapshotRef,
@@ -188,6 +188,7 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::transaction::create_table::create_table;
+    use crate::transaction::CommitActions;
     use crate::unit_test_utils::{
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
@@ -224,8 +225,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .build(&engine)?
+            .commit(&engine, &FileSystemCommitter::new(), CommitActions::new())?;
         let table_root = Snapshot::builder_for("memory:///")
             .build(&engine)?
             .table_root()
@@ -445,8 +446,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .build(&engine)?
+            .commit(&engine, &FileSystemCommitter::new(), CommitActions::new())?;
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 
         let file = manifest_file("s3://bucket/metadata/root-v1.parquet", 1024)?;

@@ -6,4 +6,6 @@
 #![allow(unreachable_pub, dead_code)]
 
 pub mod create_table;
-pub mod update;
+mod update_table;
+
+pub use update_table::ExistingTableTransactionBuilder;

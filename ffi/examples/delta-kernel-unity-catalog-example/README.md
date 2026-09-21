@@ -2,7 +2,8 @@ delta-kernel-unity-catalog example
 ===================================
 
 Simple example showing how to use the delta-kernel-unity-catalog FFI surface -- namely
-`get_uc_commit_client`, `get_uc_committer`, and `transaction_with_committer` -- to run a
+`get_uc_commit_client`, `get_uc_committer`, `transaction_from_snapshot`, and
+`commit_with_committer` -- to run a
 commit against a catalog-managed table using a custom commit callback.
 
 # Building

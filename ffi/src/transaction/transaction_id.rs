@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
-use crate::transaction::ExclusiveTransaction;
+use crate::transaction::{ExclusiveTransaction, FfiTransaction};
 use crate::{
     ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
@@ -34,11 +33,13 @@ pub unsafe extern "C" fn with_transaction_id(
 }
 
 fn with_transaction_id_impl(
-    txn: Transaction,
+    mut txn: FfiTransaction,
     app_id_res: DeltaResult<String>,
     version: i64,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    Ok(Box::new(txn.with_transaction_id(app_id_res?, version)).into())
+    let app_id = app_id_res?;
+    txn.update_options(|options| options.with_transaction_id(app_id, version))?;
+    Ok(Box::new(txn).into())
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.
@@ -82,7 +83,9 @@ mod tests {
 
     use super::*;
     use crate::ffi_test_utils::{engine_handle_for_store, ok_or_panic};
-    use crate::transaction::{commit, free_committed_transaction, transaction};
+    use crate::transaction::{
+        commit, commit_result_into_committed, free_committed_transaction, transaction,
+    };
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 
     #[cfg(feature = "default-engine-base")]
@@ -126,8 +129,10 @@ mod tests {
             });
 
             // commit!
-            let committed =
-                ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            let result = ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            let committed = ok_or_panic(unsafe {
+                commit_result_into_committed(result, default_engine_handle.shallow_copy())
+            });
             unsafe { free_committed_transaction(committed) };
 
             let snapshot: Arc<Snapshot> = Snapshot::builder_for(table_url.clone())

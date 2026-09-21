@@ -3,13 +3,15 @@
 
 use std::collections::HashMap;
 
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
+use delta_kernel::transaction::{CommitActions, TransactionOptions};
 use delta_kernel::{Engine, FileMeta};
 use serde_json::json;
 use tempfile::TempDir;
 use test_utils::{
-    begin_transaction, create_table, create_table_with_column_mapping_mode, engine_store_setup,
+    create_table, create_table_with_column_mapping_mode, engine_store_setup,
     read_actions_from_commit,
 };
 use url::Url;
@@ -66,8 +68,12 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         last_modified: 0,
         size: 1024,
     };
-    let txn = begin_transaction(snapshot, &engine)?.with_root_manifest_file(file.clone())?;
-    txn.commit(&engine)?.unwrap_committed();
+    let txn = snapshot
+        .transaction_builder()
+        .with_root_manifest_file(file.clone())
+        .build(&engine)?;
+    txn.commit(&engine, &FileSystemCommitter::new(), CommitActions::new())?
+        .unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -111,21 +117,34 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_merge").await?;
 
-    let txn = begin_transaction(snapshot, &engine)?
-        .with_domain_metadata("my.domain".to_string(), "v1".to_string())
-        .with_transaction_id("app-1".to_string(), 5);
-    let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let txn = snapshot
+        .transaction_builder()
+        .with_options(
+            TransactionOptions::new()
+                .with_domain_metadata("my.domain".to_string(), "v1".to_string())
+                .with_transaction_id("app-1".to_string(), 5),
+        )
+        .build(&engine)?;
+    let snapshot = txn
+        .commit(&engine, &FileSystemCommitter::new(), CommitActions::new())?
+        .unwrap_post_commit_snapshot();
 
     let file = FileMeta {
         location: table_url.join("metadata/root-v1.parquet")?,
         last_modified: 0,
         size: 1024,
     };
-    let txn = begin_transaction(snapshot, &engine)?
-        .with_root_manifest_file(file)?
-        .with_domain_metadata("my.domain".to_string(), "v2".to_string())
-        .with_transaction_id("app-2".to_string(), 7);
-    txn.commit(&engine)?.unwrap_committed();
+    let txn = snapshot
+        .transaction_builder()
+        .with_root_manifest_file(file)
+        .with_options(
+            TransactionOptions::new()
+                .with_domain_metadata("my.domain".to_string(), "v2".to_string())
+                .with_transaction_id("app-2".to_string(), 7),
+        )
+        .build(&engine)?;
+    txn.commit(&engine, &FileSystemCommitter::new(), CommitActions::new())?
+        .unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -173,8 +192,11 @@ async fn test_with_root_manifest_file_requires_the_feature(
         last_modified: 0,
         size: 1024,
     };
-    let txn = test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .with_root_manifest_file(file)?;
-    assert!(txn.commit(&engine).is_err());
+    let snapshot = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
+    assert!(snapshot
+        .transaction_builder()
+        .with_root_manifest_file(file)
+        .build(&engine)
+        .is_err());
     Ok(())
 }

@@ -36,7 +36,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
-use crate::transaction::{ExistingTableTransactionBuilder, Transaction};
+use crate::transaction::ExistingTableTransactionBuilder;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
@@ -930,22 +930,11 @@ impl Snapshot {
         IncrementalScanBuilder::new(self, base_version)
     }
 
-    /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
-    ///
-    /// Note: For tables with clustering enabled, this performs log replay to read clustering
-    /// columns from domain metadata, which may have a performance cost.
-    pub fn transaction(
-        self: Arc<Self>,
-        committer: Box<dyn Committer>,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer, engine)
-    }
-
     /// Creates a builder for a transaction against this snapshot.
     ///
     /// The builder supports both data-changing transactions and schema changes. Configuration is
-    /// validated when [`ExistingTableTransactionBuilder::build`] is called.
+    /// validated and frozen when [`ExistingTableTransactionBuilder::build`] is called. Commit
+    /// actions and the committer are supplied later during commit preparation and execution.
     pub fn transaction_builder(self: Arc<Self>) -> ExistingTableTransactionBuilder {
         ExistingTableTransactionBuilder::new(self)
     }
@@ -1407,6 +1396,7 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
+    use crate::transaction::CommitActions;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::utils::FoldWithOption as _;
 
@@ -2217,9 +2207,11 @@ mod tests {
                 .with_table_properties(vec![(ENABLE_IN_COMMIT_TIMESTAMPS, "true")]);
         }
 
-        let _ = create_table_builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+        let _ = create_table_builder.build(&engine)?.commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
         let ts = snapshot.get_timestamp(&engine)?;
@@ -2547,12 +2539,13 @@ mod tests {
             .fold_with(column_mapping_mode, |builder, mode| {
                 builder.with_table_properties([("delta.columnMapping.mode", mode)])
             })
-            .build(
-                &engine,
-                Box::new(crate::committer::FileSystemCommitter::new()),
-            )
+            .build(&engine)
             .unwrap()
-            .commit(&engine)
+            .commit(
+                &engine,
+                &crate::committer::FileSystemCommitter::new(),
+                CommitActions::new(),
+            )
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
         let result = snapshot.get_clustering_column_infos(&engine).unwrap();
@@ -2669,9 +2662,9 @@ mod tests {
             let store = Arc::new(InMemory::new());
             let engine = SyncEngine::new_with_store(store);
             create_table("memory:///", schema, "test")
-                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .build(&engine)
                 .unwrap()
-                .commit(&engine)
+                .commit(&engine, &FileSystemCommitter::new(), CommitActions::new())
                 .unwrap()
                 .unwrap_committed();
             Snapshot::builder_for("memory:///").build(&engine).unwrap()

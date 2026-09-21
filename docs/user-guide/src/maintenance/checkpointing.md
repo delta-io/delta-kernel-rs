@@ -55,7 +55,7 @@ The most common time to checkpoint is right after a successful commit. The post-
 snapshot gives you a checkpoint-ready `SnapshotRef`:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(c) => c,
     _ => panic!("unexpected result"),
 };
@@ -144,7 +144,7 @@ The typical pattern is to check `commits_since_checkpoint` against the table's
 `delta.checkpointInterval` property and checkpoint when the threshold is reached:
 
 ```rust,ignore
-let committed = match txn.commit(&engine)? {
+let committed = match txn.commit(&engine, &FileSystemCommitter::new(), actions)? {
     CommitResult::CommittedTransaction(c) => c,
     _ => panic!("unexpected result"),
 };
