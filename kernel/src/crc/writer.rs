@@ -31,7 +31,7 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         .metadata
         .configuration()
         .get(ENABLE_IN_COMMIT_TIMESTAMPS)
-        .is_some_and(|v| v == "true");
+        .is_some_and(|value| value == "true");
     let ict_value_present = crc.in_commit_timestamp_opt.is_some();
     require!(
         !ict_enabled || ict_value_present,
@@ -273,5 +273,17 @@ mod tests {
                 "expected ChecksumWriteUnsupported, got: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_write_treats_ict_enablement_value_case_sensitively() {
+        let (engine, crc_path) = writer_test_env(0);
+        let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
+        crc.metadata = crc
+            .metadata
+            .with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "True");
+        crc.in_commit_timestamp_opt = None;
+
+        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
     }
 }

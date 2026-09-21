@@ -160,6 +160,10 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::opaque(OpaqueTestOp("foo".to_string()), vec![lit(42), lit(1.111)]),
         Expr::unknown("mystery"),
         Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        Expr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
         Expr::coalesce([col!("col"), lit(0_i32)]),
         Expr::array([lit(1_i32), lit(2_i32)]),
     ];
@@ -256,6 +260,10 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         Expr::binary(BinaryExpressionOp::Divide, lit(100), lit(4)),
         Expr::struct_from([lit(1_i32), lit(2_i64), lit(3.0_f64)]),
         Expr::map_to_struct(col!("partitionValues"), MapToStructOptions::default()),
+        Expr::map_to_struct(
+            col!("partitionValues"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
     ];
     Arc::new(Expr::struct_from(sub_exprs)).into()
 }

@@ -75,6 +75,10 @@ impl Transaction {
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
 
+        // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
+        // and materialized column-name properties. Materialized names must be distinct and must not
+        // collide with physical data columns.
+
         // Read clustering columns from snapshot (returns None if clustering not enabled)
         let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
 

@@ -1,5 +1,6 @@
 //! Scan related ffi code
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -731,9 +732,34 @@ impl From<&MetadataValue> for CMetadataValueKind {
 /// A field-metadata map that preserves each value's [`MetadataValue`] type. Used for schema field
 /// metadata, where the kernel knows each value's type; the engine recovers that type via
 /// [`CMetadataValueKind`] rather than inferring it from the key name.
+///
+/// An engine metadata callback also uses this map to accumulate incoming field metadata. That map
+/// is owned by Kernel and exclusively borrowed for the callback duration; the engine must not
+/// retain it.
 #[derive(Default)]
 pub struct CMetadataMap {
     values: HashMap<String, MetadataValue>,
+}
+
+impl CMetadataMap {
+    /// Insert a value without replacing an existing key.
+    pub(crate) fn insert(&mut self, key: String, value: MetadataValue) -> DeltaResult<()> {
+        match self.values.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(Error::schema(format!(
+                "Duplicate metadata key: {}",
+                entry.key()
+            ))),
+        }
+    }
+
+    /// Consume the map and return its metadata values.
+    pub(crate) fn into_values(self) -> HashMap<String, MetadataValue> {
+        self.values
+    }
 }
 
 impl From<HashMap<String, MetadataValue>> for CMetadataMap {
@@ -1108,6 +1134,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(id),
                 true,
+                std::ptr::null(),
                 allocate_err,
             ))
         };
@@ -1120,6 +1147,7 @@ mod scan_builder_tests {
                 field_ids.as_ptr(),
                 1,
                 false,
+                std::ptr::null(),
                 allocate_err,
             ))
         }
@@ -1270,6 +1298,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(bare_field),
                 true,
+                std::ptr::null(),
                 allocate_err,
             ))
         }
