@@ -16,6 +16,14 @@ impl<'a> SchemaTransform<'a> for UsesVariant {
     fn transform_variant(&mut self, _: &'a StructType) -> Result<(), ()> {
         Err(())
     }
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a crate::schema::UserDefinedType,
+    ) -> Result<(), ()> {
+        self.transform(&udt.sql_type)
+    }
 }
 
 /// Checks if any column in the schema (including nested columns) has VARIANT type.
