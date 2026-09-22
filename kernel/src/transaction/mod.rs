@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::iter;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -45,7 +44,7 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::utils::require;
+use crate::utils::{require, PhantomType};
 use crate::{
     create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
     Expression, FileMeta, Predicate, RowVisitor, Version,
@@ -268,9 +267,9 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // PhantomData marker for transaction state (ExistingTable or CreateTable).
+    // PhantomType marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
-    _state: PhantomData<S>,
+    _state: PhantomType<S>,
 }
 
 impl<S> std::fmt::Debug for Transaction<S> {

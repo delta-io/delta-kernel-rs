@@ -1,6 +1,5 @@
 //! Builder for creating [`Snapshot`] instances.
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -19,7 +18,7 @@ use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::utils::{require, try_parse_uri};
+use crate::utils::{require, try_parse_uri, PhantomType};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
@@ -164,7 +163,7 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     /// cancellable.
     cancellation_token: Option<CancellationTokenRef>,
     // Carries the zero-sized typestate that limits mode-specific methods at compile time.
-    mode: PhantomData<Mode>,
+    mode: PhantomType<Mode>,
 }
 
 /// Builder for incrementally updating an existing [`Snapshot`].
@@ -256,7 +255,7 @@ impl SnapshotBuilder<FromTableRoot> {
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
-            mode: PhantomData,
+            mode: PhantomType::default(),
         }
     }
 
@@ -297,7 +296,7 @@ impl SnapshotBuilder<FromSnapshot> {
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
-            mode: PhantomData,
+            mode: PhantomType::default(),
         }
     }
 

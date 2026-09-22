@@ -24,7 +24,6 @@
 //! snapshot.alter_table().build(engine, committer)?;  // compile error
 //! ```
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -36,6 +35,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::utils::PhantomType;
 use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -71,13 +71,13 @@ pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
     correlation_id: Option<Arc<str>>,
-    // PhantomData marker for builder state (Ready or Modifying).
+    // PhantomType marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
-    _state: PhantomData<S>,
+    _state: PhantomType<S>,
 }
 
 impl<S> AlterTableTransactionBuilder<S> {
-    // Reconstructs the builder with a different PhantomData marker, changing which methods
+    // Reconstructs the builder with a different PhantomType marker, changing which methods
     // are available at compile time (e.g. Ready -> Modifying enables `build()`). All real
     // fields are moved as-is; only the zero-sized type state changes.
     //
@@ -88,7 +88,7 @@ impl<S> AlterTableTransactionBuilder<S> {
             snapshot: self.snapshot,
             operations: self.operations,
             correlation_id: self.correlation_id,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         }
     }
 
@@ -107,7 +107,7 @@ impl AlterTableTransactionBuilder<Ready> {
             snapshot,
             operations: Vec::new(),
             correlation_id: None,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         }
     }
 }
