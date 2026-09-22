@@ -767,3 +767,28 @@ fn aggregate_setter_reports_unsupported_for_existing_snapshot_builder() {
         free_engine(engine);
     }
 }
+
+#[test]
+fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
+    let engine = test_engine();
+    let mut initial_builder = test_builder(&engine);
+    unsafe { set_minimal_hint(&mut initial_builder) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(initial_builder)) };
+
+    let mut update_builder = test_builder(&engine);
+    unsafe { set_minimal_hint(&mut update_builder) };
+    unsafe { update_builder.as_mut() }.source =
+        FfiSnapshotBuilderSource::ExistingSnapshot(unsafe { snapshot.clone_as_arc() });
+
+    let result = unsafe { snapshot_builder_build(update_builder) };
+    assert_extern_result_error_contains(
+        result,
+        KernelError::InvalidSnapshotHint,
+        "cannot be used with Snapshot::builder_from",
+    );
+
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}

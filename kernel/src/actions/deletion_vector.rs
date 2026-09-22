@@ -9,6 +9,7 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::{internal_api, ToSchema};
 use roaring::RoaringTreemap;
+use serde::Deserialize;
 use url::Url;
 
 use crate::schema::DataType;
@@ -124,12 +125,9 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: DeletionVectorStorageType,
@@ -159,6 +157,30 @@ pub struct DeletionVectorDescriptor {
 
     /// Number of rows the given DV logically removes from the file.
     pub cardinality: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionVectorRaw {
+    storage_type: String,
+    path_or_inline_dv: String,
+    offset: Option<i32>,
+    size_in_bytes: i32,
+    cardinality: i64,
+}
+
+impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
+    type Error = Error;
+
+    fn try_from(raw: DeletionVectorRaw) -> DeltaResult<Self> {
+        Self::try_new(
+            raw.storage_type.parse()?,
+            raw.path_or_inline_dv,
+            raw.offset,
+            raw.size_in_bytes,
+            raw.cardinality,
+        )
+    }
 }
 
 impl DeletionVectorDescriptor {
@@ -621,6 +643,28 @@ mod tests {
             size_in_bytes: 36,
             cardinality: 2,
         }
+    }
+
+    #[test]
+    fn descriptor_deserialization_uses_validating_constructor() {
+        let valid = r#"{
+            "storageType":"i",
+            "pathOrInlineDv":"",
+            "sizeInBytes":0,
+            "cardinality":0
+        }"#;
+        let descriptor: DeletionVectorDescriptor = serde_json::from_str(valid).unwrap();
+        assert_eq!(descriptor.storage_type, DeletionVectorStorageType::Inline);
+
+        let invalid = r#"{
+            "storageType":"i",
+            "pathOrInlineDv":"",
+            "offset":1,
+            "sizeInBytes":0,
+            "cardinality":0
+        }"#;
+        let error = serde_json::from_str::<DeletionVectorDescriptor>(invalid).unwrap_err();
+        assert!(error.to_string().contains("must not carry an offset"));
     }
 
     #[test]

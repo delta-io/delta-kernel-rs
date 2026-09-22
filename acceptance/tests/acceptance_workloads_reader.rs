@@ -263,10 +263,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &["err_missing_version_0/specs/err_missing_version_0_error"],
     ),
     (
-        "Does not reject unknown reader features",
-        &["ev_unknown_reader_feature/specs/ev_unknown_reader_feature_error"],
-    ),
-    (
         "Does not enforce time travel safety",
         &[
             "tt_blocked_beyond_retention/specs/tt_blocked_beyond_retention_error",
@@ -278,8 +274,12 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &["DV-003/specs/DV-003_metadata_file_path"],
     ),
     (
-        "variantShredding feature not supported",
-        &["pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_read_latest"],
+        "Unsupported reader features in upgraded protocol",
+        &[
+            "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_read_latest",
+            "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_snapshot.json",
+            "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_snapshot_v2.json",
+        ],
     ),
     // Predicate parser: LIKE operator not supported
     (

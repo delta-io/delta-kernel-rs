@@ -359,7 +359,7 @@ fn typed_crc_accepts_full_kernel_state() {
         default_row_commit_version: OptionalValue::Some(31),
         clustering_provider: OptionalValue::Some(slice("liquid")),
     };
-    let deleted_record_counts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let deleted_record_counts = [0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
     let deleted_record_counts_histogram = FfiDeletedRecordCountsHistogram {
         deleted_record_counts: KernelI64Slice {
             ptr: deleted_record_counts.as_ptr(),
@@ -371,9 +371,17 @@ fn typed_crc_accepts_full_kernel_state() {
         in_commit_timestamp: OptionalValue::Some(37),
         txn_id: OptionalValue::Some(slice("txn-id")),
         all_files: OptionalValue::Some(FfiAddArray { ptr: &add, len: 1 }),
-        num_deleted_records: OptionalValue::Some(41),
-        num_deletion_vectors: OptionalValue::Some(43),
+        num_deleted_records: OptionalValue::Some(13),
+        num_deletion_vectors: OptionalValue::Some(1),
         deleted_record_counts_histogram: &deleted_record_counts_histogram,
+        file_stats_state: FfiFileStatsState {
+            kind: FfiFileStatsStateKind::Complete,
+            file_stats: FfiFileStats {
+                num_files: 1,
+                table_size_bytes: 17,
+            },
+            file_size_histogram: std::ptr::null(),
+        },
         ..empty_crc()
     };
 
@@ -403,22 +411,21 @@ fn typed_crc_accepts_full_kernel_state() {
         Some(31),
         Some("liquid".to_string()),
     );
-    let expected = Crc::from_parts(
+    let expected = Crc::try_from_parts(
         5,
         unsafe { test_metadata().try_to_kernel() }.unwrap(),
         unsafe { test_protocol().try_to_kernel() }.unwrap(),
-        FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+        FileStatsState::Complete(FileStats::try_new(1, 17, None).unwrap()),
         Some(37),
         SetTransactionState::Partial(HashMap::new()),
         DomainMetadataState::Partial(HashMap::new()),
         Some("txn-id".to_string()),
         Some(vec![expected_add]),
-        Some(41),
-        Some(43),
-        Some(DeletedRecordCountsHistogram::from_parts(
-            deleted_record_counts.to_vec(),
-        )),
-    );
+        Some(13),
+        Some(1),
+        Some(DeletedRecordCountsHistogram::try_new(deleted_record_counts.to_vec()).unwrap()),
+    )
+    .unwrap();
     assert_eq!(actual, expected);
 
     let indeterminate = FfiCrc {
@@ -1253,4 +1260,125 @@ fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
         ..empty_crc()
     };
     assert!(unsafe { crc.try_to_kernel() }.is_err());
+}
+
+#[test]
+fn typed_crc_rejects_ambiguous_complete_state() {
+    let transactions = [
+        FfiSetTransaction {
+            app_id: slice("orders"),
+            version: 1,
+            last_updated: none_i64(),
+        },
+        FfiSetTransaction {
+            app_id: slice("orders"),
+            version: 2,
+            last_updated: none_i64(),
+        },
+    ];
+    let crc = FfiCrc {
+        set_transaction_state: FfiSetTransactionState {
+            kind: FfiSetTransactionStateKind::Complete,
+            transactions: FfiSetTransactionArray {
+                ptr: transactions.as_ptr(),
+                len: transactions.len(),
+            },
+        },
+        ..empty_crc()
+    };
+    assert_result_error_with_message(
+        unsafe { crc.try_to_kernel() },
+        "duplicate transaction application id",
+    );
+
+    let domain = FfiDomainMetadata {
+        domain: slice("example"),
+        configuration: slice("{}"),
+        removed: true,
+    };
+    let crc = FfiCrc {
+        domain_metadata_state: FfiDomainMetadataState {
+            kind: FfiDomainMetadataStateKind::Complete,
+            domain_metadata: FfiDomainMetadataArray {
+                ptr: &domain,
+                len: 1,
+            },
+        },
+        ..empty_crc()
+    };
+    assert_result_error_with_message(unsafe { crc.try_to_kernel() }, "tombstone");
+
+    let bins = [0; 9];
+    let histogram = FfiDeletedRecordCountsHistogram {
+        deleted_record_counts: KernelI64Slice {
+            ptr: bins.as_ptr(),
+            len: bins.len(),
+        },
+    };
+    let crc = FfiCrc {
+        deleted_record_counts_histogram: &histogram,
+        ..empty_crc()
+    };
+    assert_result_error_with_message(unsafe { crc.try_to_kernel() }, "exactly 10 bins");
+}
+
+#[test]
+fn typed_crc_rejects_inconsistent_aggregates() {
+    let add = FfiAdd {
+        path: slice("part.parquet"),
+        partition_values: empty_map(),
+        size: 5,
+        modification_time: 0,
+        data_change: false,
+        stats: OptionalValue::None,
+        tags: OptionalValue::None,
+        deletion_vector: std::ptr::null(),
+        base_row_id: OptionalValue::None,
+        default_row_commit_version: OptionalValue::None,
+        clustering_provider: OptionalValue::None,
+    };
+    let all_files = || OptionalValue::Some(FfiAddArray { ptr: &add, len: 1 });
+
+    let crc = FfiCrc {
+        all_files: all_files(),
+        ..empty_crc()
+    };
+    assert_result_error_with_message(unsafe { crc.try_to_kernel() }, "allFiles/numFiles mismatch");
+
+    let complete_file_stats = || FfiFileStatsState {
+        kind: FfiFileStatsStateKind::Complete,
+        file_stats: FfiFileStats {
+            num_files: 1,
+            table_size_bytes: 5,
+        },
+        file_size_histogram: std::ptr::null(),
+    };
+    let crc = FfiCrc {
+        file_stats_state: complete_file_stats(),
+        all_files: all_files(),
+        num_deleted_records: OptionalValue::Some(1),
+        ..empty_crc()
+    };
+    assert_result_error_with_message(
+        unsafe { crc.try_to_kernel() },
+        "allFiles/numDeletedRecordsOpt mismatch",
+    );
+
+    let bins = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let histogram = FfiDeletedRecordCountsHistogram {
+        deleted_record_counts: KernelI64Slice {
+            ptr: bins.as_ptr(),
+            len: bins.len(),
+        },
+    };
+    let crc = FfiCrc {
+        file_stats_state: complete_file_stats(),
+        all_files: all_files(),
+        deleted_record_counts_histogram: &histogram,
+        ..empty_crc()
+    };
+    assert_result_error_with_message(
+        unsafe { crc.try_to_kernel() },
+        "allFiles/deletedRecordCountsHistogramOpt bins do not match",
+    );
 }

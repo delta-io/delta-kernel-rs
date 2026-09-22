@@ -10,7 +10,7 @@ use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, Snapshot};
+use crate::{DeltaResult, Error};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,11 +22,10 @@ pub struct RowTrackingDomainMetadata {
 /// The domain name for row tracking metadata.
 pub(crate) const ROW_TRACKING_DOMAIN_NAME: &str = "delta.rowTracking";
 
-impl RowTrackingDomainMetadata {
-    /// The row ID high water mark for a table with no assigned row IDs yet. The first
-    /// file written receives `baseRowId = MISSING_ROW_ID_HIGH_WATERMARK + 1 = 0`.
-    pub(crate) const MISSING_ROW_ID_HIGH_WATERMARK: i64 = -1;
+/// The row-tracking high-water mark before any fresh row IDs have been assigned.
+pub const ROW_TRACKING_INITIAL_HIGH_WATER_MARK: i64 = -1;
 
+impl RowTrackingDomainMetadata {
     pub(crate) fn new(row_id_high_water_mark: i64) -> Self {
         RowTrackingDomainMetadata {
             row_id_high_water_mark,
@@ -40,38 +39,15 @@ impl RowTrackingDomainMetadata {
 
     /// Creates the initial row tracking domain metadata for a newly created table.
     ///
-    /// Sets the high water mark to -1, meaning no rows have been assigned IDs yet.
-    /// The first file written will receive `baseRowId = 0`.
+    /// Sets the high-water mark to [`ROW_TRACKING_INITIAL_HIGH_WATER_MARK`], meaning no rows have
+    /// been assigned IDs yet. The first file written will receive `baseRowId = 0`.
     pub(crate) fn initial() -> Self {
-        Self::new(Self::MISSING_ROW_ID_HIGH_WATERMARK)
+        Self::new(ROW_TRACKING_INITIAL_HIGH_WATER_MARK)
     }
+}
 
-    /// Retrieves the row ID high water mark from the [`Snapshot`]'s row tracking domain metadata.
-    ///
-    /// This method searches through the snapshot's log segment for domain metadata actions
-    /// with the row tracking domain name and extracts the high water mark value.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(Some(high_water_mark))` if row tracking domain metadata is found,
-    /// `Ok(None)` if no row tracking domain metadata exists, or an error if the
-    /// metadata cannot be parsed or accessed.
-    ///
-    /// # Errors
-    ///
-    /// This method will return an error if:
-    /// - The domain metadata configuration cannot be read from the log segment
-    /// - The domain metadata JSON cannot be deserialized into `RowTrackingDomainMetadata`
-    pub fn get_high_water_mark(
-        snapshot: &Snapshot,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Option<i64>> {
-        Ok(snapshot
-            .get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
-            .map(|config| serde_json::from_str::<Self>(&config))
-            .transpose()?
-            .map(|metadata| metadata.row_id_high_water_mark))
-    }
+pub(crate) fn parse_row_tracking_high_water_mark(configuration: &str) -> DeltaResult<i64> {
+    Ok(serde_json::from_str::<RowTrackingDomainMetadata>(configuration)?.high_water_mark())
 }
 
 impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
@@ -108,7 +84,7 @@ impl RowTrackingVisitor {
         // Option<i64>
         Self {
             row_id_high_water_mark: row_id_high_water_mark
-                .unwrap_or(RowTrackingDomainMetadata::MISSING_ROW_ID_HIGH_WATERMARK),
+                .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
             base_row_id_batches: Vec::with_capacity(num_batches.unwrap_or(0)),
         }
     }

@@ -230,7 +230,12 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
-    #[instrument(name = "last_checkpoint.read", skip_all, err)]
+    #[instrument(
+        name = "last_checkpoint.read",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,

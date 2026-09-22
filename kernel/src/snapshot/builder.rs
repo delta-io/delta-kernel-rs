@@ -153,7 +153,7 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     max_catalog_version: Option<Version>,
     incremental_replay: IncrementalReplay,
     checkpoint_handling: CheckpointHandling,
-    snapshot_hint: Option<SnapshotHint>,
+    snapshot_hint: Option<Box<SnapshotHint>>,
     /// Kernel-minted id correlating this build's metric events with its child events.
     operation_id: MetricId,
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
@@ -277,8 +277,8 @@ impl SnapshotBuilder<FromTableRoot> {
     /// failures retain their normal error variants.
     #[allow(dead_code)]
     #[internal_api]
-    pub(crate) fn with_snapshot_hint(mut self, hint: SnapshotHint) -> Self {
-        self.snapshot_hint = Some(hint);
+    pub(crate) fn with_snapshot_hint(mut self, hint: impl Into<Box<SnapshotHint>>) -> Self {
+        self.snapshot_hint = Some(hint.into());
         self
     }
 }
@@ -429,7 +429,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
+        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
@@ -550,7 +550,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
-        snapshot_hint: SnapshotHint,
+        snapshot_hint: Box<SnapshotHint>,
     ) -> DeltaResult<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
@@ -590,7 +590,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             last_checkpoint_hint,
             crc,
             freshness,
-        } = snapshot_hint;
+        } = *snapshot_hint;
         if freshness == SnapshotHintFreshness::Latest {
             require!(
                 max_catalog_version.is_none_or(|max| max <= version),
@@ -1072,6 +1072,49 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
         assert!(hinted.crc_at_version().is_none());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::supported(
+        Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap(),
+        None,
+    )]
+    #[case::future_reader_version(
+        Protocol::try_new_legacy(4, 2).unwrap(),
+        Some("Unsupported minimum reader version 4"),
+    )]
+    #[case::unknown_reader_feature(
+        Protocol::try_new_modern(["futureFeature"], ["futureFeature"]).unwrap(),
+        Some("Feature 'futureFeature' is not supported"),
+    )]
+    #[case::missing_feature_requirement(
+        Protocol::try_new_modern(["catalogManaged"], ["catalogManaged"]).unwrap(),
+        Some("Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"),
+    )]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_hint_validates_reader_protocol(
+        #[case] protocol: Protocol,
+        #[case] expected_error: Option<&str>,
+        #[values(false, true)] with_crc: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, snapshot, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        hint.protocol = protocol.clone();
+        if with_crc {
+            Arc::make_mut(hint.crc.as_mut().unwrap()).protocol = protocol;
+        } else {
+            hint.crc = None;
+        }
+
+        let result = SnapshotBuilder::new_for(table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref());
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            assert_eq!(result?.version(), snapshot.version());
+        }
         Ok(())
     }
 

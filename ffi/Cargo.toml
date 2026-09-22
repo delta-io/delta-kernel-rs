@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
+serde_json = "1.0.142"
 peak_alloc = { version = "0.3.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
@@ -42,7 +43,6 @@ libc = "0.2.175"
 paste = "1.0"
 rand = "0.9.2"
 serde = "1.0.219"
-serde_json = "1.0.142"
 test_utils = { path = "../test-utils", default-features = false }
 tokio = { version = "1.47" }
 trybuild = "1.0"
@@ -79,6 +79,9 @@ test-ffi = []
 # Experimental, in-development feature flag gating in-progress geospatial
 # (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
+
+# Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
+adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]
 
 # Tracking global allocator for process-wide native live/peak bytes, readable via the
 # `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:
