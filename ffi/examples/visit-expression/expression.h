@@ -91,6 +91,7 @@ struct BinOp {
 struct Variadic {
   enum VariadicType op;
   ExpressionItemList exprs;
+  ExpressionItemList nullability_predicate;
 };
 struct Unary {
   enum UnaryType type;
@@ -333,14 +334,25 @@ void visit_expr_variadic(void* data,
   struct Variadic* var = malloc(sizeof(struct Variadic));
   var->op = op;
   var->exprs = get_expr_list(data, child_list_id);
+  var->nullability_predicate = (ExpressionItemList){ 0 };
   put_expr_item(data, sibling_list_id, var, Variadic);
 }
 DEFINE_VARIADIC(visit_expr_and, And)
 DEFINE_VARIADIC(visit_expr_or, Or)
-DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 DEFINE_VARIADIC(visit_expr_coalesce, Coalesce)
 DEFINE_VARIADIC(visit_expr_array, ArrayConstructor)
 #undef DEFINE_VARIADIC
+
+void visit_expr_struct_expr(void* data,
+                            uintptr_t sibling_list_id,
+                            uintptr_t child_list_id,
+                            uintptr_t nullability_predicate_list_id) {
+  struct Variadic* var = malloc(sizeof(struct Variadic));
+  var->op = StructExpression;
+  var->exprs = get_expr_list(data, child_list_id);
+  var->nullability_predicate = get_expr_list(data, nullability_predicate_list_id);
+  put_expr_item(data, sibling_list_id, var, Variadic);
+}
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
 int patch_op_cmp(const void* a, const void* b) {
@@ -629,6 +641,7 @@ void free_expression_item(ExpressionItem ref) {
     case Variadic: {
       struct Variadic* var = ref.ref;
       free_expression_list(var->exprs);
+      free_expression_list(var->nullability_predicate);
       free(var);
       break;
     };

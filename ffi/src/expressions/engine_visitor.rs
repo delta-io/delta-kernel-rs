@@ -26,6 +26,12 @@ type VisitVariadicFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitStructFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    nullability_predicate_list_id: usize,
+);
 type VisitParseJsonFn = extern "C" fn(
     data: *mut c_void,
     sibling_list_id: usize,
@@ -228,9 +234,10 @@ pub struct EngineExpressionVisitor {
     /// the duration of this callback.
     pub visit_column: VisitColumnFn,
     /// Visits a `Struct` expression belonging to the list identified by `sibling_list_id`.
-    /// The sub-expressions (fields) of the struct are in a list identified by `child_list_id`
-    pub visit_struct_expr:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
+    /// The struct fields are in `child_list_id`. `nullability_predicate_list_id` identifies a
+    /// zero-or-one item list containing its nullability predicate: true keeps the struct, while
+    /// false or null makes the struct null.
+    pub visit_struct_expr: VisitStructFn,
     /// Visits a `StructPatch` expression belonging to the list identified by `sibling_list_id`.
     /// The `input_path_list_id` is a zero-or-one item list containing the patch's input path as a
     /// column reference. The `prepended_field_list_id` and `appended_field_list_id` identify
@@ -437,10 +444,25 @@ fn visit_expression_column(
 fn visit_expression_struct(
     visitor: &mut EngineExpressionVisitor,
     exprs: &[ExpressionRef],
+    nullability_predicate: Option<&ExpressionRef>,
     sibling_list_id: usize,
 ) {
     let child_list_id = visit_expression_list(visitor, exprs);
-    call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
+    let nullability_predicate_list_id = call!(
+        visitor,
+        make_field_list,
+        usize::from(nullability_predicate.is_some())
+    );
+    if let Some(predicate) = nullability_predicate {
+        visit_expression_impl(visitor, predicate, nullability_predicate_list_id);
+    }
+    call!(
+        visitor,
+        visit_struct_expr,
+        sibling_list_id,
+        child_list_id,
+        nullability_predicate_list_id
+    )
 }
 
 fn visit_expression_list(visitor: &mut EngineExpressionVisitor, exprs: &[ExpressionRef]) -> usize {
@@ -648,7 +670,12 @@ fn visit_expression_impl(
     match expression {
         Expression::Literal(scalar) => visit_expression_scalar(visitor, scalar, sibling_list_id),
         Expression::Column(name) => visit_expression_column(visitor, name, sibling_list_id),
-        Expression::Struct(exprs, _) => visit_expression_struct(visitor, exprs, sibling_list_id),
+        Expression::Struct(exprs, nullability_predicate) => visit_expression_struct(
+            visitor,
+            exprs,
+            nullability_predicate.as_ref(),
+            sibling_list_id,
+        ),
         Expression::StructPatch(patch) => {
             visit_expression_struct_patch(visitor, patch, sibling_list_id)
         }
@@ -814,6 +841,11 @@ mod tests {
             child_list_id: usize,
             timestamp_timezone: Option<String>,
         },
+        Struct {
+            sibling_list_id: usize,
+            child_list_id: usize,
+            nullability_predicate_list_id: usize,
+        },
     }
 
     #[derive(Default)]
@@ -843,6 +875,20 @@ mod tests {
             sibling_list_id,
             child_list_id,
             timestamp_timezone,
+        });
+    }
+
+    extern "C" fn visit_struct(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        child_list_id: usize,
+        nullability_predicate_list_id: usize,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::Struct {
+            sibling_list_id,
+            child_list_id,
+            nullability_predicate_list_id,
         });
     }
 
@@ -973,7 +1019,7 @@ mod tests {
             visit_coalesce: ignore_child_list,
             visit_array: ignore_child_list,
             visit_column,
-            visit_struct_expr: ignore_child_list,
+            visit_struct_expr: visit_struct,
             visit_struct_patch_expr: ignore_struct_patch,
             visit_field_patch: ignore_field_patch,
             visit_opaque_expr: ignore_opaque_expr,
@@ -997,6 +1043,38 @@ mod tests {
                 sibling_list_id: 0,
                 parts: vec!["a".to_string(), "b.c".to_string(), "d".to_string()],
             }]
+        );
+    }
+
+    #[test]
+    fn visit_struct_expression_preserves_nullability_predicate() {
+        let expression = Expression::struct_with_nullability_from(
+            [Expression::column(["value"])],
+            Expression::column(["keep"]),
+        );
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![
+                LiteralEvent::Column {
+                    sibling_list_id: 1,
+                    parts: vec!["value".to_string()],
+                },
+                LiteralEvent::Column {
+                    sibling_list_id: 2,
+                    parts: vec!["keep".to_string()],
+                },
+                LiteralEvent::Struct {
+                    sibling_list_id: 0,
+                    child_list_id: 1,
+                    nullability_predicate_list_id: 2,
+                },
+            ]
         );
     }
 
