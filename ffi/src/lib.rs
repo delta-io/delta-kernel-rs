@@ -1835,6 +1835,19 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
     snapshot.schema().into()
 }
 
+/// Returns the table's physical schema, including partition columns.
+/// The caller owns the returned schema and must release it with [`free_schema`].
+///
+/// # Safety
+/// The snapshot handle is borrowed and must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_physical_schema(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<SharedSchema> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.table_configuration().physical_schema().into()
+}
+
 /// Free a schema
 ///
 /// # Safety

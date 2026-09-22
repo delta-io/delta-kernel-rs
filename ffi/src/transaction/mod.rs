@@ -1250,6 +1250,122 @@ mod tests {
         collected.push((key, value, is_null));
     }
 
+    #[rstest]
+    #[case::unpartitioned(false)]
+    #[case::partitioned(true)]
+    #[tokio::test]
+    async fn test_distributed_write_state_outlives_transaction(
+        #[case] partitioned: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "part": INTEGER,
+        };
+        let columns = if partitioned { vec!["part"] } else { vec![] };
+        let tables = setup_test_tables(schema, &columns, None, "distributed_write").await?;
+        for (table_url, _engine, store, _table_name) in tables {
+            let engine = engine_handle_for_store(store);
+            let table_url_str = table_url.as_str();
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            });
+            let encoded = recover_string(
+                ok_or_panic(unsafe {
+                    write_context::transaction_write_state(
+                        txn.shallow_copy(),
+                        allocate_str,
+                        engine.shallow_copy(),
+                    )
+                })
+                .unwrap(),
+            );
+            unsafe { free_transaction(txn) };
+
+            let partitions = partition_value_map_new();
+            if partitioned {
+                let part_name = "part";
+                ok_or_panic(unsafe {
+                    partition_value_map_insert_int(
+                        partitions.shallow_copy(),
+                        kernel_string_slice!(part_name),
+                        42,
+                        engine.shallow_copy(),
+                    )
+                });
+            }
+            let context = ok_or_panic(unsafe {
+                write_context::write_context_from_state(
+                    kernel_string_slice!(encoded),
+                    partitions,
+                    engine.shallow_copy(),
+                )
+            });
+            let dir = recover_string(
+                unsafe { get_write_dir(context.shallow_copy(), allocate_str) }.unwrap(),
+            );
+            assert_eq!(dir.ends_with("part=42/"), partitioned);
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            unsafe {
+                visit_partition_values(
+                    context.shallow_copy(),
+                    std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                    collect_partition_value,
+                );
+            }
+            assert_eq!(collected.len(), usize::from(partitioned));
+            if partitioned {
+                assert_eq!(collected[0], ("part".into(), "42".into(), false));
+            }
+            let mut stats: Vec<Vec<String>> = Vec::new();
+            extern "C" fn collect_stats(
+                context: NullableCvoid,
+                parts: *const KernelStringSlice,
+                count: usize,
+            ) {
+                let stats = unsafe { &mut *context.unwrap().cast::<Vec<Vec<String>>>().as_ptr() };
+                let parts = unsafe { std::slice::from_raw_parts(parts, count) };
+                stats.push(
+                    parts
+                        .iter()
+                        .map(|part| unsafe { String::try_from_slice(part) }.unwrap())
+                        .collect(),
+                );
+            }
+            unsafe {
+                write_context::visit_write_stats_columns(
+                    context.shallow_copy(),
+                    std::ptr::NonNull::new((&mut stats as *mut Vec<_>).cast()),
+                    collect_stats,
+                );
+            }
+            assert!(stats.contains(&vec!["number".to_string()]));
+            let malformed = "{}";
+            let result = unsafe {
+                write_context::write_context_from_state(
+                    kernel_string_slice!(malformed),
+                    partition_value_map_new(),
+                    engine.shallow_copy(),
+                )
+            };
+            assert!(matches!(result, ExternResult::Err(_)));
+            if let ExternResult::Err(error) = result {
+                unsafe { recover_error(error) };
+            }
+            let snapshot = unsafe {
+                build_snapshot(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            };
+            let physical = unsafe { crate::snapshot_physical_schema(snapshot.shallow_copy()) };
+            assert_eq!(unsafe { physical.as_ref() }.num_fields(), 2);
+            unsafe {
+                crate::free_schema(physical);
+                free_snapshot(snapshot);
+                free_write_context(context);
+                free_engine(engine);
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     // Keeps local storage: the test creates the Hive partition directory on disk, which an object
     // store does not have.

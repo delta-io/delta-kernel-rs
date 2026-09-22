@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::expressions::Scalar;
-use delta_kernel::transaction::BoundWriteContext;
+use delta_kernel::transaction::{BoundWriteContext, WriteState};
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -22,6 +22,81 @@ use crate::{
 /// The [`BoundWriteContext`] must be freed using [`free_write_context`] when no longer needed.
 #[handle_descriptor(target=BoundWriteContext, mutable=false, sized=true)]
 pub struct SharedWriteContext;
+
+/// Encodes transaction write state for transport to workers running the same kernel version.
+/// The callback receives opaque UTF-8 JSON, valid only during the callback; copy it to retain it.
+/// Returns an error if the transaction cannot write or its state cannot be encoded.
+///
+/// # Safety
+/// The transaction and engine handles are borrowed and must be valid. `allocate_fn` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn transaction_write_state(
+    txn: Handle<ExclusiveTransaction>,
+    allocate_fn: AllocateStringFn,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let txn = unsafe { txn.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    txn.write_state()
+        .and_then(|state| state.encode())
+        .and_then(|bytes| String::from_utf8(bytes).map_err(Error::generic))
+        .map(|state| allocate_fn(kernel_string_slice!(state)))
+        .into_extern_result(&engine)
+}
+
+/// Decodes opaque transaction write state and binds logical partition values on a worker.
+/// Use an empty map for unpartitioned tables. Returns an error for incompatible state or invalid
+/// partition values. The returned context must be released with [`free_write_context`].
+///
+/// # Safety
+/// `partition_values` is consumed on both success and error. The state slice and engine handle
+/// are borrowed and must be valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn write_context_from_state(
+    state: KernelStringSlice,
+    partition_values: Handle<ExclusivePartitionValueMap>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedWriteContext>> {
+    let partition_values = unsafe { partition_values.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let state: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&state) };
+    state
+        .and_then(|state| WriteState::decode(state.as_bytes()))
+        .and_then(|state| {
+            let builder = state.write_context_builder();
+            if partition_values.inner.is_empty() {
+                builder.build()
+            } else {
+                builder
+                    .with_partition_values(partition_values.inner)
+                    .build()
+            }
+        })
+        .map(|context| Arc::new(context).into())
+        .into_extern_result(&engine)
+}
+
+/// Visits the physical column paths for which a writer should collect statistics.
+/// Each callback receives an array of path segments, valid only for that callback.
+///
+/// # Safety
+/// The context is borrowed and must be valid. `visitor` and its context must be valid for all
+/// calls.
+#[no_mangle]
+pub unsafe extern "C" fn visit_write_stats_columns(
+    write_context: Handle<SharedWriteContext>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(NullableCvoid, *const KernelStringSlice, usize),
+) {
+    let context = unsafe { write_context.as_ref() };
+    for column in context.stats_columns() {
+        let parts: Vec<_> = column
+            .iter()
+            .map(|part| kernel_string_slice!(part))
+            .collect();
+        visitor(engine_context, parts.as_ptr(), parts.len());
+    }
+}
 
 /// Gets the write context from a transaction for an unpartitioned table. The write context
 /// provides schema and path information needed for writing data.
