@@ -199,10 +199,13 @@ descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the 
 updates require both the `deletionVectors` reader/writer feature and
 `delta.enableDeletionVectors=true`.
 
-For distributed writes, call `transaction_write_state` on the driver and copy the callback's
-opaque string to workers. Workers pass it and a partition-value map to `write_context_from_state`.
-The map is consumed even if decoding fails; free the returned context with `free_write_context`.
-An empty map means no partition binding. Driver and workers must use the same kernel version.
+For distributed writes, `transaction_write_state` returns an owned state handle that outlives the
+transaction. Call `write_state_encode` to copy its opaque payload to workers, then
+`write_state_decode` once on each worker. Local writers can skip encoding and decoding.
+`write_state_bind` borrows the state and consumes a partition-value map, including on errors.
+Reuse the state for multiple bindings; an empty map means no partition binding. Release it with
+`free_write_state`. Bound contexts retain their own state reference and need `free_write_context`.
+Driver and workers must use the same kernel version.
 `visit_write_stats_columns` reports physical column paths as borrowed arrays of string slices.
 `snapshot_physical_schema` returns the full physical table schema, including partition columns.
 

@@ -23,57 +23,104 @@ use crate::{
 #[handle_descriptor(target=BoundWriteContext, mutable=false, sized=true)]
 pub struct SharedWriteContext;
 
-/// Encodes transaction write state for transport to workers running the same kernel version.
-/// The callback receives opaque UTF-8 JSON, valid only during the callback; copy it to retain it.
-/// Returns an error if the transaction cannot write or its state cannot be encoded.
+/// Shared write metadata that can outlive its transaction and bind multiple partitions.
+/// Release each owned handle with [`free_write_state`].
+#[handle_descriptor(target=WriteState, mutable=false, sized=true)]
+pub struct SharedWriteState;
+
+/// Returns owned write state without serializing it. Returns an error if the transaction cannot
+/// write. The state remains valid after the transaction is freed.
 ///
 /// # Safety
-/// The transaction and engine handles are borrowed and must be valid. `allocate_fn` must be valid.
+/// The transaction and engine handles are borrowed and must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn transaction_write_state(
     txn: Handle<ExclusiveTransaction>,
-    allocate_fn: AllocateStringFn,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<NullableCvoid> {
+) -> ExternResult<Handle<SharedWriteState>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
     txn.write_state()
-        .and_then(|state| state.encode())
+        .map(Into::into)
+        .into_extern_result(&engine)
+}
+
+/// Encodes write state for transport to workers running the same kernel version.
+/// The callback receives borrowed UTF-8 JSON and must copy it to retain it. Returns the callback's
+/// opaque pointer unchanged, or an error if serialization fails.
+///
+/// # Safety
+/// The state and engine handles are borrowed and must be valid. The callback must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn write_state_encode(
+    state: Handle<SharedWriteState>,
+    allocate_fn: AllocateStringFn,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let state = unsafe { state.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    state
+        .encode()
         .and_then(|bytes| String::from_utf8(bytes).map_err(Error::generic))
         .map(|state| allocate_fn(kernel_string_slice!(state)))
         .into_extern_result(&engine)
 }
 
-/// Decodes opaque transaction write state and binds logical partition values on a worker.
-/// Use an empty map for unpartitioned tables. Returns an error for incompatible state or invalid
-/// partition values. The returned context must be released with [`free_write_context`].
+/// Decodes the payload from [`write_state_encode`] into an owned write-state handle.
+/// Returns an error for malformed or incompatible state. Release the handle with
+/// [`free_write_state`].
 ///
 /// # Safety
-/// `partition_values` is consumed on both success and error. The state slice and engine handle
-/// are borrowed and must be valid for this call.
+/// The encoded slice and engine handle are borrowed and must be valid for this call.
 #[no_mangle]
-pub unsafe extern "C" fn write_context_from_state(
-    state: KernelStringSlice,
+pub unsafe extern "C" fn write_state_decode(
+    encoded: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedWriteState>> {
+    let engine = unsafe { engine.as_ref() };
+    let encoded: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&encoded) };
+    encoded
+        .and_then(|state| WriteState::decode(state.as_bytes()))
+        .map(Into::into)
+        .into_extern_result(&engine)
+}
+
+/// Binds logical partition values without consuming the write state.
+/// Use an empty map for unpartitioned tables. Returns an error for invalid partition values.
+/// The returned context owns its state reference; release it with [`free_write_context`].
+///
+/// # Safety
+/// The state and engine handles are borrowed and must be valid. `partition_values` is consumed
+/// on both success and error.
+#[no_mangle]
+pub unsafe extern "C" fn write_state_bind(
+    state: Handle<SharedWriteState>,
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let partition_values = unsafe { partition_values.into_inner() };
+    let state = unsafe { state.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
-    let state: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&state) };
-    state
-        .and_then(|state| WriteState::decode(state.as_bytes()))
-        .and_then(|state| {
-            let builder = state.write_context_builder();
-            if partition_values.inner.is_empty() {
-                builder.build()
-            } else {
-                builder
-                    .with_partition_values(partition_values.inner)
-                    .build()
-            }
-        })
+    let builder = state.write_context_builder();
+    let result = if partition_values.inner.is_empty() {
+        builder.build()
+    } else {
+        builder
+            .with_partition_values(partition_values.inner)
+            .build()
+    };
+    result
         .map(|context| Arc::new(context).into())
         .into_extern_result(&engine)
+}
+
+/// Releases an owned write-state handle. Bound contexts keep their own state references.
+///
+/// # Safety
+/// The handle must be valid and is consumed. Do not use or free it again.
+#[no_mangle]
+pub unsafe extern "C" fn free_write_state(state: Handle<SharedWriteState>) {
+    unsafe { state.drop_handle() };
 }
 
 /// Visits the physical column paths for which a writer should collect statistics.

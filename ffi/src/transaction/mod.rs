@@ -1256,6 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_write_state_outlives_transaction(
         #[case] partitioned: bool,
+        #[values(false, true)] roundtrip: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let schema = schema_ref! {
             nullable "number": INTEGER,
@@ -1269,99 +1270,142 @@ mod tests {
             let txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
-            let encoded = recover_string(
+            let state = ok_or_panic(unsafe {
+                write_context::transaction_write_state(txn.shallow_copy(), engine.shallow_copy())
+            });
+            unsafe { free_transaction(txn) };
+            let state = if roundtrip {
+                let encoded = recover_string(
+                    ok_or_panic(unsafe {
+                        write_context::write_state_encode(
+                            state.shallow_copy(),
+                            allocate_str,
+                            engine.shallow_copy(),
+                        )
+                    })
+                    .unwrap(),
+                );
+                unsafe { write_context::free_write_state(state) };
                 ok_or_panic(unsafe {
-                    write_context::transaction_write_state(
-                        txn.shallow_copy(),
-                        allocate_str,
+                    write_context::write_state_decode(
+                        kernel_string_slice!(encoded),
                         engine.shallow_copy(),
                     )
                 })
-                .unwrap(),
-            );
-            unsafe { free_transaction(txn) };
+            } else {
+                state
+            };
 
-            let partitions = partition_value_map_new();
-            if partitioned {
-                let part_name = "part";
-                ok_or_panic(unsafe {
-                    partition_value_map_insert_int(
-                        partitions.shallow_copy(),
-                        kernel_string_slice!(part_name),
-                        42,
-                        engine.shallow_copy(),
-                    )
-                });
-            }
-            let context = ok_or_panic(unsafe {
-                write_context::write_context_from_state(
-                    kernel_string_slice!(encoded),
-                    partitions,
+            let invalid_partitions = partition_value_map_new();
+            let unknown = "unknown";
+            ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    invalid_partitions.shallow_copy(),
+                    kernel_string_slice!(unknown),
+                    1,
                     engine.shallow_copy(),
                 )
             });
-            let dir = recover_string(
-                unsafe { get_write_dir(context.shallow_copy(), allocate_str) }.unwrap(),
-            );
-            assert_eq!(dir.ends_with("part=42/"), partitioned);
-            let mut collected: Vec<(String, String, bool)> = Vec::new();
-            unsafe {
-                visit_partition_values(
-                    context.shallow_copy(),
-                    std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
-                    collect_partition_value,
-                );
-            }
-            assert_eq!(collected.len(), usize::from(partitioned));
-            if partitioned {
-                assert_eq!(collected[0], ("part".into(), "42".into(), false));
-            }
-            let mut stats: Vec<Vec<String>> = Vec::new();
-            extern "C" fn collect_stats(
-                context: NullableCvoid,
-                parts: *const KernelStringSlice,
-                count: usize,
-            ) {
-                let stats = unsafe { &mut *context.unwrap().cast::<Vec<Vec<String>>>().as_ptr() };
-                let parts = unsafe { std::slice::from_raw_parts(parts, count) };
-                stats.push(
-                    parts
-                        .iter()
-                        .map(|part| unsafe { String::try_from_slice(part) }.unwrap())
-                        .collect(),
-                );
-            }
-            unsafe {
-                write_context::visit_write_stats_columns(
-                    context.shallow_copy(),
-                    std::ptr::NonNull::new((&mut stats as *mut Vec<_>).cast()),
-                    collect_stats,
-                );
-            }
-            assert!(stats.contains(&vec!["number".to_string()]));
-            let malformed = "{}";
-            let result = unsafe {
-                write_context::write_context_from_state(
-                    kernel_string_slice!(malformed),
-                    partition_value_map_new(),
+            let failed_bind = unsafe {
+                write_context::write_state_bind(
+                    state.shallow_copy(),
+                    invalid_partitions,
                     engine.shallow_copy(),
                 )
             };
-            assert!(matches!(result, ExternResult::Err(_)));
-            if let ExternResult::Err(error) = result {
+            assert!(matches!(failed_bind, ExternResult::Err(_)));
+            if let ExternResult::Err(error) = failed_bind {
                 unsafe { recover_error(error) };
             }
-            let snapshot = unsafe {
-                build_snapshot(kernel_string_slice!(table_url_str), engine.shallow_copy())
-            };
-            let physical = unsafe { crate::snapshot_physical_schema(snapshot.shallow_copy()) };
-            assert_eq!(unsafe { physical.as_ref() }.num_fields(), 2);
-            unsafe {
-                crate::free_schema(physical);
-                free_snapshot(snapshot);
-                free_write_context(context);
-                free_engine(engine);
+
+            let mut contexts = Vec::new();
+            for value in [42, 43] {
+                let partitions = partition_value_map_new();
+                if partitioned {
+                    let part_name = "part";
+                    ok_or_panic(unsafe {
+                        partition_value_map_insert_int(
+                            partitions.shallow_copy(),
+                            kernel_string_slice!(part_name),
+                            value,
+                            engine.shallow_copy(),
+                        )
+                    });
+                }
+                let context = ok_or_panic(unsafe {
+                    write_context::write_state_bind(
+                        state.shallow_copy(),
+                        partitions,
+                        engine.shallow_copy(),
+                    )
+                });
+                contexts.push((value, context));
             }
+            unsafe { write_context::free_write_state(state) };
+            for (value, context) in contexts {
+                let dir = recover_string(
+                    unsafe { get_write_dir(context.shallow_copy(), allocate_str) }.unwrap(),
+                );
+                assert_eq!(dir.ends_with(&format!("part={value}/")), partitioned);
+                let mut collected: Vec<(String, String, bool)> = Vec::new();
+                unsafe {
+                    visit_partition_values(
+                        context.shallow_copy(),
+                        std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                        collect_partition_value,
+                    );
+                }
+                assert_eq!(collected.len(), usize::from(partitioned));
+                if partitioned {
+                    assert_eq!(collected[0], ("part".into(), value.to_string(), false));
+                }
+                let mut stats: Vec<Vec<String>> = Vec::new();
+                extern "C" fn collect_stats(
+                    context: NullableCvoid,
+                    parts: *const KernelStringSlice,
+                    count: usize,
+                ) {
+                    let stats =
+                        unsafe { &mut *context.unwrap().cast::<Vec<Vec<String>>>().as_ptr() };
+                    let parts = unsafe { std::slice::from_raw_parts(parts, count) };
+                    stats.push(
+                        parts
+                            .iter()
+                            .map(|part| unsafe { String::try_from_slice(part) }.unwrap())
+                            .collect(),
+                    );
+                }
+                unsafe {
+                    write_context::visit_write_stats_columns(
+                        context.shallow_copy(),
+                        std::ptr::NonNull::new((&mut stats as *mut Vec<_>).cast()),
+                        collect_stats,
+                    );
+                }
+                assert!(stats.contains(&vec!["number".to_string()]));
+                let malformed = "{}";
+                let result = unsafe {
+                    write_context::write_state_decode(
+                        kernel_string_slice!(malformed),
+                        engine.shallow_copy(),
+                    )
+                };
+                assert!(matches!(result, ExternResult::Err(_)));
+                if let ExternResult::Err(error) = result {
+                    unsafe { recover_error(error) };
+                }
+                let snapshot = unsafe {
+                    build_snapshot(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                };
+                let physical = unsafe { crate::snapshot_physical_schema(snapshot.shallow_copy()) };
+                assert_eq!(unsafe { physical.as_ref() }.num_fields(), 2);
+                unsafe {
+                    crate::free_schema(physical);
+                    free_snapshot(snapshot);
+                    free_write_context(context);
+                }
+            }
+            unsafe { free_engine(engine) };
         }
         Ok(())
     }
