@@ -60,12 +60,17 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
-    /// Whether the checkpoint has compatible pre-parsed partition values.
-    /// When `true`, checkpoint batches can read typed partition values directly from
-    /// `partitionValues_parsed` instead of parsing strings from `partitionValues`.
+    /// Whether the checkpoint has compatible pre-parsed partition values for footer skipping.
+    /// When `true`, checkpoint readers can prune with `partitionValues_parsed`; surviving scan
+    /// rows may still reparse raw `partitionValues` with reader options.
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,
+    /// Whether every timezone-independent partition field needed by the scan can be reused from
+    /// `partitionValues_parsed`.
+    #[serde(default)]
+    #[allow(unused)]
+    pub can_reuse_partition_values_parsed: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -79,6 +84,7 @@ impl CheckpointReadInfo {
         Self {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
+            can_reuse_partition_values_parsed: false,
             checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
         }
     }
@@ -1082,6 +1088,9 @@ impl LogSegment {
         let has_partition_values_parsed = partition_schema
             .zip(file_actions_schema.as_ref())
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
+        let can_reuse_partition_values_parsed = partition_schema
+            .zip(file_actions_schema.as_ref())
+            .is_some_and(|(ps, fs)| Self::schema_has_reusable_partition_values_parsed(fs, ps));
 
         // JSON checkpoint stats are required when structured stats cannot satisfy the scan schema.
         let needs_json_stats_fallback = stats_schema.is_some()
@@ -1216,6 +1225,7 @@ impl LogSegment {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
+            can_reuse_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
@@ -1533,6 +1543,32 @@ impl LogSegment {
 
         debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
+    }
+
+    /// Checks whether a compatible `partitionValues_parsed` struct contains every field that can
+    /// be reused by scan output. Zoned timestamps are reparsed from the raw map and may be absent.
+    fn schema_has_reusable_partition_values_parsed(
+        checkpoint_schema: &StructType,
+        partition_schema: &StructType,
+    ) -> bool {
+        if !Self::schema_has_compatible_partition_values_parsed(checkpoint_schema, partition_schema)
+        {
+            return false;
+        }
+
+        let Some(partition_parsed) =
+            Self::get_field_from_add(checkpoint_schema, "partitionValues_parsed")
+        else {
+            return false;
+        };
+        let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
+            return false;
+        };
+
+        partition_schema.fields().all(|field| {
+            field.data_type() == &DataType::TIMESTAMP
+                || partition_struct.field(field.name()).is_some()
+        })
     }
 }
 
