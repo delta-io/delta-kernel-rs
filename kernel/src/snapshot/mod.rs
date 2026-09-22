@@ -150,6 +150,10 @@ impl Snapshot {
     /// If the path belongs to a different table, the build fails. Use [`Snapshot::builder_for`]
     /// explicitly to load a replacement table. Requests for versions older than the input
     /// snapshot also return an error.
+    ///
+    /// Identity validation adds storage I/O even when requesting the existing version. Without a
+    /// checkpoint hint, it uses a HEAD request and metadata read of commit zero; checkpoint-based
+    /// validation also lists the log. Both paths read the checkpoint hint first.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }

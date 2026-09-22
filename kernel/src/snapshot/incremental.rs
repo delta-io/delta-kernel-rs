@@ -323,6 +323,20 @@ impl Snapshot {
         let storage = engine.storage_handler();
         let log_root = &self.log_segment.log_root;
         let hint = LastCheckpointHint::try_read(storage.as_ref(), log_root, cancellation_token)?;
+        if hint.is_none() {
+            let commit_path = ParsedLogPath::new_commit(self.table_root(), 0)?;
+            match storage.head(&commit_path.location) {
+                Ok(file) => {
+                    let commit = ParsedLogPath::parse_commit(file)?;
+                    let segment = LogSegment::new_for_version_zero(log_root.clone(), commit)?;
+                    let (metadata, _, _) = segment.read_protocol_metadata(engine, None)?;
+                    return self.ensure_same_table(metadata.id());
+                }
+                // A checkpoint may exist without a hint after commit zero has been cleaned up.
+                Err(Error::FileNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let files = match &hint {
             Some(hint) => LogSegmentFiles::list_with_checkpoint_hint(
                 hint,
@@ -915,14 +929,52 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_incremental_snapshot_rejects_metadata_id_change() -> DeltaResult<()> {
+    async fn test_incremental_snapshot_rejects_metadata_id_change(
+        #[values(false, true)] rebuild: bool,
+    ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 1).await?;
         let existing = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        let next_version = if rebuild {
+            commit(
+                ctx.url.as_str(),
+                ctx.store.as_ref(),
+                1,
+                vec![add_action("file2.parquet")],
+            )
+            .await;
+            Snapshot::builder_for(ctx.url.as_str())
+                .build(ctx.engine.as_ref())?
+                .checkpoint(ctx.engine.as_ref(), None)?;
+            2
+        } else {
+            1
+        };
         let mut metadata = metadata_action(json!({}));
         metadata["metaData"]["id"] = json!("different-table-id");
-        commit(ctx.url.as_str(), ctx.store.as_ref(), 1, vec![metadata]).await;
+        commit(
+            ctx.url.as_str(),
+            ctx.store.as_ref(),
+            next_version,
+            vec![metadata],
+        )
+        .await;
+
+        existing.validate_table_identity(ctx.engine.as_ref(), None)?;
+        if rebuild {
+            let segment = Snapshot::build_new_segment(
+                ctx.engine.as_ref(),
+                &existing.log_segment,
+                existing.version(),
+                vec![],
+                None,
+                CheckpointHandling::Adopt,
+                None,
+            )?;
+            assert!(matches!(segment, super::NewSegment::Rebuild(_)));
+        }
 
         let error = Snapshot::builder_from(existing)
             .build(ctx.engine.as_ref())
@@ -930,6 +982,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("expected table ID test-id, found different-table-id"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_same_version_identity_check_without_hint_does_not_list() -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        let engine = crate::metrics::MeteredDeltaEngine::new(ctx.engine.clone());
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        let existing = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let updated = Snapshot::builder_from(existing.clone())
+            .at_version(existing.version())
+            .build(&engine)?;
+        assert!(Arc::ptr_eq(&existing, &updated));
+        let events = reporter.events();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::JsonReadCompleted(_))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::StorageListCompleted(_))));
         Ok(())
     }
 
