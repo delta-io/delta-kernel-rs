@@ -907,7 +907,7 @@ mod tests {
             assert_extern_result_error_with_message(
                 result,
                 KernelError::SchemaError,
-                Some("UDT annotation keys type and sqlType are reserved"),
+                Some("Schema error: UDT annotation keys type and sqlType are reserved"),
             );
         }
     }
