@@ -69,15 +69,14 @@ fn generate_checkpoint_parts(
             sidecar_index += 1;
         }
 
-        if splitter.lock().expect("splitter lock").is_exhausted() {
+        if splitter.lock()?.is_exhausted() {
             break;
         }
     }
 
     let non_file_batches = Arc::into_inner(splitter)
         .expect("splitter Arc should have no other references")
-        .into_inner()
-        .expect("splitter Mutex should not be poisoned")
+        .into_inner()?
         .into_non_file_batches();
 
     Ok(CheckpointParts {
@@ -664,12 +663,11 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
 
-    assert!(splitter.lock().expect("splitter lock").is_exhausted());
+    assert!(splitter.lock()?.is_exhausted());
 
     let non_file_batches = Arc::into_inner(splitter)
         .expect("splitter Arc should have no other references")
-        .into_inner()
-        .expect("splitter Mutex should not be poisoned")
+        .into_inner()?
         .into_non_file_batches();
     verify_non_file_batches(
         &non_file_batches,
