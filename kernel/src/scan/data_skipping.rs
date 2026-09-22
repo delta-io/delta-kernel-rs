@@ -16,7 +16,9 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
+use crate::scan::data_skipping::stats_schema::{
+    is_skipping_eligible_datatype, min_max_stats_columns,
+};
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
@@ -84,10 +86,9 @@ fn as_sql_data_skipping_predicate(
     )
 }
 
-/// Like [`as_sql_data_skipping_predicate`] but only rewrites references to columns in
-/// `stats_columns`; other columns return `None` from the `get_*_stat` methods and
-/// junction-fold into NULL literals. Range comparisons also require membership in
-/// `min_max_columns`, derived from the expected stats schema.
+/// Rewrites `pred` using exact partition values and statistics for `stats_columns`.
+/// Non-partition min/max lookups also require membership in `min_max_columns`, derived
+/// from the expected stats schema. Unsupported references junction-fold into NULL literals.
 pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     pred: &Pred,
     partition_columns: &HashSet<ColumnName>,
@@ -96,18 +97,6 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
 ) -> Option<Pred> {
     DataSkippingPredicateCreator::new(partition_columns, stats_columns, min_max_columns)
         .eval_sql_where(pred)
-}
-
-/// Returns the physical leaf paths with min/max entries in the expected statistics schema.
-/// Missing stats schemas or missing min/max fields produce an empty set.
-pub(crate) fn min_max_stats_columns(stats_schema: Option<&SchemaRef>) -> HashSet<ColumnName> {
-    let Some(DataType::Struct(min_values)) = stats_schema
-        .and_then(|schema| schema.field(MIN_VALUES))
-        .map(|field| field.data_type())
-    else {
-        return HashSet::new();
-    };
-    min_values.leaves(None).as_ref().0.iter().cloned().collect()
 }
 
 #[internal_api]
@@ -220,7 +209,7 @@ impl DataSkippingFilter {
                     &predicate,
                     &partition_columns,
                     stats_columns,
-                    &min_max_stats_columns(stats_schema),
+                    &min_max_stats_columns(stats_schema.map(AsRef::as_ref)),
                 )?),
             )
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
@@ -455,7 +444,8 @@ impl DataSkippingFilter {
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
 /// partitions whose parquet min/max may omit NaNs. `physical_stats_columns` is the table-level
 /// stats membership set; references outside it fold to NULL (keeping the file).
-/// `physical_min_max_columns` restricts range comparisons to columns with min/max statistics.
+/// `physical_min_max_columns` gates non-partition min/max lookups; null-count and exact
+/// partition-value pruning remain available independently.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,
@@ -585,10 +575,8 @@ impl DataSkippingColumns<'_> {
         if self.is_partition_column(col) {
             Some(partition_value_expr(col))
         } else {
-            (self.is_stats_column(col)
-                && self.physical_min_max_columns.contains(col)
-                && has_min_max_stats(data_type))
-            .then(|| Expr::from(column_name!("stats_parsed", MIN_VALUES).join(col)))
+            self.is_min_max_column(col, data_type)
+                .then(|| Expr::from(column_name!("stats_parsed", MIN_VALUES).join(col)))
         }
     }
 
@@ -598,10 +586,8 @@ impl DataSkippingColumns<'_> {
         if self.is_partition_column(col) {
             Some(partition_value_expr(col))
         } else {
-            (self.is_stats_column(col)
-                && self.physical_min_max_columns.contains(col)
-                && has_min_max_stats(data_type))
-            .then(|| Expr::from(column_name!("stats_parsed", MAX_VALUES).join(col)))
+            self.is_min_max_column(col, data_type)
+                .then(|| Expr::from(column_name!("stats_parsed", MAX_VALUES).join(col)))
         }
     }
 
@@ -629,6 +615,12 @@ impl DataSkippingColumns<'_> {
 
     fn rowcount_stat(&self) -> Expr {
         col!("stats_parsed", NUM_RECORDS)
+    }
+
+    fn is_min_max_column(&self, col: &ColumnName, data_type: &DataType) -> bool {
+        self.is_stats_column(col)
+            && self.physical_min_max_columns.contains(col)
+            && has_min_max_stats(data_type)
     }
 }
 

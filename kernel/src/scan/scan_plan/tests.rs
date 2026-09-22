@@ -22,6 +22,73 @@ use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
 use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 
+#[cfg(feature = "udt-in-dev")]
+#[rstest]
+#[case::comparison(Pred::eq(col!("value"), lit(42i64)), ["mixed.parquet", "non_null.parquet", "unknown.parquet"])]
+#[case::is_null(Pred::is_null(col!("value")), ["all_null.parquet", "mixed.parquet", "unknown.parquet"])]
+#[case::is_not_null(Pred::is_not_null(col!("value")), ["mixed.parquet", "non_null.parquet", "unknown.parquet"])]
+#[tokio::test]
+async fn declarative_udt_skipping_uses_only_null_counts(
+    #[case] predicate: Pred,
+    #[case] expected: [&str; 3],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(crate::object_store::memory::InMemory::new());
+    let schema = schema_ref! {
+        nullable "value": (crate::schema::UserDefinedType {
+            sql_type: Box::new(DataType::LONG),
+            annotation: Default::default(),
+        }),
+    };
+    let mut actions = vec![
+        serde_json::json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+        serde_json::json!({"metaData":{
+            "id":"udt-declarative", "format":{"provider":"parquet","options":{}},
+            "schemaString":serde_json::to_string(&schema)?, "partitionColumns":[],
+            "configuration":{}, "createdTime":0,
+        }}),
+    ];
+    for (path, null_count) in [
+        ("non_null.parquet", Some(0)),
+        ("mixed.parquet", Some(1)),
+        ("all_null.parquet", Some(2)),
+        ("unknown.parquet", None),
+    ] {
+        let stats = serde_json::json!({"numRecords":2, "nullCount":{"value":null_count},
+            "minValues":{"value":100}, "maxValues":{"value":100}});
+        actions.push(serde_json::json!({"add":{
+            "path":path, "size":100, "partitionValues":{}, "modificationTime":0,
+            "dataChange":true, "stats":stats.to_string(),
+        }}));
+    }
+    ::test_utils::add_commit(
+        "memory:///",
+        store.as_ref(),
+        0,
+        actions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .await?;
+    let engine = SyncEngine::new_with_store(store);
+    let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let batches = declarative_metadata(&scan, &engine)?;
+    let mut paths = vec![];
+    for batch in &batches {
+        let column = batch.column_by_name("path").unwrap();
+        let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+        paths.extend(column.iter().flatten().map(str::to_owned));
+    }
+    paths.sort();
+    assert_eq!(paths, expected);
+    Ok(())
+}
+
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
 fn normalized_metadata_batch(

@@ -3,6 +3,7 @@
 mod column_filter;
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
@@ -29,8 +30,8 @@ use crate::DeltaResult;
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
 ///
-/// Array, Map, Variant, and UDT types are included in `nullCount` (null counts are meaningful
-/// for these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping).
+/// Array, Map, Variant, and UDT types are included in `nullCount` but excluded from
+/// `minValues`/`maxValues`.
 /// They count as leaf columns against the indexed column limit. The `nullCount` schema also
 /// includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null
 /// counts are still meaningful for those types.
@@ -191,6 +192,19 @@ pub(crate) fn stats_column_names(
     let mut columns = Vec::new();
     filter.collect_columns(data_schema, &mut columns);
     columns
+}
+
+/// Returns physical min/max leaf paths from the expected schema's `minValues` struct.
+/// Expected schemas give `minValues` and `maxValues` the same shape. Returns an empty set
+/// when the schema is absent or `minValues` is absent or not a struct.
+pub(crate) fn min_max_stats_columns(stats_schema: Option<&Schema>) -> HashSet<ColumnName> {
+    let Some(DataType::Struct(min_values)) = stats_schema
+        .and_then(|schema| schema.field(MIN_VALUES))
+        .map(|field| field.data_type())
+    else {
+        return HashSet::new();
+    };
+    min_values.leaves(None).as_ref().0.iter().cloned().collect()
 }
 
 /// Strips field metadata from every field in a schema, at all levels of nesting (nested

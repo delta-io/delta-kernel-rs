@@ -12,17 +12,21 @@ use crate::schema::{schema, UserDefinedType};
 
 #[cfg(feature = "udt-in-dev")]
 #[rstest]
-#[case::comparison(Pred::eq(col!("value"), lit(42i64)), 0, true)]
-#[case::comparison_all_null(Pred::eq(col!("value"), lit(42i64)), 2, false)]
-#[case::is_null(Pred::is_null(col!("value")), 0, false)]
-#[case::is_null_mixed(Pred::is_null(col!("value")), 1, true)]
-#[case::is_not_null(Pred::is_not_null(col!("value")), 2, false)]
-#[case::and(Pred::and(Pred::eq(col!("value"), lit(42i64)), Pred::gt(col!("other"), lit(100i64))), 0, false)]
-#[case::or(Pred::or(Pred::eq(col!("value"), lit(42i64)), Pred::gt(col!("other"), lit(100i64))), 0, true)]
+#[case::comparison(Pred::eq(col!("value"), lit(42i64)), Some(0), true, true)]
+#[case::comparison_all_null(Pred::eq(col!("value"), lit(42i64)), Some(2), false, true)]
+#[case::comparison_unknown(Pred::eq(col!("value"), lit(42i64)), None, true, true)]
+#[case::is_null(Pred::is_null(col!("value")), Some(0), false, false)]
+#[case::is_null_mixed(Pred::is_null(col!("value")), Some(1), true, true)]
+#[case::is_null_unknown(Pred::is_null(col!("value")), None, true, true)]
+#[case::is_not_null(Pred::is_not_null(col!("value")), Some(2), false, true)]
+#[case::is_not_null_unknown(Pred::is_not_null(col!("value")), None, true, true)]
+#[case::and(Pred::and(Pred::eq(col!("value"), lit(42i64)), Pred::gt(col!("other"), lit(100i64))), Some(0), false, false)]
+#[case::or(Pred::or(Pred::eq(col!("value"), lit(42i64)), Pred::gt(col!("other"), lit(100i64))), Some(0), true, true)]
 fn test_udt_skipping_uses_null_count_without_min_max(
     #[case] predicate: Pred,
-    #[case] null_count: i64,
+    #[case] null_count: Option<i64>,
     #[case] keep: bool,
+    #[case] checkpoint_keep: bool,
 ) {
     let udt = UserDefinedType {
         sql_type: Box::new(DataType::LONG),
@@ -67,7 +71,7 @@ fn test_udt_skipping_uses_null_count_without_min_max(
         (column_name!("stats_parsed.numRecords"), Scalar::from(2i64)),
         (
             column_name!("stats_parsed.nullCount.value"),
-            Scalar::from(null_count),
+            null_count.map_or(Scalar::Null(DataType::LONG), Scalar::from),
         ),
         (
             column_name!("stats_parsed.nullCount.other"),
@@ -85,6 +89,13 @@ fn test_udt_skipping_uses_null_count_without_min_max(
     assert_eq!(
         sql_pred.as_ref().and_then(|pred| evaluator.eval(pred)) != Some(false),
         keep
+    );
+    assert_eq!(
+        checkpoint_pred
+            .as_ref()
+            .and_then(|pred| evaluator.eval(pred))
+            != Some(false),
+        checkpoint_keep
     );
 }
 
