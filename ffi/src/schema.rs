@@ -46,6 +46,25 @@ pub struct EngineSchemaVisitor {
     /// Visit a UDT with its physical type in the one-element `child_list_id` list.
     /// The child is named `sqlType`, inherits `is_nullable`, and has empty field metadata.
     /// The annotation and its string slices are borrowed for the duration of this callback.
+    /// Copy annotation keys and values that the engine retains after the callback returns.
+    ///
+    /// For a schema with just this field:
+    ///
+    /// ```json
+    /// {"name":"id", "type":{"type":"udt", "sqlType":"long", "class":"example.Id"},
+    ///  "nullable":true, "metadata":{}}
+    /// ```
+    ///
+    /// Kernel calls the engine in this order (state pointers omitted; list IDs are engine-chosen):
+    ///
+    /// ```text
+    /// make_field_list(1) -> root
+    /// make_field_list(1) -> physical
+    /// visit_long(physical, "sqlType", true, {})
+    /// visit_user_defined(root, "id", true, {}, physical, {"class":"example.Id"})
+    /// ```
+    ///
+    /// The engine appends the UDT to `root`, referring to the physical type already in `physical`.
     pub visit_user_defined: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,

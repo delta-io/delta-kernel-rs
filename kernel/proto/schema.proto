@@ -85,10 +85,16 @@ message StructType {
 
 message VariantType {}
 
+// Preserves string-or-null annotation members during schema transport.
+// A present annotation key without a string value represents an explicit JSON null.
 message UserDefinedAnnotationValue {
   optional string value = 1;
 }
 
+// Encodes the UDT object in a schema field's type, for example:
+// {"type":"udt", "sqlType":"long", "class":"example.Id", "pyClass":null}
+// The physical type is sql_type; class and pyClass are annotation entries.
+// Plan transport retains both so the receiver can reconstruct the logical schema.
 message UserDefinedType {
   DataType sql_type = 1;
   map<string, UserDefinedAnnotationValue> annotation = 2;
