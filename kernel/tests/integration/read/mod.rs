@@ -1,6 +1,8 @@
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
 mod scan_cancellation;
+#[cfg(feature = "udt-in-dev")]
+mod user_defined;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -31,6 +31,7 @@ use delta_kernel::schema::{
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
 
+use crate::delta_types::FfiNullableStringMap;
 use crate::scan::{CMetadataMap, CMetadataValueKind};
 use crate::{
     AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
@@ -744,6 +745,58 @@ fn visit_field_map_impl(
     Ok(wrap_field(state, field))
 }
 
+/// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
+///
+/// Copies the annotation and consumes the physical field ID before validating the UDT. Its name,
+/// nullability, and metadata are ignored. Returns an error for invalid IDs, invalid UTF-8,
+/// duplicate or reserved annotation keys, nested UDTs, or disabled UDT support.
+///
+/// # Safety
+///
+/// `state`, `name`, `annotation` and `allocate_error` must be valid for the call. When non-null,
+/// `metadata` must point to a valid descriptor and callback. Annotation slices are borrowed only
+/// for the call duration.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_user_defined(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    sql_type_id: usize,
+    annotation: FfiNullableStringMap,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let result = (|| -> DeltaResult<usize> {
+        #[cfg(feature = "udt-in-dev")]
+        {
+            let name = unsafe { name.try_to_string() }?;
+            let annotation = unsafe { annotation.try_to_hash_map() }?;
+            let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
+            let physical = state
+                .elements
+                .take(sql_type_id)
+                .ok_or_else(|| Error::schema("Invalid UDT physical type ID"))?;
+            let udt = delta_kernel::schema::UserDefinedType {
+                sql_type: Box::new(physical.data_type),
+                annotation: annotation.into_iter().collect(),
+            };
+            udt.validate()?;
+            Ok(wrap_field(
+                state,
+                StructField::new(name, udt, nullable).with_metadata(metadata),
+            ))
+        }
+        #[cfg(not(feature = "udt-in-dev"))]
+        {
+            let _ = (state, name, sql_type_id, annotation, nullable, metadata);
+            Err(Error::unsupported(
+                "UDT schema construction requires udt-in-dev",
+            ))
+        }
+    })();
+    result.into_extern_result(&allocate_error)
+}
+
 /// Visit a variant field.
 ///
 /// Takes a struct type ID that defines the variant schema. This must reference a field created by
@@ -813,6 +866,51 @@ mod tests {
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case("class", true)]
+    #[case("type", false)]
+    #[case("sqlType", false)]
+    fn udt_schema_visit_preserves_annotation_and_rejects_reserved_keys(
+        #[case] key: &str,
+        #[case] valid: bool,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+        let entries = [crate::delta_types::FfiNullableStringMapEntry {
+            key: unsafe { KernelStringSlice::new_unsafe(key) },
+            value: None.into(),
+        }];
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: entries.as_ptr(),
+                    len: entries.len(),
+                },
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        if valid {
+            let field = state.elements.take(ok_or_panic(result)).unwrap();
+            let DataType::UserDefined(udt) = field.data_type else {
+                panic!("Expected UDT")
+            };
+            assert_eq!(*udt.sql_type, DataType::LONG);
+            assert_eq!(udt.annotation.get(key), Some(&None));
+        } else {
+            assert_extern_result_error_with_message(
+                result,
+                KernelError::SchemaError,
+                Some("UDT annotation keys type and sqlType are reserved"),
+            );
+        }
+    }
 
     #[derive(Default)]
     struct TestMetadata {
