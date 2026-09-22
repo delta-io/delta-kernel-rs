@@ -39,6 +39,7 @@ typedef struct
   uintptr_t children;
   char* column_mapping_id;
   char* column_mapping_physical_name;
+  FfiNullableStringMap annotation;
 } SchemaItem;
 
 typedef struct SchemaItemList
@@ -70,6 +71,7 @@ SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nu
   list->list[idx].is_nullable = is_nullable;
   list->list[idx].column_mapping_id = NULL;
   list->list[idx].column_mapping_physical_name = NULL;
+  list->list[idx].annotation = (FfiNullableStringMap){ NULL, 0 };
   list->len++;
   return &list->list[idx];
 }
@@ -203,12 +205,22 @@ void visit_user_defined(
   uintptr_t child_list_id,
   FfiNullableStringMap annotation)
 {
-  (void)annotation;
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
   SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "udt", is_nullable);
   item->children = child_list_id;
   read_column_mapping_metadata(item, metadata, builder->engine);
+  FfiNullableStringMapEntry* entries = calloc(annotation.len, sizeof(FfiNullableStringMapEntry));
+  for (uintptr_t i = 0; i < annotation.len; i++) {
+    entries[i].key = (KernelStringSlice){
+      allocate_string(annotation.ptr[i].key), annotation.ptr[i].key.len
+    };
+    entries[i].value = annotation.ptr[i].value;
+    if (entries[i].value.tag == SomeKernelStringSlice) {
+      entries[i].value.some.ptr = allocate_string(entries[i].value.some);
+    }
+  }
+  item->annotation = (FfiNullableStringMap){ entries, annotation.len };
 }
 
 void visit_array(
@@ -367,6 +379,13 @@ void free_builder(SchemaBuilder* builder)
       free(item->name);
       free(item->column_mapping_id); // NULL when the field carried no column-mapping id; free(NULL) is a no-op
       free(item->column_mapping_physical_name);
+      for (uintptr_t k = 0; k < item->annotation.len; k++) {
+        free((void*)item->annotation.ptr[k].key.ptr);
+        if (item->annotation.ptr[k].value.tag == SomeKernelStringSlice) {
+          free((void*)item->annotation.ptr[k].value.some.ptr);
+        }
+      }
+      free((void*)item->annotation.ptr);
       // don't free item->type, those are static strings
       if (field_type_needs_free(item->type)) {
         // except decimal and geo types, we malloc'd those :)

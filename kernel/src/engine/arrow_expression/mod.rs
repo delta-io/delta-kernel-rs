@@ -170,9 +170,7 @@ impl Scalar {
 
         match *data_type {
             #[cfg(feature = "udt-in-dev")]
-            DataType::UserDefined(_) => {
-                return Err(Error::unsupported("UDT expressions are not yet supported"))
-            }
+            DataType::UserDefined(ref udt) => Self::append_null(builder, &udt.sql_type, num_rows)?,
             DataType::INTEGER => append_nulls_as!(array::Int32Builder),
             DataType::LONG => append_nulls_as!(array::Int64Builder),
             DataType::SHORT => append_nulls_as!(array::Int16Builder),
@@ -444,6 +442,8 @@ fn validate_data_schema_top_level(
 /// Unlike a full conversion, this does not inspect nested types or field metadata.
 fn top_level_types_compatible(expected_type: &DataType, data_type: &ArrowDataType) -> bool {
     match (expected_type, data_type) {
+        #[cfg(feature = "udt-in-dev")]
+        (DataType::UserDefined(udt), _) => top_level_types_compatible(&udt.sql_type, data_type),
         // Dictionary types have the same logical type as their values.
         (_, ArrowDataType::Dictionary(_, value_type)) => {
             top_level_types_compatible(expected_type, value_type)

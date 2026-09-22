@@ -84,6 +84,18 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     int scale;
     sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
     visit_res = visit_field_decimal(state, name, precision, scale, item->is_nullable, &metadata, allocate_error);
+  } else if (strcmp(item->type, "udt") == 0) {
+    SchemaItemList child_list = cschema->builder->lists[item->children];
+    if (child_list.len != 1) {
+      printf("[ERROR] Invalid UDT child list\n");
+      return 0;
+    }
+    uintptr_t child_id = visit_schema_item(&child_list.list[0], state, cschema);
+    if (child_id == 0) {
+      return 0;
+    }
+    visit_res = visit_field_user_defined(
+      state, name, child_id, item->annotation, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "array") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     // an array should always have 1 child

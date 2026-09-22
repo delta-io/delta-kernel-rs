@@ -510,16 +510,22 @@ fn get_indices(
             ..
         }) = kernel_field_info
         {
+            let requested_type = requested_field.data_type();
+            #[cfg(feature = "udt-in-dev")]
+            let requested_type = match requested_type {
+                DataType::UserDefined(udt) => udt.sql_type.as_ref(),
+                data_type => data_type,
+            };
             // If the field is a variant, make sure the parquet schema matches the unshredded
             // variant representation. This is to ensure that shredded reads are not
             // performed.
-            if requested_field.data_type == DataType::unshredded_variant() {
+            if requested_type == &DataType::unshredded_variant() {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
-                    if let DataType::Struct(ref requested_schema)
-                    | DataType::Variant(ref requested_schema) = requested_field.data_type
+                    if let DataType::Struct(requested_schema)
+                    | DataType::Variant(requested_schema) = requested_type
                     {
                         let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
@@ -561,7 +567,7 @@ fn get_indices(
                 | ArrowDataType::LargeListView(list_field) => {
                     // we just want to transparently recurse into lists, need to transform the
                     // kernel list data type into a schema
-                    if let DataType::Array(array_type) = requested_field.data_type() {
+                    if let DataType::Array(array_type) = requested_type {
                         let requested_schema = schema! {
                             (StructField::new(
                                 list_field.name().clone(), // so we find it in the inner call
@@ -627,7 +633,7 @@ fn get_indices(
                     }
                 }
                 ArrowDataType::Map(key_val_field, _) => {
-                    match (key_val_field.data_type(), requested_field.data_type()) {
+                    match (key_val_field.data_type(), requested_type) {
                         (ArrowDataType::Struct(inner_fields), DataType::Map(map_type)) => {
                             let mut key_val_names =
                                 inner_fields.iter().map(|f| f.name().to_string());
