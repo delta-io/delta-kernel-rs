@@ -2266,6 +2266,7 @@ pub enum DataType {
     Variant(Box<StructType>),
     /// An engine annotation over a physical Delta type.
     #[cfg(feature = "udt-in-dev")]
+    #[from(UserDefinedType)]
     UserDefined(UserDefinedType),
 }
 
