@@ -241,6 +241,20 @@ fn v2_create_table_rejects_active_deletion_vectors() -> DeltaResult<()> {
 }
 
 #[test]
+fn v2_create_table_allows_supported_inactive_deletion_vectors() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    create_table(&table_path, super::simple_schema()?, "Test/1.0")
+        .with_table_properties([
+            ("delta.enableIcebergCompatV2", "true"),
+            ("delta.feature.deletionVectors", "supported"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap();
+    Ok(())
+}
+
+#[test]
 fn v2_create_table_rejects_unsupported_type_change() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let widened = StructField::nullable("value", DataType::DOUBLE).add_metadata([(

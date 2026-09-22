@@ -187,6 +187,7 @@ impl AlterTableTransactionBuilder<Modifying> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
+        // kernel doesn't currently support altering tables with these features
         let unsupported_iceberg_compat =
             [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
                 .into_iter()
