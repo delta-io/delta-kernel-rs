@@ -49,7 +49,8 @@ use delta_kernel_derive::internal_api;
 #[cfg(test)]
 pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
-    DataSkippingPredicateCreator::new(&Default::default(), &stats_columns).eval(pred)
+    DataSkippingPredicateCreator::new(&Default::default(), &stats_columns, &stats_columns)
+        .eval(pred)
 }
 
 /// Permissive stats-columns set for tests that exercise rewrite mechanics, not the gate.
@@ -64,7 +65,7 @@ pub(crate) fn as_data_skipping_predicate_with_partitions(
     partition_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
-    DataSkippingPredicateCreator::new(partition_columns, &stats_columns).eval(pred)
+    DataSkippingPredicateCreator::new(partition_columns, &stats_columns, &stats_columns).eval(pred)
 }
 
 /// Like [`as_data_skipping_predicate_with_partitions`] but invokes
@@ -75,18 +76,38 @@ fn as_sql_data_skipping_predicate(
     partition_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
-    as_sql_data_skipping_predicate_with_stats_columns(pred, partition_columns, &stats_columns)
+    as_sql_data_skipping_predicate_with_stats_columns(
+        pred,
+        partition_columns,
+        &stats_columns,
+        &stats_columns,
+    )
 }
 
 /// Like [`as_sql_data_skipping_predicate`] but only rewrites references to columns in
 /// `stats_columns`; other columns return `None` from the `get_*_stat` methods and
-/// junction-fold into NULL literals.
+/// junction-fold into NULL literals. Range comparisons also require membership in
+/// `min_max_columns`, derived from the expected stats schema.
 pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     pred: &Pred,
     partition_columns: &HashSet<ColumnName>,
     stats_columns: &HashSet<ColumnName>,
+    min_max_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
+    DataSkippingPredicateCreator::new(partition_columns, stats_columns, min_max_columns)
+        .eval_sql_where(pred)
+}
+
+/// Returns the physical leaf paths with min/max entries in the expected statistics schema.
+/// Missing stats schemas or missing min/max fields produce an empty set.
+pub(crate) fn min_max_stats_columns(stats_schema: Option<&SchemaRef>) -> HashSet<ColumnName> {
+    let Some(DataType::Struct(min_values)) = stats_schema
+        .and_then(|schema| schema.field(MIN_VALUES))
+        .map(|field| field.data_type())
+    else {
+        return HashSet::new();
+    };
+    min_values.leaves(None).as_ref().0.iter().cloned().collect()
 }
 
 #[internal_api]
@@ -199,6 +220,7 @@ impl DataSkippingFilter {
                     &predicate,
                     &partition_columns,
                     stats_columns,
+                    &min_max_stats_columns(stats_schema),
                 )?),
             )
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
@@ -433,16 +455,19 @@ impl DataSkippingFilter {
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
 /// partitions whose parquet min/max may omit NaNs. `physical_stats_columns` is the table-level
 /// stats membership set; references outside it fold to NULL (keeping the file).
+/// `physical_min_max_columns` restricts range comparisons to columns with min/max statistics.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,
     physical_floating_partition_columns: &HashSet<ColumnName>,
     physical_stats_columns: &HashSet<ColumnName>,
+    physical_min_max_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     CheckpointDataSkippingPredicateCreator {
         data_skipping_columns: DataSkippingColumns {
             physical_partition_columns,
             physical_stats_columns,
+            physical_min_max_columns,
         },
         physical_floating_partition_columns,
     }
@@ -539,6 +564,9 @@ struct DataSkippingColumns<'a> {
     /// columns). Must match the column set used to build `physical_stats_schema`; otherwise the
     /// rewritten predicate references columns absent from the unified schema.
     physical_stats_columns: &'a HashSet<ColumnName>,
+    /// Columns with min/max entries in the expected stats schema. Literal types alone cannot
+    /// determine eligibility: a UDT comparison literal carries only its physical type.
+    physical_min_max_columns: &'a HashSet<ColumnName>,
 }
 
 impl DataSkippingColumns<'_> {
@@ -557,8 +585,10 @@ impl DataSkippingColumns<'_> {
         if self.is_partition_column(col) {
             Some(partition_value_expr(col))
         } else {
-            (self.is_stats_column(col) && has_min_max_stats(data_type))
-                .then(|| Expr::from(column_name!("stats_parsed", MIN_VALUES).join(col)))
+            (self.is_stats_column(col)
+                && self.physical_min_max_columns.contains(col)
+                && has_min_max_stats(data_type))
+            .then(|| Expr::from(column_name!("stats_parsed", MIN_VALUES).join(col)))
         }
     }
 
@@ -568,8 +598,10 @@ impl DataSkippingColumns<'_> {
         if self.is_partition_column(col) {
             Some(partition_value_expr(col))
         } else {
-            (self.is_stats_column(col) && has_min_max_stats(data_type))
-                .then(|| Expr::from(column_name!("stats_parsed", MAX_VALUES).join(col)))
+            (self.is_stats_column(col)
+                && self.physical_min_max_columns.contains(col)
+                && has_min_max_stats(data_type))
+            .then(|| Expr::from(column_name!("stats_parsed", MAX_VALUES).join(col)))
         }
     }
 
@@ -614,11 +646,13 @@ impl<'a> DataSkippingPredicateCreator<'a> {
     fn new(
         physical_partition_columns: &'a HashSet<ColumnName>,
         physical_stats_columns: &'a HashSet<ColumnName>,
+        physical_min_max_columns: &'a HashSet<ColumnName>,
     ) -> Self {
         Self {
             data_skipping_columns: DataSkippingColumns {
                 physical_partition_columns,
                 physical_stats_columns,
+                physical_min_max_columns,
             },
         }
     }

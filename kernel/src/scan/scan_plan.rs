@@ -8,7 +8,9 @@ use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
-use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
+use super::data_skipping::{
+    as_sql_data_skipping_predicate_with_stats_columns, min_max_stats_columns,
+};
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
@@ -564,6 +566,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
         pred,
         &partition_column_names,
         &state.eligible_physical_stats_columns,
+        &min_max_stats_columns(state.physical_stats_schema.as_ref()),
     )?;
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
     let skipping = Predicate::distinct(skipping, lit(false));
