@@ -24,6 +24,14 @@ impl<'a> SchemaTransform<'a> for UsesGeo {
             _ => Ok(()),
         }
     }
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a crate::schema::UserDefinedType,
+    ) -> Result<(), ()> {
+        self.transform(&udt.sql_type)
+    }
 }
 
 /// Validates that if a table schema contains geometry or geography columns, the table must have
