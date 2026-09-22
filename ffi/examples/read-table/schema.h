@@ -196,6 +196,20 @@ void visit_struct(
   read_column_mapping_metadata(struct_item, metadata, builder->engine);
 }
 
+// Annotation strings are length-delimited and may contain embedded NUL bytes.
+static KernelStringSlice copy_annotation_slice(KernelStringSlice source)
+{
+  char* copy = malloc(source.len ? source.len : 1);
+  if (!copy) {
+    fprintf(stderr, "Could not allocate UDT annotation\n");
+    exit(EXIT_FAILURE);
+  }
+  if (source.len) {
+    memcpy(copy, source.ptr, source.len);
+  }
+  return (KernelStringSlice){ copy, source.len };
+}
+
 void visit_user_defined(
   void* data,
   uintptr_t sibling_list_id,
@@ -211,13 +225,15 @@ void visit_user_defined(
   item->children = child_list_id;
   read_column_mapping_metadata(item, metadata, builder->engine);
   FfiNullableStringMapEntry* entries = calloc(annotation.len, sizeof(FfiNullableStringMapEntry));
+  if (annotation.len && !entries) {
+    fprintf(stderr, "Could not allocate UDT annotation entries\n");
+    exit(EXIT_FAILURE);
+  }
   for (uintptr_t i = 0; i < annotation.len; i++) {
-    entries[i].key = (KernelStringSlice){
-      allocate_string(annotation.ptr[i].key), annotation.ptr[i].key.len
-    };
+    entries[i].key = copy_annotation_slice(annotation.ptr[i].key);
     entries[i].value = annotation.ptr[i].value;
     if (entries[i].value.tag == SomeKernelStringSlice) {
-      entries[i].value.some.ptr = allocate_string(entries[i].value.some);
+      entries[i].value.some = copy_annotation_slice(entries[i].value.some);
     }
   }
   item->annotation = (FfiNullableStringMap){ entries, annotation.len };

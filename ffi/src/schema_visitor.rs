@@ -747,15 +747,19 @@ fn visit_field_map_impl(
 
 /// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
 ///
-/// Copies the annotation and consumes the physical field ID before validating the UDT. Its name,
-/// nullability, and metadata are ignored. Returns an error for invalid IDs, invalid UTF-8,
-/// duplicate or reserved annotation keys, nested UDTs, or disabled UDT support.
+/// Copies the annotation and returns a new field ID. After decoding the name and annotation and
+/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
+/// disabled UDT support leave the ID available. The physical field's name, nullability, and
+/// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
+/// annotation keys, failed metadata callbacks, nested UDTs, or disabled UDT support.
 ///
 /// # Safety
 ///
-/// `state`, `name`, `annotation` and `allocate_error` must be valid for the call. When non-null,
-/// `metadata` must point to a valid descriptor and callback. Annotation slices are borrowed only
-/// for the call duration.
+/// `state` must be valid and exclusively borrowed. String slices must reference readable memory for
+/// their lengths. `annotation.ptr` must reference `annotation.len` initialized, aligned entries, or
+/// may be null when the length is zero. Optional values must have valid discriminants. All inputs
+/// are borrowed for the call. Non-null `metadata` must satisfy [`EngineMetadata`]'s contract, and
+/// `allocate_error` must be a valid error allocator.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_user_defined(
     state: &mut KernelSchemaVisitorState,
@@ -771,10 +775,8 @@ pub unsafe extern "C" fn visit_field_user_defined(
         let name = unsafe { name.try_to_string() }?;
         let annotation = unsafe { annotation.try_to_hash_map() }?;
         let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
-        let physical = state
-            .elements
-            .take(sql_type_id)
-            .ok_or_else(|| Error::schema("Invalid UDT physical type ID"))?;
+        let physical = unwrap_field(state, sql_type_id)
+            .ok_or_else(|| Error::schema(format!("Invalid UDT physical type ID {sql_type_id}")))?;
         let udt = delta_kernel::schema::UserDefinedType {
             sql_type: Box::new(physical.data_type),
             annotation: annotation.into_iter().collect(),
@@ -859,6 +861,8 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, KernelError};
+    #[cfg(feature = "udt-in-dev")]
+    use crate::ffi_test_utils::assert_extern_result_error_contains;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic,
     };
@@ -873,13 +877,16 @@ mod tests {
     fn udt_schema_visit_preserves_annotation_and_rejects_reserved_keys(
         #[case] key: &str,
         #[case] valid: bool,
+        #[values(false, true)] duplicate: bool,
     ) {
         let mut state = KernelSchemaVisitorState::default();
         let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
-        let entries = [crate::delta_types::FfiNullableStringMapEntry {
-            key: unsafe { KernelStringSlice::new_unsafe(key) },
-            value: None.into(),
-        }];
+        let entries: Vec<_> = (0..if duplicate { 2 } else { 1 })
+            .map(|_| crate::delta_types::FfiNullableStringMapEntry {
+                key: unsafe { KernelStringSlice::new_unsafe(key) },
+                value: None.into(),
+            })
+            .collect();
         let result = unsafe {
             visit_field_user_defined(
                 &mut state,
@@ -894,7 +901,14 @@ mod tests {
                 allocate_err,
             )
         };
-        if valid {
+        assert_eq!(state.elements.contains(physical), duplicate);
+        if duplicate {
+            assert_extern_result_error_contains(
+                result,
+                KernelError::GenericError,
+                "duplicate map key",
+            );
+        } else if valid {
             let field = state.elements.take(ok_or_panic(result)).unwrap();
             let DataType::UserDefined(udt) = field.data_type else {
                 panic!("Expected UDT")

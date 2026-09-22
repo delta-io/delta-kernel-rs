@@ -365,6 +365,8 @@ fn apply_schema_to_inner(
 ) -> DeltaResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
+        #[cfg(feature = "udt-in-dev")]
+        UserDefined(udt) => apply_schema_to_inner(array, &udt.sql_type, None, "")?,
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
@@ -390,6 +392,8 @@ mod apply_schema_validation_tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
+    #[cfg(feature = "udt-in-dev")]
+    use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
         schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
@@ -399,6 +403,35 @@ mod apply_schema_validation_tests {
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::struct_type(
+        DataType::from(schema! { nullable "x": LONG }),
+        DataType::from(schema! { not_null "x": LONG }),
+    )]
+    #[case::array(
+        DataType::from(crate::schema::ArrayType::new(DataType::LONG, true)),
+        DataType::from(crate::schema::ArrayType::new(DataType::LONG, false))
+    )]
+    #[case::map(
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::LONG, true)),
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::LONG, false))
+    )]
+    fn apply_schema_normalizes_udt_child_nullability(
+        #[case] logical: DataType,
+        #[case] physical: DataType,
+    ) {
+        let physical: ArrowDataType = physical.try_into_arrow().unwrap();
+        let input = crate::arrow::array::new_empty_array(&physical);
+        let udt = crate::schema::UserDefinedType {
+            sql_type: Box::new(logical.clone()),
+            annotation: Default::default(),
+        };
+        let output = apply_schema_to(&input, &DataType::from(udt)).unwrap();
+        let expected: ArrowDataType = logical.try_into_arrow().unwrap();
+        assert_eq!(output.data_type(), &expected);
+    }
 
     #[rstest]
     fn apply_schema_accepts_any_binary_representation_for_variant(
