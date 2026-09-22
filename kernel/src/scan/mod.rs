@@ -10,7 +10,7 @@ use itertools::Itertools;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use self::data_skipping::as_checkpoint_skipping_predicate;
+use self::data_skipping::{as_checkpoint_skipping_predicate, min_max_stats_columns};
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -594,20 +594,17 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
 
     // Capture the path mapping for this leaf field
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        // Record the physical name mappings for all referenced leaf columns. Delta column names
-        // are case-insensitive, so we probe the case-folded lookup map for O(1) matching.
-        let pred_cols = self
-            .folded_references
-            .remove(self.folded_logical_path.as_slice())?;
-        let physical = ColumnName::new(&self.physical_path);
-        for pred_col in pred_cols {
-            self.unresolved_references.remove(pred_col);
-            // Use the predicate's column name as key so ApplyColumnMappings can look it up
-            // by the exact name used in the predicate expression.
-            self.column_mappings
-                .insert(pred_col.clone(), physical.clone());
-        }
+        self.record_leaf()?;
         Some(Cow::Borrowed(ptype))
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a crate::schema::UserDefinedType,
+    ) -> Option<Cow<'a, crate::schema::UserDefinedType>> {
+        self.record_leaf()?;
+        Some(Cow::Borrowed(udt))
     }
 
     // array and map fields are not eligible for data skipping, so filter them out.
@@ -628,6 +625,22 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         self.folded_logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
+    }
+}
+
+impl GetReferencedFields<'_> {
+    fn record_leaf(&mut self) -> Option<()> {
+        // Delta column names are case-insensitive; retain each predicate spelling for rewriting.
+        let pred_cols = self
+            .folded_references
+            .remove(self.folded_logical_path.as_slice())?;
+        let physical = ColumnName::new(&self.physical_path);
+        for pred_col in pred_cols {
+            self.unresolved_references.remove(pred_col);
+            self.column_mappings
+                .insert(pred_col.clone(), physical.clone());
+        }
+        Some(())
     }
 }
 
@@ -1229,6 +1242,7 @@ impl Scan {
             &partition_columns,
             &floating_partition_columns,
             &self.state_info.eligible_physical_stats_columns,
+            &min_max_stats_columns(self.state_info.physical_stats_schema.as_ref()),
         )?;
 
         let mut prefixer = PrefixColumns {

@@ -8,6 +8,8 @@ use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
+#[cfg(feature = "udt-in-dev")]
+use crate::schema::UserDefinedType;
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
@@ -27,7 +29,7 @@ use crate::DeltaResult;
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
 ///
-/// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful
+/// Array, Map, Variant, and UDT types are included in `nullCount` (null counts are meaningful
 /// for these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping).
 /// They count as leaf columns against the indexed column limit. The `nullCount` schema also
 /// includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null
@@ -253,7 +255,7 @@ fn make_nullable_field<'a>(
 /// Converts a stats schema into a nullCount schema where all leaf fields become LONG.
 ///
 /// The nullCount struct field tracks the number of null values for each column.
-/// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
+/// All leaf fields are converted to LONG type
 /// since null counts are always integers, while struct fields are recursed into
 /// to preserve the nested structure. Field metadata (including column mapping info)
 /// is preserved for all fields.
@@ -300,7 +302,7 @@ impl<'col> BaseStatsTransform<'col> {
         }
     }
 
-    /// Checks whether a leaf column (primitive, array, map, or variant) should be included in the
+    /// Checks whether a leaf column should be included in the
     /// stats schema and records it against the column limit if so. The column limit is based on
     /// schema order, so we count all leaf columns that pass the table filter, but only generate
     /// stats for requested columns.
@@ -339,6 +341,14 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     fn transform_variant(&mut self, vtype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.include_leaf().then_some(Cow::Borrowed(vtype))
     }
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a UserDefinedType,
+    ) -> Option<Cow<'a, UserDefinedType>> {
+        self.include_leaf().then_some(Cow::Borrowed(udt))
+    }
 }
 
 // removes all fields with non eligible data types
@@ -350,7 +360,7 @@ struct MinMaxStatsTransform;
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    // Array, Map, and Variant fields pass through BaseStatsTransform (for nullCount) but must
+    // Non-struct complex fields pass through BaseStatsTransform (for nullCount) but must
     // be excluded from min/max stats.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
@@ -359,6 +369,14 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
         None
     }
     fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(
+        &mut self,
+        _: &'a UserDefinedType,
+    ) -> Option<Cow<'a, UserDefinedType>> {
         None
     }
 
@@ -399,7 +417,7 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "geo-type-in-dev")]
+    #[cfg(any(feature = "geo-type-in-dev", feature = "udt-in-dev"))]
     use rstest::rstest;
 
     use super::*;
@@ -408,6 +426,60 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::TableProperties;
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::zero("delta.dataSkippingNumIndexedCols", "0", false, false)]
+    #[case::one("delta.dataSkippingNumIndexedCols", "1", true, false)]
+    #[case::two("delta.dataSkippingNumIndexedCols", "2", true, true)]
+    #[case::explicit_udt("delta.dataSkippingStatsColumns", "value", true, false)]
+    #[case::explicit_other("delta.dataSkippingStatsColumns", "after", false, true)]
+    #[case::inner_not_leaf("delta.dataSkippingStatsColumns", "value.inner", false, false)]
+    fn test_udt_stats_leaf_and_column_limit(
+        #[case] property: &str,
+        #[case] setting: &str,
+        #[case] include_udt: bool,
+        #[case] include_after: bool,
+        #[values(
+            DataType::LONG,
+            DataType::from(schema! { nullable "inner": LONG, nullable "other": STRING }),
+            DataType::from(ArrayType::new(DataType::LONG, true)),
+            DataType::from(MapType::new(DataType::STRING, DataType::LONG, true))
+        )]
+        sql_type: DataType,
+    ) {
+        let udt = UserDefinedType {
+            sql_type: Box::new(sql_type),
+            annotation: Default::default(),
+        };
+        let schema = schema! { nullable "value": (udt), nullable "after": LONG };
+        let properties: TableProperties = [(property, setting)].into();
+        let config = stats_config_from_table_properties(&properties);
+        let actual = expected_stats_schema(&schema, &config, None, None).unwrap();
+        let mut fields = vec![StructField::nullable(NUM_RECORDS, DataType::LONG)];
+        let mut null_counts = Vec::new();
+        let mut names = Vec::new();
+        for (name, included) in [("value", include_udt), ("after", include_after)] {
+            if included {
+                null_counts.push(StructField::nullable(name, DataType::LONG));
+                names.push(ColumnName::new([name]));
+            }
+        }
+        if !null_counts.is_empty() {
+            fields.push(StructField::nullable(
+                NULL_COUNT,
+                StructType::try_new(null_counts).unwrap(),
+            ));
+        }
+        if include_after {
+            let min_max = schema! { nullable "after": LONG };
+            fields.push(StructField::nullable(MIN_VALUES, min_max.clone()));
+            fields.push(StructField::nullable(MAX_VALUES, min_max));
+        }
+        fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
+        assert_eq!(actual, StructType::try_new(fields).unwrap());
+        assert_eq!(stats_column_names(&schema, &config, None), names);
+    }
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
