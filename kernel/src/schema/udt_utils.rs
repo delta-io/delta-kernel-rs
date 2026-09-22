@@ -1,6 +1,16 @@
-//! Detection and feature-conformance tests for user-defined types.
+//! Detection and write validation for user-defined types.
 
-use super::DataType;
+use super::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::transforms::SchemaTransform;
+use crate::{transform_output_type, DeltaResult, Error};
+
+/// Rejects generated or identity metadata on UDT fields in `schema`.
+///
+/// Returns a schema error naming the field and prohibited metadata key. Physical fields inside
+/// a UDT are outside this traversal.
+pub(crate) fn validate_udt_write_metadata(schema: &StructType) -> DeltaResult<()> {
+    UdtWriteMetadataValidator.transform_struct(schema)
+}
 
 /// Returns whether `data_type` contains a UDT at any depth.
 pub(super) fn contains_udt(data_type: &DataType) -> bool {
@@ -15,6 +25,27 @@ pub(super) fn contains_udt(data_type: &DataType) -> bool {
     }
 }
 
+struct UdtWriteMetadataValidator;
+
+impl<'a> SchemaTransform<'a> for UdtWriteMetadataValidator {
+    transform_output_type!(|'a, T| DeltaResult<()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+        if matches!(field.data_type(), DataType::UserDefined(_)) {
+            if let Some(key) = field.metadata.keys().find(|key| {
+                key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
+                    || key.starts_with("delta.identity.")
+            }) {
+                return Err(Error::schema(format!(
+                    "UDT column '{}' cannot carry '{key}' metadata",
+                    field.name(),
+                )));
+            }
+        }
+        self.recurse_into_struct_field(field)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -23,9 +54,9 @@ mod tests {
     use crate::actions::Protocol;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::EdgeInterpolationAlgorithm;
-    use crate::schema::{schema, ArrayType, MapType, UserDefinedType};
-    use crate::table_features::TableFeature;
-    use crate::unit_test_utils::assert_schema_feature_validation;
+    use crate::schema::{schema, ArrayType, MapType, MetadataValue, UserDefinedType};
+    use crate::table_features::{Operation, TableFeature};
+    use crate::unit_test_utils::{assert_schema_feature_validation, MockTableConfigurationBuilder};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::unit_test_utils::{geography_type, geometry_type};
 
@@ -38,6 +69,33 @@ mod tests {
             "map_value" => MapType::new(DataType::STRING, data_type, true).into(),
             _ => panic!("Unknown layout: {layout}"),
         }
+    }
+
+    #[rstest]
+    #[case::generated("delta.generationExpression")]
+    #[case::identity("delta.identity.start")]
+    fn existing_udt_rejects_write_metadata(#[case] key: &str, #[values(false, true)] nested: bool) {
+        let field = StructField::nullable(
+            "value",
+            UserDefinedType {
+                sql_type: Box::new(DataType::LONG),
+                annotation: Default::default(),
+            },
+        )
+        .add_metadata([(key.to_owned(), MetadataValue::String("1".to_owned()))]);
+        let schema = schema! { (field), };
+        let schema = if nested {
+            schema! { nullable "outer": (schema) }
+        } else {
+            schema
+        };
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .build();
+        crate::unit_test_utils::assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "cannot carry",
+        );
     }
 
     #[rstest]

@@ -9,6 +9,7 @@
 //!
 //! - `CURRENT_DEFAULT` metadata must be a string.
 //! - A Variant column must default to NULL; a non-NULL variant default is rejected.
+//! - A UDT column cannot carry a default, including NULL.
 //! - A non-NULL default on an Array, Map, or Struct column is protocol-legal but kernel cannot
 //!   materialize it, so it is tolerated and surfaced via raw SQL (`to_scalar` returns `None`).
 //! - Defaults may appear on nested struct fields, not just top-level columns, so validation
@@ -53,9 +54,14 @@ impl<'a> ColumnDefault<'a> {
     /// # Errors
     ///
     /// Returns an [`Error::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
-    /// (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is accepted;
+    /// (case-insensitive), or when `data_type` is a UDT. A non-`NULL` default on an Array,
+    /// Map, or Struct column is accepted;
     /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
+        #[cfg(feature = "udt-in-dev")]
+        if matches!(data_type, DataType::UserDefined(_)) {
+            return Err(Error::schema("a UDT column cannot carry a default"));
+        }
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
 
         if matches!(data_type, DataType::Variant(_)) && !is_null {
@@ -119,7 +125,7 @@ impl<'a> ColumnDefault<'a> {
 ///
 /// Propagates any error from
 /// [`StructField::column_default`](crate::schema::StructField::column_default): a `CURRENT_DEFAULT`
-/// whose value is not a string, or a non-`NULL` default on a Variant column.
+/// whose value is not a string, a non-`NULL` default on a Variant column, or any UDT default.
 pub(crate) fn try_collect_column_defaults(
     schema: &StructType,
 ) -> DeltaResult<Vec<(String, ColumnDefault<'_>)>> {
@@ -195,7 +201,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 /// # Errors
 ///
 /// Propagates any error from [`try_collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is
-/// not a string, or a non-NULL default on a Variant column.
+/// not a string, a non-NULL default on a Variant column, or any UDT default.
 pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<bool> {
     Ok(!try_collect_column_defaults(schema)?.is_empty())
 }

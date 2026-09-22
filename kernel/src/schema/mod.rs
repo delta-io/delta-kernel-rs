@@ -39,7 +39,7 @@ pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 #[cfg(feature = "udt-in-dev")]
-mod udt_utils;
+pub(crate) mod udt_utils;
 #[cfg(feature = "udt-in-dev")]
 mod user_defined;
 pub(crate) mod validation;

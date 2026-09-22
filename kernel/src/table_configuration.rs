@@ -749,6 +749,8 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
+        #[cfg(feature = "udt-in-dev")]
+        crate::schema::udt_utils::validate_udt_write_metadata(&self.logical_schema)?;
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
