@@ -7,6 +7,7 @@ use serde::de::Error as _;
 use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::udt_utils::contains_udt;
 use super::DataType;
 use crate::{DeltaResult, Error};
 
@@ -107,18 +108,6 @@ impl<'de> Deserialize<'de> for UserDefinedType {
         };
         udt.validate().map_err(D::Error::custom)?;
         Ok(udt)
-    }
-}
-
-fn contains_udt(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::UserDefined(_) => true,
-        DataType::Struct(s) | DataType::Variant(s) => {
-            s.fields().any(|f| contains_udt(f.data_type()))
-        }
-        DataType::Array(a) => contains_udt(a.element_type()),
-        DataType::Map(m) => contains_udt(m.key_type()) || contains_udt(m.value_type()),
-        DataType::Primitive(_) => false,
     }
 }
 
