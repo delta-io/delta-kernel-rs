@@ -9,7 +9,7 @@
 //!    frame-of-reference (PFOR) scheme (see [`decode_pfor`]). A container's key is implicit -- it
 //!    is the index into this array. Bit 5 of a descriptor selects the container type (0 = sparse, 1
 //!    = dense); for a sparse container the low 5 bits are the set count. The top two bits are
-//!    reserved.
+//!    reserved and this reader rejects them when set.
 //! 3. **Containers**: concatenated in container-index order. A sparse container is a sorted list of
 //!    set positions (one byte each); a dense container is a 32-byte, MSB-first bitset.
 //!
@@ -18,7 +18,8 @@
 //!
 //! [`MumblingBitmap`] is the owned, read-only decoded form: it answers membership queries and
 //! iterates set positions without materializing a `Vec<bool>`. [`read_bitmap`] is a convenience
-//! wrapper that decodes straight to a selection vector. Encoding and mutation are out of scope.
+//! wrapper that decodes straight to a selection vector of a caller-provided length. Encoding and
+//! mutation are out of scope.
 
 use bytes::{Buf, Bytes};
 use itertools::Either;
@@ -45,6 +46,9 @@ const DENSE_TYPE_FLAG: u8 = 0x20;
 
 /// Descriptor bits holding a sparse container's set count (0..=31).
 const SPARSE_LEN_MASK: u8 = 0x1F;
+
+/// Descriptor's top two bits, reserved for future use; a v1 reader rejects them when set.
+const RESERVED_DESCRIPTOR_BITS: u8 = 0xC0;
 
 /// An owned, decoded Mumbling bitmap (version 1).
 ///
@@ -130,23 +134,34 @@ impl MumblingBitmap {
             })
     }
 
-    /// Materialize a selection vector of length `container_count * 256` where element `p` is `true`
-    /// if and only if position `p` is set.
-    pub(crate) fn to_selection_vec(&self) -> Vec<bool> {
-        let mut out = vec![false; self.containers.len() * POSITIONS_PER_CONTAINER];
+    /// Materialize a selection vector of length `len` where element `p` is `true` if and only if
+    /// position `p` is set.
+    ///
+    /// `len` is typically the row count of the data being filtered (the selection vector must not
+    /// exceed it); it must be greater than the highest set position.
+    ///
+    /// # Errors
+    /// Returns an error if any set position is `>= len`.
+    pub(crate) fn to_selection_vec(&self, len: usize) -> DeltaResult<Vec<bool>> {
+        let mut out = vec![false; len];
         for pos in self.iter() {
-            out[pos as usize] = true;
+            let slot = out.get_mut(pos as usize).ok_or_else(|| {
+                Error::generic(format!(
+                    "Mumbling bitmap position {pos} exceeds selection vector length {len}"
+                ))
+            })?;
+            *slot = true;
         }
-        out
+        Ok(out)
     }
 }
 
-/// Decode a Mumbling bitmap (version 1) directly into a selection vector.
+/// Decode a Mumbling bitmap (version 1) directly into a selection vector of length `len`.
 ///
 /// Convenience wrapper over [`MumblingBitmap::deserialize`] and
-/// [`MumblingBitmap::to_selection_vec`]; see those for the returned layout and errors.
-pub(crate) fn read_bitmap(bytes: Bytes) -> DeltaResult<Vec<bool>> {
-    Ok(MumblingBitmap::deserialize(bytes)?.to_selection_vec())
+/// [`MumblingBitmap::to_selection_vec`]; see those for the layout and errors.
+pub(crate) fn read_bitmap(bytes: Bytes, len: usize) -> DeltaResult<Vec<bool>> {
+    MumblingBitmap::deserialize(bytes)?.to_selection_vec(len)
 }
 
 // === Helpers ===
@@ -163,12 +178,25 @@ enum Container {
 impl Container {
     /// Read the container described by `descriptor` from `bytes`.
     fn read(bytes: &mut Bytes, descriptor: u8) -> DeltaResult<Self> {
-        if descriptor & DENSE_TYPE_FLAG != 0 {
-            Ok(Container::Dense(take(bytes, DENSE_BYTES)?))
-        } else {
-            let length = (descriptor & SPARSE_LEN_MASK) as usize;
-            Ok(Container::Sparse(take(bytes, length)?))
+        if descriptor & RESERVED_DESCRIPTOR_BITS != 0 {
+            return Err(Error::generic(format!(
+                "Mumbling container descriptor {descriptor:#04x} sets reserved bits"
+            )));
         }
+        if descriptor & DENSE_TYPE_FLAG != 0 {
+            return Ok(Container::Dense(take(bytes, DENSE_BYTES)?));
+        }
+        let length = (descriptor & SPARSE_LEN_MASK) as usize;
+        let values = take(bytes, length)?;
+        // Sparse values must be strictly ascending. This guarantees uniqueness -- so `count` cannot
+        // over-count and let a malformed body slip past the cardinality check -- and upholds the
+        // ascending-order contract of `MumblingBitmap::iter`.
+        if values.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(Error::generic(
+                "Mumbling sparse container values are not strictly ascending",
+            ));
+        }
+        Ok(Container::Sparse(values))
     }
 
     /// The number of set bits in this container.
@@ -232,6 +260,7 @@ fn decode_pfor(bytes: &mut Bytes, count: usize) -> DeltaResult<Vec<u8>> {
         let offsets = take(bytes, exception_count)?;
         let exceptions = take(bytes, bytes_for_bits(exception_count, b2))?;
         let exception_bits = unpack_msb(exceptions.as_ref(), exception_count, b2);
+        let mut patched = [false; PFOR_CHUNK];
         for (&offset, &high) in offsets.as_ref().iter().zip(&exception_bits) {
             let offset = offset as usize;
             if offset >= chunk_len {
@@ -239,6 +268,12 @@ fn decode_pfor(bytes: &mut Bytes, count: usize) -> DeltaResult<Vec<u8>> {
                     "Mumbling PFOR exception offset {offset} out of range for chunk length {chunk_len}"
                 )));
             }
+            if patched[offset] {
+                return Err(Error::generic(format!(
+                    "Mumbling PFOR chunk has a duplicate exception offset {offset}"
+                )));
+            }
+            patched[offset] = true;
             chunk[offset] |= high << b1; // exception supplies the high bits above b1
         }
 
@@ -411,6 +446,8 @@ mod tests {
     #[case::truncated_primary(&[0x08, 0x00, 0x00], 4)] // b1=8 needs 4 body bytes, none follow
     #[case::truncated_exceptions(&[0x00, 0x01, 0x00], 4)] // 1 exception offset promised, none follow
     #[case::invalid_bit_widths(&[0x88, 0x00, 0x00], 4)] // b1=8, b2=8 -> sum > 8
+    // b1=0, b2=8, e=2, m=0, offsets [1, 1] (duplicate), values [0, 0]
+    #[case::duplicate_exception_offset(&[0x80, 0x02, 0x00, 0x01, 0x01, 0x00, 0x00], 3)]
     fn decode_pfor_rejects_malformed_chunks(#[case] encoded: &[u8], #[case] count: usize) {
         assert!(decode_pfor(&mut Bytes::copy_from_slice(encoded), count).is_err());
     }
@@ -426,17 +463,16 @@ mod tests {
 
     #[test]
     fn empty_bitmap_has_no_containers() {
-        let bitmap = read_bitmap(encode_bitmap(0, &[], None)).unwrap();
+        let bitmap = read_bitmap(encode_bitmap(0, &[], None), 0).unwrap();
         assert!(bitmap.is_empty());
     }
 
     #[test]
     fn sparse_container_sets_expected_positions() {
-        let bitmap = read_bitmap(encode_bitmap(
-            1,
-            &[(0, Body::Sparse(vec![3, 5, 255]))],
-            None,
-        ))
+        let bitmap = read_bitmap(
+            encode_bitmap(1, &[(0, Body::Sparse(vec![3, 5, 255]))], None),
+            256,
+        )
         .unwrap();
         assert_eq!(bitmap.len(), 256);
         assert_eq!(set_positions(&bitmap), vec![3, 5, 255]);
@@ -446,11 +482,10 @@ mod tests {
     fn high_container_index_maps_to_24_bit_position() {
         // Container 0x123 (291), value 0x45 -> position 0x12345. Exercises the u16 container index
         // (a u8 container, as in the old gist-based reader, could not address this).
-        let bitmap = read_bitmap(encode_bitmap(
-            292,
-            &[(0x123, Body::Sparse(vec![0x45]))],
-            None,
-        ))
+        let bitmap = read_bitmap(
+            encode_bitmap(292, &[(0x123, Body::Sparse(vec![0x45]))], None),
+            292 * 256,
+        )
         .unwrap();
         assert_eq!(bitmap.len(), 292 * 256);
         assert_eq!(set_positions(&bitmap), vec![0x12345]);
@@ -459,11 +494,10 @@ mod tests {
     #[test]
     fn dense_container_respects_msb_first_bit_order() {
         let values = [0u8, 7, 8, 255];
-        let bitmap = read_bitmap(encode_bitmap(
-            1,
-            &[(0, Body::Dense(dense_bytes(&values)))],
-            None,
-        ))
+        let bitmap = read_bitmap(
+            encode_bitmap(1, &[(0, Body::Dense(dense_bytes(&values)))], None),
+            256,
+        )
         .unwrap();
         let expected: Vec<usize> = values.iter().map(|&v| v as usize).collect();
         assert_eq!(set_positions(&bitmap), expected);
@@ -473,18 +507,17 @@ mod tests {
     fn dense_byte0_msb_is_position_zero() {
         let mut block = [0u8; DENSE_BYTES];
         block[0] = 0x80; // only the most significant bit of byte 0
-        let bitmap = read_bitmap(encode_bitmap(1, &[(0, Body::Dense(block))], None)).unwrap();
+        let bitmap = read_bitmap(encode_bitmap(1, &[(0, Body::Dense(block))], None), 256).unwrap();
         assert!(bitmap[0]);
         assert!(!bitmap[1]);
     }
 
     #[test]
     fn full_dense_container_sets_all_256_positions() {
-        let bitmap = read_bitmap(encode_bitmap(
-            1,
-            &[(0, Body::Dense([0xFF; DENSE_BYTES]))],
-            None,
-        ))
+        let bitmap = read_bitmap(
+            encode_bitmap(1, &[(0, Body::Dense([0xFF; DENSE_BYTES]))], None),
+            256,
+        )
         .unwrap();
         assert_eq!(set_positions(&bitmap), (0..256).collect::<Vec<_>>());
     }
@@ -492,8 +525,11 @@ mod tests {
     #[test]
     fn sparse_container_at_max_length() {
         let values: Vec<u8> = (0..31).collect(); // 31 values, the largest sparse container
-        let bitmap =
-            read_bitmap(encode_bitmap(1, &[(0, Body::Sparse(values.clone()))], None)).unwrap();
+        let bitmap = read_bitmap(
+            encode_bitmap(1, &[(0, Body::Sparse(values.clone()))], None),
+            256,
+        )
+        .unwrap();
         let expected: Vec<usize> = values.iter().map(|&v| v as usize).collect();
         assert_eq!(set_positions(&bitmap), expected);
     }
@@ -505,7 +541,7 @@ mod tests {
             // container 1 empty
             (2, Body::Dense(dense_bytes(&[0, 100, 255]))),
         ];
-        let bitmap = read_bitmap(encode_bitmap(3, &entries, None)).unwrap();
+        let bitmap = read_bitmap(encode_bitmap(3, &entries, None), 3 * 256).unwrap();
         let mut expected = vec![1usize, 2];
         expected.extend([0usize, 100, 255].iter().map(|&v| 512 + v));
         expected.sort_unstable();
@@ -533,7 +569,11 @@ mod tests {
             })
             .collect();
 
-        let bitmap = read_bitmap(encode_bitmap(container_count, &entries, None)).unwrap();
+        let bitmap = read_bitmap(
+            encode_bitmap(container_count, &entries, None),
+            container_count * 256,
+        )
+        .unwrap();
         let mut expected = positions.to_vec();
         expected.sort_unstable();
         assert_eq!(set_positions(&bitmap), expected);
@@ -552,7 +592,7 @@ mod tests {
         buf.push(0x20 << 2); // 6-bit value 0x20 packed MSB-first into one byte -> 0x80
         buf.extend_from_slice(&dense_bytes(&[1, 2, 3, 4, 5, 6, 7, 8])); // container 1's body
 
-        let bitmap = read_bitmap(Bytes::from(buf)).unwrap();
+        let bitmap = read_bitmap(Bytes::from(buf), 3 * 256).unwrap();
         assert_eq!(bitmap.len(), 3 * 256);
         assert_eq!(
             set_positions(&bitmap),
@@ -561,12 +601,23 @@ mod tests {
     }
 
     #[test]
+    fn position_beyond_selection_vec_len_errors() {
+        // Position 0x12345 with a selection vector too short to hold it.
+        let bytes = encode_bitmap(292, &[(0x123, Body::Sparse(vec![0x45]))], None);
+        let err = read_bitmap(bytes, 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds selection vector length"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn cardinality_mismatch_errors() {
         let entries = [(0, Body::Sparse(vec![1, 2, 3]))];
         // Correct cardinality (3) decodes.
-        assert!(read_bitmap(encode_bitmap(1, &entries, Some(3))).is_ok());
+        assert!(read_bitmap(encode_bitmap(1, &entries, Some(3)), 256).is_ok());
         // Wrong cardinality is rejected.
-        let err = read_bitmap(encode_bitmap(1, &entries, Some(99))).unwrap_err();
+        let err = read_bitmap(encode_bitmap(1, &entries, Some(99)), 256).unwrap_err();
         assert!(err.to_string().contains("cardinality"), "{err:?}");
     }
 
@@ -574,9 +625,25 @@ mod tests {
     #[case::short_header(Bytes::from(vec![0x01, 0x00, 0x00]), "truncated")]
     #[case::bad_version(encode_bad_version(), "version")]
     #[case::truncated_container(encode_truncated_container(), "truncated")]
+    #[case::reserved_descriptor_bits(encode_reserved_descriptor(), "reserved")]
+    #[case::sparse_not_ascending(
+        encode_bitmap(1, &[(0, Body::Sparse(vec![5, 3]))], None), "ascending"
+    )]
+    #[case::sparse_duplicate_values(
+        encode_bitmap(1, &[(0, Body::Sparse(vec![5, 5]))], None), "ascending"
+    )]
     fn rejects_malformed_bitmap(#[case] bytes: Bytes, #[case] needle: &str) {
-        let err = read_bitmap(bytes).unwrap_err();
+        let err = read_bitmap(bytes, 256).unwrap_err();
         assert!(err.to_string().contains(needle), "{err:?}");
+    }
+
+    /// A bitmap with a single container whose descriptor sets a reserved (high) bit.
+    fn encode_reserved_descriptor() -> Bytes {
+        let mut buf = vec![FORMAT_VERSION];
+        buf.extend_from_slice(&0u32.to_le_bytes()[..3]); // cardinality
+        buf.extend_from_slice(&1u16.to_le_bytes()); // one container
+        buf.extend_from_slice(&encode_pfor_raw(&[0x40])); // reserved bit 6 set (sparse, length 0)
+        Bytes::from(buf) // length-0 sparse body: no bytes follow
     }
 
     /// A header whose version byte is not `0x01`.
@@ -649,7 +716,10 @@ mod tests {
             "iter must be ascending"
         );
         assert_eq!(from_iter.len(), bitmap.cardinality());
-        assert_eq!(from_iter, set_positions(&bitmap.to_selection_vec()));
+        assert_eq!(
+            from_iter,
+            set_positions(&bitmap.to_selection_vec(292 * 256).unwrap())
+        );
     }
 
     #[test]
@@ -664,8 +734,9 @@ mod tests {
         );
         let via_type = MumblingBitmap::deserialize(bytes.clone())
             .unwrap()
-            .to_selection_vec();
-        assert_eq!(via_type, read_bitmap(bytes).unwrap());
+            .to_selection_vec(3 * 256)
+            .unwrap();
+        assert_eq!(via_type, read_bitmap(bytes, 3 * 256).unwrap());
     }
 
     #[test]
