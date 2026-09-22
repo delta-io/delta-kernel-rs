@@ -252,9 +252,9 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> DeltaResult<()> {
 #[case::in_memory_base(None, None, Some(5))]
 // a newer crc@v4 lands on disk and beats the base snapshot's crc@v3 -> advance crc@v4.
 #[case::newer_disk_crc(None, Some(4), Some(5))]
-// a checkpoint at v2 (below the base snapshot version) appears; the base snapshot's crc@v3 still
-// applies (a CRC may sit above its checkpoint), so advance it.
-#[case::checkpoint_before_base_snap_reuses_crc(Some(2), None, Some(5))]
+// a newly adopted checkpoint at v2 rebuilds without the cached crc@v3. No on-disk CRC at or above
+// the checkpoint is available, so the rebuilt snapshot has no stats.
+#[case::checkpoint_before_base_snap_rebuilds_without_crc(Some(2), None, None)]
 // a checkpoint at v4 (above the base snapshot version) forces a rebuild; the base snapshot's
 // crc@v3 is below it and dropped, so the on-disk crc@v4 advances instead.
 #[case::checkpoint_after_base_snap_with_crc(Some(4), Some(4), Some(5))]

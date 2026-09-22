@@ -146,14 +146,14 @@ impl Snapshot {
     /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
     /// to a more recent version.
     ///
-    /// For path-based tables, read the current table ID from storage before reusing cached state.
-    /// If the path belongs to a different table, the build fails. Use [`Snapshot::builder_for`]
-    /// explicitly to load a replacement table. Requests for versions older than the input
-    /// snapshot also return an error.
+    /// Refreshes compare sizes and modification times for overlapping log files from the normal
+    /// listing with cached files. Changed files trigger a rebuild; newly loaded metadata must
+    /// retain the input snapshot's table ID. Use [`Snapshot::builder_for`] to load a
+    /// replacement table. This does not detect replacements whose compared file metadata is
+    /// identical.
     ///
-    /// Identity validation adds storage I/O even when requesting the existing version. Without a
-    /// checkpoint hint, it uses a HEAD request and metadata read of commit zero; checkpoint-based
-    /// validation also lists the log. Both paths read the checkpoint hint first.
+    /// Requesting the input snapshot's version returns it without I/O or freshness validation.
+    /// Requests for older versions return an error.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
