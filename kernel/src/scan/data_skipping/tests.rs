@@ -7,10 +7,8 @@ use crate::expressions::{col, column_expr_ref, column_name, lit};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, UnimplementedColumnResolver,
 };
-#[cfg(feature = "udt-in-dev")]
 use crate::schema::{schema, UserDefinedType};
 
-#[cfg(feature = "udt-in-dev")]
 #[rstest]
 #[case::comparison(Pred::eq(col!("value"), lit(42i64)), Some(0), true, true)]
 #[case::comparison_all_null(Pred::eq(col!("value"), lit(42i64)), Some(2), false, true)]

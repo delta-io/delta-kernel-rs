@@ -366,7 +366,6 @@ fn apply_schema_to_inner(
 ) -> KernelResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
-        #[cfg(feature = "udt-in-dev")]
         UserDefined(udt) => {
             // Reject mismatched struct arity before rebuilding, allowing nullability normalization.
             ensure_data_types(udt.sql_type(), array.data_type(), ValidationMode::TypesOnly)?;
@@ -399,7 +398,6 @@ mod apply_schema_validation_tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
-    #[cfg(feature = "udt-in-dev")]
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
@@ -411,7 +409,6 @@ mod apply_schema_validation_tests {
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::struct_type(
         DataType::from(schema! { nullable "x": LONG }),
@@ -438,7 +435,6 @@ mod apply_schema_validation_tests {
         assert_eq!(output.data_type(), &expected);
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     fn apply_schema_rejects_udt_struct_field_count_mismatch(#[values(1, 3)] count: usize) {
         let sql_type = DataType::from(schema! { nullable "x": LONG, nullable "y": LONG });

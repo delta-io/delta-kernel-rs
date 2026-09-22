@@ -172,7 +172,6 @@ impl Scalar {
         }
 
         match *data_type {
-            #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(_) => {
                 Self::append_null(builder, data_type.physical_type(), num_rows)?
             }

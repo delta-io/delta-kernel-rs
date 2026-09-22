@@ -910,7 +910,6 @@ mod tests {
         assert!(error.to_string().contains("expected ident"));
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case(serde_json::json!(123))]
     #[case(serde_json::json!(false))]
