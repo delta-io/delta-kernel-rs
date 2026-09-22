@@ -22,8 +22,8 @@ schema to existing files without scanning them, and writers that are only
 concerned with data changes can ignore the commit.
 
 > [!NOTE]
-> The first supported operation is `add_column()`. Other schema operations
-> (drop column, rename, type changes) are not yet available through `alter_table()`.
+> Supported operations are `add_column()`, `add_column_at()`, and `set_nullable()`. Other schema
+> operations (drop column, rename, type changes) are not yet available through `alter_table()`.
 
 ## Adding a column
 
