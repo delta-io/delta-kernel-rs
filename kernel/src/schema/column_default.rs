@@ -58,7 +58,6 @@ impl<'a> ColumnDefault<'a> {
     /// Map, or Struct column is accepted;
     /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
-        #[cfg(feature = "udt-in-dev")]
         if matches!(data_type, DataType::UserDefined(_)) {
             return Err(Error::schema("a UDT column cannot carry a default"));
         }

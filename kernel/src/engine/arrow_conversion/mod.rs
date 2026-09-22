@@ -264,7 +264,6 @@ fn kernel_field_into_arrow(
     datatype: &DataType,
 ) -> Result<ArrowDataType, ArrowError> {
     match datatype {
-        #[cfg(feature = "udt-in-dev")]
         DataType::UserDefined(udt) => udt.sql_type.as_ref().try_into_arrow(),
         DataType::Array(a) => {
             let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
@@ -342,7 +341,6 @@ impl TryFromKernel<&MapType> for ArrowField {
 impl TryFromKernel<&DataType> for ArrowDataType {
     fn try_from_kernel(t: &DataType) -> Result<Self, ArrowError> {
         match t {
-            #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => udt.sql_type.as_ref().try_into_arrow(),
             DataType::Primitive(p) => {
                 match p {

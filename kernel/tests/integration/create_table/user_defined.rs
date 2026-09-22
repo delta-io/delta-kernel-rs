@@ -1,15 +1,83 @@
-//! Write restrictions for user-defined columns.
+//! Table creation and write restrictions for user-defined columns.
 
+use std::io::Cursor;
+use std::sync::Arc;
+
+use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{
     schema, schema_ref, ArrayType, DataType, MapType, MetadataValue, StructField, UserDefinedType,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
-use test_utils::{assert_result_error_with_message, test_table_setup};
+use test_utils::{
+    assert_result_error_with_message, test_read, test_table_setup, test_table_setup_mt,
+};
+use url::Url;
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_and_read_vector_udt(
+    #[values("none", "name", "id")] mapping_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, table_path, engine) = test_table_setup_mt()?;
+    let vector = UserDefinedType {
+        sql_type: Box::new(
+            schema! {
+                not_null "type": BYTE,
+                nullable "size": INTEGER,
+                nullable "indices": (ArrayType::new(DataType::INTEGER, false)),
+                nullable "values": (ArrayType::new(DataType::DOUBLE, false)),
+            }
+            .into(),
+        ),
+        annotation: [
+            (
+                "class".to_owned(),
+                Some("org.apache.spark.ml.linalg.VectorUDT".to_owned()),
+            ),
+            (
+                "pyClass".to_owned(),
+                Some("pyspark.ml.linalg.VectorUDT".to_owned()),
+            ),
+            ("extension".to_owned(), None),
+        ]
+        .into(),
+    };
+    let expected_type = serde_json::to_value(&vector)?;
+    let schema = schema_ref! { nullable "id": LONG, nullable "features": (vector) };
+    let rows = r#"{"id":1,"features":{"type":1,"size":null,"indices":null,"values":[1.5,2.5]}}
+{"id":2,"features":{"type":0,"size":4,"indices":[1,3],"values":[2.0,7.0]}}
+{"id":3,"features":null}"#;
+    let batch = ReaderBuilder::new(Arc::new(schema.as_ref().try_into_arrow()?))
+        .build(Cursor::new(rows))?
+        .next()
+        .unwrap()?;
+    let mut txn = create_table(&table_path, schema, "test")
+        .with_table_properties([("delta.columnMapping.mode", mapping_mode)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let context = txn.write_state()?.write_context_builder().build()?;
+    txn.add_files(
+        engine
+            .write_parquet(&ArrowEngineData::new(batch.clone()), &context)
+            .await?,
+    );
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        serde_json::to_value(snapshot.schema().field("features").unwrap().data_type())?,
+        expected_type,
+    );
+    let table_root = Url::from_directory_path(&table_path).unwrap();
+    test_read(&ArrowEngineData::new(batch), &table_root, engine)?;
+    Ok(())
+}
 
 fn udt(sql_type: DataType) -> DataType {
     UserDefinedType {
