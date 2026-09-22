@@ -4,6 +4,7 @@ use delta_kernel::expressions::{col, lit, Predicate};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{schema_ref, DataType, UserDefinedType};
+use delta_kernel::table_features::{assign_column_mapping_metadata, ColumnMappingMode};
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use serde_json::json;
@@ -27,6 +28,12 @@ async fn udt_skipping_ignores_min_max_and_reads_leaf_null_count(
     )]
     source: AllNullSource,
     #[values(false, true)] parallel: bool,
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    mapping_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, table_path, engine) = test_table_setup_mt()?;
     let table_root = Url::from_directory_path(&table_path).unwrap().to_string();
@@ -36,15 +43,29 @@ async fn udt_skipping_ignores_min_max_and_reads_leaf_null_count(
             annotation: [("class".into(), Some("example.Value".into()))].into(),
         }),
     };
+    let schema = if mapping_mode == ColumnMappingMode::None {
+        schema
+    } else {
+        Arc::new(assign_column_mapping_metadata(&schema, &mut 0, false)?)
+    };
+    let physical_name = schema.field("value").unwrap().physical_name(mapping_mode);
     let struct_only = matches!(source, AllNullSource::CheckpointStructStats);
-    let configuration = if struct_only {
+    let mut configuration = if struct_only {
         json!({"delta.checkpoint.writeStatsAsStruct":"true",
             "delta.checkpoint.writeStatsAsJson":"false"})
     } else {
         json!({})
     };
+    let protocol = if mapping_mode == ColumnMappingMode::None {
+        json!({"minReaderVersion":1,"minWriterVersion":2})
+    } else {
+        configuration["delta.columnMapping.mode"] = json!(mapping_mode);
+        configuration["delta.columnMapping.maxColumnId"] = json!("1");
+        json!({"minReaderVersion":3,"minWriterVersion":7,
+            "readerFeatures":["columnMapping"], "writerFeatures":["columnMapping"]})
+    };
     let mut actions = vec![
-        json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+        json!({"protocol":protocol}),
         json!({"metaData":{
             "id":"udt-stats", "format":{"provider":"parquet","options":{}},
             "schemaString":serde_json::to_string(&schema)?, "partitionColumns":[],
@@ -58,8 +79,8 @@ async fn udt_skipping_ignores_min_max_and_reads_leaf_null_count(
         ("all_null.parquet", 2),
     ] {
         // A reader must ignore UDT min/max even when a log contains them.
-        let stats = json!({"numRecords":2, "nullCount":{"value":null_count},
-            "minValues":{"value":100}, "maxValues":{"value":100}, "tightBounds":true});
+        let stats = json!({"numRecords":2, "nullCount":{(physical_name):null_count},
+            "minValues":{(physical_name):100}, "maxValues":{(physical_name):100}, "tightBounds":true});
         actions.push(json!({"add":{
             "path":path, "size":100, "partitionValues":{}, "modificationTime":0,
             "dataChange":true, "stats":stats.to_string(),
