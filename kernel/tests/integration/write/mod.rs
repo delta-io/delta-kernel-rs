@@ -19,3 +19,5 @@ mod row_tracking;
 mod stats;
 mod txn;
 mod types;
+#[cfg(feature = "udt-in-dev")]
+mod user_defined;
