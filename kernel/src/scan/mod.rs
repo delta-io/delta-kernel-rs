@@ -10,7 +10,8 @@ use itertools::Itertools;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use self::data_skipping::{as_checkpoint_skipping_predicate, min_max_stats_columns};
+use self::data_skipping::as_checkpoint_skipping_predicate;
+use self::data_skipping::stats_schema::min_max_stats_columns;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -1242,7 +1243,7 @@ impl Scan {
             &partition_columns,
             &floating_partition_columns,
             &self.state_info.eligible_physical_stats_columns,
-            &min_max_stats_columns(self.state_info.physical_stats_schema.as_ref()),
+            &min_max_stats_columns(self.state_info.physical_stats_schema.as_deref()),
         )?;
 
         let mut prefixer = PrefixColumns {
