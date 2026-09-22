@@ -169,20 +169,6 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-mod sealed {
-    pub trait SupportsDataFiles {}
-}
-
-/// Marker trait for transaction states that support data file operations.
-///
-/// Only transaction types that implement this trait can access methods for adding, removing, or
-/// updating data files.
-pub trait SupportsDataFiles: sealed::SupportsDataFiles {}
-impl sealed::SupportsDataFiles for ExistingTable {}
-impl sealed::SupportsDataFiles for CreateTable {}
-impl SupportsDataFiles for ExistingTable {}
-impl SupportsDataFiles for CreateTable {}
-
 /// Late-produced data actions to include in a transaction commit.
 ///
 /// A transaction's configuration is frozen before writers produce data files. Connectors collect
@@ -254,7 +240,7 @@ impl<S> CommitActions<S> {
     }
 }
 
-impl<S: SupportsDataFiles> CommitActions<S> {
+impl<S> CommitActions<S> {
     /// Add a batch of file metadata produced by a data writer.
     ///
     /// The expected schema is returned by [`Transaction::add_files_schema`]. This method may be
@@ -266,7 +252,7 @@ impl<S: SupportsDataFiles> CommitActions<S> {
     }
 }
 
-impl<S: SupportsDataFiles> From<Box<dyn EngineData>> for CommitActions<S> {
+impl<S> From<Box<dyn EngineData>> for CommitActions<S> {
     fn from(add_metadata: Box<dyn EngineData>) -> Self {
         let mut actions = Self::new();
         actions.add_files(add_metadata);
@@ -274,7 +260,7 @@ impl<S: SupportsDataFiles> From<Box<dyn EngineData>> for CommitActions<S> {
     }
 }
 
-impl<S: SupportsDataFiles> From<Vec<Box<dyn EngineData>>> for CommitActions<S> {
+impl<S> From<Vec<Box<dyn EngineData>>> for CommitActions<S> {
     fn from(add_metadata: Vec<Box<dyn EngineData>>) -> Self {
         Self {
             add_files_metadata: add_metadata,
@@ -1685,9 +1671,9 @@ impl<S> Transaction<S> {
 }
 
 // =============================================================================
-// Data file methods -- only available on transaction types that support data files
+// Data file methods
 // =============================================================================
-impl<S: SupportsDataFiles> Transaction<S> {
+impl<S> Transaction<S> {
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -3581,12 +3567,12 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S: SupportsDataFiles>(actions: &mut CommitActions<S>) {
+    fn add_dummy_file<S>(actions: &mut CommitActions<S>) {
         let batch = create_valid_add_file_batch(false /* all_nullable */);
         actions.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
-    fn add_empty_file_batch<S: SupportsDataFiles>(actions: &mut CommitActions<S>) {
+    fn add_empty_file_batch<S>(actions: &mut CommitActions<S>) {
         let batch = create_valid_add_file_batch(false /* all_nullable */).slice(0, 0);
         actions.add_files(Box::new(ArrowEngineData::new(batch)));
     }

@@ -27,7 +27,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::{CommitResult, TransactionOptions};
+use delta_kernel::transaction::{CommitActions, CommitResult, TransactionOptions};
 use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -648,11 +648,15 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
         .next()
         .expect("one scan-metadata batch")?
         .scan_files;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
-    txn.remove_files(scan_files);
-    txn.ack_row_tracking_preservation();
+    let txn = snapshot
+        .transaction_builder()
+        .with_data_change(true)
+        .ack_row_tracking_preservation()
+        .build(engine.as_ref())?;
+    let mut actions = CommitActions::new();
+    actions.remove_files(scan_files);
     let version = txn
-        .commit(engine.as_ref())?
+        .commit(engine.as_ref(), &FileSystemCommitter::new(), actions)?
         .unwrap_committed()
         .commit_version();
 

@@ -169,8 +169,8 @@ apply:
 
 > [!NOTE]
 > Validation is performed by `build()`. `TransactionOptions::with_domain_metadata()` and
-> `TransactionBuilder::with_domain_metadata_removed()` only collect intent; duplicate domains and
-> reserved prefixes surface as build errors.
+> `ExistingTableTransactionBuilder::with_domain_metadata_removed()` only collect intent; duplicate
+> domains and reserved prefixes surface as build errors.
 
 ## What's next
 

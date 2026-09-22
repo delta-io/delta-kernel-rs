@@ -201,12 +201,6 @@ txn.commit(
 To commit multiple metadata batches, collect them in a `CommitActions` value and call
 `CommitActions::add_files` for each batch before committing.
 
-> [!NOTE]
-> Methods that produce or register data files (`unpartitioned_write_context`,
-> `partitioned_write_context`, `CommitActions::add_files`, `stats_schema`) are gated by the
-> `SupportsDataFiles` trait bound and are available on standard write transactions but not
-> on metadata-only transaction states (such as a future `AlterTable`).
-
 ## Committing
 
 `commit()` consumes the transaction and the supplied actions, then returns a `CommitResult`:

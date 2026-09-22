@@ -17,7 +17,9 @@ use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, S
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{ExistingTableTransactionBuilder, TransactionOptions};
+use delta_kernel::transaction::{
+    CommitActions, ExistingTableTransactionBuilder, TransactionOptions,
+};
 #[cfg(feature = "internal-api")]
 use delta_kernel::LogPath;
 use delta_kernel::{
@@ -157,8 +159,12 @@ async fn test_get_all_files_no_crc() -> DeltaResult<()> {
     };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -188,9 +194,15 @@ async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> DeltaRes
 
     // ===== WHEN =====
     // Safe (WRITE) commit with no file actions advances to version 1 (no new CRC written).
-    begin_transaction(snapshot, engine.as_ref())?
+    snapshot
+        .transaction_builder()
         .with_operation("WRITE".to_string())
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?
         .unwrap_committed();
 
     // ===== THEN =====
