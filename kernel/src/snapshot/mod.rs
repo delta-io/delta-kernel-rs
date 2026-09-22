@@ -42,6 +42,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
+mod crc_validation;
 mod incremental;
 mod snapshot_crc;
 #[doc(hidden)]
@@ -50,6 +51,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
+pub use crc_validation::CrcValidationResult;
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;

@@ -131,6 +131,7 @@ impl ActionReconciliationIteratorState {
 pub struct ActionReconciliationIterator {
     inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
+    failed: bool,
 }
 
 impl ActionReconciliationIterator {
@@ -139,6 +140,7 @@ impl ActionReconciliationIterator {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
+            failed: false,
         }
     }
 
@@ -180,7 +182,11 @@ impl Iterator for ActionReconciliationIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
         let batch = self.inner.next();
+        self.failed = matches!(batch, Some(Err(_)));
         self.transform_batch(batch)
     }
 }

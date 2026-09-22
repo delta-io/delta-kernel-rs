@@ -104,25 +104,23 @@ use std::sync::{Arc, LazyLock, Mutex};
 use tracing::info;
 use url::Url;
 
-use crate::action_reconciliation::log_replay::{
-    ActionReconciliationBatch, ActionReconciliationProcessor,
-};
+use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
 use crate::action_reconciliation::{
-    ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
+    ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
 use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
+use crate::crc::validation::with_crc_validation;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::log_replay::LogReplayProcessor;
+use crate::log_segment::CrcReplayAccumulator;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
-use crate::table_properties::TableProperties;
 use crate::{
     version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
     Version,
@@ -369,12 +367,6 @@ pub struct CheckpointWriter {
     transform_expr: ExpressionRef,
 }
 
-impl RetentionCalculator for CheckpointWriter {
-    fn table_properties(&self) -> &TableProperties {
-        self.snapshot.table_properties()
-    }
-}
-
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
@@ -438,6 +430,11 @@ impl CheckpointWriter {
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
     /// shared state for building a [`LastCheckpointHintStats`] after the iterator is exhausted.
     ///
+    /// If the snapshot holds a CRC at its version, checks the fields documented by
+    /// [`Snapshot::validate_crc`](crate::Snapshot::validate_crc) after reconciliation is exhausted.
+    /// A mismatch yields [`Error::ChecksumMismatch`]. The engine must abort the write on any
+    /// iterator error.
+    ///
     /// # Engine Usage
     ///
     /// ```ignore
@@ -464,18 +461,33 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        // Read actions from log segment
-        let actions = self
+        let (checkpoint_data, transaction_expiration) = self
             .snapshot
-            .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
-
-        // Process actions through reconciliation
-        let checkpoint_data = ActionReconciliationProcessor::new(
-            self.deleted_file_retention_timestamp()?,
-            self.get_transaction_expiration_timestamp()?,
-        )
-        .process_actions_iter(actions);
+            .reconciled_actions(engine, self.read_schema.clone())?;
+        let expected_crc = self.snapshot.crc_at_version().cloned();
+        let histogram = expected_crc
+            .as_ref()
+            .map(|crc| crc.replay_histogram())
+            .transpose()?
+            .flatten();
+        let ict = match &expected_crc {
+            Some(crc) if crc.in_commit_timestamp_opt.is_some() => {
+                Some(self.snapshot.read_commit_in_commit_timestamp(engine)?)
+            }
+            _ => None,
+        };
+        let accumulator = expected_crc.as_ref().map(|_| {
+            (
+                CrcReplayAccumulator::new(histogram),
+                self.snapshot.version(),
+                ict,
+            )
+        });
+        let checkpoint_data = with_crc_validation(checkpoint_data, accumulator, move |actual| {
+            expected_crc.as_ref().map_or(Ok(()), |expected| {
+                expected.validate_against(&actual, transaction_expiration)
+            })
+        });
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).

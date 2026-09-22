@@ -413,6 +413,19 @@ pub enum Error {
     #[error("Checksum write unsupported: {0}")]
     ChecksumWriteUnsupported(String),
 
+    /// Reconciled table state differs from the version checksum.
+    #[error("CRC mismatch at version {version} for {field}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        /// The snapshot and checksum version.
+        version: Version,
+        /// The checksum field that differs.
+        field: &'static str,
+        /// The value recorded in the checksum.
+        expected: String,
+        /// The value computed from the transaction log.
+        actual: String,
+    },
+
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),

@@ -27,7 +27,9 @@ use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
 };
-use crate::engine_data::{GetData, TypedGetData as _};
+use crate::engine_data::{
+    FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData as _,
+};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
@@ -175,8 +177,9 @@ impl LogSegment {
             .actions;
         for batch in batches {
             let batch = batch?;
+            let filtered = FilteredEngineData::with_all_rows_selected(batch.actions);
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
-            visitor.visit_rows_of(batch.actions())?;
+            visitor.visit_rows_of(&filtered)?;
         }
         Ok(acc.into_crc_delta().into_complete_crc(version))
     }
@@ -295,7 +298,7 @@ impl LogSegment {
 /// replay. The visitor calls `process_batch_start` on each batch and the `on_*` methods on
 /// each row. After all batches have been folded in and `process_commit_file_end` has run for
 /// the final commit, [`Self::into_crc_delta`] returns the result.
-struct CrcReplayAccumulator {
+pub(crate) struct CrcReplayAccumulator {
     delta: CrcDelta,
 
     /// True while the visitor is still on the newest commit. Used to gate ICT capture
@@ -319,7 +322,7 @@ struct CrcReplayAccumulator {
 }
 
 impl CrcReplayAccumulator {
-    fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
+    pub(crate) fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
         Self {
             delta: CrcDelta {
                 is_incremental_safe: true,
@@ -497,6 +500,14 @@ impl CrcReplayAccumulator {
     fn into_crc_delta(self) -> CrcDelta {
         self.delta
     }
+
+    pub(crate) fn visit_reconciled_batch(&mut self, batch: &FilteredEngineData) -> DeltaResult<()> {
+        CheckpointCrcVisitor { acc: self }.visit_rows_of(batch)
+    }
+
+    pub(crate) fn into_complete_crc(self, version: Version) -> Option<Crc> {
+        self.into_crc_delta().into_complete_crc(version)
+    }
 }
 
 // ===== Shared column indices =====
@@ -657,16 +668,20 @@ struct CheckpointCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
 }
 
-impl RowVisitor for CheckpointCrcVisitor<'_> {
+impl FilteredRowVisitor for CheckpointCrcVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| append_protocol_metadata_leaves(shared_columns()).into());
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
         check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
-        for i in 0..row_count {
+        for i in rows {
             self.acc.apply_shared_columns(i, getters)?;
         }
         Ok(())
