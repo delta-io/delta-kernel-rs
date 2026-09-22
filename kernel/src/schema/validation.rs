@@ -20,6 +20,7 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 2. Column names contain only valid characters
 /// 3. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
 ///    by kernel)
+/// 4. Validates UDT physical-type nesting and reserved annotation keys.
 pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
@@ -73,6 +74,14 @@ impl SchemaValidator {
 
 impl<'a> SchemaTransform<'a> for SchemaValidator {
     transform_output_type!(|'a, T| ());
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(&mut self, udt: &'a crate::schema::UserDefinedType) {
+        if let Err(error) = udt.validate() {
+            self.errors
+                .push(format!("Column '{}': {error}", self.current_path.join(".")));
+        }
+    }
 
     fn transform_struct_field(&mut self, field: &'a StructField) {
         if let Err(e) = validate_field_name(field.name(), self.cm_enabled) {
@@ -156,6 +165,41 @@ mod tests {
     use crate::schema::{
         schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest::rstest]
+    #[case::reserved_type(DataType::LONG, "type", "reserved")]
+    #[case::reserved_sql_type(DataType::LONG, "sqlType", "reserved")]
+    #[case::nested(
+        crate::schema::UserDefinedType {
+            sql_type: Box::new(DataType::LONG),
+            annotation: Default::default(),
+        }.into(),
+        "class",
+        "another UDT",
+    )]
+    fn invalid_udt_rejected_by_write_schema_validation(
+        #[case] sql_type: DataType,
+        #[case] annotation_key: &str,
+        #[case] error: &str,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mapping_mode: ColumnMappingMode,
+    ) {
+        let schema = schema! {
+            nullable "value": (crate::schema::UserDefinedType {
+                sql_type: Box::new(sql_type),
+                annotation: [(annotation_key.to_owned(), None)].into(),
+            }),
+        };
+        crate::unit_test_utils::assert_result_error_with_message(
+            validate_schema(&schema, mapping_mode),
+            error,
+        );
+    }
 
     // === Schema builders for test cases ===
 

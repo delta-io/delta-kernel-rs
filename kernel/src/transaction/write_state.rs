@@ -739,6 +739,22 @@ mod tests {
         assert!(error.to_string().contains("expected ident"));
     }
 
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case(serde_json::json!(123))]
+    #[case(serde_json::json!(false))]
+    #[case(serde_json::json!({"nested":"member"}))]
+    fn write_state_decode_rejects_non_string_udt_annotation(#[case] annotation: serde_json::Value) {
+        let state = partitioned_write_state(ColumnMappingMode::None, false, false, 2, false);
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        encoded["write_state"]["full_logical_schema"]["fields"][1]["type"] = serde_json::json!({
+            "type":"udt", "sqlType":"long", "class":annotation,
+        });
+        let error = WriteState::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("string"), "{error}");
+    }
+
     #[test]
     fn write_state_encoding_uses_current_format_version() {
         let state = partitioned_write_state(
