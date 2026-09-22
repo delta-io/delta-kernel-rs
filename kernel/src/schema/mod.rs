@@ -525,9 +525,8 @@ impl StructField {
     ///
     /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
     /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
-    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
-    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
-    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
+    /// - `Err(_)` -- `CURRENT_DEFAULT` is not a [`MetadataValue::String`], or the declared type
+    ///   rejects the default: any UDT default (including `NULL`) or a non-`NULL` Variant default.
     pub fn column_default(&self) -> Result<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
             None => return Ok(None),
