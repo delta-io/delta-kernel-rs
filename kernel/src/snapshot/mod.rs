@@ -146,10 +146,10 @@ impl Snapshot {
     /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
     /// to a more recent version.
     ///
-    /// For path-based tables, reload if the cached latest commit's file metadata has changed.
-    /// If the table was recreated at the same path, return the new table's snapshot, even if its
-    /// latest version is lower. Explicit requests for versions older than the input snapshot
-    /// still return an error.
+    /// For path-based tables, read the current table ID from storage before reusing cached state.
+    /// If the path belongs to a different table, the build fails. Use [`Snapshot::builder_for`]
+    /// explicitly to load a replacement table. Requests for versions older than the input
+    /// snapshot also return an error.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
