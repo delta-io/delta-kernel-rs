@@ -587,7 +587,6 @@ fn flat_cm_info_for_nested_data_type(
         }
         // Primitive and Variant types don't contain nested struct fields - return as-is
         DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
-        #[cfg(feature = "udt-in-dev")]
         DataType::UserDefined(_) => Ok(data_type.clone()),
     }
 }
@@ -645,7 +644,6 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
                 )))
             }
             DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
-            #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(_) => Ok(data_type.clone()),
         }
     }
@@ -914,16 +912,15 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_name, ColumnName};
-    #[cfg(feature = "udt-in-dev")]
-    use crate::schema::UserDefinedType;
-    use crate::schema::{schema, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{
+        schema, DataType, MetadataValue, StructField, StructType, UserDefinedType,
+    };
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm, MockTableConfigurationBuilder,
     };
     use crate::utils::FoldWithOption as _;
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest::rstest]
     fn test_udt_column_mapping_preserves_sql_type(
         #[values(ColumnMappingMode::Name, ColumnMappingMode::Id)] mode: ColumnMappingMode,

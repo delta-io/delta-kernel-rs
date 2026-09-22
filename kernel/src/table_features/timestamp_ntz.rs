@@ -40,7 +40,6 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
         }
     }
 
-    #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(
         &mut self,
         udt: &'a crate::schema::UserDefinedType,

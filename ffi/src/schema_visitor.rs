@@ -748,10 +748,10 @@ fn visit_field_map_impl(
 /// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
 ///
 /// Copies the annotation and returns a new field ID. After decoding the name and annotation and
-/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
-/// disabled UDT support leave the ID available. The physical field's name, nullability, and
-/// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
-/// annotation keys, failed metadata callbacks, nested UDTs, or disabled UDT support.
+/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors leave the
+/// ID available. The physical field's name, nullability, and metadata are ignored. Returns an error
+/// for invalid IDs, invalid UTF-8, duplicate or reserved annotation keys, failed metadata
+/// callbacks, or nested UDTs.
 ///
 /// # Safety
 ///
@@ -770,7 +770,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    #[cfg(feature = "udt-in-dev")]
     let result = (|| -> DeltaResult<usize> {
         let name = unsafe { name.try_to_string() }?;
         let annotation = unsafe { annotation.try_to_hash_map() }?;
@@ -787,13 +786,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
             StructField::new(name, udt, nullable).with_metadata(metadata),
         ))
     })();
-    #[cfg(not(feature = "udt-in-dev"))]
-    let result: DeltaResult<usize> = {
-        let _ = (state, name, sql_type_id, annotation, nullable, metadata);
-        Err(Error::unsupported(
-            "UDT schema construction requires udt-in-dev",
-        ))
-    };
     result.into_extern_result(&allocate_error)
 }
 
@@ -861,15 +853,13 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, KernelError};
-    #[cfg(feature = "udt-in-dev")]
-    use crate::ffi_test_utils::assert_extern_result_error_contains;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+        allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        ok_or_panic,
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case("class", true)]
     #[case("type", false)]

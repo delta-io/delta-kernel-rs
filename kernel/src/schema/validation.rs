@@ -26,7 +26,6 @@ pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<()> {
-    #[cfg(feature = "udt-in-dev")]
     super::udt_utils::validate_udt_write_metadata(schema)?;
     let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
@@ -78,7 +77,6 @@ impl SchemaValidator {
 impl<'a> SchemaTransform<'a> for SchemaValidator {
     transform_output_type!(|'a, T| ());
 
-    #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(&mut self, udt: &'a crate::schema::UserDefinedType) {
         if let Err(error) = udt.validate() {
             self.errors
@@ -169,7 +167,6 @@ mod tests {
         schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest::rstest]
     #[case::reserved_type(DataType::LONG, "type", "reserved")]
     #[case::reserved_sql_type(DataType::LONG, "sqlType", "reserved")]

@@ -9,10 +9,9 @@ use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
-#[cfg(feature = "udt-in-dev")]
-use crate::schema::UserDefinedType;
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
+    UserDefinedType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
@@ -356,7 +355,6 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
         self.include_leaf().then_some(Cow::Borrowed(vtype))
     }
 
-    #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(
         &mut self,
         udt: &'a UserDefinedType,
@@ -386,7 +384,6 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
         None
     }
 
-    #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(
         &mut self,
         _: &'a UserDefinedType,
@@ -431,7 +428,6 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "geo-type-in-dev", feature = "udt-in-dev"))]
     use rstest::rstest;
 
     use super::*;
@@ -441,7 +437,6 @@ mod tests {
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::TableProperties;
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::zero("delta.dataSkippingNumIndexedCols", "0", false, false)]
     #[case::one("delta.dataSkippingNumIndexedCols", "1", true, false)]

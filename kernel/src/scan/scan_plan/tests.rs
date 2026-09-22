@@ -22,7 +22,6 @@ use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
 use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 
-#[cfg(feature = "udt-in-dev")]
 #[rstest]
 #[case::comparison(Pred::eq(col!("value"), lit(42i64)), ["mixed.parquet", "non_null.parquet", "unknown.parquet"])]
 #[case::is_null(Pred::is_null(col!("value")), ["all_null.parquet", "mixed.parquet", "unknown.parquet"])]
