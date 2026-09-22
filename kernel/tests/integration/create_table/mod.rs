@@ -9,7 +9,6 @@ mod interval;
 mod partitioned;
 mod row_tracking;
 mod timestamp_ntz;
-#[cfg(feature = "udt-in-dev")]
 mod user_defined;
 mod variant;
 

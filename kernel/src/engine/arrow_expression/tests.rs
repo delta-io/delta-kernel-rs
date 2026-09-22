@@ -67,7 +67,6 @@ fn test_array_column() {
     assert_eq!(result, expected_not_in);
 }
 
-#[cfg(feature = "udt-in-dev")]
 #[rstest]
 #[case(KernelDataType::LONG)]
 #[case(KernelDataType::from(schema! { nullable "x": LONG }))]

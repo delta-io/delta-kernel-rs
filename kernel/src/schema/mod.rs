@@ -39,12 +39,9 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
-#[cfg(feature = "udt-in-dev")]
 pub(crate) mod udt_utils;
-#[cfg(feature = "udt-in-dev")]
 mod user_defined;
 pub(crate) mod validation;
-#[cfg(feature = "udt-in-dev")]
 pub use user_defined::UserDefinedType;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
@@ -1293,7 +1290,6 @@ impl StructType {
             // Primitive types cannot contain nested metadata columns and variant types are
             // validated at creation
             DataType::Primitive(_) | DataType::Variant(_) => {}
-            #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(_) => {}
         };
 
@@ -2268,7 +2264,6 @@ pub enum DataType {
     /// An engine annotation over a physical Delta type.
     /// Retains logical type information in schemas; physical operations use the enclosed
     /// `sql_type`. See [`UserDefinedType`] for a schema example.
-    #[cfg(feature = "udt-in-dev")]
     #[from(UserDefinedType)]
     UserDefined(UserDefinedType),
 }
@@ -2333,7 +2328,6 @@ impl<'de> serde::Deserialize<'de> for DataType {
                     "map" => MapType::deserialize(value)
                         .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
-                    #[cfg(feature = "udt-in-dev")]
                     "udt" => UserDefinedType::deserialize(value)
                         .map(DataType::UserDefined)
                         .map_err(Error::custom),
@@ -2414,7 +2408,6 @@ impl DataType {
             Self::Struct(_) => "struct".to_string(),
             Self::Map(_) => "map".to_string(),
             Self::Variant(_) => "variant".to_string(),
-            #[cfg(feature = "udt-in-dev")]
             Self::UserDefined(_) => "udt".to_string(),
         }
     }
@@ -2529,7 +2522,6 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
-            #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
         }
     }
@@ -2689,7 +2681,6 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         Ok(Cow::Borrowed(stype))
     }
 
-    #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(
         &mut self,
         udt: &'a UserDefinedType,

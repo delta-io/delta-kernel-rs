@@ -876,7 +876,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    #[cfg(feature = "udt-in-dev")]
     let result = (|| -> Result<usize> {
         let name = unsafe { name.try_to_string() }?;
         let annotation = unsafe { annotation.try_to_hash_map() }?;
@@ -893,13 +892,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
             StructField::new(name, udt, nullable).with_metadata(metadata),
         ))
     })();
-    #[cfg(not(feature = "udt-in-dev"))]
-    let result: Result<usize> = {
-        let _ = (state, name, sql_type_id, annotation, nullable, metadata);
-        Err(KernelError::unsupported(
-            "UDT schema construction requires udt-in-dev",
-        ))
-    };
     result.into_extern_result(&allocate_error)
 }
 
@@ -967,15 +959,13 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, FFIKernelError};
-    #[cfg(feature = "udt-in-dev")]
-    use crate::ffi_test_utils::assert_extern_result_error_contains;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+        allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        ok_or_panic,
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case("class", true)]
     #[case("type", false)]

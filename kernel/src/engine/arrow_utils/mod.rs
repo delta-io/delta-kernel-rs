@@ -510,7 +510,6 @@ fn get_indices(
         }) = kernel_field_info
         {
             let requested_type = requested_field.data_type();
-            #[cfg(feature = "udt-in-dev")]
             let requested_type = match requested_type {
                 DataType::UserDefined(udt) => udt.sql_type(),
                 data_type => data_type,

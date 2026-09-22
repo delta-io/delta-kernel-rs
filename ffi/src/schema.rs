@@ -2,9 +2,7 @@ use std::os::raw::c_void;
 
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
-use crate::delta_types::FfiNullableStringMap;
-#[cfg(feature = "udt-in-dev")]
-use crate::delta_types::FfiNullableStringMapEntry;
+use crate::delta_types::{FfiNullableStringMap, FfiNullableStringMapEntry};
 use crate::handle::Handle;
 use crate::scan::CMetadataMap;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
@@ -393,7 +391,6 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             };
         }
         match data_type {
-            #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => {
                 let child_list_id = (visitor.make_field_list)(visitor.data, 1);
                 visit_schema_item(
@@ -778,7 +775,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[test]
     fn visit_schema_preserves_udt_physical_type_and_annotation() {
         let schema: StructType = serde_json::from_value(serde_json::json!({
