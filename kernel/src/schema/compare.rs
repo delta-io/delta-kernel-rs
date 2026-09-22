@@ -269,7 +269,6 @@ mod tests {
         assert!(schema.can_read_as(&schema).is_ok());
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::to_udt(false, true)]
     #[case::from_udt(true, false)]

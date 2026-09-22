@@ -75,7 +75,6 @@ impl EnsureDataTypes {
         arrow_type: &ArrowDataType,
     ) -> DeltaResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
-            #[cfg(feature = "udt-in-dev")]
             (DataType::UserDefined(udt), _) => self.ensure_data_types(&udt.sql_type, arrow_type),
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)

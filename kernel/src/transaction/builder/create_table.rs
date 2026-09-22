@@ -1395,7 +1395,7 @@ mod tests {
         test_schema(),
         &[],
     )]
-    #[cfg_attr(feature = "udt-in-dev", case::udt_physical_features(
+    #[case::udt_physical_features(
         schema_ref! {
             nullable "value": (crate::schema::UserDefinedType {
                 sql_type: Box::new(DataType::from(schema! {
@@ -1406,7 +1406,7 @@ mod tests {
             }),
         },
         &[TableFeature::VariantType, TableFeature::TimestampWithoutTimezone],
-    ))]
+    )]
     fn test_schema_driven_feature_auto_enablement(
         #[case] schema: SchemaRef,
         #[case] expected_features: &[TableFeature],

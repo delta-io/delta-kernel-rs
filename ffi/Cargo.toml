@@ -78,7 +78,6 @@ test-ffi = []
 # Experimental, in-development feature flag gating in-progress geospatial
 # (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
-udt-in-dev = ["delta_kernel/udt-in-dev"]
 
 # Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
 adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]

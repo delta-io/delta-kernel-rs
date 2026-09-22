@@ -109,6 +109,11 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 
 ## Architecture at a Glance
 
+**User-defined types:** `DataType::UserDefined` is available without a cargo or table feature.
+`UserDefinedType` carries a physical `sql_type` and string-or-null annotations. Generic schema
+transforms treat it as a leaf; feature detectors explicitly inspect its physical type. Type
+equality compares only `sql_type`, so annotation-preservation tests must compare serialized schemas.
+
 **Snapshot** is the primary entry point for existing-table operations: an immutable view of a
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
 

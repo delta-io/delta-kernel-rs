@@ -229,6 +229,11 @@ are the raw 16 bytes of the kernel UUID (`MetricId`).
 
 ## Building
 
+UDT schema visitation and construction are always available. `visit_user_defined` supplies one
+physical-type child plus a borrowed string-or-null annotation map; `visit_field_user_defined`
+reconstructs the wrapper. Callbacks must copy annotation bytes they retain, including embedded
+NUL bytes, before returning. Engines must provide the UDT schema callback.
+
 ```bash
 cargo build -p delta_kernel_ffi --release
 # Headers written to target/ffi-headers/
