@@ -509,8 +509,7 @@ fn get_indices(
             ..
         }) = kernel_field_info
         {
-            let requested_type = requested_field.data_type();
-            let requested_type = match requested_type {
+            let requested_type = match requested_field.data_type() {
                 DataType::UserDefined(udt) => udt.sql_type(),
                 data_type => data_type,
             };
