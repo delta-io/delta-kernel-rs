@@ -16,6 +16,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::{CommitActions, TransactionOptions};
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
@@ -29,10 +30,6 @@ fn simple_schema() -> SchemaRef {
         nullable "id": INTEGER,
         nullable "name": STRING,
     }
-}
-
-fn committer() -> Box<FileSystemCommitter> {
-    Box::new(FileSystemCommitter::new())
 }
 
 /// Reads `delta.columnMapping.maxColumnId` from the snapshot's metadata. Returns
@@ -89,8 +86,12 @@ async fn add_columns_lifecycle(
         let committed = current
             .alter_table()
             .add_column(StructField::nullable(name, DataType::STRING))
-            .build(engine.as_ref(), committer())?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref())?
+            .commit(
+                engine.as_ref(),
+                &FileSystemCommitter::new(),
+                delta_kernel::transaction::CommitActions::new(),
+            )?
             .unwrap_committed();
         let post = committed
             .post_commit_snapshot()
@@ -272,8 +273,12 @@ async fn add_complex_type_column(
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
@@ -329,7 +334,7 @@ async fn add_column_failures(
     let err = snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains(error_contains));
 
@@ -353,8 +358,12 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
     let v1 = snapshot
         .alter_table()
         .add_column(StructField::nullable("a", DataType::STRING))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let v1_snap = v1
         .post_commit_snapshot()
@@ -367,8 +376,12 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
     let v2 = v1_ckpt
         .alter_table()
         .add_column(StructField::nullable("b", DataType::INTEGER))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let v2_snap = v2
         .post_commit_snapshot()
@@ -452,8 +465,12 @@ async fn add_column_at_round_trip(
             column_name!("parent"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -507,8 +524,12 @@ async fn add_column_at_nested_struct_with_column_mapping(
             column_name!("address"),
             StructField::nullable("zip", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -575,8 +596,12 @@ async fn add_column_at_containers_round_trip(
             column_name!("by_value.value"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -638,8 +663,12 @@ async fn add_column_at_struct_fields_named_like_container_segments() -> DeltaRes
             column_name!("address.value"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -682,7 +711,7 @@ async fn add_column_at_rejects_duplicate_field_in_same_builder() -> DeltaResult<
             column_name!("address"),
             StructField::nullable("dup", DataType::STRING),
         )
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert_result_error_with_message(result, "already exists");
 
     Ok(())
@@ -700,7 +729,7 @@ async fn add_column_at_rejects_non_struct_parent() -> DeltaResult<()> {
             column_name!("id"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert_result_error_with_message(result, "path target is not a struct");
 
     Ok(())
@@ -743,8 +772,9 @@ async fn empty_create_then_add_column(
     );
     let write_state_err = v0
         .clone()
-        .transaction(committer(), engine.as_ref())?
-        .with_engine_info("EmptySchemaApp/0.1.0")
+        .transaction_builder()
+        .with_options(TransactionOptions::new().with_engine_info("EmptySchemaApp/0.1.0"))
+        .build(engine.as_ref())?
         .write_state()
         .expect_err("write_state() must reject empty-schema snapshots");
     assert!(
@@ -755,8 +785,12 @@ async fn empty_create_then_add_column(
 
     v0.alter_table()
         .add_column(StructField::nullable("id", DataType::INTEGER))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let v1 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -854,8 +888,12 @@ async fn set_nullable_succeeds(
     snapshot
         .alter_table()
         .set_nullable(column.clone())
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
@@ -900,8 +938,12 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     create_table(&table_path, schema.clone(), "Test/1.0")
         .with_data_layout(layout)
         .with_table_properties(properties)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(!v0.schema().field(col_name).unwrap().is_nullable());
@@ -943,8 +985,12 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     let v2 = v1
         .alter_table()
         .set_nullable(ColumnName::new([col_name]))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let v2_snap = v2
         .post_commit_snapshot()
@@ -982,7 +1028,7 @@ async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
     let err = snapshot
         .alter_table()
         .set_nullable(column_name!("nonexistent"))
-        .build(engine.as_ref(), committer());
+        .build(engine.as_ref());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("does not exist"));
 
@@ -1030,8 +1076,12 @@ async fn chain_add_column_and_set_nullable(
         .alter_table()
         .add_column(StructField::nullable("email", DataType::STRING))
         .set_nullable(column_name!("id"))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let v1_snap = v1
         .post_commit_snapshot()
@@ -1041,8 +1091,12 @@ async fn chain_add_column_and_set_nullable(
         .alter_table()
         .add_column(StructField::nullable("age", DataType::INTEGER))
         .set_nullable(column_name!("name"))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
     let v2_snap = v2
         .post_commit_snapshot()
@@ -1127,8 +1181,12 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
@@ -1169,8 +1227,12 @@ async fn add_column_strip_is_none_mode_only(
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1196,7 +1258,7 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
     let msg = snapshot
         .alter_table()
         .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(engine.as_ref(), committer())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -1220,8 +1282,12 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1233,7 +1299,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
         .expect("CURRENT_DEFAULT metadata must survive ALTER");
     assert_eq!(default.raw_sql(), "42");
 
-    let txn = reloaded.transaction(committer(), engine.as_ref())?;
+    let txn = reloaded.transaction_builder().build(engine.as_ref())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
         "default metadata must remain inert without allowColumnDefaults",
@@ -1261,7 +1327,7 @@ async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dy
     let msg = snapshot
         .alter_table()
         .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(&engine, committer())
+        .build(&engine)
         .unwrap_err()
         .to_string();
     assert!(
@@ -1320,8 +1386,12 @@ async fn add_column_preserves_complete_cm_metadata(
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1359,8 +1429,12 @@ async fn add_column_with_only_physical_name_allocates_id(
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1397,8 +1471,12 @@ async fn add_column_with_only_id_fills_physical_name(
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1447,8 +1525,12 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
     snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1490,7 +1572,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
     let err = snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())
+        .build(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -1544,8 +1626,12 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
     snapshot
         .alter_table()
         .add_column(added_field)
-        .build(&engine, committer())?
-        .commit(&engine)?
+        .build(&engine)?
+        .commit(
+            &engine,
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?
         .unwrap_committed();
 
     // Reload from disk so we assert on the persisted schemaString, not the in-memory config.

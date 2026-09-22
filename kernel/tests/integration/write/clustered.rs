@@ -121,8 +121,12 @@ fn setup_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: clustering_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .build(engine.as_ref())?
+        .commit(
+            engine.as_ref(),
+            &FileSystemCommitter::new(),
+            delta_kernel::transaction::CommitActions::new(),
+        )?;
 
     let snapshot = set_table_properties(
         &table_path,

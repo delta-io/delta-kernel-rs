@@ -1,9 +1,9 @@
 # Idempotent writes
 
-To guarantee at-most-once semantics for retryable write pipelines (e.g., a streaming job
-or a queue consumer), you attach a **transaction identifier** to each commit. If the same
-logical write is attempted twice, the second attempt becomes a no-op. Delta supports this
-through `SetTransaction` actions recorded in the transaction log.
+A `SetTransaction` action records an application-defined transaction version in the Delta log.
+Connectors can use this record when coordinating retryable pipelines such as streaming jobs or
+queue consumers. Kernel does not make a repeated `(app_id, version)` attempt a no-op or otherwise
+guarantee at-most-once execution.
 
 ## How it works
 
@@ -15,13 +15,14 @@ Each transaction can carry a `SetTransaction` action containing:
   number, Kafka offset, etc.), but other schemes are valid. The protocol only guarantees
   that the latest committed `version` per `app_id` is retrievable.
 
-Before writing, check the table for the latest committed version for your `app_id`. If
-that version indicates the write has already been applied, skip it. The comparison logic
-is up to you.
+Before writing, check the table for the latest committed version for your `app_id`. If that version
+indicates the write has already been applied, skip it. This check can race with another writer, so
+the connector must also coordinate concurrent attempts when it requires at-most-once behavior.
+The comparison and coordination strategy are up to the connector.
 
 ## Writing with a transaction ID
 
-Call `with_transaction_id()` on the transaction and check `get_app_id_version()` before
+Call `TransactionOptions::with_transaction_id()` and check `get_app_id_version()` before
 committing:
 
 ```rust,no_run
@@ -32,7 +33,7 @@ committing:
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, Operation, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -52,9 +53,12 @@ if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
 
 // Not yet committed. Proceed with the write.
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_transaction_id(app_id.to_string(), batch_version)
-    .with_operation("STREAMING UPDATE".to_string());
+    .transaction_builder()
+    .with_options(
+        TransactionOptions::new().with_transaction_id(app_id.to_string(), batch_version),
+    )
+    .with_operation(Operation::StreamingUpdate)
+    .build(&engine)?;
 
 // ... write data, add files, commit ...
 # Ok(())
@@ -65,8 +69,9 @@ The `>=` check above assumes the application uses monotonically increasing versi
 connector with a different scheme (for example, tracking a set of known batch IDs) would
 compare differently.
 
-The `SetTransaction` action is written to the commit log alongside the data actions. On
-the next run, `get_app_id_version()` will find it and the duplicate write is skipped.
+The `SetTransaction` action is written to the commit log alongside the data actions. On the next
+run, `get_app_id_version()` exposes the recorded version so the connector can decide whether to
+skip the write. A standalone check followed by a commit is not an at-most-once guarantee.
 
 ## Reading the latest transaction version
 
@@ -87,8 +92,8 @@ retention duration via the `delta.setTransactionRetentionDuration` table propert
 the retention window are filtered out by `get_app_id_version()`.
 
 > [!NOTE]
-> Kernel automatically sets `lastUpdated` to the commit timestamp when you call
-> `with_transaction_id()`. You don't need to set it manually.
+> Kernel automatically sets `lastUpdated` to the commit timestamp for identifiers configured with
+> `TransactionOptions::with_transaction_id()`. You don't need to set it manually.
 
 ## What's next
 

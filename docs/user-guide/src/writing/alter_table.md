@@ -1,9 +1,8 @@
 # Altering a table
 
-To add a column to an existing Delta table, you build an `AlterTableTransaction`
-from a `Snapshot`, queue one or more schema operations, and commit. The result
-is a metadata-only commit that updates the table's schema without rewriting any
-data files.
+To add a column to an existing Delta table, you create an existing-table transaction builder
+from a `Snapshot`, queue one or more schema operations, and commit. The result is a metadata-only
+commit that updates the table's schema without rewriting any data files.
 
 Before reading this page, make sure you understand
 [Creating a Table](./create_table.md) and
@@ -23,9 +22,8 @@ schema to existing files without scanning them, and writers that are only
 concerned with data changes can ignore the commit.
 
 > [!NOTE]
-> The first supported operation is `add_column()`. Other schema operations
-> (drop column, rename, type changes) are not yet available through the
-> `AlterTableTransaction` API.
+> Supported operations are `add_column()`, `add_column_at()`, and `set_nullable()`. Other schema
+> operations (drop column, rename, type changes) are not yet available through `alter_table()`.
 
 ## Adding a column
 
@@ -34,9 +32,10 @@ STRING` with rows for Alice, Bob, and Carol, and you want to add a `country`
 column. The flow is:
 
 1. Load a `Snapshot` of the table.
-2. Call `snapshot.alter_table()` to get an `AlterTableTransactionBuilder`.
+2. Call `snapshot.alter_table()` to get an `ExistingTableTransactionBuilder` configured for
+   schema evolution.
 3. Call `add_column()` with the new field.
-4. Call `build()` to produce an `AlterTableTransaction`.
+4. Call `build(&engine)` to produce a `Transaction<ExistingTable>`.
 5. Call `commit()` to atomically apply the schema change.
 
 ```rust,no_run
@@ -46,7 +45,7 @@ column. The flow is:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -57,10 +56,14 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Build and commit an alter-table transaction that adds a new column.
 let result = snapshot
     .alter_table()
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .with_engine_info("my-app/1.0")
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 
 match result {
     CommitResult::CommittedTransaction(committed) => {
@@ -105,30 +108,24 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
-    .commit(&engine)?;
+    .build(&engine)?
+    .commit(
+        &engine,
+        &FileSystemCommitter::new(),
+        delta_kernel::transaction::CommitActions::new(),
+    )?;
 ```
 
-The builder uses a type-state pattern to enforce that at least one operation is
-queued before `build()` is callable. Calling `.build()` directly on
-`snapshot.alter_table()` without first calling `add_column()` is a compile
-error.
+The builder requires at least one schema operation. Calling `.build(&engine)` directly on
+`snapshot.alter_table()` returns an error.
 
-## What you cannot do on an alter-table transaction
+## Alter-table validation
 
-`AlterTableTransaction` is a metadata-only transaction. It does not implement
-`SupportsDataFiles`, so the data-file methods are not available at compile
-time. In particular, the following are not callable on an `AlterTableTransaction`:
-
-| Method | Used for |
-|--------|----------|
-| `write_state()` | Creating the `WriteState` used to bind a `BoundWriteContext` |
-| `add_files()` | Registering newly written data files |
-| `stats_schema()` | Retrieving the statistics schema for written files |
-
-If you need to add data and evolve the schema, run two transactions: an
-alter-table transaction first, then a write transaction against the post-commit
-snapshot. See [Appending Data](./append.md) for the write flow.
+`alter_table()` is a convenience entry point for an existing-table transaction. It selects the
+`ALTER TABLE` operation and configures the transaction as a non-data-changing commit. The builder
+validates that the transaction contains a schema change and rejects incompatible options such as
+blind append. The resulting transaction uses the same existing-table API as other updates; it is
+not a separate type-state.
 
 ## What's next
 

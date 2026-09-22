@@ -191,19 +191,23 @@ async fn live_create_table() {
     // `address.city` so it carries `delta.clustering`.
     let mut disk_props = get_required_properties_for_disk(&resp.table_id);
     disk_props.insert("delta.enableRowTracking".to_string(), "true".to_string());
-    let committer = Box::new(UCCommitter::new(
+    let committer = UCCommitter::new(
         Arc::new(UCUpdateTableRestClient::new(client_config(&url, &token)).expect("update client")),
         resp.table_id.clone(),
         TableIdentifier::new(catalog.clone(), schema_name.clone(), name.to_string()),
-    ));
+    );
     create_table(table_root.as_str(), schema, "delta-kernel-rs-live-test")
         .with_table_properties(disk_props)
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("name"), column_name!("address", "city")],
         })
-        .build(engine.as_ref(), committer)
+        .build(engine.as_ref())
         .expect("failed to build create-table transaction")
-        .commit(engine.as_ref())
+        .commit(
+            engine.as_ref(),
+            &committer,
+            delta_kernel::transaction::CommitActions::new(),
+        )
         .expect("failed to commit create-table transaction")
         .unwrap_committed();
 

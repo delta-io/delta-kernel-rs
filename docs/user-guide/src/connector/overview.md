@@ -91,7 +91,7 @@ From a snapshot, you can:
 |-----------|-----------|-------------------------------|
 | Get schema and metadata | `snapshot.schema()`, `snapshot.table_properties()` | Table schema discovery |
 | Read data | `snapshot.scan_builder()` | Scan / PartitionReader |
-| Write data | `snapshot.transaction(committer, &engine)` | Writer / Committer |
+| Write data | `snapshot.transaction_builder().build(&engine)` + `txn.commit(&engine, committer, actions)` | Writer / Committer |
 | Checkpoint | `snapshot.create_checkpoint_writer(&engine)` | Maintenance task |
 
 ## What your connector does vs. what Kernel does
@@ -154,7 +154,7 @@ Building a connector typically involves these steps:
 
 3. **Implement your DataSource's write interfaces** using Kernel's Transaction API:
    - Create a `Transaction` from a `Snapshot`
-   - Write Parquet files and register them with the transaction
+   - Write Parquet files and collect their metadata in `CommitActions`
    - Commit atomically, handling conflicts and retries
    - See [Creating a table](../writing/create_table.md) and
      [Appending data](../writing/append.md)

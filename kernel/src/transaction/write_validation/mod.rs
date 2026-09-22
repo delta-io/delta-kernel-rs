@@ -1,10 +1,9 @@
-//! Pre-commit validation of data staged on a [`Transaction`].
+//! Pre-commit validation of data supplied through [`CommitActions`].
 //!
-//! [`Transaction`]: super::Transaction
+//! [`CommitActions`]: super::CommitActions
 
 // TODO(#2869): Add the remaining write-side validations:
-// - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
-//   `txn.dv_matched_files`
+// - No duplicate (path, DvId) in add, remove, and deletion-vector action inputs.
 
 mod addfile;
 mod dv;

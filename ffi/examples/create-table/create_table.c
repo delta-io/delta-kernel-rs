@@ -23,9 +23,7 @@
 //
 // Note: get_create_table_builder takes engine_info and stores it on the builder, so the
 // transaction is already labelled by the time we call create_table_commit. The example
-// therefore does NOT call create_table_with_engine_info -- that function exists for
-// engines that want to override the engine_info after building (and is exercised by the
-// existing-table write path in write-table).
+// therefore does not call create_table_builder_with_engine_info.
 //
 // The example does not stage any initial files. The
 // add_files flow requires constructing an Arrow batch matching Transaction::add_files_schema,
@@ -171,14 +169,30 @@ int main(int argc, char* argv[]) {
   ExclusiveCreateTransaction* txn = txn_res.ok;
 
   // === Commit ===
-  ExternResultHandleExclusiveCommittedTransaction commit_res = create_table_commit(txn, engine);
-  if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
+  ExternResultHandleExclusiveCommitResult commit_res = create_table_commit(txn, engine);
+  if (commit_res.tag != OkHandleExclusiveCommitResult) {
     print_error("create_table_commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);
     free_engine(engine);
     return 1;
   }
-  HandleExclusiveCommittedTransaction committed = commit_res.ok;
+  HandleExclusiveCommitResult result = commit_res.ok;
+  if (commit_result_kind(&result) != Committed) {
+    fprintf(stderr, "Create-table commit did not succeed; result kind: %d\n",
+            commit_result_kind(&result));
+    free_commit_result(result);
+    free_engine(engine);
+    return 1;
+  }
+  ExternResultHandleExclusiveCommittedTransaction committed_res =
+      commit_result_into_committed(result, engine);
+  if (committed_res.tag != OkHandleExclusiveCommittedTransaction) {
+    print_error("Failed to extract committed transaction.", (Error*)committed_res.err);
+    free_error((Error*)committed_res.err);
+    free_engine(engine);
+    return 1;
+  }
+  HandleExclusiveCommittedTransaction committed = committed_res.ok;
   printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
   free_committed_transaction(committed);
 

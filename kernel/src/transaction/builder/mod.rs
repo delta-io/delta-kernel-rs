@@ -5,5 +5,7 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-pub mod alter_table;
 pub mod create_table;
+mod update_table;
+
+pub use update_table::ExistingTableTransactionBuilder;
