@@ -55,6 +55,11 @@ impl Snapshot {
     /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
     /// merged with filesystem listings.
     ///
+    /// For path-based tables, compare the cached latest commit's file metadata with storage first.
+    /// If it changed, reload the snapshot: the table may have been recreated at the same path.
+    /// If the commit is missing, newer commits can still extend the cached history. Otherwise,
+    /// reload before returning the cached version as current.
+    ///
     /// Position layout per case (`....` is the version axis; `====` marks the range read for
     /// P+M replay; `listed` is the listing range; `read` is what's read for P+M):
     ///
@@ -157,10 +162,6 @@ impl Snapshot {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
-            // Case A: re-requesting the same version.
-            if requested_version == existing_snapshot_version {
-                return Ok(existing_snapshot.clone());
-            }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
                 return Err(Error::Generic(format!(
@@ -173,22 +174,84 @@ impl Snapshot {
         }
 
         let existing_log_segment = &existing_snapshot.log_segment;
+        // Dropping and recreating a table can reuse both its path and version number.
+        // For catalog-managed tables, the catalog supplies the table identity and commit history.
+        let commit_matches = if existing_snapshot.table_configuration().is_catalog_managed() {
+            Some(true)
+        } else {
+            existing_snapshot.current_commit_matches(engine, cancellation_token)?
+        };
+        let rebuild = || {
+            let log_segment = LogSegment::for_snapshot(
+                engine.storage_handler().as_ref(),
+                existing_log_segment.log_root.clone(),
+                log_tail.clone(),
+                requested_version,
+                metric_context.clone(),
+                cancellation_token,
+            )?;
+            let refreshed = Self::try_new_from_log_segment(
+                existing_snapshot.table_root().clone(),
+                log_segment,
+                engine,
+                metric_context.clone(),
+                incremental_replay,
+                built_as_latest,
+            )?;
+            if refreshed.version() < existing_snapshot_version
+                && refreshed.table_configuration().metadata().id()
+                    == existing_snapshot.table_configuration().metadata().id()
+            {
+                emit_log_segment_load_failure(&metric_context);
+                return Err(Error::invalid_log_segment(format!(
+                    "Unexpected state: the newest version in the log {} is \
+                     older than the existing snapshot version {existing_snapshot_version}",
+                    refreshed.version()
+                )));
+            }
+            Ok(Arc::new(refreshed))
+        };
+        if commit_matches == Some(false)
+            || (commit_matches.is_none() && requested_version == Some(existing_snapshot_version))
+        {
+            return rebuild();
+        }
+
+        // Case A: re-requesting the same version of the same table.
+        if requested_version == Some(existing_snapshot_version) {
+            return Ok(existing_snapshot.clone());
+        }
+
         let skipped_new_checkpoints = checkpoint_handling == CheckpointHandling::Ignore;
 
         // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
         // the `inspect_err` below.
         let segment_load_start = std::time::Instant::now();
-        let (combined_log_segment, new_end_version) = match Self::build_new_segment(
+        let new_segment = Self::build_new_segment(
             engine,
             existing_log_segment,
             existing_snapshot_version,
-            log_tail,
+            log_tail.clone(),
             requested_version,
             checkpoint_handling,
             cancellation_token,
-        )
-        .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
-        {
+        );
+        // Log cleanup can delete a cached commit while newer commits still extend its history.
+        // If the version hasn't advanced, reload to check whether the table was recreated.
+        let new_segment = match new_segment {
+            Ok(NewSegment::Combined(ref segment))
+                if commit_matches.is_none() && segment.end_version == existing_snapshot_version =>
+            {
+                return rebuild();
+            }
+            Ok(NewSegment::Unchanged) | Err(Error::InvalidLogSegment(_))
+                if commit_matches.is_none() =>
+            {
+                return rebuild();
+            }
+            result => result.inspect_err(|_| emit_log_segment_load_failure(&metric_context))?,
+        };
+        let (combined_log_segment, new_end_version) = match new_segment {
             NewSegment::Unchanged => {
                 return Self::reuse_with_build_metadata(
                     &existing_snapshot,
@@ -300,6 +363,34 @@ impl Snapshot {
     // ============================================================================
     // Helpers
     // ============================================================================
+
+    /// Returns `None` if the cached commit is missing, possibly because of log cleanup.
+    fn current_commit_matches(
+        &self,
+        engine: &dyn Engine,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Option<bool>> {
+        let Some(commit) = self.log_segment.listed.latest_commit_file.as_ref() else {
+            return Ok(None);
+        };
+        // list_from excludes its starting path. Use the version prefix to include the commit.
+        let start = self
+            .log_segment
+            .log_root
+            .join(&format!("{:020}.", commit.version))?;
+        let current = engine
+            .storage_handler()
+            .list_from_with_cancellation(&start, cancellation_token.cloned())?
+            .find(|file| {
+                !file
+                    .as_ref()
+                    .is_ok_and(|file| file.location < commit.location.location)
+            })
+            .transpose()?;
+        Ok(current
+            .filter(|file| file.location == commit.location.location)
+            .map(|file| file == commit.location))
+    }
 
     /// List the log after the existing snapshot and assemble the new [`NewSegment`] for this
     /// incremental update. Returns a non-failure [`NewSegment`] on the C/D.1/E/F cases; a
@@ -714,6 +805,89 @@ mod tests {
     // ============================================================================
     // Tests: try_new_from direct API
     // ============================================================================
+
+    #[rstest]
+    #[case(0, 0, None)]
+    #[case(2, 2, None)]
+    #[case(2, 0, None)]
+    #[case(2, 4, None)]
+    #[case(0, 0, Some(0))]
+    #[case(2, 2, Some(2))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_after_path_recreation(
+        #[case] old_version: u64,
+        #[case] new_version: u64,
+        #[case] requested_version: Option<Version>,
+        #[values(false, true)] skip_new_checkpoints: bool,
+        #[values(false, true)] with_checkpoint: bool,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, old_version + 1).await?;
+        if with_checkpoint {
+            Snapshot::builder_for(ctx.url.as_str())
+                .build(ctx.engine.as_ref())?
+                .checkpoint(ctx.engine.as_ref(), None)?;
+        }
+        let existing = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+
+        for version in 0..=old_version {
+            ctx.store
+                .delete(&delta_path_for_version(version, "json"))
+                .await?;
+        }
+        if with_checkpoint {
+            ctx.store
+                .delete(&delta_path_for_version(old_version, "checkpoint.parquet"))
+                .await?;
+            ctx.store
+                .delete(&"_delta_log/_last_checkpoint".into())
+                .await?;
+        }
+        let mut metadata = metadata_action(json!({}));
+        metadata["metaData"]["id"] = json!("recreated-table-id");
+        commit(
+            ctx.url.as_str(),
+            ctx.store.as_ref(),
+            0,
+            vec![
+                protocol_action(1, 2),
+                metadata,
+                add_action("new-table-file.parquet"),
+            ],
+        )
+        .await;
+        for version in 1..=new_version {
+            commit(
+                ctx.url.as_str(),
+                ctx.store.as_ref(),
+                version,
+                vec![add_action(&format!("new-table-file-{version}.parquet"))],
+            )
+            .await;
+        }
+        if with_checkpoint {
+            Snapshot::builder_for(ctx.url.as_str())
+                .build(ctx.engine.as_ref())?
+                .checkpoint(ctx.engine.as_ref(), None)?;
+        }
+
+        let builder = Snapshot::builder_from(existing);
+        let builder = if skip_new_checkpoints {
+            builder.skip_new_checkpoints()
+        } else {
+            builder
+        };
+        let builder = if let Some(version) = requested_version {
+            builder.at_version(version)
+        } else {
+            builder
+        };
+        let actual = builder.build(ctx.engine.as_ref())?;
+        let expected = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        compare_snapshots(&actual, &expected);
+        assert_eq!(actual.version(), new_version);
+        Ok(())
+    }
 
     #[test]
     fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
@@ -2619,12 +2793,8 @@ mod tests {
             })
             .expect("expected a LogSegmentLoadFailure");
         assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
-            "no success event should fire on the failure path"
-        );
+        // Reloading reveals that the table ID is unchanged. The load succeeds, but the version
+        // regression still fails because commits were deleted from the same table.
         Ok(())
     }
 
