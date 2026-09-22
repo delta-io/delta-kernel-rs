@@ -449,7 +449,6 @@ mod apply_schema_validation_tests {
         );
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[test]
     fn apply_schema_rejects_udt_long_over_utf8() {
         let input: ArrayRef = Arc::new(crate::arrow::array::StringArray::from(vec!["42"]));

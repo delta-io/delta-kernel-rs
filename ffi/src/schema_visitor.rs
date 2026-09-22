@@ -854,11 +854,10 @@ fn visit_field_map_impl(
 /// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
 ///
 /// Copies the annotation and returns a new field ID. After decoding the name and annotation and
-/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
-/// disabled UDT support leave the ID available. The physical field's name, nullability, and
-/// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
-/// annotation keys, failed metadata callbacks, physical types containing UDTs or metadata columns,
-/// or disabled UDT support.
+/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors leave the
+/// ID available. The physical field's name, nullability, and metadata are ignored. Returns an error
+/// for invalid IDs, invalid UTF-8, duplicate or reserved annotation keys, failed metadata
+/// callbacks, or physical types containing UDTs or metadata columns.
 ///
 /// # Safety
 ///
@@ -1026,7 +1025,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     fn udt_schema_visit_rejects_invalid_or_consumed_id(#[values(false, true)] consumed: bool) {
         let mut state = KernelSchemaVisitorState::default();
@@ -1075,7 +1073,6 @@ mod tests {
         assert!(!state.elements.contains(physical));
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::name(0)]
     #[case::annotation_key(1)]
@@ -1120,7 +1117,6 @@ mod tests {
         assert!(state.elements.contains(physical));
     }
 
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::nested_udt(
         DataType::from(delta_kernel::schema::UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap()),
@@ -1156,35 +1152,6 @@ mod tests {
         assert_extern_result_error_contains(result, FFIKernelError::SchemaError, message);
         assert!(!state.elements.contains(physical));
         assert!(state.elements.contains(unrelated));
-    }
-
-    #[cfg(not(feature = "udt-in-dev"))]
-    #[test]
-    fn udt_schema_visit_disabled_preserves_child_and_skips_metadata() {
-        let mut state = KernelSchemaVisitorState::default();
-        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
-        let mut metadata = TestMetadata::default();
-        let result = unsafe {
-            visit_field_user_defined(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                physical,
-                FfiNullableStringMap {
-                    ptr: null(),
-                    len: 0,
-                },
-                true,
-                &test_engine_metadata(&mut metadata),
-                allocate_err,
-            )
-        };
-        assert_extern_result_error_contains(
-            result,
-            FFIKernelError::UnsupportedError,
-            "requires udt-in-dev",
-        );
-        assert!(state.elements.contains(physical));
-        assert!(!metadata.visited);
     }
 
     #[derive(Default)]
