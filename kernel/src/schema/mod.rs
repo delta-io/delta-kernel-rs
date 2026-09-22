@@ -2343,6 +2343,12 @@ impl From<PrimitiveType> for DataType {
         DataType::Primitive(ptype)
     }
 }
+#[cfg(feature = "udt-in-dev")]
+impl From<UserDefinedType> for DataType {
+    fn from(udt: UserDefinedType) -> Self {
+        Self::UserDefined(udt)
+    }
+}
 impl From<MapType> for DataType {
     fn from(map_type: MapType) -> Self {
         DataType::Map(Box::new(map_type))

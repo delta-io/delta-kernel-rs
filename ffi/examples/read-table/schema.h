@@ -194,6 +194,23 @@ void visit_struct(
   read_column_mapping_metadata(struct_item, metadata, builder->engine);
 }
 
+void visit_user_defined(
+  void* data,
+  uintptr_t sibling_list_id,
+  struct KernelStringSlice name,
+  bool is_nullable,
+  const CMetadataMap* metadata,
+  uintptr_t child_list_id,
+  FfiNullableStringMap annotation)
+{
+  (void)annotation;
+  SchemaBuilder* builder = data;
+  char* name_ptr = allocate_string(name);
+  SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "udt", is_nullable);
+  item->children = child_list_id;
+  read_column_mapping_metadata(item, metadata, builder->engine);
+}
+
 void visit_array(
   void* data,
   uintptr_t sibling_list_id,
@@ -379,6 +396,7 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
   EngineSchemaVisitor visitor = {
     .data = builder,
     .make_field_list = make_field_list,
+    .visit_user_defined = visit_user_defined,
     .visit_struct = visit_struct,
     .visit_array = visit_array,
     .visit_map = visit_map,

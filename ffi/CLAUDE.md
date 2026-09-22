@@ -43,7 +43,8 @@ the caller's memory space.
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
-- `src/schema_visitor.rs` -- visitor pattern for schema traversal
+- `src/schema.rs` -- visitor pattern for schema traversal; UDT callbacks expose their physical
+  type as a child and preserve string-or-null annotation members
 - `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
   (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)

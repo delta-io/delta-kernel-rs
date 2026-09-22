@@ -16,7 +16,8 @@ use crate::{DeltaResult, Error};
 pub struct UserDefinedType {
     /// Physical type. It must not contain another user-defined type.
     pub sql_type: Box<DataType>,
-    /// Opaque engine members. The keys `type` and `sqlType` are reserved.
+    /// Opaque engine members. `None` preserves an explicit JSON null; absent keys stay absent.
+    /// The keys `type` and `sqlType` are reserved.
     pub annotation: BTreeMap<String, Option<String>>,
 }
 
@@ -96,6 +97,7 @@ mod tests {
 
     use super::*;
     use crate::schema::compare::SchemaComparison;
+    use crate::transforms::{transform_output_type, SchemaTransform};
 
     #[rstest]
     #[case(json!({"type":"udt", "sqlType":"long"}))]
@@ -154,5 +156,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reserved"));
+    }
+
+    #[test]
+    fn schema_transform_treats_udt_as_leaf() {
+        struct RejectPrimitives;
+        impl<'a> SchemaTransform<'a> for RejectPrimitives {
+            transform_output_type!(|'a, T| Result<(), ()>);
+            fn transform_primitive(
+                &mut self,
+                _: &'a super::super::PrimitiveType,
+            ) -> Result<(), ()> {
+                Err(())
+            }
+        }
+        let udt = UserDefinedType {
+            sql_type: Box::new(DataType::LONG),
+            annotation: BTreeMap::new(),
+        };
+        assert!(RejectPrimitives.transform(&DataType::from(udt)).is_ok());
+        assert!(RejectPrimitives.transform(&DataType::LONG).is_err());
     }
 }

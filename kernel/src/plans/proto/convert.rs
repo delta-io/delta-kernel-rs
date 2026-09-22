@@ -2120,6 +2120,53 @@ mod tests {
         assert_eq!(serde_json::to_value(decoded).unwrap(), value);
     }
 
+    #[test]
+    fn reject_user_defined_proto_without_physical_type() {
+        let proto = proto_schema::DataType {
+            kind: Some(DataTypeKind::UserDefined(Box::new(
+                proto_schema::UserDefinedType {
+                    sql_type: None,
+                    annotation: Default::default(),
+                },
+            ))),
+        };
+        let error = DataType::try_from(proto).unwrap_err();
+        #[cfg(feature = "udt-in-dev")]
+        assert!(error.to_string().contains("missing sql_type"));
+        #[cfg(not(feature = "udt-in-dev"))]
+        assert!(error.to_string().contains("udt-in-dev"));
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::reserved_key(true)]
+    #[case::nested_udt(false)]
+    fn proto_decode_rejects_invalid_public_udt(#[case] reserved_key: bool) {
+        let inner = crate::schema::UserDefinedType {
+            sql_type: Box::new(DataType::LONG),
+            annotation: Default::default(),
+        };
+        let invalid = crate::schema::UserDefinedType {
+            sql_type: Box::new(if reserved_key {
+                DataType::LONG
+            } else {
+                inner.into()
+            }),
+            annotation: if reserved_key {
+                [("type".into(), None)].into()
+            } else {
+                Default::default()
+            },
+        };
+        let encoded = proto_schema::DataType::from(&DataType::from(invalid));
+        let error = DataType::try_from(encoded).unwrap_err();
+        assert!(error.to_string().contains(if reserved_key {
+            "reserved"
+        } else {
+            "another UDT"
+        }));
+    }
+
     #[rstest]
     #[case(DataType::INTEGER, "primitive")]
     #[case(ArrayType::new(DataType::INTEGER, true).into(), "array")]

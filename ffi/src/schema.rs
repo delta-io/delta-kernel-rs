@@ -44,6 +44,7 @@ pub struct EngineSchemaVisitor {
     pub make_field_list: extern "C" fn(data: *mut c_void, reserve: usize) -> usize,
 
     /// Visit a UDT with its physical type in the one-element `child_list_id` list.
+    /// The child is named `sqlType`, inherits `is_nullable`, and has empty field metadata.
     /// The annotation and its string slices are borrowed for the duration of this callback.
     pub visit_user_defined: extern "C" fn(
         data: *mut c_void,
