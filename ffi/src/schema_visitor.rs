@@ -766,34 +766,32 @@ pub unsafe extern "C" fn visit_field_user_defined(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
+    #[cfg(feature = "udt-in-dev")]
     let result = (|| -> DeltaResult<usize> {
-        #[cfg(feature = "udt-in-dev")]
-        {
-            let name = unsafe { name.try_to_string() }?;
-            let annotation = unsafe { annotation.try_to_hash_map() }?;
-            let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
-            let physical = state
-                .elements
-                .take(sql_type_id)
-                .ok_or_else(|| Error::schema("Invalid UDT physical type ID"))?;
-            let udt = delta_kernel::schema::UserDefinedType {
-                sql_type: Box::new(physical.data_type),
-                annotation: annotation.into_iter().collect(),
-            };
-            udt.validate()?;
-            Ok(wrap_field(
-                state,
-                StructField::new(name, udt, nullable).with_metadata(metadata),
-            ))
-        }
-        #[cfg(not(feature = "udt-in-dev"))]
-        {
-            let _ = (state, name, sql_type_id, annotation, nullable, metadata);
-            Err(Error::unsupported(
-                "UDT schema construction requires udt-in-dev",
-            ))
-        }
+        let name = unsafe { name.try_to_string() }?;
+        let annotation = unsafe { annotation.try_to_hash_map() }?;
+        let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
+        let physical = state
+            .elements
+            .take(sql_type_id)
+            .ok_or_else(|| Error::schema("Invalid UDT physical type ID"))?;
+        let udt = delta_kernel::schema::UserDefinedType {
+            sql_type: Box::new(physical.data_type),
+            annotation: annotation.into_iter().collect(),
+        };
+        udt.validate()?;
+        Ok(wrap_field(
+            state,
+            StructField::new(name, udt, nullable).with_metadata(metadata),
+        ))
     })();
+    #[cfg(not(feature = "udt-in-dev"))]
+    let result: DeltaResult<usize> = {
+        let _ = (state, name, sql_type_id, annotation, nullable, metadata);
+        Err(Error::unsupported(
+            "UDT schema construction requires udt-in-dev",
+        ))
+    };
     result.into_extern_result(&allocate_error)
 }
 
