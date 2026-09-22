@@ -748,10 +748,10 @@ fn visit_field_map_impl(
 /// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
 ///
 /// Copies the annotation and returns a new field ID. After decoding the name and annotation and
-/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
-/// disabled UDT support leave the ID available. The physical field's name, nullability, and
-/// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
-/// annotation keys, failed metadata callbacks, nested UDTs, or disabled UDT support.
+/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors leave the
+/// ID available. The physical field's name, nullability, and metadata are ignored. Returns an error
+/// for invalid IDs, invalid UTF-8, duplicate or reserved annotation keys, failed metadata
+/// callbacks, or nested UDTs.
 ///
 /// # Safety
 ///

@@ -108,8 +108,13 @@ commit actions, and delegates the atomic commit to a `Committer`.
 `sql_type`; schema serialization and write-state transport preserve the annotation.
 
 Generic schema transforms, column mapping, and statistics treat the UDT wrapper as a leaf.
-Feature detection explicitly descends into `sql_type`. UDT equality compares only the physical
-type; use serialized schema comparisons when verifying annotation preservation.
+Feature detection explicitly descends into `sql_type`. Logical equality compares the complete
+physical type and annotations; use it for exact schema matching and preservation assertions.
+Directional `can_read_as` / `can_read_as_without_type_widening` checks require exact UDT equality,
+including the complete physical type and annotations. They validate schema compatibility without
+converting data. Ordinary CDF and plan unions use equality; row-tracking CDF uses compatibility
+without type widening, retaining nullable additions and relaxed outer nullability around unchanged
+UDTs. Both CDF modes reject annotation changes to existing UDTs.
 
 ## Engine Trait System
 
