@@ -20,11 +20,9 @@ use crate::committer::{
 use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::expressions::null_lit;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
+    col, column_name, lit, null_lit, ArrayData, ColumnName, ExpressionStructPatch,
     ExpressionStructPatchBuilder, Scalar,
 };
 use crate::log_replay::HasSelectionVector;
@@ -2202,6 +2200,12 @@ impl<S> Transaction<S> {
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
         let evaluation_handler = engine.evaluation_handler();
 
+        // adaptiveMetadata removes must carry a null deletionTimestamp and extendedFileMetadata =
+        // true (see `Remove` and `build_remove_struct_patch`).
+        let adaptive_metadata_enabled = self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview);
+
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
@@ -2209,6 +2213,7 @@ impl<S> Transaction<S> {
                 self.data_change,
                 &columns_to_drop,
                 coalesce_stats_with_parsed,
+                adaptive_metadata_enabled,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
@@ -2254,21 +2259,32 @@ impl<S> Transaction<S> {
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
+///
+/// When `adaptive_metadata_enabled` is set, the RFC requires `deletionTimestamp` to be null
+/// (cleanup uses tree reachability, not timestamp expiry), so it is emitted as a fixed literal
+/// rather than derived from the input.
 fn build_remove_struct_patch(
     commit_timestamp: i64,
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
+    adaptive_metadata_enabled: bool,
 ) -> DeltaResult<ExpressionStructPatch> {
+    let deletion_timestamp = if adaptive_metadata_enabled {
+        null_lit(DataType::LONG)
+    } else {
+        lit(commit_timestamp)
+    };
     // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
     // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
+    // Under adaptiveMetadata both are guaranteed present
     let extended_file_metadata = Predicate::and_from([
         col!(SIZE_NAME).is_not_null(),
         col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
     ]);
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .insert_after("path", lit(commit_timestamp))
+        .insert_after("path", deletion_timestamp)
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
@@ -2853,27 +2869,52 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_remove_action_projection_sets_extended_metadata() -> DeltaResult<()> {
+    /// Verifies the Remove projection's `deletionTimestamp` and `extendedFileMetadata` fields.
+    /// `extendedFileMetadata` is always a presence predicate; `deletionTimestamp` derives from the
+    /// input outside adaptiveMetadata and is fixed to null under it per the RFC.
+    #[rstest]
+    #[case::standard(false)]
+    #[case::adaptive_metadata(true)]
+    fn test_remove_action_projection_deletion_timestamp_and_extended_metadata(
+        #[case] adaptive_metadata_enabled: bool,
+    ) -> DeltaResult<()> {
+        let commit_timestamp = 123;
         let patch = build_remove_struct_patch(
-            0,     /* commit_timestamp */
+            commit_timestamp,
             true,  /* data_change */
             &[],   /* columns_to_drop */
             false, /* coalesce_stats_with_parsed */
+            adaptive_metadata_enabled,
         )?;
         let path_patch = patch
             .field_patches
             .get("path")
             .expect("path should have inserted fields");
+        // Insertions preserve `insert_after` call order: deletionTimestamp, dataChange,
+        // extendedFileMetadata, partitionValues.
+        let deletion_timestamp = path_patch
+            .insertions
+            .first()
+            .expect("deletionTimestamp should be the first inserted field");
         let extended_file_metadata = path_patch
             .insertions
             .get(2)
             .expect("extendedFileMetadata should follow deletionTimestamp and dataChange");
-        let expected = Expression::from_pred(Predicate::and_from([
+
+        let expected_deletion_timestamp = if adaptive_metadata_enabled {
+            null_lit(DataType::LONG)
+        } else {
+            lit(commit_timestamp)
+        };
+        let expected_extended_file_metadata = Expression::from_pred(Predicate::and_from([
             col!(SIZE_NAME).is_not_null(),
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
         ]));
-        assert_eq!(extended_file_metadata.as_ref(), &expected);
+        assert_eq!(deletion_timestamp.as_ref(), &expected_deletion_timestamp);
+        assert_eq!(
+            extended_file_metadata.as_ref(),
+            &expected_extended_file_metadata
+        );
         Ok(())
     }
 

@@ -458,24 +458,29 @@ impl<'a> CategoryScopes<'a> {
     }
 }
 
-/// A [`SchemaTransform`] that collects the flat AMT `content_stats` schema by visiting every leaf
-/// of a table schema (see [`stats_schema`] for the layout, [`leaf_stats_field`] for each leaf).
+/// Drives the table-schema walk for AMT `content_stats` schema generation
+/// ([`collect_stats_schema`]): it descends structs, threads the optional Delta stat projection
+/// through each descent, and invokes `on_leaf` once for every non-struct leaf the projection did
+/// not drop, with the leaf field, its root-to-leaf path, and its category membership (`None` when
+/// not projecting). Stat-eligibility (field IDs, geospatial, array/map producing no stats) is left
+/// to the sink. A leaf that a projection drops entirely (present in no category) is skipped before
+/// `on_leaf` is called.
 ///
-/// When `projection` is `Some`, only leaves present in at least one Delta stat category are emitted
-/// (see [`projected_stats_schema`]); when `None`, every stat-eligible leaf is emitted.
-///
-/// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, [`Self::fields`] is the
+/// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, the `on_leaf` sink is the
 /// real result, and an `Err` short-circuits the walk.
-struct StatsSchemaCollector<'a> {
+struct StatsLeafWalker<'a, F> {
     /// Field names from the root to the current node; the last segment is the leaf being visited.
     path: Vec<String>,
-    /// Accumulated flat stats fields, in schema order.
-    fields: Vec<StructField>,
-    /// Delta stat categories in scope at the current position, or `None` to emit every leaf.
+    /// Delta stat categories in scope at the current position, or `None` to visit every leaf.
     projection: Option<CategoryScopes<'a>>,
+    /// Invoked once per surviving leaf with `(field, path, categories)`.
+    on_leaf: F,
 }
 
-impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
+impl<'a, F> SchemaTransform<'a> for StatsLeafWalker<'a, F>
+where
+    F: FnMut(&'a StructField, &[String], Option<StatCategories>) -> Result<(), Error>,
+{
     transform_output_type!(|'a, T| Result<(), Error>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), Error> {
@@ -495,17 +500,14 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector<'a> {
             self.projection = saved_projection;
             result
         } else {
-            // Every non-struct type is a leaf handled by `leaf_stats_field` -- including variants
-            // (never descended into: their inner fields carry no field IDs) and array/map columns
-            // (which produce no stats). When projecting, a leaf absent from every category is
-            // dropped here (before `leaf_stats_field`'s field-id checks); otherwise its category
-            // membership determines which stats sub-fields survive.
+            // Every non-struct type is a leaf -- including variants (never descended into: their
+            // inner fields carry no field IDs) and array/map columns (which produce no stats). When
+            // projecting, a leaf absent from every category is dropped here.
             let categories = self.projection.map(|s| s.leaf_categories(field.name()));
             if categories.is_some_and(|c| !c.any()) {
                 Ok(())
             } else {
-                leaf_stats_field(field, &self.path, categories)
-                    .map(|stats| self.fields.extend(stats))
+                (self.on_leaf)(field, &self.path, categories)
             }
         };
         self.path.pop();
@@ -573,15 +575,20 @@ fn collect_stats_schema<'a>(
     table_struct: &'a StructType,
     projection: Option<CategoryScopes<'a>>,
 ) -> DeltaResult<StructType> {
-    let mut collector = StatsSchemaCollector {
-        path: Vec::new(),
-        fields: Vec::new(),
-        projection,
-    };
-    collector.transform_struct(table_struct)?;
+    let mut fields: Vec<StructField> = Vec::new();
+    {
+        let mut walker = StatsLeafWalker {
+            path: Vec::new(),
+            projection,
+            on_leaf: |field: &'a StructField, path: &[String], categories| {
+                leaf_stats_field(field, path, categories).map(|stats| fields.extend(stats))
+            },
+        };
+        walker.transform_struct(table_struct)?;
+    }
     // `new_unchecked` skips name dedup; safe because `ColumnName`'s `Display` is lossless -- a leaf
     // whose name contains a dot is backtick-escaped, so it never collides with a nested path.
-    Ok(StructType::new_unchecked(collector.fields))
+    Ok(StructType::new_unchecked(fields))
 }
 
 #[cfg(test)]

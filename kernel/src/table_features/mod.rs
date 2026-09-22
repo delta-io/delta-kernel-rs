@@ -234,6 +234,8 @@ pub(crate) enum EnablementCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum Operation {
+    /// Create a [`Snapshot`](crate::Snapshot) on the table.
+    SnapshotLoad,
     /// Read operations on regular table data
     Scan,
     /// Read operations on change data feed data
@@ -296,9 +298,9 @@ pub(crate) struct FeatureInfo {
     ///
     /// Note: `kernel_support` validation depends on `feature_type`:
     /// WriterOnly features: Only checked during `Operation::Write`
-    /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
-    /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
-    /// WriterOnly features are never invoked for Scan/CDF regardless of the custom check logic.
+    /// ReaderWriter features: Checked during every operation
+    /// Read operations (SnapshotLoad, Scan, Cdf) only validate reader features, so they do not
+    /// invoke `kernel_support` for WriterOnly features.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
@@ -363,9 +365,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
@@ -509,7 +509,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Write => Ok(()),
+        Operation::SnapshotLoad | Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
             "Feature 'catalogManaged' is not supported for CDF",
         )),
@@ -522,7 +522,7 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Write => Ok(()),
+        Operation::SnapshotLoad | Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
             "Feature 'catalogOwned-preview' is not supported for CDF",
         )),
@@ -632,8 +632,9 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
-// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// Dependencies and mutual exclusions per the adaptiveMetadata RFC (delta-io/delta#6978) "Table
+// Feature Enablement" section. Enforcement is covered by
+// `test_adaptive_metadata_feature_requirements`.
 // TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
 static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
@@ -653,6 +654,10 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Enabled(TableFeature::DomainMetadata),
         FeatureRequirement::Enabled(TableFeature::DeletionVectors),
         FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+        // adaptiveMetadata and v2Checkpoint are mutually exclusive: once adaptiveMetadata is
+        // enabled, checkpoint state is carried by the `checkpoint` action rather than by V2
+        // checkpoint files, so a table must not enable both.
+        FeatureRequirement::NotSupported(TableFeature::V2Checkpoint),
     ],
     #[cfg(feature = "adaptive-metadata-in-dev")]
     kernel_support: KernelSupport::Supported,
@@ -668,7 +673,7 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[],
     #[cfg(feature = "geo-type-in-dev")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => Ok(()),
         Operation::Write => Err(Error::unsupported(
             "Feature 'geospatial' is not supported for writes",
         )),

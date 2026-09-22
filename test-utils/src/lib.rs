@@ -814,13 +814,24 @@ async fn create_table_impl(
         }
     }
 
+    // adaptiveMetadata auto-enables its dependencies (see `enable_adaptive_metadata_dependencies`)
+    // so callers can pass just `adaptiveMetadata-preview` and get a loadable table.
+    let enable_adaptive_metadata = reader_features.contains(&"adaptiveMetadata-preview")
+        || writer_features.contains(&"adaptiveMetadata-preview");
+    if enable_adaptive_metadata {
+        enable_adaptive_metadata_dependencies(&mut reader_features, &mut writer_features);
+    }
+
     // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
-    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
-    // `delta.columnMapping.maxColumnId` below.
+    // fails. Assign it here (with nested ids for iceberg v3 / adaptiveMetadata); `max_column_id`
+    // feeds `delta.columnMapping.maxColumnId` below.
     let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
         let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
-        let schema =
-            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        let schema = assign_column_mapping_metadata(
+            &schema,
+            &mut max_id,
+            enable_iceberg_compat_v3 || enable_adaptive_metadata,
+        )?;
         (Arc::new(schema), max_id)
     } else {
         (schema, 0i64)
@@ -952,6 +963,36 @@ async fn create_table_impl(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
+}
+
+/// Adds the features `adaptiveMetadata-preview` depends on to `reader_features` and
+/// `writer_features` (each only if not already present).
+///
+/// adaptiveMetadata requires column mapping (in `id` mode, set by the caller) plus RowTracking,
+/// DomainMetadata, DeletionVectors, and InCommitTimestamp. The ReaderWriter dependencies are
+/// mirrored into both feature lists; the writer-only dependencies are added to `writer_features`.
+fn enable_adaptive_metadata_dependencies<'a>(
+    reader_features: &mut Vec<&'a str>,
+    writer_features: &mut Vec<&'a str>,
+) {
+    // ReaderWriter features must appear in both reader and writer feature lists.
+    for f in [
+        "adaptiveMetadata-preview",
+        "columnMapping",
+        "deletionVectors",
+    ] {
+        if !reader_features.contains(&f) {
+            reader_features.push(f);
+        }
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
+    for f in ["rowTracking", "domainMetadata", "inCommitTimestamp"] {
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
 }
 
 /// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level

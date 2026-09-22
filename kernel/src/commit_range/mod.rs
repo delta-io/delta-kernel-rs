@@ -314,7 +314,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use test_utils::add_commit;
+    use test_utils::{add_commit, assert_result_error_with_message};
 
     use super::*;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
@@ -901,31 +901,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_on_start_snapshot_unsupported_for_scan() {
+    async fn snapshot_load_rejects_unsupported_reader_feature() {
         let v0 = format!("{}\n{}", UNSUPPORTED_PROTOCOL_LINE, VALID_METADATA_LINE,);
         let (engine, table_root) = engine_with_commits(&[(0, &v0)]).await;
 
-        let snapshot = Snapshot::builder_for(table_root)
-            .at_version(0)
-            .build(engine.as_ref())
-            .expect("snapshot with unknown feature should still build");
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add];
-        let err = range
-            .commits(engine, Some(snapshot), &actions)
-            .err()
-            .expect(
-                "commits must reject snapshot with unsupported feature before iteration begins",
-            );
-        match err {
-            Error::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
-            other => panic!("expected Error::Unsupported, got: {other:?}"),
-        }
+        assert_result_error_with_message(
+            Snapshot::builder_for(table_root)
+                .at_version(0)
+                .build(engine.as_ref()),
+            "futureFeature",
+        );
     }
 
     #[rstest::rstest]

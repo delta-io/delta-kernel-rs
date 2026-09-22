@@ -601,6 +601,76 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// End-to-end check that a Remove committed to an adaptiveMetadata table conforms to the RFC:
+/// `deletionTimestamp` is null (cleanup uses tree reachability, not timestamp expiry) and
+/// `extendedFileMetadata` is true. Outside adaptiveMetadata,
+/// `test_remove_files_adds_expected_entries` covers the timestamped, conditionally-extended shape.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = tempdir()?;
+    let tmp_dir_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let (store, engine, table_location) =
+        test_utils::engine_store_setup("adaptive_remove", Some(&tmp_dir_url));
+    let engine = Arc::new(engine);
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let table_url = test_utils::create_table_with_column_mapping_mode(
+        store,
+        table_location,
+        schema,
+        &[],  // no partition columns
+        true, // (3, 7) protocol
+        vec!["adaptiveMetadata-preview"],
+        vec![],
+        "id",
+    )
+    .await?;
+
+    // v1: append a data file.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    // v2: remove the file.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan_files = snapshot
+        .clone()
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .next()
+        .expect("one scan-metadata batch")?
+        .scan_files;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    txn.remove_files(scan_files);
+    txn.ack_row_tracking_preservation();
+    let version = txn
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .commit_version();
+
+    let removes = read_actions_from_commit(&table_url, version, "remove")?;
+    assert_eq!(removes.len(), 1, "expected exactly one remove action");
+    let remove = &removes[0];
+    assert!(
+        remove.get("deletionTimestamp").is_none_or(|v| v.is_null()),
+        "deletionTimestamp must be null under adaptiveMetadata, got {remove}"
+    );
+    assert_eq!(
+        remove["extendedFileMetadata"].as_bool(),
+        Some(true),
+        "extendedFileMetadata must be true under adaptiveMetadata, got {remove}"
+    );
+    Ok(())
+}
+
 /// Verifies that `extendedFileMetadata` is true exactly when `size` and `partitionValues` are
 /// present; `tags` does not affect it.
 ///
