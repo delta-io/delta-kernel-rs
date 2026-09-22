@@ -10,6 +10,12 @@ use delta_kernel_derive::internal_api;
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
+#[cfg(feature = "arrow-expression")]
+use crate::parquet::basic::Compression;
+#[cfg(feature = "arrow-expression")]
+use crate::parquet::file::properties::WriterProperties;
+#[cfg(feature = "arrow-expression")]
+use crate::table_properties::{ParquetCompressionCodec, ParquetWriterConfig};
 
 /// Returns the standard [`ArrowReaderOptions`] for all default engine parquet reads.
 ///
@@ -21,14 +27,40 @@ pub(crate) fn reader_options() -> ArrowReaderOptions {
     ArrowReaderOptions::new().with_skip_arrow_metadata(true)
 }
 
+/// Maps a Delta [`ParquetCompressionCodec`] onto the Arrow/parquet [`Compression`] the writer
+/// emits.
+///
+/// Lives here (not in an engine crate) because kernel owns [`ParquetCompressionCodec`]: the orphan
+/// rule forbids the default-engine crate from implementing this conversion on the foreign
+/// [`Compression`].
+#[cfg(feature = "arrow-expression")]
+impl From<ParquetCompressionCodec> for Compression {
+    fn from(codec: ParquetCompressionCodec) -> Self {
+        match codec {
+            ParquetCompressionCodec::Snappy => Compression::SNAPPY,
+            ParquetCompressionCodec::Zstd => Compression::ZSTD(Default::default()),
+            ParquetCompressionCodec::Uncompressed => Compression::UNCOMPRESSED,
+            ParquetCompressionCodec::Gzip => Compression::GZIP(Default::default()),
+            ParquetCompressionCodec::Lz4 => Compression::LZ4,
+            ParquetCompressionCodec::Lz4Raw => Compression::LZ4_RAW,
+        }
+    }
+}
+
 /// Returns the standard [`ArrowWriterOptions`] for all kernel parquet writes.
 ///
-/// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
-/// non-Arrow readers and avoids encoding Arrow-specific type information.
+/// Sets the compression codec from `config` and omits the Arrow IPC schema from the file metadata,
+/// which keeps Delta files interoperable with non-Arrow readers and avoids encoding Arrow-specific
+/// type information.
 #[cfg(feature = "arrow-expression")]
 #[internal_api]
-pub(crate) fn writer_options() -> ArrowWriterOptions {
-    ArrowWriterOptions::new().with_skip_arrow_metadata(true)
+pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions {
+    let props = WriterProperties::builder()
+        .set_compression(config.compression.into())
+        .build();
+    ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_skip_arrow_metadata(true)
 }
 
 #[cfg(feature = "arrow-conversion")]
@@ -68,3 +100,25 @@ pub(crate) mod ensure_data_types;
 pub mod parquet_row_group_skipping;
 #[cfg(all(test, feature = "default-engine-base"))]
 pub(crate) mod test_utils;
+
+#[cfg(all(test, feature = "arrow-expression"))]
+mod tests {
+    use crate::parquet::basic::Compression;
+    use crate::table_properties::ParquetCompressionCodec;
+
+    // Literal expected values (not `Compression::from(codec)`) so a swapped arm is caught: the
+    // round-trip engine tests assert against this same conversion and would not notice.
+    #[rstest::rstest]
+    #[case(ParquetCompressionCodec::Snappy, Compression::SNAPPY)]
+    #[case(ParquetCompressionCodec::Zstd, Compression::ZSTD(Default::default()))]
+    #[case(ParquetCompressionCodec::Uncompressed, Compression::UNCOMPRESSED)]
+    #[case(ParquetCompressionCodec::Gzip, Compression::GZIP(Default::default()))]
+    #[case(ParquetCompressionCodec::Lz4, Compression::LZ4)]
+    #[case(ParquetCompressionCodec::Lz4Raw, Compression::LZ4_RAW)]
+    fn parquet_codec_maps_to_expected_compression(
+        #[case] codec: ParquetCompressionCodec,
+        #[case] expected: Compression,
+    ) {
+        assert_eq!(Compression::from(codec), expected);
+    }
+}

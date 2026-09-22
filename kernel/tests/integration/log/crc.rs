@@ -25,6 +25,8 @@ use delta_kernel::{
     FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
     PredicateRef, StorageHandler, Version,
 };
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -1928,11 +1930,11 @@ fn assert_histogram_totals(
 /// The first non-zero default histogram bin boundary (8KB).
 const FIRST_BIN_BOUNDARY: i64 = 8192;
 
-/// Approximate bytes per row for `(int32, 100-char padded string)` parquet data.
-const APPROX_BYTES_PER_ROW: i64 = 104;
+/// Conservative lower bound on post-Zstd bytes/row for `(int32, 80-char random string)` data;
+/// underestimating keeps [`LARGE_FILE_ROW_COUNT`] above the bin boundary.
+const APPROX_BYTES_PER_ROW: i64 = 40;
 
 /// Row count guaranteed to produce a parquet file exceeding [`FIRST_BIN_BOUNDARY`].
-/// Uses 2x the boundary divided by per-row size as a generous margin.
 const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW) as i32;
 
 /// Verifies that the in-memory CRC histogram correctly tracks file adds and removes across
@@ -1982,7 +1984,15 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     // ===== v2: insert large file (>= 8KB -> bin 1+) =====
     let n = LARGE_FILE_ROW_COUNT;
     let ids: ArrayRef = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()));
-    let strings: Vec<String> = (0..n).map(|i| format!("{i:0>100}")).collect();
+    // Random (high-entropy) values so Zstd can't shrink the file below the 8KB bin boundary.
+    let mut rng = StdRng::seed_from_u64(0);
+    let strings: Vec<String> = (0..n)
+        .map(|_| {
+            let (a, b, c, d): (u64, u64, u64, u64) =
+                (rng.random(), rng.random(), rng.random(), rng.random());
+            format!("{a:020}{b:020}{c:020}{d:020}")
+        })
+        .collect();
     let data: ArrayRef = Arc::new(StringArray::from(strings));
     let committed = insert_data(snapshot.clone(), &engine, vec![ids, data])
         .await?

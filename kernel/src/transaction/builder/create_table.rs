@@ -32,15 +32,16 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
-    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
-    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
-    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
-    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
+    CheckpointPolicy, ParquetCompressionCodec, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL,
+    CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS,
+    DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP,
+    ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+    ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
+    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
+    SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -117,6 +118,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // Parquet compression codec: connectors read this to configure their Parquet writer
+    PARQUET_COMPRESSION_CODEC,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
@@ -723,6 +726,13 @@ fn validate_extract_table_features_and_properties(
         }
     }
 
+    // Reject an unrecognized compression codec at create time. Per the Delta protocol a writer
+    // SHOULD abort on a codec it does not recognize; reads stay lenient (see
+    // `TableProperties::compression_codec_or_default`).
+    if let Some(codec) = properties.get(PARQUET_COMPRESSION_CODEC) {
+        ParquetCompressionCodec::try_from_property(codec)?;
+    }
+
     Ok(ValidatedTableProperties {
         properties,
         reader_features,
@@ -1005,7 +1015,7 @@ mod tests {
     use crate::table_features::FeatureType;
     use crate::table_properties::{
         COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
-        PARQUET_FORMAT_VERSION,
+        PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
@@ -1099,17 +1109,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parquet_format_version_accepted() {
-        let properties =
-            HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
+    #[rstest::rstest]
+    #[case::parquet_format_version(PARQUET_FORMAT_VERSION, "2.12.0")]
+    #[case::parquet_compression_codec(PARQUET_COMPRESSION_CODEC, "snappy")]
+    fn test_parquet_writer_properties_accepted(#[case] key: &str, #[case] value: &str) {
+        let properties = HashMap::from([(key.to_string(), value.to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
-        assert_eq!(
-            validated.properties.get(PARQUET_FORMAT_VERSION),
-            Some(&"2.12.0".to_string()),
-        );
+        assert_eq!(validated.properties.get(key), Some(&value.to_string()),);
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::gzip("gzip")]
+    #[case::lz4_raw("lz4_raw")]
+    #[case::none("none")]
+    fn test_parquet_compression_codec_recognized_accepted(#[case] codec: &str) {
+        let properties =
+            HashMap::from([(PARQUET_COMPRESSION_CODEC.to_string(), codec.to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(PARQUET_COMPRESSION_CODEC),
+            Some(&codec.to_string())
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::brotli("brotli")]
+    #[case::bogus("not_a_codec")]
+    fn test_parquet_compression_codec_unrecognized_rejected(#[case] codec: &str) {
+        let properties =
+            HashMap::from([(PARQUET_COMPRESSION_CODEC.to_string(), codec.to_string())]);
+        let err = validate_extract_table_features_and_properties(properties)
+            .err()
+            .expect("unrecognized codec should be rejected");
+        assert!(
+            err.to_string().contains(codec),
+            "error should name the rejected codec, got: {err}"
+        );
     }
 
     #[rstest::rstest]

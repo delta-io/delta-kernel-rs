@@ -119,7 +119,11 @@ fn write_via_default_engine(record_batch: RecordBatch) -> std::path::PathBuf {
     let location = Url::from_file_path(&file_path).unwrap();
 
     let store = Arc::new(LocalFileSystem::new());
-    let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let handler = DefaultParquetHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+        Default::default(),
+    );
     let data: delta_kernel::DeltaResultIteratorStatic<Box<dyn EngineData>> =
         Box::new(std::iter::once(Ok(
             Box::new(ArrowEngineData::new(record_batch)) as Box<dyn EngineData>,
