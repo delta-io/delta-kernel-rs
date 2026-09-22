@@ -422,14 +422,14 @@ mod apply_schema_validation_tests {
         #[case] logical: DataType,
         #[case] physical: DataType,
     ) {
-        let physical: ArrowDataType = physical.try_into_arrow().unwrap();
+        let physical: ArrowDataType = (&physical).try_into_arrow().unwrap();
         let input = crate::arrow::array::new_empty_array(&physical);
         let udt = crate::schema::UserDefinedType {
             sql_type: Box::new(logical.clone()),
             annotation: Default::default(),
         };
         let output = apply_schema_to(&input, &DataType::from(udt)).unwrap();
-        let expected: ArrowDataType = logical.try_into_arrow().unwrap();
+        let expected: ArrowDataType = (&logical).try_into_arrow().unwrap();
         assert_eq!(output.data_type(), &expected);
     }
 
