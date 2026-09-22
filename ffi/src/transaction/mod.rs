@@ -2384,13 +2384,14 @@ mod tests {
             )
         });
 
-        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        let result = unsafe { commit(txn.shallow_copy(), engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
             Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
         );
 
+        unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -2427,13 +2428,14 @@ mod tests {
             )
         });
 
-        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        let result = unsafe { commit(txn.shallow_copy(), engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
             Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
         );
 
+        unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -2478,13 +2480,14 @@ mod tests {
             )
         });
 
-        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        let result = unsafe { commit(txn.shallow_copy(), engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
             KernelError::UnsupportedError,
             Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
         );
 
+        unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
