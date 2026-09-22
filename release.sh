@@ -2,8 +2,13 @@
 
 ###################################################################################################
 # USAGE:
-# 1. on a release branch: ./release.sh <version> (example: ./release.sh 0.1.0)
-# 2. on main branch (after merging release branch): ./release.sh
+# 1. on a release branch: ./release.sh release <version> (example: ./release.sh release 0.1.0)
+# 2. on main branch (after merging release branch): ./release.sh release
+# 3. refresh a release PR after merging/rebasing main: ./release.sh changelog <version>
+# 4. verify that a release changelog covers every merged PR: ./release.sh verify-changelog [version]
+#
+# Set DELTA_KERNEL_RELEASE_REGISTRY when cargo-release must use an alternate registry:
+#   DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh release 0.29.0
 ###################################################################################################
 
 # This is a script to automate a large portion of the release process for the crates we publish to
@@ -12,6 +17,8 @@
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # print commands before executing them for debugging
 # set -x
@@ -37,6 +44,20 @@ check_requirements() {
     command -v jq >/dev/null 2>&1 || log_error "jq is required but not installed."
 
     log_success "All required tools are available"
+}
+
+check_changelog_requirements() {
+    command -v git >/dev/null 2>&1 || log_error "git is required but not installed"
+    command -v git-cliff >/dev/null 2>&1 || \
+        log_error "git-cliff is required but not installed. Install with: cargo install git-cliff"
+}
+
+check_changelog_verification_requirements() {
+    command -v cargo >/dev/null 2>&1 || log_error "cargo is required but not installed"
+    command -v git >/dev/null 2>&1 || log_error "git is required but not installed"
+    command -v git-cliff >/dev/null 2>&1 || \
+        log_error "git-cliff is required but not installed. Install with: cargo install git-cliff"
+    command -v jq >/dev/null 2>&1 || log_error "jq is required but not installed"
 }
 
 is_main_branch() {
@@ -69,8 +90,173 @@ is_version_published() {
 # get current version from Cargo.toml
 get_current_version() {
     local crate_name="$1"
-    cargo metadata --no-deps --format-version 1 | \
+    cargo metadata --locked --no-deps --format-version 1 | \
         jq -r --arg name "$crate_name" '.packages[] | select(.name == $name) | .version'
+}
+
+# Run cargo-release with an optional registry selection.
+run_cargo_release() {
+    local version="$1"
+    local args=(
+        release --workspace "$version" --no-publish --no-push --no-tag --execute
+    )
+
+    if [[ -n "${DELTA_KERNEL_RELEASE_REGISTRY:-}" ]]; then
+        args+=(--registry "$DELTA_KERNEL_RELEASE_REGISTRY")
+    fi
+
+    cargo "${args[@]}"
+}
+
+kernel_cliff() {
+    git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" --use-branch-tags "$@"
+}
+
+# Ask git-cliff for the latest Kernel release so changelog generation and verification use the
+# same tag grammar from cliff.toml.
+latest_kernel_release_tag() {
+    kernel_cliff --latest --context | jq -r '.[0].version // empty'
+}
+
+release_changelog_heading() {
+    local version="$1"
+    printf '## [v%s]' "$version"
+}
+
+# Extract or remove a release section using the same section-boundary rules.
+filter_release_changelog_section() {
+    local mode="$1"
+    local version="$2"
+    local heading
+    heading=$(release_changelog_heading "$version")
+
+    awk -v heading="$heading" -v mode="$mode" '
+        index($0, heading) == 1 {
+            in_release = 1
+            if (mode == "extract") { print }
+            next
+        }
+        in_release && /^## \[v/ {
+            in_release = 0
+            if (mode == "extract") { exit }
+        }
+        mode == "extract" && in_release { print }
+        mode == "strip" && !in_release { print }
+    ' "$REPO_ROOT/CHANGELOG.md"
+}
+
+release_changelog_section() {
+    filter_release_changelog_section extract "$1"
+}
+
+# Render the pending changelog from git-cliff's context so the template remains the source of truth
+# for commit filtering and PR references.
+render_release_changelog() {
+    local version="$1"
+    kernel_cliff --unreleased --include-path "*" --tag "$version" --context | \
+        git cliff --config "$REPO_ROOT/cliff.toml" --from-context -
+}
+
+changelog_pr_reference_ids() {
+    awk 'match($0, /^\[#[0-9]+\]:/) { print substr($0, 3, RLENGTH - 4) }'
+}
+
+changelog_pr_bullet_ids() {
+    awk '
+        {
+            line = $0
+            while (match(line, /\(\[#[0-9]+\]\)/)) {
+                print substr(line, RSTART + 3, RLENGTH - 5)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    '
+}
+
+# Verify that the current release section contains every PR git-cliff would render after the
+# previous Kernel release. This check runs against GitHub's merge ref, so it becomes stale whenever
+# main moves.
+verify_release_changelog() {
+    local version="${1:-}"
+    local previous_tag section rendered expected_prs section_references section_bullets pr
+    local missing=0
+
+    if [[ -z "$version" ]]; then
+        version=$(get_current_version "delta_kernel")
+    fi
+
+    if ! previous_tag=$(latest_kernel_release_tag); then
+        log_warning "Could not resolve the latest Kernel release tag"
+        return 1
+    fi
+    if [[ -z "$previous_tag" ]]; then
+        log_warning "No prior Kernel release tag found"
+        return 1
+    fi
+    if [[ "$previous_tag" == "v$version" ]]; then
+        log_info "Workspace version $version is already tagged; no release changelog to verify"
+        return 0
+    fi
+
+    section=$(release_changelog_section "$version")
+    if [[ -z "$section" ]]; then
+        log_warning "CHANGELOG.md has no section for v$version"
+        return 1
+    fi
+
+    if ! rendered=$(render_release_changelog "$version"); then
+        log_warning "Could not render the expected changelog for v$version"
+        return 1
+    fi
+    expected_prs=$(changelog_pr_reference_ids <<< "$rendered")
+    section_references=$(changelog_pr_reference_ids <<< "$section")
+    section_bullets=$(changelog_pr_bullet_ids <<< "$section")
+
+    while IFS= read -r pr; do
+        [[ -z "$pr" ]] && continue
+        if ! grep -Fqx "$pr" <<< "$section_references"; then
+            log_warning "CHANGELOG.md v$version is missing the link reference for PR #$pr"
+            missing=1
+        fi
+        if ! grep -Fqx "$pr" <<< "$section_bullets"; then
+            log_warning "CHANGELOG.md v$version is missing the changelog entry for PR #$pr"
+            missing=1
+        fi
+    done <<< "$expected_prs"
+
+    if (( missing != 0 )); then
+        log_warning "Update from main, then run: ./release.sh changelog $version"
+        return 1
+    fi
+
+    log_success "CHANGELOG.md v$version covers every merged PR since $previous_tag"
+}
+
+# Remove the changelog section for the version specified as the first argument.
+strip_release_changelog_section() {
+    local output="$2"
+    filter_release_changelog_section strip "$1" > "$output"
+}
+
+# Replace, rather than append, the pending release section so this command is safe to rerun after
+# the release branch is updated from main.
+refresh_release_changelog() {
+    local version="$1"
+    local changelog="$REPO_ROOT/CHANGELOG.md"
+    local backup stripped
+
+    backup=$(mktemp "${TMPDIR:-/tmp}/delta-kernel-changelog-backup.XXXXXX")
+    stripped=$(mktemp "${TMPDIR:-/tmp}/delta-kernel-changelog-stripped.XXXXXX")
+    cp "$changelog" "$backup"
+    strip_release_changelog_section "$version" "$stripped"
+    mv "$stripped" "$changelog"
+
+    if ! kernel_cliff --unreleased --prepend "$changelog" --include-path "*" --tag "$version"; then
+        cp "$backup" "$changelog"
+        log_error "Failed to refresh CHANGELOG.md; original saved at $backup"
+    fi
+
+    log_success "Refreshed CHANGELOG.md for v$version; backup retained at $backup"
 }
 
 # Prompt user for confirmation
@@ -92,8 +278,12 @@ handle_release_branch() {
 
     # Update CHANGELOG and README
     log_info "Updating CHANGELOG.md and README.md..."
-    if ! cargo release --workspace "$version" --no-publish --no-push --no-tag --execute; then
+    if ! run_cargo_release "$version"; then
         log_error "Failed to update CHANGELOG and README"
+    fi
+
+    if ! verify_release_changelog "$version"; then
+        log_error "Generated changelog is incomplete"
     fi
 
     if confirm "Print diff of CHANGELOG/README changes?"; then
@@ -172,17 +362,60 @@ validate_version() {
     fi
 }
 
-check_requirements
+usage() {
+    printf '%s\n' \
+        "Usage:" \
+        "  $0 release [version]" \
+        "  $0 changelog <version>" \
+        "  $0 verify-changelog [version]"
+}
 
-if is_main_branch; then
-    if [[ $# -ne 0 ]]; then
-        log_error "Version argument not expected on main branch\nUsage: $0"
-    fi
-    handle_main_branch
-else
-    if [[ $# -ne 1 ]]; then
-        log_error "Version argument required when on release branch\nUsage: $0 <version>"
-    fi
-    validate_version "$1"
-    handle_release_branch "$1"
+main() {
+    case "${1:-}" in
+        changelog)
+            if [[ $# -ne 2 ]]; then
+                log_error "Usage: $0 changelog <version>"
+            fi
+            check_changelog_requirements
+            validate_version "$2"
+            refresh_release_changelog "$2"
+            ;;
+        verify-changelog)
+            if [[ $# -gt 2 ]]; then
+                log_error "Usage: $0 verify-changelog [version]"
+            fi
+            check_changelog_verification_requirements
+            if ! verify_release_changelog "${2:-}"; then
+                log_error "Release changelog is incomplete"
+            fi
+            ;;
+        release)
+            check_requirements
+            if is_main_branch; then
+                if [[ $# -ne 1 ]]; then
+                    usage >&2
+                    log_error "Version argument not expected on main branch"
+                fi
+                handle_main_branch
+            else
+                if [[ $# -ne 2 ]]; then
+                    usage >&2
+                    log_error "Version argument required when on release branch"
+                fi
+                validate_version "$2"
+                handle_release_branch "$2"
+            fi
+            ;;
+        "" | help | -h | --help)
+            usage
+            ;;
+        *)
+            usage >&2
+            log_error "Unknown command: $1"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

@@ -1,5 +1,5 @@
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{quote, quote_spanned};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -551,23 +551,30 @@ pub fn internal_api(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     let input = parse_macro_input!(item as Item);
+    internal_api_impl(input).into()
+}
 
+fn internal_api_impl(input: Item) -> TokenStream {
     // Create a version with public visibility for the unstable feature
-    let public_version = make_public(input.clone());
+    let public_version = match make_public(input.clone()) {
+        Ok(public_version) => public_version,
+        Err(err) => {
+            let error = err.to_compile_error();
+            return quote! { #input #error };
+        }
+    };
 
     // The original item stays as-is for the non-unstable case
-    let output = quote! {
+    quote! {
         #[cfg(feature = "internal-api")]
         #public_version
 
         #[cfg(not(feature = "internal-api"))]
         #input
-    };
-
-    output.into()
+    }
 }
 
-fn make_public(mut item: Item) -> Item {
+fn make_public(mut item: Item) -> Result<Item, Error> {
     /// Transforms the passed visibility to be `pub`. We pass the original span that the visibility
     /// came from, and attach it to the newly created pub token. This means that the compiler treats
     /// it as user-written code and normal lints apply. We want this because it allows us to catch
@@ -591,7 +598,7 @@ fn make_public(mut item: Item) -> Item {
         }};
     }
 
-    let result = match &mut item {
+    match &mut item {
         Item::Fn(f) => set_vis!(f),
         Item::Struct(s) => set_vis!(s),
         Item::Enum(e) => set_vis!(e),
@@ -606,23 +613,29 @@ fn make_public(mut item: Item) -> Item {
             item.span(),
             format!("unsupported item type for #[internal_api]: {item:?}"),
         )),
-    };
-
-    if let Err(err) = result {
-        let error = err.to_compile_error();
-        let mut tokens = item.to_token_stream();
-        tokens.extend(error);
-        return syn::parse_quote!(#tokens);
-    }
-
-    item
+    }?;
+    Ok(item)
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use syn::parse_quote;
 
     use super::*;
+
+    #[test]
+    fn internal_api_rejects_public_items_without_panicking() {
+        let input = parse_quote!(
+            pub fn already_public() {}
+        );
+
+        let output = internal_api_impl(input).to_string();
+
+        assert!(output.contains("pub fn already_public"));
+        assert!(output.contains("compile_error"));
+        assert!(output.contains("item is already public"));
+    }
 
     /// Expand `gen_schema_fields` for `input` and return the generated tokens as a string. Macro
     /// errors are embedded as `compile_error!` tokens in that string; `Err` only signals that the
