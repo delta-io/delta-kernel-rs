@@ -1332,7 +1332,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "chrono-tz",
  "crc",
  "criterion",
  "delta_kernel",
@@ -1342,6 +1341,7 @@ dependencies = [
  "hdfs-native-object-store",
  "indexmap",
  "itertools 0.14.0",
+ "jiff",
  "object_store 0.13.2",
  "parquet 58.1.0",
  "parquet 59.0.0",
@@ -2434,6 +2434,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a3546dc96b6d42c5f24902af9e2538e82e39ad350b0c766eb3fbf2d8f3d8359"
 dependencies = [
  "jiff-static",
+ "jiff-tzdb",
  "log",
  "portable-atomic",
  "portable-atomic-util",
@@ -2450,6 +2451,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c900ef84826f1338a557697dc8fc601df9ca9af4ac137c7fb61d4c6f2dfd3076"
 
 [[package]]
 name = "jni"

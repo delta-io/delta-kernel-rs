@@ -7,7 +7,6 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
-use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -43,6 +42,7 @@ use crate::expressions::{
     OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
+use crate::partition_values::TimestampTimezone;
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
 #[internal_api]
@@ -937,12 +937,12 @@ fn coalesce_arrays(
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
-/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
+/// `timestamp_timezone` applies only to `TIMESTAMP` values without an explicit offset; it does not
+/// affect `DATE` or `TIMESTAMP_NTZ`.
 fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
-    timestamp_timezone: TimestampTimezone,
+    timestamp_timezone: &TimestampTimezone,
 ) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
@@ -975,7 +975,7 @@ fn parse_partition_scalar(
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
+/// `timestamp_timezone` controls `TIMESTAMP` values without an explicit offset.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -1064,7 +1064,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
+                match parse_partition_scalar(target_types[i], raw, &timestamp_timezone)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -2878,6 +2878,11 @@ mod tests {
         "2024-06-15 08:00:00.500500",
         "2024-06-15T15:00:00.500500Z"
     )]
+    #[case::iana_future(
+        Some("America/New_York"),
+        "2100-07-15 12:30:45",
+        "2100-07-15T16:30:45Z"
+    )]
     #[case::fixed_minute_offset(
         Some("+05:30"),
         "2024-01-15 12:30:45.123456",
@@ -2895,28 +2900,18 @@ mod tests {
     )]
     #[case::explicit_input_offset(
         Some("America/Los_Angeles"),
-        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
     #[case::explicit_input_offset_over_fixed_reader(
         Some("+05:30"),
-        "2024-01-15 12:30:45+02:00",
+        "2024-01-15T12:30:45+02:00",
         "2024-01-15T10:30:45Z"
     )]
     #[case::normalized_utc(
         Some("America/Los_Angeles"),
         "2024-01-15T12:30:45.123456Z",
         "2024-01-15T12:30:45.123456Z"
-    )]
-    #[case::embedded_iana_timezone(
-        Some("Europe/Berlin"),
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
-    )]
-    #[case::embedded_iana_timezone_with_default_options(
-        None,
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
     )]
     #[case::dst_overlap(
         Some("America/Los_Angeles"),
