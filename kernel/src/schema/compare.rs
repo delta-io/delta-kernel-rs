@@ -268,6 +268,45 @@ mod tests {
 
         assert!(schema.can_read_as(&schema).is_ok());
     }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::to_udt(false, true)]
+    #[case::from_udt(true, false)]
+    #[case::inside_udt(true, true)]
+    fn udt_type_widening_is_rejected(
+        #[case] source_udt: bool,
+        #[case] target_udt: bool,
+        #[values("primitive", "struct", "array", "map")] physical_layout: &str,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
+        let wrap = |value, is_udt| {
+            let sql_type = match physical_layout {
+                "primitive" => value,
+                "struct" => schema! { nullable "inner": (value) }.into(),
+                "array" => ArrayType::new(value, true).into(),
+                "map" => MapType::new(DataType::STRING, value, true).into(),
+                _ => unreachable!(),
+            };
+            if is_udt {
+                crate::schema::UserDefinedType {
+                    sql_type: Box::new(sql_type),
+                    annotation: Default::default(),
+                }
+                .into()
+            } else {
+                sql_type
+            }
+        };
+        assert!(matches!(
+            mode.can_read_as(
+                &wrap(DataType::INTEGER, source_udt),
+                &wrap(DataType::LONG, target_udt)
+            ),
+            Err(Error::TypeMismatch)
+        ));
+    }
     #[rstest]
     fn add_nullable_column_to_map_key_and_value(
         #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
