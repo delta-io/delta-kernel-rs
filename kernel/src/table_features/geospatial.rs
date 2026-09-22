@@ -25,7 +25,6 @@ impl<'a> SchemaTransform<'a> for UsesGeo {
         }
     }
 
-    #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(
         &mut self,
         udt: &'a crate::schema::UserDefinedType,

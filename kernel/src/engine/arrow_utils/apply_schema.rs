@@ -366,7 +366,6 @@ fn apply_schema_to_inner(
 ) -> KernelResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
-        #[cfg(feature = "udt-in-dev")]
         UserDefined(udt) => {
             // Check physical type compatibility before rebuilding with logical nullability.
             ensure_data_types(udt.sql_type(), array.data_type(), ValidationMode::TypesOnly)?;
@@ -399,7 +398,6 @@ mod apply_schema_validation_tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
-    #[cfg(feature = "udt-in-dev")]
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
@@ -413,7 +411,6 @@ mod apply_schema_validation_tests {
 
     /// Verifies that applying a UDT schema restores logical child nullability without changing
     /// its physical container shape.
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::struct_type(
         DataType::from(schema! { nullable "x": LONG }),
@@ -442,7 +439,6 @@ mod apply_schema_validation_tests {
 
     /// Verifies that a struct-backed UDT rejects physical structs with a different arity before
     /// rebuilding child fields.
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     fn apply_schema_rejects_udt_struct_field_count_mismatch(#[values(1, 3)] count: usize) {
         let sql_type = DataType::from(schema! { nullable "x": LONG, nullable "y": LONG });

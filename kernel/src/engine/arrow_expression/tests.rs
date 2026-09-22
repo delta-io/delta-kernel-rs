@@ -70,7 +70,6 @@ fn test_array_column() {
 
 /// Verifies that null UDT scalars materialize as their physical Arrow type and remain compatible
 /// with the logical UDT.
-#[cfg(feature = "udt-in-dev")]
 #[rstest]
 #[case(KernelDataType::LONG)]
 #[case(KernelDataType::from(schema! { nullable "x": LONG }))]

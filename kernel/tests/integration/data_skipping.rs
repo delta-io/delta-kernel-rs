@@ -12,7 +12,6 @@
 //!   checkpoint parquet row-group filter)
 
 use std::collections::HashMap;
-#[cfg(feature = "udt-in-dev")]
 mod user_defined;
 
 use std::sync::Arc;
