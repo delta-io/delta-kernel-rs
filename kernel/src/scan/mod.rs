@@ -116,7 +116,7 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables stats-based file skipping. Kernel reads no stats
-///   columns from checkpoints. Data-file Parquet predicate pushdown is unaffected.
+///   columns from checkpoints.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
     /// Whether to surface JSON stats on parsed-stats checkpoints (where the
@@ -1441,7 +1441,8 @@ impl Scan {
 
                 // Only flag an empty iterator as a connector bug when stats are present and report
                 // a positive row count. When stats are absent we cannot distinguish a legitimate
-                // 0-row file from a buggy connector. A predicate may also prune every row group.
+                // 0-row file from a buggy connector, so we conservatively allow it. A predicate may
+                // also prune every row group.
                 let expect_data = !has_predicate
                     && scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {

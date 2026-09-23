@@ -78,8 +78,8 @@ impl DeletionVectorFilter {
         })
     }
 
-    /// Filter a physical batch and restore its original schema, retaining original row indexes
-    /// if they were already part of that schema. Invalid or missing indexes are errors.
+    /// Filter a physical batch and restore its original schema. Invalid or missing indexes are
+    /// errors.
     pub(super) fn apply(&self, data: Box<dyn EngineData>) -> DeltaResult<Box<dyn EngineData>> {
         let mut visitor = DeletionVectorVisitor {
             deleted: &self.deleted,
