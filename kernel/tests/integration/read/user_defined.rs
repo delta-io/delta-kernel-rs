@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{Array, RecordBatch, StructArray};
 use delta_kernel::arrow::compute::concat_batches;
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::schema::{schema_ref, ArrayType, DataType, MapType, UserDefinedType};
+use delta_kernel::table_features::{assign_column_mapping_metadata, ColumnMappingMode};
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use serde_json::json;
@@ -45,6 +49,12 @@ async fn read_udt_as_sql_type_preserves_logical_schema(
     #[case] sql_type: DataType,
     #[case] rows: &str,
     #[values(false, true)] project: bool,
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    mapping_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let udt = UserDefinedType {
         sql_type: Box::new(sql_type),
@@ -57,20 +67,69 @@ async fn read_udt_as_sql_type_preserves_logical_schema(
         nullable "id": LONG,
         nullable "value": (udt),
     };
+    let schema = if mapping_mode == ColumnMappingMode::None {
+        schema
+    } else {
+        Arc::new(assign_column_mapping_metadata(&schema, &mut 0, false)?)
+    };
     let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
     let batch = ReaderBuilder::new(Arc::new(arrow_schema))
         .build(Cursor::new(rows))?
         .next()
         .unwrap()?;
-    let bytes = record_batch_to_bytes(&batch);
+    let physical_schema: ArrowSchema = (&schema.make_physical(mapping_mode)?).try_into_arrow()?;
+    let mut physical_fields = physical_schema.fields().to_vec();
+    let mut physical_columns = batch.columns().to_vec();
+    if let Some(vector) = physical_columns[1].as_any().downcast_ref::<StructArray>() {
+        // Reordering makes the read distinguish sqlType-name matching from positional matching.
+        let fields = vector.fields().iter().rev().cloned().collect::<Vec<_>>();
+        let columns = vector.columns().iter().rev().cloned().collect();
+        let reordered =
+            StructArray::try_new(fields.clone().into(), columns, vector.nulls().cloned())?;
+        physical_fields[1] = Arc::new(
+            physical_fields[1]
+                .as_ref()
+                .clone()
+                .with_data_type(ArrowDataType::Struct(fields.into())),
+        );
+        physical_columns[1] = Arc::new(reordered);
+    }
+    if mapping_mode == ColumnMappingMode::Id {
+        // Only field IDs link these Parquet names to the enclosing logical fields.
+        physical_fields = physical_fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                Arc::new(ArrowField::clone(field).with_name(format!("stored_{index}")))
+            })
+            .collect();
+    }
+    let physical_batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(physical_fields)),
+        physical_columns,
+    )?;
+    let bytes = record_batch_to_bytes(&physical_batch);
     let store = Arc::new(InMemory::new());
     let table_root = "memory:///";
+    let (protocol, configuration) = if mapping_mode == ColumnMappingMode::None {
+        (
+            json!({"minReaderVersion":1,"minWriterVersion":2}),
+            json!({}),
+        )
+    } else {
+        (
+            json!({"minReaderVersion":3,"minWriterVersion":7,
+                "readerFeatures":["columnMapping"], "writerFeatures":["columnMapping"]}),
+            json!({"delta.columnMapping.mode":mapping_mode,
+                "delta.columnMapping.maxColumnId":"2"}),
+        )
+    };
     let actions = [
-        json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+        json!({"protocol":protocol}),
         json!({"metaData":{
             "id":"udt-read", "format":{"provider":"parquet","options":{}},
             "schemaString":serde_json::to_string(&schema)?,
-            "partitionColumns":[], "configuration":{}, "createdTime":0,
+            "partitionColumns":[], "configuration":configuration, "createdTime":0,
         }}),
         json!({"add":{
             "path":"data.parquet", "size":bytes.len(), "partitionValues":{},
