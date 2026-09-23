@@ -6,7 +6,6 @@
 
 #![allow(unreachable_pub)]
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::committer::Committer;
@@ -14,7 +13,7 @@ use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{AlterTable, Transaction};
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, PhantomType};
 use crate::DeltaResult;
 
 /// A type alias for alter-table transactions.
@@ -80,7 +79,7 @@ impl AlterTableTransaction {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             root_manifest_file: None,
             physical_clustering_columns: None,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         })
     }
 }

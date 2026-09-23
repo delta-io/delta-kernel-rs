@@ -135,16 +135,14 @@ fn commit_result_to_committed_handle<S>(
     result: DeltaResult<CommitResult<S>>,
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
-        CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
-        CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
+        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
+        CommitResult::Retryable(_) => Err(delta_kernel::Error::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
-        CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            )))
-        }
+        CommitResult::Conflicted(conflicted) => Err(delta_kernel::Error::Generic(format!(
+            "commit conflict at version {}",
+            conflicted.conflict_version()
+        ))),
     }
 }
 

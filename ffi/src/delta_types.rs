@@ -13,16 +13,10 @@ use delta_kernel::crc::{
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::{DeltaResult, Error, Version};
 
-use crate::{FfiFileStats, KernelI64Slice, KernelStringSlice, OptionalValue};
+use crate::{FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue};
 
 /// Borrowed array of UTF-8 strings.
-#[repr(C)]
-pub struct FfiStringArray {
-    /// Pointer to `len` string slices, or null when `len` is zero.
-    pub ptr: *const KernelStringSlice,
-    /// Number of strings in the array.
-    pub len: usize,
-}
+pub type FfiStringArray = FfiSlice<KernelStringSlice>;
 
 /// One borrowed UTF-8 map entry.
 #[repr(C)]
@@ -34,13 +28,7 @@ pub struct FfiStringMapEntry {
 }
 
 /// Borrowed array of UTF-8 map entries.
-#[repr(C)]
-pub struct FfiStringMap {
-    /// Pointer to `len` entries, or null when `len` is zero.
-    pub ptr: *const FfiStringMapEntry,
-    /// Number of entries.
-    pub len: usize,
-}
+pub type FfiStringMap = FfiSlice<FfiStringMapEntry>;
 
 /// One borrowed UTF-8 map entry whose value may be null.
 #[repr(C)]
@@ -52,13 +40,7 @@ pub struct FfiNullableStringMapEntry {
 }
 
 /// Borrowed array of UTF-8 map entries whose values may be null.
-#[repr(C)]
-pub struct FfiNullableStringMap {
-    /// Pointer to `len` entries, or null when `len` is zero.
-    pub ptr: *const FfiNullableStringMapEntry,
-    /// Number of entries.
-    pub len: usize,
-}
+pub type FfiNullableStringMap = FfiSlice<FfiNullableStringMapEntry>;
 
 /// Borrowed Delta protocol state.
 #[repr(C)]
@@ -152,31 +134,13 @@ pub struct FfiFileSizeHistogram {
 }
 
 /// Borrowed array of Delta checkpoint sidecar actions.
-#[repr(C)]
-pub struct FfiSidecarArray {
-    /// Pointer to `len` actions, or null when `len` is zero.
-    pub ptr: *const FfiSidecar,
-    /// Number of actions.
-    pub len: usize,
-}
+pub type FfiSidecarArray = FfiSlice<FfiSidecar>;
 
 /// Borrowed array of Delta set-transaction actions.
-#[repr(C)]
-pub struct FfiSetTransactionArray {
-    /// Pointer to `len` actions, or null when `len` is zero.
-    pub ptr: *const FfiSetTransaction,
-    /// Number of actions.
-    pub len: usize,
-}
+pub type FfiSetTransactionArray = FfiSlice<FfiSetTransaction>;
 
 /// Borrowed array of Delta domain-metadata actions.
-#[repr(C)]
-pub struct FfiDomainMetadataArray {
-    /// Pointer to `len` actions, or null when `len` is zero.
-    pub ptr: *const FfiDomainMetadata,
-    /// Number of actions.
-    pub len: usize,
-}
+pub type FfiDomainMetadataArray = FfiSlice<FfiDomainMetadata>;
 
 /// One typed checkpoint non-file action.
 ///
@@ -196,13 +160,7 @@ pub enum FfiCheckpointNonFileAction {
 }
 
 /// Borrowed array of typed checkpoint non-file actions.
-#[repr(C)]
-pub struct FfiCheckpointNonFileActionArray {
-    /// Pointer to `len` actions, or null when `len` is zero.
-    pub ptr: *const FfiCheckpointNonFileAction,
-    /// Number of actions.
-    pub len: usize,
-}
+pub type FfiCheckpointNonFileActionArray = FfiSlice<FfiCheckpointNonFileAction>;
 
 /// Borrowed fields of the `v2Checkpoint` object in `_last_checkpoint`.
 #[repr(C)]
@@ -300,13 +258,7 @@ pub struct FfiAdd {
 }
 
 /// Borrowed array of Delta Add actions.
-#[repr(C)]
-pub struct FfiAddArray {
-    /// Pointer to `len` actions, or null when `len` is zero.
-    pub ptr: *const FfiAdd,
-    /// Number of actions.
-    pub len: usize,
-}
+pub type FfiAddArray = FfiSlice<FfiAdd>;
 
 /// File-statistics completeness.
 ///
@@ -414,27 +366,6 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::generic(message.into())
 }
 
-/// Borrows a native array after validating its nullable layout.
-///
-/// # Safety
-///
-/// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
-/// storage must remain valid for the lifetime of the returned slice.
-pub(crate) unsafe fn raw_slice<'a, O: ?Sized, T>(
-    _owner: &'a O,
-    ptr: *const T,
-    len: usize,
-    name: &str,
-) -> DeltaResult<&'a [T]> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if ptr.is_null() {
-        return Err(invalid(format!("{name} pointer is null with length {len}")));
-    }
-    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
 /// Borrows a required native payload, with its lifetime bounded by `owner`.
 ///
 /// # Safety
@@ -451,7 +382,7 @@ unsafe fn required_ref<'a, O: ?Sized, T>(
 
 impl FfiStringArray {
     pub(crate) unsafe fn try_to_strings(&self) -> DeltaResult<Vec<String>> {
-        unsafe { raw_slice(self, self.ptr, self.len, "string array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_string() })
             .collect()
@@ -460,7 +391,7 @@ impl FfiStringArray {
 
 impl FfiStringMap {
     pub(crate) unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, String>> {
-        let entries = unsafe { raw_slice(self, self.ptr, self.len, "string map") }?;
+        let entries = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(entries.len());
         for entry in entries {
             let key = unsafe { entry.key.try_to_string() }?;
@@ -475,7 +406,7 @@ impl FfiStringMap {
 
 impl FfiNullableStringMap {
     pub(crate) unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, Option<String>>> {
-        let entries = unsafe { raw_slice(self, self.ptr, self.len, "nullable string map") }?;
+        let entries = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(entries.len());
         for entry in entries {
             let key = unsafe { entry.key.try_to_string() }?;
@@ -582,20 +513,17 @@ impl FfiSidecar {
 
 impl FfiFileSizeHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<FileSizeHistogram> {
-        let (boundaries_ptr, boundaries_len) = self.sorted_bin_boundaries.as_raw_parts();
-        let (counts_ptr, counts_len) = self.file_counts.as_raw_parts();
-        let (bytes_ptr, bytes_len) = self.total_bytes.as_raw_parts();
         FileSizeHistogram::try_new(
-            unsafe { raw_slice(self, boundaries_ptr, boundaries_len, "integer array") }?.to_vec(),
-            unsafe { raw_slice(self, counts_ptr, counts_len, "integer array") }?.to_vec(),
-            unsafe { raw_slice(self, bytes_ptr, bytes_len, "integer array") }?.to_vec(),
+            unsafe { self.sorted_bin_boundaries.try_as_slice() }?.to_vec(),
+            unsafe { self.file_counts.try_as_slice() }?.to_vec(),
+            unsafe { self.total_bytes.try_as_slice() }?.to_vec(),
         )
     }
 }
 
 impl FfiSidecarArray {
     unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<Sidecar>> {
-        unsafe { raw_slice(self, self.ptr, self.len, "sidecar array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -626,7 +554,7 @@ impl FfiCheckpointNonFileAction {
 
 impl FfiCheckpointNonFileActionArray {
     unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<HintAction>> {
-        unsafe { raw_slice(self, self.ptr, self.len, "non-file action array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -741,7 +669,7 @@ impl FfiAdd {
 
 impl FfiAddArray {
     unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<Add>> {
-        unsafe { raw_slice(self, self.ptr, self.len, "Add action array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -770,7 +698,7 @@ impl FfiFileStatsState {
 
 impl FfiSetTransactionArray {
     unsafe fn try_to_vec(&self) -> DeltaResult<Vec<SetTransaction>> {
-        let values = unsafe { raw_slice(self, self.ptr, self.len, "set-transaction array") }?;
+        let values = unsafe { self.try_as_slice() }?;
         values
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
@@ -790,7 +718,7 @@ impl FfiSetTransactionState {
 
 impl FfiDomainMetadataArray {
     unsafe fn try_to_vec(&self) -> DeltaResult<Vec<DomainMetadata>> {
-        unsafe { raw_slice(self, self.ptr, self.len, "domain-metadata array") }?
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()
@@ -813,9 +741,8 @@ impl FfiDomainMetadataState {
 
 impl FfiDeletedRecordCountsHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DeletedRecordCountsHistogram> {
-        let (ptr, len) = self.deleted_record_counts.as_raw_parts();
         DeletedRecordCountsHistogram::try_new(
-            unsafe { raw_slice(self, ptr, len, "deleted-record-count histogram") }?.to_vec(),
+            unsafe { self.deleted_record_counts.try_as_slice() }?.to_vec(),
         )
     }
 }
