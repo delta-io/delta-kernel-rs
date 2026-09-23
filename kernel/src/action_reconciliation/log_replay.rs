@@ -137,7 +137,7 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: Option<DeltaResultIteratorStatic<ActionReconciliationBatch>>,
+    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
@@ -145,7 +145,7 @@ impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
     pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
-            inner: Some(inner),
+            inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
         }
     }
@@ -188,11 +188,7 @@ impl Iterator for ActionReconciliationIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut inner = self.inner.take()?;
-        let batch = inner.next();
-        if matches!(batch, Some(Ok(_))) {
-            self.inner = Some(inner);
-        }
+        let batch = self.inner.next();
         self.transform_batch(batch)
     }
 }

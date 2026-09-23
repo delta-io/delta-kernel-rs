@@ -325,7 +325,7 @@ async fn crc_validation_handles_empty_tables_and_rejects_malformed_crc() -> Delt
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn crc_validation_custom_checkpoint_cannot_finalize_after_error() -> DeltaResult<()> {
+async fn crc_validation_custom_checkpoint_stops_on_mismatch() -> DeltaResult<()> {
     let (dir, path, engine) = test_table_setup_mt()?;
     let snapshot = populated_snapshot(&path, &engine, CheckpointFormat::V1, false).await?;
     snapshot.write_checksum(engine.as_ref())?;
@@ -342,7 +342,6 @@ async fn crc_validation_custom_checkpoint_cannot_finalize_after_error() -> Delta
         iter.by_ref().try_for_each(|batch| batch.map(|_| ())),
         "numFiles",
     );
-    assert!(iter.next().is_none());
     assert!(!state.is_exhausted());
     drop(iter);
     let state = Arc::into_inner(state).unwrap();
