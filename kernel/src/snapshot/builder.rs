@@ -266,10 +266,10 @@ impl SnapshotBuilder<FromTableRoot> {
     /// The hint conflicts with [`with_log_tail`](Self::with_log_tail) and non-disabled incremental
     /// CRC replay. An explicit [`at_version`](Self::at_version) must equal the hint version. When
     /// no explicit version is set, a supplied maximum catalog version must also equal the hint
-    /// version. Kernel validates structural consistency without reading the supplied files. The
-    /// caller must ensure every path belongs to this builder's table root, the protocol and
-    /// metadata came from those files, and `max_published_version` accurately describes the
-    /// published commit prefix.
+    /// version. Kernel requires supplied log paths to be beneath this builder's table log root and
+    /// validates structural consistency without reading the supplied files. The caller must ensure
+    /// the protocol and metadata came from those files, and `max_published_version` accurately
+    /// describes the published commit prefix.
     ///
     /// # Errors
     ///
@@ -623,11 +623,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::LogCompaction.into()
         );
 
-        // Hinted locations are connector-resolved storage URLs. Kernel cannot determine root
-        // membership through lexical URL comparison because equivalent locations may use
-        // filesystem aliases or connector-specific URI forms. The connector must ensure that all
-        // hinted locations belong to this table. Kernel validates only path self-consistency and
-        // log-segment semantics.
+        Self::validate_snapshot_hint_paths(&log_segment_files, &log_root)?;
         let log_segment = LogSegment::try_new(
             log_segment_files,
             log_root,
@@ -684,6 +680,30 @@ impl<Mode> SnapshotBuilder<Mode> {
             false, /* skipped_new_checkpoints */
         )
         .map(Into::into)
+    }
+
+    /// Validates that hinted log locations are beneath the builder's log root.
+    fn validate_snapshot_hint_paths(
+        log_segment_files: &LogSegmentFiles,
+        log_root: &url::Url,
+    ) -> DeltaResult<()> {
+        let log_root = log_root.as_str();
+        if let Some(path) = log_segment_files
+            .ascending_commit_files
+            .iter()
+            .chain(&log_segment_files.ascending_compaction_files)
+            .chain(&log_segment_files.checkpoint_parts)
+            .chain(&log_segment_files.latest_crc_file)
+            .chain(&log_segment_files.latest_commit_file)
+            .find(|path| !path.location.location.as_str().starts_with(log_root))
+        {
+            return Err(SnapshotHintError::LogPathOutsideRoot {
+                path: path.location.location.to_string(),
+                log_root: log_root.to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     // ===== Catalog-managed Validations =====
@@ -909,6 +929,64 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::commit("memory:///target/_delta_log/00000000000000000001.json", true)]
+    #[case::checkpoint(
+        "memory:///target/_delta_log/00000000000000000001.checkpoint.parquet",
+        true
+    )]
+    #[case::crc("memory:///target/_delta_log/00000000000000000001.crc", true)]
+    #[case::staged_commit(
+        concat!(
+            "memory:///target/_delta_log/_staged_commits/",
+            "00000000000000000001.11111111-1111-1111-1111-111111111111.json"
+        ),
+        true
+    )]
+    #[case::different_table("memory:///other/_delta_log/00000000000000000001.json", false)]
+    #[case::different_scheme("s3a://target/_delta_log/00000000000000000001.json", false)]
+    #[case::root_prefix_collision(
+        "memory:///target/_delta_log_suffix/00000000000000000001.json",
+        false
+    )]
+    fn snapshot_hint_paths_must_be_beneath_the_builder_log_root(
+        #[case] supplied: &str,
+        #[case] expected_valid: bool,
+    ) {
+        let path = create_log_path(supplied);
+        let files = LogSegmentFiles {
+            ascending_commit_files: vec![path],
+            ..Default::default()
+        };
+
+        let result = SnapshotBuilder::<FromTableRoot>::validate_snapshot_hint_paths(
+            &files,
+            &url::Url::parse("memory:///target/_delta_log/").unwrap(),
+        );
+        assert_eq!(result.is_ok(), expected_valid);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_hint_build_rejects_a_log_path_outside_the_table_log_root(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, _snapshot, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        let path = hint
+            .log_segment_files
+            .ascending_commit_files
+            .first_mut()
+            .unwrap();
+        path.location.location =
+            url::Url::parse(&format!("memory:///other/_delta_log/{}", path.filename))?;
+
+        let result = SnapshotBuilder::new_for(&table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref());
+
+        assert_result_error_with_message(result, "is not beneath log root");
+        Ok(())
     }
 
     #[rstest::rstest]
