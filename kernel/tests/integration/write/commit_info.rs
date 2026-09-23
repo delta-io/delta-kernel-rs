@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::schema_ref;
+use delta_kernel::transaction::{TransactionOptions, UpdateTableOperation};
+use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
 use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
@@ -59,6 +62,46 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         assert_eq!(parsed_commit, expected_commit);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_builder_writes_operation_parameters_and_metrics(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+        let transaction = snapshot
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
+            .with_options(
+                TransactionOptions::new()
+                    .with_operation_parameters([("mode", "Append")])?
+                    .with_operation_metrics([("numFiles", "3")])?,
+            )
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+
+        transaction.commit(&engine)?.unwrap_committed();
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+        let parsed_commit: serde_json::Value = serde_json::from_slice(&commit.bytes().await?)?;
+
+        assert_eq!(
+            parsed_commit["commitInfo"]["operationParameters"],
+            json!({"mode": "Append"})
+        );
+        assert_eq!(
+            parsed_commit["commitInfo"]["operationMetrics"],
+            json!({"numFiles": "3"})
+        );
     }
     Ok(())
 }

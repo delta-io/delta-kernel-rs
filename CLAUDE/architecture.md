@@ -75,8 +75,8 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContextBuilder` ->
-`BoundWriteContext`) -> commit
+`Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> (`WriteState` ->
+`BoundWriteContextBuilder` -> `BoundWriteContext`) -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
 partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`
@@ -85,8 +85,9 @@ directory. The transaction registers the resulting files, enforces protocol comp
 commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
-1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Call `txn.write_state()` after configuring the transaction, then use
+1. Configure an `UpdateTableTransactionBuilder` from a snapshot and build it with a `Committer`
+   (e.g. `FileSystemCommitter`)
+2. Call `txn.write_state()`, then use
    `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
    Distributed writers can encode the state and decode it on each worker before binding partition
    values.
