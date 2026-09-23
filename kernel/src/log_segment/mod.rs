@@ -143,6 +143,8 @@ pub(crate) fn validate_catalog_managed_log_tail(
         );
     }
 
+    // TODO: This check only recognizes staged catalog commits. Supporting inline or other catalog
+    // commit representations requires including them here.
     let has_staged_commits = log_tail
         .iter()
         .any(|path| path.file_type == LogPathFileType::StagedCommit);

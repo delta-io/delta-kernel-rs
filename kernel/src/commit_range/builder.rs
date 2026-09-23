@@ -63,15 +63,16 @@ impl CommitRangeBuilder {
         self
     }
 
-    /// Set the catalog-ratified staged commits to use as the authoritative log tail. The entries
+    /// Set the catalog-ratified staged commits and maximum catalog-ratified version. The entries
     /// must be sorted in ascending, contiguous version order.
-    pub fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
+    pub fn with_log_tail(mut self, log_tail: Vec<LogPath>, max_catalog_version: Version) -> Self {
         self.log_tail = log_tail;
+        self.max_catalog_version = Some(max_catalog_version);
         self
     }
 
     /// Set the maximum version ratified by the catalog. Filesystem commits beyond this version are
-    /// ignored. Catalog-managed ranges that contain staged commits must set this value.
+    /// ignored.
     pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
         self.max_catalog_version = Some(max_catalog_version);
         self
@@ -278,7 +279,7 @@ mod tests {
     fn staged_commit(table_root: &Url, version: Version) -> LogPath {
         LogPath::staged_commit(
             table_root.clone(),
-            &format!("{version:020}.catalog-{version}.json"),
+            &format!("{version:020}.00000000-0000-4000-8000-{version:012}.json"),
             0,
             1,
         )
@@ -415,8 +416,7 @@ mod tests {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let range = CommitRange::builder_for(table_root.as_str(), 0)
-            .with_log_tail(vec![staged_commit(&table_root, 1)])
-            .with_max_catalog_version(1)
+            .with_log_tail(vec![staged_commit(&table_root, 1)], 1)
             .build(&engine)
             .unwrap();
 
@@ -440,8 +440,7 @@ mod tests {
         let engine = DelegatingEngine::new(Arc::new(engine))
             .with_storage_handler(Arc::new(NoIoStorageHandler));
         let range = CommitRange::builder_from(snapshot, 0)
-            .with_log_tail(vec![staged_commit(&table_root, 1)])
-            .with_max_catalog_version(1)
+            .with_log_tail(vec![staged_commit(&table_root, 1)], 1)
             .build(&engine)
             .unwrap();
 
@@ -466,11 +465,10 @@ mod tests {
             .build(&engine)
             .unwrap();
         let range = CommitRange::builder_from(snapshot, 0)
-            .with_log_tail(vec![
-                staged_commit(&table_root, 1),
-                staged_commit(&table_root, 2),
-            ])
-            .with_max_catalog_version(2)
+            .with_log_tail(
+                vec![staged_commit(&table_root, 1), staged_commit(&table_root, 2)],
+                2,
+            )
             .fold_with(end_version, CommitRangeBuilder::with_end_version)
             .build(&engine)
             .unwrap();
@@ -505,8 +503,7 @@ mod tests {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let result = CommitRange::builder_for(table_root.as_str(), 0)
-            .with_log_tail(vec![staged_commit(&table_root, 1)])
-            .with_max_catalog_version(max_catalog_version)
+            .with_log_tail(vec![staged_commit(&table_root, 1)], max_catalog_version)
             .fold_with(end_version, CommitRangeBuilder::with_end_version)
             .build(&engine);
 
@@ -537,27 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_log_tail_requires_max_catalog_version() {
-        let table_root = dv_small_table_root();
-        let engine = SyncEngine::new();
-        let err = CommitRange::builder_for(table_root.as_str(), 0)
-            .with_log_tail(vec![staged_commit(&table_root, 1)])
-            .build(&engine)
-            .unwrap_err();
-
-        assert!(matches!(err, Error::MaxCatalogVersion(_)));
-    }
-
-    #[test]
     fn test_catalog_log_tail_must_be_contiguous() {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let err = CommitRange::builder_for(table_root.as_str(), 0)
-            .with_log_tail(vec![
-                staged_commit(&table_root, 0),
-                staged_commit(&table_root, 2),
-            ])
-            .with_max_catalog_version(2)
+            .with_log_tail(
+                vec![staged_commit(&table_root, 0), staged_commit(&table_root, 2)],
+                2,
+            )
             .build(&engine)
             .unwrap_err();
 
@@ -577,8 +561,7 @@ mod tests {
         ))
         .unwrap();
         let err = CommitRange::builder_for(table_root.as_str(), 0)
-            .with_log_tail(vec![published])
-            .with_max_catalog_version(1)
+            .with_log_tail(vec![published], 1)
             .build(&engine)
             .unwrap_err();
 

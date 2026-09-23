@@ -33,7 +33,7 @@ const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 #[internal_api]
 pub(crate) enum LogPathFileType {
     Commit,
-    /// Staged commits use catalog-generated identifiers in `_delta_log/_staged_commits`.
+    /// Staged commits are commits with UUID filenames, stored in _delta_log/_staged_commits dir.
     StagedCommit,
     /// A classic-named checkpoint, `<version>.checkpoint.parquet`. The name is the file-naming
     /// scheme, not the spec version: this file may hold a V1 checkpoint with its actions inline,
@@ -121,7 +121,7 @@ impl CheckpointInstance {
 ///
 /// Every parsed log path has a version. And additionally, we implement a 'should_list' method
 /// which controls whether or not we include this file in our listing. For example, when we list
-/// the _delta_log we may see _staged_commits/00000000000000000000.{id}.json, but we MUST NOT
+/// the _delta_log we may see _staged_commits/00000000000000000000.{uuid}.json, but we MUST NOT
 /// include those in listing, as only the catalog can tell us which are valid commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -259,9 +259,12 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // Parse the file type, based on the number of remaining parts
         let file_type = match split.as_slice() {
             ["json"] if in_delta_log_dir => LogPathFileType::Commit,
-            [commit_id, "json"] if in_staged_commits_dir && !commit_id.is_empty() => {
-                // Catalogs may choose any non-empty, dot-free commit identifier.
-                LogPathFileType::StagedCommit
+            [uuid, "json"] if in_staged_commits_dir => {
+                // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
+                match parse_path_part::<String>(uuid, UUID_PART_LEN) {
+                    Some(_uuid) => LogPathFileType::StagedCommit,
+                    None => LogPathFileType::Unknown,
+                }
             }
             ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
             ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::ClassicCheckpoint,
@@ -1124,21 +1127,14 @@ pub(crate) mod tests {
         assert!(!log_path.is_checkpoint());
         assert!(!log_path.is_unknown());
 
-        // Catalog-defined commit identifiers do not need to be UUIDs.
+        // invalid uuid
         let log_path = table_log_dir
             .join("_staged_commits/00000000000000000010.not-a-uuid.json")
             .unwrap();
         let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
-        assert!(matches!(log_path.file_type, LogPathFileType::StagedCommit));
-        assert!(log_path.is_commit());
-        assert!(!log_path.is_checkpoint());
-
-        // The commit identifier must be non-empty.
-        let log_path = table_log_dir
-            .join("_staged_commits/00000000000000000010..json")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
         assert!(log_path.is_unknown());
+        assert!(!log_path.is_commit());
+        assert!(!log_path.is_checkpoint());
 
         // outside _staged_commits directory
         let log_path = table_log_dir
