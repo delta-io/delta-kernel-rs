@@ -28,6 +28,7 @@ const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 /// it, transport it to another process, decode it, and bind partition values there without
 /// transporting the transaction itself.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteState {
     pub(super) table_root: Url,
     /// Complete logical table schema, including partition columns.
@@ -305,6 +306,14 @@ impl WriteState {
             logical_row_id_col_name: None,
             logical_row_commit_version_col_name: None,
         }
+    }
+
+    /// Returns the physical column names for which writers should collect statistics.
+    ///
+    /// The list includes columns selected by the table's data-skipping configuration and any
+    /// clustering columns.
+    pub fn stats_columns(&self) -> &[ColumnName] {
+        &self.stats_columns
     }
 
     /// Encodes this write state as opaque, versioned JSON bytes for transport.
@@ -770,5 +779,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported write state format version 2; expected 1"));
+    }
+
+    #[test]
+    fn write_state_decode_rejects_unknown_fields() {
+        let state = partitioned_write_state(
+            ColumnMappingMode::None,
+            false, /* materialize_partition_columns */
+            false, /* randomize_file_prefixes */
+            2,     /* random_prefix_length */
+            false, /* row_tracking_enabled */
+        );
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        encoded["write_state"]["unknown_field"] = true.into();
+
+        let error = WriteState::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("unknown field `unknown_field`"));
     }
 }

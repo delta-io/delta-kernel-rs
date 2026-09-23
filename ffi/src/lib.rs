@@ -304,12 +304,34 @@ impl KernelBytesSlice {
     ///
     /// # Safety
     /// Caller must guarantee that the source will outlive the created KernelBytesSlice.
-    #[cfg(feature = "declarative-plans")]
     pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
         Self {
             ptr: source.as_ptr(),
             len: source.len(),
         }
+    }
+
+    /// Returns the borrowed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `ptr` is null and `len` is not zero.
+    ///
+    /// # Safety
+    ///
+    /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
+    /// returned slice's lifetime.
+    pub(crate) unsafe fn try_as_slice(&self) -> DeltaResult<&[u8]> {
+        if self.len == 0 {
+            return Ok(&[]);
+        }
+        if self.ptr.is_null() {
+            return Err(delta_kernel::Error::generic(format!(
+                "byte pointer is null with length {}",
+                self.len
+            )));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
     }
 }
 
@@ -378,7 +400,6 @@ pub(crate) use kernel_string_slice;
 ///
 /// Refer to [`kernel_string_slice!`](kernel_string_slice) for safety and implementation
 /// notes.
-#[cfg(feature = "declarative-plans")]
 macro_rules! kernel_bytes_slice {
     ( $source:ident ) => {{
         fn do_it(b: &[u8]) -> $crate::KernelBytesSlice {
@@ -387,7 +408,6 @@ macro_rules! kernel_bytes_slice {
         do_it(&$source)
     }};
 }
-#[cfg(feature = "declarative-plans")]
 pub(crate) use kernel_bytes_slice;
 
 trait TryFromStringSlice<'a>: Sized {
@@ -424,6 +444,15 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
 /// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
 /// function is that `kernel_str` is _only_ valid until the return from this function
 pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
+
+/// Lets an engine copy borrowed bytes into its own memory. `kernel_bytes` is valid only for the
+/// duration of the callback.
+pub type AllocateBytesFn = extern "C" fn(kernel_bytes: KernelBytesSlice) -> NullableCvoid;
+
+/// Lets an engine copy borrowed physical column names into its own memory. The array and its nested
+/// slices are valid only for the duration of the callback.
+pub type AllocateColumnNamesFn =
+    extern "C" fn(column_names: delta_types::FfiColumnNameArray) -> NullableCvoid;
 
 /// An opaque type that rust will understand as a string. This can be obtained by calling
 /// [`allocate_kernel_string`] with a [`KernelStringSlice`]
@@ -1835,7 +1864,9 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
     snapshot.schema().into()
 }
 
-/// Returns the table's physical schema, including partition columns.
+/// Returns the full table physical schema, including `VOID` fields and partition columns that are
+/// not stored in data files. Use a bound write context's physical write schema when shaping a
+/// Parquet file.
 /// The caller owns the returned schema and must release it with [`free_schema`].
 ///
 /// # Safety
@@ -2287,6 +2318,24 @@ mod tests {
             unsafe { null_nonempty.try_as_slice() },
             "slice pointer is null with length 1",
         );
+    }
+
+    #[test]
+    fn kernel_bytes_slice_pointer_length_contract() {
+        let null_empty = KernelBytesSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let null_nonempty = KernelBytesSlice {
+            ptr: std::ptr::null(),
+            len: 4,
+        };
+
+        assert!(unsafe { null_empty.try_as_slice() }.unwrap().is_empty());
+        assert!(matches!(
+            unsafe { null_nonempty.try_as_slice() },
+            Err(delta_kernel::Error::Generic(_))
+        ));
     }
 
     #[test]

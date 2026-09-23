@@ -18,6 +18,16 @@ use crate::{FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalV
 /// Borrowed array of UTF-8 strings.
 pub type FfiStringArray = FfiSlice<KernelStringSlice>;
 
+/// One borrowed column path, stored as UTF-8 path segments.
+#[repr(C)]
+pub struct FfiColumnName {
+    /// Column path segments.
+    pub path: FfiStringArray,
+}
+
+/// Borrowed array of column paths.
+pub type FfiColumnNameArray = FfiSlice<FfiColumnName>;
+
 /// One borrowed UTF-8 map entry.
 #[repr(C)]
 pub struct FfiStringMapEntry {

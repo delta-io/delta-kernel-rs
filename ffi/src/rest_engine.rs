@@ -369,7 +369,7 @@ mod tests {
     use crate::ffi_test_utils::allocate_err;
     use crate::kernel_string_slice;
 
-    // Miri policy for this module. See ffi/CLAUDE.md "Testing under Miri" for the policy;
+    // Miri policy for this module. See ffi/AGENTS.md "Testing under Miri" for the policy;
     // tests below are grouped by their relationship to `unsafe`, in file order:
     //
     //   1. Pure-logic tests: no `unsafe`. Run under Miri.
