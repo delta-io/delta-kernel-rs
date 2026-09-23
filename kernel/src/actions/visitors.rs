@@ -882,26 +882,20 @@ struct CheckpointElementVisitor {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointElementVisitor {
-    /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
-    /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
+    /// Assemble the visited elements into a [`CheckpointAction`] via the shared
+    /// [`CheckpointAction::from_parts`], which errors if a required element was absent or if
+    /// [`CheckpointAction::validate`] rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
-        let missing = |field: &str| {
-            Error::generic(format!(
-                "checkpoint action is missing required `{field}` element"
-            ))
-        };
-        let action = CheckpointAction {
-            version: self.version.ok_or_else(|| missing("checkpointMetadata"))?,
-            content_root: self.content_root.ok_or_else(|| missing("contentRoot"))?,
-            protocol: self.protocol.ok_or_else(|| missing("protocol"))?,
-            metadata: self.metadata.ok_or_else(|| missing("metaData"))?,
-            transactions: self.transactions,
-            domain_metadata: self.domain_metadata,
-            txn_sidecars: self.txn_sidecars,
-            domain_metadata_sidecars: self.domain_metadata_sidecars,
-        };
-        action.validate()?;
-        Ok(action)
+        CheckpointAction::from_parts(
+            self.version,
+            self.content_root,
+            self.protocol,
+            self.metadata,
+            self.transactions,
+            self.domain_metadata,
+            self.txn_sidecars,
+            self.domain_metadata_sidecars,
+        )
     }
 }
 
