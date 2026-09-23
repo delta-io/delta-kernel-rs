@@ -847,11 +847,7 @@ fn test_data_row_group_skipping() {
     let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
     assert_eq!(data.len(), 1);
 
-    // TODO(#860): we disable predicate pushdown until we support row indexes. Update this test
-    // accordingly after support is reintroduced.
-    //
-    // Effective predicate pushdown, so no data files should be returned. BUT since we disabled
-    // predicate pushdown, the one data file is still returned.
+    // Effective Parquet predicate pushdown prunes the file's only row group.
     let predicate = Arc::new(int_col.lt(value));
     let scan = snapshot
         .scan_builder()
@@ -859,7 +855,7 @@ fn test_data_row_group_skipping() {
         .build()
         .unwrap();
     let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
-    assert_eq!(data.len(), 1);
+    assert!(data.is_empty());
 }
 
 #[test]
