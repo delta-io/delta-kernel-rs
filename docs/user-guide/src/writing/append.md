@@ -31,7 +31,7 @@ may differ.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation, TransactionOptions};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -42,10 +42,11 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Write)
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
@@ -92,18 +93,19 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Write)
+    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 The builder methods:
 
 | Method | Purpose |
 |--------|---------|
-| `with_operation(String)` | Operation name stored in the commit log (e.g. `"INSERT"`, `"MERGE"`) |
-| `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
+| `with_operation(UpdateTableOperation)` | Typed operation stored in the commit log; use `UpdateTableOperation::Custom` for connector-specific names |
+| `with_options(TransactionOptions)` | Supplies engine information, operation metadata, transaction IDs, and domain metadata |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## WriteState and BoundWriteContext

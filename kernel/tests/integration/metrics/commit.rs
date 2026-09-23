@@ -11,7 +11,7 @@ use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, Transaction
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -216,7 +216,9 @@ async fn alter_table_builder_carries_correlation_id(
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     // Set the id in the `Ready` state (before `add_column`) to exercise the carry-through.
-    let mut builder = snapshot.alter_table();
+    let mut builder = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::AlterTable);
     if let Some(id) = correlation_id {
         builder = builder.with_correlation_id(id);
     }

@@ -31,8 +31,6 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-use std::sync::Arc;
-
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
@@ -44,7 +42,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, V2_VALIDATOR,
 };
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CreateTable, Operation, Transaction, TransactionConfig};
 use crate::utils::{current_time_ms, PhantomType};
 use crate::DeltaResult;
 
@@ -142,11 +140,10 @@ impl CreateTableTransaction {
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
         effective_table_config: TableConfiguration,
-        engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
-        correlation_id: Option<Arc<str>>,
+        config: TransactionConfig,
     ) -> DeltaResult<Self> {
         validate_iceberg_compat_if_needed(
             &effective_table_config,
@@ -159,17 +156,19 @@ impl CreateTableTransaction {
             path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
-        Ok(Transaction {
+        Transaction {
             span,
             operation_id: MetricId::new(),
-            correlation_id,
+            correlation_id: None,
             read_snapshot_opt: None,
             effective_table_config,
             should_emit_protocol: true,
             should_emit_metadata: true,
             committer,
-            operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
+            operation: Some(Operation::CreateTable),
+            operation_parameters: std::collections::HashMap::new(),
+            operation_metrics: std::collections::HashMap::new(),
+            engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -179,6 +178,7 @@ impl CreateTableTransaction {
             provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
+            infer_data_change: false,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
@@ -189,6 +189,7 @@ impl CreateTableTransaction {
             root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
-        })
+        }
+        .with_transaction_config(config)
     }
 }
