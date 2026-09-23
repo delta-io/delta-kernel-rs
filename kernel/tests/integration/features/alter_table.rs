@@ -1183,14 +1183,20 @@ async fn add_column_strip_is_none_mode_only(
     Ok(())
 }
 
+#[rstest]
+#[case::v2("delta.enableIcebergCompatV2", "icebergCompatV2")]
+#[case::v3("delta.enableIcebergCompatV3", "icebergCompatV3")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_blocked_when_iceberg_compat_enabled(
+    #[case] enablement_property: &str,
+    #[case] feature_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
         simple_schema(),
         engine.as_ref(),
-        &[("delta.enableIcebergCompatV3", "true")],
+        &[(enablement_property, "true")],
     )?;
 
     let msg = snapshot
@@ -1200,7 +1206,9 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         .unwrap_err()
         .to_string();
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
+        msg.contains(&format!(
+            "ALTER TABLE is not yet supported on tables with {feature_name} enabled"
+        )),
         "unexpected error: {msg}",
     );
 

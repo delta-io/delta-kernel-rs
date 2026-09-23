@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use derive_more::From;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -195,11 +196,14 @@ pub(crate) trait ToSchema {
     fn to_schema() -> StructType;
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, From)]
 #[serde(untagged)]
 pub enum MetadataValue {
+    #[from]
     Number(i64),
+    #[from(String, &String, &str)]
     String(String),
+    #[from]
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
     // only that the metadata is "A JSON map containing information about this column.", so we can
@@ -216,36 +220,6 @@ impl Display for MetadataValue {
             MetadataValue::Boolean(b) => write!(f, "{b}"),
             MetadataValue::Other(v) => write!(f, "{v}"), // just write the json back
         }
-    }
-}
-
-impl From<String> for MetadataValue {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<&String> for MetadataValue {
-    fn from(value: &String) -> Self {
-        Self::String(value.clone())
-    }
-}
-
-impl From<&str> for MetadataValue {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_string())
-    }
-}
-
-impl From<i64> for MetadataValue {
-    fn from(value: i64) -> Self {
-        Self::Number(value)
-    }
-}
-
-impl From<bool> for MetadataValue {
-    fn from(value: bool) -> Self {
-        Self::Boolean(value)
     }
 }
 
@@ -1660,18 +1634,12 @@ pub(crate) fn normalize_column_names_to_schema_casing(
 
 /// Helper for RowVisitor implementations
 #[internal_api]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, From)]
 pub(crate) struct ColumnNamesAndTypes(Vec<ColumnName>, Vec<DataType>);
 impl ColumnNamesAndTypes {
     #[internal_api]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
-    }
-}
-
-impl From<(Vec<ColumnName>, Vec<DataType>)> for ColumnNamesAndTypes {
-    fn from((names, fields): (Vec<ColumnName>, Vec<DataType>)) -> Self {
-        ColumnNamesAndTypes(names, fields)
     }
 }
 
@@ -1960,7 +1928,7 @@ impl DecimalType {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq, From)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -1997,14 +1965,17 @@ pub enum PrimitiveType {
     /// variant above, the serde rename is the multi-word `schemaString` type-name string.
     #[serde(rename = "interval day to second")]
     IntervalDayTime,
+    #[from]
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
     /// Geometry column with an associated coordinate reference system (CRS).
     #[cfg(feature = "geo-type-in-dev")]
+    #[from(GeometryType)]
     #[serde(serialize_with = "serialize_geotype", untagged)]
     Geometry(Box<GeometryType>),
     /// Geography column with an associated CRS and edge interpolation algorithm.
     #[cfg(feature = "geo-type-in-dev")]
+    #[from(GeographyType)]
     #[serde(serialize_with = "serialize_geotype", untagged)]
     Geography(Box<GeographyType>),
 }
@@ -2276,18 +2247,22 @@ impl Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq, From)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
+    #[from(PrimitiveType, DecimalType)]
     Primitive(PrimitiveType),
     /// An array stores a variable length collection of items of some type.
+    #[from(ArrayType)]
     Array(Box<ArrayType>),
     /// A struct is used to represent both the top-level schema of the table as well
     /// as struct columns that contain nested columns.
+    #[from(StructType)]
     Struct(Box<StructType>),
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
+    #[from(MapType)]
     Map(Box<MapType>),
     /// The Variant data type. The physical representation can be flexible to support shredded
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
@@ -2295,32 +2270,10 @@ pub enum DataType {
     Variant(Box<StructType>),
 }
 
-impl From<DecimalType> for PrimitiveType {
-    fn from(dtype: DecimalType) -> Self {
-        PrimitiveType::Decimal(dtype)
-    }
-}
-impl From<DecimalType> for DataType {
-    fn from(dtype: DecimalType) -> Self {
-        PrimitiveType::from(dtype).into()
-    }
-}
-#[cfg(feature = "geo-type-in-dev")]
-impl From<GeometryType> for PrimitiveType {
-    fn from(gtype: GeometryType) -> Self {
-        PrimitiveType::Geometry(Box::new(gtype))
-    }
-}
 #[cfg(feature = "geo-type-in-dev")]
 impl From<GeometryType> for DataType {
     fn from(gtype: GeometryType) -> Self {
         PrimitiveType::from(gtype).into()
-    }
-}
-#[cfg(feature = "geo-type-in-dev")]
-impl From<GeographyType> for PrimitiveType {
-    fn from(gtype: GeographyType) -> Self {
-        PrimitiveType::Geography(Box::new(gtype))
     }
 }
 #[cfg(feature = "geo-type-in-dev")]
@@ -2329,29 +2282,6 @@ impl From<GeographyType> for DataType {
         PrimitiveType::from(gtype).into()
     }
 }
-impl From<PrimitiveType> for DataType {
-    fn from(ptype: PrimitiveType) -> Self {
-        DataType::Primitive(ptype)
-    }
-}
-impl From<MapType> for DataType {
-    fn from(map_type: MapType) -> Self {
-        DataType::Map(Box::new(map_type))
-    }
-}
-
-impl From<StructType> for DataType {
-    fn from(struct_type: StructType) -> Self {
-        DataType::Struct(Box::new(struct_type))
-    }
-}
-
-impl From<ArrayType> for DataType {
-    fn from(array_type: ArrayType) -> Self {
-        DataType::Array(Box::new(array_type))
-    }
-}
-
 impl From<SchemaRef> for DataType {
     fn from(schema: SchemaRef) -> Self {
         Arc::unwrap_or_clone(schema).into()

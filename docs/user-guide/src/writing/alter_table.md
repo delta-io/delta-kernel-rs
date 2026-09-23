@@ -63,7 +63,7 @@ let result = snapshot
     .commit(&engine)?;
 
 match result {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Schema evolved at version {}", committed.commit_version());
     }
     _ => eprintln!("alter table did not succeed"),

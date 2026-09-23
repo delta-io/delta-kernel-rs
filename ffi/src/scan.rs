@@ -11,6 +11,7 @@ use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
+use derive_more::From;
 use tracing::debug;
 use url::Url;
 
@@ -640,15 +641,9 @@ type CScanCallback = extern "C" fn(
     partition_map: &CStringMap,
 );
 
-#[derive(Default)]
+#[derive(Default, From)]
 pub struct CStringMap {
     values: HashMap<String, String>,
-}
-
-impl From<HashMap<String, String>> for CStringMap {
-    fn from(val: HashMap<String, String>) -> Self {
-        Self { values: val }
-    }
 }
 
 #[no_mangle]
@@ -736,7 +731,7 @@ impl From<&MetadataValue> for CMetadataValueKind {
 /// An engine metadata callback also uses this map to accumulate incoming field metadata. That map
 /// is owned by Kernel and exclusively borrowed for the callback duration; the engine must not
 /// retain it.
-#[derive(Default)]
+#[derive(Default, From)]
 pub struct CMetadataMap {
     values: HashMap<String, MetadataValue>,
 }
@@ -759,12 +754,6 @@ impl CMetadataMap {
     /// Consume the map and return its metadata values.
     pub(crate) fn into_values(self) -> HashMap<String, MetadataValue> {
         self.values
-    }
-}
-
-impl From<HashMap<String, MetadataValue>> for CMetadataMap {
-    fn from(values: HashMap<String, MetadataValue>) -> Self {
-        Self { values }
     }
 }
 

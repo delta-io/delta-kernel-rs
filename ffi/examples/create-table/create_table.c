@@ -105,9 +105,9 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
+  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return 1;

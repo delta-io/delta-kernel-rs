@@ -1637,7 +1637,7 @@ pub async fn write_batch_to_table(
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+        delta_kernel::transaction::CommitResult::Committed(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
             .clone()),
@@ -2105,7 +2105,7 @@ pub fn remove_all_and_get_remove_actions(
         txn.remove_files(sm.scan_files);
     }
     let committed = match txn.commit(engine)? {
-        CommitResult::CommittedTransaction(c) => c,
+        CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
     read_actions_from_commit(table_url, committed.commit_version(), "remove")
