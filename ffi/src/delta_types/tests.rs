@@ -424,6 +424,8 @@ fn typed_crc_accepts_full_kernel_state() {
         Some(13),
         Some(1),
         Some(DeletedRecordCountsHistogram::try_new(deleted_record_counts.to_vec()).unwrap()),
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        None,
     )
     .unwrap();
     assert_eq!(actual, expected);
