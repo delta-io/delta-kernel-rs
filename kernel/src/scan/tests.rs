@@ -847,7 +847,7 @@ fn test_data_row_group_skipping() {
     let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
     assert_eq!(data.len(), 1);
 
-    // Effective predicate pushdown, so no data files should be returned.
+    // The predicate prunes all row groups, so the scan returns no data batches.
     let predicate = Arc::new(int_col.lt(value));
     let scan = snapshot
         .scan_builder()
