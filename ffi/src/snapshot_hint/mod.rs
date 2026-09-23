@@ -120,10 +120,10 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
 /// Copies and installs a complete typed snapshot hint on a snapshot builder.
 ///
 /// The input is converted and validated before replacing any previously installed hint. Build
-/// performs the remaining structural and table-configuration validation. Kernel does not verify
-/// that supplied log locations belong to the builder's table; the caller must ensure every log
-/// path addresses that table. `Latest` makes `is_built_as_latest()` true, and kernel trusts that
-/// caller claim. `Unverified` makes it false.
+/// preserves the supplied log locations and requires them to be beneath the builder's table log
+/// root, then performs the remaining structural and table-configuration validation. The connector
+/// must canonicalize every location into the same URL form as the table root. `Latest` makes
+/// `is_built_as_latest()` true, and kernel trusts that caller claim. `Unverified` makes it false.
 ///
 /// # Errors
 ///
