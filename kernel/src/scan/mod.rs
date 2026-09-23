@@ -32,7 +32,6 @@ use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
-use crate::scan::data_skipping::stats_schema::VariantMinMaxStats;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -231,27 +230,6 @@ impl StatsOptions {
         }
     }
 
-    /// Requests a shredded VARIANT column's min/max statistic in `minValues`/`maxValues`.
-    ///
-    /// Off by default. That statistic is itself a VARIANT value rather than a comparable scalar, so
-    /// kernel never prunes with it, and only a caller that knows how to interpret one gains
-    /// anything. Enabling it adds a column per VARIANT to the stats schema.
-    ///
-    /// Kernel does not itself encode or decode the statistic. The Delta protocol does not yet
-    /// specify how a VARIANT value is stored in the stats JSON, so that knowledge has to come from
-    /// the caller: enabling this means supplying an [`EvaluationHandler`] that overrides whichever
-    /// of [`ParseJson`] and [`ToJson`] the stats path uses -- `ParseJson` to read the statistic out
-    /// of the stats JSON, `ToJson` to write it back under `synthesize_json`. A checkpoint's own
-    /// `stats_parsed` needs neither: it holds the variant as binary and passes straight through.
-    ///
-    /// [`ParseJson`]: crate::expressions::ParseJsonExpression
-    /// [`ToJson`]: crate::expressions::UnaryExpressionOp::ToJson
-    /// [`EvaluationHandler`]: crate::EvaluationHandler
-    pub fn with_variant_stats(mut self, variant_stats: bool) -> Self {
-        self.variant_stats = variant_stats;
-        self
-    }
-
     /// **Disables all stats work**: no stats output, no internal data skipping (even
     /// when a predicate is set). Kernel reads no stats columns from parquet at all.
     /// Use when the engine handles its own pruning.
@@ -266,13 +244,28 @@ impl StatsOptions {
         }
     }
 
-    /// How the stats schema should treat a VARIANT column's min/max statistic.
-    pub(crate) fn variant_min_max(&self) -> VariantMinMaxStats {
-        if self.variant_stats {
-            VariantMinMaxStats::Include
-        } else {
-            VariantMinMaxStats::Omit
-        }
+    /// Requests each VARIANT column's min/max statistic in the `minValues` and `maxValues` of
+    /// `stats_parsed`, typed as the variant's physical struct. Off by default.
+    ///
+    /// The statistic is itself a VARIANT value, so kernel never prunes with it. It requires struct
+    /// stats without JSON synthesis, such as [`Self::all_struct`]; [`ScanBuilder::build`] rejects
+    /// any other combination.
+    ///
+    /// The Delta protocol does not specify how a VARIANT statistic is stored in the stats JSON, so
+    /// kernel does not decode it. For commits, and for checkpoints without compatible
+    /// `stats_parsed`, the engine's [`ParseJson`] must decode it. A compatible checkpoint's
+    /// `stats_parsed` stores the statistic as its physical struct, which kernel reads directly.
+    ///
+    /// With the default engine, a `ParseJson` failure on any file's statistic logs
+    /// `Using null stats.` and nulls the stats of every file in that batch, so kernel cannot prune
+    /// those files either.
+    ///
+    /// [`ParseJson`]: crate::expressions::ParseJsonExpression
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn with_variant_stats(mut self, variant_stats: bool) -> Self {
+        self.variant_stats = variant_stats;
+        self
     }
 }
 
@@ -463,6 +456,18 @@ impl ScanBuilder {
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
     pub fn build(self) -> DeltaResult<Scan> {
+        if self.stats.variant_stats {
+            if matches!(self.stats.struct_stats, StructStats::None) {
+                return Err(Error::unsupported(
+                    "StatsOptions::with_variant_stats requires struct stats output",
+                ));
+            }
+            if self.stats.synthesize_json {
+                return Err(Error::unsupported(
+                    "StatsOptions::with_variant_stats cannot be combined with JSON stats synthesis",
+                ));
+            }
+        }
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -807,11 +812,11 @@ fn build_physical_stats_output_schema(
                 return Ok(None);
             }
             let stats_schema = table_configuration
-                .build_expected_stats_schemas(
-                    Some(requested),
-                    Some(requested),
-                    stats.variant_min_max(),
-                )?
+                .stats_schema_builder()
+                .with_required_physical_columns(Some(requested))
+                .with_requested_physical_columns(Some(requested))
+                .with_variant_min_max(stats.variant_stats)
+                .build()?
                 .physical;
             Ok(stats_schema_with_data_columns(stats_schema))
         }

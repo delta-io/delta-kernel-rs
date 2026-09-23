@@ -119,7 +119,6 @@ use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::scan::data_skipping::stats_schema::VariantMinMaxStats;
 use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
@@ -739,12 +738,9 @@ impl CheckpointWriter {
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
         let stats_schema = tc
-            .build_expected_stats_schemas(
-                physical_clustering_columns.as_deref(),
-                None,
-                // Writers do not carry the VARIANT statistic: `ToJson` cannot encode it.
-                VariantMinMaxStats::Omit,
-            )?
+            .stats_schema_builder()
+            .with_required_physical_columns(physical_clustering_columns.as_deref())
+            .build()?
             .physical;
 
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)

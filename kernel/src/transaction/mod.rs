@@ -31,9 +31,7 @@ use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::{CommitFailureReason, MetricId};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::{
-    schema_with_all_fields_nullable, VariantMinMaxStats,
-};
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
     PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_PARSED_NAME, TAGS_NAME,
@@ -1103,12 +1101,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schemas = self.effective_table_config.build_expected_stats_schemas(
-            self.physical_clustering_columns.as_deref(),
-            None,
-            // Writers do not carry the VARIANT statistic: `ToJson` cannot encode it.
-            VariantMinMaxStats::Omit,
-        )?;
+        let stats_schemas = self
+            .effective_table_config
+            .stats_schema_builder()
+            .with_required_physical_columns(self.physical_clustering_columns.as_deref())
+            .build()?;
         Ok(stats_schemas.physical)
     }
 

@@ -4236,6 +4236,35 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     ));
 }
 
+/// Parquet has no variant type, so a checkpoint footer reports a `stats_parsed` VARIANT statistic
+/// as the struct of binaries it is stored as. A needed VARIANT accepts that struct by checking its
+/// fields, not unconditionally.
+#[rstest]
+#[case::physical_struct(DataType::BINARY, true)]
+#[case::mismatched_inner_type(DataType::STRING, false)]
+fn test_schema_has_compatible_stats_parsed_variant_against_struct(
+    #[case] checkpoint_value_type: DataType,
+    #[case] expected: bool,
+) {
+    let checkpoint_variant = schema! {
+        not_null "metadata": BINARY,
+        not_null "value": (checkpoint_value_type),
+    };
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("v", checkpoint_variant),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("v", DataType::unshredded_variant()),
+    ]);
+
+    assert_eq!(
+        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
+        expected
+    );
+}
+
 #[test]
 fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
     // Checkpoint stores timestamp stats as Int64 (no logical type annotation)
