@@ -41,7 +41,6 @@ mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
-pub(crate) use crc_replay::CrcReplayAccumulator;
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
 
 #[cfg(test)]

@@ -31,8 +31,13 @@
 //!      counts of actions selected
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::actions::visitors::{
+    visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
+};
+use crate::actions::{DomainMetadata, SetTransaction};
+use crate::crc::{Crc, DomainMetadataState, FileStatsState, SetTransactionState};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
@@ -46,6 +51,9 @@ use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
 pub(crate) struct ActionReconciliationProcessor {
+    /// Shared with the caller because the engine owns the replay iterator during checkpoint
+    /// writes.
+    crc: Arc<Mutex<Option<Crc>>>,
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
     seen_file_keys: HashSet<FileActionKey>,
@@ -129,18 +137,16 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
+    inner: Option<DeltaResultIteratorStatic<ActionReconciliationBatch>>,
     state: Arc<ActionReconciliationIteratorState>,
-    failed: bool,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
     pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             state: Arc::new(ActionReconciliationIteratorState::default()),
-            failed: false,
         }
     }
 
@@ -182,11 +188,11 @@ impl Iterator for ActionReconciliationIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
+        let mut inner = self.inner.take()?;
+        let batch = inner.next();
+        if matches!(batch, Some(Ok(_))) {
+            self.inner = Some(inner);
         }
-        let batch = self.inner.next();
-        self.failed = matches!(batch, Some(Err(_)));
         self.transform_batch(batch)
     }
 }
@@ -208,6 +214,10 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
             is_log_batch,
         } = actions_batch;
         let selection_vector = vec![true; actions.len()];
+        let mut crc = self
+            .crc
+            .lock()
+            .map_err(|e| Error::internal_error(format!("CRC accumulator lock poisoned: {e}")))?;
 
         // Create the action reconciliation visitor to process actions and update selection vector
         let mut visitor = ActionReconciliationVisitor::new(
@@ -220,7 +230,8 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
             &mut self.seen_txns,
             &mut self.seen_domains,
             self.txn_expiration_timestamp,
-        );
+        )
+        .with_crc(crc.as_mut());
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Update protocol and metadata seen flags
@@ -249,6 +260,7 @@ impl ActionReconciliationProcessor {
         txn_expiration_timestamp: Option<i64>,
     ) -> Self {
         Self {
+            crc: Arc::default(),
             seen_file_keys: Default::default(),
             seen_protocol: false,
             seen_metadata: false,
@@ -257,6 +269,11 @@ impl ActionReconciliationProcessor {
             minimum_file_retention_timestamp,
             txn_expiration_timestamp,
         }
+    }
+
+    pub(crate) fn with_crc(mut self, crc: Arc<Mutex<Option<Crc>>>) -> Self {
+        self.crc = crc;
+        self
     }
 }
 
@@ -301,6 +318,7 @@ impl ActionReconciliationProcessor {
 ///
 /// The resulting filtered set of actions are the reconciled actions.
 pub(crate) struct ActionReconciliationVisitor<'seen> {
+    crc: Option<&'seen mut Crc>,
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
     // This set has O(M) memory usage where M = number of file actions with unique (path, dvId)
@@ -351,7 +369,7 @@ impl GetterColumn {
 }
 
 #[allow(unused)]
-impl ActionReconciliationVisitor<'_> {
+impl<'seen> ActionReconciliationVisitor<'seen> {
     // Projected columns in the same order as `selected_column_names_and_types()`.
     // DV columns are defined individually for completeness, even when accessed via a start index.
     const ADD_PATH: GetterColumn = GetterColumn::new(0, "add.path");
@@ -376,9 +394,13 @@ impl ActionReconciliationVisitor<'_> {
     const TXN_LAST_UPDATED: GetterColumn = GetterColumn::new(13, "txn.lastUpdated");
     const DOMAIN_METADATA_DOMAIN: GetterColumn = GetterColumn::new(14, "domainMetadata.domain");
     const DOMAIN_METADATA_REMOVED: GetterColumn = GetterColumn::new(15, "domainMetadata.removed");
+    const TXN_VERSION: GetterColumn = GetterColumn::new(16, "txn.version");
+    const DOMAIN_METADATA_CONFIGURATION: GetterColumn =
+        GetterColumn::new(17, "domainMetadata.configuration");
+    const PROTOCOL_LEAVES_START: usize = 18;
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new<'seen>(
+    pub(crate) fn new(
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
         selection_vector: Vec<bool>,
@@ -390,6 +412,7 @@ impl ActionReconciliationVisitor<'_> {
         txn_expiration_timestamp: Option<i64>,
     ) -> ActionReconciliationVisitor<'seen> {
         ActionReconciliationVisitor {
+            crc: None,
             deduplicator: FileActionDeduplicator::new(
                 seen_file_keys,
                 is_log_batch,
@@ -409,6 +432,69 @@ impl ActionReconciliationVisitor<'_> {
             seen_domains,
             txn_expiration_timestamp,
         }
+    }
+
+    fn with_crc(mut self, crc: Option<&'seen mut Crc>) -> Self {
+        self.crc = crc;
+        self
+    }
+
+    fn accumulate_crc<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<()> {
+        let Some(crc) = &mut self.crc else {
+            return Ok(());
+        };
+        if let Some(size) = getters[Self::ADD_SIZE.index].get_opt(row, Self::ADD_SIZE.name)? {
+            let FileStatsState::Complete(stats) = &mut crc.file_stats_state else {
+                return Err(Error::internal_error(
+                    "CRC replay requires complete file statistics",
+                ));
+            };
+            return stats.add_file(size);
+        }
+        if let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(row, Self::TXN_APP_ID.name)? {
+            let version = getters[Self::TXN_VERSION.index].get(row, Self::TXN_VERSION.name)?;
+            let last_updated =
+                getters[Self::TXN_LAST_UPDATED.index].get_opt(row, Self::TXN_LAST_UPDATED.name)?;
+            let transactions = match &mut crc.set_transaction_state {
+                SetTransactionState::Complete(transactions)
+                | SetTransactionState::Partial(transactions) => transactions,
+            };
+            transactions.insert(
+                app_id.to_owned(),
+                SetTransaction::new(app_id.to_owned(), version, last_updated),
+            );
+            return Ok(());
+        }
+        if let Some(domain) = getters[Self::DOMAIN_METADATA_DOMAIN.index]
+            .get_str(row, Self::DOMAIN_METADATA_DOMAIN.name)?
+        {
+            let configuration = getters[Self::DOMAIN_METADATA_CONFIGURATION.index]
+                .get(row, Self::DOMAIN_METADATA_CONFIGURATION.name)?;
+            let domains = match &mut crc.domain_metadata_state {
+                DomainMetadataState::Complete(domains) | DomainMetadataState::Partial(domains) => {
+                    domains
+                }
+            };
+            domains.insert(
+                domain.to_owned(),
+                DomainMetadata::new(domain.to_owned(), configuration),
+            );
+            return Ok(());
+        }
+        let (protocol, metadata) =
+            getters[Self::PROTOCOL_LEAVES_START..].split_at(PROTOCOL_LEAVES.as_ref().0.len());
+        if let Some(protocol) = visit_protocol_at(row, protocol)? {
+            crc.protocol = protocol;
+            return Ok(());
+        }
+        if let Some(metadata) = visit_metadata_at(row, metadata)? {
+            crc.metadata = metadata;
+        }
+        Ok(())
     }
 
     /// Determines if a remove action tombstone has expired and should be excluded.
@@ -629,6 +715,7 @@ impl ActionReconciliationVisitor<'_> {
 
         if is_valid {
             self.actions_count += 1;
+            self.accumulate_crc(i, getters)?;
         }
 
         Ok(is_valid)
@@ -673,12 +760,31 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
         });
-        NAMES_AND_TYPES.as_ref()
+        static CRC_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let (names, types) = NAMES_AND_TYPES.as_ref();
+            let (mut names, mut types) = (names.to_vec(), types.to_vec());
+            names.extend([
+                column_name!("txn.version"),
+                column_name!("domainMetadata.configuration"),
+            ]);
+            types.extend([DataType::LONG, DataType::STRING]);
+            for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
+                let (leaf_names, leaf_types) = leaves.as_ref();
+                names.extend_from_slice(leaf_names);
+                types.extend_from_slice(leaf_types);
+            }
+            (names, types).into()
+        });
+        if self.crc.is_some() {
+            CRC_NAMES_AND_TYPES.as_ref()
+        } else {
+            NAMES_AND_TYPES.as_ref()
+        }
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == self.selected_column_names_and_types().0.len(),
             Error::InternalError(format!(
                 "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
@@ -697,11 +803,114 @@ mod tests {
     use std::collections::HashSet;
 
     use itertools::Itertools;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
     use crate::arrow::array::StringArray;
+    use crate::crc::FileSizeHistogram;
     use crate::unit_test_utils::{action_batch, parse_json_batch};
     use crate::Error;
+
+    #[rstest::rstest]
+    fn reconciliation_accumulates_shared_crc_after_deduplication(
+        #[values(false, true)] enabled: bool,
+    ) -> DeltaResult<()> {
+        let crc = Arc::new(Mutex::new(enabled.then(|| {
+            Crc::replay_accumulator(5, Some(FileSizeHistogram::create_default()), Some(123))
+        })));
+        let batches = vec![
+            create_batch(vec![
+                r#"{"add":{"path":"live","partitionValues":{},"size":2,
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"remove":{"path":"dead","deletionTimestamp":1,"dataChange":true}}"#,
+                r#"{"txn":{"appId":"app","version":2}}"#,
+                r#"{"domainMetadata":{"domain":"live","configuration":"new","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"gone","configuration":"","removed":true}}"#,
+                r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+                r#"{"metaData":{"id":"new","format":{"provider":"parquet","options":{}},
+                    "schemaString":"{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns":[],"configuration":{}}}"#,
+            ])?,
+            create_batch(vec![
+                r#"{"add":{"path":"live","partitionValues":{},"size":100,
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"dead","partitionValues":{},"size":100,
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"other","partitionValues":{},"size":3,
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"txn":{"appId":"app","version":1}}"#,
+                r#"{"domainMetadata":{"domain":"live","configuration":"old","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"gone","configuration":"old","removed":false}}"#,
+                r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}"#,
+                r#"{"metaData":{"id":"old","format":{"provider":"parquet","options":{}},
+                    "schemaString":"{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns":[],"configuration":{}}}"#,
+            ])?,
+        ];
+        ActionReconciliationProcessor::new(0, None)
+            .with_crc(crc.clone())
+            .process_actions_iter(batches.into_iter().map(Ok))
+            .try_for_each(|batch| batch.map(|_| ()))?;
+        let crc = crc.lock().unwrap();
+        if enabled {
+            let crc = crc.as_ref().unwrap();
+            let mut histogram = FileSizeHistogram::create_default();
+            histogram.insert(2)?;
+            histogram.insert(3)?;
+            let stats = crc.file_stats().unwrap();
+            assert_eq!(stats.num_files(), 2);
+            assert_eq!(stats.table_size_bytes(), 5);
+            assert_eq!(stats.file_size_histogram(), Some(&histogram));
+            assert_eq!(crc.protocol.min_reader_version(), 1);
+            assert_eq!(crc.metadata.id(), "new");
+            assert_eq!(crc.version, 5);
+            assert_eq!(crc.in_commit_timestamp_opt, Some(123));
+            assert_eq!(
+                crc.set_transaction_state.expect_complete().get("app"),
+                Some(&SetTransaction::new("app".into(), 2, None)),
+            );
+            let domains = crc.domain_metadata_state.expect_complete();
+            assert_eq!(domains.len(), 1);
+            assert_eq!(domains["live"].configuration(), "new");
+        } else {
+            assert!(crc.is_none());
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn reconciliation_crc_reads_only_selected_protocols(
+        #[values(false, true)] superseded: bool,
+    ) -> DeltaResult<()> {
+        let crc = Arc::new(Mutex::new(Some(Crc::replay_accumulator(0, None, None))));
+        let valid = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        let malformed = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7}}"#;
+        let actions = if superseded {
+            vec![valid, malformed]
+        } else {
+            vec![malformed, valid]
+        };
+        let batch = create_batch(actions)?;
+        let result = ActionReconciliationProcessor::new(0, None)
+            .with_crc(crc.clone())
+            .process_actions_iter(std::iter::once(Ok(batch)))
+            .try_for_each(|batch| batch.map(|_| ()));
+        if superseded {
+            result?;
+            assert_eq!(
+                crc.lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .protocol
+                    .min_reader_version(),
+                1
+            );
+        } else {
+            assert_result_error_with_message(result, "Reader features must be present");
+        }
+        Ok(())
+    }
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {

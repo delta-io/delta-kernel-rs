@@ -54,7 +54,9 @@ start a `Transaction` to write data, or create a checkpoint.
 writing, then compares the available checksum fields after replay. Predicate-free `scan_metadata`
 calls check file counts, byte totals, and any file-size histogram when the iterator finishes. The
 comparison logic lives in `kernel/src/crc/validation.rs`; snapshot/checkpoint replay is shared
-through `kernel/src/snapshot/crc_validation.rs`.
+through `kernel/src/snapshot/crc_validation.rs`. The reconciliation and scan processors accumulate
+`Crc` and `FileStats` in optional state shared with their callers through `Arc<Mutex<_>>`. They
+update selected actions under one lock per batch; callers compare only after successful replay.
 
 ## Read Path
 

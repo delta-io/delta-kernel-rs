@@ -113,10 +113,10 @@ use crate::actions::{
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
 use crate::crc::validation::with_crc_validation;
+use crate::crc::Crc;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::log_segment::CrcReplayAccumulator;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
@@ -461,9 +461,6 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        let (checkpoint_data, transaction_expiration) = self
-            .snapshot
-            .reconciled_actions(engine, self.read_schema.clone())?;
         let expected_crc = self.snapshot.crc_at_version().cloned();
         let histogram = expected_crc
             .as_ref()
@@ -476,16 +473,22 @@ impl CheckpointWriter {
             }
             _ => None,
         };
-        let accumulator = expected_crc.as_ref().map(|_| {
-            (
-                CrcReplayAccumulator::new(histogram),
-                self.snapshot.version(),
-                ict,
-            )
-        });
-        let checkpoint_data = with_crc_validation(checkpoint_data, accumulator, move |actual| {
+        let actual =
+            Arc::new(Mutex::new(expected_crc.as_ref().map(|_| {
+                Crc::replay_accumulator(self.snapshot.version(), histogram, ict)
+            })));
+        let (checkpoint_data, transaction_expiration) =
+            self.snapshot
+                .reconciled_actions(engine, self.read_schema.clone(), actual.clone())?;
+        let checkpoint_data = with_crc_validation(checkpoint_data, move || {
             expected_crc.as_ref().map_or(Ok(()), |expected| {
-                expected.validate_against(&actual, transaction_expiration)
+                let actual = actual.lock().map_err(|e| {
+                    Error::internal_error(format!("CRC accumulator lock poisoned: {e}"))
+                })?;
+                let actual = actual
+                    .as_ref()
+                    .ok_or_else(|| Error::internal_error("CRC accumulator missing"))?;
+                expected.validate_against(actual, transaction_expiration)
             })
         });
 

@@ -298,7 +298,7 @@ impl LogSegment {
 /// replay. The visitor calls `process_batch_start` on each batch and the `on_*` methods on
 /// each row. After all batches have been folded in and `process_commit_file_end` has run for
 /// the final commit, [`Self::into_crc_delta`] returns the result.
-pub(crate) struct CrcReplayAccumulator {
+struct CrcReplayAccumulator {
     delta: CrcDelta,
 
     /// True while the visitor is still on the newest commit. Used to gate ICT capture
@@ -322,7 +322,7 @@ pub(crate) struct CrcReplayAccumulator {
 }
 
 impl CrcReplayAccumulator {
-    pub(crate) fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
+    fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
         Self {
             delta: CrcDelta {
                 is_incremental_safe: true,
@@ -499,14 +499,6 @@ impl CrcReplayAccumulator {
 
     fn into_crc_delta(self) -> CrcDelta {
         self.delta
-    }
-
-    pub(crate) fn visit_reconciled_batch(&mut self, batch: &FilteredEngineData) -> DeltaResult<()> {
-        CheckpointCrcVisitor { acc: self }.visit_rows_of(batch)
-    }
-
-    pub(crate) fn into_complete_crc(self, version: Version) -> Option<Crc> {
-        self.into_crc_delta().into_complete_crc(version)
     }
 }
 

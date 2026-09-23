@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::Snapshot;
 use crate::action_reconciliation::log_replay::{
@@ -11,10 +11,8 @@ use crate::actions::{
     ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
     SET_TRANSACTION_FIELD,
 };
-use crate::crc::try_read_crc_file;
-use crate::crc::validation::with_crc_validation;
+use crate::crc::{try_read_crc_file, Crc};
 use crate::log_replay::LogReplayProcessor;
-use crate::log_segment::CrcReplayAccumulator;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::utils::current_time_duration;
 use crate::{DeltaResult, Engine, Error};
@@ -69,19 +67,26 @@ impl Snapshot {
         let Some(crc) = crc else {
             return Ok(CrcValidationResult::Skipped);
         };
-        let (reconciled, transaction_expiration) =
-            self.reconciled_actions(engine, RECONCILIATION_SCHEMA.clone())?;
         let histogram = crc.replay_histogram()?;
         let ict = crc
             .in_commit_timestamp_opt
             .map(|_| self.read_commit_in_commit_timestamp(engine))
             .transpose()?;
-        with_crc_validation(
-            reconciled,
-            Some((CrcReplayAccumulator::new(histogram), self.version(), ict)),
-            |actual| crc.validate_against(&actual, transaction_expiration),
-        )
-        .try_for_each(|batch| batch.map(|_| ()))?;
+        let actual = Arc::new(Mutex::new(Some(Crc::replay_accumulator(
+            self.version(),
+            histogram,
+            ict,
+        ))));
+        let (mut reconciled, transaction_expiration) =
+            self.reconciled_actions(engine, RECONCILIATION_SCHEMA.clone(), actual.clone())?;
+        reconciled.try_for_each(|batch| batch.map(|_| ()))?;
+        let actual = actual
+            .lock()
+            .map_err(|e| Error::internal_error(format!("CRC accumulator lock poisoned: {e}")))?;
+        let actual = actual
+            .as_ref()
+            .ok_or_else(|| Error::internal_error("CRC accumulator missing"))?;
+        crc.validate_against(actual, transaction_expiration)?;
         Ok(CrcValidationResult::Validated)
     }
 
@@ -89,6 +94,7 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
         read_schema: SchemaRef,
+        crc: Arc<Mutex<Option<Crc>>>,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
         Option<i64>,
@@ -101,6 +107,7 @@ impl Snapshot {
         )?;
         let actions = self.log_segment().read_actions(engine, read_schema)?;
         let reconciled = ActionReconciliationProcessor::new(file_retention, transaction_expiration)
+            .with_crc(crc)
             .process_actions_iter(actions);
         Ok((reconciled, transaction_expiration))
     }
