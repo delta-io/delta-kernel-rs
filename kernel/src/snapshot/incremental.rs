@@ -26,7 +26,7 @@ use crate::{DeltaResult, Engine, Error, Version};
 enum NewSegment {
     /// No new segment to build; the caller returns the existing snapshot unchanged.
     Unchanged,
-    /// Changed cached files or a newly adopted checkpoint require a rebuild.
+    /// A newly adopted checkpoint requires a rebuild, preserving the existing table ID.
     Rebuild(LogSegment),
     /// New commits merged into the existing segment; ready for incremental P&M.
     Combined(LogSegment),
@@ -56,7 +56,7 @@ impl Snapshot {
     /// merged with filesystem listings.
     ///
     /// Refreshes compare listed file metadata with cached files before reusing state. Changed
-    /// files trigger a rebuild, and any newly loaded metadata must have the same table ID.
+    /// cached files cause an error, and any newly loaded metadata must have the same table ID.
     ///
     /// Position layout per case (`....` is the version axis; `====` marks the range read for
     /// P+M replay; `listed` is the listing range; `read` is what's read for P+M):
@@ -80,12 +80,12 @@ impl Snapshot {
     /// - **A.** `T == S1`: return the existing snapshot unchanged.
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
     /// - Otherwise (`T` unset or `T > S1`), list from `C1` (or zero without a checkpoint). When
-    ///   ignoring checkpoints, list from `S1` instead. Changed cached files require a rebuild;
+    ///   ignoring checkpoints, list from `S1` instead. Changed cached files cause an error;
     ///   otherwise one of the following applies:
     ///   - **C.** Listing is empty:
     ///     - **C.1.** `T` is set: error (target is newer than anything in the log).
     ///     - **C.2.** `T` is unset: error (no files remain in the cached listing range).
-    ///   - **D.** Listing contains a new or changed checkpoint:
+    ///   - **D.** Listing contains a newly adopted checkpoint:
     ///     - **D.1.** `C2 > S1`: the new checkpoint at `C2` already captures the table state
     ///       through version `C2`, including changes in `(S1, C2]`, so we can use it as the new
     ///       base instead of replaying those commits. Build a fresh snapshot from `C2`.
@@ -344,10 +344,11 @@ impl Snapshot {
                 existing_snapshot_version
             }
         };
-        let mut new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
+        let log_tail_start = log_tail.iter().map(|file| file.version).min();
+        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
             storage.as_ref(),
             &log_root,
-            log_tail.clone(),
+            log_tail,
             Some(listing_start),
             requested_version,
             checkpoint_handling,
@@ -375,7 +376,6 @@ impl Snapshot {
         // Compare file metadata already returned by the listing before reusing cached state.
         // Missing old commits may have been cleaned up; changed files cannot extend that history.
         // Catalog-supplied tail entries can use different file metadata than storage listings.
-        let log_tail_start = log_tail.iter().map(|file| file.version).min();
         let changed_commit = new_listed_files
             .ascending_commit_files
             .iter()
@@ -400,21 +400,24 @@ impl Snapshot {
                             && cached.location != file.location
                     })
             });
-        let changed_checkpoint = !new_listed_files.checkpoint_parts.is_empty()
-            && new_listed_files.checkpoint_parts != existing_log_segment.listed.checkpoint_parts;
-        if changed_commit && new_listed_files.checkpoint_parts.is_empty() && listing_start > 0 {
-            // The incremental range is not a complete replacement history. Reload only when a
-            // changed file requires rebuilding, never on an unchanged refresh.
-            new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
-                storage.as_ref(),
-                &log_root,
-                log_tail,
-                Some(0),
-                requested_version,
-                checkpoint_handling,
-                cancellation_token,
-            )?;
+        let changed_checkpoint = new_listed_files.checkpoint_parts.iter().any(|file| {
+            existing_log_segment
+                .listed
+                .checkpoint_parts
+                .iter()
+                .any(|cached| {
+                    cached.location.location == file.location.location
+                        && cached.location != file.location
+                })
+        });
+        if changed_commit || changed_checkpoint {
+            return Err(Error::invalid_log_segment(format!(
+                "Cached log files changed at {log_root}; cannot incrementally update this snapshot. \
+                 Load the table explicitly with Snapshot::builder_for"
+            )));
         }
+        let new_checkpoint = !new_listed_files.checkpoint_parts.is_empty()
+            && new_listed_files.checkpoint_parts != existing_log_segment.listed.checkpoint_parts;
 
         // Save the latest commit before moving the listing into the segment.
         let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
@@ -434,7 +437,7 @@ impl Snapshot {
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
         }
-        if changed_commit || changed_checkpoint {
+        if new_checkpoint {
             return Ok(NewSegment::Rebuild(new_log_segment));
         }
 
@@ -480,7 +483,7 @@ impl Snapshot {
         );
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
-        // Changed checkpoints took the rebuild path. Keep the cached hint for this unchanged
+        // Newly adopted checkpoints took the rebuild path. Keep the hint for this unchanged
         // checkpoint so later scans do not need to read its footer again.
         let new_checkpoint_parts = existing_log_segment.listed.checkpoint_parts.clone();
         let new_checkpoint_hint = existing_log_segment.last_checkpoint_metadata.clone();
@@ -826,9 +829,12 @@ mod tests {
                 && !(skip_new_checkpoints && with_checkpoint && new_version > 0)
             {
                 assert!(matches!(error, Error::InvalidLogSegment(_)), "{error:?}");
-                assert!(error
-                    .to_string()
-                    .contains("expected table ID test-id, found recreated-table-id"));
+                let message = error.to_string();
+                assert!(
+                    message.contains("Cached log files changed")
+                        || message.contains("expected table ID test-id, found recreated-table-id"),
+                    "{message}"
+                );
             }
         }
         let replacement = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
@@ -863,9 +869,7 @@ mod tests {
         let error = Snapshot::builder_from(existing)
             .build(ctx.engine.as_ref())
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("expected table ID test-id, found new--id"));
+        assert!(error.to_string().contains("Cached log files changed"));
         Ok(())
     }
 
@@ -987,7 +991,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_changed_cached_file_metadata_rebuilds_same_table(
+    async fn test_changed_cached_file_metadata_errors_without_content_reads(
         #[values(false, true)] with_checkpoint: bool,
         #[values(false, true)] change_size: bool,
     ) -> DeltaResult<()> {
@@ -1011,20 +1015,26 @@ mod tests {
             file.location.last_modified -= 1;
         }
 
-        let segment = Snapshot::build_new_segment(
-            ctx.engine.as_ref(),
-            &existing.log_segment,
-            existing.version(),
-            vec![],
-            None,
-            CheckpointHandling::Adopt,
-            None,
-        )?;
-        assert!(matches!(segment, super::NewSegment::Rebuild(_)));
-        let updated = Snapshot::builder_from(existing.clone()).build(ctx.engine.as_ref())?;
-        assert!(!Arc::ptr_eq(&existing, &updated));
-        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
-        compare_snapshots(&updated, &fresh);
+        let engine = crate::metrics::MeteredDeltaEngine::new(ctx.engine.clone());
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let error = Snapshot::builder_from(existing).build(&engine).unwrap_err();
+        assert!(matches!(error, Error::InvalidLogSegment(_)));
+        assert!(error.to_string().contains("Cached log files changed"));
+        let events = reporter.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, MetricEvent::StorageListCompleted(_)))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            MetricEvent::JsonReadCompleted(_)
+                | MetricEvent::ParquetReadCompleted(_)
+                | MetricEvent::StorageReadCompleted(_)
+        )));
         Ok(())
     }
 
