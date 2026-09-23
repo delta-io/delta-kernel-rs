@@ -1,5 +1,6 @@
 //! Various utility functions/macros used throughout the kernel
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +9,18 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::{DeltaResult, Error};
+
+/// Phantom type parameter `T`. The containing type mentions `T` but does not own any `T`.
+///
+/// Use this instead of [`PhantomData<T>`] when `T` is only a compile-time parameter: it selects
+/// which methods exist on a type, or appears in a stored closure's signature without being
+/// stored itself. [`PhantomData<T>`] tells the compiler that the containing type may drop a `T`,
+/// and makes `Send`/`Sync` follow `T`. This alias does not claim ownership, is always
+/// `Send`/`Sync`, and is covariant in `T`.
+///
+/// Construct values with [`PhantomType::default`]. A generic alias cannot be named as a
+/// constructor.
+pub(crate) type PhantomType<T> = PhantomData<fn() -> T>;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {

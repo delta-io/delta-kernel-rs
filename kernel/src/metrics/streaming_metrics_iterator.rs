@@ -7,12 +7,12 @@
 //!
 //! [`MeteredStorageHandler`]: crate::metrics::MeteredStorageHandler
 
-use std::marker::PhantomData;
 use std::time::Instant;
 
 use bytes::Bytes;
 
 use crate::metrics::events::STORAGE_SPAN;
+use crate::utils::PhantomType;
 use crate::{DeltaResult, FileMeta};
 
 /// Counts items observed and emits a `"storage"` span on drop. The type parameter
@@ -23,7 +23,7 @@ pub(crate) struct MetricsIterator<I, T> {
     start: Instant,
     num_files: u64,
     bytes_read: u64,
-    _phantom: PhantomData<T>,
+    _phantom: PhantomType<T>,
 }
 
 impl<I, T> MetricsIterator<I, T> {
@@ -34,7 +34,7 @@ impl<I, T> MetricsIterator<I, T> {
             start,
             num_files: 0,
             bytes_read: 0,
-            _phantom: PhantomData,
+            _phantom: PhantomType::default(),
         }
     }
 

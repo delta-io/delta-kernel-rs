@@ -1,3 +1,5 @@
+use derive_more::Constructor;
+
 use super::*;
 use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
 use crate::kernel_predicates::KernelPredicateEvaluator as _;
@@ -129,14 +131,12 @@ fn test_junctions() {
     }
 }
 
+#[derive(Constructor)]
 struct MinMaxTestFilter {
     min: Option<Scalar>,
     max: Option<Scalar>,
 }
 impl MinMaxTestFilter {
-    fn new(min: Option<Scalar>, max: Option<Scalar>) -> Self {
-        Self { min, max }
-    }
     fn get_stat_value(stat: &Option<Scalar>, data_type: &DataType) -> Option<Scalar> {
         stat.as_ref()
             .filter(|v| v.data_type() == *data_type)
@@ -204,17 +204,10 @@ fn test_eval_binary_comparisons() {
     do_test(FIVE, FIFTEEN, &[TRUE, TRUE, TRUE, TRUE, TRUE, TRUE]);
 }
 
+#[derive(Constructor)]
 struct NullCountTestFilter {
     nullcount: Option<i64>,
     rowcount: i64,
-}
-impl NullCountTestFilter {
-    fn new(nullcount: Option<i64>, rowcount: i64) -> Self {
-        Self {
-            nullcount,
-            rowcount,
-        }
-    }
 }
 impl ParquetStatsProvider for NullCountTestFilter {
     fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
