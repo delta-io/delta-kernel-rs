@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use delta_kernel_derive::internal_api;
 use serde::de::Error as _;
 use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -53,6 +54,8 @@ pub struct UserDefinedType {
 }
 
 impl UserDefinedType {
+    /// Returns an error if the physical type contains a UDT or the annotation uses a reserved key.
+    #[internal_api]
     pub(crate) fn validate(&self) -> DeltaResult<()> {
         if contains_udt(&self.sql_type) {
             return Err(Error::schema("A UDT sqlType must not contain another UDT"));

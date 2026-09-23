@@ -67,6 +67,24 @@ fn test_array_column() {
     assert_eq!(result, expected_not_in);
 }
 
+#[cfg(feature = "udt-in-dev")]
+#[rstest]
+#[case(KernelDataType::LONG)]
+#[case(KernelDataType::from(schema! { nullable "x": LONG }))]
+#[case(KernelDataType::from(ArrayType::new(KernelDataType::LONG, true)))]
+#[case(KernelDataType::from(MapType::new(KernelDataType::STRING, KernelDataType::LONG, true)))]
+fn null_udt_scalar_uses_physical_type(#[case] sql_type: KernelDataType) {
+    let udt = KernelDataType::from(crate::schema::UserDefinedType {
+        sql_type: Box::new(sql_type.clone()),
+        annotation: Default::default(),
+    });
+    let array = Scalar::null(udt.clone()).to_array(3).unwrap();
+    let expected = Scalar::null(sql_type).to_array(3).unwrap();
+    assert_eq!(array.as_ref(), expected.as_ref());
+    assert!(top_level_types_compatible(&udt, array.data_type()));
+    assert!(!top_level_types_compatible(&udt, &DataType::Boolean));
+}
+
 #[test]
 fn test_bad_right_type_array() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
