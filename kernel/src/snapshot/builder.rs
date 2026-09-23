@@ -11,7 +11,9 @@ use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{
+    validate_catalog_managed_log_tail, validate_catalog_managed_versions, LogSegment,
+};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
@@ -609,7 +611,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             .as_ref()
             .or_else(|| log_segment_files.ascending_commit_files.last())
             .map(|path| path.version);
-        Self::validate_catalog_managed_versions(
+        validate_catalog_managed_versions(
             requested_version,
             max_catalog_version,
             has_staged_commits,
@@ -692,100 +694,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
     ) -> DeltaResult<()> {
-        // Log tail must be sorted ascending and contiguous (no gaps or duplicates)
-        for pair in log_tail.windows(2) {
-            require!(
-                pair[0].version.checked_add(1) == Some(pair[1].version),
-                Error::LogTailVersionsNotContiguous {
-                    first_version: pair[0].version,
-                    second_version: pair[1].version,
-                }
-            );
-        }
-
-        // TODO: If inline commits (or any other catalog commits) are ever supported, change this
-        // method to check if there are any catalog commits.
-        let has_catalog_commits = log_tail
-            .iter()
-            .any(|p| p.file_type == LogPathFileType::StagedCommit);
-
-        Self::validate_catalog_managed_versions(
-            version,
-            max_catalog_version,
-            has_catalog_commits,
-            log_tail.last().map(|path| path.version),
-        )
-    }
-
-    fn validate_catalog_managed_versions(
-        version: Option<Version>,
-        max_catalog_version: Option<Version>,
-        has_staged_commits: bool,
-        latest_commit_version: Option<Version>,
-    ) -> DeltaResult<()> {
-        Self::validate_catalog_version_bounds(version, max_catalog_version)?;
-        Self::require_max_catalog_version_for_staged_commits(
-            has_staged_commits,
-            max_catalog_version,
-        )?;
-
-        // Log tail end version validation when max_catalog_version is set
-        if let (Some(max_cv), Some(latest_commit_version)) =
-            (max_catalog_version, latest_commit_version)
-        {
-            if let Some(ver) = version {
-                // With time-travel: last log_tail entry must be >= requested version
-                require!(
-                    latest_commit_version >= ver,
-                    Error::MaxCatalogVersion(format!(
-                        "Log tail version {} is less than requested version {ver} for max catalog \
-                         version {max_cv}",
-                        latest_commit_version
-                    ))
-                );
-            } else {
-                // Without time-travel: last log_tail entry must == max_catalog_version
-                require!(
-                    latest_commit_version == max_cv,
-                    Error::MaxCatalogVersion(format!(
-                        "Log tail version {} does not match max catalog version {max_cv}",
-                        latest_commit_version
-                    ))
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_catalog_version_bounds(
-        version: Option<Version>,
-        max_catalog_version: Option<Version>,
-    ) -> DeltaResult<()> {
-        if let (Some(version), Some(max_catalog_version)) = (version, max_catalog_version) {
-            require!(
-                version <= max_catalog_version,
-                Error::MaxCatalogVersion(format!(
-                    "Requested version {version} exceeds max catalog version {max_catalog_version}"
-                ))
-            );
-        }
-        Ok(())
-    }
-
-    fn require_max_catalog_version_for_staged_commits(
-        has_staged_commits: bool,
-        max_catalog_version: Option<Version>,
-    ) -> DeltaResult<()> {
-        require!(
-            !has_staged_commits || max_catalog_version.is_some(),
-            Error::MaxCatalogVersion(
-                "Max catalog version is required when providing staged commits. \
-                 Use with_max_catalog_version()."
-                    .to_string()
-            )
-        );
-        Ok(())
+        validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
     }
 
     /// Post-build validation: catalog-managed tables must have max_catalog_version, and

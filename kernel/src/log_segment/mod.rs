@@ -127,6 +127,90 @@ pub(crate) struct LogSegment {
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
+/// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
+pub(crate) fn validate_catalog_managed_log_tail(
+    requested_version: Option<Version>,
+    max_catalog_version: Option<Version>,
+    log_tail: &[ParsedLogPath],
+) -> DeltaResult<()> {
+    for pair in log_tail.windows(2) {
+        require!(
+            pair[0].version.checked_add(1) == Some(pair[1].version),
+            Error::LogTailVersionsNotContiguous {
+                first_version: pair[0].version,
+                second_version: pair[1].version,
+            }
+        );
+    }
+
+    // TODO: This check only recognizes staged catalog commits. Supporting inline or other catalog
+    // commit representations requires including them here.
+    let has_staged_commits = log_tail
+        .iter()
+        .any(|path| path.file_type == LogPathFileType::StagedCommit);
+    validate_catalog_managed_versions(
+        requested_version,
+        max_catalog_version,
+        has_staged_commits,
+        log_tail.last().map(|path| path.version),
+    )
+}
+
+/// Validate catalog version bounds against the staged commits available to the caller.
+pub(crate) fn validate_catalog_managed_versions(
+    requested_version: Option<Version>,
+    max_catalog_version: Option<Version>,
+    has_staged_commits: bool,
+    latest_commit_version: Option<Version>,
+) -> DeltaResult<()> {
+    require!(
+        !has_staged_commits || max_catalog_version.is_some(),
+        Error::MaxCatalogVersion(
+            "Max catalog version is required when providing staged commits. Use \
+             with_max_catalog_version()."
+                .to_string()
+        )
+    );
+
+    if let (Some(requested_version), Some(max_catalog_version)) =
+        (requested_version, max_catalog_version)
+    {
+        require!(
+            requested_version <= max_catalog_version,
+            Error::MaxCatalogVersion(format!(
+                "Requested version {requested_version} exceeds max catalog version \
+                 {max_catalog_version}"
+            ))
+        );
+    }
+
+    if let (Some(latest_commit_version), Some(max_catalog_version)) =
+        (latest_commit_version, max_catalog_version)
+    {
+        if let Some(requested_version) = requested_version {
+            require!(
+                latest_commit_version >= requested_version,
+                Error::MaxCatalogVersion(format!(
+                    "Log tail version {} is less than requested version {requested_version} for \
+                     max catalog version {max_catalog_version}",
+                    latest_commit_version
+                ))
+            );
+        } else {
+            require!(
+                latest_commit_version == max_catalog_version,
+                Error::MaxCatalogVersion(format!(
+                    "Log tail version {} does not match max catalog version \
+                     {max_catalog_version}",
+                    latest_commit_version
+                ))
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Returns the column whose non-nullness identifies a row containing `action_name`.
 fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
     action_presence_leaf(action_name).map(|leaf| ColumnName::new([action_name, leaf]))
@@ -461,6 +545,17 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
+        Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+    }
+
+    /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
+    pub(crate) fn for_table_changes_with_log_tail(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        start_version: Version,
+        end_version: impl Into<Option<Version>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> DeltaResult<Self> {
         let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
@@ -471,12 +566,10 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        // TODO(#2796): table-changes does not supply a log_tail yet. CDF over a catalog-managed
-        // table will need the catalog's commits passed here to see unbackfilled staged commits.
         let listed_files = LogSegmentFiles::list_commits(
             storage,
             &log_root,
-            vec![], // log-tail
+            log_tail,
             Some(start_version),
             end_version,
             None, // table-changes does not thread a cancellation token
