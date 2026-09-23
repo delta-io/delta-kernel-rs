@@ -34,6 +34,7 @@ bytes = "1.10"
 chrono = "0.4.41"
 chrono-tz = { version = "0.10.4", optional = true }
 crc = "3.2.2"
+derive_more = { version = "~2.1", default-features = false, features = ["constructor", "deref", "from"] }
 indexmap = "2.10.0"
 itertools = "0.14"
 percent-encoding = "2"

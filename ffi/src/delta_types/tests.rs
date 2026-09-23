@@ -446,6 +446,76 @@ fn typed_crc_accepts_full_kernel_state() {
 }
 
 #[test]
+fn typed_add_array_preserves_file_fields() {
+    let partition_value = FfiStringMapEntry {
+        key: slice("p"),
+        value: slice("one"),
+    };
+    let add = FfiAdd {
+        path: slice("p=one/part-00000.parquet"),
+        partition_values: FfiStringMap {
+            ptr: &partition_value,
+            len: 1,
+        },
+        size: 17,
+        modification_time: 19,
+        data_change: true,
+        stats: OptionalValue::None,
+        tags: OptionalValue::None,
+        deletion_vector: std::ptr::null(),
+        base_row_id: OptionalValue::None,
+        default_row_commit_version: OptionalValue::None,
+        clustering_provider: OptionalValue::None,
+    };
+    let adds = FfiAddArray { ptr: &add, len: 1 };
+
+    let actual = unsafe { adds.try_to_kernel() }.unwrap();
+    let expected = Add::from_parts(
+        "p=one/part-00000.parquet".to_string(),
+        HashMap::from([("p".to_string(), "one".to_string())]),
+        17,
+        19,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(actual, vec![expected]);
+}
+
+#[test]
+fn typed_domain_metadata_array_rejects_duplicate() {
+    let domain_metadata = [
+        FfiDomainMetadata {
+            domain: slice("example.domain"),
+            configuration: slice("first"),
+            removed: false,
+        },
+        FfiDomainMetadata {
+            domain: slice("example.domain"),
+            configuration: slice("second"),
+            removed: false,
+        },
+    ];
+    let values = FfiDomainMetadataArray {
+        ptr: domain_metadata.as_ptr(),
+        len: domain_metadata.len(),
+    };
+
+    let state = FfiDomainMetadataState {
+        kind: FfiDomainMetadataStateKind::Complete,
+        domain_metadata: values,
+    };
+    assert_result_error_with_message(
+        unsafe { state.try_to_kernel() },
+        "CRC state contains duplicate domain example.domain",
+    );
+}
+
+#[test]
 fn typed_arrays_preserve_absent_and_present_empty() {
     assert_eq!(
         Option::<&FfiStringArray>::from(&empty_strings(false))

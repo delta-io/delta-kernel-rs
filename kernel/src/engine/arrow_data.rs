@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use derive_more::From;
 use itertools::Itertools;
 use tracing::debug;
 
@@ -31,6 +32,8 @@ use crate::{DeltaResult, Error};
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
 /// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
 /// example. When in doubt, call [`fix_nested_null_masks`] first.
+#[derive(From)]
+#[from(RecordBatch, StructArray)]
 pub struct ArrowEngineData {
     data: RecordBatch,
 }
@@ -95,18 +98,6 @@ impl ArrowEngineData {
     /// Get a reference to the `RecordBatch` this `ArrowEngineData` is wrapping
     pub fn record_batch(&self) -> &RecordBatch {
         &self.data
-    }
-}
-
-impl From<RecordBatch> for ArrowEngineData {
-    fn from(value: RecordBatch) -> Self {
-        ArrowEngineData::new(value)
-    }
-}
-
-impl From<StructArray> for ArrowEngineData {
-    fn from(value: StructArray) -> Self {
-        ArrowEngineData::new(value.into())
     }
 }
 

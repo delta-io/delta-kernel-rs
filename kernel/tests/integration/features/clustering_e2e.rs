@@ -54,11 +54,11 @@ async fn test_clustered_table_write_and_checkpoint(
         Snapshot::builder_for(table_url).build(engine.as_ref())?
     } else {
         match create_result {
-            CommitResult::CommittedTransaction(committed) => committed
+            CommitResult::Committed(committed) => committed
                 .post_commit_snapshot()
                 .expect("post-commit snapshot should exist")
                 .clone(),
-            other => panic!("Expected CommittedTransaction, got: {other:?}"),
+            other => panic!("Expected Committed, got: {other:?}"),
         }
     };
 

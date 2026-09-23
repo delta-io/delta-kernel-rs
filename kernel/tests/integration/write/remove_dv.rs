@@ -441,7 +441,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     let result = txn.commit(engine.as_ref())?;
 
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
             // Read the commit log directly to verify remove actions
@@ -745,7 +745,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     let result = txn.commit(engine.as_ref())?;
 
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
             // Read the original version 1 log to get original file metadata
@@ -1261,7 +1261,7 @@ async fn test_update_deletion_vectors_multiple_files(
     let result = txn.commit(engine.as_ref())?;
 
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
             // Read the commit log directly from object store
@@ -1584,7 +1584,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         let result = txn.commit(engine.as_ref());
 
         match result? {
-            CommitResult::CommittedTransaction(committed) => {
+            CommitResult::Committed(committed) => {
                 assert_eq!(committed.commit_version(), 2);
 
                 let new_snapshot = Snapshot::builder_for(table_url.clone())
@@ -1767,7 +1767,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         let result = txn.commit(engine.as_ref())?;
 
         match result {
-            CommitResult::CommittedTransaction(committed) => {
+            CommitResult::Committed(committed) => {
                 assert_eq!(committed.commit_version(), 6);
 
                 // Verify that exactly 2 files were removed (1 from each batch)

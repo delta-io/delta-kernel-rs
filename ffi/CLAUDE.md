@@ -15,6 +15,10 @@ FFI boundary, or when the type is not representable in C/C++ (dyn trait referenc
 options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelError`,
 `KernelStringSlice`, and `EngineIterator` do not need handles.
 
+Borrowed record arrays use `FfiSlice<T>`: empty slices accept null or non-null pointers, while
+non-empty slices require a non-null pointer. The pointed-to storage is never owned.
+Descriptive aliases identify each public array's element type.
+
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
 
 Handle parameters follow one of two ownership contracts:
@@ -98,6 +102,8 @@ builder (`ffi/src/commit_range.rs`):
 ```
 commit_range_builder_for(path, start_version, engine)
   -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
+  -> commit_range_builder_set_log_tail(builder, log_tail, max)    // optional catalog commits
+  -> commit_range_builder_set_max_catalog_version(builder, max)   // optional without a log tail
   -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
   -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
        // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)
