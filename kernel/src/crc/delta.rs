@@ -143,6 +143,14 @@ impl Crc {
             delta.is_incremental_safe,
         );
 
+        // These fields describe one exact table version and are not maintained by incremental
+        // replay. Keeping them would make the advanced CRC expose stale state.
+        self.txn_id = None;
+        self.all_files = None;
+        self.num_deleted_records_opt = None;
+        self.num_deletion_vectors_opt = None;
+        self.deleted_record_counts_histogram_opt = None;
+
         self.version = new_version;
         self
     }
@@ -217,8 +225,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{DomainMetadata, Metadata, Protocol};
-    use crate::crc::{is_incremental_safe_operation, FileSizeHistogram, SetTransactionState};
+    use crate::actions::{Add, DomainMetadata, Metadata, Protocol};
+    use crate::crc::{
+        is_incremental_safe_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
+        SetTransactionState,
+    };
 
     fn base_crc() -> Crc {
         Crc {
@@ -335,6 +346,27 @@ mod tests {
         assert_eq!(stats.table_size_bytes(), 1600); // 1000 + 600
         assert!(crc.file_stats_state.is_complete());
         assert_eq!(crc.version, 1);
+    }
+
+    #[test]
+    fn test_apply_drops_version_specific_extended_fields() {
+        let crc = Crc {
+            txn_id: Some("txn".to_string()),
+            all_files: Some(vec![Add::default()]),
+            num_deleted_records_opt: Some(0),
+            num_deletion_vectors_opt: Some(0),
+            deleted_record_counts_histogram_opt: Some(
+                DeletedRecordCountsHistogram::try_new(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            ),
+            ..base_crc()
+        }
+        .apply(CrcDelta::default(), 1);
+
+        assert_eq!(crc.txn_id, None);
+        assert_eq!(crc.all_files, None);
+        assert_eq!(crc.num_deleted_records_opt, None);
+        assert_eq!(crc.num_deletion_vectors_opt, None);
+        assert_eq!(crc.deleted_record_counts_histogram_opt, None);
     }
 
     /// Applies multiple commit deltas sequentially.

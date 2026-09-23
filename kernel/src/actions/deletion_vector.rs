@@ -9,6 +9,7 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::{internal_api, ToSchema};
 use roaring::RoaringTreemap;
+use serde::Deserialize;
 use url::Url;
 
 use crate::schema::DataType;
@@ -24,6 +25,8 @@ const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 /// Magic number for native RoaringBitmap serialization format.
 /// This format is reserved for future use and not currently supported.
 const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
+
+const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
@@ -124,12 +127,9 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    test,
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: DeletionVectorStorageType,
@@ -159,6 +159,30 @@ pub struct DeletionVectorDescriptor {
 
     /// Number of rows the given DV logically removes from the file.
     pub cardinality: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletionVectorRaw {
+    storage_type: String,
+    path_or_inline_dv: String,
+    offset: Option<i32>,
+    size_in_bytes: i32,
+    cardinality: i64,
+}
+
+impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
+    type Error = Error;
+
+    fn try_from(raw: DeletionVectorRaw) -> DeltaResult<Self> {
+        Self::try_new(
+            raw.storage_type.parse()?,
+            raw.path_or_inline_dv,
+            raw.offset,
+            raw.size_in_bytes,
+            raw.cardinality,
+        )
+    }
 }
 
 impl DeletionVectorDescriptor {
@@ -325,7 +349,16 @@ impl DeletionVectorDescriptor {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
-                let magic = slice_to_u32(&byte_slice[0..4], Endian::Little)?;
+                require!(
+                    byte_slice.len() >= INLINE_DELETION_VECTOR_MAGIC_SIZE,
+                    Error::deletion_vector(
+                        "Inline deletion vector payload must contain at least 4 bytes"
+                    )
+                );
+                let magic = slice_to_u32(
+                    &byte_slice[..INLINE_DELETION_VECTOR_MAGIC_SIZE],
+                    Endian::Little,
+                )?;
                 match magic {
                     ROARING_BITMAP_PORTABLE_MAGIC => {
                         RoaringTreemap::deserialize_from(&byte_slice[4..])
@@ -624,6 +657,28 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_deserialization_uses_validating_constructor() {
+        let valid = r#"{
+            "storageType":"i",
+            "pathOrInlineDv":"",
+            "sizeInBytes":0,
+            "cardinality":0
+        }"#;
+        let descriptor: DeletionVectorDescriptor = serde_json::from_str(valid).unwrap();
+        assert_eq!(descriptor.storage_type, DeletionVectorStorageType::Inline);
+
+        let invalid = r#"{
+            "storageType":"i",
+            "pathOrInlineDv":"",
+            "offset":1,
+            "sizeInBytes":0,
+            "cardinality":0
+        }"#;
+        let error = serde_json::from_str::<DeletionVectorDescriptor>(invalid).unwrap_err();
+        assert!(error.to_string().contains("must not carry an offset"));
+    }
+
+    #[test]
     fn test_deletion_vector_absolute_path() {
         let parent = Url::parse("s3://mytable/").unwrap();
 
@@ -740,6 +795,37 @@ mod tests {
         for i in [1, 2, 8, 17, 55, 200] {
             assert!(!tree_map.contains(i));
         }
+    }
+
+    #[rstest::rstest]
+    #[case::empty(vec![], "at least 4 bytes")]
+    #[case::one_byte(vec![0], "at least 4 bytes")]
+    #[case::two_bytes(vec![0, 1], "at least 4 bytes")]
+    #[case::three_bytes(vec![0, 1, 2], "at least 4 bytes")]
+    #[case::invalid_magic(vec![0, 0, 0, 0], "Invalid magic")]
+    fn test_inline_read_rejects_malformed_payload(
+        #[case] bytes: Vec<u8>,
+        #[case] expected_error: &str,
+    ) {
+        let encoded = z85::encode(&bytes);
+        let inline = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            encoded,
+            None,
+            bytes.len() as i32,
+            0,
+        )
+        .unwrap();
+        let sync_engine = SyncEngine::new();
+        let storage = sync_engine.storage_handler();
+        let parent = Url::parse("http://not.used").unwrap();
+
+        let error = inline.read(storage, &parent).unwrap_err();
+        assert!(matches!(&error, Error::DeletionVector(_)));
+        assert!(
+            error.to_string().contains(expected_error),
+            "expected error containing {expected_error:?}, got {error}"
+        );
     }
 
     #[test]

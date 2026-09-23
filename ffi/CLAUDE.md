@@ -98,6 +98,8 @@ builder (`ffi/src/commit_range.rs`):
 ```
 commit_range_builder_for(path, start_version, engine)
   -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
+  -> commit_range_builder_set_log_tail(builder, log_tail, max)    // optional catalog commits
+  -> commit_range_builder_set_max_catalog_version(builder, max)   // optional without a log tail
   -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
   -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
        // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)

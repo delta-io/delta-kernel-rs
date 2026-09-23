@@ -259,22 +259,22 @@ persisted:
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Created table at version {}", committed.commit_version());
     }
-    CommitResult::ConflictedTransaction(_) => {
+    CommitResult::Conflicted(_) => {
         // Another writer created the table concurrently
     }
-    CommitResult::RetryableTransaction(retry) => {
+    CommitResult::Retryable(retry) => {
         // Transient I/O error. Safe to retry.
         println!("Retryable error: {}", retry.error);
     }
 }
 ```
 
-For table creation, `CommittedTransaction` is the expected result (version 0).
-`ConflictedTransaction` means another process created the table between your existence
-check and commit. `RetryableTransaction` indicates a transient error.
+For table creation, `CommitResult::Committed` is the expected result (version 0).  `Conflicted`
+means another process created the table between your existence check and commit. `Retryable`
+indicates a transient error.
 
 ## Validations
 

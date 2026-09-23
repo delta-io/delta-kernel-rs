@@ -186,21 +186,16 @@ mod tests {
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
-    use crate::table_features::TableFeature;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
+        adaptive_metadata_table_configuration, assert_result_error_with_message,
+        test_schema_flat_with_column_mapping, MockTableConfigurationBuilder,
     };
     use crate::{create_row, Engine};
 
     fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
-        let table_config = MockTableConfigurationBuilder::new()
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([TableFeature::AdaptiveMetadataPreview])
-                    .build(),
-            )
-            .build();
+        let table_config =
+            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
         (
             table_config.protocol().clone(),
             table_config.metadata().clone(),

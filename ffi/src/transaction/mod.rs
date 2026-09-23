@@ -135,16 +135,14 @@ fn commit_result_to_committed_handle<S>(
     result: DeltaResult<CommitResult<S>>,
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
-        CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
-        CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
+        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
+        CommitResult::Retryable(_) => Err(delta_kernel::Error::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
-        CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            )))
-        }
+        CommitResult::Conflicted(conflicted) => Err(delta_kernel::Error::Generic(format!(
+            "commit conflict at version {}",
+            conflicted.conflict_version()
+        ))),
     }
 }
 
@@ -2353,18 +2351,21 @@ mod tests {
                             state,
                             kernel_string_slice!(name),
                             nullable,
+                            std::ptr::null(),
                             allocate_err,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
+                            std::ptr::null(),
                             allocate_err,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
+                            std::ptr::null(),
                             allocate_err,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
@@ -2380,6 +2381,7 @@ mod tests {
                 field_ids.as_ptr(),
                 field_ids.len(),
                 false,
+                std::ptr::null(),
                 allocate_err,
             ))
         }

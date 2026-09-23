@@ -769,50 +769,43 @@ impl FfiFileStatsState {
 }
 
 impl FfiSetTransactionArray {
-    unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, SetTransaction>> {
+    unsafe fn try_to_vec(&self) -> DeltaResult<Vec<SetTransaction>> {
         let values = unsafe { raw_slice(self, self.ptr, self.len, "set-transaction array") }?;
-        let mut result = HashMap::with_capacity(values.len());
-        for value in values {
-            let key = unsafe { value.app_id.try_to_string() }?;
-            result.insert(key, unsafe { value.try_to_kernel() }?);
-        }
-        Ok(result)
+        values
+            .iter()
+            .map(|value| unsafe { value.try_to_kernel() })
+            .collect()
     }
 }
 
 impl FfiSetTransactionState {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<SetTransactionState> {
-        let transactions = unsafe { self.transactions.try_to_hash_map() }?;
+        let transactions = unsafe { self.transactions.try_to_vec() }?;
         match self.kind {
-            FfiSetTransactionStateKind::Complete => Ok(SetTransactionState::Complete(transactions)),
-            FfiSetTransactionStateKind::Partial => Ok(SetTransactionState::Partial(transactions)),
+            FfiSetTransactionStateKind::Complete => SetTransactionState::try_complete(transactions),
+            FfiSetTransactionStateKind::Partial => SetTransactionState::try_partial(transactions),
         }
     }
 }
 
 impl FfiDomainMetadataArray {
-    unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, DomainMetadata>> {
-        Ok(
-            unsafe { raw_slice(self, self.ptr, self.len, "domain-metadata array") }?
-                .iter()
-                .map(|value| unsafe { value.try_to_kernel() })
-                .collect::<DeltaResult<Vec<_>>>()?
-                .into_iter()
-                .map(|value| (value.domain().to_string(), value))
-                .collect(),
-        )
+    unsafe fn try_to_vec(&self) -> DeltaResult<Vec<DomainMetadata>> {
+        unsafe { raw_slice(self, self.ptr, self.len, "domain-metadata array") }?
+            .iter()
+            .map(|value| unsafe { value.try_to_kernel() })
+            .collect()
     }
 }
 
 impl FfiDomainMetadataState {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DomainMetadataState> {
-        let domain_metadata = unsafe { self.domain_metadata.try_to_hash_map() }?;
+        let domain_metadata = unsafe { self.domain_metadata.try_to_vec() }?;
         match self.kind {
             FfiDomainMetadataStateKind::Complete => {
-                Ok(DomainMetadataState::Complete(domain_metadata))
+                DomainMetadataState::try_complete(domain_metadata)
             }
             FfiDomainMetadataStateKind::Partial => {
-                Ok(DomainMetadataState::Partial(domain_metadata))
+                DomainMetadataState::try_partial(domain_metadata)
             }
         }
     }
@@ -821,9 +814,9 @@ impl FfiDomainMetadataState {
 impl FfiDeletedRecordCountsHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DeletedRecordCountsHistogram> {
         let (ptr, len) = self.deleted_record_counts.as_raw_parts();
-        Ok(DeletedRecordCountsHistogram::from_parts(
+        DeletedRecordCountsHistogram::try_new(
             unsafe { raw_slice(self, ptr, len, "deleted-record-count histogram") }?.to_vec(),
-        ))
+        )
     }
 }
 
@@ -839,7 +832,7 @@ impl FfiCrc {
             unsafe { self.deleted_record_counts_histogram.as_ref() }
                 .map(|value| unsafe { value.try_to_kernel() })
                 .transpose()?;
-        Ok(Crc::from_parts(
+        Crc::try_from_parts(
             self.version,
             unsafe { self.metadata.try_to_kernel() }?,
             unsafe { self.protocol.try_to_kernel() }?,
@@ -852,7 +845,7 @@ impl FfiCrc {
             Option::<&i64>::from(&self.num_deleted_records).copied(),
             Option::<&i64>::from(&self.num_deletion_vectors).copied(),
             deleted_record_counts_histogram,
-        ))
+        )
     }
 }
 
