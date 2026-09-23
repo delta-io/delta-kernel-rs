@@ -241,3 +241,100 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     assert!(schema.field("name").is_some());
     assert_eq!(schema.num_fields(), 2);
 }
+
+// === lastManifestCommit capture ===
+
+// A commit line carrying both P&M (so a snapshot can load) and a `commitInfo.lastManifestCommit`.
+fn commit_with_last_manifest_commit(lmc_version: i64, content_root_version: i64) -> String {
+    let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
+    [
+        serde_json::json!({ "commitInfo": {
+            "lastManifestCommit": { "version": lmc_version, "contentRootVersion": content_root_version }
+        } }),
+        serde_json::json!({ "protocol": config.protocol() }),
+        serde_json::json!({ "metaData": config.metadata() }),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+// A `commitInfo`-only commit line carrying a `lastManifestCommit` (no P&M).
+fn commit_info_last_manifest_commit(lmc_version: i64, content_root_version: i64) -> String {
+    serde_json::json!({ "commitInfo": {
+        "lastManifestCommit": { "version": lmc_version, "contentRootVersion": content_root_version }
+    } })
+    .to_string()
+}
+
+// A freshly-loaded snapshot reports the newest commit's `lastManifestCommit`, whether the replay
+// captured it (non-plan path) or it is read lazily (plan path). The newest commit wins and its two
+// sub-fields are carried independently.
+#[tokio::test]
+async fn test_load_reports_newest_last_manifest_commit() {
+    check_last_manifest_commit(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_last_manifest_commit(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn check_last_manifest_commit<E: Engine>(make_engine: impl FnOnce(Arc<InMemory>) -> E) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        commit_with_last_manifest_commit(5, 3),
+    )
+    .await
+    .unwrap();
+    // Newest commit carries a distinct value and no P&M (P&M come from v0).
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        commit_info_last_manifest_commit(9, 7),
+    )
+    .await
+    .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(snapshot.version(), 1);
+    let lmc = snapshot
+        .last_manifest_commit(&engine)
+        .unwrap()
+        .expect("lastManifestCommit present");
+    assert_eq!((lmc.version, lmc.content_root_version), (9, 7));
+    // A second call is served from the cache (and must agree).
+    let again = snapshot.last_manifest_commit(&engine).unwrap().unwrap();
+    assert_eq!((again.version, again.content_root_version), (9, 7));
+}
+
+// A table whose commits carry no `lastManifestCommit` reports `None`.
+#[tokio::test]
+async fn test_load_reports_none_when_absent() {
+    check_absent_last_manifest_commit(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_absent_last_manifest_commit(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn check_absent_last_manifest_commit<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), None);
+}

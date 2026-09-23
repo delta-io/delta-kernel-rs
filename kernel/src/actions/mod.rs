@@ -873,6 +873,35 @@ impl Protocol {
     }
 }
 
+/// Identifies the most recent manifest commit, recorded in [`CommitInfo`] so readers can locate
+/// the latest checkpoint action without scanning the whole log. Each commit carries this value
+/// forward from its predecessor, and a manifest commit updates it to its own version and
+/// content-root version.
+///
+/// See the adaptiveMetadata `lastManifestCommit` protocol RFC (delta-io/delta#7533).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
+#[internal_api]
+#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+pub(crate) struct LastManifestCommit {
+    /// The version of the manifest commit that emitted the latest checkpoint action.
+    pub(crate) version: i64,
+    /// The `contentRoot.version` of that checkpoint action. Never newer than `version`.
+    pub(crate) content_root_version: i64,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl LastManifestCommit {
+    /// Creates a `LastManifestCommit` pointing at the manifest commit at `version` whose checkpoint
+    /// action has content root `content_root_version`.
+    pub(crate) fn new(version: i64, content_root_version: i64) -> Self {
+        LastManifestCommit {
+            version,
+            content_root_version,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
@@ -907,6 +936,11 @@ pub(crate) struct CommitInfo {
     pub(crate) txn_id: Option<String>,
     /// Map of tags associated with this commit.
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
+    /// Identifies the most recent manifest commit, carried forward across commits so readers can
+    /// find the latest checkpoint action without a full log scan. Populated only on tables that
+    /// support `adaptiveMetadata-preview`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
 }
 
 impl CommitInfo {
@@ -928,6 +962,8 @@ impl CommitInfo {
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
             tags: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: None,
         }
     }
 
@@ -2114,6 +2150,7 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let expected = schema_ref! {
             nullable "commitInfo": {
                 nullable "timestamp": LONG,
@@ -2126,6 +2163,25 @@ mod tests {
                 nullable "engineInfo": STRING,
                 nullable "txnId": STRING,
                 nullable "tags": { STRING => nullable STRING },
+            },
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = schema_ref! {
+            nullable "commitInfo": {
+                nullable "timestamp": LONG,
+                nullable "inCommitTimestamp": LONG,
+                nullable "operation": STRING,
+                nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
+                nullable "kernelVersion": STRING,
+                nullable "isBlindAppend": BOOLEAN,
+                nullable "engineInfo": STRING,
+                nullable "txnId": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                nullable "lastManifestCommit": {
+                    not_null "version": LONG,
+                    not_null "contentRootVersion": LONG,
+                },
             },
         };
         assert_eq!(schema, expected);

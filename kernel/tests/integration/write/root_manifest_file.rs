@@ -55,6 +55,105 @@ async fn setup_adaptive_metadata_table(
     Ok((engine, temp_dir, table_url, snapshot))
 }
 
+/// Reads the single `commitInfo` action from the commit at `version`.
+fn read_commit_info(
+    table_url: &Url,
+    version: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut commit_infos = read_actions_from_commit(table_url, version, "commitInfo")?;
+    assert_eq!(commit_infos.len(), 1, "expected exactly one commitInfo");
+    Ok(commit_infos.remove(0))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_last_manifest_commit_is_written_and_carried_forward(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_last_manifest_commit").await?;
+
+    // Manifest commit at version 1 records itself: version == contentRootVersion == 1.
+    let file = FileMeta {
+        location: table_url.join("metadata/root-v1.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    let snapshot = begin_transaction(snapshot, &engine)?
+        .with_root_manifest_file(file)?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(
+        read_commit_info(&table_url, 1)?["lastManifestCommit"],
+        json!({"version": 1, "contentRootVersion": 1})
+    );
+
+    // A following regular commit (version 2) carries the value forward unchanged.
+    begin_transaction(snapshot, &engine)?
+        .with_domain_metadata("my.domain".to_string(), "v1".to_string())
+        .commit(&engine)?
+        .unwrap_committed();
+    assert_eq!(
+        read_commit_info(&table_url, 2)?["lastManifestCommit"],
+        json!({"version": 1, "contentRootVersion": 1})
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_last_manifest_commit_carried_forward_from_freshly_loaded_snapshot(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_fresh_load_carry").await?;
+
+    // Manifest commit at version 1.
+    let file = FileMeta {
+        location: table_url.join("metadata/root-v1.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    begin_transaction(snapshot, &engine)?
+        .with_root_manifest_file(file)?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    // Reload a FRESH snapshot (not the post-commit one) so the value comes from log replay
+    // capture, then a regular commit must still carry it forward.
+    let reloaded = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    begin_transaction(reloaded, &engine)?
+        .with_domain_metadata("my.domain".to_string(), "v1".to_string())
+        .commit(&engine)?
+        .unwrap_committed();
+
+    assert_eq!(
+        read_commit_info(&table_url, 2)?["lastManifestCommit"],
+        json!({"version": 1, "contentRootVersion": 1})
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_regular_commit_without_prior_manifest_commit_omits_last_manifest_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_no_prior_manifest").await?;
+
+    // A regular commit with no preceding manifest commit has nothing to carry forward.
+    begin_transaction(snapshot, &engine)?
+        .with_domain_metadata("my.domain".to_string(), "v1".to_string())
+        .commit(&engine)?
+        .unwrap_committed();
+
+    let commit_info = read_commit_info(&table_url, 1)?;
+    assert!(
+        commit_info
+            .get("lastManifestCommit")
+            .is_none_or(serde_json::Value::is_null),
+        "expected no lastManifestCommit, got: {commit_info}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_action(
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -8,6 +8,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::LastManifestCommitVisitor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
@@ -409,6 +413,43 @@ impl ParsedLogPath<FileMeta> {
             }
             Some(Err(err)) => Err(err),
             None => Err(Error::generic("Commit file contains no actions")),
+        }
+    }
+
+    /// Reads this commit file's `commitInfo.lastManifestCommit`, if present.
+    ///
+    /// This method performs IO by reading the commit log file from storage. Unlike the in-commit
+    /// timestamp, the field is optional: `Ok(None)` is returned when the commit has no
+    /// `lastManifestCommit` (older commits, or tables without adaptiveMetadata).
+    ///
+    /// Errors if called on a non-commit file.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn read_last_manifest_commit(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<LastManifestCommit>> {
+        if !self.is_commit() {
+            return Err(Error::generic(format!(
+                "read_last_manifest_commit can only be called on commit files, got: {:?}",
+                self.file_type
+            )));
+        }
+
+        let mut action_iter = engine.json_handler().read_json_files(
+            slice::from_ref(&self.location),
+            LastManifestCommitVisitor::schema(),
+            None,
+        )?;
+
+        // commitInfo MUST be the first action, so only the first batch is inspected.
+        match action_iter.next() {
+            Some(Ok(actions)) => {
+                let mut visitor = LastManifestCommitVisitor::default();
+                visitor.visit_rows_of(actions.as_ref())?;
+                Ok(visitor.last_manifest_commit)
+            }
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
         }
     }
 }
@@ -1271,6 +1312,28 @@ pub(crate) mod tests {
         assert_result_error_with_message(
             result,
             "read_in_commit_timestamp can only be called on commit files",
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_read_last_manifest_commit_rejects_non_commit_file() {
+        let engine = SyncEngine::new();
+        let table_url = url::Url::try_from("file:///tmp/test_table").unwrap();
+        let checkpoint_path = table_url
+            .join("_delta_log/00000000000000000000.checkpoint.parquet")
+            .unwrap();
+        let parsed_path = ParsedLogPath::try_from(FileMeta {
+            location: checkpoint_path,
+            last_modified: 0,
+            size: 100,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_result_error_with_message(
+            parsed_path.read_last_manifest_commit(&engine),
+            "read_last_manifest_commit can only be called on commit files",
         );
     }
 

@@ -9,6 +9,8 @@ use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
 use crate::cancellation::CancellationTokenRef;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -194,10 +196,13 @@ impl Snapshot {
             .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let mut last_manifest_commit = LastManifestCommitResolution::Unresolved;
         let (new_metadata, new_protocol, source) = match &crc_at_version {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
-                // creation.
+                // creation. P&M come from the CRC without reading commits, so `lastManifestCommit`
+                // stays unresolved (read lazily on first access).
                 let new_metadata = (crc.metadata != *existing_table_config.metadata())
                     .then(|| crc.metadata.clone());
                 let new_protocol = (crc.protocol != *existing_table_config.protocol())
@@ -212,10 +217,15 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
-                combined_log_segment
+                let resolution = combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
-                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    last_manifest_commit = resolution.last_manifest_commit;
+                }
+                (resolution.metadata, resolution.protocol, resolution.source)
             }
         };
         emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
@@ -228,13 +238,18 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
-        Ok(Arc::new(Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
             built_as_latest,
             skipped_new_checkpoints,
-        )?))
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let LastManifestCommitResolution::Resolved(value) = last_manifest_commit {
+            let _ = snapshot.last_manifest_commit.set(value);
+        }
+        Ok(Arc::new(snapshot))
     }
 
     // ============================================================================

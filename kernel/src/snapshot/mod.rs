@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, info, instrument, warn};
@@ -12,6 +14,8 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -24,6 +28,8 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
@@ -93,6 +99,11 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// Cached `commitInfo.lastManifestCommit` at this snapshot's version. Filled (`set`) when
+    /// resolved at construction (post-commit seed or log-replay capture); empty means unresolved,
+    /// so [`Snapshot::last_manifest_commit`] reads it lazily once and caches it here.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    last_manifest_commit: OnceLock<Option<LastManifestCommit>>,
 }
 
 impl PartialEq for Snapshot {
@@ -200,6 +211,8 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: OnceLock::new(),
         })
     }
 
@@ -227,11 +240,22 @@ impl Snapshot {
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full).
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let mut last_manifest_commit = LastManifestCommitResolution::Unresolved;
         let (metadata, protocol, source) = match &crc_at_version {
+            // P&M come from the CRC without reading commits, so `lastManifestCommit` stays
+            // unresolved (read lazily on first access).
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
-            None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
-                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
+            None => {
+                let checked = log_segment
+                    .read_protocol_metadata(engine, base_crc.as_ref())
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    last_manifest_commit = checked.last_manifest_commit;
+                }
+                (checked.metadata, checked.protocol, checked.source)
+            }
         };
         emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
 
@@ -241,13 +265,18 @@ impl Snapshot {
         tracing::Span::current().record("version", table_configuration.version());
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(
+        let snapshot = Self::new_with_crc(
             log_segment,
             table_configuration,
             crc,
             built_as_latest,
             false, /* skipped_new_checkpoints */
-        )
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let LastManifestCommitResolution::Resolved(value) = last_manifest_commit {
+            let _ = snapshot.last_manifest_commit.set(value);
+        }
+        Ok(snapshot)
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -293,6 +322,11 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
+        // The transaction computed the `lastManifestCommit` it wrote; carry it onto the post-commit
+        // snapshot so a follow-up commit reads it with no I/O.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let last_manifest_commit = crc_delta.last_manifest_commit.clone();
+
         // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
         // a stale base is carried forward unadvanced.
         let new_crc = match self.crc_at_version() {
@@ -303,13 +337,16 @@ impl Snapshot {
         };
 
         // A successful commit means the post-commit snapshot is the latest version.
-        Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
             new_crc,
             true, /* built_as_latest */
             self.skipped_new_checkpoints,
-        )
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let _ = snapshot.last_manifest_commit.set(last_manifest_commit);
+        Ok(snapshot)
     }
 
     // ============================================================================
@@ -871,6 +908,35 @@ impl Snapshot {
             }
             None => Err(Error::MissingVersion(self.version())),
         }
+    }
+
+    /// The `commitInfo.lastManifestCommit` at this snapshot's version, or `None` if the table has
+    /// none (no manifest commit yet, or a non-adaptiveMetadata table).
+    ///
+    /// Returns the value resolved at construction (post-commit seed or log-replay capture) with no
+    /// I/O. If it was left unresolved (a CRC-at-version load, or the declarative-plan replay path),
+    /// the latest commit file is read once and the result cached for subsequent calls.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn last_manifest_commit(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<LastManifestCommit>> {
+        if let Some(value) = self.last_manifest_commit.get() {
+            return Ok(value.clone());
+        }
+        let value = match &self.log_segment.listed.latest_commit_file {
+            Some(commit_file_meta) => commit_file_meta.read_last_manifest_commit(engine)?,
+            None => None,
+        };
+        let _ = self.last_manifest_commit.set(value.clone());
+        Ok(value)
+    }
+
+    /// Seeds the cached `lastManifestCommit` (see [`Snapshot::last_manifest_commit`]) with a value
+    /// resolved at construction, so later reads need no I/O. No-op if already set.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn seed_last_manifest_commit(&self, value: Option<LastManifestCommit>) {
+        let _ = self.last_manifest_commit.set(value);
     }
 
     /// Get the timestamp for this snapshot's version, in milliseconds since the Unix epoch.

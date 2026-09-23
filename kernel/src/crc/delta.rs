@@ -12,6 +12,8 @@ use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::Version;
 
@@ -31,6 +33,11 @@ pub(crate) struct CrcDelta {
     /// In-commit timestamp at `Y`. Replaces the base's ICT unconditionally
     /// (whether `Some` or `None`).
     pub(crate) in_commit_timestamp: Option<i64>,
+    /// The `lastManifestCommit` written at `Y`. Carrier ONLY: it seeds the post-commit snapshot's
+    /// cached value (see `Snapshot::last_manifest_commit`); it is NOT persisted into the [`Crc`]
+    /// and is ignored by [`Crc::apply`] / [`CrcDelta::into_complete_crc`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
     /// `false` whenever they observe a signal that makes incremental tracking unsound (for

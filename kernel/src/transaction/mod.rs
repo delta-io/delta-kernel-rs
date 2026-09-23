@@ -10,6 +10,8 @@ use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
@@ -481,6 +483,34 @@ impl<S> Transaction<S> {
         {
             kernel_commit_info.set_row_tracking_preserved();
         }
+
+        // On adaptiveMetadata tables, record `lastManifestCommit`: a manifest commit points at
+        // itself (content root version equals the commit version), while a regular commit carries
+        // forward the value the read snapshot already holds (no I/O). The value is written to this
+        // commit's `commitInfo` and threaded into the CRC delta so the post-commit snapshot carries
+        // it forward.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let last_manifest_commit = if self
+            .effective_table_config
+            .is_feature_supported(&TableFeature::AdaptiveMetadataPreview)
+        {
+            if self.root_manifest_file.is_some() {
+                let commit_version = version_as_i64(self.get_commit_version())?;
+                Some(LastManifestCommit::new(commit_version, commit_version))
+            } else {
+                self.read_snapshot_opt
+                    .as_ref()
+                    .map(|snapshot| snapshot.last_manifest_commit(engine))
+                    .transpose()?
+                    .flatten()
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            kernel_commit_info.last_manifest_commit = last_manifest_commit.clone();
+        }
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions based on emit flags
@@ -580,8 +610,13 @@ impl<S> Transaction<S> {
                     prepare_duration,
                     committer_duration,
                 );
-                let crc_delta =
-                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
+                let crc_delta = self.build_crc_delta(
+                    file_stats,
+                    in_commit_timestamp,
+                    dm_changes,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
+                )?;
                 Ok(CommitResult::CommittedTransaction(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
@@ -1416,6 +1451,8 @@ impl<S> Transaction<S> {
                     .table_root()
                     .join("_delta_log/")?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                let last_manifest_commit = crc_delta.last_manifest_commit.clone();
                 let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
                     Error::internal_error("CREATE TABLE CRC delta is missing protocol or metadata")
                 })?;
@@ -1430,6 +1467,8 @@ impl<S> Transaction<S> {
                     true,  /* built_as_latest */
                     false, /* skipped_new_checkpoints */
                 )?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                snapshot.seed_last_manifest_commit(last_manifest_commit);
                 (stats, Arc::new(snapshot))
             }
         };
@@ -1448,6 +1487,9 @@ impl<S> Transaction<S> {
         file_stats: FileStatsDelta,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
+        #[cfg(feature = "adaptive-metadata-in-dev")] last_manifest_commit: Option<
+            LastManifestCommit,
+        >,
     ) -> DeltaResult<CrcDelta> {
         // TODO: drop these conversions by migrating the upstream chain
         //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
@@ -1483,6 +1525,8 @@ impl<S> Transaction<S> {
             set_transactions,
             in_commit_timestamp,
             is_incremental_safe,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit,
         })
     }
 

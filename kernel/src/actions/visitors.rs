@@ -750,6 +750,74 @@ impl RowVisitor for InCommitTimestampVisitor {
     }
 }
 
+/// Extracts the `commitInfo.lastManifestCommit` object from a commit, if present. The
+/// [`EngineData`] being visited must have the schema returned by
+/// [`LastManifestCommitVisitor::schema`].
+///
+/// Like the in-commit timestamp, `lastManifestCommit` lives in the `commitInfo` action, which is
+/// the first action in a commit, so only the first row is inspected. The field is optional (older
+/// commits and non-adaptiveMetadata tables omit it), so absence leaves `last_manifest_commit` as
+/// `None`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+pub(crate) struct LastManifestCommitVisitor {
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl LastManifestCommitVisitor {
+    /// The schema this visitor expects the data to have.
+    pub(crate) fn schema() -> SchemaRef {
+        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            nullable COMMIT_INFO_NAME: {
+                nullable "lastManifestCommit": {
+                    nullable "version": LONG,
+                    nullable "contentRootVersion": LONG,
+                },
+            },
+        };
+        SCHEMA.clone()
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl RowVisitor for LastManifestCommitVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![
+                column_name!("commitInfo.lastManifestCommit.version"),
+                column_name!("commitInfo.lastManifestCommit.contentRootVersion"),
+            ];
+            let types = vec![DataType::LONG, DataType::LONG];
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 2,
+            Error::InternalError(format!(
+                "Wrong number of LastManifestCommitVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        if row_count == 0 {
+            return Ok(());
+        }
+        // commitInfo is the first action in a commit; both sub-fields are required when the object
+        // is present, so treat either being null as "no lastManifestCommit".
+        let version = getters[0].get_long(0, "commitInfo.lastManifestCommit.version")?;
+        let content_root_version =
+            getters[1].get_long(0, "commitInfo.lastManifestCommit.contentRootVersion")?;
+        if let (Some(version), Some(content_root_version)) = (version, content_root_version) {
+            self.last_manifest_commit =
+                Some(LastManifestCommit::new(version, content_root_version));
+        }
+        Ok(())
+    }
+}
+
 // === Checkpoint action (adaptiveMetadata) ===
 
 /// Extracts the first `checkpoint` action found, leaving `checkpoint` as `None` if a batch has
@@ -2020,6 +2088,41 @@ mod tests {
             vec![commit_info_action(), add_action()],
             Some(1677811178585), // Retrieved ICT
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn visit_last_manifest_commit(commit_json: &str) -> Option<LastManifestCommit> {
+        let engine = SyncEngine::new();
+        let data = engine
+            .json_handler()
+            .parse_json(
+                string_array_to_engine_data(StringArray::from(vec![commit_json])),
+                LastManifestCommitVisitor::schema(),
+            )
+            .unwrap();
+        let mut visitor = LastManifestCommitVisitor::default();
+        visitor.visit_rows_of(data.as_ref()).unwrap();
+        visitor.last_manifest_commit
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::present(
+        r#"{"commitInfo":{"lastManifestCommit":{"version":7,"contentRootVersion":4}}}"#,
+        Some(LastManifestCommit::new(7, 4))
+    )]
+    #[case::absent(r#"{"commitInfo":{"timestamp":1}}"#, None)]
+    // Both sub-fields are required; either missing means no lastManifestCommit.
+    #[case::only_version(r#"{"commitInfo":{"lastManifestCommit":{"version":7}}}"#, None)]
+    #[case::only_content_root(
+        r#"{"commitInfo":{"lastManifestCommit":{"contentRootVersion":4}}}"#,
+        None
+    )]
+    fn last_manifest_commit_visitor(
+        #[case] commit_json: &str,
+        #[case] expected: Option<LastManifestCommit>,
+    ) {
+        assert_eq!(visit_last_manifest_commit(commit_json), expected);
     }
 
     // Helper to create a boolean batch for SelectionVectorVisitor tests

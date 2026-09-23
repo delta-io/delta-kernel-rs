@@ -41,6 +41,11 @@ fn commit_info_literal_exprs(
             "tags",
             string_map_literal_expr(commit_info.tags, &string_map_type)?,
         ),
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        (
+            "lastManifestCommit",
+            Arc::new(lit(commit_info.last_manifest_commit)),
+        ),
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
@@ -321,6 +326,26 @@ mod tests {
         assert_eq!(get_str(ci, "operation"), "WRITE");
         assert!(!get_str(ci, "kernelVersion").is_empty());
         assert!(!get_str(ci, "txnId").is_empty());
+        Ok(())
+    }
+
+    /// A `CommitInfo` with no `lastManifestCommit` still emits the gated field in the schema,
+    /// written as null. (Population from the commit flow is covered by the integration tests.)
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_build_commit_info_last_manifest_commit_written_null() -> DeltaResult<()> {
+        let (engine, txn) = make_txn(None)?;
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
+        let ci = commit_info_struct(&result);
+        let last_manifest_commit = ci
+            .column_by_name("lastManifestCommit")
+            .expect("lastManifestCommit column present");
+        assert!(
+            last_manifest_commit.is_null(0),
+            "kernel should write lastManifestCommit as null"
+        );
         Ok(())
     }
 

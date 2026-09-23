@@ -9,10 +9,12 @@ use tracing::{info, instrument};
 use url::Url;
 
 use super::LogSegment;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::CHECKPOINT_ACTION_NAME;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
+use crate::actions::{CheckpointAction, LastManifestCommit, CHECKPOINT_ACTION_FIELD};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
@@ -44,12 +46,25 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
-        match self.read_protocol_metadata_opt(engine, crc)? {
-            (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(Error::MissingMetadata),
-            (Some(_), None, _) => Err(Error::MissingProtocol),
-            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
+    ) -> DeltaResult<CheckedPmResolution> {
+        let PmResolution {
+            metadata,
+            protocol,
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit,
+        } = self.read_protocol_metadata_opt(engine, crc)?;
+        match (metadata, protocol) {
+            (Some(metadata), Some(protocol)) => Ok(CheckedPmResolution {
+                metadata,
+                protocol,
+                source,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit,
+            }),
+            (None, Some(_)) => Err(Error::MissingMetadata),
+            (Some(_), None) => Err(Error::MissingProtocol),
+            (None, None) => Err(Error::MissingMetadataAndProtocol),
         }
     }
 
@@ -67,15 +82,18 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
+    ) -> DeltaResult<PmResolution> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
-            return Ok((
-                Some(crc.metadata.clone()),
-                Some(crc.protocol.clone()),
-                ProtocolMetadataSource::CrcAtTarget,
-            ));
+            return Ok(PmResolution {
+                metadata: Some(crc.metadata.clone()),
+                protocol: Some(crc.protocol.clone()),
+                source: ProtocolMetadataSource::CrcAtTarget,
+                // CRC-at-target reads no commits, so `lastManifestCommit` is resolved lazily.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit: LastManifestCommitResolution::Unresolved,
+            });
         }
 
         // We didn't return above, so we need to do log replay to find P&M.
@@ -94,10 +112,14 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
+            let replay = pruned.replay_for_pm(engine)?;
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let last_manifest_commit = replay.last_manifest_commit;
             let PmCandidate {
                 metadata: metadata_opt,
                 protocol: protocol_opt,
-            } = pruned.replay_for_pm(engine)?;
+                ..
+            } = replay.candidate;
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
             // carry it, and the CRC's P&M is at least as new.
             let metadata_opt = metadata_opt
@@ -109,43 +131,72 @@ impl LogSegment {
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
-                return Ok((
-                    metadata_opt,
-                    protocol_opt,
-                    ProtocolMetadataSource::CrcSeededPmOnlyReplay,
-                ));
+                return Ok(PmResolution {
+                    metadata: metadata_opt,
+                    protocol: protocol_opt,
+                    source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
+                });
             }
 
             // Case 2(b): P&M incomplete or older than the CRC, use the CRC.
             // Use `or_else` so any newer P or M found in the pruned replay takes priority
             // over the (older) CRC values.
             info!("P&M fallback to CRC (no P&M changes after CRC version)");
-            return Ok((
-                metadata_opt.or_else(|| Some(crc.metadata.clone())),
-                protocol_opt.or_else(|| Some(crc.protocol.clone())),
-                ProtocolMetadataSource::CrcSeededPmOnlyReplay,
-            ));
+            return Ok(PmResolution {
+                metadata: metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                protocol: protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit,
+            });
         }
 
         // Case 3: Full P&M log replay.
+        let replay = self.replay_for_pm(engine)?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let last_manifest_commit = replay.last_manifest_commit;
         let PmCandidate {
             metadata: metadata_opt,
             protocol: protocol_opt,
-        } = self.replay_for_pm(engine)?;
-        Ok((
-            metadata_opt.map(|(_, m)| m),
-            protocol_opt.map(|(_, p)| p),
-            ProtocolMetadataSource::FullReplay,
-        ))
+            ..
+        } = replay.candidate;
+        Ok(PmResolution {
+            metadata: metadata_opt.map(|(_, m)| m),
+            protocol: protocol_opt.map(|(_, p)| p),
+            source: ProtocolMetadataSource::FullReplay,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit,
+        })
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
+    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmReplayResult> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
-            return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
+            let candidate = resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?)?;
+            // The plan aggregate does not project `commitInfo`, so `lastManifestCommit` is resolved
+            // lazily rather than captured here.
+            return Ok(PmReplayResult {
+                candidate,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit: LastManifestCommitResolution::Unresolved,
+            });
         }
-        resolve_pm_batches(self.read_pm_batches(engine)?)
+        let candidate = resolve_pm_batches(self.read_pm_batches(engine)?)?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let last_manifest_commit = LastManifestCommitResolution::Resolved(
+            candidate
+                .last_manifest_commit
+                .as_ref()
+                .map(|(_, v)| v.clone()),
+        );
+        Ok(PmReplayResult {
+            candidate,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit,
+        })
     }
 
     /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
@@ -223,6 +274,9 @@ impl LogSegment {
                     protocol_version,
                     metadata_version,
                     batch,
+                    // The plan aggregate does not project `commitInfo`.
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit: None,
                 })
             });
         Ok(batches)
@@ -261,13 +315,60 @@ impl LogSegment {
                 checkpoint_version
                     .ok_or_else(|| Error::internal_error("checkpoint batch without a version"))?
             };
+            // Commit batches carry `commitInfo`; capture its `lastManifestCommit` if present.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let last_manifest_commit = if batch.is_log_batch {
+                let mut visitor = LastManifestCommitVisitor::default();
+                visitor.visit_rows_of(batch.actions.as_ref())?;
+                visitor.last_manifest_commit
+            } else {
+                None
+            };
             Ok(VersionedBatch {
                 protocol_version: Some(version),
                 metadata_version: Some(version),
                 batch,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit,
             })
         }))
     }
+}
+
+/// How a snapshot's `commitInfo.lastManifestCommit` was resolved during construction.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) enum LastManifestCommitResolution {
+    /// Captured while replaying the log (the inner `None` means the table genuinely has none).
+    Resolved(Option<LastManifestCommit>),
+    /// Not captured (CRC-at-target load, or the declarative-plan replay path); resolve lazily.
+    Unresolved,
+}
+
+/// Result of [`LogSegment::read_protocol_metadata_opt`]: the latest Protocol and Metadata (each may
+/// be missing), how they were resolved, and the `lastManifestCommit` resolution.
+pub(crate) struct PmResolution {
+    pub(crate) metadata: Option<Metadata>,
+    pub(crate) protocol: Option<Protocol>,
+    pub(crate) source: ProtocolMetadataSource,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: LastManifestCommitResolution,
+}
+
+/// Result of [`LogSegment::read_protocol_metadata`]: like [`PmResolution`] but with Protocol and
+/// Metadata guaranteed present.
+pub(crate) struct CheckedPmResolution {
+    pub(crate) metadata: Metadata,
+    pub(crate) protocol: Protocol,
+    pub(crate) source: ProtocolMetadataSource,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: LastManifestCommitResolution,
+}
+
+/// A [`PmCandidate`] plus the `lastManifestCommit` resolution from the replay path taken.
+struct PmReplayResult {
+    candidate: PmCandidate,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    last_manifest_commit: LastManifestCommitResolution,
 }
 
 /// Protocol and Metadata, each tagged with the version it was found at. Holds both a single
@@ -275,6 +376,9 @@ impl LogSegment {
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
+    /// The newest commit's `commitInfo.lastManifestCommit`, version-tagged so the latest wins.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    last_manifest_commit: Option<(i64, LastManifestCommit)>,
 }
 
 /// A P&M-projected batch with the versions to rank its Protocol and Metadata at.
@@ -282,6 +386,10 @@ struct VersionedBatch {
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
     batch: ActionsBatch,
+    /// This batch's `commitInfo.lastManifestCommit`, if it is a commit that carries one. Only the
+    /// fallback replay projects `commitInfo`; the plan path leaves this `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    last_manifest_commit: Option<LastManifestCommit>,
 }
 
 /// The newest Protocol and Metadata across `batches`.
@@ -290,22 +398,38 @@ fn resolve_pm_batches(
 ) -> DeltaResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    let mut last_manifest_commit: Option<(i64, LastManifestCommit)> = None;
     for batch in batches {
         let VersionedBatch {
             protocol_version,
             metadata_version,
             batch,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit: batch_last_manifest_commit,
         } = batch?;
         let batch_version = protocol_version.max(metadata_version);
         let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
         metadata = newer(metadata, candidate.metadata);
         protocol = newer(protocol, candidate.protocol);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            last_manifest_commit = newer(
+                last_manifest_commit,
+                batch_version.zip(batch_last_manifest_commit),
+            );
+        }
         // A checkpoint action's P&M can be older than its commit, so check version not presence.
         if is_final(&protocol, batch_version) && is_final(&metadata, batch_version) {
             break;
         }
     }
-    Ok(PmCandidate { protocol, metadata })
+    Ok(PmCandidate {
+        protocol,
+        metadata,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        last_manifest_commit,
+    })
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
@@ -377,6 +501,12 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
         (&PROTOCOL_FIELD),
         (&METADATA_FIELD),
         (&CHECKPOINT_ACTION_FIELD),
+        nullable "commitInfo": {
+            nullable "lastManifestCommit": {
+                nullable "version": LONG,
+                nullable "contentRootVersion": LONG,
+            },
+        },
     };
     #[cfg(not(feature = "adaptive-metadata-in-dev"))]
     let commit_schema = checkpoint_schema.clone();
@@ -400,6 +530,9 @@ fn pm_candidate(
     Ok(PmCandidate {
         protocol: newer(protocol, checkpoint_protocol),
         metadata: newer(metadata, checkpoint_metadata),
+        // Per-batch `commitInfo` capture happens in `resolve_pm_batches`, not here.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        last_manifest_commit: None,
     })
 }
 
