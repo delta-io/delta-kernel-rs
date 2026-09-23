@@ -17,7 +17,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    create_add_files_metadata, generate_batch, into_record_batch, load_and_begin_transaction,
+    begin_transaction, create_add_files_metadata, generate_batch, into_record_batch,
     modify_add_file_partition_keys, record_batch_to_bytes_with_props, AddFilePartitionKeyModify,
     IntoArray,
 };
@@ -45,7 +45,7 @@ async fn parquet_pruning_preserves_deletion_vector_positions(
     #[values(1, 3, 20)] batch_size: usize,
     #[values(false, true)] with_dv: bool,
     #[values(false, true)] project_row_index: bool,
-    #[values(ColumnMappingMode::None, ColumnMappingMode::Name)] mapping: ColumnMappingMode,
+    #[values("none", "name")] mapping: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let engine = Arc::new(
@@ -61,22 +61,16 @@ async fn parquet_pruning_preserves_deletion_vector_positions(
     let snapshot = create_table(table_url.as_str(), schema, "parquet pushdown test")
         .with_table_properties([
             ("delta.enableDeletionVectors", "true"),
-            (
-                "delta.columnMapping.mode",
-                if mapping == ColumnMappingMode::Name {
-                    "name"
-                } else {
-                    "none"
-                },
-            ),
+            ("delta.columnMapping.mode", mapping),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let schema = snapshot.schema();
+    let mapping: ColumnMappingMode = mapping.parse()?;
     let id_name = schema.field("id").unwrap().physical_name(mapping);
     let value_name = schema.field("value").unwrap().physical_name(mapping);
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     for file in 0..2i64 {
         let batch = generate_batch(vec![
             (
@@ -176,36 +170,49 @@ async fn parquet_pruning_preserves_deletion_vector_positions(
 }
 
 #[rstest::rstest]
-#[case::and(Some("7"), Predicate::and(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))), vec![2, 3])]
-#[case::or(Some("7"), Predicate::or(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))), vec![0, 1, 2, 3])]
-#[case::not(Some("7"), Predicate::not(Predicate::or(col!("part").eq(lit(8i64)), col!("id").lt(lit(2i64)))), vec![2, 3])]
-#[case::null(None, Predicate::and(col!("part").is_null(), col!("id").ge(lit(2i64))), vec![2, 3])]
-#[case::not_null(None, Predicate::or(col!("part").is_not_null(), col!("id").ge(lit(2i64))), vec![2, 3])]
+#[case::and(
+    Some("7"),
+    Predicate::and(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))),
+    vec![2, 3]
+)]
+#[case::or(
+    Some("7"),
+    Predicate::or(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))),
+    vec![0, 1, 2, 3]
+)]
+#[case::not(
+    Some("7"),
+    Predicate::not(Predicate::or(col!("part").eq(lit(8i64)), col!("id").lt(lit(2i64)))),
+    vec![2, 3]
+)]
+#[case::null(
+    None,
+    Predicate::and(col!("part").is_null(), col!("id").ge(lit(2i64))),
+    vec![2, 3]
+)]
+#[case::not_null(
+    None,
+    Predicate::or(col!("part").is_not_null(), col!("id").ge(lit(2i64))),
+    vec![2, 3]
+)]
 #[tokio::test]
 async fn parquet_predicate_uses_delta_partition_values(
     #[case] partition_value: Option<&str>,
     #[case] predicate: Predicate,
     #[case] expected: Vec<i64>,
-    #[values(ColumnMappingMode::None, ColumnMappingMode::Name)] mapping: ColumnMappingMode,
+    #[values("none", "name")] mapping: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
-    let table_url = Url::parse("memory:///")?;
     let schema = schema_ref! { nullable "id": LONG, nullable "part": LONG };
-    let snapshot = create_table(table_url.as_str(), schema, "partition pushdown test")
+    let snapshot = create_table("memory:///", schema, "partition pushdown test")
         .with_data_layout(DataLayout::partitioned(["part"]))
-        .with_table_properties([(
-            "delta.columnMapping.mode",
-            if mapping == ColumnMappingMode::Name {
-                "name"
-            } else {
-                "none"
-            },
-        )])
+        .with_table_properties([("delta.columnMapping.mode", mapping)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let schema = snapshot.schema();
+    let mapping: ColumnMappingMode = mapping.parse()?;
     let part_name = schema.field("part").unwrap().physical_name(mapping);
     let batch = generate_batch(vec![
         (
@@ -223,7 +230,7 @@ async fn parquet_predicate_uses_delta_partition_values(
     );
     let size = bytes.len() as i64;
     store.put(&Path::from("data.parquet"), bytes.into()).await?;
-    let mut txn = load_and_begin_transaction(table_url, engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     let metadata = create_add_files_metadata(
         txn.add_files_schema(),
         vec![("data.parquet", size, 0, Some(4))],
@@ -241,6 +248,7 @@ async fn parquet_predicate_uses_delta_partition_values(
         .scan_builder()
         .with_predicate(Arc::new(predicate))
         .build()?;
+    let expected_partition_value = partition_value.map(|value| value.parse::<i64>().unwrap());
     let mut actual = Vec::new();
     for data in scan.execute(engine)? {
         let batch = into_record_batch(data?);
@@ -254,9 +262,7 @@ async fn parquet_predicate_uses_delta_partition_values(
                 .copied(),
         );
         let parts = batch.column(1).as_primitive::<Int64Type>();
-        assert!(parts
-            .iter()
-            .all(|value| value == partition_value.map(|v| v.parse().unwrap())));
+        assert!(parts.iter().all(|value| value == expected_partition_value));
     }
     assert_eq!(actual, expected);
     Ok(())

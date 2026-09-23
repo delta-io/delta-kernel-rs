@@ -23,26 +23,6 @@ pub(super) fn bind_partition_values(
     let Some(partition_schema) = partition_schema else {
         return Ok(predicate.clone());
     };
-    struct BindPartitions<'s> {
-        schema: &'s SchemaRef,
-        values: &'s HashMap<String, String>,
-    }
-    impl<'a> ExpressionTransform<'a> for BindPartitions<'_> {
-        transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
-
-        fn transform_expr(&mut self, expr: &'a Expression) -> DeltaResult<Cow<'a, Expression>> {
-            if let Expression::Column(column) = expr {
-                if let [name] = column.path() {
-                    if let Some(field) = self.schema.field(name) {
-                        let value =
-                            parse_partition_value_raw(self.values.get(name), field.data_type())?;
-                        return Ok(Cow::Owned(value.into()));
-                    }
-                }
-            }
-            self.recurse_into_expr(expr)
-        }
-    }
     let mut binder = BindPartitions {
         schema: partition_schema,
         values: partition_values,
@@ -111,6 +91,28 @@ impl DeletionVectorFilter {
             Some(evaluator) => evaluator.evaluate(data.as_ref()),
             None => Ok(data),
         }
+    }
+}
+
+struct BindPartitions<'s> {
+    schema: &'s SchemaRef,
+    values: &'s HashMap<String, String>,
+}
+
+impl<'a> ExpressionTransform<'a> for BindPartitions<'_> {
+    transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+
+    fn transform_expr(&mut self, expr: &'a Expression) -> DeltaResult<Cow<'a, Expression>> {
+        if let Expression::Column(column) = expr {
+            if let [name] = column.path() {
+                if let Some(field) = self.schema.field(name) {
+                    let value =
+                        parse_partition_value_raw(self.values.get(name), field.data_type())?;
+                    return Ok(Cow::Owned(value.into()));
+                }
+            }
+        }
+        self.recurse_into_expr(expr)
     }
 }
 
