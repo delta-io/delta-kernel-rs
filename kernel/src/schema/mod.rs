@@ -2300,6 +2300,8 @@ pub enum DataType {
     #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
     /// An engine annotation over a physical Delta type.
+    /// Retains logical type information in schemas; physical operations use the enclosed
+    /// `sql_type`. See [`UserDefinedType`] for a schema example.
     #[cfg(feature = "udt-in-dev")]
     UserDefined(UserDefinedType),
 }

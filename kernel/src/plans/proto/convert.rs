@@ -2123,7 +2123,7 @@ mod tests {
     #[test]
     fn reject_user_defined_proto_without_physical_type() {
         let proto = proto_schema::DataType {
-            kind: Some(DataTypeKind::UserDefined(Box::new(
+            kind: Some(proto_schema::data_type::Kind::UserDefined(Box::new(
                 proto_schema::UserDefinedType {
                     sql_type: None,
                     annotation: Default::default(),
