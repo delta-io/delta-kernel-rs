@@ -12,9 +12,9 @@ use crate::{DeltaResult, Error};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
-/// It is covariant in `T`, and Send+Sync even if T is not. Use this instead of [`PhantomData<T>`]
+/// It is covariant in `T`, and Send+Sync even if `T` is not. Use this instead of [`PhantomData<T>`]
 /// when `T` is only a compile-time parameter, because [`PhantomData<T>`] tells the compiler that
-/// the containing type owns and may drop a `T`, and additionally makes `Send`/`Sync` follow `T`.
+/// the containing type owns and may drop a `T`, and additionally makes Send/Sync follow `T`.
 ///
 /// A generic alias cannot be named as a constructor, so construct values with
 /// [`PhantomType::default`] instead of `PhantomType`.
