@@ -1,3 +1,5 @@
+use derive_more::Deref;
+
 use crate::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use crate::expressions::{
     Expression, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
@@ -128,16 +130,10 @@ impl ArrowOpaquePredicate for Predicate {
 /// there would be no way to recover a &dyn ArrowOpaqueExpressionOp` from it. Instead, we must
 /// downcast from `&dyn OpaqueExpressionOp` to the concrete `ArrowOpaqueExpressionOpAdaptor` type
 /// that implements both traits, and extract its inner `dyn ArrowOpaqueExpressionOp`.
-#[derive(Debug)]
-pub(crate) struct ArrowOpaqueExpressionOpAdaptor(Box<dyn ArrowOpaqueExpressionOp>);
-
-impl std::ops::Deref for ArrowOpaqueExpressionOpAdaptor {
-    type Target = dyn ArrowOpaqueExpressionOp;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
+#[derive(Debug, Deref)]
+pub(crate) struct ArrowOpaqueExpressionOpAdaptor(
+    #[deref(forward)] Box<dyn ArrowOpaqueExpressionOp>,
+);
 
 impl PartialEq for ArrowOpaqueExpressionOpAdaptor {
     fn eq(&self, other: &Self) -> bool {
@@ -168,16 +164,8 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
 /// would be no way to recover a &dyn ArrowOpaquePredicateOp` from it. Instead, we must downcast
 /// from `&dyn OpaquePredicateOp` to the concrete `ArrowOpaquePredicateOpAdaptor` type that
 /// implements both traits, and extract its inner `dyn ArrowOpaquePredicateOp`.
-#[derive(Debug)]
-pub(crate) struct ArrowOpaquePredicateOpAdaptor(Box<dyn ArrowOpaquePredicateOp>);
-
-impl std::ops::Deref for ArrowOpaquePredicateOpAdaptor {
-    type Target = dyn ArrowOpaquePredicateOp;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
+#[derive(Debug, Deref)]
+pub(crate) struct ArrowOpaquePredicateOpAdaptor(#[deref(forward)] Box<dyn ArrowOpaquePredicateOp>);
 
 impl PartialEq for ArrowOpaquePredicateOpAdaptor {
     fn eq(&self, other: &Self) -> bool {

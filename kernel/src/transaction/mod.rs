@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::iter;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -8,6 +7,8 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::BackReference;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
@@ -21,7 +22,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
+    col, column_name, lit, null_lit, ArrayData, ColumnName, ExpressionStructPatch,
     ExpressionStructPatchBuilder,
 };
 use crate::log_replay::HasSelectionVector;
@@ -37,6 +38,8 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::validate_schema_for_write;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::ToSchema;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
@@ -45,7 +48,7 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::utils::require;
+use crate::utils::{require, PhantomType};
 use crate::{
     create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
     Expression, FileMeta, Predicate, RowVisitor, Version,
@@ -71,6 +74,8 @@ pub use alter_table::AlterTableTransaction;
 mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod root_manifest_file;
 pub(crate) mod schema_evolution;
 #[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 #[internal_api]
@@ -84,7 +89,10 @@ mod write_state;
 mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use root_manifest_file::RootManifestFile;
 use stats_verifier::StatsColumnVerifier;
+use update::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -256,13 +264,16 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
+    // Caller-supplied root manifest file to commit, set via with_root_manifest_file().
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    root_manifest_file: Option<RootManifestFile>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // PhantomData marker for transaction state (ExistingTable or CreateTable).
+    // PhantomType marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
-    _state: PhantomData<S>,
+    _state: PhantomType<S>,
 }
 
 impl<S> std::fmt::Debug for Transaction<S> {
@@ -389,6 +400,8 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.validate_append_only_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_root_manifest_file_semantics()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
@@ -501,16 +514,28 @@ impl<S> Transaction<S> {
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
 
         // Step 6: Generate remove actions (collect to avoid borrowing self)
-        let remove_actions =
-            self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.remove_files_metadata.iter(),
+            false, /* has_dv_update_columns */
+        )?;
+
+        // Step 6b: checkpoint action for a root manifest file commit, if configured.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let checkpoint_action =
+            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let checkpoint_action: Option<Box<dyn EngineData>> = None;
 
         // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
-        // -> removes For existing table: CommitInfo -> adds -> txns -> domain_metadata ->
+        // For create-table: CommitInfo -> Protocol -> Metadata -> checkpoint -> adds -> txns ->
+        // domain_metadata -> removes
+        // For existing table: CommitInfo -> checkpoint -> adds -> txns -> domain_metadata ->
         // removes
         let actions = iter::once(commit_info_action)
             .chain(protocol_action.map(Ok))
             .chain(metadata_action.map(Ok))
+            .chain(checkpoint_action.map(Ok))
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
@@ -556,7 +581,7 @@ impl<S> Transaction<S> {
                 );
                 let crc_delta =
                     self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
-                Ok(CommitResult::CommittedTransaction(
+                Ok(CommitResult::Committed(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
             }
@@ -564,9 +589,7 @@ impl<S> Transaction<S> {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::Conflict.as_ref());
-                Ok(CommitResult::ConflictedTransaction(
-                    self.into_conflicted(version),
-                ))
+                Ok(CommitResult::Conflicted(self.into_conflicted(version)))
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
@@ -574,7 +597,7 @@ impl<S> Transaction<S> {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
-                Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
+                Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
             Err(e) => Err(e),
         }
@@ -810,6 +833,51 @@ impl<S> Transaction<S> {
         );
 
         Ok(())
+    }
+
+    /// Validate that a root manifest file commit targets an `adaptiveMetadata-preview` table and
+    /// carries no file actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn validate_root_manifest_file_semantics(&self) -> DeltaResult<()> {
+        if self.root_manifest_file.is_none() {
+            return Ok(());
+        }
+        require!(
+            self.effective_table_config
+                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
+            Error::generic(
+                "root manifest file commit requires the adaptiveMetadata-preview feature"
+            )
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::generic("root manifest file commit cannot include file actions")
+        );
+        Ok(())
+    }
+
+    /// Builds the `checkpoint` action committing the configured root manifest file, or `None` if
+    /// this transaction has none.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn generate_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        commit_version: Version,
+        dm_changes: &[DomainMetadata],
+    ) -> DeltaResult<Option<Box<dyn EngineData>>> {
+        self.root_manifest_file
+            .as_ref()
+            .map(|root_manifest_file| {
+                let action = root_manifest_file.compute_checkpoint_action(
+                    engine,
+                    commit_version,
+                    &self.effective_table_config,
+                    dm_changes,
+                    &self.set_transactions,
+                )?;
+                action.into_engine_data(engine)
+            })
+            .transpose()
     }
 
     // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
@@ -1263,7 +1331,8 @@ impl<S> Transaction<S> {
         let row_id_high_water_mark = if self.is_create_table() {
             None
         } else {
-            RowTrackingDomainMetadata::get_high_water_mark(self.read_snapshot()?, engine)?
+            self.read_snapshot()?
+                .get_row_tracking_high_water_mark(engine)?
         };
 
         // Create a row tracking visitor and visit all files to collect row tracking information
@@ -1438,9 +1507,8 @@ impl<S> Transaction<S> {
     ///
     /// - `engine`: The engine used for expression evaluation
     /// - `remove_files_metadata`: Iterator over scan file metadata to transform into Remove actions
-    /// - `columns_to_drop`: Column names to drop from the scan metadata before transformation. This
-    ///   is used to remove temporary columns like the intermediate deletion vector column added
-    ///   during DV updates.
+    /// - `has_dv_update_columns`: Whether `remove_files_metadata` contains the temporary columns
+    ///   added for a deletion vector update
     ///
     /// # Returns
     ///
@@ -1453,7 +1521,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &dyn Engine,
         remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-        columns_to_drop: &'a [&str],
+        has_dv_update_columns: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
@@ -1463,16 +1531,35 @@ impl<S> Transaction<S> {
             ));
         }
 
-        let input_schema = scan_row_schema();
         let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
         let evaluation_handler = engine.evaluation_handler();
+        // TODO(#3263): `remove_files_metadata` may contain `stats_parsed` and
+        // `partitionValues_parsed`; provide its full schema to both evaluators.
+        let input_schema = if has_dv_update_columns {
+            intermediate_dv_schema().clone()
+        } else {
+            scan_row_schema()
+        };
+        let columns_to_drop: Vec<_> = has_dv_update_columns
+            .then(new_dv_column_schema)
+            .into_iter()
+            .flat_map(|schema| schema.fields().map(|field| field.name().to_owned()))
+            .collect();
 
-        let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
+        // adaptiveMetadata removes must carry a null deletionTimestamp and extendedFileMetadata =
+        // true (see `Remove` and `build_remove_struct_patch`).
+        let adaptive_metadata_enabled = self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview);
+
+        let make_eval = |coalesce_stats_with_parsed: bool| {
+            let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
                 self.commit_timestamp,
                 self.data_change,
-                columns_to_drop,
+                &columns_to_drop,
                 coalesce_stats_with_parsed,
+                adaptive_metadata_enabled,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
             evaluation_handler.new_expression_evaluator(
@@ -1487,8 +1574,8 @@ impl<S> Transaction<S> {
         // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
         // case where stats is null (e.g., on V2 checkpoints with writeStatsAsJson=false) and
         // then drops the stats_parsed column.
-        let base_eval = Arc::new(make_eval(false)?);
-        let stats_parsed_eval = Arc::new(make_eval(true)?);
+        let base_eval = make_eval(false /* coalesce_stats_with_parsed */)?;
+        let stats_parsed_eval = make_eval(true /* coalesce_stats_with_parsed */)?;
         let stats_parsed_col = column_name!(STATS_PARSED_NAME);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
@@ -1518,21 +1605,32 @@ impl<S> Transaction<S> {
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
 ///   scans always populate from `add.partitionValues`.
+///
+/// When `adaptive_metadata_enabled` is set, the RFC requires `deletionTimestamp` to be null
+/// (cleanup uses tree reachability, not timestamp expiry), so it is emitted as a fixed literal
+/// rather than derived from the input.
 fn build_remove_struct_patch(
     commit_timestamp: i64,
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
+    adaptive_metadata_enabled: bool,
 ) -> DeltaResult<ExpressionStructPatch> {
+    let deletion_timestamp = if adaptive_metadata_enabled {
+        null_lit(DataType::LONG)
+    } else {
+        lit(commit_timestamp)
+    };
     // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
     // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
+    // Under adaptiveMetadata both are guaranteed present
     let extended_file_metadata = Predicate::and_from([
         col!(SIZE_NAME).is_not_null(),
         col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
     ]);
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
-        .insert_after("path", lit(commit_timestamp))
+        .insert_after("path", deletion_timestamp)
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
@@ -1568,6 +1666,13 @@ fn build_remove_struct_patch(
         // Added to scan output when the predicate touches a partition column.
         .drop_if_exists(PARTITION_VALUES_PARSED_NAME);
 
+    // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null to
+    // keep the produced struct aligned with the `backReference` field of LOG_REMOVE_SCHEMA.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    {
+        patch = patch.append(null_lit(BackReference::to_schema()));
+    }
+
     for column_to_drop in columns_to_drop {
         patch = patch.drop(*column_to_drop);
     }
@@ -1593,32 +1698,33 @@ pub struct PostCommitStats {
 /// error occurred, the result is Err(Error).
 ///
 /// The commit result can be one of the following:
-/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and in
-///   the future a post-commit snapshot can be obtained from the committed transaction.
-/// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
-///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
-/// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
-///   can be retried without rebasing.
+/// - [`CommitResult::Committed`]: the transaction was successfully committed. [PostCommitStats] and
+///   in the future a post-commit snapshot can be obtained from the committed transaction.
+/// - [`CommitResult::Conflicted`]: the transaction conflicted with an existing version. This
+///   transcation must be rebased before retrying. (currently no rebase APIs exist, caller must
+///   create new txn)
+/// - [`CommitResult::Retryable`]: an IO (retryable) error occurred during the commit. This
+///   transaction can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
 pub enum CommitResult<S = ExistingTable> {
     /// The transaction was successfully committed.
-    CommittedTransaction(CommittedTransaction),
+    Committed(CommittedTransaction),
     /// This transaction conflicted with an existing version (see
     /// [ConflictedTransaction::conflict_version]). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    ConflictedTransaction(ConflictedTransaction<S>),
+    Conflicted(ConflictedTransaction<S>),
     /// An IO (retryable) error occurred during the commit.
-    RetryableTransaction(RetryableTransaction<S>),
+    Retryable(RetryableTransaction<S>),
 }
 
 impl<S> CommitResult<S> {
     /// Returns true if the commit was successful.
     pub fn is_committed(&self) -> bool {
-        matches!(self, CommitResult::CommittedTransaction(_))
+        matches!(self, CommitResult::Committed(_))
     }
 }
 
@@ -1628,8 +1734,8 @@ impl<S: std::fmt::Debug> CommitResult<S> {
     #[allow(clippy::panic)]
     pub fn unwrap_committed(self) -> CommittedTransaction {
         match self {
-            CommitResult::CommittedTransaction(c) => c,
-            other => panic!("Expected CommittedTransaction, got: {other:?}"),
+            CommitResult::Committed(c) => c,
+            other => panic!("Expected Committed, got: {other:?}"),
         }
     }
 
@@ -1749,6 +1855,8 @@ mod tests {
     use crate::scan::state_info::tests::RowTrackingState;
     use crate::schema::{schema, schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::table_features::TableFeature;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
@@ -1758,6 +1866,8 @@ mod tests {
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
         CapturingReporter,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
     impl Transaction {
@@ -2001,27 +2111,52 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_remove_action_projection_sets_extended_metadata() -> DeltaResult<()> {
+    /// Verifies the Remove projection's `deletionTimestamp` and `extendedFileMetadata` fields.
+    /// `extendedFileMetadata` is always a presence predicate; `deletionTimestamp` derives from the
+    /// input outside adaptiveMetadata and is fixed to null under it per the RFC.
+    #[rstest]
+    #[case::standard(false)]
+    #[case::adaptive_metadata(true)]
+    fn test_remove_action_projection_deletion_timestamp_and_extended_metadata(
+        #[case] adaptive_metadata_enabled: bool,
+    ) -> DeltaResult<()> {
+        let commit_timestamp = 123;
         let patch = build_remove_struct_patch(
-            0,     /* commit_timestamp */
+            commit_timestamp,
             true,  /* data_change */
             &[],   /* columns_to_drop */
             false, /* coalesce_stats_with_parsed */
+            adaptive_metadata_enabled,
         )?;
         let path_patch = patch
             .field_patches
             .get("path")
             .expect("path should have inserted fields");
+        // Insertions preserve `insert_after` call order: deletionTimestamp, dataChange,
+        // extendedFileMetadata, partitionValues.
+        let deletion_timestamp = path_patch
+            .insertions
+            .first()
+            .expect("deletionTimestamp should be the first inserted field");
         let extended_file_metadata = path_patch
             .insertions
             .get(2)
             .expect("extendedFileMetadata should follow deletionTimestamp and dataChange");
-        let expected = Expression::from_pred(Predicate::and_from([
+
+        let expected_deletion_timestamp = if adaptive_metadata_enabled {
+            null_lit(DataType::LONG)
+        } else {
+            lit(commit_timestamp)
+        };
+        let expected_extended_file_metadata = Expression::from_pred(Predicate::and_from([
             col!(SIZE_NAME).is_not_null(),
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
         ]));
-        assert_eq!(extended_file_metadata.as_ref(), &expected);
+        assert_eq!(deletion_timestamp.as_ref(), &expected_deletion_timestamp);
+        assert_eq!(
+            extended_file_metadata.as_ref(),
+            &expected_extended_file_metadata
+        );
         Ok(())
     }
 
@@ -3076,6 +3211,62 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn dummy_root_manifest_file(read_snapshot: SnapshotRef) -> RootManifestFile {
+        let file = FileMeta {
+            location: read_snapshot.table_root().join("root-v1.parquet").unwrap(),
+            last_modified: 0,
+            size: 1024,
+        };
+        RootManifestFile::new(file, read_snapshot)
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn adaptive_table_config() -> TableConfiguration {
+        MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AdaptiveMetadataPreview])
+                    .build(),
+            )
+            .build()
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_validate_root_manifest_file_succeeds_on_adaptive_table() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
+        txn.effective_table_config = adaptive_table_config();
+        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
+        txn.validate_root_manifest_file_semantics()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_validate_root_manifest_file_rejects_non_adaptive_table() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
+        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
+        let result = txn.validate_root_manifest_file_semantics();
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_validate_root_manifest_file_rejects_file_actions() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
+        txn.effective_table_config = adaptive_table_config();
+        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
+        add_dummy_file(&mut txn);
+        let result = txn.validate_root_manifest_file_semantics();
+        assert!(result.is_err());
+        Ok(())
+    }
+
     #[test]
     fn test_blind_append_sets_commit_info_flag() -> Result<(), Box<dyn std::error::Error>> {
         let commit_info = CommitInfo::new(1, None, None, None, true);
@@ -3133,10 +3324,10 @@ mod tests {
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
-            matches!(result, CommitResult::RetryableTransaction(_)),
-            "Expected RetryableTransaction, got: {result:?}"
+            matches!(result, CommitResult::Retryable(_)),
+            "Expected Retryable, got: {result:?}"
         );
-        if let CommitResult::RetryableTransaction(retryable) = result {
+        if let CommitResult::Retryable(retryable) = result {
             assert!(
                 retryable.error.to_string().contains("simulated IO error"),
                 "Unexpected error: {}",
@@ -3732,8 +3923,8 @@ mod tests {
 
         let result = txn.commit(&engine)?;
         assert!(
-            matches!(result, CommitResult::ConflictedTransaction(_)),
-            "Expected ConflictedTransaction from capturing committer"
+            matches!(result, CommitResult::Conflicted(_)),
+            "Expected Conflicted from capturing committer"
         );
 
         // The ICT in CommitMetadata must be prev_ict + 1 (monotonicity), NOT the wall time.
@@ -3767,7 +3958,7 @@ mod tests {
         let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
+        assert!(matches!(result, CommitResult::Retryable(_)));
         let failure = commit_failure_event(&reporter).expect("commit failure event");
         assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
         assert_eq!(failure.table_type, TableType::PathBased);

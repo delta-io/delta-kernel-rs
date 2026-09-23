@@ -63,7 +63,7 @@ void* allocate_string(const KernelStringSlice slice)
 
 // utility function to convert key/val into slices and set them on a builder
 // returns false on failure
-bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
+bool set_builder_opt(HandleMutableFfiEngineBuilder* engine_builder, char* key, char* val)
 {
   KernelStringSlice key_slice = { key, strlen(key) };
   KernelStringSlice val_slice = { val, strlen(val) };

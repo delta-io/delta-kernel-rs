@@ -10,20 +10,25 @@
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::null_lit;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
@@ -35,10 +40,12 @@ use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V3_VALIDATOR,
+    V2_VALIDATOR, V3_VALIDATOR,
 };
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
-use crate::utils::{current_time_ms, require};
+use crate::utils::{current_time_ms, require, PhantomType};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -67,6 +74,10 @@ impl Transaction {
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
 
+        // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
+        // and materialized column-name properties. Materialized names must be distinct and must not
+        // collide with physical data columns.
+
         // Read clustering columns from snapshot (returns None if clustering not enabled)
         let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
 
@@ -79,6 +90,12 @@ impl Transaction {
         );
 
         let effective_table_config = read_snapshot.table_configuration().clone();
+
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
 
         validate_iceberg_compat_if_needed(
             &effective_table_config,
@@ -112,8 +129,10 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         })
     }
 
@@ -239,6 +258,16 @@ impl Transaction {
             ));
         }
         self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        Ok(self)
+    }
+
+    /// Stages `file` to be committed as the table's root manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
+        let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+            Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+        })?;
+        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
         Ok(self)
     }
 
@@ -488,7 +517,7 @@ static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
-fn intermediate_dv_schema() -> &'static SchemaRef {
+pub(super) fn intermediate_dv_schema() -> &'static SchemaRef {
     &INTERMEDIATE_DV_SCHEMA
 }
 
@@ -538,15 +567,13 @@ fn struct_deletion_vector_schema() -> &'static ArrayType {
 
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
     nullable NEW_STATS_NAME: STRING,
 };
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-fn new_dv_column_schema() -> &'static SchemaRef {
+pub(super) fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
 
@@ -572,10 +599,11 @@ impl<S> Transaction<S> {
             ));
         }
 
-        // The rewritten stats are for the add action only, so they are dropped here.
-        static COLUMNS_TO_DROP: &[&str] = &[NEW_DELETION_VECTOR_NAME, NEW_STATS_NAME];
-        let remove_actions =
-            self.generate_remove_actions(engine, self.dv_matched_files.iter(), COLUMNS_TO_DROP)?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.dv_matched_files.iter(),
+            true, /* has_dv_update_columns */
+        )?;
         let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
         Ok(remove_actions.chain(add_actions))
     }
@@ -592,10 +620,7 @@ impl<S> Transaction<S> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
-        // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns. The engine data has this
-        // temporary column appended by update_deletion_vectors(), but it is not expected by
-        // the transforms used in generate_remove_actions() which expect only the scan row
-        // schema fields.
+        // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns.
         let with_new_dv_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
                 .replace("deletionVector", col!(NEW_DELETION_VECTOR_NAME))
@@ -603,6 +628,8 @@ impl<S> Transaction<S> {
                 .drop(NEW_DELETION_VECTOR_NAME)
                 .drop(NEW_STATS_NAME),
         )?;
+        // TODO(#3263): `file_metadata_batch` may contain `stats_parsed` and
+        // `partitionValues_parsed`; provide its full schema to both evaluators.
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
             Arc::new(with_new_dv_expr),
@@ -613,10 +640,16 @@ impl<S> Transaction<S> {
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
         )?;
-        let with_data_change_patch = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new_nested(["add"])
-                .insert_after("modificationTime", lit(self.data_change)),
-        )?;
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+        let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
+            .insert_after("modificationTime", lit(self.data_change));
+        // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
+        // to keep the produced struct aligned with the `backReference` field of LOG_ADD_SCHEMA.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            add_patch = add_patch.append(null_lit(BackReference::to_schema()));
+        }
+        let with_data_change_patch = Expression::struct_patch(add_patch)?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),

@@ -31,7 +31,6 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 // Re-export the builder so callers can still access it from this module path.
@@ -42,8 +41,11 @@ use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
+use crate::table_features::{
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, V2_VALIDATOR,
+};
 use crate::transaction::{CreateTable, Transaction};
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, PhantomType};
 use crate::DeltaResult;
 
 /// A type alias for create-table transactions.
@@ -146,6 +148,12 @@ impl CreateTableTransaction {
         clustering_columns: Option<Vec<ColumnName>>,
         correlation_id: Option<Arc<str>>,
     ) -> DeltaResult<Self> {
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
+
         let span = tracing::info_span!(
             "txn",
             path = %effective_table_config.table_root(),
@@ -177,8 +185,10 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         })
     }
 }

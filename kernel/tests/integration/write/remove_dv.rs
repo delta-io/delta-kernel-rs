@@ -24,7 +24,7 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::{scan_row_schema, StatsOptions};
+use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
@@ -452,7 +452,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     let result = txn.commit(engine.as_ref())?;
 
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
             // Read the commit log directly to verify remove actions
@@ -568,10 +568,84 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
             // row_tracking tests cover having these populated.
             assert!(remove.get("baseRowId").is_none());
             assert!(remove.get("defaultRowCommitVersion").is_none());
+
+            // Kernel never populates adaptive-metadata-tree back references on writes, so a
+            // classic remove must emit the field as null (omitted from the JSON commit).
+            assert!(remove.get("backReference").is_none());
         }
         _ => panic!("Transaction should be committed"),
     }
 
+    Ok(())
+}
+
+/// End-to-end check that a Remove committed to an adaptiveMetadata table conforms to the RFC:
+/// `deletionTimestamp` is null (cleanup uses tree reachability, not timestamp expiry) and
+/// `extendedFileMetadata` is true. Outside adaptiveMetadata,
+/// `test_remove_files_adds_expected_entries` covers the timestamped, conditionally-extended shape.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = tempdir()?;
+    let tmp_dir_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let (store, engine, table_location) =
+        test_utils::engine_store_setup("adaptive_remove", Some(&tmp_dir_url));
+    let engine = Arc::new(engine);
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let table_url = test_utils::create_table_with_column_mapping_mode(
+        store,
+        table_location,
+        schema,
+        &[],  // no partition columns
+        true, // (3, 7) protocol
+        vec!["adaptiveMetadata-preview"],
+        vec![],
+        "id",
+    )
+    .await?;
+
+    // v1: append a data file.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    // v2: remove the file.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan_files = snapshot
+        .clone()
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .next()
+        .expect("one scan-metadata batch")?
+        .scan_files;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    txn.remove_files(scan_files);
+    txn.ack_row_tracking_preservation();
+    let version = txn
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .commit_version();
+
+    let removes = read_actions_from_commit(&table_url, version, "remove")?;
+    assert_eq!(removes.len(), 1, "expected exactly one remove action");
+    let remove = &removes[0];
+    assert!(
+        remove.get("deletionTimestamp").is_none_or(|v| v.is_null()),
+        "deletionTimestamp must be null under adaptiveMetadata, got {remove}"
+    );
+    assert_eq!(
+        remove["extendedFileMetadata"].as_bool(),
+        Some(true),
+        "extendedFileMetadata must be true under adaptiveMetadata, got {remove}"
+    );
     Ok(())
 }
 
@@ -733,7 +807,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     let result = txn.commit(engine.as_ref())?;
 
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
             // Read the original version 1 log to get original file metadata
@@ -1249,7 +1323,7 @@ async fn test_update_deletion_vectors_multiple_files(
     let result = txn.commit(engine.as_ref())?;
 
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             let commit_version = committed.commit_version();
 
             // Read the commit log directly from object store
@@ -1572,7 +1646,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         let result = txn.commit(engine.as_ref());
 
         match result? {
-            CommitResult::CommittedTransaction(committed) => {
+            CommitResult::Committed(committed) => {
                 assert_eq!(committed.commit_version(), 2);
 
                 let new_snapshot = Snapshot::builder_for(table_url.clone())
@@ -1755,7 +1829,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         let result = txn.commit(engine.as_ref())?;
 
         match result {
-            CommitResult::CommittedTransaction(committed) => {
+            CommitResult::Committed(committed) => {
                 assert_eq!(committed.commit_version(), 6);
 
                 // Verify that exactly 2 files were removed (1 from each batch)
@@ -1911,40 +1985,50 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
     Ok(())
 }
 
-/// Remove files via scan metadata on a partitioned table. Covers three predicate
-/// shapes against the same table so the remove-transform correctly handles the
-/// parsed scan columns in every combination:
-/// - no predicate: no `partitionValues_parsed`.
-/// - data-column predicate: no `partitionValues_parsed` (negative case; the fix must not affect
-///   scans whose predicate misses the partition columns).
-/// - partition predicate: `partitionValues_parsed` present.
+/// Remove files via scan metadata on a partitioned table. Covers these parsed-column shapes:
 ///
-/// Every case sets `.with_stats(StatsOptions::all())`, which forces `stats_parsed`
-/// into the scan output regardless of the predicate shape, so the partition-
-/// predicate case exercises both parsed-column drop paths together while the
-/// other two exercise only the `stats_parsed` drop path. The coalesce
-/// *reconstruction* of `stats` from `stats_parsed` is not exercised here
-/// because `stats` is non-null; the sibling
-/// `test_remove_files_after_predicate_scan_includes_stats_parsed` covers that.
+/// - no predicate: `stats_parsed` only.
+/// - data-column predicate: `stats_parsed` only.
+/// - partition predicate: both parsed columns.
+/// - partition values only: `partitionValues_parsed` only.
 ///
-/// `expected_partitions` is the multiset of `country` values expected across
-/// the generated Remove actions. Its length gives the expected Remove count,
-/// and its contents pin the correct partition was chosen (catches regressions
-/// where the wrong partition is removed).
+/// `expected_partitions` lists the `country` values expected across the generated Remove actions.
 #[rstest::rstest]
-#[case::no_predicate(None, &["usa", "japan"])]
+#[case::no_predicate(
+    StatsOptions::all(),
+    PartitionValuesOptions::string_map_only(),
+    None /* predicate */,
+    &["usa", "japan"],
+    true /* expect_stats */,
+)]
 #[case::data_predicate(
+    StatsOptions::all(),
+    PartitionValuesOptions::string_map_only(),
     Some(Pred::gt(col!("id"), lit(0_i32))),
-    &["usa", "japan"]
+    &["usa", "japan"],
+    true /* expect_stats */,
 )]
 #[case::partition_predicate(
+    StatsOptions::all(),
+    PartitionValuesOptions::string_map_only(),
     Some(Pred::eq(col!("country"), lit("usa".to_string()))),
-    &["usa"]
+    &["usa"],
+    true /* expect_stats */,
+)]
+#[case::partition_values_only(
+    StatsOptions::none(),
+    PartitionValuesOptions::with_struct(),
+    None /* predicate */,
+    &["usa", "japan"],
+    false /* expect_stats */,
 )]
 #[tokio::test]
 async fn test_remove_files_partitioned_with_parsed_columns(
+    #[case] stats: StatsOptions,
+    #[case] partition_values: PartitionValuesOptions,
     #[case] predicate: Option<Pred>,
     #[case] expected_partitions: &[&str],
+    #[case] expect_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -1998,7 +2082,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let mut scan_builder = snapshot
             .clone()
             .scan_builder()
-            .with_stats(StatsOptions::all());
+            .with_stats(stats.clone())
+            .with_partition_values(partition_values.clone());
         if let Some(pred) = predicate.clone() {
             scan_builder = scan_builder.with_predicate(Arc::new(pred));
         }
@@ -2036,18 +2121,19 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             "partitionValues mismatch across removes; got: {remove_actions:?}"
         );
 
-        // stats_parsed is present on every scan row, so the stats-with-parsed
-        // evaluator is selected for every case; it must still yield a populated
-        // stats JSON on every remove action.
         for remove in &remove_actions {
-            let stats_str = remove["stats"]
-                .as_str()
-                .expect("stats field should be a non-null JSON string");
-            let stats: serde_json::Value = serde_json::from_str(stats_str)?;
-            assert!(
-                stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
-                "stats.numRecords should be populated, got: {stats}"
-            );
+            if expect_stats {
+                let stats_str = remove["stats"]
+                    .as_str()
+                    .expect("stats field should be a non-null JSON string");
+                let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+                assert!(
+                    stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
+                    "stats.numRecords should be populated, got: {stats}"
+                );
+            } else {
+                assert!(remove["stats"].is_null());
+            }
         }
     }
     Ok(())

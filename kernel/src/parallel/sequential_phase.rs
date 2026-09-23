@@ -18,6 +18,7 @@ use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_replay::{ActionsBatch, LogReplayProcessor};
 use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
+use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta};
 
@@ -37,7 +38,8 @@ use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut sequential = SequentialPhase::try_new(processor, log_segment, engine)?;
+/// let mut sequential =
+///     SequentialPhase::try_new(processor, log_segment, engine, checkpoint_read_schema)?;
 ///
 /// // Iterate over sequential batches
 /// for batch in sequential.by_ref() {
@@ -95,11 +97,13 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `processor`: The log replay processor
     /// - `log_segment`: The log segment to process
     /// - `engine`: Engine for reading files
+    /// - `checkpoint_read_schema`: Schema for checkpoint manifests and leaf files
     #[internal_api]
     pub(crate) fn try_new(
         processor: P,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
+        checkpoint_read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>> = Some(Box::new(
             log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
@@ -112,6 +116,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
                 engine,
                 single_part,
                 log_segment.log_root.clone(),
+                checkpoint_read_schema,
             )?),
             _ => None,
         };
@@ -202,18 +207,19 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::AfterSequentialScanMetadata;
+    use crate::scan::{AfterSequentialScanMetadata, StatsOptions};
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
     fn verify_sequential_processing(
         table_name: &str,
+        stats: StatsOptions,
         expected_adds: &[&str],
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
-        let scan = snapshot.scan_builder().build()?;
+        let scan = snapshot.scan_builder().with_stats(stats).build()?;
         let mut sequential = scan.parallel_scan_metadata(engine)?;
 
         // Process all batches and collect Add file paths
@@ -274,6 +280,7 @@ mod tests {
     fn test_sequential_v2_with_commits_only() -> DeltaResult<()> {
         verify_sequential_processing(
             "table-without-dv-small",
+            StatsOptions::default(),
             &["part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"],
             &[], // No sidecars
         )
@@ -283,6 +290,7 @@ mod tests {
     fn test_sequential_v2_with_sidecars() -> DeltaResult<()> {
         verify_sequential_processing(
             "v2-checkpoints-json-with-sidecars",
+            StatsOptions::default(),
             &[], // No adds in sequential phase (all in checkpoint sidecars)
             &[
                 "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet",
@@ -309,6 +317,7 @@ mod tests {
     fn test_sequential_checkpoint_without_sidecars() -> DeltaResult<()> {
         verify_sequential_processing(
             "v2-checkpoints-json-without-sidecars",
+            StatsOptions::default(),
             &[
                 // Adds from checkpoint manifest processed in sequential phase
                 "test%25file%25prefix-part-00000-0e32f92c-e232-4daa-b734-369d1a800502-c000.snappy.parquet",
@@ -319,10 +328,15 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_sequential_parquet_checkpoint_with_sidecars() -> DeltaResult<()> {
+    #[rstest::rstest]
+    #[case::default(StatsOptions::default())]
+    #[case::without_stats(StatsOptions::none())]
+    fn test_sequential_parquet_checkpoint_with_sidecars(
+        #[case] stats: StatsOptions,
+    ) -> DeltaResult<()> {
         verify_sequential_processing(
             "v2-checkpoints-parquet-with-sidecars",
+            stats,
             &[], // No adds in sequential phase
             &[
                 // Expected sidecars
@@ -336,6 +350,7 @@ mod tests {
     fn test_sequential_checkpoint_no_commits() -> DeltaResult<()> {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
+            StatsOptions::default(),
             &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], /* Add from commit 3 */
             &[], // No sidecars
         )

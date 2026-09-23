@@ -39,6 +39,10 @@ use crate::table_features::{
     TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::COLUMN_MAPPING_MODE;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_properties::{
+    ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+};
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
@@ -462,6 +466,36 @@ impl MockTableConfigurationBuilder {
 
         TableConfiguration::try_new(metadata, self.protocol, self.table_root, self.version)
     }
+}
+
+/// Builds an adaptive-metadata configuration from a column-mapped schema and extra features.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn adaptive_metadata_table_configuration(
+    schema: SchemaRef,
+    extra_features: &[TableFeature],
+) -> TableConfiguration {
+    let features = [
+        TableFeature::AdaptiveMetadataPreview,
+        TableFeature::ColumnMapping,
+        TableFeature::DeletionVectors,
+        TableFeature::RowTracking,
+        TableFeature::DomainMetadata,
+        TableFeature::InCommitTimestamp,
+    ];
+    MockTableConfigurationBuilder::new()
+        .with_schema(schema)
+        .with_column_mapping(ColumnMappingMode::Id)
+        .with_properties([
+            (ENABLE_ROW_TRACKING, "true"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+        ])
+        .with_protocol(
+            MockProtocolBuilder::new()
+                .with_features(features.iter().chain(extra_features))
+                .build(),
+        )
+        .build()
 }
 
 /// Builds a mock [`Protocol`] for unit tests.

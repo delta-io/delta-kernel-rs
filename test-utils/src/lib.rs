@@ -745,8 +745,58 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        "name",
+    )
+    .await
+}
+
+/// Like [`create_table`], but writes `delta.columnMapping.mode` as `column_mapping_mode` instead
+/// of always `"name"`. No-op when `columnMapping` isn't in `reader_features`.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table_with_column_mapping_mode(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+    column_mapping_mode: &str,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        column_mapping_mode,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_table_impl(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
+    column_mapping_mode: &str,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
 
@@ -764,13 +814,24 @@ pub async fn create_table(
         }
     }
 
+    // adaptiveMetadata auto-enables its dependencies (see `enable_adaptive_metadata_dependencies`)
+    // so callers can pass just `adaptiveMetadata-preview` and get a loadable table.
+    let enable_adaptive_metadata = reader_features.contains(&"adaptiveMetadata-preview")
+        || writer_features.contains(&"adaptiveMetadata-preview");
+    if enable_adaptive_metadata {
+        enable_adaptive_metadata_dependencies(&mut reader_features, &mut writer_features);
+    }
+
     // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
-    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
-    // `delta.columnMapping.maxColumnId` below.
+    // fails. Assign it here (with nested ids for iceberg v3 / adaptiveMetadata); `max_column_id`
+    // feeds `delta.columnMapping.maxColumnId` below.
     let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
         let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
-        let schema =
-            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        let schema = assign_column_mapping_metadata(
+            &schema,
+            &mut max_id,
+            enable_iceberg_compat_v3 || enable_adaptive_metadata,
+        )?;
         (Arc::new(schema), max_id)
     } else {
         (schema, 0i64)
@@ -799,7 +860,10 @@ pub async fn create_table(
         let mut config = serde_json::Map::new();
 
         if reader_features.contains(&"columnMapping") {
-            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.mode".to_string(),
+                json!(column_mapping_mode),
+            );
             config.insert(
                 "delta.columnMapping.maxColumnId".to_string(),
                 json!(max_column_id.to_string()),
@@ -899,6 +963,36 @@ pub async fn create_table(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
+}
+
+/// Adds the features `adaptiveMetadata-preview` depends on to `reader_features` and
+/// `writer_features` (each only if not already present).
+///
+/// adaptiveMetadata requires column mapping (in `id` mode, set by the caller) plus RowTracking,
+/// DomainMetadata, DeletionVectors, and InCommitTimestamp. The ReaderWriter dependencies are
+/// mirrored into both feature lists; the writer-only dependencies are added to `writer_features`.
+fn enable_adaptive_metadata_dependencies<'a>(
+    reader_features: &mut Vec<&'a str>,
+    writer_features: &mut Vec<&'a str>,
+) {
+    // ReaderWriter features must appear in both reader and writer feature lists.
+    for f in [
+        "adaptiveMetadata-preview",
+        "columnMapping",
+        "deletionVectors",
+    ] {
+        if !reader_features.contains(&f) {
+            reader_features.push(f);
+        }
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
+    for f in ["rowTracking", "domainMetadata", "inCommitTimestamp"] {
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
 }
 
 /// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
@@ -1543,7 +1637,7 @@ pub async fn write_batch_to_table(
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+        delta_kernel::transaction::CommitResult::Committed(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
             .clone()),
@@ -2011,7 +2105,7 @@ pub fn remove_all_and_get_remove_actions(
         txn.remove_files(sm.scan_files);
     }
     let committed = match txn.commit(engine)? {
-        CommitResult::CommittedTransaction(c) => c,
+        CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
     read_actions_from_commit(table_url, committed.commit_version(), "remove")

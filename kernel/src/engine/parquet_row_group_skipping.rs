@@ -266,13 +266,18 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
 }
 
 fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
-    // WARNING: The bytes are stored in big-endian order; reverse and then 0-pad to 16 bytes.
+    // Statistics are a minimal-width big-endian two's-complement integer. Sign-extend to
+    // 16 bytes on the stack (no heap alloc) and copy in as little-endian: fill with 0xFF
+    // when the sign bit of the most-significant (first, big-endian) byte is set, else 0x00.
+    // Zero-padding a negative value would decode it as a large positive i128 and wrongly
+    // prune row groups. `(b >> 7) * 0xFF` sets the fill without a data-dependent branch.
     let bytes = bytes.filter(|b| b.len() <= 16)?;
-    let mut bytes = Vec::from(bytes);
-    bytes.reverse();
-    bytes.resize(16, 0u8);
-    let bytes: [u8; 16] = bytes.try_into().ok()?;
-    let value = DecimalData::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
+    let fill = bytes.first().map_or(0x00, |&b| (b >> 7) * 0xFF);
+    let mut le = [fill; 16];
+    for (dst, &src) in le.iter_mut().zip(bytes.iter().rev()) {
+        *dst = src;
+    }
+    let value = DecimalData::try_new(i128::from_le_bytes(le), dtype).ok()?;
     Some(value.into())
 }
 

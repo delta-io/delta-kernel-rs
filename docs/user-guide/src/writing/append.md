@@ -76,7 +76,7 @@ txn.add_files(file_metadata);
 
 // 6. Commit
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),
@@ -220,7 +220,7 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => {
@@ -230,10 +230,10 @@ match txn.commit(&engine)? {
 ```
 
 > [!NOTE]
-> `commit()` returns a `CommitResult` with three variants: `CommittedTransaction` on success,
-> `ConflictedTransaction` if another writer committed first, and `RetryableTransaction` for
-> transient IO errors. Automatic conflict resolution is not yet supported. A blind append to
-> a table with no concurrent writers always succeeds.
+> `commit()` returns a `CommitResult` with three variants: `Committed` on success, `Conflicted` if
+> another writer committed first, and `Retryable` for transient IO errors. Automatic conflict
+> resolution is not yet supported. A blind append to a table with no concurrent writers always
+> succeeds.
 
 ## Blind appends
 
@@ -309,7 +309,7 @@ snapshot and post-commit statistics:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 

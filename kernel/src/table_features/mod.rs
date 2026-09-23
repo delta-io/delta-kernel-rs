@@ -15,6 +15,7 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
+pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
@@ -234,6 +235,8 @@ pub(crate) enum EnablementCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum Operation {
+    /// Create a [`Snapshot`](crate::Snapshot) on the table.
+    SnapshotLoad,
     /// Read operations on regular table data
     Scan,
     /// Read operations on change data feed data
@@ -296,9 +299,9 @@ pub(crate) struct FeatureInfo {
     ///
     /// Note: `kernel_support` validation depends on `feature_type`:
     /// WriterOnly features: Only checked during `Operation::Write`
-    /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
-    /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
-    /// WriterOnly features are never invoked for Scan/CDF regardless of the custom check logic.
+    /// ReaderWriter features: Checked during every operation
+    /// Read operations (SnapshotLoad, Scan, Cdf) only validate reader features, so they do not
+    /// invoke `kernel_support` for WriterOnly features.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
@@ -363,9 +366,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
@@ -418,14 +419,23 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// TODO(#1125): IcebergCompatV2 requires schema type validation. Unlike V1, V2 allows Map and Array
-// types but needs validation against an allowlist of supported types.
-// This validation is not yet implemented. The feature is marked as NotSupported for writes until
-// proper validation is added.
-
-// See Delta Spark: IcebergCompat.scala CheckTypeInV2AllowList (lines 450-459)
-// See Java Kernel: IcebergCompatMetadataValidatorAndUpdater.java V2_SUPPORTED_TYPES
-// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2 for more requirements to support.
+/// IcebergCompatV2 ensures that Delta tables can be converted to Iceberg format.
+/// Spec: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2>.
+/// See
+/// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2>
+/// for more requirements to support.
+///
+/// TODO(#1125): Implement the schema-evolution requirements for IcebergCompatV2.
+/// TODO: Support ALTER TABLE on tables with IcebergCompatV2 enabled.
+///
+/// Requirements to enforce when the corresponding write paths are supported:
+/// - REPLACE TABLE: when supported, partition columns must not change across the replace.
+/// - Timestamp parquet encoding: if/when kernel can write INT96 or INT64, IcebergCompatV2 tables
+///   must always use INT64; INT96 is forbidden.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
+///   disable IcebergCompatV2 on an existing table.
+///
+/// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/1125>
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -435,7 +445,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
     }),
@@ -509,7 +519,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Write => Ok(()),
+        Operation::SnapshotLoad | Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
             "Feature 'catalogManaged' is not supported for CDF",
         )),
@@ -522,7 +532,7 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Write => Ok(()),
+        Operation::SnapshotLoad | Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
             "Feature 'catalogOwned-preview' is not supported for CDF",
         )),
@@ -632,8 +642,9 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
-// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// Dependencies and mutual exclusions per the adaptiveMetadata RFC (delta-io/delta#6978) "Table
+// Feature Enablement" section. Enforcement is covered by
+// `test_adaptive_metadata_feature_requirements`.
 // TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
 static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
@@ -653,6 +664,10 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Enabled(TableFeature::DomainMetadata),
         FeatureRequirement::Enabled(TableFeature::DeletionVectors),
         FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+        // adaptiveMetadata and v2Checkpoint are mutually exclusive: once adaptiveMetadata is
+        // enabled, checkpoint state is carried by the `checkpoint` action rather than by V2
+        // checkpoint files, so a table must not enable both.
+        FeatureRequirement::NotSupported(TableFeature::V2Checkpoint),
     ],
     #[cfg(feature = "adaptive-metadata-in-dev")]
     kernel_support: KernelSupport::Supported,
@@ -668,7 +683,7 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[],
     #[cfg(feature = "geo-type-in-dev")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => Ok(()),
         Operation::Write => Err(Error::unsupported(
             "Feature 'geospatial' is not supported for writes",
         )),
