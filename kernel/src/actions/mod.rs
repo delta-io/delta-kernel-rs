@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use delta_kernel_derive::{internal_api, IntoStructData, ToSchema, TryFromStructData};
+use derive_more::Constructor;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
@@ -1241,9 +1242,10 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
+#[derive(Constructor, IntoStructData, ToSchema)]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
     pub(crate) app_id: String,
@@ -1256,16 +1258,6 @@ pub(crate) struct SetTransaction {
 }
 
 impl SetTransaction {
-    /// Creates a set-transaction action.
-    #[internal_api]
-    pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
-        Self {
-            app_id,
-            version,
-            last_updated,
-        }
-    }
-
     /// Whether this transaction is expired: `last_updated <= expiration_timestamp` with both
     /// present. A `None` `last_updated` (no timestamp recorded) or a `None` `expiration_timestamp`
     /// (no retention duration configured) never expires.
@@ -1650,9 +1642,10 @@ impl Sidecar {
 /// specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
+#[derive(Constructor, IntoStructData, ToSchema)]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
     ///
@@ -1665,15 +1658,6 @@ pub(crate) struct CheckpointMetadata {
     /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
     #[allow_null_container_values]
     pub(crate) tags: Option<HashMap<String, String>>,
-}
-
-impl CheckpointMetadata {
-    /// Creates checkpoint metadata.
-    #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn new(version: i64, tags: Option<HashMap<String, String>>) -> Self {
-        Self { version, tags }
-    }
 }
 
 /// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two

@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel_derive::internal_api;
+use derive_more::Constructor;
 use itertools::Itertools;
 use tracing::debug;
 
@@ -355,7 +356,7 @@ pub(crate) fn fixup_parquet_read(
 /// position. The `index` of the element is the position that the column should appear in the final
 /// output. The `transform` indicates what, if any, transforms are needed. See the docs for
 /// [`ReorderIndexTransform`] for the meaning.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Constructor)]
 #[internal_api]
 pub(crate) struct ReorderIndex {
     pub index: usize,
@@ -380,10 +381,6 @@ pub(crate) enum ReorderIndexTransform {
 }
 
 impl ReorderIndex {
-    fn new(index: usize, transform: ReorderIndexTransform) -> Self {
-        ReorderIndex { index, transform }
-    }
-
     fn cast(index: usize, target: ArrowDataType) -> Self {
         ReorderIndex::new(index, ReorderIndexTransform::Cast(target))
     }

@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use derive_more::Constructor;
 use tracing::{debug, warn};
 
 use crate::engine_data::GetData;
@@ -64,6 +65,7 @@ impl FileActionKey {
 ///
 /// TODO: Modify deduplication to track only file paths instead of (path, dv_unique_id).
 /// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701
+#[derive(Constructor)]
 pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
@@ -84,28 +86,6 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     add_dv_start_index: usize,
     /// Starting index for remove action deletion vector columns
     remove_dv_start_index: usize,
-}
-
-impl<'seen> FileActionDeduplicator<'seen> {
-    pub(crate) fn new(
-        seen_file_keys: &'seen mut HashSet<FileActionKey>,
-        is_log_batch: bool,
-        add_path_index: usize,
-        add_size_index: usize,
-        remove_path_index: usize,
-        add_dv_start_index: usize,
-        remove_dv_start_index: usize,
-    ) -> Self {
-        Self {
-            seen_file_keys,
-            is_log_batch,
-            add_path_index,
-            add_size_index,
-            remove_path_index,
-            add_dv_start_index,
-            remove_dv_start_index,
-        }
-    }
 }
 
 impl Deduplicator for FileActionDeduplicator<'_> {
@@ -209,6 +189,7 @@ impl Deduplicator for FileActionDeduplicator<'_> {
 }
 
 #[internal_api]
+#[derive(Constructor)]
 pub(crate) struct ActionsBatch {
     /// The batch of actions to be processed: each row is an action from the log.
     pub actions: Box<dyn EngineData>,
@@ -217,20 +198,6 @@ pub(crate) struct ActionsBatch {
 }
 
 impl ActionsBatch {
-    /// Creates a new `ActionsBatch` instance. See [`LogReplayProcessor::process_actions_batch`] for
-    /// usage.
-    ///
-    /// # Parameters
-    /// - `actions`: A boxed [`EngineData`] instance representing the actions batch.
-    /// - `is_log_batch`: A boolean indicating whether the batch is from a commit log (`true`) or a
-    ///   checkpoint/CRC/elsewhere (`false`).
-    pub(crate) fn new(actions: Box<dyn EngineData>, is_log_batch: bool) -> Self {
-        Self {
-            actions,
-            is_log_batch,
-        }
-    }
-
     /// HACK: a duplication of the pub(crate) field `actions` to allow us to export as
     /// 'internal-api' and let inspect-table example use it.
     #[allow(unused)]

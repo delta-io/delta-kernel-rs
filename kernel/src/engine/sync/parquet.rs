@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use url::Url;
 
 use super::{get_bytes, put_bytes, read_files_arrow};
@@ -21,14 +22,9 @@ use crate::{
     ParquetFooter, ParquetHandler, PredicateRef,
 };
 
+#[derive(Constructor)]
 pub(crate) struct SyncParquetHandler {
     store: Option<Arc<DynObjectStore>>,
-}
-
-impl SyncParquetHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
-    }
 }
 
 pub(super) fn try_create_from_parquet(
