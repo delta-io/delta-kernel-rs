@@ -42,9 +42,9 @@ pub(crate) fn validate_schema(
     Ok(())
 }
 
-/// Rejects CDF-reserved top-level logical names and top-level physical name `_change_type` (case-insensitive).
-/// Among the CDF-reserved column names, only `_change_type` is stored in parquet, so for top-level physical name
-/// we only need to check it.
+/// Rejects CDF-reserved top-level logical names and top-level physical name `_change_type`
+/// (case-insensitive). Among the CDF-reserved column names, only `_change_type` is stored in
+/// parquet, so for top-level physical name we only need to check it.
 fn validate_cdf_column_names(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
