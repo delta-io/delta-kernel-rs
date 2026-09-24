@@ -413,6 +413,17 @@ pub enum Error {
     #[error("Checksum write unsupported: {0}")]
     ChecksumWriteUnsupported(String),
 
+    /// A replayed file total differs from the snapshot's version checksum.
+    #[error(
+        "Checksum mismatch at version {version} for {field}: expected {expected}, got {actual}"
+    )]
+    ChecksumMismatch {
+        version: Version,
+        field: &'static str,
+        expected: i64,
+        actual: i64,
+    },
+
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),

@@ -31,8 +31,9 @@
 //!      counts of actions selected
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::crc::FileStats;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
@@ -46,6 +47,7 @@ use crate::{DeltaResult, DeltaResultIteratorStatic, Error};
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
 pub(crate) struct ActionReconciliationProcessor {
+    file_stats: Arc<Mutex<FileStats>>,
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
     seen_file_keys: HashSet<FileActionKey>,
@@ -202,6 +204,10 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
             is_log_batch,
         } = actions_batch;
         let selection_vector = vec![true; actions.len()];
+        let mut file_stats = self
+            .file_stats
+            .lock()
+            .map_err(|e| Error::internal_error(format!("File statistics lock poisoned: {e}")))?;
 
         // Create the action reconciliation visitor to process actions and update selection vector
         let mut visitor = ActionReconciliationVisitor::new(
@@ -215,6 +221,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
             &mut self.seen_domains,
             self.txn_expiration_timestamp,
         );
+        visitor.file_stats = Some(&mut file_stats);
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Update protocol and metadata seen flags
@@ -243,6 +250,7 @@ impl ActionReconciliationProcessor {
         txn_expiration_timestamp: Option<i64>,
     ) -> Self {
         Self {
+            file_stats: Arc::default(),
             seen_file_keys: Default::default(),
             seen_protocol: false,
             seen_metadata: false,
@@ -251,6 +259,10 @@ impl ActionReconciliationProcessor {
             minimum_file_retention_timestamp,
             txn_expiration_timestamp,
         }
+    }
+
+    pub(crate) fn file_stats(&self) -> Arc<Mutex<FileStats>> {
+        self.file_stats.clone()
     }
 }
 
@@ -295,6 +307,7 @@ impl ActionReconciliationProcessor {
 ///
 /// The resulting filtered set of actions are the reconciled actions.
 pub(crate) struct ActionReconciliationVisitor<'seen> {
+    file_stats: Option<&'seen mut FileStats>,
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
     // This set has O(M) memory usage where M = number of file actions with unique (path, dvId)
@@ -384,6 +397,7 @@ impl ActionReconciliationVisitor<'_> {
         txn_expiration_timestamp: Option<i64>,
     ) -> ActionReconciliationVisitor<'seen> {
         ActionReconciliationVisitor {
+            file_stats: None,
             deduplicator: FileActionDeduplicator::new(
                 seen_file_keys,
                 is_log_batch,
@@ -456,6 +470,9 @@ impl ActionReconciliationVisitor<'_> {
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;
+            if let Some(file_stats) = &mut self.file_stats {
+                file_stats.add_file(getters[Self::ADD_SIZE.index].get(i, Self::ADD_SIZE.name)?)?;
+            }
             true
         } else {
             // Expired remove actions are not valid
