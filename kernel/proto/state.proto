@@ -1,0 +1,39 @@
+// Proto transport for kernel-owned snapshot state.
+
+syntax = "proto3";
+
+package delta.kernel.state;
+
+option java_package = "io.delta.kernel.proto.state";
+
+import "schema.proto";
+
+message Metadata {
+  string id = 1;
+  optional string name = 2;
+  optional string description = 3;
+  string format_provider = 4;
+  map<string, string> format_options = 5;
+  string schema_string = 6;
+  repeated string partition_columns = 7;
+  optional int64 created_time = 8;
+  map<string, string> configuration = 9;
+}
+
+// A wrapper preserves the distinction between an absent feature list and a present empty list.
+message FeatureList {
+  repeated string features = 1;
+}
+
+message Protocol {
+  int32 min_reader_version = 1;
+  int32 min_writer_version = 2;
+  FeatureList reader_features = 3;
+  FeatureList writer_features = 4;
+}
+
+message SnapshotState {
+  delta.kernel.schema.StructType schema = 1;
+  Metadata metadata = 2;
+  Protocol protocol = 3;
+}

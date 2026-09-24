@@ -22,8 +22,10 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotHint, SnapshotRef};
+use delta_kernel::state_proto::{schema as proto_schema, state as proto_state};
 use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
+use prost::Message;
 use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
@@ -448,14 +450,12 @@ mod private {
     /// An owned byte buffer allocated by the kernel. Any time the engine receives a
     /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
     /// must free it by calling [super::free_kernel_bytes] exactly once.
-    #[cfg(feature = "declarative-plans")]
     #[repr(C)]
     pub struct KernelOwnedBytes {
         ptr: NonNull<u8>,
         len: usize,
     }
 
-    #[cfg(feature = "declarative-plans")]
     impl KernelOwnedBytes {
         /// Converts this buffer back into a `Vec<u8>`.
         ///
@@ -472,7 +472,6 @@ mod private {
         }
     }
 
-    #[cfg(feature = "declarative-plans")]
     impl From<Vec<u8>> for KernelOwnedBytes {
         fn from(val: Vec<u8>) -> Self {
             let len = val.len();
@@ -489,12 +488,10 @@ mod private {
     /// The engine assumes ownership of the buffer memory when kernel passes it a
     /// [KernelOwnedBytes], but must only free it by calling [super::free_kernel_bytes]. Since the
     /// global allocator is threadsafe, it doesn't matter which engine thread invokes that method.
-    #[cfg(feature = "declarative-plans")]
     unsafe impl Send for KernelOwnedBytes {}
     /// # Safety
     ///
     /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
-    #[cfg(feature = "declarative-plans")]
     unsafe impl Sync for KernelOwnedBytes {}
 
     impl KernelBoolSlice {
@@ -604,9 +601,7 @@ mod private {
         }
     }
 }
-#[cfg(feature = "declarative-plans")]
-pub use private::KernelOwnedBytes;
-pub use private::{KernelBoolSlice, KernelRowIndexArray};
+pub use private::{KernelBoolSlice, KernelOwnedBytes, KernelRowIndexArray};
 
 /// # Safety
 ///
@@ -630,7 +625,6 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
-#[cfg(feature = "declarative-plans")]
 #[no_mangle]
 pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
     let _ = unsafe { bytes.into_vec() };
@@ -1754,6 +1748,19 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
     snapshot.schema().into()
 }
 
+/// Serialize a borrowed schema handle as protobuf. The caller owns the returned buffer and must
+/// free it exactly once with [`free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid schema handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_schema_as_proto(schema: Handle<SharedSchema>) -> KernelOwnedBytes {
+    let schema = unsafe { schema.as_ref() };
+    proto_schema::StructType::from(schema)
+        .encode_to_vec()
+        .into()
+}
+
 /// Free a schema
 ///
 /// # Safety
@@ -1855,6 +1862,19 @@ pub unsafe extern "C" fn snapshot_get_protocol(
     Arc::new(snapshot.table_configuration().protocol().clone()).into()
 }
 
+/// Serialize a borrowed protocol handle as protobuf. The caller owns the returned buffer and must
+/// free it exactly once with [`free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid protocol handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_protocol_as_proto(
+    protocol: Handle<SharedProtocol>,
+) -> KernelOwnedBytes {
+    let protocol = unsafe { protocol.as_ref() };
+    proto_state::Protocol::from(protocol).encode_to_vec().into()
+}
+
 /// Free a protocol handle obtained from [`snapshot_get_protocol`].
 ///
 /// # Safety
@@ -1916,6 +1936,43 @@ pub unsafe extern "C" fn snapshot_get_metadata(
 ) -> Handle<SharedMetadata> {
     let snapshot = unsafe { snapshot.as_ref() };
     Arc::new(snapshot.table_configuration().metadata().clone()).into()
+}
+
+/// Serialize a borrowed metadata handle as protobuf. The caller owns the returned buffer and must
+/// free it exactly once with [`free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid metadata handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_metadata_as_proto(
+    metadata: Handle<SharedMetadata>,
+) -> KernelOwnedBytes {
+    let metadata = unsafe { metadata.as_ref() };
+    proto_state::Metadata::from(metadata).encode_to_vec().into()
+}
+
+/// Serialize the schema, metadata, and protocol of a borrowed snapshot in one protobuf buffer.
+/// The caller owns the returned buffer and must free it exactly once with
+/// [`free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_snapshot_state_as_proto(
+    snapshot: Handle<SharedSnapshot>,
+) -> KernelOwnedBytes {
+    let snapshot = unsafe { snapshot.as_ref() };
+    proto_state::SnapshotState {
+        schema: Some(proto_schema::StructType::from(snapshot.schema().as_ref())),
+        metadata: Some(proto_state::Metadata::from(
+            snapshot.table_configuration().metadata(),
+        )),
+        protocol: Some(proto_state::Protocol::from(
+            snapshot.table_configuration().protocol(),
+        )),
+    }
+    .encode_to_vec()
+    .into()
 }
 
 /// Free a metadata handle obtained from [`snapshot_get_metadata`].
