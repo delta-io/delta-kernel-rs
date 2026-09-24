@@ -17,8 +17,8 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
-    ExpressionRef, MapToStructOptions, Predicate, UnaryExpressionOp,
+    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
+    MapToStructOptions, Predicate, UnaryExpressionOp,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -30,7 +30,7 @@ use crate::schema::{
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Error, PlanBuilder};
+use crate::{DeltaResult, PlanBuilder};
 
 // === Internal column names ===
 
@@ -70,8 +70,8 @@ impl Scan {
         // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's
         // dedup carrier and both terminal `{ add }` projections, so every arm agrees on the
         // union schema.
-        let add_field = self.normalized_add_field()?;
-        let (output_expr, output_schema) = self.metadata_output_projection(&add_field)?;
+        let output_schema = schema_ref! { (self.normalized_add_field()?) };
+        let output_expr: ExpressionRef = Arc::new(Expr::struct_from([col!(ADD_NAME)]));
 
         let commit_actions = self.commit_arm()?.try_fold_with(prune, |p, prune| {
             // We filter so that:
@@ -248,27 +248,7 @@ impl Scan {
         })
     }
 
-    fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_schema = self.required_parsed_stats_schema();
-        let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
-        let add_schema = add_read_schema(true);
-        let patch = SchemaStructPatchBuilder::new()
-            .fold_with(physical_stats_schema, |patch, schema| {
-                patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
-            })
-            .fold_with(physical_partition_schema, |patch, schema| {
-                patch.append(StructField::nullable(
-                    PARTITION_VALUES_PARSED,
-                    schema.as_ref().clone(),
-                ))
-            });
-        Ok(StructField::nullable(ADD_NAME, patch.build(&add_schema)?))
-    }
-
-    /// Builds the output projection over the add struct constructed by
-    /// [`Self::normalized_add_field`].
-    ///
-    /// The output schema is:
+    /// Returns the `add` field that every arm normalizes to and the plan emits:
     /// ```text
     /// add: struct<
     ///   path: string,
@@ -287,28 +267,21 @@ impl Scan {
     /// >
     /// ```
     /// Parsed partition values are omitted for unpartitioned tables.
-    fn metadata_output_projection(
-        &self,
-        add_field: &StructField,
-    ) -> DeltaResult<(ExpressionRef, SchemaRef)> {
-        let input_schema = schema_ref! { (add_field.clone()) };
-        let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
-
-        // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
-        let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
-        let projection = match (self.stats.emit_json, has_json_stats) {
-            (true, true) | (false, false) => projection,
-            (true, false) => {
-                return Err(Error::internal_error(
-                    "JSON stats were requested, but add.stats is missing from the metadata schema",
-                ));
-            }
-            (false, true) => projection.drop(STATS),
-        };
-
-        let (add_schema, add_expr) = projection.build()?;
-        let schema = schema_ref! { nullable ADD_NAME: (add_schema.as_ref().clone()) };
-        Ok((Arc::new(Expr::struct_from([add_expr])), schema))
+    fn normalized_add_field(&self) -> DeltaResult<StructField> {
+        let physical_stats_schema = self.required_parsed_stats_schema();
+        let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
+        let add_schema = add_read_schema(self.stats.emit_json);
+        let patch = SchemaStructPatchBuilder::new()
+            .fold_with(physical_stats_schema, |patch, schema| {
+                patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
+            })
+            .fold_with(physical_partition_schema, |patch, schema| {
+                patch.append(StructField::nullable(
+                    PARTITION_VALUES_PARSED,
+                    schema.as_ref().clone(),
+                ))
+            });
+        Ok(StructField::nullable(ADD_NAME, patch.build(&add_schema)?))
     }
 }
 
@@ -442,7 +415,8 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 trait ProjectionStructPatchBuilderExt<'a> {
-    /// Emits requested JSON stats, or a null placeholder when JSON stats are disabled.
+    /// Emits JSON stats when requested, serializing `add.stats_parsed` for rows without JSON.
+    /// Otherwise drops `add.stats`.
     fn with_output_add_json_stats(self, emit_json: bool) -> Self;
 
     /// Parses add stats, preferring a compatible parsed field.
@@ -459,29 +433,20 @@ trait ProjectionStructPatchBuilderExt<'a> {
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
     fn with_output_add_json_stats(self, emit_json: bool) -> Self {
         let has_json_stats = self.input_schema().contains_col([ADD_NAME, STATS]);
-        if !emit_json {
-            return if has_json_stats {
-                self.replace_expr_at([ADD_NAME], STATS, null_lit(DataType::STRING))
-            } else {
-                self.insert_after_at(
-                    [ADD_NAME],
-                    "dataChange",
-                    StructField::nullable(STATS, DataType::STRING),
-                    null_lit(DataType::STRING),
-                )
-            };
-        }
-        if !self
+        let has_stats_parsed = self
             .input_schema()
-            .contains_col([ADD_NAME, STATS_PARSED_NAME])
-        {
-            return self;
+            .contains_col([ADD_NAME, STATS_PARSED_NAME]);
+        match (emit_json, has_json_stats, has_stats_parsed) {
+            (false, true, _) => self.drop_at([ADD_NAME], STATS),
+            (true, true, true) => {
+                let stats = Expr::coalesce([
+                    col!(ADD_NAME, STATS),
+                    Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
+                ]);
+                self.replace_expr_at([ADD_NAME], STATS, stats)
+            }
+            _ => self,
         }
-        let stats = Expr::coalesce([
-            col!(ADD_NAME, STATS),
-            Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
-        ]);
-        self.replace_expr_at([ADD_NAME], STATS, stats)
     }
 
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self {
