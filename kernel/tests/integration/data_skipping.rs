@@ -1190,11 +1190,7 @@ async fn scan_with_replace_table_schema_change(
     Ok(())
 }
 
-// === RFC 3339 offset partition values (#2733) ===
-//
-// A foreign writer can emit a timestamp partition value with a non-UTC RFC 3339 offset. The
-// offset must be honored and the value normalized to UTC, e.g. `2024-06-15T14:30:00+05:00`
-// denotes 09:30 UTC, not 14:30 UTC.
+// === Timestamp partition values ===
 
 /// Builds a Delta commit body containing a `commitInfo` plus one stats-less Add per
 /// `(path, ts_partition_value)`.
@@ -1212,7 +1208,7 @@ fn commit_with_ts_partitioned_adds(version: u64, adds: &[(&str, &str)]) -> Strin
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn partition_pruning_honors_rfc3339_offset_partition_values(
+async fn partition_pruning_interprets_explicit_offsets_as_absolute(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -1226,12 +1222,15 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
         .commit(engine.as_ref())?
         .unwrap_committed();
 
-    // v1: adds in the style of an offset-emitting foreign writer. Pruning never opens data
-    // files, so fake paths are fine. The two partition values denote *different* instants:
-    // file_A is 2024-06-15T09:30:00Z once its +05:00 offset is honored, file_B is 14:30:00Z.
+    // Pruning never opens data files, so a fake path is sufficient.
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(&table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
+    let predicate: PredicateRef = Arc::new(Pred::eq(
+        col!("ts"),
+        lit(Scalar::Timestamp(1_718_461_800_000_000)),
+    ));
+
     add_commit(
         table_url.as_str(),
         store.as_ref(),
@@ -1239,34 +1238,32 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
         commit_with_ts_partitioned_adds(
             1,
             &[
-                ("file_A.parquet", "2024-06-15T14:30:00+05:00"),
-                ("file_B.parquet", "2024-06-15T14:30:00Z"),
+                ("matching.parquet", "2024-06-15T14:30:00Z"),
+                ("pruned.parquet", "2024-06-15T15:30:00Z"),
             ],
         ),
     )
     .await?;
-
-    let nine_thirty_utc_us: i64 = 1_718_443_800_000_000; // 2024-06-15T09:30:00Z
-    let fourteen_thirty_utc_us: i64 = 1_718_461_800_000_000; // 2024-06-15T14:30:00Z
-
-    // ts == 09:30Z must keep only file_A (its +05:00 value normalized to 09:30 UTC).
-    let predicate = Arc::new(Pred::eq(
-        col!("ts"),
-        lit(Scalar::Timestamp(nine_thirty_utc_us)),
-    ));
     assert_eq!(
-        surviving_files(&table_path, engine.clone(), predicate, use_parallel)?,
+        surviving_files(
+            &table_path,
+            Arc::clone(&engine),
+            Arc::clone(&predicate),
+            use_parallel,
+        )?,
         1
     );
 
-    // ts == 14:30Z must keep only file_B.
-    let predicate = Arc::new(Pred::eq(
-        col!("ts"),
-        lit(Scalar::Timestamp(fourteen_thirty_utc_us)),
-    ));
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        2,
+        commit_with_ts_partitioned_adds(2, &[("offset.parquet", "2024-06-15T19:30:00+05:00")]),
+    )
+    .await?;
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
-        1
+        2
     );
     Ok(())
 }
