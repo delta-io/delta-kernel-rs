@@ -160,6 +160,91 @@ fn test_snapshot_hint(
     }
 }
 
+#[test]
+fn externalized_core_borrows_validated_connector_state() {
+    let engine = test_engine();
+    let mut builder = test_builder(&engine);
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let mut different_state = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    different_state.metadata.id = slice("different-table-id");
+    let rejected = unsafe {
+        snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &different_state,
+            42,
+            engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "differs");
+    assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+    let core = unsafe {
+        ok_or_panic(snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(snapshot) };
+
+    assert_eq!(unsafe { snapshot_core_version(core.shallow_copy()) }, 0);
+    let schema = unsafe {
+        ok_or_panic(snapshot_core_logical_schema(
+            core.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { crate::free_schema(schema) };
+    let protocol = unsafe {
+        ok_or_panic(snapshot_core_get_protocol(
+            core.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { crate::free_protocol(protocol) };
+    let metadata = unsafe {
+        ok_or_panic(snapshot_core_get_metadata(
+            core.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { crate::free_metadata(metadata) };
+
+    let wrong_generation = unsafe {
+        snapshot_core_logical_schema(core.shallow_copy(), &hint, 43, engine.shallow_copy())
+    };
+    assert_extern_result_error_contains(
+        wrong_generation,
+        KernelError::InvalidSnapshotHint,
+        "generation",
+    );
+    unsafe {
+        free_snapshot_core(core);
+        free_engine(engine);
+    }
+}
+
 unsafe fn set_minimal_hint(builder: &mut Handle<MutableFfiSnapshotBuilder>) {
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
