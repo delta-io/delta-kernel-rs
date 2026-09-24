@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::actions::visitors::{
-    visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
+    visit_metadata_at, visit_protocol_at, AddVisitor, METADATA_LEAVES, PROTOCOL_LEAVES,
 };
 use crate::actions::{DomainMetadata, SetTransaction};
 use crate::crc::{Crc, DomainMetadataState, FileStatsState, SetTransactionState};
@@ -234,12 +234,23 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         self.seen_protocol = visitor.seen_protocol;
         self.seen_metadata = visitor.seen_metadata;
 
-        let filtered_data = FilteredEngineData::try_new(actions, visitor.selection_vector)?;
+        let actions_count = visitor.actions_count;
+        let add_actions_count = visitor.add_actions_count;
+        let mut filtered_data = FilteredEngineData::try_new(actions, visitor.selection_vector)?;
+        if let Some(files) = crc.as_mut().and_then(|crc| crc.all_files.as_mut()) {
+            // Materialize only live files, keeping the selected engine data unchanged for the
+            // checkpoint writer.
+            let actions = filtered_data.apply_selection_vector()?;
+            let mut visitor = AddVisitor { adds: Vec::new() };
+            visitor.visit_rows_of(actions.as_ref())?;
+            files.extend(visitor.adds);
+            filtered_data = FilteredEngineData::with_all_rows_selected(actions);
+        }
 
         Ok(ActionReconciliationBatch {
             filtered_data,
-            actions_count: visitor.actions_count,
-            add_actions_count: visitor.add_actions_count,
+            actions_count,
+            add_actions_count,
         })
     }
 
@@ -393,7 +404,9 @@ impl<'seen> ActionReconciliationVisitor<'seen> {
     const TXN_VERSION: GetterColumn = GetterColumn::new(16, "txn.version");
     const DOMAIN_METADATA_CONFIGURATION: GetterColumn =
         GetterColumn::new(17, "domainMetadata.configuration");
-    const PROTOCOL_LEAVES_START: usize = 18;
+    const ADD_DV_CARDINALITY: GetterColumn =
+        GetterColumn::new(18, "add.deletionVector.cardinality");
+    const PROTOCOL_LEAVES_START: usize = 19;
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -443,13 +456,25 @@ impl<'seen> ActionReconciliationVisitor<'seen> {
         let Some(crc) = &mut self.crc else {
             return Ok(());
         };
-        if let Some(size) = getters[Self::ADD_SIZE.index].get_opt(row, Self::ADD_SIZE.name)? {
+        if getters[Self::ADD_PATH.index]
+            .get_str(row, Self::ADD_PATH.name)?
+            .is_some()
+        {
+            let size = getters[Self::ADD_SIZE.index].get(row, Self::ADD_SIZE.name)?;
             let FileStatsState::Complete(stats) = &mut crc.file_stats_state else {
                 return Err(Error::internal_error(
                     "CRC replay requires complete file statistics",
                 ));
             };
-            return stats.add_file(size);
+            stats.add_file(size)?;
+            let cardinality = getters[Self::ADD_DV_STORAGE_TYPE.index]
+                .get_str(row, Self::ADD_DV_STORAGE_TYPE.name)?
+                .map(|_| {
+                    getters[Self::ADD_DV_CARDINALITY.index].get(row, Self::ADD_DV_CARDINALITY.name)
+                })
+                .transpose()?;
+            crc.add_deletion_vector(cardinality)?;
+            return Ok(());
         }
         if let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(row, Self::TXN_APP_ID.name)? {
             let version = getters[Self::TXN_VERSION.index].get(row, Self::TXN_VERSION.name)?;
@@ -762,8 +787,9 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
             names.extend([
                 column_name!("txn.version"),
                 column_name!("domainMetadata.configuration"),
+                column_name!("add.deletionVector.cardinality"),
             ]);
-            types.extend([DataType::LONG, DataType::STRING]);
+            types.extend([DataType::LONG, DataType::STRING, DataType::LONG]);
             for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
                 let (leaf_names, leaf_types) = leaves.as_ref();
                 names.extend_from_slice(leaf_names);
@@ -870,6 +896,81 @@ mod tests {
             assert_eq!(domains["live"].configuration(), "new");
         } else {
             assert!(crc.is_none());
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn reconciliation_crc_counts_live_deletion_vectors_and_optionally_collects_files(
+        #[values(false, true)] collect_files: bool,
+        #[values(false, true)] checkpoint_base: bool,
+    ) -> DeltaResult<()> {
+        let mut accumulator = Crc::replay_accumulator(2, None, None);
+        accumulator.all_files = collect_files.then(Vec::new);
+        let crc = Arc::new(Mutex::new(Some(accumulator)));
+        let newest = create_batch(vec![
+            r#"{"add":{"path":"live","partitionValues":{},"size":1,
+                "modificationTime":0,"dataChange":true,
+                "tags":{"key":"value","null":null},"baseRowId":7,"defaultRowCommitVersion":1,
+                "deletionVector":{"storageType":"i","pathOrInlineDv":"new",
+                    "sizeInBytes":1,"cardinality":10}}}"#,
+            r#"{"add":{"path":"zero","partitionValues":{},"size":2,
+                "modificationTime":0,"dataChange":true,
+                "deletionVector":{"storageType":"i","pathOrInlineDv":"zero",
+                    "sizeInBytes":1,"cardinality":0}}}"#,
+            r#"{"remove":{"path":"live","dataChange":true,
+                "deletionVector":{"storageType":"i","pathOrInlineDv":"old",
+                    "sizeInBytes":1,"cardinality":1}}}"#,
+            r#"{"remove":{"path":"dead","dataChange":true}}"#,
+        ])?;
+        let mut older = create_batch(vec![
+            r#"{"add":{"path":"live","partitionValues":{},"size":-1,
+                "modificationTime":0,"dataChange":true,
+                "deletionVector":{"storageType":"i","pathOrInlineDv":"new",
+                    "sizeInBytes":1,"cardinality":-1}}}"#,
+            r#"{"add":{"path":"live","partitionValues":{},"size":99,
+                "modificationTime":0,"dataChange":true,
+                "deletionVector":{"storageType":"i","pathOrInlineDv":"old",
+                    "sizeInBytes":1,"cardinality":1}}}"#,
+            r#"{"add":{"path":"dead","partitionValues":{},"size":99,
+                "modificationTime":0,"dataChange":true}}"#,
+            r#"{"add":{"path":"plain","partitionValues":{},"size":3,
+                "modificationTime":0,"dataChange":true}}"#,
+        ])?;
+        older.is_log_batch = !checkpoint_base;
+        ActionReconciliationProcessor::new(0, None)
+            .with_crc(crc.clone())
+            .process_actions_iter([Ok(newest), Ok(older)].into_iter())
+            .try_for_each(|batch| batch.map(|_| ()))?;
+        let crc = crc.lock().unwrap();
+        let crc = crc.as_ref().unwrap();
+        assert_eq!(crc.num_deleted_records_opt, Some(10));
+        assert_eq!(crc.num_deletion_vectors_opt, Some(2));
+        assert_eq!(
+            crc.deleted_record_counts_histogram_opt
+                .as_ref()
+                .unwrap()
+                .deleted_record_counts,
+            vec![2, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(crc.file_stats().unwrap().num_files(), 3);
+        assert_eq!(crc.file_stats().unwrap().table_size_bytes(), 6);
+        if collect_files {
+            let files = crc.all_files.as_ref().unwrap();
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|add| add.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["live", "zero", "plain"]
+            );
+            let tags = files[0].tags.as_ref().unwrap();
+            assert_eq!(tags["key"].as_deref(), Some("value"));
+            assert_eq!(tags["null"], None);
+            assert_eq!(files[0].base_row_id, Some(7));
+            assert_eq!(files[0].default_row_commit_version, Some(1));
+        } else {
+            assert!(crc.all_files.is_none());
         }
         Ok(())
     }

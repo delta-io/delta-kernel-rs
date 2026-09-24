@@ -113,7 +113,6 @@ use crate::actions::{
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
 use crate::crc::validation::with_crc_validation;
-use crate::crc::Crc;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -462,21 +461,12 @@ impl CheckpointWriter {
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
         let expected_crc = self.snapshot.crc_at_version().cloned();
-        let histogram = expected_crc
-            .as_ref()
-            .map(|crc| crc.replay_histogram())
-            .transpose()?
-            .flatten();
-        let ict = match &expected_crc {
-            Some(crc) if crc.in_commit_timestamp_opt.is_some() => {
-                Some(self.snapshot.read_commit_in_commit_timestamp(engine)?)
-            }
-            _ => None,
-        };
-        let actual =
-            Arc::new(Mutex::new(expected_crc.as_ref().map(|_| {
-                Crc::replay_accumulator(self.snapshot.version(), histogram, ict)
-            })));
+        let actual = Arc::new(Mutex::new(
+            expected_crc
+                .as_ref()
+                .map(|crc| self.snapshot.crc_replay_accumulator(engine, crc))
+                .transpose()?,
+        ));
         let (checkpoint_data, transaction_expiration) =
             self.snapshot
                 .reconciled_actions(engine, self.read_schema.clone(), actual.clone())?;

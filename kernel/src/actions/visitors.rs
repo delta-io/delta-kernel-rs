@@ -138,7 +138,11 @@ impl AddVisitor {
         let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
         let stats: Option<String> = getters[5].get_opt(row_index, "add.stats")?;
 
-        // TODO(nick) extract tags if we ever need them at getters[6]
+        let tags = getters[6].get_map(row_index, "add.tags")?.map(|tags| {
+            tags.keys()
+                .map(|key| (key.to_owned(), tags.get(key).map(str::to_owned)))
+                .collect()
+        });
 
         let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
 
@@ -158,7 +162,7 @@ impl AddVisitor {
             modification_time,
             data_change,
             stats,
-            tags: None,
+            tags,
             deletion_vector,
             base_row_id,
             default_row_commit_version,

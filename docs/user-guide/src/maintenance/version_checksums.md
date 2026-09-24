@@ -69,9 +69,13 @@ An in-memory CRC is eligible; an older CRC is not compared with newer state.
 Validation checks complete file counts and byte totals, the optional file-size
 histogram, protocol, metadata, and their counts. It also checks complete
 domain metadata and transaction arrays, applying transaction retention to
-both sides. If the CRC contains an in-commit timestamp, validation reads that
-version's commit to check it. Validation does not compare `allFiles`, deletion
-vector aggregates, or `txnId` against the log.
+both sides. It checks deletion-vector totals and their histogram when present.
+If the CRC contains an in-commit timestamp or `txnId`, validation reads that
+version's commit to check them; the commit must still be available.
+
+When the CRC contains `allFiles`, validation collects the live file actions
+and compares them without relying on their order, `dataChange` flags, or
+per-file `stats`. Without `allFiles`, validation doesn't collect the file list.
 
 A discrepancy returns `Error::ChecksumMismatch` with the version, field,
 expected value, and actual value. Read failures and malformed CRC files also

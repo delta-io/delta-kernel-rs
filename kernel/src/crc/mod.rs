@@ -611,28 +611,41 @@ impl DeletedRecordCountsHistogram {
     }
 
     fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> DeltaResult<Self> {
-        let mut bins = vec![0; 10];
+        let mut histogram = Self::empty();
         for cardinality in cardinalities {
-            if cardinality < 0 {
-                return Err(Error::generic(format!(
-                    "allFiles contains negative deletion-vector cardinality {cardinality}"
-                )));
-            }
-            let bin = match cardinality {
-                0 => 0,
-                1..=9 => 1,
-                10..=99 => 2,
-                100..=999 => 3,
-                1_000..=9_999 => 4,
-                10_000..=99_999 => 5,
-                100_000..=999_999 => 6,
-                1_000_000..=9_999_999 => 7,
-                10_000_000..=2_147_483_646 => 8,
-                _ => 9,
-            };
-            bins[bin] += 1;
+            histogram.insert(cardinality)?;
         }
-        Self::try_new(bins)
+        Ok(histogram)
+    }
+
+    fn empty() -> Self {
+        Self {
+            deleted_record_counts: vec![0; 10],
+        }
+    }
+
+    fn insert(&mut self, cardinality: i64) -> DeltaResult<()> {
+        if cardinality < 0 {
+            return Err(Error::generic(format!(
+                "allFiles contains negative deletion-vector cardinality {cardinality}"
+            )));
+        }
+        let bin = match cardinality {
+            0 => 0,
+            1..=9 => 1,
+            10..=99 => 2,
+            100..=999 => 3,
+            1_000..=9_999 => 4,
+            10_000..=99_999 => 5,
+            100_000..=999_999 => 6,
+            1_000_000..=9_999_999 => 7,
+            10_000_000..=2_147_483_646 => 8,
+            _ => 9,
+        };
+        self.deleted_record_counts[bin] = self.deleted_record_counts[bin]
+            .checked_add(1)
+            .ok_or_else(|| Error::generic("CRC deleted-record-count histogram overflow"))?;
+        Ok(())
     }
 
     fn validate(deleted_record_counts: &[i64]) -> DeltaResult<()> {

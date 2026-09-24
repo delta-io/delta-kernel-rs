@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 
 use super::{
-    Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
+    Crc, DeletedRecordCountsHistogram, DomainMetadataState, FileSizeHistogram, FileStats,
+    FileStatsState, SetTransactionState,
 };
-use crate::actions::SetTransaction;
+use crate::actions::{Add, SetTransaction};
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 
@@ -23,6 +24,9 @@ impl Crc {
             domain_metadata_state: DomainMetadataState::Complete(HashMap::new()),
             set_transaction_state: SetTransactionState::Complete(HashMap::new()),
             in_commit_timestamp_opt,
+            num_deleted_records_opt: Some(0),
+            num_deletion_vectors_opt: Some(0),
+            deleted_record_counts_histogram_opt: Some(DeletedRecordCountsHistogram::empty()),
             ..Default::default()
         }
     }
@@ -36,6 +40,31 @@ impl Crc {
                 )
             })
             .transpose()
+    }
+
+    pub(crate) fn add_deletion_vector(&mut self, cardinality: Option<i64>) -> DeltaResult<()> {
+        let records = cardinality.unwrap_or(0);
+        require!(
+            records >= 0,
+            Error::generic("Negative deletion-vector cardinality")
+        );
+        for (total, increment) in [
+            (&mut self.num_deleted_records_opt, records),
+            (
+                &mut self.num_deletion_vectors_opt,
+                i64::from(cardinality.is_some()),
+            ),
+        ] {
+            if let Some(total) = total {
+                *total = total
+                    .checked_add(increment)
+                    .ok_or_else(|| Error::generic("CRC deletion-vector total overflow"))?;
+            }
+        }
+        if let Some(histogram) = &mut self.deleted_record_counts_histogram_opt {
+            histogram.insert(records)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_against(
@@ -101,6 +130,64 @@ impl Crc {
                 &self.in_commit_timestamp_opt,
                 &actual.in_commit_timestamp_opt,
             )?;
+        }
+        for (field, expected, actual) in [
+            (
+                "numDeletedRecordsOpt",
+                self.num_deleted_records_opt,
+                actual.num_deleted_records_opt,
+            ),
+            (
+                "numDeletionVectorsOpt",
+                self.num_deletion_vectors_opt,
+                actual.num_deletion_vectors_opt,
+            ),
+        ] {
+            if expected.is_some() {
+                check_crc_field(self.version, field, &expected, &actual)?;
+            }
+        }
+        if self.deleted_record_counts_histogram_opt.is_some() {
+            check_crc_field(
+                self.version,
+                "deletedRecordCountsHistogramOpt",
+                &self.deleted_record_counts_histogram_opt,
+                &actual.deleted_record_counts_histogram_opt,
+            )?;
+        }
+        if self.txn_id.is_some() {
+            check_crc_field(self.version, "txnId", &self.txn_id, &actual.txn_id)?;
+        }
+        if let Some(expected) = &self.all_files {
+            let actual = actual
+                .all_files
+                .as_ref()
+                .ok_or_else(|| Error::internal_error("CRC replay did not collect allFiles"))?;
+            check_crc_field(self.version, "allFiles", &expected.len(), &actual.len())?;
+            let mut expected: Vec<_> = expected.iter().collect();
+            let mut actual: Vec<_> = actual.iter().collect();
+            let sort_files = |files: &mut Vec<&Add>| {
+                files.sort_by(|a, b| {
+                    (&a.path, a.modification_time, a.size).cmp(&(
+                        &b.path,
+                        b.modification_time,
+                        b.size,
+                    ))
+                });
+            };
+            sort_files(&mut expected);
+            sort_files(&mut actual);
+            for (expected, actual) in expected.into_iter().zip(actual) {
+                // dataChange describes the commit, not the reconciled file state. Per-file
+                // statistics are outside CRC validation's comparison scope.
+                let mut expected = expected.clone();
+                let mut actual = actual.clone();
+                expected.data_change = false;
+                actual.data_change = false;
+                expected.stats = None;
+                actual.stats = None;
+                check_crc_field(self.version, "allFiles", &expected, &actual)?;
+            }
         }
         Ok(())
     }
@@ -236,6 +323,64 @@ mod tests {
             sizes
                 .into_iter()
                 .try_for_each(|size| accumulator.add_file(size)),
+            message,
+        );
+    }
+
+    #[test]
+    fn crc_deletion_vector_accumulation_covers_bin_boundaries() -> DeltaResult<()> {
+        let mut crc = Crc::replay_accumulator(0, None, None);
+        let cardinalities = [
+            0,
+            1,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1_000,
+            9_999,
+            10_000,
+            99_999,
+            100_000,
+            999_999,
+            1_000_000,
+            9_999_999,
+            10_000_000,
+            2_147_483_646,
+            2_147_483_647,
+            2_147_483_648,
+        ];
+        crc.add_deletion_vector(None)?;
+        for cardinality in cardinalities {
+            crc.add_deletion_vector(Some(cardinality))?;
+        }
+        assert_eq!(
+            crc.num_deleted_records_opt,
+            Some(cardinalities.iter().sum())
+        );
+        assert_eq!(crc.num_deletion_vectors_opt, Some(19));
+        assert_eq!(
+            crc.deleted_record_counts_histogram_opt
+                .unwrap()
+                .deleted_record_counts,
+            vec![2; 10]
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::negative(vec![-1], "Negative deletion-vector cardinality")]
+    #[case::overflow(vec![i64::MAX, 1], "deletion-vector total overflow")]
+    fn crc_deletion_vector_accumulation_rejects_invalid_totals(
+        #[case] cardinalities: Vec<i64>,
+        #[case] message: &str,
+    ) {
+        let mut crc = Crc::replay_accumulator(0, None, None);
+        assert_result_error_with_message(
+            cardinalities
+                .into_iter()
+                .try_for_each(|value| crc.add_deletion_vector(Some(value))),
             message,
         );
     }

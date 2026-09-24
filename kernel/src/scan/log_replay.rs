@@ -590,6 +590,7 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     active_add_file_sizes: Vec<u64>,
     metrics: &'a ScanMetrics,
+    validate_file_sizes: bool,
 }
 
 impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
@@ -607,6 +608,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             row_transform_exprs: Vec::new(),
             active_add_file_sizes,
             metrics,
+            validate_file_sizes: false,
         }
     }
 
@@ -661,6 +663,14 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // Check both adds and removes (skipping already-seen), but only transform and return adds
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
+        }
+
+        if self.validate_file_sizes {
+            let size: i64 = getters[ScanLogReplayProcessor::ADD_SIZE_INDEX].get(row, "add.size")?;
+            require!(
+                size >= 0,
+                Error::generic("Cannot validate CRC: negative Add size")
+            );
         }
 
         // Parse partition values for building the per-row transform expression.
@@ -1065,6 +1075,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             actions,
             is_log_batch,
         } = actions_batch;
+        let mut file_stats = self.file_stats.lock().map_err(|e| {
+            Error::internal_error(format!("file statistics accumulator lock poisoned: {e}"))
+        })?;
 
         let mut should_retry_transform_and_data_skip = false;
         // Step 1: Apply transform + data skipping. Do this before deduplication to reduce the size
@@ -1110,6 +1123,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 self.state_info.clone(),
                 &self.metrics,
             );
+            visitor.validate_file_sizes = file_stats.is_some();
             visitor.visit_rows_of(actions.as_ref())?;
             (
                 visitor.selection_vector,
@@ -1142,16 +1156,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 active_add_file_sizes,
             }
         };
-        {
-            let mut file_stats = self.file_stats.lock().map_err(|e| {
-                Error::internal_error(format!("file statistics accumulator lock poisoned: {e}"))
-            })?;
-            self.record_selected_add_files(
-                &final_selection,
-                &active_add_file_sizes,
-                file_stats.as_mut(),
-            )?;
-        }
+        self.record_selected_add_files(
+            &final_selection,
+            &active_add_file_sizes,
+            file_stats.as_mut(),
+        )?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
