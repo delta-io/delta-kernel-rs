@@ -44,6 +44,7 @@ use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Vers
 mod builder;
 mod incremental;
 mod snapshot_crc;
+mod state;
 #[cfg(test)]
 mod tracing_tests;
 #[doc(hidden)]
@@ -53,6 +54,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[internal_api]
 pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
+pub use state::SnapshotState;
 
 pub use crate::error::SnapshotHintError;
 
