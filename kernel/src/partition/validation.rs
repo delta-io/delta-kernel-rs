@@ -51,37 +51,35 @@ pub(crate) fn validate_partition_values(
 
 /// Validates that a connector-provided partition value map contains exactly the expected
 /// partition columns, with case-insensitive key matching. Returns the map re-keyed to
-/// the logical schema case.
+/// the expected column-name case.
 ///
-/// Keys in the input map are logical column names provided by the connector, which may
-/// use any casing (e.g., "YEAR" or "year" for a schema column named "Year"). The returned
-/// map uses the exact logical names from the schema.
+/// Keys in the input map may use any casing (e.g., "YEAR" or "year" for an expected
+/// column named "Year"). The caller supplies logical or physical expected names.
 ///
 /// # Parameters
-/// - `logical_partition_columns`: logical partition column names from kernel's table metadata.
-/// - `logical_partition_values`: connector-provided map from logical column names (any case) to
-///   typed values.
+/// - `expected_partition_columns`: expected logical or physical partition column names.
+/// - `partition_values`: connector-provided map from column names (any case) to typed values.
 ///
 /// # Errors
 /// - A partition column is missing from the map
 /// - An extra key is present that is not a partition column
 /// - Two keys collide after case normalization (e.g., "COL" and "col" both provided)
-fn validate_keys(
-    logical_partition_columns: &[String],
-    logical_partition_values: HashMap<String, Scalar>,
+pub(crate) fn validate_keys(
+    expected_partition_columns: &[String],
+    partition_values: HashMap<String, Scalar>,
 ) -> DeltaResult<HashMap<String, Scalar>> {
-    let schema_lookup: HashMap<String, &str> = logical_partition_columns
+    let schema_lookup: HashMap<String, &str> = expected_partition_columns
         .iter()
         .map(|name| (name.to_lowercase(), name.as_str()))
         .collect();
 
-    let mut normalized = HashMap::with_capacity(logical_partition_values.len());
-    for (key, value) in logical_partition_values {
+    let mut normalized = HashMap::with_capacity(partition_values.len());
+    for (key, value) in partition_values {
         let lower_key = key.to_lowercase();
         let schema_name = schema_lookup.get(&lower_key).ok_or_else(|| {
             Error::invalid_partition_values(format!(
                 "unknown partition column '{key}'. Expected one of: [{}]",
-                logical_partition_columns.join(", ")
+                expected_partition_columns.join(", ")
             ))
         })?;
         // Detect post-normalization duplicates (e.g., "COL" and "col" both provided).
@@ -93,7 +91,7 @@ fn validate_keys(
         normalized.insert(schema_name.to_string(), value);
     }
 
-    for col in logical_partition_columns {
+    for col in expected_partition_columns {
         if !normalized.contains_key(col.as_str()) {
             return Err(Error::invalid_partition_values(format!(
                 "missing partition column '{col}'. Provided: [{}]",

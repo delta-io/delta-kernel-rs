@@ -139,6 +139,23 @@ pub unsafe extern "C" fn write_context_builder_with_partition_values(
     Box::new(builder.with_partition_values(partition_values.inner)).into()
 }
 
+/// Sets physical partition values and consumes both input handles.
+///
+/// The returned handle replaces `builder`; neither input handle remains valid. Kernel validates the
+/// values in [`write_context_builder_build`]. Unpartitioned writers skip this function.
+///
+/// # Safety
+/// The builder and partition-value map handles must be valid and are consumed by this call.
+#[no_mangle]
+pub unsafe extern "C" fn write_context_builder_with_physical_partition_values(
+    builder: Handle<ExclusiveWriteContextBuilder>,
+    partition_values: Handle<ExclusivePartitionValueMap>,
+) -> Handle<ExclusiveWriteContextBuilder> {
+    let builder = unsafe { builder.into_inner() };
+    let partition_values = unsafe { partition_values.into_inner() };
+    Box::new(builder.with_physical_partition_values(partition_values.inner)).into()
+}
+
 /// Sets the logical names of materialized row-tracking columns and consumes the builder.
 ///
 /// The returned handle replaces `builder`. Kernel checks the table's row-tracking configuration in
