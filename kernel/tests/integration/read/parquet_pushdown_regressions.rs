@@ -26,11 +26,12 @@ use test_utils::{
 #[case::max(1234, 10_000, true)]
 #[case::min(-1234, -10_000, false)]
 #[tokio::test]
-async fn decimal_scale_widening_preserves_matching_rows(
+async fn decimal_scale_widening_prunes_only_nonmatching_rows(
     #[case] unscaled: i128,
     #[case] threshold: i128,
     #[case] greater_than: bool,
     #[values(5, 10, 20)] precision: u8,
+    #[values(false, true)] matches: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = Decimal128Array::from(vec![unscaled]).with_precision_and_scale(precision, 2)?;
     let batch = RecordBatch::try_from_iter([("value", Arc::new(source) as ArrayRef)])?;
@@ -43,7 +44,7 @@ async fn decimal_scale_widening_preserves_matching_rows(
         }])),
     )]);
     let threshold = lit(Scalar::decimal(threshold, precision + 1, 3)?);
-    let predicate = if greater_than {
+    let predicate = if greater_than == matches {
         col!("value").gt(threshold)
     } else {
         col!("value").lt(threshold)
@@ -66,7 +67,7 @@ async fn decimal_scale_widening_preserves_matching_rows(
                 .copied()
         })
         .collect();
-    assert_eq!(values, vec![unscaled * 10]);
+    assert_eq!(values, if matches { vec![unscaled * 10] } else { vec![] });
     Ok(())
 }
 
@@ -76,12 +77,13 @@ async fn decimal_scale_widening_preserves_matching_rows(
 #[case::nanos_min(TimeUnit::Nanosecond, 1_000_000_000, 2_000_000, false)]
 #[case::nanos_max(TimeUnit::Nanosecond, -1_000_000_000, -2_000_000, true)]
 #[tokio::test]
-async fn timestamp_unit_conversion_preserves_matching_rows(
+async fn timestamp_unit_conversion_prunes_only_nonmatching_rows(
     #[case] unit: TimeUnit,
     #[case] stored: i64,
     #[case] threshold: i64,
     #[case] greater_than: bool,
     #[values(false, true)] with_timezone: bool,
+    #[values(false, true)] matches: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timezone = with_timezone.then_some("UTC");
     let (source, expected): (ArrayRef, i64) = match unit {
@@ -102,7 +104,7 @@ async fn timestamp_unit_conversion_preserves_matching_rows(
         Scalar::TimestampNtz(threshold)
     };
     let schema = schema_ref! { (StructField::nullable("value", threshold.data_type())) };
-    let predicate = if greater_than {
+    let predicate = if greater_than == matches {
         col!("value").gt(lit(threshold))
     } else {
         col!("value").lt(lit(threshold))
@@ -119,7 +121,7 @@ async fn timestamp_unit_conversion_preserves_matching_rows(
                 .copied()
         })
         .collect();
-    assert_eq!(values, vec![expected]);
+    assert_eq!(values, if matches { vec![expected] } else { vec![] });
     Ok(())
 }
 
