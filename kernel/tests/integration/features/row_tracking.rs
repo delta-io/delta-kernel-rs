@@ -1292,7 +1292,8 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
         .scan_builder()
         .with_schema(scan_schema)
         .with_predicate(Arc::new(col!("number").ge(lit(104i32))))
-        .build()?;
+        .build()?
+        .with_parquet_pushdown_for_testing();
     let batches = read_scan(&scan, engine.clone())?;
     for batch in &batches {
         assert_eq!(

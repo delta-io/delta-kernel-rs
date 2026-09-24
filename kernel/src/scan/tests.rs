@@ -819,43 +819,42 @@ fn test_replay_for_scan_metadata() {
     assert_eq!(data.len(), 3);
 }
 
-#[test]
-fn test_data_row_group_skipping() {
+#[rstest]
+#[case::no_predicate(None, 1)]
+#[case::keeps_row_group(Some(Arc::new(col!("numeric.ints.int32").gt(lit(1000i32)))), 1)]
+#[case::prunes_row_group(Some(Arc::new(col!("numeric.ints.int32").lt(lit(1000i32)))), 0)]
+fn test_data_row_group_skipping(
+    #[case] predicate: Option<PredicateRef>,
+    #[case] batches_with_pushdown: usize,
+    #[values(false, true)] enable_pushdown: bool,
+) {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = Arc::new(SyncEngine::new());
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    // No predicate pushdown attempted, so the one data file should be returned.
-    //
-    // NOTE: The data file contains only five rows -- near guaranteed to produce one row group.
-    let scan = snapshot.clone().scan_builder().build().unwrap();
-    let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
-    assert_eq!(data.len(), 1);
-
-    // Ineffective predicate pushdown attempted, so the one data file should be returned.
-    let int_col = col!("numeric.ints.int32");
-    let value = lit(1000i32);
-    let predicate = Arc::new(int_col.clone().gt(value.clone()));
-    let scan = snapshot
-        .clone()
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-    let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
-    assert_eq!(data.len(), 1);
-
-    // The predicate prunes all row groups, so the scan returns no data batches.
-    let predicate = Arc::new(int_col.lt(value));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .build()
         .unwrap();
+    let scan = if enable_pushdown {
+        scan.with_parquet_pushdown_for_testing()
+    } else {
+        scan
+    };
     let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
-    assert!(data.is_empty());
+    // This file has one row group and no Delta min/max statistics. Only the explicit opt-in
+    // may prune it, even when the library is built with all features enabled.
+    assert_eq!(
+        data.len(),
+        if enable_pushdown {
+            batches_with_pushdown
+        } else {
+            1
+        }
+    );
 }
 
 #[test]
@@ -877,7 +876,8 @@ fn test_missing_column_row_group_skipping() {
         .scan_builder()
         .with_predicate(predicate)
         .build()
-        .unwrap();
+        .unwrap()
+        .with_parquet_pushdown_for_testing();
     let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
     assert_eq!(data.len(), 1);
 
@@ -2301,15 +2301,18 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
 /// Used to simulate a buggy connector that drops all data for a file.
-struct EmptyParquetHandler;
+struct EmptyParquetHandler {
+    expect_predicate: bool,
+}
 
 impl ParquetHandler for EmptyParquetHandler {
     fn read_parquet_files(
         &self,
         _files: &[FileMeta],
         _schema: schema::SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        assert_eq!(predicate.is_some(), self.expect_predicate);
         Ok(Box::new(std::iter::empty()))
     }
 
@@ -2326,22 +2329,42 @@ impl ParquetHandler for EmptyParquetHandler {
     }
 }
 
-/// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
-/// iterator, `execute` must surface an error rather than silently producing no rows.
-#[test]
-fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
+#[rstest]
+fn execute_checks_empty_reader_unless_predicate_was_forwarded(
+    #[values(false, true)] with_predicate: bool,
+    #[values(false, true)] enable_pushdown: bool,
+) {
     let path =
         std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(
-        DelegatingEngine::new(Arc::new(SyncEngine::new()))
-            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_parquet_handler(Arc::new(
+            EmptyParquetHandler {
+                expect_predicate: with_predicate && enable_pushdown,
+            },
+        )),
     );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-    let scan = snapshot.scan_builder().build().unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(with_predicate.then(|| Arc::new(col!("value").ge(lit(0i64)))))
+        .build()
+        .unwrap();
+    let scan = if enable_pushdown {
+        scan.with_parquet_pushdown_for_testing()
+    } else {
+        scan
+    };
 
     let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    if with_predicate && enable_pushdown {
+        assert!(
+            results.is_empty(),
+            "the predicate may prune every row group"
+        );
+        return;
+    }
     assert_eq!(results.len(), 1, "should emit exactly one error item");
     assert!(results[0].is_err(), "the result should be an error, got Ok");
     let err = results[0].as_ref().err().unwrap().to_string();
@@ -2358,8 +2381,11 @@ fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(
-        DelegatingEngine::new(Arc::new(SyncEngine::new()))
-            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_parquet_handler(Arc::new(
+            EmptyParquetHandler {
+                expect_predicate: false,
+            },
+        )),
     );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();

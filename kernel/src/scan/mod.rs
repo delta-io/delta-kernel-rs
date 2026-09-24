@@ -484,6 +484,7 @@ impl ScanBuilder {
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
+            parquet_pushdown: false,
         })
     }
 }
@@ -742,6 +743,7 @@ pub struct Scan {
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+    parquet_pushdown: bool,
 }
 
 /// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
@@ -1341,15 +1343,26 @@ impl Scan {
         ))
     }
 
+    /// Enables experimental data-file Parquet predicate pushdown for this scan's test execution.
+    ///
+    /// Returns the scan with pushdown enabled. For testing only: decimal scale widening and
+    /// timestamp unit conversion can cause incorrect pruning. Ordinary scans leave it disabled.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn with_parquet_pushdown_for_testing(mut self) -> Self {
+        self.parquet_pushdown = true;
+        self
+    }
+
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
     /// the data for the query. Each [`EngineData`] in the resultant iterator is a portion of the
     /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
     /// they can have more control over the execution of the scan.
     ///
-    /// The scan predicate is used for file skipping and passed to the Parquet handler for
-    /// conservative pruning. Returned rows are not guaranteed to satisfy it; callers must apply
-    /// any remaining row-level filter. Deletion vectors are applied using original file row
-    /// indexes.
+    /// The scan predicate is used for Delta file skipping. Data-file Parquet predicate pushdown
+    /// is disabled unless explicitly enabled through the test-only opt-in. Returned rows are not
+    /// guaranteed to satisfy the predicate; callers must apply any remaining row-level filter.
+    /// Deletion vectors are applied using original file row indexes.
     ///
     /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
     /// [`Scan::scan_metadata`] instead.
@@ -1391,7 +1404,10 @@ impl Scan {
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let table_physical_schema = self.snapshot.table_configuration().physical_schema();
-        let predicate = self.physical_predicate();
+        let predicate = self
+            .parquet_pushdown
+            .then(|| self.physical_predicate())
+            .flatten();
         let partition_schema = self.state_info.physical_partition_schema.clone();
         let mut dv_read_setup = None;
         let result = scan_files_iter

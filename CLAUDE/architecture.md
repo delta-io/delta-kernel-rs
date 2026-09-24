@@ -59,12 +59,13 @@ and partition values) -> file reading with optional Parquet predicate pruning ->
 filtering by original file row index -> physical-to-logical transform (partition values,
 column mapping, schema evolution).
 
-`Scan::execute()` binds predicate partition references to Add-action values before Parquet
-pushdown, and requests row-index metadata for DV-bearing files. Parquet pushdown is conservative:
-callers must still apply the predicate for exact row-level filtering.
-The built-in Parquet reader does not use decimal or timestamp min/max bounds for pruning:
-interpreting them requires source-scale and source-unit metadata. Null-count pruning and
-Delta log statistics remain available.
+`Scan::execute()` uses Delta file skipping and requests row-index metadata for DV-bearing files.
+Data-file Parquet predicate pushdown requires an explicit `with_parquet_pushdown_for_testing()`
+opt-in, exposed only for tests and the `test-utils` feature. The opt-in binds partition references
+to Add-action values before pushdown. Ordinary execution leaves pushdown disabled because the
+built-in Parquet reader can misinterpret decimal scales and timestamp units. Direct Parquet reads
+and checkpoint pruning retain their existing behavior. Callers must still apply the predicate for
+exact row-level filtering.
 
 **Key modules** (`kernel/src/scan/`): `log_replay.rs` (reconcile Add/Remove into active file
 set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and partition values).

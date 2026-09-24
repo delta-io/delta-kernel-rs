@@ -177,7 +177,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(11032, 8, 3).unwrap())
     );
 
     assert_eq!(
@@ -185,7 +185,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(11064, 16, 3).unwrap())
     );
 
     // type widening!
@@ -194,7 +194,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(11032, 16, 3).unwrap())
     );
 
     assert_eq!(
@@ -202,7 +202,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(11128, 32, 3).unwrap())
     );
 
     // type widening!
@@ -211,7 +211,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(11064, 32, 3).unwrap())
     );
 
     // type widening!
@@ -220,7 +220,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(11032, 32, 3).unwrap())
     );
 
     assert_eq!(
@@ -246,7 +246,11 @@ fn test_get_stat_values() {
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_min_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
-        None
+        Some(
+            PrimitiveType::Timestamp
+                .parse_scalar("1970-01-02 00:00:00.000000")
+                .unwrap()
+        )
     );
 
     assert_eq!(
@@ -254,13 +258,21 @@ fn test_get_stat_values() {
             &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP_NTZ
         ),
-        None
+        Some(
+            PrimitiveType::TimestampNtz
+                .parse_scalar("1970-01-02 00:00:00.000000")
+                .unwrap()
+        )
     );
 
     // type widening!
     assert_eq!(
         filter.get_min_stat(&column_name!("chrono.date32"), &DataType::TIMESTAMP_NTZ),
-        None
+        Some(
+            PrimitiveType::TimestampNtz
+                .parse_scalar("1971-01-01 00:00:00.000000")
+                .unwrap()
+        )
     );
 
     assert_eq!(
@@ -347,7 +359,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(15032, 8, 3).unwrap())
     );
 
     assert_eq!(
@@ -355,7 +367,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(15064, 16, 3).unwrap())
     );
 
     // type widening!
@@ -364,7 +376,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(15032, 16, 3).unwrap())
     );
 
     assert_eq!(
@@ -372,7 +384,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(15128, 32, 3).unwrap())
     );
 
     // type widening!
@@ -381,7 +393,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(15064, 32, 3).unwrap())
     );
 
     // type widening!
@@ -390,7 +402,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        None
+        Some(Scalar::decimal(15032, 32, 3).unwrap())
     );
 
     assert_eq!(
@@ -416,7 +428,11 @@ fn test_get_stat_values() {
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_max_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
-        None
+        Some(
+            PrimitiveType::Timestamp
+                .parse_scalar("1970-01-02 00:04:00.000000")
+                .unwrap()
+        )
     );
 
     assert_eq!(
@@ -424,13 +440,21 @@ fn test_get_stat_values() {
             &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP_NTZ
         ),
-        None
+        Some(
+            PrimitiveType::TimestampNtz
+                .parse_scalar("1970-01-02 00:04:00.000000")
+                .unwrap()
+        )
     );
 
     // type widening!
     assert_eq!(
         filter.get_max_stat(&column_name!("chrono.date32"), &DataType::TIMESTAMP_NTZ),
-        None
+        Some(
+            PrimitiveType::TimestampNtz
+                .parse_scalar("1971-01-05 00:00:00.000000")
+                .unwrap()
+        )
     );
 }
 
@@ -826,7 +850,9 @@ fn checkpoint_filter_is_not_null_never_prunes() {
 }
 
 #[test]
-fn checkpoint_filter_timestamp_bounds_are_unknown() {
+fn checkpoint_filter_timestamp_max_widened() {
+    // Timestamp max stats are widened by 999us to account for millisecond truncation
+    // in JSON-serialized stats (which stats_parsed inherits).
     let tmp = write_checkpoint_parquet(
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
@@ -840,13 +866,14 @@ fn checkpoint_filter_timestamp_bounds_are_unknown() {
     let predicate = column_pred!("x");
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
+    // max(maxValues.x) = 200, widened to 200 + 999 = 1199
     assert_eq!(
         filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP),
-        None
+        Some(Scalar::Timestamp(1199))
     );
     assert_eq!(
         filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NTZ),
-        None
+        Some(Scalar::TimestampNtz(1199))
     );
 
     // Non-timestamp types are not widened.

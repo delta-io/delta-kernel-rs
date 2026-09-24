@@ -140,7 +140,7 @@ async fn parquet_pruning_preserves_deletion_vector_positions(
         .with_predicate(Arc::new(predicate))
         .build()?;
     let mut actual = Vec::new();
-    for data in scan.execute(engine)? {
+    for data in scan.with_parquet_pushdown_for_testing().execute(engine)? {
         let batch = into_record_batch(data?);
         assert_eq!(batch.num_columns(), if project_row_index { 2 } else { 1 });
         assert_eq!(batch.schema().field(0).name(), "id");
@@ -250,7 +250,7 @@ async fn parquet_predicate_uses_delta_partition_values(
         .build()?;
     let expected_partition_value = partition_value.map(|value| value.parse::<i64>().unwrap());
     let mut actual = Vec::new();
-    for data in scan.execute(engine)? {
+    for data in scan.with_parquet_pushdown_for_testing().execute(engine)? {
         let batch = into_record_batch(data?);
         assert_eq!(batch.num_columns(), 2);
         actual.extend(
