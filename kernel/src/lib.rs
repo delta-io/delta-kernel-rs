@@ -770,7 +770,7 @@ pub struct ParquetFooter {
 /// The result of writing a parquet file via [`ParquetHandler::write_parquet_file`].
 #[derive(Debug)]
 pub struct ParquetWriteResult {
-    /// The number of bytes written to the parquet file.
+    /// The written file size
     pub size_in_bytes: u64,
 }
 
