@@ -2,12 +2,18 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Array, BooleanArray, RecordBatch, StructArray};
-use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, AsArray as _, BinaryArray, BooleanArray, Datum, RecordBatch, StringArray,
+    StructArray,
+};
+use delta_kernel::arrow::compute::kernels::zip::zip;
+use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::PartitionValuesOptions;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
@@ -17,7 +23,8 @@ use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{partitioned, version_latest, FeatureSet, LogState, TableConfig};
 use test_utils::{
     add_commit, create_default_engine_mt_executor, get_column,
-    install_thread_local_metrics_reporter, test_context, CountingReporter,
+    install_thread_local_metrics_reporter, record_batch_to_bytes_with_props, test_context,
+    CountingReporter,
 };
 use url::Url;
 
@@ -217,13 +224,93 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
     .to_string()
 }
 
+/// Where a scan of a foreign-writer table reads its partition values from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LogSource {
+    Commits,
+    /// A kernel-written checkpoint, whose native `partitionValues_parsed` holds null for "".
+    KernelCheckpoint,
+    /// A checkpoint whose native STRING and BINARY partition values hold a foreign writer's
+    /// literal "", with one action per row group so checkpoint row-group skipping sees each value.
+    ForeignCheckpoint,
+}
+
+/// Checkpoints the table at `table_path` according to `source`.
+fn checkpoint_table(table_path: &std::path::Path, url: &Url, source: LogSource) {
+    if source == LogSource::Commits {
+        return;
+    }
+    let engine = create_default_engine_mt_executor(url).unwrap();
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    if source == LogSource::KernelCheckpoint {
+        return;
+    }
+
+    let log_dir = table_path.join("_delta_log");
+    let checkpoint_path = log_dir.join(format!("{:020}.checkpoint.parquet", snapshot.version()));
+    let file = std::fs::File::open(&checkpoint_path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
+    let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+    // Replace every null native STRING and BINARY value of an Add with "".
+    let actions = StructArray::from(batch);
+    let add = actions.column_by_name("add").unwrap().as_struct();
+    let parsed = add
+        .column_by_name("partitionValues_parsed")
+        .unwrap()
+        .as_struct();
+    let p_str = parsed.column_by_name("p_str").unwrap();
+    let is_empty = BooleanArray::from_iter(
+        (0..add.len()).map(|row| Some(add.is_valid(row) && p_str.is_null(row))),
+    );
+    let fill = |name: &str, empty: &dyn Datum| {
+        zip(&is_empty, empty, parsed.column_by_name(name).unwrap()).unwrap()
+    };
+    let parsed = with_field(parsed, "p_str", fill("p_str", &StringArray::new_scalar("")));
+    let parsed = with_field(
+        &parsed,
+        "p_bin",
+        fill("p_bin", &BinaryArray::new_scalar(b"")),
+    );
+    let add = with_field(add, "partitionValues_parsed", Arc::new(parsed));
+    let batch = RecordBatch::from(with_field(&actions, "add", Arc::new(add)));
+
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    std::fs::write(
+        &checkpoint_path,
+        record_batch_to_bytes_with_props(&batch, props),
+    )
+    .unwrap();
+    std::fs::remove_file(log_dir.join("_last_checkpoint")).unwrap();
+}
+
+/// Returns `array` with its `name` child replaced by `value`.
+fn with_field(array: &StructArray, name: &str, value: ArrayRef) -> StructArray {
+    let (fields, mut columns, nulls) = array.clone().into_parts();
+    columns[fields.find(name).unwrap().0] = value;
+    StructArray::new(fields, columns, nulls)
+}
+
 /// A foreign writer can persist a literal "" in the `partitionValues` map. On read, kernel
-/// reconstructs every such `partitionValues_parsed` field as null, whether from a JSON commit or a
-/// kernel-written checkpoint. The `native_checkpoint` axis exercises both sources.
+/// reconstructs every such `partitionValues_parsed` field as null from every [`LogSource`].
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_partition_values_read_foreign_empty_string(
-    #[values(false, true)] native_checkpoint: bool,
+    #[values(
+        LogSource::Commits,
+        LogSource::KernelCheckpoint,
+        LogSource::ForeignCheckpoint
+    )]
+    source: LogSource,
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("foreign-empty-string");
@@ -237,14 +324,8 @@ async fn parsed_partition_values_read_foreign_empty_string(
         )],
     )
     .await;
+    checkpoint_table(&table_path, &url, source);
     let engine = create_default_engine_mt_executor(&url).unwrap();
-
-    if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
-    }
 
     // Confirm the scan reads from the intended source: the checkpoint axis must actually place a
     // checkpoint in the snapshot's log segment (and the non-checkpoint axis must not), otherwise a
@@ -256,8 +337,8 @@ async fn parsed_partition_values_read_foreign_empty_string(
         .unwrap();
     assert_eq!(
         reporter.checkpoint_files.get(),
-        u64::from(native_checkpoint),
-        "log segment checkpoint parts must match native_checkpoint={native_checkpoint}"
+        u64::from(source != LogSource::Commits),
+        "log segment checkpoint parts must match {source:?}"
     );
     let scan = snapshot
         .scan_builder()
@@ -280,10 +361,7 @@ async fn parsed_partition_values_read_foreign_empty_string(
 
         asserted_rows += batch.num_rows();
     }
-    assert_eq!(
-        asserted_rows, 1,
-        "expected exactly one file (native_checkpoint={native_checkpoint})"
-    );
+    assert_eq!(asserted_rows, 1, "expected exactly one file ({source:?})");
 }
 
 fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
@@ -292,11 +370,17 @@ fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
 
 /// A file whose partition value is a foreign literal "" has a null partition value, so partition
 /// skipping prunes it under an equality with any literal (including `''`) and under `IS NOT NULL`,
-/// and keeps it under `IS NULL`. The `native_checkpoint` axis exercises that pruning is identical
-/// before and after a kernel checkpoint.
+/// and keeps it under `IS NULL`, from every [`LogSource`].
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint: bool) {
+async fn empty_string_partition_pruning(
+    #[values(
+        LogSource::Commits,
+        LogSource::KernelCheckpoint,
+        LogSource::ForeignCheckpoint
+    )]
+    source: LogSource,
+) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("empty-string-pruning");
     let url = write_foreign_partition_table(
@@ -307,14 +391,8 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         ],
     )
     .await;
+    checkpoint_table(&table_path, &url, source);
     let engine = create_default_engine_mt_executor(&url).unwrap();
-
-    if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
-    }
 
     let surviving = |predicate: Predicate| -> Vec<String> {
         let snapshot = Snapshot::builder_for(url.clone())
