@@ -1100,10 +1100,9 @@ mod tests {
             .to_string()
     }
 
-    /// Each target field extracts its value with `cast(get_field(pv, name), T)`, and the whole
-    /// rebuild is wrapped in a null-map guard. Runtime cast/parse semantics (empty-string,
-    /// temporal, decimal, duplicate keys, null masking) are arrow's, verified end-to-end rather
-    /// than here.
+    /// Each target field extracts its value with `cast(nullif(get_field(pv, name), ''), T)`, and
+    /// the whole rebuild is wrapped in a null-map guard. Runtime cast/parse semantics (temporal,
+    /// decimal, duplicate keys, null masking) are arrow's, verified end-to-end rather than here.
     #[test]
     fn map_to_struct_lowers_to_named_struct_over_get_field() {
         let target = schema! {
