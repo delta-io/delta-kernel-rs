@@ -232,6 +232,20 @@ fn externalized_core_borrows_validated_connector_state() {
     })
     .unwrap();
     assert_eq!(path_count, 1);
+    let wrong_freshness = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Latest,
+    );
+    let rejected = unsafe {
+        snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &wrong_freshness,
+            42,
+            engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "freshness");
     let mut different_state = test_snapshot_hint(
         std::slice::from_ref(&log_path),
         0,
