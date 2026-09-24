@@ -7,10 +7,9 @@ use delta_kernel::{DeltaResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
-use super::{
-    invalid, validate_handoff, BorrowedSnapshotState, FfiSnapshotHint, FfiSnapshotHintFreshness,
-    SnapshotHint, SnapshotHintFreshness,
-};
+use super::{invalid, validate_handoff, BorrowedSnapshotState, FfiSnapshotHint};
+#[cfg(feature = "declarative-plans")]
+use super::{FfiSnapshotHintFreshness, SnapshotHint, SnapshotHintFreshness};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{SharedExternEngine, SharedMetadata, SharedProtocol, SharedSchema, SharedSnapshot};

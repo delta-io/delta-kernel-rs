@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
@@ -20,8 +19,7 @@ use crate::{DeltaResult, Snapshot, Version};
 ///
 /// Implementations must return the same state for every call. In particular, the version,
 /// protocol, metadata, schema, and log paths must describe one validated snapshot generation.
-#[internal_api]
-pub(crate) trait SnapshotState {
+pub trait SnapshotState {
     fn table_root(&self) -> &Url;
     fn version(&self) -> Version;
     fn is_latest(&self) -> bool;
