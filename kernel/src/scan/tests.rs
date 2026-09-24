@@ -520,7 +520,7 @@ fn test_without_row_transforms_rejects_execute() {
     let filtered_err = scan
         .execute_with_file_filter(engine.clone(), |_| {
             callback_invoked.set(true);
-            true
+            Ok(true)
         })
         .err()
         .expect("filtered execute must error when row transforms are skipped");
@@ -579,7 +579,7 @@ fn execute_with_file_filter_is_lazy_and_preserves_dv_results() -> DeltaResult<()
     let callback_count = Cell::new(0);
     let filtered = scan.execute_with_file_filter(engine, |_| {
         callback_count.set(callback_count.get() + 1);
-        true
+        Ok(true)
     })?;
     assert_eq!(callback_count.get(), 0, "the file filter must be lazy");
 
@@ -587,6 +587,26 @@ fn execute_with_file_filter_is_lazy_and_preserves_dv_results() -> DeltaResult<()
     assert_eq!(callback_count.get(), 1);
     assert_eq!(actual, expected);
     assert_eq!(actual, (1..=8).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn execute_with_file_filter_early_drop_leaves_later_files_unseen() -> DeltaResult<()> {
+    let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    assert!(
+        get_files_for_scan(snapshot.clone().scan_builder().build()?, engine.as_ref())?.len() > 1
+    );
+    let scan = snapshot.scan_builder().build()?;
+    let callback_count = Cell::new(0);
+    let mut results = scan.execute_with_file_filter(engine, |_| {
+        callback_count.set(callback_count.get() + 1);
+        Ok(true)
+    })?;
+
+    assert_eq!(callback_count.get(), 0);
+    assert!(results.next().transpose()?.is_some());
+    drop(results);
+    assert_eq!(callback_count.get(), 1);
     Ok(())
 }
 
@@ -601,7 +621,7 @@ fn execute_with_file_filter_preserves_partition_injection() -> DeltaResult<()> {
 
     let mut actual = Vec::new();
     for result in
-        scan.execute_with_file_filter(engine, |file| file.path.starts_with("letter=a/"))?
+        scan.execute_with_file_filter(engine, |file| Ok(file.path.starts_with("letter=a/")))?
     {
         let data = result?;
         let batch: RecordBatch = (*data
@@ -649,7 +669,7 @@ fn execute_with_file_filter_preserves_column_mapping() -> DeltaResult<()> {
     let scan = snapshot.scan_builder().build()?;
 
     let mut rows = 0;
-    for result in scan.execute_with_file_filter(engine, |file| file.path == target)? {
+    for result in scan.execute_with_file_filter(engine, |file| Ok(file.path == target))? {
         let data = result?;
         let batch: RecordBatch = (*data
             .into_any()
@@ -685,7 +705,7 @@ fn execute_with_file_filter_preserves_schema_reconciliation() -> DeltaResult<()>
     let scan = snapshot.scan_builder().build()?;
 
     let mut rows = 0;
-    for result in scan.execute_with_file_filter(engine, |file| file.path == OLD_FILE)? {
+    for result in scan.execute_with_file_filter(engine, |file| Ok(file.path == OLD_FILE))? {
         let data = result?;
         let batch: RecordBatch = (*data
             .into_any()
@@ -729,7 +749,7 @@ fn execute_with_file_filter_preserves_cancellation_errors() -> DeltaResult<()> {
     let callback_count = Cell::new(0);
     let mut results = scan.execute_with_file_filter(engine, |_| {
         callback_count.set(callback_count.get() + 1);
-        false
+        Ok(false)
     })?;
 
     token.cancel();
@@ -2717,7 +2737,7 @@ mod scan_metadata_completed_tests {
         let results = scan
             .execute_with_file_filter(engine, |_| {
                 callback_count.set(callback_count.get() + 1);
-                false
+                Ok(false)
             })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()

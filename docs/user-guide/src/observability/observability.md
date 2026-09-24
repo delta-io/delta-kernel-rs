@@ -152,7 +152,7 @@ parallel scan. It describes the corresponding log replay work:
 | `num_add_files_seen` | Add actions in replay input before predicate filtering and deduplication. Includes checkpoint and delta files. |
 | `num_add_files_seen_from_delta_files` | Add actions in delta-file replay input before predicate filtering and deduplication. |
 | `num_selected_add_files` | Candidate data files that survived log replay, data skipping, and partition pruning, before any execute-time file filter. |
-| `selected_add_files_bytes` | Total Add-action size of those candidate data files, before any execute-time file filter. |
+| `selected_add_files_bytes` | Sum of the Add actions' `size` values for candidate data files, before any execute-time file filter. |
 | `num_remove_files_seen_from_delta_files` | Remove actions in delta-file replay input before deduplication. |
 | `num_non_file_actions` | Non-file actions (protocol, metadata, etc.) seen during replay. |
 | `num_predicate_filtered` | Files eliminated by predicate evaluation (data skipping and partition pruning). |
@@ -186,7 +186,7 @@ storage call may serve multiple higher-level operations.
 | Event | Fields | What it measures |
 |-------|--------|------------------|
 | `StorageListCompleted` | `duration`, `num_files` | A storage list call (e.g., listing the `_delta_log` directory). |
-| `StorageReadCompleted` | `duration`, `num_files`, `bytes_read` | A storage read call. `bytes_read` is the planned total from file metadata, not measured network bytes. |
+| `StorageReadCompleted` | `duration`, `num_files`, `bytes_read` | A storage read call. `bytes_read` is the sum of byte-buffer lengths successfully yielded before exhaustion or drop. |
 | `StorageCopyCompleted` | `duration` | A storage copy/rename call. |
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the planned total from file metadata. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed, including checkpoint reads. `bytes_read` is the planned total from file metadata. |

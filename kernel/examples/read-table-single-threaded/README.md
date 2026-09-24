@@ -9,7 +9,7 @@ This example shows a program that reads a table using a single thread. It uses t
 The data is in Arrow format because this example uses the default engine, so the example converts
 the opaque engine data into Arrow record batches before printing it. Connectors using the
 experimental `internal-api` feature can call `Scan::execute_with_file_filter` to select whole data
-files before deletion-vector and Parquet I/O.
+files before deletion-vector and data-file Parquet I/O; checkpoint replay still occurs.
 
 You can run this example from anywhere in this repository by running `cargo run -p read-table-single-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 

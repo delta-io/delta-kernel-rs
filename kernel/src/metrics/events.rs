@@ -1683,8 +1683,9 @@ impl fmt::Display for StorageListCompleted {
 // StorageReadCompleted
 // ============================
 
-/// A storage read operation completed. `bytes_read` is the planned sum of requested file ranges,
-/// not a measurement of network traffic.
+/// A storage read operation completed. `bytes_read` is the sum of byte-buffer lengths successfully
+/// yielded before the returned iterator is exhausted or dropped, not a measurement of network
+/// traffic.
 #[derive(Debug, Clone)]
 pub struct StorageReadCompleted {
     // === Set on span creation ===
