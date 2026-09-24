@@ -78,6 +78,21 @@ bool set_builder_opt(HandleMutableFfiEngineBuilder* engine_builder, char* key, c
 
 void compile_snapshot_hint_abi(void)
 {
+  FfiSliceFfiLogPath concrete_log_path_slice = { .ptr = NULL, .len = 0 };
+  FfiSliceKernelStringSlice concrete_string_slice = { .ptr = NULL, .len = 0 };
+  FfiSliceFfiStringMapEntry concrete_string_map_slice = { .ptr = NULL, .len = 0 };
+  FfiSliceFfiNullableStringMapEntry concrete_nullable_string_map_slice = {
+    .ptr = NULL,
+    .len = 0,
+  };
+  FfiSliceFfiSidecar concrete_sidecar_slice = { .ptr = NULL, .len = 0 };
+  FfiSliceFfiCheckpointNonFileAction concrete_non_file_action_slice = {
+    .ptr = NULL,
+    .len = 0,
+  };
+  FfiSliceFfiSetTransaction concrete_transaction_slice = { .ptr = NULL, .len = 0 };
+  FfiSliceFfiDomainMetadata concrete_domain_metadata_slice = { .ptr = NULL, .len = 0 };
+  FfiSliceFfiAdd concrete_add_slice = { .ptr = NULL, .len = 0 };
   KernelStringSlice string = { .ptr = NULL, .len = 0 };
   OptionalValueKernelStringSlice optional_string = { .tag = NoneKernelStringSlice };
   OptionalValuei64 optional_i64 = { .tag = Nonei64 };
@@ -271,6 +286,15 @@ void compile_snapshot_hint_abi(void)
 
   (void)snapshot_hint;
   (void)set_snapshot_hint;
+  (void)concrete_log_path_slice;
+  (void)concrete_string_slice;
+  (void)concrete_string_map_slice;
+  (void)concrete_nullable_string_map_slice;
+  (void)concrete_sidecar_slice;
+  (void)concrete_non_file_action_slice;
+  (void)concrete_transaction_slice;
+  (void)concrete_domain_metadata_slice;
+  (void)concrete_add_slice;
 }
 
 // utility to print out a metric id as a uuid

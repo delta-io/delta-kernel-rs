@@ -895,12 +895,13 @@ mod tests {
         schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
     };
     use delta_kernel::table_features::TableFeature;
+    use delta_kernel_ffi::delta_types::FfiColumnNameArray;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_contains,
+        allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, engine_handle_for_store,
-        ok_or_panic, recover_error, recover_string,
+        ok_or_panic, recover_bytes, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
@@ -914,7 +915,9 @@ mod tests {
         create_table_get_partitioned_write_context, create_table_get_unpartitioned_write_context,
         free_write_context, get_logical_to_physical, get_partitioned_write_context,
         get_physical_write_schema, get_unpartitioned_write_context, get_write_dir, get_write_path,
-        get_write_schema, resolve_file_path, visit_partition_values, SharedWriteContext,
+        get_write_schema, resolve_file_path, visit_partition_values, write_context_builder_build,
+        write_context_builder_with_partition_values, FfiRowTrackingMetadataColumns,
+        SharedWriteContext,
     };
 
     use super::*;
@@ -924,8 +927,8 @@ mod tests {
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
-        KernelStringSlice, NullableCvoid, OptionalValue,
+        free_engine, free_schema, free_snapshot, kernel_bytes_slice, kernel_string_slice,
+        logical_schema, version, KernelStringSlice, NullableCvoid, OptionalValue,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -1248,6 +1251,258 @@ mod tests {
         let key = unsafe { String::try_from_slice(&key) }.unwrap();
         let value = unsafe { String::try_from_slice(&value) }.unwrap();
         collected.push((key, value, is_null));
+    }
+
+    extern "C" fn allocate_column_names(columns: FfiColumnNameArray) -> NullableCvoid {
+        let columns = unsafe { columns.try_as_slice() }.unwrap();
+        let columns: Vec<Vec<String>> = columns
+            .iter()
+            .map(|column| {
+                let path = unsafe { column.path.try_as_slice() }.unwrap();
+                path.iter()
+                    .map(|part| unsafe { String::try_from_slice(part) }.unwrap())
+                    .collect()
+            })
+            .collect();
+        std::ptr::NonNull::new(Box::into_raw(Box::new(columns)).cast())
+    }
+
+    fn recover_column_names(ptr: std::ptr::NonNull<c_void>) -> Vec<Vec<String>> {
+        *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
+    }
+
+    #[rstest]
+    #[case::unpartitioned(false)]
+    #[case::partitioned(true)]
+    #[tokio::test]
+    async fn test_distributed_write_state_outlives_transaction(
+        #[case] partitioned: bool,
+        #[values(false, true)] roundtrip: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "part": INTEGER,
+        };
+        let columns = if partitioned { vec!["part"] } else { vec![] };
+        let tables = setup_test_tables(schema, &columns, None, "distributed_write").await?;
+        for (table_url, _engine, store, _table_name) in tables {
+            let engine = engine_handle_for_store(store);
+            let table_url_str = table_url.as_str();
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            });
+            let state = ok_or_panic(unsafe {
+                write_context::transaction_write_state(txn.shallow_copy(), engine.shallow_copy())
+            });
+            unsafe { free_transaction(txn) };
+            let state = if roundtrip {
+                let encoded = recover_bytes(
+                    ok_or_panic(unsafe {
+                        write_context::write_state_encode(
+                            state.shallow_copy(),
+                            allocate_bytes,
+                            engine.shallow_copy(),
+                        )
+                    })
+                    .unwrap(),
+                );
+                unsafe { write_context::free_write_state(state) };
+                ok_or_panic(unsafe {
+                    write_context::write_state_decode(
+                        kernel_bytes_slice!(encoded),
+                        engine.shallow_copy(),
+                    )
+                })
+            } else {
+                state
+            };
+
+            let stats = recover_column_names(
+                unsafe {
+                    write_context::get_write_state_stats_columns(
+                        state.shallow_copy(),
+                        allocate_column_names,
+                    )
+                }
+                .unwrap(),
+            );
+            assert!(stats.contains(&vec!["number".to_string()]));
+
+            let invalid_partitions = partition_value_map_new();
+            let unknown = "unknown";
+            ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    invalid_partitions.shallow_copy(),
+                    kernel_string_slice!(unknown),
+                    1,
+                    engine.shallow_copy(),
+                )
+            });
+            let builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            let builder =
+                unsafe { write_context_builder_with_partition_values(builder, invalid_partitions) };
+            let invalid_partition_build =
+                unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
+            assert_extern_result_error_contains(
+                invalid_partition_build,
+                KernelError::UnknownError,
+                if partitioned {
+                    "unknown partition column 'unknown'"
+                } else {
+                    "table is not partitioned; partition values are not allowed"
+                },
+            );
+
+            if partitioned {
+                let builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+                let builder = unsafe {
+                    write_context_builder_with_partition_values(builder, partition_value_map_new())
+                };
+                let missing_partition_build =
+                    unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
+                assert_extern_result_error_contains(
+                    missing_partition_build,
+                    KernelError::UnknownError,
+                    "missing partition column 'part'",
+                );
+            }
+
+            let invalid_utf8 = [0xff];
+            let builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            let invalid_columns = FfiRowTrackingMetadataColumns {
+                row_id_col_name: OptionalValue::Some(KernelStringSlice {
+                    ptr: invalid_utf8.as_ptr().cast(),
+                    len: invalid_utf8.len(),
+                }),
+                row_commit_version_col_name: OptionalValue::None,
+            };
+            let invalid_row_tracking = unsafe {
+                write_context::write_context_builder_with_row_tracking_columns(
+                    builder,
+                    &invalid_columns,
+                    engine.shallow_copy(),
+                )
+            };
+            assert_extern_result_error_with_message(
+                invalid_row_tracking,
+                KernelError::Utf8Error,
+                None,
+            );
+
+            let mut builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            if partitioned {
+                let partitions = partition_value_map_new();
+                let part_name = "part";
+                ok_or_panic(unsafe {
+                    partition_value_map_insert_int(
+                        partitions.shallow_copy(),
+                        kernel_string_slice!(part_name),
+                        1,
+                        engine.shallow_copy(),
+                    )
+                });
+                builder =
+                    unsafe { write_context_builder_with_partition_values(builder, partitions) };
+            }
+            let row_id_col_name = "row_id";
+            let row_commit_version_col_name = "row_commit_version";
+            let columns = FfiRowTrackingMetadataColumns {
+                row_id_col_name: OptionalValue::Some(kernel_string_slice!(row_id_col_name)),
+                row_commit_version_col_name: OptionalValue::Some(kernel_string_slice!(
+                    row_commit_version_col_name
+                )),
+            };
+            let builder = ok_or_panic(unsafe {
+                write_context::write_context_builder_with_row_tracking_columns(
+                    builder,
+                    &columns,
+                    engine.shallow_copy(),
+                )
+            });
+            let unsupported_row_tracking_build =
+                unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
+            assert_extern_result_error_with_message(
+                unsupported_row_tracking_build,
+                KernelError::UnsupportedError,
+                None,
+            );
+
+            let unused_builder =
+                unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            unsafe { write_context::free_write_context_builder(unused_builder) };
+
+            let mut builders = Vec::new();
+            for value in [42, 43] {
+                let mut builder =
+                    unsafe { write_context::write_context_builder(state.shallow_copy()) };
+                if partitioned {
+                    let partitions = partition_value_map_new();
+                    let part_name = "part";
+                    ok_or_panic(unsafe {
+                        partition_value_map_insert_int(
+                            partitions.shallow_copy(),
+                            kernel_string_slice!(part_name),
+                            value,
+                            engine.shallow_copy(),
+                        )
+                    });
+                    builder =
+                        unsafe { write_context_builder_with_partition_values(builder, partitions) };
+                }
+                builders.push((value, builder));
+            }
+            unsafe { write_context::free_write_state(state) };
+
+            let mut contexts = Vec::new();
+            for (value, builder) in builders {
+                let context = ok_or_panic(unsafe {
+                    write_context_builder_build(builder, engine.shallow_copy())
+                });
+                contexts.push((value, context));
+            }
+            for (value, context) in contexts {
+                let dir = recover_string(
+                    unsafe { get_write_dir(context.shallow_copy(), allocate_str) }.unwrap(),
+                );
+                assert_eq!(dir.ends_with(&format!("part={value}/")), partitioned);
+                let mut collected: Vec<(String, String, bool)> = Vec::new();
+                unsafe {
+                    visit_partition_values(
+                        context.shallow_copy(),
+                        std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                        collect_partition_value,
+                    );
+                }
+                assert_eq!(collected.len(), usize::from(partitioned));
+                if partitioned {
+                    assert_eq!(collected[0], ("part".into(), value.to_string(), false));
+                }
+                let malformed = b"{}".to_vec();
+                let result = unsafe {
+                    write_context::write_state_decode(
+                        kernel_bytes_slice!(malformed),
+                        engine.shallow_copy(),
+                    )
+                };
+                assert_extern_result_error_with_message(
+                    result,
+                    KernelError::MalformedJsonError,
+                    None,
+                );
+                let snapshot = unsafe {
+                    build_snapshot(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                };
+                let physical = unsafe { crate::snapshot_physical_schema(snapshot.shallow_copy()) };
+                assert_eq!(unsafe { physical.as_ref() }.num_fields(), 2);
+                unsafe {
+                    crate::free_schema(physical);
+                    free_snapshot(snapshot);
+                    free_write_context(context);
+                }
+            }
+            unsafe { free_engine(engine) };
+        }
+        Ok(())
     }
 
     #[tokio::test]

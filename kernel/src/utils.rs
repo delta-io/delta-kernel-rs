@@ -10,17 +10,15 @@ use url::Url;
 
 use crate::{DeltaResult, Error};
 
-/// Phantom type parameter `T`. The containing type mentions `T` but does not own any `T`.
+/// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
-/// Use this instead of [`PhantomData<T>`] when `T` is only a compile-time parameter: it selects
-/// which methods exist on a type, or appears in a stored closure's signature without being
-/// stored itself. [`PhantomData<T>`] tells the compiler that the containing type may drop a `T`,
-/// and makes `Send`/`Sync` follow `T`. This alias does not claim ownership, is always
-/// `Send`/`Sync`, and is covariant in `T`.
+/// It is covariant in `T`, and Send+Sync even if `T` is not. Use this instead of [`PhantomData<T>`]
+/// when `T` is only a compile-time parameter, because [`PhantomData<T>`] tells the compiler that
+/// the containing type owns and may drop a `T`, and additionally makes Send/Sync follow `T`.
 ///
-/// Construct values with [`PhantomType::default`]. A generic alias cannot be named as a
-/// constructor.
-pub(crate) type PhantomType<T> = PhantomData<fn() -> T>;
+/// A generic alias cannot be named as a constructor, so construct values with
+/// [`PhantomType::default`] instead of `PhantomType`.
+pub(crate) type PhantomType<T> = PhantomData<fn() -> *const T>;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
