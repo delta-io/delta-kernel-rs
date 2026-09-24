@@ -1829,7 +1829,8 @@ fn checkpoint_stats_projection_follows_output_or_pruning(
     #[values(
         "v1-single-part-struct-stats-only",
         "v2-parquet-sidecars-struct-stats-only",
-        "v2-checkpoints-parquet-with-sidecars"
+        "v2-checkpoints-parquet-with-sidecars",
+        "parsed-stats"
     )]
     table: &str,
     #[case] stats: StatsOptions,
@@ -1852,8 +1853,8 @@ fn checkpoint_stats_projection_follows_output_or_pruning(
 
     let predicate: Option<PredicateRef> =
         with_predicate.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
-    let needs_stats =
-        request_json_stats || with_predicate || !matches!(stats.struct_stats, StructStats::None);
+    let parsed_stats_required = with_predicate || !matches!(stats.struct_stats, StructStats::None);
+    let needs_stats = request_json_stats || parsed_stats_required;
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1870,8 +1871,13 @@ fn checkpoint_stats_projection_follows_output_or_pruning(
     }
 
     let reads = recorder.take_reads();
-    let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
-    let expect_parsed_stats = needs_stats && compatible_structured_stats;
+    let (compatible_structured_stats, checkpoint_has_json_stats) = match table {
+        "v2-checkpoints-parquet-with-sidecars" => (false, true),
+        "parsed-stats" => (true, true),
+        _ => (true, false),
+    };
+    let expect_parsed_stats = compatible_structured_stats
+        && (parsed_stats_required || (request_json_stats && !checkpoint_has_json_stats));
     let expect_json_stats = needs_stats && (request_json_stats || !expect_parsed_stats);
     let expected_file_fragment = if table.starts_with("v2-") {
         "_sidecars/"

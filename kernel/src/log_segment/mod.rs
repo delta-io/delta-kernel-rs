@@ -66,6 +66,11 @@ pub(crate) struct CheckpointReadInfo {
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,
+    /// Whether the checkpoint's file actions have a JSON `add.stats` column. `true` when the
+    /// checkpoint schema was not inspected.
+    #[serde(default = "default_has_json_stats")]
+    #[allow(unused)]
+    pub has_json_stats: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -79,9 +84,25 @@ impl CheckpointReadInfo {
         Self {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
+            has_json_stats: true,
             checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
         }
     }
+}
+
+fn default_has_json_stats() -> bool {
+    true
+}
+
+/// When a checkpoint read projects a compatible `add.stats_parsed` column.
+#[derive(Debug, Clone, Copy)]
+#[internal_api]
+pub(crate) enum ParsedStatsRead<'a> {
+    /// Read it with this schema for data skipping or requested structured output.
+    Required(&'a StructType),
+    /// Read it with this schema only when the checkpoint has no JSON `add.stats` column, so JSON
+    /// stats can be serialized from it.
+    JsonFallback(&'a StructType),
 }
 
 /// Result of reading actions from a log segment, containing both the actions iterator
@@ -825,7 +846,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-        stats_schema: Option<&StructType>,
+        parsed_stats: Option<ParsedStatsRead<'_>>,
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<
@@ -846,7 +867,7 @@ impl LogSegment {
             engine,
             checkpoint_read_schema,
             checkpoint_predicate,
-            stats_schema,
+            parsed_stats,
             partition_schema,
             cancellation_token,
         )?;
@@ -1151,7 +1172,7 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-        stats_schema: Option<&StructType>,
+        parsed_stats: Option<ParsedStatsRead<'_>>,
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<
@@ -1165,6 +1186,14 @@ impl LogSegment {
             (None, vec![])
         };
 
+        let has_json_stats = file_actions_schema
+            .as_deref()
+            .is_none_or(Self::schema_has_json_stats);
+        let stats_schema = match parsed_stats {
+            Some(ParsedStatsRead::Required(schema)) => Some(schema),
+            Some(ParsedStatsRead::JsonFallback(schema)) if !has_json_stats => Some(schema),
+            Some(ParsedStatsRead::JsonFallback(_)) | None => None,
+        };
         let has_stats_parsed =
             stats_schema
                 .zip(file_actions_schema.as_ref())
@@ -1309,6 +1338,7 @@ impl LogSegment {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
+            has_json_stats,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
@@ -1485,6 +1515,11 @@ impl LogSegment {
             return None;
         };
         add.field(name)
+    }
+
+    /// Returns whether a checkpoint schema has a JSON `add.stats` column.
+    pub(crate) fn schema_has_json_stats(checkpoint_schema: &StructType) -> bool {
+        Self::get_field_from_add(checkpoint_schema, "stats").is_some()
     }
 
     /// Checks if a checkpoint schema contains a usable `add.stats_parsed` field.

@@ -142,12 +142,19 @@ impl Scan {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.required_parsed_stats_schema();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
-        let needs_stats = !self.skip_stats();
-        let source_physical_stats = physical_stats
-            .filter(|_| needs_stats)
+        let emit_json = self.stats.emit_json;
+        // Native parsed stats serve pruning and structured output, and stand in for JSON output
+        // when the checkpoint has no JSON stats column.
+        let source_physical_stats = self
+            .state_info
+            .physical_stats_schema
+            .as_ref()
+            .filter(|_| physical_stats.is_some() || (emit_json && !shape.has_json_stats()))
             .and_then(|schema| shape.compatible_stats_parsed_schema(schema));
-        let reads_json_stats =
-            needs_stats && (self.stats.emit_json || source_physical_stats.is_none());
+        let reads_json_stats = match source_physical_stats {
+            Some(_) => emit_json && shape.has_json_stats(),
+            None => emit_json || physical_stats.is_some(),
+        };
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
@@ -415,8 +422,8 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 trait ProjectionStructPatchBuilderExt<'a> {
-    /// Emits JSON stats when requested, serializing `add.stats_parsed` for rows without JSON.
-    /// Otherwise drops `add.stats`.
+    /// Emits JSON stats when requested, serializing `add.stats_parsed` when the input has no
+    /// `add.stats`. Otherwise drops `add.stats`.
     fn with_output_add_json_stats(self, emit_json: bool) -> Self;
 
     /// Parses add stats, preferring a compatible parsed field.
@@ -438,13 +445,14 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             .contains_col([ADD_NAME, STATS_PARSED_NAME]);
         match (emit_json, has_json_stats, has_stats_parsed) {
             (false, true, _) => self.drop_at([ADD_NAME], STATS),
-            (true, true, true) => {
-                let stats = Expr::coalesce([
-                    col!(ADD_NAME, STATS),
-                    Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
-                ]);
-                self.replace_expr_at([ADD_NAME], STATS, stats)
-            }
+            // Keeps the field order of the normalized add schema, where `stats` follows
+            // `dataChange`.
+            (true, false, true) => self.insert_after_at(
+                [ADD_NAME],
+                "dataChange",
+                StructField::nullable(STATS, DataType::STRING),
+                Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
+            ),
             _ => self,
         }
     }
@@ -621,7 +629,7 @@ mod tests {
     fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
         let leaf_checkpoint_schema = parsed_stats
             .as_ref()
-            .map(|stats| parquet_read_schema(Some(stats), None).unwrap());
+            .map(|stats| parquet_read_schema(Some(stats), None, true).unwrap());
         CheckpointShape {
             checkpoint_type,
             leaf_checkpoint_schema,
@@ -730,20 +738,37 @@ mod tests {
             .expect("stats schema")
     }
 
-    #[test]
-    fn checkpoint_with_parsed_stats_does_not_read_json_stats() -> DeltaResult<()> {
+    #[rstest::rstest]
+    #[case::struct_output_with_json_column(StatsOptions::all_struct(), true, false, true)]
+    #[case::struct_output_without_json_column(StatsOptions::all_struct(), false, false, true)]
+    #[case::json_output_with_json_column(StatsOptions::json_only(), true, true, false)]
+    #[case::json_output_without_json_column(StatsOptions::json_only(), false, false, true)]
+    #[case::both_outputs_with_json_column(StatsOptions::all(), true, true, true)]
+    fn checkpoint_with_parsed_stats_reads_only_needed_stats_columns(
+        #[case] stats: StatsOptions,
+        #[case] has_json_stats: bool,
+        #[case] expect_json_stats: bool,
+        #[case] expect_parsed_stats: bool,
+    ) -> DeltaResult<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let scan = mock_snapshot(segment)?
             .scan_builder()
-            .with_stats(StatsOptions::all_struct())
+            .with_stats(stats)
             .build()?;
         let parsed_stats = scan
             .state_info
             .physical_stats_schema
             .clone()
             .expect("parsed stats schema");
+        // The retained leaf schema drives `has_json_stats()`: including the JSON `add.stats`
+        // column makes the checkpoint report JSON stats, omitting it forces synthesis.
+        let leaf_checkpoint_schema = parquet_read_schema(Some(&parsed_stats), None, has_json_stats)?;
+        let shape = CheckpointShape {
+            checkpoint_type: CheckpointType::Leaf,
+            leaf_checkpoint_schema: Some(leaf_checkpoint_schema),
+        };
         let plan = scan
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, Some(parsed_stats)))?
+            .build_metadata_scan_plan(&shape)?
             .expect("metadata plan");
         let checkpoint_scan = plan
             .nodes
@@ -755,8 +780,8 @@ mod tests {
             .expect("checkpoint parquet scan");
         let add = add_struct(&checkpoint_scan.schema);
 
-        assert!(add.field(STATS).is_none());
-        assert!(add.field(STATS_PARSED).is_some());
+        assert_eq!(add.field(STATS).is_some(), expect_json_stats);
+        assert_eq!(add.field(STATS_PARSED).is_some(), expect_parsed_stats);
         Ok(())
     }
 

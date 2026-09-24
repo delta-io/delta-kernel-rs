@@ -25,7 +25,9 @@ use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::log_segment::{
+    ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment, ParsedStatsRead,
+};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -792,25 +794,41 @@ impl Scan {
         }
     }
 
+    /// Whether structured output or predicate pruning consumes parsed stats.
+    fn parsed_stats_required(&self) -> bool {
+        self.physical_stats_output_schema.is_some()
+            || matches!(
+                &self.state_info.physical_predicate,
+                PhysicalPredicate::Some(_, _)
+            )
+    }
+
+    /// Returns how checkpoint reads use a compatible `add.stats_parsed` column. JSON-only output
+    /// reads it only for checkpoints without JSON stats.
+    fn parsed_stats_read(&self) -> Option<ParsedStatsRead<'_>> {
+        let schema = self.state_info.physical_stats_schema.as_deref()?;
+        Some(if self.parsed_stats_required() {
+            ParsedStatsRead::Required(schema)
+        } else {
+            ParsedStatsRead::JsonFallback(schema)
+        })
+    }
+
     #[cfg(feature = "declarative-plans")]
     /// Returns the schema that a declarative plan must normalize into `add.stats_parsed`.
     ///
     /// Structured output and predicate pruning consume that normalized column. JSON-only output
     /// can serialize a checkpoint's native `stats_parsed` directly and then drop the column.
     fn required_parsed_stats_schema(&self) -> Option<&SchemaRef> {
-        if self.physical_stats_output_schema.is_some()
-            || matches!(
-                &self.state_info.physical_predicate,
-                PhysicalPredicate::Some(_, _)
-            )
-        {
-            self.state_info.physical_stats_schema.as_ref()
-        } else {
-            None
-        }
+        self.state_info
+            .physical_stats_schema
+            .as_ref()
+            .filter(|_| self.parsed_stats_required())
     }
 
-    fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
+    fn checkpoint_read_options(
+        &self,
+    ) -> (SchemaRef, Option<PredicateRef>, Option<ParsedStatsRead<'_>>) {
         // `physical_stats_schema` is the typed shape this scan can consume, not evidence that the
         // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
         // restores `add.stats` before opening the reader when the structured field is incompatible.
@@ -821,8 +839,7 @@ impl Scan {
         };
 
         let meta_predicate = self.build_actions_meta_predicate();
-        let physical_stats_schema = self.state_info.physical_stats_schema.as_deref();
-        (checkpoint_schema, meta_predicate, physical_stats_schema)
+        (checkpoint_schema, meta_predicate, self.parsed_stats_read())
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
@@ -1009,6 +1026,7 @@ impl Scan {
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
+                    has_json_stats: true,
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
@@ -1043,14 +1061,13 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
-            self.checkpoint_read_options();
+        let (checkpoint_schema, meta_predicate, parsed_stats) = self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             self.commit_read_schema(),
             checkpoint_schema,
             meta_predicate,
-            physical_stats_schema,
+            parsed_stats,
             None,
             self.cancellation_token.as_ref(),
         )?;
@@ -1065,6 +1082,7 @@ impl Scan {
             checkpoint_info: CheckpointReadInfo {
                 has_stats_parsed: false,
                 has_partition_values_parsed: false,
+                has_json_stats: true,
                 checkpoint_read_schema: restored_add_schema().clone(),
             },
         };
@@ -1160,8 +1178,7 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
-            self.checkpoint_read_options();
+        let (checkpoint_schema, meta_predicate, parsed_stats) = self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
@@ -1171,7 +1188,7 @@ impl Scan {
                 self.commit_read_schema(),
                 checkpoint_schema,
                 meta_predicate,
-                physical_stats_schema,
+                parsed_stats,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
@@ -1321,7 +1338,7 @@ impl Scan {
                 engine.as_ref(),
                 checkpoint_read_schema,
                 None, // Checkpoint discovery does not evaluate a metadata predicate.
-                self.state_info.physical_stats_schema.as_deref(),
+                self.parsed_stats_read(),
                 self.state_info.physical_partition_schema.as_deref(),
                 None, // Cancellation is rejected above for parallel scans.
             )?

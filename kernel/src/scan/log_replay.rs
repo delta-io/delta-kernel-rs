@@ -241,6 +241,7 @@ impl ScanLogReplayProcessor {
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
+            has_json_stats,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
         let emit_json = stats_options.emit_json;
@@ -303,6 +304,7 @@ impl ScanLogReplayProcessor {
                 get_add_transform_expr(
                     stats_schema_for_transform.clone(),
                     false,
+                    true,
                     emit_json,
                     partition_schema_for_transform.clone(),
                     false,
@@ -315,6 +317,7 @@ impl ScanLogReplayProcessor {
                 get_add_transform_expr(
                     stats_schema_for_transform,
                     has_stats_parsed,
+                    has_json_stats,
                     emit_json,
                     partition_schema_for_transform,
                     has_partition_values_parsed,
@@ -816,12 +819,11 @@ fn scan_row_schema_with_parsed_columns(
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
 ///   names), or None if parsed stats are not needed for pruning or output.
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
-///   `emit_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))` so that
-///   `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+/// - `has_json_stats`: Whether the source has a JSON `add.stats` column. When false and
+///   `has_stats_parsed` is true, JSON stats output is `ToJson(add.stats_parsed)`
 ///   (writeStatsAsJson=false).
-/// - `emit_json`: When false, replaces the stats column with a null literal. When true, a
-///   `stats_parsed` checkpoint value is serialized as a fallback for a missing JSON value.
+/// - `emit_json`: When false, replaces the stats column with a null literal.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
@@ -834,19 +836,18 @@ fn scan_row_schema_with_parsed_columns(
 fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
+    has_json_stats: bool,
     emit_json: bool,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if !emit_json {
         Arc::new(null_lit(DataType::STRING))
-    } else if has_stats_parsed {
-        // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
-        // serializing stats_parsed so ScanFile.stats is populated either way.
-        Arc::new(Expression::coalesce([
-            col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
-        ]))
+    } else if has_stats_parsed && !has_json_stats {
+        Arc::new(Expression::unary(
+            UnaryExpressionOp::ToJson,
+            col!("add.stats_parsed"),
+        ))
     } else {
         column_expr_ref!("add.stats")
     };
@@ -1171,8 +1172,8 @@ mod tests {
     };
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
-        Predicate, Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
+        col, column_name, lit, BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate,
+        Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -2146,58 +2147,35 @@ mod tests {
         }
     }
 
-    /// `emit_json=false` removes every `ToJson` node from the add transform;
-    /// `emit_json=true` leaves exactly one inside the COALESCE branch.
-    #[test]
-    fn add_transform_omits_to_json_when_synthesis_skipped() {
+    /// With JSON output, a checkpoint without JSON stats serializes `add.stats_parsed` and one
+    /// with JSON stats passes `add.stats` through. Without JSON output, neither is read.
+    #[rstest]
+    #[case::json_from_parsed_stats(false, true, 1, false)]
+    #[case::json_passthrough(true, true, 0, true)]
+    #[case::no_json_output(false, false, 0, false)]
+    fn add_transform_json_stats_follow_source_columns(
+        #[case] has_json_stats: bool,
+        #[case] emit_json: bool,
+        #[case] expected_to_json: usize,
+        #[case] reads_json_stats: bool,
+    ) {
         let stats_schema: SchemaRef = schema_ref! {
             nullable "id": LONG,
             nullable "value": STRING,
         };
-        let partition_schema: Option<SchemaRef> = Some(schema_ref! {
-            nullable "date": DATE,
-        });
-
-        // Synthesis enabled: COALESCE branch present -> exactly one ToJson.
-        let with_synthesis = get_add_transform_expr(
-            Some(stats_schema.clone()),
-            true, // has_stats_parsed
-            true, // emit_json
-            partition_schema.clone(),
-            false, // has_partition_values_parsed
-        );
-        assert_eq!(
-            count_to_json(&with_synthesis),
-            1,
-            "expected exactly one ToJson(add.stats_parsed) in the COALESCE branch when synthesis is enabled"
-        );
-
-        // Synthesis disabled: no ToJson anywhere in the transform.
-        let without_synthesis = get_add_transform_expr(
+        let transform = get_add_transform_expr(
             Some(stats_schema),
-            true,  // has_stats_parsed
-            false, // emit_json
-            partition_schema,
+            true, // has_stats_parsed
+            has_json_stats,
+            emit_json,
+            Some(schema_ref! { nullable "date": DATE }),
             false, // has_partition_values_parsed
         );
+
+        assert_eq!(count_to_json(&transform), expected_to_json);
         assert_eq!(
-            count_to_json(&without_synthesis),
-            0,
-            "expected no ToJson nodes anywhere in the transform when synthesis is skipped"
-        );
-        assert!(
-            !without_synthesis
-                .references()
-                .contains(&column_name!("add.stats")),
-            "structured-only checkpoint transform must not reference add.stats"
-        );
-        let Expression::Struct(fields, _) = without_synthesis.as_ref() else {
-            panic!("add transform must produce a struct");
-        };
-        assert_eq!(
-            fields[3].as_ref(),
-            &null_lit(DataType::STRING),
-            "structured-only checkpoint stats output must be a typed NULL"
+            transform.references().contains(&column_name!("add.stats")),
+            reads_json_stats
         );
     }
 }

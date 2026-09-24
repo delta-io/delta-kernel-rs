@@ -2268,7 +2268,7 @@ fn checkpoint_stats_skipping(
 // writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all checkpoint variants against the four common output shapes.
-// ScanFile.stats is populated via the COALESCE/ToJson fallback whenever JSON is requested.
+// ScanFile.stats is serialized from stats_parsed whenever JSON is requested.
 #[rstest::rstest]
 #[case::default_json_only(StatsOptions::default(), true)]
 #[case::all_both(StatsOptions::all(), true)]

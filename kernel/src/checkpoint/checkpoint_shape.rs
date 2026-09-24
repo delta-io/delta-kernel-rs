@@ -242,6 +242,14 @@ impl CheckpointShape {
             })
             .then_some(stats_schema)
     }
+
+    /// Whether the checkpoint's file actions carry a JSON `add.stats` column. `true` when the
+    /// leaf schema was not retained, so JSON stats are read rather than synthesized.
+    pub(crate) fn has_json_stats(&self) -> bool {
+        self.leaf_checkpoint_schema
+            .as_deref()
+            .is_none_or(LogSegment::schema_has_json_stats)
+    }
 }
 
 #[tracing::instrument(

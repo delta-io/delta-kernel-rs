@@ -3873,7 +3873,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         &engine,
         CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
         None, // meta_predicate
-        Some(&stats_schema),
+        Some(ParsedStatsRead::Required(&stats_schema)),
         None, // partition_schema
         None, // cancellation_token
     )?;
