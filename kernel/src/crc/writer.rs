@@ -3,11 +3,13 @@
 use url::Url;
 
 use super::Crc;
+use crate::coroutine::kernel::Channel;
+use crate::coroutine::ChannelExt as _;
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
-/// Serialize and write a CRC file to storage.
+/// Serialize a CRC and offload its storage write.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
 /// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
@@ -18,7 +20,11 @@ use crate::{DeltaResult, Engine, Error};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
-pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
+pub(crate) async fn try_write_crc_file_with_channel(
+    channel: &Channel,
+    path: &Url,
+    crc: &Crc,
+) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
         Error::ChecksumWriteUnsupported(format!(
@@ -41,9 +47,7 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
-    engine
-        .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+    channel.write_bytes(path.clone(), data.into(), false).await
 }
 
 #[cfg(test)]
@@ -55,20 +59,31 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
-    use crate::crc::reader::try_read_crc_file;
+    use crate::coroutine::engine::run_workflow_with_engine;
     use crate::crc::{
-        DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
+        try_read_crc_file, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState,
+        SetTransactionState,
     };
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
+    use crate::Engine;
 
     fn writer_test_env(version: u64) -> (SyncEngine, ParsedLogPath) {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let table_root = Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
         (engine, crc_path)
+    }
+
+    /// Test helper: drive [`super::try_write_crc_file_with_channel`] through a legacy [`Engine`].
+    fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
+        let path = path.clone();
+        let crc = crc.clone();
+        run_workflow_with_engine!(engine, async move |channel| {
+            try_write_crc_file_with_channel(channel, &path, &crc).await
+        })
     }
 
     fn test_crc(ict_supported: bool, ict_enabled: bool) -> Crc {

@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 
+use delta_kernel_derive::pub_macro;
 use derive_more::Deref;
 
 use crate::utils::CollectInto;
@@ -433,19 +434,14 @@ pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
 /// # use delta_kernel::expressions::column_name;
 /// let name = column_name!("a..b"); // empty segment
 /// ```
-// NOTE: Macros are only public if exported, which defines them at the root of the crate. But we
-// don't want it there. So, we export a hidden macro and pub use it here where we actually want it.
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __column_name {
+#[pub_macro]
+macro_rules! column_name {
     ( $($segments:tt)+ ) => {{
         const SEGMENTS: &[&str] =
             $crate::delta_kernel_derive::column_name_segments!($($segments)+);
         $crate::expressions::ColumnName::new(SEGMENTS.iter().copied())
     }};
 }
-#[doc(inline)]
-pub use __column_name as column_name;
 
 /// Joins two column names together, when one or both inputs might be literal strings representing
 /// simple (non-nested) column names. For example:
@@ -463,24 +459,21 @@ pub use __column_name as column_name;
 /// let s = "s";
 /// let name = joined_column_name!(s, s);
 /// ```
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __joined_column_name {
+#[pub_macro]
+macro_rules! joined_column_name {
     ( $left:literal, $right:literal ) => {
-        $crate::__column_name!($left).join(&$crate::__column_name!($right))
+        $crate::expressions::column_name!($left).join(&$crate::expressions::column_name!($right))
     };
     ( $left:literal, $right:expr ) => {
-        $crate::__column_name!($left).join(&$right)
+        $crate::expressions::column_name!($left).join(&$right)
     };
     ( $left:expr, $right:literal) => {
-        $left.join(&$crate::__column_name!($right))
+        $left.join(&$crate::expressions::column_name!($right))
     };
     ( $($other:tt)* ) => {
         compile_error!("joined_column_name!() requires at least one string literal input")
     };
 }
-#[doc(inline)]
-pub use __joined_column_name as joined_column_name;
 
 /// Convenience macro that builds an [`Expression`](crate::expressions::Expression) column reference
 /// by forwarding all args to [`column_name!`]:
@@ -495,47 +488,39 @@ pub use __joined_column_name as joined_column_name;
 ///     Expression::Column(ColumnName::new(["version", "a", "b"]))
 /// );
 /// ```
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __column_expr {
+#[pub_macro]
+macro_rules! col {
     ( $($name:tt)* ) => {
-        $crate::expressions::Expression::from($crate::__column_name!($($name)*))
+        $crate::expressions::Expression::from($crate::expressions::column_name!($($name)*))
     };
 }
 #[doc(hidden)]
-pub use __column_expr as column_expr;
-#[doc(inline)]
-pub use __column_expr as col;
+pub use col as column_expr;
 
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __column_expr_ref {
+#[pub_macro]
+macro_rules! column_expr_ref {
     ( $($name:tt)* ) => {
-        std::sync::Arc::new($crate::expressions::Expression::from($crate::__column_name!($($name)*)))
+        std::sync::Arc::new($crate::expressions::Expression::from(
+            $crate::expressions::column_name!($($name)*)
+        ))
     };
 }
-#[doc(inline)]
-pub use __column_expr_ref as column_expr_ref;
 
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __column_pred {
+#[pub_macro]
+macro_rules! column_pred {
     ( $($name:tt)* ) => {
-        $crate::expressions::Predicate::from($crate::__column_name!($($name)*))
+        $crate::expressions::Predicate::from($crate::expressions::column_name!($($name)*))
     };
 }
-#[doc(inline)]
-pub use __column_pred as column_pred;
 
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __joined_column_expr {
+#[pub_macro]
+macro_rules! joined_column_expr {
     ( $($name:tt)* ) => {
-        $crate::expressions::Expression::from($crate::__joined_column_name!($($name)*))
+        $crate::expressions::Expression::from(
+            $crate::expressions::joined_column_name!($($name)*)
+        )
     };
 }
-#[doc(inline)]
-pub use __joined_column_expr as joined_column_expr;
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]

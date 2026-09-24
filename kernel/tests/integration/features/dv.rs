@@ -218,7 +218,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     txn.add_files(add_metadata);
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(commit_result, CommitResult::Committed(_)));
+    assert!(matches!(&commit_result.0, CommitResult::Committed(_)));
 
     // Step 3: Verify we can read all 20 rows before deletion
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -250,7 +250,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(commit_result, CommitResult::Committed(_)));
+    assert!(matches!(&commit_result.0, CommitResult::Committed(_)));
 
     // Step 6: Verify first deletion - should have 17 rows (7 from file 1 + 10 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -302,7 +302,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
             .map(Ok),
     )?;
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(commit_result, CommitResult::Committed(_)));
+    assert!(matches!(&commit_result.0, CommitResult::Committed(_)));
 
     // Step 9: Verify final deletion - should have 14 rows (6 from file 1 + 8 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -419,7 +419,7 @@ async fn test_dv_update_stats_tight_bound(
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path.to_string(), dv_descriptor);
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    txn.commit(engine.as_ref())?.0.unwrap_committed();
 
     // The new AddFile must report tightBounds: false while preserving every other stats field.
     let v2_adds = read_actions_from_commit(&table_url, 2, "add")?;

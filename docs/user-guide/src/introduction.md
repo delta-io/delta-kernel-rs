@@ -32,16 +32,14 @@ making it usable from virtually any language.
                   │  Delta Kernel  │
                   │  (core logic)  │
                   └───────┬────────┘
-                          │ calls into
-                  ┌───────▼────────┐
-                  │  Engine trait   │
-                  │  (abstraction)  │
-                  └───────┬────────┘
-                          │ implemented by
-                  ┌───────▼────────┐
-                  │  DefaultEngine │
-                  │  (or custom)   │
-                  └───────┬────────┘
+                          │ requests I/O and compute
+                ┌─────────┴──────────┐
+                │                    │
+      ┌─────────▼──────────┐ ┌───────▼─────────┐
+      │ Connector driver   │ │ Engine trait    │
+      │ (native async)     │ │ (compatibility) │
+      └─────────┬──────────┘ └───────┬─────────┘
+                └─────────┬──────────┘
                           │
                   ┌───────▼────────┐
                   │  Delta Table   │
@@ -49,10 +47,11 @@ making it usable from virtually any language.
                   └────────────────┘
 ```
 
-The **Engine trait** is the boundary between Kernel and your connector. Kernel defines
-_what_ needs to happen (read JSON, read Parquet, evaluate expressions); the engine
-defines _how_. A batteries-included `DefaultEngine` is provided for common use cases.
-See [Architecture Overview](./concepts/architecture.md) for details.
+Kernel defines _what_ needs to happen, such as reading JSON or evaluating an expression. Rust
+connectors can drive typed workflow requests directly, or use the synchronous **Engine trait**
+compatibility surface. The default-engine crate provides `AsyncEngineConnector` for native async
+execution and `DefaultEngine` for Engine compatibility. See
+[Architecture overview](./concepts/architecture.md) for details.
 
 ## Key APIs
 

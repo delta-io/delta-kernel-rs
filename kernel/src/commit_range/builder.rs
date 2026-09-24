@@ -1,6 +1,8 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
+use crate::coroutine::kernel::{static_workflow, Channel};
+use crate::coroutine::{drive_workflow, StaticWorkflow};
 use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
@@ -14,6 +16,7 @@ use crate::{DeltaResult, Engine, Error, LogPath, Version};
 /// and the commit ordering. Catalog-managed tables also supply the catalog-ratified log tail and
 /// maximum catalog version. [`Self::build`] lists the log for a path-based builder or reuses the
 /// commit-file metadata in a snapshot-based builder, then validates contiguity.
+#[derive(Clone)]
 pub struct CommitRangeBuilder {
     table_root: String,
     start_version: Version,
@@ -88,6 +91,16 @@ impl CommitRangeBuilder {
     /// non-contiguous, or the requested start version is unavailable from both the filesystem and
     /// the supplied catalog tail.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
+        drive_workflow(engine, self.workflow())
+    }
+
+    /// Return a lazy workflow that lists and validates this commit range.
+    pub fn workflow(&self) -> StaticWorkflow<CommitRange> {
+        let builder = self.clone();
+        static_workflow!(async move |channel| builder.build_with_channel(channel).await)
+    }
+
+    async fn build_with_channel(&self, channel: &Channel) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
@@ -125,12 +138,13 @@ impl CommitRangeBuilder {
             (commit_files, end_version)
         } else {
             let log_segment = LogSegment::for_table_changes_with_log_tail(
-                engine.storage_handler().as_ref(),
+                channel,
                 log_root,
                 start_version,
                 configured_end_version,
                 log_tail,
-            )?;
+            )
+            .await?;
             let end_version = configured_end_version.unwrap_or(log_segment.end_version);
             let commit_files = log_segment
                 .listed

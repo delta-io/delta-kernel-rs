@@ -26,7 +26,6 @@ may differ.
 # extern crate tokio;
 # use std::sync::Arc;
 # use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
@@ -42,7 +41,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
@@ -76,7 +75,7 @@ txn.add_files(file_metadata);
 
 // 6. Commit
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),
@@ -92,7 +91,7 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
@@ -216,11 +215,11 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ## Committing
 
-`commit()` consumes the transaction and returns a `CommitResult`:
+`commit()` consumes the transaction and returns its `CommitResult` together with the committer:
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => {
@@ -230,7 +229,7 @@ match txn.commit(&engine)? {
 ```
 
 > [!NOTE]
-> `commit()` returns a `CommitResult` with three variants: `Committed` on success, `Conflicted` if
+> The canonical `CommitResult` has three variants: `Committed` on success, `Conflicted` if
 > another writer committed first, and `Retryable` for transient IO errors. Automatic conflict
 > resolution is not yet supported. A blind append to a table with no concurrent writers always
 > succeeds.
@@ -243,7 +242,7 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_blind_append();
 ```
@@ -275,7 +274,7 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
@@ -309,7 +308,7 @@ snapshot and post-commit statistics:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::Committed(c) => c,
+    (CommitResult::Committed(c), _) => c,
     _ => panic!("unexpected result"),
 };
 

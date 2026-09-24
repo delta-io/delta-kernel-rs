@@ -9,13 +9,11 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use rstest::rstest;
 use test_utils::{
     generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
@@ -45,7 +43,7 @@ async fn test_clustered_table_write_and_checkpoint(
         .with_data_layout(DataLayout::Clustered {
             columns: expected_clustering.clone(),
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot = if use_fresh_snapshot {
@@ -53,13 +51,7 @@ async fn test_clustered_table_write_and_checkpoint(
         let table_url = delta_kernel::try_parse_uri(&table_path)?;
         Snapshot::builder_for(table_url).build(engine.as_ref())?
     } else {
-        match create_result {
-            CommitResult::Committed(committed) => committed
-                .post_commit_snapshot()
-                .expect("post-commit snapshot should exist")
-                .clone(),
-            other => panic!("Expected Committed, got: {other:?}"),
-        }
+        create_result.0.unwrap_post_commit_snapshot()
     };
 
     // First write: 3 rows
@@ -158,12 +150,13 @@ async fn test_clustered_table_write_all_null_clustering_column() {
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("category"), column_name!("region_id")],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .commit(engine.as_ref())
         .unwrap();
 
     let snapshot = create_result
+        .0
         .unwrap_committed()
         .post_commit_snapshot()
         .expect("post-commit snapshot should exist")

@@ -91,6 +91,7 @@ pub mod commit_range;
 pub mod committer;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod content_tree;
+pub mod coroutine;
 #[cfg(feature = "internal-api")]
 pub mod crc;
 #[cfg(not(feature = "internal-api"))]
@@ -207,10 +208,17 @@ pub use snapshot::{Snapshot, SnapshotRef};
 ))]
 pub mod engine;
 
-/// Delta table version is 8 byte unsigned int
+/// Delta table version represented as an 8-byte unsigned integer.
+///
+/// NOTE: In practice, versions are 63-bit unsigned values (`0..=i64::MAX`) because The Java
+/// ecosystem lacks an unsigned 64-bit int type. In bounds and searches, `Version::MAX` is the
+/// sentinel value for a missing/open upper bound, and code using versions MUST treat
+/// `v..Version::MAX` as equivalent to `v..`. Use saturating adds when increasing a version number
+/// to preserve the sentinel while avoiding overflow panics.
 pub type Version = u64;
 
 /// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
+// See `Version` above for the sentinel semantics that callers must preserve before conversion.
 pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
@@ -525,20 +533,6 @@ pub trait EvaluationHandler: AsAny {
         schema: SchemaRef,
         rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>>;
-}
-
-/// Creates one row containing a single scalar value.
-///
-/// `schema` must contain exactly one top-level field whose type matches `value`.
-pub(crate) fn create_row(
-    engine: &dyn Engine,
-    schema: SchemaRef,
-    value: impl Into<Scalar>,
-) -> DeltaResult<Box<dyn EngineData>> {
-    let value = value.into();
-    engine
-        .evaluation_handler()
-        .create_many(schema, vec![vec![value]])
 }
 
 /// Provides file system related functionalities to Delta Kernel.

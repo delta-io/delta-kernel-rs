@@ -9,7 +9,7 @@
 //! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC, and
 //!   on-demand API calls like `get_domain_metadata`)
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
-//! - [`commit`]: `Transaction::commit()` success / conflict metrics
+//! - [`commit`]: `TransactionWithCommitter::commit()` success / conflict metrics
 //!
 //! Where possible, tests use [`TestTableBuilder`] for table setup. Tests that need
 //! checkpoint, CRC, or log compaction features still use manual helpers until those
@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -77,6 +76,7 @@ async fn insert_rows(
     for val in start_val..(start_val + count) {
         let committed = insert_data(snap, engine, vec![Arc::new(Int32Array::from(vec![val]))])
             .await?
+            .0
             .unwrap_committed();
         snap = committed
             .post_commit_snapshot()
@@ -104,7 +104,7 @@ async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let _ = create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(setup_engine.as_ref())?
         .commit(setup_engine.as_ref())?;
 
     let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
@@ -114,6 +114,7 @@ async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
         vec![Arc::new(Int32Array::from(vec![1]))],
     )
     .await?
+    .0
     .unwrap_committed();
     committed
         .post_commit_snapshot()

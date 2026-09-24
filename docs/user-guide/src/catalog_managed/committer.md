@@ -6,8 +6,8 @@ your catalog's staging and ratification logic. For filesystem-managed tables, th
 tables, you provide your own `Committer` that routes commits through your catalog.
 
 > [!WARNING]
-> Kernel rejects `FileSystemCommitter` on a catalog-managed table at `txn.commit()`
-> time. You must provide a catalog committer before commit runs.
+> Kernel rejects `FileSystemCommitter` when committing a catalog-managed transaction.
+> You must provide a catalog committer before commit runs.
 
 Before reading this page, make sure you understand [Catalog-managed tables](./overview.md).
 
@@ -18,8 +18,14 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse>;
+
+    fn commit_prepared(
+        &self,
+        engine: &dyn Engine,
+        commit: Commit,
     ) -> DeltaResult<CommitResponse>;
 
     fn is_catalog_committer(&self) -> bool;
@@ -32,28 +38,29 @@ pub trait Committer: Send {
 }
 ```
 
-The trait has three methods. Two (`commit()` and `publish()`) carry the real
-logic; the third (`is_catalog_committer()`) is a one-line method that returns a
-constant:
+The trait has four methods:
 
-1. **`commit()`** atomically commits the given actions at the version specified in
-   `CommitMetadata`. Returns `CommitResponse::Committed` on success or
-   `CommitResponse::Conflict { version }` if another writer already committed this
-   version.
+1. **`commit()`** owns the complete commit for Engine-based callers: staging actions and asking the
+   catalog to atomically accept the staged commit.
 
-2. **`is_catalog_committer()`** returns `true` for catalog committers. Kernel checks
+2. **`commit_prepared()`** receives Kernel's lazy action generator. Its default implementation
+   validates the committer type, drives those actions through the `Engine`, and delegates to
+   `commit()`. Override it when your committer can consume `Commit` directly and avoid that
+   compatibility conversion; the override must preserve the validation.
+
+3. **`is_catalog_committer()`** returns `true` for catalog committers. Kernel checks
    this flag on both commit and publish paths and enforces the pairing in both
    directions: it rejects a `FileSystemCommitter` on a catalog-managed table, and
    it rejects a catalog committer on a filesystem-managed table.
 
-3. **`publish()`** copies ratified catalog commits from `_staged_commits/` to the main
+4. **`publish()`** copies ratified catalog commits from `_staged_commits/` to the main
    `_delta_log/` directory as published delta files. Some catalogs publish
    server-side, in which case `publish()` only notifies the catalog; others use
    PUT-if-absent copies from the client.
 
 ## CommitMetadata
 
-Kernel constructs `CommitMetadata` and passes it to your `commit()` method. Key methods:
+Kernel constructs `CommitMetadata` and passes it to `commit()`. Key methods:
 
 ```rust,ignore
 impl CommitMetadata {
@@ -107,61 +114,52 @@ Return `Committed` with the `FileMeta` of the staged commit file on success. Ret
 
 ## Implementing a catalog committer
 
-The typical implementation follows four steps. Steps 1 and 2 form the body of
-`commit()`. Step 3 is the `is_catalog_committer()` flag. Step 4 is `publish()`.
+The Engine compatibility implementation follows four protocol steps. Its `commit()` method
+performs the first two.
 
 ### Step 1: Stage the commit
 
 Write the actions to a staged commit file in `_staged_commits/`:
 
 ```rust,ignore
-fn commit(
-    &self,
+fn stage_commit(
     engine: &dyn Engine,
-    actions: DeltaResultIterator<'_, FilteredEngineData>,
-    commit_metadata: CommitMetadata,
-) -> DeltaResult<CommitResponse> {
+    actions: DeltaResultIteratorStatic<FilteredEngineData>,
+    commit_metadata: &CommitMetadata,
+) -> DeltaResult<FileMeta> {
     // Write actions to _staged_commits/<version>.<uuid>.json. `actions` is
     // already a Box<dyn Iterator<...>>, so pass it directly (do not re-box).
     let staged_path = commit_metadata.staged_commit_path()?;
     let written_size = engine
         .json_handler()
         .write_json_file(&staged_path, actions, false)?;
-    // ...
+    let file_meta = engine.storage_handler().head(&staged_path)?;
+    debug_assert_eq!(file_meta.size, written_size);
+    Ok(file_meta)
+}
 ```
 
 ### Step 2: Ratify through the catalog
 
-Call your catalog's commit API to ratify the staged commit. The exact arguments
-vary by catalog; Unity Catalog's `CommitRequest`, for example, carries the table
-id, commit version, staged filename, in-commit timestamp, and the maximum
-published version. Your catalog's API may look different. Here is the general
-shape:
+Call the catalog's commit API to atomically accept the staged commit:
 
 ```rust,ignore
-    // Tell the catalog about the staged commit.
-    // Replace this with your catalog's ratification API. Forward the
-    // commit_metadata.in_commit_timestamp() value so the catalog records the
-    // same timestamp Kernel writes into the CommitInfo action.
+fn commit(
+    &self,
+    engine: &dyn Engine,
+    actions: DeltaResultIteratorStatic<FilteredEngineData>,
+    commit_metadata: CommitMetadata,
+) -> DeltaResult<CommitResponse> {
+    let file_meta = stage_commit(engine, actions, &commit_metadata)?;
     self.catalog_client.ratify_commit(
         &self.table_id,
         commit_metadata.version(),
-        &staged_path,
+        &file_meta.location,
         commit_metadata.in_commit_timestamp(),
         commit_metadata.max_published_version(),
     )?;
 
-    // Return the staged file metadata on success and use
-    // the in-commit timestamp as the logical commit time (not the filesystem
-    // mtime, which reflects when the file was written rather than when the
-    // commit took effect).
-    Ok(CommitResponse::Committed {
-        file_meta: FileMeta::new(
-            staged_path,
-            commit_metadata.in_commit_timestamp(),
-            written_size,
-        ),
-    })
+    Ok(CommitResponse::Committed { file_meta })
 }
 ```
 
@@ -199,9 +197,10 @@ fn publish(
     publish_metadata: PublishMetadata,
 ) -> DeltaResult<()> {
     for catalog_commit in publish_metadata.commits_to_publish() {
-        let src = catalog_commit.location();            // _staged_commits/<v>.<uuid>.json
-        let dest = catalog_commit.published_location(); // _delta_log/<v>.json
-        match engine.storage_handler().copy_atomic(src, dest) {
+        match engine.storage_handler().copy_atomic(
+            &catalog_commit.location,
+            &catalog_commit.published_location,
+        ) {
             Ok(()) | Err(Error::FileAlreadyExists(_)) => (), // already published
             Err(e) => return Err(e),
         }
@@ -209,6 +208,22 @@ fn publish(
     Ok(())
 }
 ```
+
+## Connector-driven commits
+
+With the experimental `internal-api` feature, a Kernel transaction workflow emits
+`Request::Commit(commit, reply)`. Your connector serves `commit` through its chosen committer and
+calls `reply.send(result)`.
+
+The Unity Catalog integration turns that request into `UCCommitter::commit_workflow()`. Its catalog
+workflow emits `WriteJson(operation, reply)` with a static Kernel action generator, then emits
+`UpdateTable(operation, reply)` to ratify the written file. Serving `WriteJson` drives that
+generator while the catalog workflow remains suspended. `publish_workflow()` emits ordered
+`CopyAtomic(operation, reply)` requests.
+
+Kernel and catalog workflows retain separate request channels. Your connector owns both driver
+loops, so neither workflow invokes connector code. See
+[Driving connector workflows](../connector/coroutines.md) for the workflow and reply protocol.
 
 ## Putting it all together
 
@@ -218,7 +233,7 @@ catalog's client type and fill in the ratification logic:
 ```rust,ignore
 // Imports elided for brevity. In addition to the ones below, you will need
 // Committer, CommitMetadata, CommitResponse, PublishMetadata, DeltaResult,
-// FilteredEngineData, and Engine from delta_kernel.
+// DeltaResultIteratorStatic, FilteredEngineData, and Engine from delta_kernel.
 use delta_kernel::{Error, FileMeta};
 
 pub struct MyCatalogCommitter {
@@ -230,7 +245,7 @@ impl Committer for MyCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         // 1. Stage: write actions to _staged_commits/
@@ -238,26 +253,19 @@ impl Committer for MyCatalogCommitter {
         let written_size = engine
             .json_handler()
             .write_json_file(&staged_path, actions, false)?;
-
-        // 2. Ratify: register the staged commit with the catalog. ratify_commit
-        //    is an imagined example API; your catalog's signature will differ.
+        let file_meta = engine.storage_handler().head(&staged_path)?;
+        debug_assert_eq!(file_meta.size, written_size);
+        // 2. Ratify: ask the catalog to atomically accept the staged commit.
+        // ratify_commit is an imagined example API; your catalog's signature will differ.
         self.catalog_client.ratify_commit(
             &self.table_id,
             commit_metadata.version(),
-            &staged_path,
+            &file_meta.location,
             commit_metadata.in_commit_timestamp(),
             commit_metadata.max_published_version(),
         )?;
 
-        // 3. Return success and use the in-commit timestamp as the logical commit time (not
-        //    the filesystem mtime).
-        Ok(CommitResponse::Committed {
-            file_meta: FileMeta::new(
-                staged_path,
-                commit_metadata.in_commit_timestamp(),
-                written_size,
-            ),
-        })
+        Ok(CommitResponse::Committed { file_meta })
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -270,9 +278,10 @@ impl Committer for MyCatalogCommitter {
         publish_metadata: PublishMetadata,
     ) -> DeltaResult<()> {
         for catalog_commit in publish_metadata.commits_to_publish() {
-            let src = catalog_commit.location();
-            let dest = catalog_commit.published_location();
-            match engine.storage_handler().copy_atomic(src, dest) {
+            match engine.storage_handler().copy_atomic(
+                &catalog_commit.location,
+                &catalog_commit.published_location,
+            ) {
                 Ok(()) | Err(Error::FileAlreadyExists(_)) => (),
                 Err(e) => return Err(e),
             }

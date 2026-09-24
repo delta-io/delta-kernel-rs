@@ -52,16 +52,14 @@ To begin a write, create a transaction with your catalog's `Committer`, add file
 call `commit()`:
 
 ```rust,ignore
-// transaction() moves the Box<dyn Committer> into the Transaction, and commit()
-// consumes the Transaction, so the boxed committer is gone by the time you need
-// to publish. Construct a second committer for publish() in Phase 3 and clone
-// any catalog-client state you need to keep in scope across both calls.
+// transaction_with_committer() moves the Box<dyn Committer> into the bound
+// transaction. A successful commit retains it for publishing.
 let committer = Box::new(MyCatalogCommitter::new(
     catalog_client.clone(),
     table_id.clone(),
 ));
 let mut txn = snapshot
-    .transaction(committer, &engine)?
+    .transaction_with_committer(committer, &engine)?
     .with_operation("INSERT".to_string());
 
 // Drive your Parquet writer from the write context, then hand the resulting
@@ -102,54 +100,45 @@ Your committer then:
 
 ## Phase 3: Handle the result
 
-On success, `CommittedTransaction` provides the commit version and a **post-commit
-snapshot** that reflects the newly committed state:
+`commit()` returns the `CommitResult` and committer together. Handle each outcome with its
+committer so successful catalog commits can be published and recoverable transactions can be
+retried:
 
 ```rust,ignore
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, RetryableTransaction};
+use delta_kernel::Error;
 
 match commit_result {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), committer) => {
         let version = committed.commit_version();
-        // post_commit_snapshot() returns an Option. For catalog-managed
-        // commits today, Kernel returns Some. The Option exists for
-        // incremental-development paths (e.g., table creation). Treat a
-        // None as an error rather than silently skipping publish, so the
-        // problem surfaces loudly if the invariant ever changes.
-        let post_commit = committed
+        let snapshot = committed
             .post_commit_snapshot()
             .ok_or_else(|| Error::generic("missing post-commit snapshot"))?;
-
-        // commit() consumed the Box<dyn Committer> from Phase 2. publish() only
-        // needs &dyn Committer, so construct a fresh instance here. This moves
-        // catalog_client and table_id; clone them if you need them for a retry
-        // loop around the whole write.
-        let publish_committer =
-            MyCatalogCommitter::new(catalog_client, table_id);
-
-        // Proceed to publish (Phase 4).
-        let published_snapshot = post_commit.publish(&engine, &publish_committer)?;
+        let published_snapshot = snapshot.publish(&engine, committer.as_ref())?;
     }
-    CommitResult::Conflicted(conflicted) => {
+    (CommitResult::Conflicted(conflicted), committer) => {
         // Another writer already committed at this version.
         // `conflicted.conflict_version()` returns the version this transaction
-        // attempted. Rebase onto the new table state and retry.
+        // attempted. Rebase onto the new table state, bind `committer`, and retry.
     }
-    CommitResult::Retryable(retryable) => {
-        // Transient I/O error. `retryable.error` gives the underlying cause;
-        // `retryable.transaction` is the original transaction you can retry
+    (
+        CommitResult::Retryable(RetryableTransaction { transaction, error }),
+        committer,
+    ) => {
+        // Transient I/O error. `error` gives the underlying cause;
+        // `transaction` is the original transaction you can retry
         // without rebasing. Kernel reaches this arm only for `Error::IOError`
         // variants; return other error kinds as-is rather than disguising
         // them as IOError to force retry.
+        let txn = transaction.with_committer(committer);
     }
 }
 ```
 
 ## Phase 4: Publish
 
-Call `Snapshot::publish()` on the post-commit snapshot (shown in Phase 3 above) to
-make ratified commits visible as normal delta files and to unlock maintenance
-operations. `Snapshot::publish()`:
+Call `Snapshot::publish()` in the committed arm (shown in Phase 3 above) to make ratified commits
+visible as normal delta files and to unlock maintenance operations. It:
 
 1. Finds all unpublished catalog commits in the snapshot's log segment.
 2. Validates that the table is catalog-managed and the committer is a catalog committer.

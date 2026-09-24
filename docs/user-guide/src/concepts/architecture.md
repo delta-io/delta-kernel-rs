@@ -23,9 +23,12 @@ Before diving in, here are the key terms used throughout this guide:
   exposes APIs (`Snapshot`, `Scan`, `Transaction`) that connectors use. It never does I/O
   directly.
 
-- **Engine trait** is the I/O and compute abstraction that Kernel calls into. It has four
+- **Workflow and Generator** are connector-driven operations. Your connector owns each operation,
+  requests its steps, and serves typed requests without Kernel invoking connector code.
+
+- **Engine trait** is the synchronous compatibility abstraction that Kernel calls into. It has four
   required handlers (`StorageHandler`, `ParquetHandler`, `JsonHandler`,
-  `EvaluationHandler`) and one optional handler (`MetricsReporter`).
+  `EvaluationHandler`) and an optional `PlanExecutor`. Metrics use tracing layers.
   A `DefaultEngine` is provided. Connectors can implement their own for better performance
   with their native data formats and I/O.
 
@@ -53,21 +56,20 @@ interface to the layer above and below it.
  │  Snapshot · Scan · Transaction · Log Replay │
  │  Data Skipping · Predicate Pushdown         │
  │  Protocol Compliance · Table Features       │
- └──────────────────┬──────────────────────────┘
-                    │  calls into
- ┌──────────────────▼──────────────────────────┐
- │           Engine trait (abstraction)        │
- │                                             │
- │  EvaluationHandler · StorageHandler         │
- │  JsonHandler · ParquetHandler               │
- │  MetricsReporter (optional)                 │
- └──────────────────┬─────────────────────────┘
-                    │  implemented by
- ┌──────────────────▼──────────────────────────┐
- │     DefaultEngine  (or your custom engine)  │
- │                                             │
- │  Arrow-based evaluation · object_store I/O  │
- └──────────────────┬──────────────────────────┘
+ └──────────────┬───────────────────┬───────────┘
+                │ typed requests    │ Engine compatibility calls
+ ┌──────────────▼────────────┐ ┌────▼────────────────────────┐
+ │ Connector-owned driver    │ │ Engine trait implementation │
+ │                           │ │                             │
+ │ AsyncEngineConnector or   │ │ DefaultEngine or custom     │
+ │ your own request loop     │ │ handlers                    │
+ └──────────────┬────────────┘ └────┬────────────────────────┘
+                └─────────────┬─────┘
+                              │ I/O and compute
+ ┌────────────────────────────▼─────────────────┐
+ │ Arrow or native data · object_store or       │
+ │ connector-native storage                     │
+ └────────────────────────────┬─────────────────┘
                     │
  ┌──────────────────▼──────────────────────────┐
  │              Storage                        │
@@ -78,9 +80,13 @@ interface to the layer above and below it.
 **Kernel** contains all Delta protocol logic: log replay, data skipping,
 schema enforcement, table features, and transaction coordination. It never does I/O directly.
 
-**Engine** is a trait that the kernel calls whenever it needs I/O or expression evaluation.
-You can use the built-in `DefaultEngine` (Arrow + `object_store`) or implement your own.
-See [The Engine Trait](./engine_trait.md).
+**Connector-driven execution** returns lazy workflows and channel-bound generators. Your connector
+drives workflows or constructs static generators, serves each request, and completes its `Reply`.
+Kernel code with a parent channel calls async workflow implementations directly and awaits
+`Generator::next` for streams. See [Driving connector workflows](../connector/coroutines.md).
+
+**Engine compatibility** lets synchronous callers use the built-in `DefaultEngine` (Arrow +
+`object_store`) or implement the `Engine` trait. See [The Engine trait](./engine_trait.md).
 
 **Your connector** implements your compute engine's DataSource API and calls kernel APIs
 (`Snapshot`, `Scan`, `Transaction`) to do the Delta work. The kernel handles the protocol;
@@ -151,11 +157,12 @@ The advanced path is how you build a distributed connector. See
 
 ### Transaction
 
-A `Transaction` writes data to a table. It is built from a snapshot:
+A `Transaction` describes a write to a table. Bind it to a `Committer` before committing. For a
+filesystem-managed table, use the convenience method on `Snapshot`:
 
 ```rust,ignore
 let mut txn = snapshot                              // Arc<Snapshot>
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 
@@ -164,9 +171,9 @@ txn.add_files(file_metadata);
 
 // Commit atomically
 match txn.commit(&engine)? {
-    CommitResult::Committed(c) => println!("v{}", c.commit_version()),
-    CommitResult::Conflicted(_) => { /* handle conflict */ }
-    CommitResult::Retryable(_) => { /* retry */ }
+    (CommitResult::Committed(c), _) => println!("v{}", c.commit_version()),
+    (CommitResult::Conflicted(_), _) => { /* handle conflict */ }
+    (CommitResult::Retryable(_), _) => { /* retry */ }
 }
 ```
 
@@ -186,7 +193,7 @@ instead of `transaction()`. See
 
 See [Quick Start: Writing a Table](../getting_started/quick_start_write.md) for a complete example.
 
-## How a read works
+## How an Engine-compatible read works
 
 When you call `scan.execute(engine)`, here is what happens internally:
 
@@ -214,12 +221,15 @@ When you call `scan.execute(engine)`, here is what happens internally:
 The kernel handles steps 1, 2, and 4. The engine handles step 3. This separation means
 the kernel never touches raw bytes. It works purely with metadata and delegates all I/O.
 
+The connector-driven path performs the same stages, but Kernel returns typed requests instead of
+calling Engine handlers. Your driver decides how to execute each request.
+
 ## How a write works
 
 ```text
 1. START TRANSACTION (kernel)
-   Create a Transaction from a snapshot. The snapshot pins the
-   table version you're writing against.
+   Create a Transaction from a snapshot and bind it to a Committer.
+   The snapshot pins the table version you're writing against.
 
 2. WRITE DATA (engine / your code)
    Write Parquet files using the engine. Collect file metadata
@@ -233,9 +243,9 @@ the kernel never touches raw bytes. It works purely with metadata and delegates 
    catalog-managed tables, it goes through the catalog.
 
 4. HANDLE RESULT
-   CommittedTransaction: success.
-   ConflictedTransaction: another writer committed first.
-   RetryableTransaction: transient I/O error, safe to retry.
+   Committed: success.
+   Conflicted: another writer committed first.
+   Retryable: transient I/O error, safe to retry.
 ```
 
 ## EngineData: staying engine-agnostic
@@ -268,7 +278,8 @@ The project is organized into several crates:
 
 | Crate | Description |
 |-------|-------------|
-| `delta_kernel` | Core library: protocol logic, table operations, trait definitions, default engine |
+| `delta_kernel` | Core library: protocol logic, table operations, coroutine types, and Engine traits |
+| `delta_kernel_default_engine` | Arrow and `object_store` implementations for synchronous Engine compatibility and native async coroutine driving |
 | `delta_kernel_ffi` | C/C++ Foreign Function Interface for cross-language integration |
 | `delta_kernel_derive` | Procedural macros for internal code generation |
 | `delta_kernel_unity_catalog` | Unity Catalog integration for catalog-managed tables (see [Unity Catalog Integration](../unity_catalog/overview.md)) |
@@ -281,6 +292,7 @@ The project is organized into several crates:
 ## What's next
 
 - [The Engine Trait](./engine_trait.md) explains the `Engine` abstraction and its handlers in detail.
+- [Driving Connector Workflows](../connector/coroutines.md) explains connector-owned execution.
 - [Building a Scan](../reading/building_a_scan.md) walks through reading data from a Delta table.
 - [Building a Connector](../connector/overview.md) describes how to integrate Kernel with a compute engine.
 

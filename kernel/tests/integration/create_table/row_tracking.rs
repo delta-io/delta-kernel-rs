@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::snapshot::Snapshot;
@@ -81,7 +80,7 @@ async fn test_create_table_with_row_tracking(
 
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([(key, value)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     if with_data {
         // Write one parquet file with 5 rows
@@ -102,7 +101,7 @@ async fn test_create_table_with_row_tracking(
         txn.add_files(add_files);
     }
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
@@ -197,7 +196,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     let schema = super::simple_schema()?;
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.enableRowTracking", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> =
         Arc::new(schema.as_ref().try_into_arrow()?);
@@ -232,7 +231,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     txn.add_files(adds1);
     txn.add_files(adds2);
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
@@ -270,8 +269,9 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
+        .0
         .unwrap_committed();
 
     let snapshot = committed
@@ -322,7 +322,7 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.enableRowTracking", "true")])
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
     let batch = RecordBatch::try_new(
@@ -340,7 +340,7 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
         .await?;
     txn.add_files(add_files);
 
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
@@ -407,7 +407,7 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
     // Create empty table with feature signal only (no enablement property)
     let _ = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties([("delta.feature.rowTracking", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");

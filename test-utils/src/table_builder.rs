@@ -61,7 +61,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::committer::Committer;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
@@ -73,6 +73,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -1321,8 +1322,9 @@ impl TestTableBuilder {
         let mut stale_hint_bytes: Option<Vec<u8>> = None;
 
         let mut snapshot = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?
+            .0
             .unwrap_post_commit_snapshot();
 
         let crcs_at = self.log_state.crcs_at();
@@ -1348,6 +1350,7 @@ impl TestTableBuilder {
                 v,
             )
             .await?
+            .0
             .unwrap_post_commit_snapshot();
             if crcs_at.contains(&v) {
                 write_crc(&snapshot, engine.as_ref())?;
@@ -1442,13 +1445,13 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> DeltaResult<delta_kernel::transaction::CommitResult> {
+) -> DeltaResult<(CommitResult, Box<dyn Committer>)> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction_with_filesystem_committer(engine)?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let write_state = txn.write_state()?;

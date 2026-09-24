@@ -67,7 +67,7 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         size: 1024,
     };
     let txn = begin_transaction(snapshot, &engine)?.with_root_manifest_file(file.clone())?;
-    txn.commit(&engine)?.unwrap_committed();
+    txn.commit(&engine)?.0.unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -114,7 +114,7 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
     let txn = begin_transaction(snapshot, &engine)?
         .with_domain_metadata("my.domain".to_string(), "v1".to_string())
         .with_transaction_id("app-1".to_string(), 5);
-    let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let snapshot = txn.commit(&engine)?.0.unwrap_post_commit_snapshot();
 
     let file = FileMeta {
         location: table_url.join("metadata/root-v1.parquet")?,
@@ -125,7 +125,7 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
         .with_root_manifest_file(file)?
         .with_domain_metadata("my.domain".to_string(), "v2".to_string())
         .with_transaction_id("app-2".to_string(), 7);
-    txn.commit(&engine)?.unwrap_committed();
+    txn.commit(&engine)?.0.unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);

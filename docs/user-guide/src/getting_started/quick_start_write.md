@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel_default_engine::storage::store_from_url;
@@ -61,7 +60,7 @@ async fn main() -> DeltaResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&engine)?
         .commit(&engine)?;
     println!("Created table at {url}");
 
@@ -69,7 +68,7 @@ async fn main() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction_with_filesystem_committer(&engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("quick-start/1.0")
         .with_data_change(true);
@@ -96,13 +95,13 @@ async fn main() -> DeltaResult<()> {
 
     // Commit
     match txn.commit(&engine)? {
-        CommitResult::Committed(committed) => {
+        (CommitResult::Committed(committed), _) => {
             println!("Committed version {}", committed.commit_version());
         }
-        CommitResult::Conflicted(_) => {
+        (CommitResult::Conflicted(_), _) => {
             panic!("unexpected conflict on a brand new table");
         }
-        CommitResult::Retryable(retry) => {
+        (CommitResult::Retryable(retry), _) => {
             panic!("commit failed with retryable error: {}", retry.error);
         }
     }
@@ -133,7 +132,7 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 ```
 
@@ -142,8 +141,9 @@ create_table(url.as_str(), schema.clone(), "quick-start/1.0")
 - A schema (using kernel's `StructType`)
 - An engine info string (identifies your application)
 
-`.build()` takes the engine and a `Committer`. For local filesystem tables, use
-`FileSystemCommitter`. For catalog-managed tables, you provide your own committer.
+`.build_with_filesystem_committer()` validates the builder and binds the resulting transaction to
+a `FileSystemCommitter`. For catalog-managed tables, call `.build_with_committer(engine,
+committer)` instead.
 [Catalog-Managed Tables](../catalog_managed/overview.md) covers that topic.
 
 `.commit()` writes version 0 of the table (the initial Protocol and Metadata actions).
@@ -155,7 +155,7 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_with_filesystem_committer(&engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 ```
@@ -193,14 +193,14 @@ transaction needs. `add_files` registers that metadata with the transaction.
 **Commit:**
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::Committed(committed) => { /* success */ }
-    CommitResult::Conflicted(_) => { /* another writer won */ }
-    CommitResult::Retryable(retry) => { /* transient error, retry */ }
+    (CommitResult::Committed(committed), _) => { /* success */ }
+    (CommitResult::Conflicted(_), _) => { /* another writer won */ }
+    (CommitResult::Retryable(retry), _) => { /* transient error, retry */ }
 }
 ```
 
-`commit()` returns a `CommitResult` with three variants. For blind appends to a table with no
-concurrent writers, you'll always get `CommitResult::Committed`.
+The canonical `CommitResult` has three variants. For blind appends to a table with no concurrent
+writers, you'll always get `CommitResult::Committed`.
 
 ## Run it
 

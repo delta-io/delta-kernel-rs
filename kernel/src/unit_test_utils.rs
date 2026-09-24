@@ -23,10 +23,12 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use crate::committer::FileSystemCommitter;
+use crate::coroutine::engine::run_workflow_with_engine;
+use crate::coroutine::ChannelExt as _;
 use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
+use crate::expressions::Scalar;
 use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
@@ -46,6 +48,21 @@ use crate::table_properties::{
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
+
+/// Creates one row containing a single scalar value via
+/// [`crate::coroutine::ChannelExt::create_row`].
+///
+/// `schema` must contain exactly one top-level field whose type matches `value`.
+pub(crate) fn create_row(
+    engine: &dyn Engine,
+    schema: SchemaRef,
+    value: impl Into<Scalar>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let value = value.into();
+    run_workflow_with_engine!(engine, async move |channel| {
+        channel.create_row(schema, value).await
+    })
+}
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -1107,7 +1124,7 @@ pub(crate) fn setup_column_mapping_txn(
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine")
         .with_table_properties([("delta.columnMapping.mode", mode_str)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref())?;
     Ok((engine, txn))
 }
 

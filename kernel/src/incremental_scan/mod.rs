@@ -51,7 +51,7 @@ impl IncrementalScanBuilder {
     /// prune against file stats parsed from `add.stats`, and partition-column predicates prune
     /// against the file's partition values. The surviving Add set matches what a full scan at the
     /// target version with the same predicate would keep among these added files. Skipping never
-    /// drops a file a cold scan would keep, so consumers must re-apply the predicate at read time
+    /// drops a file a fresh scan would keep, so consumers must re-apply the predicate at read time
     /// regardless.
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();

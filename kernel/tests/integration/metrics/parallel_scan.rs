@@ -46,6 +46,7 @@ async fn test_parallel_scan_metadata_events_carry_table_type(
         /* is_blind_append */ false,
     )
     .await?
+    .0
     .unwrap_committed();
 
     // When: the table is scanned via the parallel (sequential + optional distributed) path.

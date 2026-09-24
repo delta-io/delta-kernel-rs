@@ -129,14 +129,14 @@ The following diagram shows how data flows through the three crates when your
 connector reads or writes a UC-managed table.
 
 ```text
- ┌───────────────────────────────────────────────────────────┐
- │  Your Connector                                           │
- │                                                           │
- │  1. UCClient::load_table("cat", "schema", "table")        │
- │  2. UCClient::get_table_credentials(.., ReadWrite)        │
- │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
- │  4. snapshot.transaction(UCCommitter).commit(engine)?     │
- └──────┬─────────────────────────┬──────────────────────────┘
+ ┌───────────────────────────────────────────────────────────────┐
+ │  Your Connector                                               │
+ │                                                               │
+ │  1. UCClient::load_table("cat", "schema", "table")            │
+ │  2. UCClient::get_table_credentials(.., ReadWrite)            │
+ │  3. snapshot_builder_from_load_table(&resp)?.build(..)        │
+ │  4. snapshot.transaction_with_committer(committer, engine)    │
+ └──────┬─────────────────────────────┬──────────────────────────┘
         │                         │
         ▼                         ▼
  ┌──────────────────┐  ┌─────────────────────────────────────┐

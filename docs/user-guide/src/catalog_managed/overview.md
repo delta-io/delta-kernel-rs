@@ -126,7 +126,8 @@ IDs, catalog APIs, or catalog servers. Instead:
 |      .with_log_tail(commits)                              |
 |      .with_max_catalog_version(version)                   |
 |      .build(&engine)                                      |
-|    snapshot.transaction(committer, &engine)                |
+|    snapshot                                               |
+|      .transaction_with_committer(committer, &engine)      |
 +---------------------------+-------------------------------+
                             | calls Kernel APIs
                             v
@@ -141,8 +142,7 @@ IDs, catalog APIs, or catalog servers. Instead:
 
 ### Key Kernel APIs for catalog-managed tables
 
-Four Kernel APIs form the integration surface between the catalog client and
-Kernel:
+The following Kernel APIs form the integration surface between the catalog client and Kernel:
 
 - **`SnapshotBuilder::with_log_tail(Vec<LogPath>)`** accepts a contiguous run of
   commits from version `M` to version `N` inclusive (published or staged). The
@@ -159,6 +159,9 @@ Kernel:
 - **`Committer` trait** defines how transactions are committed. A catalog
   committer implements `commit()` to stage and ratify commits through the
   catalog API, and `publish()` to copy ratified commits to the Delta log.
+
+- **`Snapshot::transaction_with_committer()`** binds a committer when the connector creates the
+  transaction.
 
 - **`Snapshot::publish()`** publishes all unpublished catalog commits at the
   current snapshot version. Published commits become visible to filesystem-based

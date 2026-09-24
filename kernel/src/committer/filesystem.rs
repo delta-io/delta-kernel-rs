@@ -1,11 +1,17 @@
 //! File system committer for non-catalog-managed tables.
 
+use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
+use url::Url;
 
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
-use super::Committer;
-use crate::{DeltaResult, DeltaResultIterator, Engine, Error, FileMeta, FilteredEngineData};
+use super::{Commit, CommitActions, Committer};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::kernel::{static_workflow, Channel};
+use crate::coroutine::write::{FileWriteMode, WriteJsonFile};
+use crate::coroutine::{ChannelExt as _, StaticWorkflow};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, FilteredEngineData};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -19,50 +25,88 @@ impl FileSystemCommitter {
     pub fn new() -> Self {
         Self {}
     }
+
+    /// Return a lazy workflow that commits a prepared path-based transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `commit` requires a catalog committer.
+    #[internal_api]
+    pub(crate) fn commit_workflow(commit: Commit) -> DeltaResult<StaticWorkflow<CommitResponse>> {
+        if commit.metadata.commit_type().requires_catalog_committer() {
+            return Err(Error::generic(
+                "FileSystemCommitter cannot commit a catalog-managed transaction",
+            ));
+        }
+        Ok(static_workflow!(async move |channel| {
+            commit_to_filesystem(channel, commit.actions, &commit.metadata).await
+        }))
+    }
+}
+
+/// Commit `actions` to the numbered Delta log file selected by `commit_metadata`.
+///
+/// The connector owns the JSON write while pulling batches from the action generator. An existing
+/// destination is returned as a transaction conflict. Other write and action-generation errors are
+/// propagated.
+#[instrument(
+    name = "fs_committer.commit",
+    skip_all,
+    fields(version = commit_metadata.version()),
+    err
+)]
+pub(crate) async fn commit_to_filesystem(
+    channel: &Channel,
+    actions: CommitActions,
+    commit_metadata: &CommitMetadata,
+) -> DeltaResult<CommitResponse> {
+    let version = commit_metadata.version();
+    let published_commit_path = commit_metadata.published_commit_path()?;
+    let write_result = write_commit_file(channel, actions, published_commit_path).await;
+
+    match write_result {
+        Ok(mut file_meta) => {
+            info!(committed_version = version, "Committed delta file");
+            file_meta.last_modified = commit_metadata.in_commit_timestamp();
+            Ok(CommitResponse::Committed { file_meta })
+        }
+        Err(Error::FileAlreadyExists(_)) => {
+            info!(
+                conflicting_version = version,
+                "Delta commit file already exists"
+            );
+            Ok(CommitResponse::Conflict { version })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Drain `actions` into one new JSON file and return its storage metadata.
+pub(crate) async fn write_commit_file(
+    channel: &Channel,
+    actions: CommitActions,
+    url: Url,
+) -> DeltaResult<FileMeta> {
+    let operation = WriteJsonFile::new(url, FileWriteMode::CreateNew, actions);
+    channel.write_json_file(operation).await
 }
 
 impl Committer for FileSystemCommitter {
-    #[instrument(
-        name = "fs_committer.commit",
-        skip_all,
-        fields(version = commit_metadata.version()),
-        err
-    )]
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
-        let version = commit_metadata.version();
-        let published_commit_path = commit_metadata.published_commit_path()?;
+        self.commit_prepared(
+            engine,
+            Commit::from_engine_iterator(commit_metadata, actions),
+        )
+    }
 
-        match engine.json_handler().write_json_file(
-            &published_commit_path,
-            Box::new(actions),
-            false,
-        ) {
-            Ok(written_size) => {
-                info!(
-                    committed_version = version,
-                    "Committed delta file via filesystem committer"
-                );
-                let file_meta = FileMeta::new(
-                    published_commit_path,
-                    commit_metadata.in_commit_timestamp(),
-                    written_size,
-                );
-                Ok(CommitResponse::Committed { file_meta })
-            }
-            Err(Error::FileAlreadyExists(_)) => {
-                info!(
-                    conflicting_version = version,
-                    "Filesystem commit conflict: target version already exists"
-                );
-                Ok(CommitResponse::Conflict { version })
-            }
-            Err(e) => Err(e),
-        }
+    fn commit_prepared(&self, engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+        let workflow = Self::commit_workflow(commit)?;
+        EngineConnector::new(engine).run(workflow)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -91,13 +135,13 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
-    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
+    use crate::unit_test_utils::create_row;
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -121,13 +165,13 @@ mod tests {
         // Try to commit a transaction with FileSystemCommitter
         let committer = Box::new(FileSystemCommitter::new());
         let err = snapshot
-            .transaction(committer, &engine)
+            .transaction_with_committer(committer, &engine)
             .unwrap()
-            .commit(&engine)
-            .unwrap_err();
+            .commit(&engine);
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            Err(Error::Generic(e))
+                if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 

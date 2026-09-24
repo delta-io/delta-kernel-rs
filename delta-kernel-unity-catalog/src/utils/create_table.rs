@@ -16,7 +16,7 @@
 //! let disk_props = get_required_properties_for_disk(&staging_info.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
 //!     .with_table_properties(disk_props)
-//!     .build(engine, committer);
+//!     .build_with_committer(engine, committer)?;
 //! create_table_txn.commit(engine)?;
 //!
 //! // Step 3: Finalize table in UC
@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
+use delta_kernel::coroutine::run_workflow_with_engine;
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
@@ -143,15 +144,20 @@ pub fn build_uc_create_table_request(
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-    for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
-    {
+    let domain_metadatas = run_workflow_with_engine!(engine, async move |channel| {
+        snapshot
+            .get_domain_metadatas_internal(channel, Some(&uc_recognized_domains))
+            .await
+    })?;
+    for (domain, dm) in domain_metadatas {
         let value = serde_json::from_str(dm.configuration())
             .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;
         domain_metadata.insert(domain, value);
     }
 
-    let in_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+    let in_commit_timestamp_ms = run_workflow_with_engine!(engine, async move |channel| {
+        snapshot.get_timestamp_with_channel(channel).await
+    })?;
 
     Ok(CreateTableRequest {
         name: table_name.into(),
@@ -216,10 +222,11 @@ mod tests {
         create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
             .with_data_layout(data_layout)
-            .build(engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(engine)
             .unwrap()
+            .0
             .unwrap_committed();
         let snapshot = Snapshot::builder_for(table_path)
             .with_max_catalog_version(0)
@@ -343,11 +350,12 @@ mod tests {
         );
         create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
             .commit(&engine)
             .unwrap()
+            .0
             .unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_path)
@@ -417,7 +425,7 @@ mod tests {
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -426,11 +434,11 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(TestCatalogCommitter), &engine)
+            .transaction_with_committer(Box::new(TestCatalogCommitter), &engine)
             .unwrap()
             .commit(&engine)
             .unwrap();
-        assert!(result.is_committed());
+        assert!(result.0.is_committed());
 
         // Load snapshot at version 1.
         let snapshot = Snapshot::builder_for(table_path)

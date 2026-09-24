@@ -6,8 +6,8 @@ use std::collections::HashSet;
 
 use crate::schema::{StructField, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::SchemaTransform;
-use crate::{transform_output_type, DeltaResult, Error};
+use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::{DeltaResult, Error};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
 /// These characters have special meaning in Parquet schema syntax.

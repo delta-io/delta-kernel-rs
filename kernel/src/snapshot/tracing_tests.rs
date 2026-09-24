@@ -211,7 +211,10 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
         .build(engine.as_ref())?;
     let updated = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
     assert_eq!(updated.version(), 1);
-    assert_eq!(updated.get_in_commit_timestamp(engine.as_ref())?, None);
+    assert_eq!(
+        updated.get_in_commit_timestamp_with_engine(engine.as_ref())?,
+        None
+    );
     assert!(captured.error_events().is_empty());
 
     {

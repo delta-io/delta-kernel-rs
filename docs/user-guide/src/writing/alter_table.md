@@ -36,13 +36,12 @@ column. The flow is:
 1. Load a `Snapshot` of the table.
 2. Call `snapshot.alter_table()` to get an `AlterTableTransactionBuilder`.
 3. Call `add_column()` with the new field.
-4. Call `build()` to produce an `AlterTableTransaction`.
+4. Call `build_with_filesystem_committer()` to produce a bound transaction.
 5. Call `commit()` to atomically apply the schema change.
 
 ```rust,no_run
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
@@ -58,12 +57,12 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .with_engine_info("my-app/1.0")
     .commit(&engine)?;
 
 match result {
-    CommitResult::Committed(committed) => {
+    (CommitResult::Committed(committed), _) => {
         println!("Schema evolved at version {}", committed.commit_version());
     }
     _ => eprintln!("alter table did not succeed"),
@@ -79,8 +78,8 @@ column by including it in the `RecordBatch` they pass to
 
 ## Validation rules
 
-`add_column()` checks the new field at `build()` time. If any rule is violated,
-`build()` returns an error and no commit is attempted.
+`add_column()` checks the new field when the builder is consumed. If any rule is violated, the
+build method returns an error and no commit is attempted.
 
 | Rule | Why |
 |------|-----|
@@ -105,12 +104,12 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 ```
 
 The builder uses a type-state pattern to enforce that at least one operation is
-queued before `build()` is callable. Calling `.build()` directly on
+queued before a build method is callable. Calling a build method directly on
 `snapshot.alter_table()` without first calling `add_column()` is a compile
 error.
 

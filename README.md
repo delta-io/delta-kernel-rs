@@ -57,21 +57,19 @@ cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
 ```
 
-In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
-`Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
-module. The core kernel includes facilities for reading and writing delta tables, and allows the
-consumer to implement their own `Engine` trait in order to build engine-specific implementations of
-the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
-`read_json_files()` using the native engine JSON reader). If you do not need a custom `Engine`,
-add the `delta_kernel_default_engine` crate to get the default asynchronous `Engine` implementation
-built with [Arrow] and [Tokio].
+Rust projects normally add `delta_kernel` to `Cargo.toml`; other languages use the [FFI] module.
+The core crate provides Delta protocol operations as lazy connector-driven workflows and
+synchronous Engine-compatible methods. Enable `internal-api` to drive workflow requests directly,
+or implement `Engine` to back the compatibility surface with native I/O and data.
+
+Add `delta_kernel_default_engine` to use Arrow with `object_store`. It provides `DefaultEngine` for
+Engine compatibility and `AsyncEngineConnector` for native asynchronous workflow execution.
 
 ```toml
-# fewer dependencies, requires consumer to implement Engine trait.
-# allows consumers to implement their own in-memory format
+# Core protocol APIs and Engine traits
 delta_kernel = "0.28.0"
 
-# or pull in the default Arrow/Tokio engine alongside the kernel
+# Arrow/object_store Engine and async workflow driver
 delta_kernel = "0.28.0"
 delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
@@ -92,6 +90,7 @@ The `delta_kernel` crate itself exposes a few additional flags:
 | ------------- | ------------- |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
+| `internal-api` | Unstable connector-driven coroutine and distributed-execution APIs |
 
 ### Versions and Api Stability
 We intend to follow [Semantic Versioning](https://semver.org/). However, in the `0.x` line, the APIs
@@ -100,7 +99,8 @@ we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
 If you depend on `delta_kernel_default_engine` (with either the `rustls` or `native-tls` feature),
-you get an implementation of the `Engine` trait that uses [Arrow] as its data format.
+you get Engine-compatible and connector-driven implementations that use [Arrow] as their data
+format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
 frequently. To enable engines that already integrate arrow to also integrate kernel and not force
@@ -146,24 +146,23 @@ projects.
 
 There are a few key concepts that will help in understanding kernel:
 
-1. The `Engine` trait encapsulates all the functionality an engine or connector needs to provide to
-   the Delta Kernel in order to read/write the Delta table.
-2. The `DefaultEngine` is our default implementation of the above trait. It lives in
-   `engine/default`, and provides a reference implementation for all `Engine`
-   functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
-   data format.
-3. A `Scan` is the entrypoint for reading data from a table.
-4. A `Transaction` is the entrypoint for writing data to a table.
+1. `Workflow` and `Generator` are lazy operations. A connector starts a root task, advances it, and
+   serves each typed request; Kernel never calls connector code on this path.
+2. The `Engine` trait is the synchronous compatibility interface for connector I/O and evaluation.
+3. The default-engine crate provides `DefaultEngine` for Engine compatibility and
+   `AsyncEngineConnector` for native asynchronous workflow execution. Both use
+   [Arrow](https://docs.rs/arrow/latest/arrow/) as their in-memory data format.
+4. A `Scan` is the entrypoint for reading data from a table.
+5. A `Transaction` is the entrypoint for writing data to a table.
 
 ### Design Principles
 
 Some design principles which should be considered:
 
-- async should live only in the `Engine` implementation. The core kernel does not use async at
-  all. We do not wish to impose the need for an entire async runtime on an engine or connector. The
-  `DefaultEngine` _does_ use async quite heavily. It doesn't depend on a particular runtime however,
-  and implementations could provide an "executor" based on tokio, smol, async-std, or whatever might
-  be needed. Currently only a `tokio` based executor is provided.
+- Kernel uses async state machines internally without choosing or depending on an async runtime.
+  Connectors own task advancement and execute requests using their scheduling model.
+- Engine-compatible methods remain synchronous. `DefaultEngine` bridges its async I/O through a
+  `TaskExecutor`.
 - Prefer builder style APIs over object oriented ones.
 - "Simple" set of default-features enabled to provide the basic functionality with the least
   necessary amount of dependencies possible. Putting more complex optimizations or APIs behind

@@ -1,3 +1,4 @@
+use delta_kernel::coroutine::run_workflow_with_engine;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::DeltaResult;
 
@@ -132,7 +133,11 @@ fn visit_clustering_columns_impl(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> DeltaResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+    let engine = extern_engine.engine();
+    let Some(infos) = run_workflow_with_engine!(engine.as_ref(), async move |channel| {
+        snapshot.get_clustering_column_infos(channel).await
+    })?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -185,7 +190,10 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> DeltaResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let engine = extern_engine.engine();
+    let res = run_workflow_with_engine!(engine.as_ref(), async move |channel| {
+        snapshot.get_all_domain_metadata(channel).await
+    })?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();

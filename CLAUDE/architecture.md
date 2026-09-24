@@ -5,20 +5,22 @@
 ```
 Compute Engine (Spark, Flink, DuckDB, Polars, ...)
   -> Your Delta Connector (implements compute engine's DataSource API)
-    -> Delta Kernel (snapshot loading, scan orchestration, write transaction coordination,
-       log replay, data skipping, schema enforcement, predicate evaluation,
-       physical-to-logical transforms, deletion vector handling, checkpointing)
-      -> Engine trait (abstraction for I/O and compute)
-        -> DefaultEngine (Arrow + object_store + Tokio) or custom engine
-          -> Storage (local FS, S3, GCS, Azure, HDFS, ...)
+    -> Delta Kernel operation
+      -> Workflow/Generator coroutine -> connector-owned driver -> I/O and compute
+      -> Engine compatibility adapter -> Engine handlers -> I/O and compute
 ```
 
 Kernel handles the Delta protocol; connectors handle execution, distribution, and data flow.
-Kernel never does I/O directly: it delegates all I/O to the Engine trait. Kernel also leaves
-columnar memory representation and I/O scheduling to the connector and engine. For example, during
-log replay or checkpoint writes, kernel receives opaque `EngineData` batches, inspects them via the
-visitor pattern, updates a selection vector, and hands them back to the engine: it never
-deserializes the full batch into in-memory structs.
+Kernel never does I/O. On the connector-driven path, it also never invokes connector code:
+entry points return lazy workflows or channel-bound generators. The connector owns the operation,
+requests each step, serves typed requests, and completes their `Reply` values. Engine-based entry
+points are a synchronous compatibility surface whose internal adapter performs the same requests
+by calling `Engine` handlers.
+
+Kernel leaves columnar memory representation and I/O scheduling to the connector. For example,
+during log replay or checkpoint writes, kernel receives opaque `EngineData` batches, inspects them
+via the visitor pattern, updates a selection vector, and hands them back without deserializing the
+full batch into in-memory structs.
 
 ## Snapshot
 
@@ -82,29 +84,35 @@ Kernel captures table-wide configuration in a transportable `WriteState`. Each w
 partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`
 containing validated partition values, data schemas, statistics columns, and the recommended write
 directory. The transaction registers the resulting files, enforces protocol compliance, assembles
-commit actions, and delegates the atomic commit to a `Committer`.
+commit actions, and emits a prepared `Commit` request. The connector delegates that request to the
+selected committer workflow.
 
 **Data-write steps:**
-1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
+1. Create a `TransactionWithCommitter` from a snapshot
 2. Call `txn.write_state()` after configuring the transaction, then use
    `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
    Distributed writers can encode the state and decode it on each worker before binding partition
    values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
-5. Commit: returns `CommitResult::Committed`, `Conflicted`, or `Retryable`
+5. Commit: returns the `CommitResult` and committer together so every outcome retains the
+   committer for retry or catalog publish
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
   updates, table creation (including clustered tables via `DataLayout`), and limited schema
   evolution
-- **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` for
-  filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
-  for catalog-managed tables (staging, ratifying, publishing).
+- **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` provides a
+  path-based workflow; the `Committer` trait is the Engine compatibility API.
+- **Coroutine runtime** (`kernel/src/coroutine/`): connector-driven workflows, generators, and
+  request vocabularies. Connectors drive workflows or construct `StaticGenerator` values with
+  `StaticGenerator::new`. Kernel code with an existing `Channel` calls async workflow
+  implementations directly and consumes streams through `Generator::next`, causing child requests
+  to surface from the parent coroutine. Drivers process requests and complete their replies.
 
 ## Engine Trait System
 
-The kernel is built around the `Engine` trait (`kernel/src/lib.rs`), which provides the required
-handlers below and an optional `PlanExecutor` under the `declarative-plans` feature:
+The `Engine` trait (`kernel/src/lib.rs`) is the synchronous compatibility interface. It provides the
+required handlers below and an optional `PlanExecutor` under the `declarative-plans` feature:
 
 | Handler              | Purpose                          | Key Methods                                |
 |----------------------|----------------------------------|--------------------------------------------|
@@ -113,9 +121,10 @@ handlers below and an optional `PlanExecutor` under the `declarative-plans` feat
 | `ParquetHandler`     | Data file and checkpoint I/O     | `read_parquet_files`, `write_parquet_file`  |
 | `EvaluationHandler`  | Expression/predicate evaluation  | `new_expression_evaluator`, etc.           |
 
-Metrics are emitted as tracing events and collected by tracing layers. A `DefaultEngine` (Arrow +
-`object_store` + Tokio) lives in `default-engine/src/`. Custom engines only need to replace
-specific handlers: they can reuse defaults for the rest.
+Metrics are emitted as tracing events and collected by tracing layers. `DefaultEngine` (Arrow +
+`object_store` + Tokio) implements this interface. `AsyncEngineConnector` in the same crate drives
+coroutines through native async I/O without `Engine` or its `TaskExecutor`. Custom Engine
+implementations can reuse default handlers.
 
 ## EngineData Trait
 
@@ -147,6 +156,7 @@ all returned batches: the engine may split a single file across multiple batches
 - `kernel/src/partition/` -- partition value validation, serialization, Hive-style path
    encoding, URI encoding for `add.path`
 - `kernel/src/committer/`: `Committer` trait, `FileSystemCommitter`
+- `kernel/src/coroutine/`: generic coroutine runtime and kernel request vocabulary
 - `kernel/src/log_segment/`: log file discovery, Protocol/Metadata replay
 - `kernel/src/log_replay/`: file-action deduplication, `LogReplayProcessor` trait
 - `kernel/src/log_reader/`: I/O layer for reading commit and checkpoint files
@@ -168,14 +178,17 @@ all returned batches: the engine may split a single file across multiple batches
 ## Catalog-Managed Tables
 
 Tables whose commits go through a catalog (e.g. Unity Catalog) instead of direct filesystem
-writes. Kernel doesn't know about catalogs: the catalog client provides a log tail via
+writes. Kernel doesn't know catalog APIs: the catalog client provides a log tail via
 `SnapshotBuilder::with_log_tail()`, caps the version via `with_max_catalog_version()`, and
-uses a custom `Committer` for staging/ratifying/publishing commits.
+uses a catalog workflow for staging, ratifying, and publishing commits. Engine-based connectors use
+a custom `Committer` as a compatibility adapter.
 
 The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a
 catalog committer for Unity Catalog. It writes version 0 directly to `_delta_log/`. For later
 versions, it stages commits in `_staged_commits/`, calls the UC commit API to ratify them, and
-publishes them by atomically copying them to `_delta_log/`.
+publishes them by atomically copying them to `_delta_log/`. Its connector-owned commit task consumes
+catalog requests. A staged JSON write carries the commit-action generator, whose kernel requests
+are driven by the connector performing the write.
 
 For versions after 0, commit types are staged (written to `_staged_commits/`), ratified (accepted
 by the catalog for a version), and published (copied to `_delta_log/` as a normal Delta file).

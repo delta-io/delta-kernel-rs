@@ -148,27 +148,33 @@ get_default_engine() -> transaction() -> with_engine_info() -> with_operation() 
                                                                   free_committed_transaction
 ```
 
-`commit()` and `create_table_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+`commit()` and `create_table_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the
+caller can read via `committed_transaction_version` and
+`committed_transaction_post_commit_snapshot`, publish via `committed_transaction_publish`, then
+must release with `free_committed_transaction`. The post-commit snapshot, when present, is a
+separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
 
 Write context: `get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_builder_with_partition_columns`.
 
 Catalog-managed publish flow (after a catalog committer stages commits):
 
 ```
-committed_transaction_post_commit_snapshot()
-  -> snapshot_publish_with_committer(snapshot, committer, engine)
-     // borrows snapshot; consumes committer (do not free)
+committed_transaction_publish(committed_transaction, engine)
+     // borrows the committed transaction and reuses its retained committer
   -> use returned snapshot for subsequent transaction_with_committer / checkpoint
      // mint a fresh get_uc_committer for that transaction -- it also consumes
   -> free_snapshot (returned snapshot) when done
-  -> free_snapshot (post-commit input snapshot)
+  -> free_committed_transaction
 ```
 
-`snapshot_publish_with_committer` mirrors kernel `Snapshot::publish`: it copies ratified staged
-commits into `_delta_log/` via the catalog committer's `publish()` implementation. The input
-snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
-snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
-needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
+`committed_transaction_publish` publishes the retained post-commit snapshot through the same
+committer that executed the transaction. It copies ratified staged commits into `_delta_log/` via
+the catalog committer's `publish()` implementation. The caller owns the returned snapshot handle.
+The returned snapshot carries the published watermark (`max_published_version`) needed for the next
+catalog commit; do not continue from the pre-publish post-commit snapshot.
+
+`snapshot_publish_with_committer` remains available for publishing an arbitrary snapshot. It
+borrows the snapshot and consumes a separate committer handle.
 
 Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The kernel reports
 defaults but never materializes them, so the connector fills every omitted column itself:

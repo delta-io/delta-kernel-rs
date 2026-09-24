@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use crate::committer::Committer;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
@@ -37,7 +36,6 @@ impl AlterTableTransaction {
     pub(crate) fn try_new_alter_table(
         read_snapshot: SnapshotRef,
         effective_table_config: TableConfiguration,
-        committer: Box<dyn Committer>,
         correlation_id: Option<Arc<str>>,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
@@ -55,7 +53,6 @@ impl AlterTableTransaction {
             effective_table_config,
             should_emit_protocol: false,
             should_emit_metadata: true,
-            committer,
             operation: Some("ALTER TABLE".to_string()),
             engine_info: None,
             add_files_metadata: vec![],

@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -21,7 +20,6 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -102,7 +100,7 @@ fn verify_column_names_in_clustering_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = snapshot.schema();
     let clustering_columns = snapshot
-        .get_physical_clustering_columns(engine)?
+        .get_physical_clustering_columns_with_engine(engine)?
         .expect("Clustering columns should be present");
 
     assert_eq!(
@@ -220,15 +218,9 @@ async fn run_ctas_test(
             builder = builder.with_data_layout(DataLayout::clustered(["row_number"]));
         }
         let result = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?;
-        match result {
-            CommitResult::Committed(c) => c
-                .post_commit_snapshot()
-                .expect("should have post_commit_snapshot")
-                .clone(),
-            _ => panic!("Source create should succeed"),
-        }
+        result.0.unwrap_post_commit_snapshot()
     };
 
     // 2. Write seed data to the source table
@@ -258,7 +250,7 @@ async fn run_ctas_test(
     if tgt_clustered {
         tgt_builder = tgt_builder.with_data_layout(DataLayout::clustered(["row_number"]));
     }
-    let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut tgt_txn = tgt_builder.build(engine.as_ref())?;
 
     let write_context = tgt_txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
@@ -266,14 +258,10 @@ async fn run_ctas_test(
         .await?;
     tgt_txn.add_files(add_meta);
 
-    let commit_result = tgt_txn.commit(engine.as_ref())?;
-    let tgt_snapshot = match commit_result {
-        CommitResult::Committed(c) => c
-            .post_commit_snapshot()
-            .expect("should have post_commit_snapshot")
-            .clone(),
-        _ => panic!("CTAS commit should succeed"),
-    };
+    let commit_result = tgt_txn
+        .with_filesystem_committer()
+        .commit(engine.as_ref())?;
+    let tgt_snapshot = commit_result.0.unwrap_post_commit_snapshot();
 
     // 5. Verify target version, feature flags, and column naming consistency
     assert_eq!(tgt_snapshot.version(), 0, "CTAS should produce version-0");

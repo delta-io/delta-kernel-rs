@@ -10,7 +10,6 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Snapshot, Version};
 use rstest::rstest;
 use tempfile::{tempdir, TempDir};
@@ -61,11 +60,11 @@ async fn write_data_to_table(
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
-    let result = txn.commit(engine.as_ref())?;
-    match result {
-        CommitResult::Committed(committed) => Ok(committed.commit_version()),
-        _ => panic!("Transaction should be committed"),
-    }
+    Ok(txn
+        .commit(engine.as_ref())?
+        .0
+        .unwrap_committed()
+        .commit_version())
 }
 
 // Helper function to add files to an existing transaction
@@ -130,13 +129,8 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     // This should succeed - remove-only transactions are allowed with CDF
-    let result = txn.commit(engine.as_ref())?;
-    match result {
-        CommitResult::Committed(committed) => {
-            assert_eq!(committed.commit_version(), 2);
-        }
-        _ => panic!("Transaction should be committed"),
-    }
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
+    assert_eq!(committed.commit_version(), 2);
 
     Ok(())
 }
@@ -172,13 +166,8 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
     txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
 
     // This should succeed - mixed operations are allowed when dataChange=false
-    let result = txn.commit(engine.as_ref())?;
-    match result {
-        CommitResult::Committed(committed) => {
-            assert_eq!(committed.commit_version(), 2);
-        }
-        _ => panic!("Transaction should be committed"),
-    }
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
+    assert_eq!(committed.commit_version(), 2);
 
     Ok(())
 }
@@ -281,7 +270,7 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         )],
     )?;
     setup_txn.add_files(existing_file);
-    let snapshot = setup_txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let snapshot = setup_txn.commit(&engine)?.0.unwrap_post_commit_snapshot();
 
     let mut txn = begin_transaction(snapshot.clone(), &engine)?.with_data_change(data_change);
     let new_file = create_add_files_metadata(
@@ -312,7 +301,7 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
         assert_eq!(snapshot.version(), 1);
     } else {
-        let snapshot = commit_result?.unwrap_post_commit_snapshot();
+        let snapshot = commit_result?.0.unwrap_post_commit_snapshot();
         let mut active_files = 0;
         let mut existing_dv = None;
         for files in get_scan_files(snapshot.clone(), &engine)? {

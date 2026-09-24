@@ -1002,8 +1002,6 @@ mod tests {
     use crate::arrow::array::{BooleanArray, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::create_row;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1013,6 +1011,8 @@ mod tests {
     use crate::expressions::{column_expr_ref, Expression};
     use crate::schema::schema_ref;
     use crate::table_features::TableFeature;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::create_row;
     use crate::unit_test_utils::{action_batch, parse_json_batch, string_array_to_engine_data};
     use crate::Engine;
 

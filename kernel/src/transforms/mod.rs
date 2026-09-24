@@ -1,6 +1,8 @@
 //! Shared transform infrastructure.
 use std::borrow::{Cow, ToOwned};
 
+use delta_kernel_derive::pub_macro;
+
 mod carrier;
 mod expression;
 mod schema;
@@ -15,9 +17,8 @@ pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 ///
 /// Example: fallible schema visitor
 /// ```rust,no_run
-/// # use delta_kernel::transform_output_type;
 /// # use delta_kernel::schema::StructField;
-/// # use delta_kernel::transforms::SchemaTransform;
+/// # use delta_kernel::transforms::{transform_output_type, SchemaTransform};
 /// # use delta_kernel::DeltaResult;
 /// struct Validate;
 ///
@@ -33,9 +34,8 @@ pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 /// Example: infallible filtering expression transform
 /// ```rust,no_run
 /// # use std::borrow::Cow;
-/// # use delta_kernel::transform_output_type;
 /// # use delta_kernel::expressions::ColumnName;
-/// # use delta_kernel::transforms::ExpressionTransform;
+/// # use delta_kernel::transforms::{transform_output_type, ExpressionTransform};
 /// struct KeepSomeColumns;
 ///
 /// impl<'a> ExpressionTransform<'a> for KeepSomeColumns {
@@ -46,15 +46,13 @@ pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 ///     }
 /// }
 /// ```
-#[macro_export]
+#[pub_macro]
 macro_rules! transform_output_type {
     (|$lt:lifetime, $T:ident| $out:ty) => {
         type Output<$T: ::std::borrow::ToOwned + ?Sized + $lt> = $out;
         type Residual = <Self::Output<()> as $crate::transforms::Carrier<$lt, ()>>::Residual;
     };
 }
-#[doc(inline)]
-pub use transform_output_type;
 
 /// Rebuilds a parent from transformed children only when needed.
 ///

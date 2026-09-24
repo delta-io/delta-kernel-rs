@@ -15,6 +15,12 @@ use crate::actions::{
 };
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
+use crate::coroutine::engine::{
+    run_workflow_with_connector, run_workflow_with_storage, EngineConnector,
+};
+use crate::coroutine::kernel::{unbound_generator, Channel, Request, UnboundGenerator};
+use crate::coroutine::read::{ReadJsonFiles, ReadParquetFiles};
+use crate::coroutine::{ChannelExt as _, PageRequest, PagedOperation};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -33,8 +39,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, Predicate, PredicateRef, RowVisitor, StorageHandler,
-    Version,
+    DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -84,13 +90,16 @@ impl CheckpointReadInfo {
     }
 }
 
-/// Result of reading actions from a log segment, containing both the actions iterator
-/// and checkpoint metadata.
+/// Result of reading actions from a log segment, containing both the actions and checkpoint
+/// metadata.
+///
+/// The actions are presented to coroutine users through an [`UnboundGenerator`] while [`Engine`]
+/// users receive a lazy [`Iterator`].
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
 #[internal_api]
-pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
-    /// Iterator over action batches read from the log segment.
+pub(crate) struct ActionsWithCheckpointInfo<A> {
+    /// Iterator or generator over action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
@@ -106,10 +115,10 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<Actio
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
 ///
-/// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
-/// in `TableChanges` when built with [`LogSegment::for_table_changes`].
+/// [`Snapshot`] and [`TableChanges`] consume log segments when reading table state.
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
+/// [`TableChanges`]: crate::table_changes::TableChanges
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct LogSegment {
@@ -428,37 +437,35 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
-    #[internal_api]
     #[tracing::instrument(
         name = "log_segment.for_snapshot",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
+    pub(crate) async fn for_snapshot(
+        channel: &Channel,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
-        let build = || {
-            let checkpoint_hint =
-                LastCheckpointHint::try_read(storage, &log_root, cancellation_token)?;
+        let build = async {
+            let checkpoint_hint = LastCheckpointHint::try_read(channel, &log_root).await?;
             Self::for_snapshot_impl(
-                storage,
+                channel,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
-                cancellation_token,
             )
+            .await
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build
+            .await
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -475,14 +482,13 @@ impl LogSegment {
             .map(|crc| self.end_version - crc.version)
     }
 
-    // factored out for testing
-    pub(crate) fn for_snapshot_impl(
-        storage: &dyn StorageHandler,
+    /// Shared listing body of [`Self::for_snapshot`]; tests inject a resolved checkpoint hint.
+    async fn for_snapshot_impl(
+        channel: &Channel,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -508,26 +514,25 @@ impl LogSegment {
 
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-                cancellation_token,
-            )?,
-            // Case 3
-            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage,
-                &log_root,
-                log_tail,
-                end,
-                cancellation_token,
-            )?,
-            // Case 4
-            (None, None) => {
-                LogSegmentFiles::list(storage, &log_root, log_tail, None, None, cancellation_token)?
+            (Some(cp), end_version) => {
+                LogSegmentFiles::list_with_checkpoint_hint(
+                    cp,
+                    channel,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                )
+                .await?
             }
+            // Case 3
+            (None, Some(end)) => {
+                LogSegmentFiles::list_with_backward_checkpoint_scan(
+                    channel, &log_root, log_tail, end,
+                )
+                .await?
+            }
+            // Case 4
+            (None, None) => LogSegmentFiles::list(channel, &log_root, log_tail, None, None).await?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
@@ -545,18 +550,33 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
-        Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+        let end_version = end_version.into();
+        run_workflow_with_storage!(storage, None, async move |channel| {
+            Self::for_table_changes_with_channel(channel, log_root, start_version, end_version)
+                .await
+        })
     }
 
-    /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
-    pub(crate) fn for_table_changes_with_log_tail(
-        storage: &dyn StorageHandler,
+    /// Constructs a table-changes log segment through `channel`.
+    pub(crate) async fn for_table_changes_with_channel(
+        channel: &Channel,
         log_root: Url,
         start_version: Version,
-        end_version: impl Into<Option<Version>>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        Self::for_table_changes_with_log_tail(channel, log_root, start_version, end_version, vec![])
+            .await
+    }
+
+    /// Constructs a table-changes log segment through `channel` with a caller-provided
+    /// authoritative commit tail.
+    pub(crate) async fn for_table_changes_with_log_tail(
+        channel: &Channel,
+        log_root: Url,
+        start_version: Version,
+        end_version: Option<Version>,
         log_tail: Vec<ParsedLogPath>,
     ) -> DeltaResult<Self> {
-        let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
                 return Err(Error::generic(
@@ -567,13 +587,13 @@ impl LogSegment {
 
         // TODO: compactions?
         let listed_files = LogSegmentFiles::list_commits(
-            storage,
+            channel,
             &log_root,
             log_tail,
             Some(start_version),
             end_version,
-            None, // table-changes does not thread a cancellation token
-        )?;
+        )
+        .await?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
@@ -588,7 +608,6 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
-    #[allow(unused)]
     /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
     /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
     /// `limit` specifies the maximum length of the returned log segment. The log segment may be
@@ -599,6 +618,20 @@ impl LogSegment {
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
     pub(crate) fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+        log_tail: Vec<ParsedLogPath>,
+    ) -> DeltaResult<Self> {
+        run_workflow_with_storage!(storage, None, async move |channel| {
+            Self::for_timestamp_conversion_impl(channel, log_root, end_version, limit, log_tail)
+                .await
+        })
+    }
+
+    /// Constructs a timestamp-conversion log segment through `channel`.
+    async fn for_timestamp_conversion_impl(
+        channel: &Channel,
         log_root: Url,
         end_version: Version,
         limit: Option<NonZero<usize>>,
@@ -617,13 +650,14 @@ impl LogSegment {
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
         let mut listed_commits = LogSegmentFiles::list_commits(
-            storage,
+            channel,
             &log_root,
             log_tail,
             start_from,
             Some(end_version),
-            None, // timestamp conversion does not thread a cancellation token
-        )?;
+        )
+        .await?;
+
         if listed_commits.ascending_commit_files().is_empty() {
             return Err(Error::EmptyLog);
         }
@@ -790,9 +824,7 @@ impl LogSegment {
             .collect()
     }
 
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
+    /// Read a stream of actions from this log segment.
     ///
     /// The log files will be read from most recent to oldest.
     ///
@@ -817,20 +849,17 @@ impl LogSegment {
     /// `IS NOT NULL` predicates are combined (OR), then combined (AND) with `meta_predicate`.
     /// Otherwise projection-based pruning is disabled. Readers may ignore the resulting predicate,
     /// and downstream log replay must tolerate rows that do not satisfy it.
-    #[internal_api]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn read_actions_with_projected_checkpoint_actions(
+    #[internal_api]
+    pub(crate) async fn read_actions_with_projected_checkpoint_actions(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-        cancellation_token: Option<&CancellationTokenRef>,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-    > {
+    ) -> DeltaResult<ActionsWithCheckpointInfo<UnboundGenerator<ActionsBatch>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -839,43 +868,92 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream =
-            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
+        let commits = self.read_commit_actions(commit_read_schema);
 
-        let checkpoint_result = self.create_checkpoint_stream(
-            engine,
-            checkpoint_read_schema,
-            checkpoint_predicate,
-            stats_schema,
-            partition_schema,
-            cancellation_token,
-        )?;
-
+        let checkpoint_result = self
+            .create_checkpoint_stream_with_channel(
+                channel,
+                checkpoint_read_schema,
+                checkpoint_predicate,
+                stats_schema,
+                partition_schema,
+            )
+            .await?;
+        let actions = unbound_generator!(async move |channel| {
+            channel.yield_from(commits).await?;
+            channel.yield_from(checkpoint_result.actions).await?;
+            Ok(())
+        });
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_result.actions),
+            actions,
             checkpoint_info: checkpoint_result.checkpoint_info,
         })
     }
 
-    /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but uses the same schema
-    /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
-    /// the schema, so callers do not need to supply them.
+    /// Read actions using the same schema for commit and checkpoint files.
     #[internal_api]
-    pub(crate) fn read_actions(
+    pub(crate) async fn read_actions(
+        &self,
+        channel: &Channel,
+        action_schema: SchemaRef,
+    ) -> DeltaResult<UnboundGenerator<ActionsBatch>> {
+        let result = self
+            .read_actions_with_projected_checkpoint_actions(
+                channel,
+                action_schema.clone(),
+                action_schema,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        Ok(result.actions)
+    }
+
+    /// Drives the coroutine-based action reader through an [`Engine`].
+    #[internal_api]
+    pub(crate) fn read_actions_with_engine(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let result = self.read_actions_with_projected_checkpoint_actions(
-            engine,
-            action_schema.clone(),
-            action_schema,
-            None,
-            None,
-            None,
-            None,
-        )?;
-        Ok(result.actions)
+        let connector = EngineConnector::new(engine);
+        let actions = run_workflow_with_connector!(connector, async move |channel| {
+            self.read_actions(channel, action_schema).await
+        })?;
+        Ok(connector.iterate_generator(actions))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_actions_with_projected_checkpoint_actions_with_engine(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        checkpoint_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
+        let stream = run_workflow_with_connector!(connector, async move |channel| {
+            self.read_actions_with_projected_checkpoint_actions(
+                channel,
+                commit_read_schema,
+                checkpoint_read_schema,
+                checkpoint_predicate,
+                stats_schema,
+                partition_schema,
+            )
+            .await
+        })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: connector.iterate_generator(stream.actions),
+            checkpoint_info: stream.checkpoint_info,
+        })
     }
 
     /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
@@ -883,24 +961,22 @@ impl LogSegment {
     ///
     /// Files are returned in descending version order, as log replay expects. Only the commit
     /// cover is read; checkpoints and sidecars are not consulted.
-    #[internal_api]
-    pub(crate) fn read_commit_actions(
+    pub(crate) fn read_commit_actions_with_engine(
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
+        Ok(connector.iterate_generator(self.read_commit_actions(schema)))
+    }
+
+    #[internal_api]
+    pub(crate) fn read_commit_actions(&self, schema: SchemaRef) -> UnboundGenerator<ActionsBatch> {
         let commit_files = self.find_commit_cover();
-        let actions = engine
-            .json_handler()
-            .read_json_files_with_cancellation(
-                &commit_files,
-                schema,
-                None,
-                cancellation_token.cloned(),
-            )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
-        Ok(actions)
+        // `replay` expects commit files to be sorted in descending order.
+        action_pages(ReadJsonFiles::new(commit_files, schema, None), true)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -1039,10 +1115,9 @@ impl LogSegment {
     ///   footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
-    fn get_file_actions_schema_and_sidecars(
+    async fn get_file_actions_schema_and_sidecars_with_channel(
         &self,
-        engine: &dyn Engine,
-        cancellation_token: Option<&CancellationTokenRef>,
+        channel: &Channel,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_hint_schema();
@@ -1056,35 +1131,28 @@ impl LogSegment {
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
-                let schema = Self::read_checkpoint_schema(
-                    engine,
-                    checkpoint,
-                    hint_schema.as_ref(),
-                    cancellation_token,
-                )?;
+                let schema =
+                    Self::read_checkpoint_schema(channel, checkpoint, hint_schema.as_ref()).await?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
                 // JSON checkpoint is always V2. No checkpoint schema is available since JSON
                 // checkpoints don't have a parquet footer to read.
-                self.read_sidecar_schema_and_files(engine, checkpoint, None, cancellation_token)
+                self.read_sidecar_schema_and_files(channel, checkpoint, None)
+                    .await
             }
             ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
-                let checkpoint_schema = Self::read_checkpoint_schema(
-                    engine,
-                    checkpoint,
-                    hint_schema.as_ref(),
-                    cancellation_token,
-                )?;
+                let checkpoint_schema =
+                    Self::read_checkpoint_schema(channel, checkpoint, hint_schema.as_ref()).await?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
                     self.read_sidecar_schema_and_files(
-                        engine,
+                        channel,
                         checkpoint,
                         Some(&checkpoint_schema),
-                        cancellation_token,
                     )
+                    .await
                 } else {
                     Ok((Some(checkpoint_schema), vec![]))
                 }
@@ -1093,52 +1161,42 @@ impl LogSegment {
         }
     }
 
-    /// Reads a parquet footer schema, passing the cancellation token to the Engine. Engines may
-    /// additionally use it to interrupt a read already in flight.
-    fn read_footer_schema(
-        engine: &dyn Engine,
-        file: &FileMeta,
-        cancellation_token: Option<&CancellationTokenRef>,
-    ) -> DeltaResult<SchemaRef> {
-        Ok(engine
-            .parquet_handler()
-            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
-            .schema)
+    /// Reads a parquet footer schema.
+    async fn read_footer_schema(channel: &Channel, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        Ok(channel.read_parquet_footer(file.clone()).await?.schema)
     }
 
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
-    fn read_checkpoint_schema(
-        engine: &dyn Engine,
+    async fn read_checkpoint_schema(
+        channel: &Channel,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<SchemaRef> {
         match hint_schema {
             Some(schema) => Ok(schema.clone()),
-            None => Self::read_footer_schema(engine, &checkpoint.location, cancellation_token),
+            None => Self::read_footer_schema(channel, &checkpoint.location).await,
         }
     }
 
     /// Extracts sidecar file references and reads the file actions schema from the first
     /// sidecar's parquet footer. If no sidecars exist, falls back to `checkpoint_schema`
     /// since V2 checkpoints may store add actions directly in the main file.
-    fn read_sidecar_schema_and_files(
+    async fn read_sidecar_schema_and_files(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint, cancellation_token)?;
+        let sidecar_files = self.extract_sidecar_refs(channel, checkpoint).await?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(Self::read_footer_schema(engine, first, cancellation_token)?),
+            Some(first) => Some(Self::read_footer_schema(channel, first).await?),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))
     }
 
-    /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
+    /// Returns an unpulled checkpoint/sidecar action generator plus [`CheckpointReadInfo`].
     ///
     /// For checkpoints that need file actions, this function:
     /// 1. Determines the file actions schema (for stats_parsed / partitionValues_parsed detection)
@@ -1146,21 +1204,19 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
-    fn create_checkpoint_stream(
+    async fn create_checkpoint_stream_with_channel(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-        cancellation_token: Option<&CancellationTokenRef>,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
-    > {
+    ) -> DeltaResult<ActionsWithCheckpointInfo<UnboundGenerator<ActionsBatch>>> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine, cancellation_token)?
+            self.get_file_actions_schema_and_sidecars_with_channel(channel)
+                .await?
         } else {
             (None, vec![])
         };
@@ -1243,6 +1299,12 @@ impl LogSegment {
             action_schema.clone()
         };
 
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed,
+            has_partition_values_parsed,
+            checkpoint_read_schema: augmented_checkpoint_read_schema,
+        };
+        let checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
         let checkpoint_file_meta: Vec<_> = self
             .listed
             .checkpoint_parts
@@ -1254,107 +1316,150 @@ impl LogSegment {
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
-        let actions = match self.listed.checkpoint_parts.first() {
-            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files_with_cancellation(
-                    &checkpoint_file_meta,
-                    augmented_checkpoint_read_schema.clone(),
+        let checkpoint_actions = match self.listed.checkpoint_parts.first() {
+            Some(parsed_log_path) if parsed_log_path.extension == "json" => Some(action_pages(
+                ReadJsonFiles::new(
+                    checkpoint_file_meta,
+                    checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    cancellation_token.cloned(),
-                )?
-            }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => engine
-                .parquet_handler()
-                .read_parquet_files_with_cancellation(
-                    &checkpoint_file_meta,
-                    augmented_checkpoint_read_schema.clone(),
+                ),
+                false,
+            )),
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => Some(action_pages(
+                ReadParquetFiles::new(
+                    checkpoint_file_meta,
+                    checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    cancellation_token.cloned(),
-                )?,
+                ),
+                false,
+            )),
             Some(parsed_log_path) => {
                 return Err(Error::invalid_checkpoint(format!(
                     "Unsupported checkpoint file type: {}",
                     parsed_log_path.extension,
                 )));
             }
-            // This is the case when there are no checkpoints in the log segment
-            // so we return an empty iterator
-            None => Box::new(std::iter::empty()),
+            None => None,
         };
 
-        // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
-        // The sidecar column will be null in sidecar batches, which is harmless.
-        // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
-        // layout, so we reuse the same predicate for row group skipping.
-        let sidecar_batches = if !sidecar_files.is_empty() {
-            engine
-                .parquet_handler()
-                .read_parquet_files_with_cancellation(
-                    &sidecar_files,
-                    augmented_checkpoint_read_schema.clone(),
-                    meta_predicate,
-                    cancellation_token.cloned(),
-                )?
-        } else {
-            Box::new(std::iter::empty())
-        };
+        // Sidecars use the checkpoint schema and predicate because their parquet column layout is
+        // identical. The sidecar column itself is null in these batches.
+        let sidecar_actions = (!sidecar_files.is_empty()).then(|| {
+            action_pages(
+                ReadParquetFiles::new(sidecar_files, checkpoint_read_schema, meta_predicate),
+                false,
+            )
+        });
 
-        // Chain checkpoint batches with sidecar batches.
-        // The boolean flag indicates whether the batch originated from a commit file
-        // (true) or a checkpoint file (false).
-        let actions_iter = actions
-            .map_ok(|batch| ActionsBatch::new(batch, false))
-            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
-
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed,
-            has_partition_values_parsed,
-            checkpoint_read_schema: augmented_checkpoint_read_schema,
-        };
+        let sources = checkpoint_actions.into_iter().chain(sidecar_actions);
+        let actions = unbound_generator!(async move |channel| {
+            for source in sources {
+                channel.yield_from(source).await?;
+            }
+            Ok(())
+        });
         Ok(ActionsWithCheckpointInfo {
-            actions: actions_iter,
+            actions,
             checkpoint_info,
         })
     }
 
-    /// Extracts sidecar file references from a checkpoint file.
-    fn extract_sidecar_refs(
+    /// Drives [`Self::create_checkpoint_stream_with_channel`] through an [`Engine`].
+    #[cfg(test)]
+    fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
-        checkpoint: &ParsedLogPath,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
+        let stream = run_workflow_with_connector!(connector, async move |channel| {
+            self.create_checkpoint_stream_with_channel(
+                channel,
+                checkpoint_read_schema,
+                meta_predicate,
+                stats_schema,
+                partition_schema,
+            )
+            .await
+        })?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: connector.iterate_generator(stream.actions),
+            checkpoint_info: stream.checkpoint_info,
+        })
+    }
+
+    /// Extracts sidecar file references from a checkpoint file.
+    async fn extract_sidecar_refs(
+        &self,
+        channel: &Channel,
+        checkpoint: &ParsedLogPath,
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files_with_cancellation(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-                cancellation_token.cloned(),
-            )?,
-            "parquet" => engine
-                .parquet_handler()
-                .read_parquet_files_with_cancellation(
-                    std::slice::from_ref(&checkpoint.location),
-                    Self::sidecar_read_schema(),
-                    None,
-                    cancellation_token.cloned(),
-                )?,
-            _ => return Ok(vec![]),
+            "json" => {
+                Self::extract_sidecars_from_pages(
+                    channel,
+                    ReadJsonFiles::new(
+                        vec![checkpoint.location.clone()],
+                        Self::sidecar_read_schema(),
+                        None,
+                    ),
+                    &self.log_root,
+                )
+                .await
+            }
+            "parquet" => {
+                Self::extract_sidecars_from_pages(
+                    channel,
+                    ReadParquetFiles::new(
+                        vec![checkpoint.location.clone()],
+                        Self::sidecar_read_schema(),
+                        None,
+                    ),
+                    &self.log_root,
+                )
+                .await
+            }
+            _ => Ok(vec![]),
         };
+        batches
+    }
 
+    /// Consumes every page of a sidecar-column read, extracting the sidecar file references.
+    async fn extract_sidecars_from_pages<Op>(
+        channel: &Channel,
+        operation: Op,
+        log_root: &Url,
+    ) -> DeltaResult<Vec<FileMeta>>
+    where
+        Op: PagedOperation<Page = Vec<Box<dyn EngineData>>>,
+        PageRequest<Op>: Into<Request>,
+    {
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
-        for batch_result in batches {
-            let batch = batch_result?;
-            visitor.visit_rows_of(batch.as_ref())?;
+        let mut page = channel.start_paged(operation).await?;
+        loop {
+            for batch in page.data {
+                visitor.visit_rows_of(batch.as_ref())?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            page = channel.continue_paged(next).await?;
         }
 
         // Convert to FileMeta
         visitor
             .sidecars
             .iter()
-            .map(|sidecar| sidecar.to_filemeta(&self.log_root))
+            .map(|sidecar| sidecar.to_filemeta(log_root))
             .try_collect()
     }
 
@@ -1622,6 +1727,43 @@ impl LogSegment {
         debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
+
+    /// Test helper: drive [`Self::get_file_actions_schema_and_sidecars_with_channel`] through a
+    /// legacy [`Engine`].
+    #[cfg(test)]
+    fn get_file_actions_schema_and_sidecars(
+        &self,
+        engine: &dyn Engine,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        let connector =
+            EngineConnector::new(engine).with_cancellation_token(cancellation_token.cloned());
+        run_workflow_with_connector!(connector, async move |channel| {
+            self.get_file_actions_schema_and_sidecars_with_channel(channel)
+                .await
+        })
+    }
+}
+
+fn action_pages<Op>(operation: Op, is_log_batch: bool) -> UnboundGenerator<ActionsBatch>
+where
+    Op: PagedOperation<Page = Vec<Box<dyn EngineData>>>,
+    PageRequest<Op>: Into<Request>,
+{
+    unbound_generator!(async move |channel| {
+        let mut page = channel.start_paged(operation).await?;
+        loop {
+            for data in page.data {
+                channel
+                    .yield_item(ActionsBatch::new(data, is_log_batch))
+                    .await?;
+            }
+            let Some(next) = page.next else {
+                return Ok(());
+            };
+            page = channel.continue_paged(next).await?;
+        }
+    })
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
@@ -1881,4 +2023,25 @@ fn validate_crc(
         ))
     );
     Ok(())
+}
+
+/// Test helper: drive [`LogSegment::for_snapshot_impl`] through a [`StorageHandler`].
+#[cfg(test)]
+fn for_snapshot_from_storage(
+    storage: &dyn StorageHandler,
+    log_root: Url,
+    log_tail: Vec<ParsedLogPath>,
+    checkpoint_hint: Option<LastCheckpointHint>,
+    time_travel_version: Option<Version>,
+) -> DeltaResult<LogSegment> {
+    run_workflow_with_storage!(storage, None, async move |channel| {
+        LogSegment::for_snapshot_impl(
+            channel,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+        )
+        .await
+    })
 }

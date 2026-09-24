@@ -27,7 +27,7 @@ use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
+use delta_kernel::transaction::{BoundWriteContext, TransactionWithCommitter};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -243,20 +243,16 @@ pub async fn write_data_and_check_result_and_stats(
     }
 
     // commit!
-    match txn.commit(engine.as_ref())? {
-        CommitResult::Committed(committed) => {
-            assert_eq!(committed.commit_version(), expected_since_commit as Version);
-            assert_eq!(
-                committed.post_commit_stats().commits_since_checkpoint,
-                expected_since_commit
-            );
-            assert_eq!(
-                committed.post_commit_stats().commits_since_log_compaction,
-                expected_since_commit
-            );
-        }
-        _ => panic!("Commit should have succeeded"),
-    };
+    let committed = txn.commit(engine.as_ref())?.0.unwrap_committed();
+    assert_eq!(committed.commit_version(), expected_since_commit as Version);
+    assert_eq!(
+        committed.post_commit_stats().commits_since_checkpoint,
+        expected_since_commit
+    );
+    assert_eq!(
+        committed.post_commit_stats().commits_since_log_compaction,
+        expected_since_commit
+    );
 
     Ok(())
 }
@@ -498,7 +494,7 @@ pub async fn write_deletion_vector_to_store(
 pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
+) -> Result<TransactionWithCommitter, Box<dyn std::error::Error>> {
     Ok(load_and_begin_transaction(table_url.clone(), engine)?
         .with_engine_info("test engine")
         .with_operation("DELETE".to_string()))

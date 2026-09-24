@@ -1,11 +1,14 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned};
+use quote::{format_ident, quote, quote_spanned};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field,
-    Fields, Item, Lit, Meta, PathArguments, Token, Type, Visibility,
+    Fields, Item, ItemMacro, Lit, Meta, PathArguments, Token, Type, Visibility,
 };
 
 mod schema_macro;
@@ -540,7 +543,64 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     })
 }
 
+/// Expose a `macro_rules!` declaration as a public macro at its declaration site.
+///
+/// The macro's crate-root implementation is exported under a doc-hidden generated name.
+/// Other item types and macros already marked `#[macro_export]` produce a compile error.
+///
+/// ```
+/// mod first {
+///     use delta_kernel_derive::pub_macro;
+///
+///     #[pub_macro]
+///     macro_rules! identity {
+///         () => { 1 };
+///     }
+/// }
+///
+/// mod second {
+///     use delta_kernel_derive::pub_macro;
+///
+///     #[pub_macro]
+///     macro_rules! identity {
+///         () => { 2 };
+///     }
+/// }
+///
+/// assert_eq!(first::identity!(), 1);
+/// assert_eq!(second::identity!(), 2);
+/// ```
+///
+/// Distinct declarations can use the same public name because the hidden name includes a
+/// deterministic hash of the declaration. Byte-identical declarations with the same name still
+/// collide.
+///
+/// The expansion has this shape:
+///
+/// ```text
+/// #[macro_export]
+/// #[doc(hidden)]
+/// macro_rules! __identity_<hash> { ... }
+///
+/// #[doc(inline)]
+/// pub use __identity_<hash> as identity;
+/// ```
+#[proc_macro_attribute]
+pub fn pub_macro(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(item as Item);
+    pub_macro_impl(input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
+///
+/// A `macro_rules!` declaration is exposed through a hidden crate-root implementation and a
+/// re-export at the declaration site. Its expansion follows [`pub_macro`], except the public
+/// re-export is enabled only by the `internal-api` feature; otherwise it is crate-visible.
 ///
 /// NOTE: This macro does not support `mod` declarations because of nuances in how the mod expander
 /// and proc macro system interact for non-inline modules such as `mod foo;`. Use explicit
@@ -551,27 +611,84 @@ pub fn internal_api(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     let input = parse_macro_input!(item as Item);
-    internal_api_impl(input).into()
+    internal_api_impl(input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
 }
 
-fn internal_api_impl(input: Item) -> TokenStream {
-    // Create a version with public visibility for the unstable feature
-    let public_version = match make_public(input.clone()) {
-        Ok(public_version) => public_version,
-        Err(err) => {
-            let error = err.to_compile_error();
-            return quote! { #input #error };
+fn internal_api_impl(input: Item) -> Result<TokenStream, Error> {
+    let (macro_definition, input) = match input {
+        Item::Macro(item) if item.mac.path.is_ident("macro_rules") => {
+            let Some(public_name) = item.ident.clone() else {
+                return Ok(quote!(#item)); // malformed, let compiler deal with it
+            };
+            let (definition, reexport) = make_macro_api(item, public_name)?;
+            (Some(definition), reexport)
         }
+        input => (None, input),
     };
 
+    // Create a version with public visibility for the unstable feature
+    let public_version = make_public(input.clone())?;
+
     // The original item stays as-is for the non-unstable case
-    quote! {
+    Ok(quote! {
+        #macro_definition
+
         #[cfg(feature = "internal-api")]
         #public_version
 
         #[cfg(not(feature = "internal-api"))]
         #input
+    })
+}
+
+fn pub_macro_impl(input: Item) -> Result<TokenStream, Error> {
+    match input {
+        Item::Macro(item) if item.mac.path.is_ident("macro_rules") => {
+            let Some(public_name) = item.ident.clone() else {
+                return Ok(quote!(#item)); // malformed, let compiler deal with it
+            };
+            let (definition, reexport) = make_macro_api(item, public_name)?;
+            let reexport = make_public(reexport)?;
+            Ok(quote! {
+                #definition
+                #reexport
+            })
+        }
+        input => Err(Error::new(
+            input.span(),
+            "macro_rules! declaration expected",
+        )),
     }
+}
+
+fn make_macro_api(mut item: ItemMacro, public_name: Ident) -> Result<(Item, Item), Error> {
+    if item
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("macro_export"))
+    {
+        return Err(Error::new(item.span(), "macro is already #[macro_export]"));
+    }
+
+    let implementation_name = hidden_macro_name(&item, &public_name);
+    item.ident = Some(implementation_name.clone());
+    item.attrs.push(syn::parse_quote!(#[macro_export]));
+    item.attrs.push(syn::parse_quote!(#[doc(hidden)]));
+
+    let reexport: Item = syn::parse_quote! {
+        #[doc(inline)]
+        pub(crate) use #implementation_name as #public_name;
+    };
+
+    Ok((Item::Macro(item), reexport))
+}
+
+fn hidden_macro_name(item: &ItemMacro, public_name: &Ident) -> Ident {
+    let mut hasher = DefaultHasher::new();
+    quote!(#item).to_string().hash(&mut hasher);
+    format_ident!("__{}_{:016x}", public_name, hasher.finish())
 }
 
 fn make_public(mut item: Item) -> Result<Item, Error> {
@@ -624,17 +741,56 @@ mod tests {
 
     use super::*;
 
+    fn implementation_name(input: &Item) -> Ident {
+        let Item::Macro(item) = input else {
+            panic!("expected macro item");
+        };
+        hidden_macro_name(item, item.ident.as_ref().unwrap())
+    }
+
     #[test]
-    fn internal_api_rejects_public_items_without_panicking() {
+    fn internal_api_rejects_public_items() {
         let input = parse_quote!(
             pub fn already_public() {}
         );
 
-        let output = internal_api_impl(input).to_string();
+        assert!(internal_api_impl(input).is_err());
+    }
 
-        assert!(output.contains("pub fn already_public"));
-        assert!(output.contains("compile_error"));
-        assert!(output.contains("item is already public"));
+    #[test]
+    fn internal_api_generates_complete_macro_rules_api() {
+        let input = parse_quote! {
+            #[doc = "Returns its argument."]
+            macro_rules! identity {
+                ($value:expr) => {
+                    $value
+                };
+            }
+        };
+        let implementation_name = implementation_name(&input);
+        let expected = quote! {
+            #[doc = "Returns its argument."]
+            #[macro_export]
+            #[doc(hidden)]
+            macro_rules! #implementation_name {
+                ($value:expr) => {
+                    $value
+                };
+            }
+
+            #[cfg(feature = "internal-api")]
+            #[doc(inline)]
+            pub use #implementation_name as identity;
+
+            #[cfg(not(feature = "internal-api"))]
+            #[doc(inline)]
+            pub(crate) use #implementation_name as identity;
+        };
+
+        assert_eq!(
+            internal_api_impl(input).unwrap().to_string(),
+            expected.to_string()
+        );
     }
 
     /// Expand `gen_schema_fields` for `input` and return the generated tokens as a string. Macro

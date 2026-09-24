@@ -44,6 +44,7 @@
 # Building a Connector
 
 - [Overview](./connector/overview.md)
+- [Driving connector workflows](./connector/coroutines.md)
 - [Implementing the Engine Trait](./connector/implementing_engine.md)
 - [The EngineData Trait](./connector/engine_data.md)
 

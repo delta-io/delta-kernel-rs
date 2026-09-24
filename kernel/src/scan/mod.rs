@@ -1046,7 +1046,7 @@ impl Scan {
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
-        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions_with_engine(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
@@ -1167,7 +1167,7 @@ impl Scan {
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
+            .read_actions_with_projected_checkpoint_actions_with_engine(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,

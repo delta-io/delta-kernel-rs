@@ -1,49 +1,59 @@
-//! The `committer` module provides a [`Committer`] trait which allows different implementations to
-//! define how to commit transactions to a catalog or filesystem. For catalog-managed tables, a
-//! [`Committer`] specific to the managing catalog should be provided. For non-catalog-managed
-//! tables, the [`FileSystemCommitter`] should be used to commit directly to the object store (via
-//! put-if-absent call to storage to atomically write new commit files).
+//! Commit coordination for filesystem-managed and catalog-managed tables.
 //!
-//! By implementing the [`Committer`] trait, different catalogs can define what happens when the
-//! kernel needs to commit a transaction to a table. The goal terminal state of every
-//! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
-//! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes a
-//! single method, [`commit`] which takes an engine, an iterator of actions (as [`EngineData`]
-//! batches), and [`CommitMetadata`] (which includes critical commit metadata like the version to
-//! commit) to allow different catalogs to define what it means to 'commit' the actions to a table.
-//! For some, this may mean writing staged commits to object storage and retaining an in-memory list
-//! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
-//! database.
+//! [`FileSystemCommitter`] writes a new Delta version directly to object storage. A catalog
+//! committer instead stages the commit, asks its catalog to ratify it, and later publishes
+//! ratified commits to the Delta log.
 //!
-//! The implementation of [`commit`] must ensure that the actions are committed atomically to the
-//! table at the given version and either (1) persisted directly to object storage as published
-//! deltas as in non-catalog-managed tables or (2) persisted within the catalog and made available
-//! to readers during snapshot contstruction via the [`log_tail`] API.
-//!
-//! [`Transaction`]: crate::transaction::Transaction
-//! [`commit`]: crate::committer::Committer::commit
-//! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
-//! [`EngineData`]: crate::EngineData
+//! [`Committer`] is the Engine compatibility interface. [`Committer::commit_prepared`] receives a
+//! lazy [`Commit`] and defaults to driving its actions as an Engine iterator for
+//! [`Committer::commit`]. Coroutine-aware committers can override that bridge and consume the
+//! prepared commit directly.
 
 mod commit_types;
 mod filesystem;
 mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+use derive_more::Constructor;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
+use crate::coroutine::engine::EngineConnector;
+use crate::coroutine::StaticGenerator;
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FilteredEngineData};
 
-/// A Committer is the system by which transactions are committed to a table. Transactions are
-/// effectively a collection of actions performed on the table at a specific version. The kernel
-/// exposes this trait so different catalogs can build their own commit implementations. For
-/// example, different catalogs may: commit directly to a database, commit to an object store, or
-/// use another system entirely.
+/// An unpolled generator of commit actions.
 ///
-/// Critically, a Committer must implement [`commit`] which takes an engine and an iterator of
-/// actions (as [`EngineData`] batches) to commit to the table at the given version
-/// ([`CommitMetadata::version`]).
+/// cbindgen:ignore
+pub type CommitActions = StaticGenerator<FilteredEngineData>;
+
+/// A prepared transaction whose actions are ready for a committer to persist.
+#[derive(Constructor)]
+pub struct Commit {
+    /// Metadata describing the target version and commit semantics.
+    pub metadata: CommitMetadata,
+    /// Commit actions in Delta log schema order.
+    pub actions: CommitActions,
+}
+
+impl Commit {
+    /// Construct a prepared commit from an Engine-based compatibility iterator.
+    ///
+    /// Advancing the commit actions calls `actions.next()` inline. Connector-driven paths should
+    /// construct commit actions from kernel generators instead.
+    pub fn from_engine_iterator(
+        metadata: CommitMetadata,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
+    ) -> Self {
+        let actions = StaticGenerator::from_iterator(actions);
+        Self { metadata, actions }
+    }
+}
+
+/// Engine-based compatibility driver for committing and publishing transactions.
+///
+/// [`commit`] performs the complete legacy write. Coroutine-driven connectors receive a prepared
+/// [`Commit`] through the kernel request protocol instead.
 ///
 /// [`commit`]: Committer::commit
 /// [`EngineData`]: crate::EngineData
@@ -62,9 +72,23 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: DeltaResultIteratorStatic<FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
+
+    /// Commit a prepared transaction through the Engine compatibility interface.
+    ///
+    /// The default implementation drives the action generator as an Engine iterator and delegates
+    /// to [`Self::commit`]. Coroutine-aware committers should override this method to consume the
+    /// [`Commit`] directly. Overrides must validate that [`CommitMetadata::commit_type`] agrees
+    /// with [`Self::is_catalog_committer`].
+    fn commit_prepared(&self, engine: &dyn Engine, commit: Commit) -> DeltaResult<CommitResponse> {
+        commit
+            .metadata
+            .validate_committer(self.is_catalog_committer())?;
+        let actions = EngineConnector::new(engine).iterate_generator(commit.actions);
+        self.commit(engine, Box::new(actions), commit.metadata)
+    }
 
     /// Returns `true` if this committer is for a catalog-managed table, else `false`.
     fn is_catalog_committer(&self) -> bool;

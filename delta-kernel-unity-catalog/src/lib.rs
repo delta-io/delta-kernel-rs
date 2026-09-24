@@ -1,10 +1,15 @@
 //! Kernel-side helpers for catalog-managed Delta tables in Unity Catalog.
+//!
+//! [`UCCommitter`] provides Engine compatibility and connector-driven commit and publish
+//! workflows. The [`coroutine`] module defines the catalog request vocabulary and workflow types;
+//! connectors remain responsible for executing Unity Catalog client calls.
 
 mod committer;
 mod constants;
 mod errors;
 mod utils;
 
+pub mod coroutine;
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
 use delta_kernel::{DeltaResult, Error, LogPath, Snapshot};

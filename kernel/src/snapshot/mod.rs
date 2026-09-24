@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+use crate::actions::visitors::InCommitTimestampVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
@@ -18,9 +19,13 @@ use crate::checkpoint::{
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
+use crate::coroutine::engine::{drive_workflow, run_workflow_with_engine, EngineConnector};
+use crate::coroutine::kernel::{static_workflow, Channel};
+use crate::coroutine::read::ReadJsonFiles;
+use crate::coroutine::{ChannelExt as _, StaticWorkflow};
 use crate::crc::{
-    try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
-    SetTransactionState,
+    try_write_crc_file_with_channel, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram,
+    FileStats, SetTransactionState,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
@@ -37,9 +42,9 @@ use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionWithCommitter};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
+use crate::{DeltaResult, Engine, Error, LogCompactionWriter, RowVisitor, Version};
 
 mod builder;
 mod incremental;
@@ -95,6 +100,11 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+}
+
+enum InCommitTimestampSource<'a> {
+    Resolved(Option<i64>),
+    Commit(&'a ParsedLogPath),
 }
 
 impl PartialEq for Snapshot {
@@ -232,10 +242,10 @@ impl Snapshot {
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    fn try_new_from_log_segment(
+    async fn try_new_from_log_segment(
+        channel: &Channel,
         location: Url,
         log_segment: LogSegment,
-        engine: &dyn Engine,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
@@ -243,11 +253,12 @@ impl Snapshot {
         let (table_configuration, crc) = Self::prepare_new_from_log_segment(
             &location,
             &log_segment,
-            engine,
+            channel,
             &metric_context,
             incremental_replay,
             built_as_latest,
-        )?;
+        )
+        .await?;
 
         Ok(Self::new_with_validated_crc(
             log_segment,
@@ -259,10 +270,10 @@ impl Snapshot {
     }
 
     #[instrument(name = "try_new_from_log_segment", skip_all, fields(path = %location, enable_call_frame, version = log_segment.end_version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
-    fn prepare_new_from_log_segment(
+    async fn prepare_new_from_log_segment(
         location: &Url,
         log_segment: &LogSegment,
-        engine: &dyn Engine,
+        channel: &Channel,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
@@ -270,10 +281,11 @@ impl Snapshot {
         let result = Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
-            engine,
+            channel,
             metric_context,
             incremental_replay,
         )
+        .await
         .and_then(|(table_configuration, crc)| {
             let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
             Ok((table_configuration, crc))
@@ -291,10 +303,10 @@ impl Snapshot {
         })
     }
 
-    fn resolve_table_configuration_and_crc(
+    async fn resolve_table_configuration_and_crc(
         location: &Url,
         log_segment: &LogSegment,
-        engine: &dyn Engine,
+        channel: &Channel,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<(TableConfiguration, Option<Arc<Crc>>)> {
@@ -302,9 +314,10 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine);
+        let base_crc = log_segment.read_latest_crc(channel).await;
         let crc_at_version = log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .try_build_crc_within_budget(channel, base_crc.as_ref(), incremental_replay)
+            .await
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
@@ -312,7 +325,8 @@ impl Snapshot {
         let (metadata, protocol, source) = match &crc_at_version {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
+                .read_protocol_metadata(channel, base_crc.as_ref())
+                .await
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
@@ -549,17 +563,42 @@ impl Snapshot {
     /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
-    #[instrument(
-        parent = &self.span,
-        name = SET_TRANSACTION_LOADED_SPAN,
-        skip_all,
-        err,
-        fields(report, from_cache, found)
-    )]
     pub fn get_app_id_version(
         &self,
         application_id: &str,
         engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_app_id_version_with_channel(application_id, channel)
+                .await
+        })
+    }
+
+    /// Return a lazy workflow that fetches the latest transaction version for an
+    /// application id.
+    pub fn get_app_id_version_workflow(
+        self: &SnapshotRef,
+        application_id: &str,
+    ) -> StaticWorkflow<Option<i64>> {
+        let snapshot = Arc::clone(self);
+        let application_id = application_id.to_owned();
+        static_workflow!(async move |channel| {
+            snapshot
+                .get_app_id_version_with_channel(&application_id, channel)
+                .await
+        })
+    }
+
+    #[instrument(
+        parent = &self.span,
+        name = SET_TRANSACTION_LOADED_SPAN,
+        skip_all,
+        fields(report, from_cache, found)
+    )]
+    async fn get_app_id_version_with_channel(
+        &self,
+        application_id: &str,
+        channel: &Channel,
     ) -> DeltaResult<Option<i64>> {
         fn record_metric(from_cache: bool, found: bool) {
             let span = tracing::Span::current();
@@ -603,8 +642,9 @@ impl Snapshot {
                     application_id,
                     base_active,
                     base.version,
-                    engine,
-                )?;
+                    channel,
+                )
+                .await?;
                 let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
@@ -617,7 +657,8 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let txn =
+            SetTransactionScanner::get_one(self.log_segment(), application_id, channel).await?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
@@ -625,16 +666,16 @@ impl Snapshot {
 
     /// Fetch the latest transaction version for every application id in this snapshot.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn get_app_id_versions(
+    pub(crate) async fn get_app_id_versions(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<SetTransactionMap> {
         if let Some(crc) = self.crc_at_version() {
             if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
                 return Ok(map.clone());
             }
         }
-        SetTransactionScanner::get_all(self.log_segment(), engine)
+        SetTransactionScanner::get_all_with_channel(self.log_segment(), channel).await
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
@@ -651,8 +692,31 @@ impl Snapshot {
                 "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
             ));
         }
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_domain_metadata_internal(domain, channel).await
+        })
+    }
 
-        self.get_domain_metadata_internal(domain, engine)
+    /// Return a lazy workflow that fetches user-controlled domain metadata.
+    ///
+    /// Returns an error if `domain` is system-controlled.
+    pub fn get_domain_metadata_workflow(
+        self: &SnapshotRef,
+        domain: &str,
+    ) -> DeltaResult<StaticWorkflow<Option<String>>> {
+        if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
+            return Err(Error::generic(
+                "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
+            ));
+        }
+
+        let snapshot = Arc::clone(self);
+        let domain = domain.to_owned();
+        Ok(static_workflow!(async move |channel| {
+            snapshot
+                .get_domain_metadata_internal(&domain, channel)
+                .await
+        }))
     }
 
     /// Get the row-tracking high-water mark for this snapshot.
@@ -667,7 +731,30 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_row_tracking_high_water_mark_with_channel(channel)
+                .await
+        })
+    }
+
+    /// Return a lazy workflow that gets this snapshot's row-tracking high-water mark.
+    pub fn get_row_tracking_high_water_mark_workflow(
+        self: &SnapshotRef,
+    ) -> StaticWorkflow<Option<i64>> {
+        let snapshot = Arc::clone(self);
+        static_workflow!(async move |channel| {
+            snapshot
+                .get_row_tracking_high_water_mark_with_channel(channel)
+                .await
+        })
+    }
+
+    pub(crate) async fn get_row_tracking_high_water_mark_with_channel(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<i64>> {
+        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, channel)
+            .await?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
     }
@@ -691,11 +778,11 @@ impl Snapshot {
     /// column name cannot be resolved to a logical name in the schema.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
-    pub(crate) fn get_clustering_column_infos(
+    pub(crate) async fn get_clustering_column_infos(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
-        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+        let Some(physical_columns) = self.get_physical_clustering_columns(channel).await? else {
             return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
@@ -727,12 +814,22 @@ impl Snapshot {
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    #[internal_api]
-    pub(crate) fn get_physical_clustering_columns(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_physical_clustering_columns_with_engine(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        match self.get_clustering_domain_metadata(engine)? {
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_physical_clustering_columns(channel).await
+        })
+    }
+
+    #[internal_api]
+    pub(crate) async fn get_physical_clustering_columns(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        match self.get_clustering_domain_metadata(channel).await? {
             Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
             None => Ok(None),
         }
@@ -743,9 +840,9 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
-    pub(crate) fn get_clustering_domain_metadata(
+    async fn get_clustering_domain_metadata(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
     ) -> DeltaResult<Option<String>> {
         if !self
             .table_configuration
@@ -754,7 +851,8 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, channel)
+            .await
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -763,6 +861,20 @@ impl Snapshot {
     /// replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_domain_metadatas_internal_with_engine(
+        &self,
+        engine: &dyn Engine,
+        domains: Option<&HashSet<&str>>,
+    ) -> DeltaResult<DomainMetadataMap> {
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_domain_metadatas_internal(channel, domains).await
+        })
+    }
+
+    /// Load the requested domain metadata through `channel`.
+    ///
+    /// `domains == None` loads all domains.
     #[instrument(
         parent = &self.span,
         name = DOMAIN_METADATA_LOADED_SPAN,
@@ -771,9 +883,9 @@ impl Snapshot {
         fields(report, from_cache, num_domains_returned)
     )]
     #[internal_api]
-    pub(crate) fn get_domain_metadatas_internal(
+    pub(crate) async fn get_domain_metadatas_internal(
         &self,
-        engine: &dyn Engine,
+        channel: &Channel,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
@@ -825,12 +937,15 @@ impl Snapshot {
         // scan and falls through to the full replay below.
         if let Some(base) = self.base_crc() {
             if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
-                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
-                    base.version,
-                    base_active,
-                    domains,
-                    engine,
-                )?;
+                let rooted = self
+                    .log_segment()
+                    .scan_domain_metadatas_rooted_in_crc(
+                        base.version,
+                        base_active,
+                        domains,
+                        channel,
+                    )
+                    .await?;
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
                 //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
@@ -845,7 +960,10 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        let replayed = self
+            .log_segment()
+            .scan_domain_metadatas_with_channel(domains, channel)
+            .await?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }
@@ -856,27 +974,51 @@ impl Snapshot {
     /// Returns the latest configuration for the domain, or `None` if the domain does not exist
     /// (or was removed). Unlike [`Snapshot::get_domain_metadata`], this does not reject `delta.*`
     /// domains.
-    #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn get_domain_metadata_internal(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_domain_metadata_internal_with_engine(
         &self,
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_domain_metadata_internal(domain, channel).await
+        })
+    }
+
+    /// Fetch system-controlled or user-controlled domain metadata through `channel`.
+    #[internal_api]
+    pub(crate) async fn get_domain_metadata_internal(
+        &self,
+        domain: &str,
+        channel: &Channel,
+    ) -> DeltaResult<Option<String>> {
+        let mut map = self
+            .get_domain_metadatas_internal(channel, Some(&HashSet::from([domain])))
+            .await?;
         Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
     /// Fetch all non-internal domain metadata for this snapshot as a `Vec`.
     ///
     /// Internal (`delta.*`) domains are filtered out.
-    #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn get_all_domain_metadata(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_all_domain_metadata_with_engine(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_all_domain_metadata(channel).await
+        })
+    }
+
+    /// Fetch all non-internal domain metadata through `channel`.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) async fn get_all_domain_metadata(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
+        let all_metadata = self.get_domain_metadatas_internal(channel, None).await?;
         Ok(all_metadata
             .into_values()
             .filter(|domain| !domain.is_internal())
@@ -900,21 +1042,63 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_in_commit_timestamp_with_engine(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_in_commit_timestamp(channel).await
+        })
+    }
+
+    /// Get this snapshot's in-commit timestamp through `channel`.
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     #[internal_api]
-    pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+    pub(crate) async fn get_in_commit_timestamp(
+        &self,
+        channel: &Channel,
+    ) -> DeltaResult<Option<i64>> {
+        let commit = match self.in_commit_timestamp_source()? {
+            InCommitTimestampSource::Resolved(timestamp) => return Ok(timestamp),
+            InCommitTimestampSource::Commit(commit) => commit,
+        };
+        let mut page = channel
+            .start_paged(ReadJsonFiles::new(
+                vec![commit.location.clone()],
+                InCommitTimestampVisitor::schema(),
+                None,
+            ))
+            .await?;
+        // CommitInfo is the first action, so the first batch is enough. Empty pages with a live
+        // cursor are not exhaustion and must be continued.
+        let batch = loop {
+            if let Some(batch) = page.data.into_iter().next() {
+                break batch;
+            }
+            let Some(next) = page.next else {
+                return Err(Error::generic("Commit file contains no actions"));
+            };
+            page = channel.continue_paged(next).await?;
+        };
+        let mut visitor = InCommitTimestampVisitor::default();
+        visitor.visit_rows_of(batch.as_ref())?;
+        visitor
+            .in_commit_timestamp
+            .map(Some)
+            .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
+    }
+
+    fn in_commit_timestamp_source(&self) -> DeltaResult<InCommitTimestampSource<'_>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()
             .in_commit_timestamp_enablement()?;
 
-        // Return None if ICT is not enabled at all
         if matches!(enablement, InCommitTimestampEnablement::NotEnabled) {
-            return Ok(None);
+            return Ok(InCommitTimestampSource::Resolved(None));
         }
 
-        // If ICT is enabled with an enablement version, verify the enablement version is not in the
-        // future
         if let InCommitTimestampEnablement::Enabled {
             enablement: Some((enablement_version, _)),
         } = enablement
@@ -928,10 +1112,9 @@ impl Snapshot {
             }
         }
 
-        // Fast path: serve ICT from CRC if available at this version.
         if let Some(crc) = self.crc_at_version() {
             match crc.in_commit_timestamp_opt {
-                Some(ict) => return Ok(Some(ict)),
+                Some(ict) => return Ok(InCommitTimestampSource::Resolved(Some(ict))),
                 None => {
                     return Err(Error::generic(format!(
                         "In-Commit Timestamp not found in CRC file at version {}",
@@ -941,12 +1124,8 @@ impl Snapshot {
             }
         }
 
-        // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.listed.latest_commit_file {
-            Some(commit_file_meta) => {
-                let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
-                Ok(Some(ict))
-            }
+            Some(commit) => Ok(InCommitTimestampSource::Commit(commit)),
             None => Err(Error::MissingVersion(self.version())),
         }
     }
@@ -962,24 +1141,33 @@ impl Snapshot {
     /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
-    #[allow(unused)]
-    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        run_workflow_with_engine!(engine, async move |channel| {
+            self.get_timestamp_with_channel(channel).await
+        })
+    }
+
+    /// Return a lazy workflow that gets this snapshot's version timestamp.
+    pub fn timestamp_workflow(self: &SnapshotRef) -> StaticWorkflow<i64> {
+        let snapshot = Arc::clone(self);
+        static_workflow!(async move |channel| snapshot.get_timestamp_with_channel(channel).await)
+    }
+
+    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
+    #[internal_api]
+    pub(crate) async fn get_timestamp_with_channel(&self, channel: &Channel) -> DeltaResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
         {
             InCommitTimestampEnablement::NotEnabled => {
                 match &self.log_segment.listed.latest_commit_file {
-                    Some(commit_file_meta) => {
-                        let ts = commit_file_meta.location.last_modified;
-                        Ok(ts)
-                    }
+                    Some(commit_file_meta) => Ok(commit_file_meta.location.last_modified),
                     None => Err(Error::MissingVersion(self.version())),
                 }
             }
             InCommitTimestampEnablement::Enabled { .. } => {
-                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+                self.get_in_commit_timestamp(channel).await?.ok_or_else(|| {
                     Error::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
@@ -1010,16 +1198,37 @@ impl Snapshot {
         IncrementalScanBuilder::new(self, base_version)
     }
 
-    /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
+    /// Creates a [`Transaction`] for this `SnapshotRef`.
     ///
     /// Note: For tables with clustering enabled, this performs log replay to read clustering
     /// columns from domain metadata, which may have a performance cost.
-    pub fn transaction(
+    pub fn transaction(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+        drive_workflow(engine, self.transaction_workflow())
+    }
+
+    /// Return a lazy workflow that creates a transaction for this snapshot.
+    pub fn transaction_workflow(self: Arc<Self>) -> StaticWorkflow<Transaction> {
+        static_workflow!(async move |channel| {
+            Transaction::try_new_existing_table(self, channel).await
+        })
+    }
+
+    /// Binds `committer` to the transaction produced by [`Self::transaction`].
+    pub fn transaction_with_committer(
         self: Arc<Self>,
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer, engine)
+    ) -> DeltaResult<TransactionWithCommitter> {
+        Ok(self.transaction(engine)?.with_committer(committer))
+    }
+
+    /// Binds a [`FileSystemCommitter`](crate::committer::FileSystemCommitter) to the transaction
+    /// produced by [`Self::transaction`].
+    pub fn transaction_with_filesystem_committer(
+        self: Arc<Self>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<TransactionWithCommitter> {
+        Ok(self.transaction(engine)?.with_filesystem_committer())
     }
 
     /// Creates a builder for altering this table's metadata. Currently supports schema change
@@ -1097,10 +1306,27 @@ impl Snapshot {
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
         self: &SnapshotRef,
         engine: &dyn Engine,
+    ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
+        drive_workflow(engine, self.write_checksum_workflow())
+    }
+
+    /// Return a lazy workflow that writes this snapshot's version checksum.
+    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all)]
+    pub fn write_checksum_workflow(
+        self: &SnapshotRef,
+    ) -> StaticWorkflow<(ChecksumWriteResult, SnapshotRef)> {
+        let snapshot = Arc::clone(self);
+        static_workflow!(async move |channel| {
+            snapshot.write_checksum_with_channel(channel).await
+        })
+    }
+
+    async fn write_checksum_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
     ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
@@ -1119,11 +1345,11 @@ impl Snapshot {
 
         self.table_configuration().ensure_read_write_supported()?;
 
-        let crc = self.resolve_crc_for_write(engine)?;
+        let crc = self.resolve_crc_for_write(channel).await?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        match try_write_crc_file(engine, &crc_path.location, &crc) {
+        match try_write_crc_file_with_channel(channel, &crc_path.location, &crc).await {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
@@ -1163,7 +1389,7 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+    async fn resolve_crc_for_write(&self, channel: &Channel) -> DeltaResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1178,7 +1404,7 @@ impl Snapshot {
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
         if let Some(base) = self.base_crc() {
             span.record("root", "stale_crc");
-            let crc = log_segment.build_crc_from_base(engine, base)?;
+            let crc = log_segment.build_crc_from_base(channel, base).await?;
             return Ok(Arc::new(crc));
         }
 
@@ -1191,24 +1417,28 @@ impl Snapshot {
                 // at the checkpoint version and returns None when ICT is disabled, or errors when
                 // it is enabled but unreadable.
                 let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
+                    .build_crc_from_checkpoint(channel)
+                    .await?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(channel).await?;
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let delta = log_segment.build_crc_delta_from_base(
-                engine,
-                checkpoint_version,
-                Some(FileSizeHistogram::create_default()),
-            )?;
+            let delta = log_segment
+                .build_crc_delta_from_base(
+                    channel,
+                    checkpoint_version,
+                    Some(FileSizeHistogram::create_default()),
+                )
+                .await?;
             require!(
                 delta.is_incremental_safe,
                 unresolved_crc("commits after the checkpoint are not incremental-safe")
             );
             let base = log_segment
-                .build_crc_from_checkpoint(engine)?
+                .build_crc_from_checkpoint(channel)
+                .await?
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
@@ -1217,7 +1447,8 @@ impl Snapshot {
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         span.record("root", "version_zero");
         let crc = log_segment
-            .build_crc_from_version_zero(engine)?
+            .build_crc_from_version_zero(channel)
+            .await?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
     }
@@ -1379,11 +1610,38 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
-    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
         committer: &dyn Committer,
+    ) -> DeltaResult<SnapshotRef> {
+        EngineConnector::new(engine).drive_with_committer(
+            self.publish_workflow(committer.is_catalog_committer()),
+            engine,
+            committer,
+        )
+    }
+
+    /// Return a lazy workflow that publishes this snapshot's catalog commits.
+    ///
+    /// `is_catalog_committer` reports whether the connector can publish catalog-managed commits.
+    #[instrument(parent = &self.span, name = "snap.publish", skip_all)]
+    pub fn publish_workflow(
+        self: &SnapshotRef,
+        is_catalog_committer: bool,
+    ) -> StaticWorkflow<SnapshotRef> {
+        let snapshot = Arc::clone(self);
+        static_workflow!(async move |channel| {
+            snapshot
+                .publish_with_channel(channel, is_catalog_committer)
+                .await
+        })
+    }
+
+    async fn publish_with_channel(
+        self: &SnapshotRef,
+        channel: &Channel,
+        is_catalog_committer: bool,
     ) -> DeltaResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
@@ -1394,7 +1652,7 @@ impl Snapshot {
         require!(
             unpublished_catalog_commits
                 .windows(2)
-                .all(|commits| commits[0].version() + 1 == commits[1].version()),
+                .all(|commits| commits[0].version + 1 == commits[1].version),
             Error::generic(format!(
                 "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"
@@ -1409,7 +1667,7 @@ impl Snapshot {
         );
 
         require!(
-            committer.is_catalog_committer(),
+            is_catalog_committer,
             Error::generic(
                 "There are catalog commits that need publishing, but the committer is not a catalog committer.",
             )
@@ -1418,7 +1676,7 @@ impl Snapshot {
         let publish_metadata =
             PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
 
-        committer.publish(engine, publish_metadata)?;
+        channel.publish(publish_metadata).await?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
@@ -1455,6 +1713,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
+    use tempfile::tempdir;
     use test_utils::table_builder::{
         checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder, VersionTarget,
     };
@@ -1464,7 +1723,9 @@ mod tests {
     use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
+    use crate::coroutine::engine::run_workflow_with_storage;
+    use crate::coroutine::kernel::workflow;
+    use crate::coroutine::{Cursor, Page, PageRequest, Request, WorkflowStep};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -1483,6 +1744,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::utils::FoldWithOption as _;
+    use crate::StorageHandler;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -1635,6 +1897,17 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
+    /// Drive [`LastCheckpointHint::try_read`] through a [`StorageHandler`].
+    fn read_last_checkpoint(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+    ) -> DeltaResult<Option<LastCheckpointHint>> {
+        let log_root = log_root.clone();
+        run_workflow_with_storage!(storage, None, async move |channel| {
+            LastCheckpointHint::try_read(channel, &log_root).await
+        })
+    }
+
     #[test]
     fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
@@ -1646,7 +1919,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
+        let cp = read_last_checkpoint(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1705,8 +1978,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-            .expect("read last checkpoint");
+        let invalid = read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1740,8 +2012,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-                .expect("read last checkpoint");
+            let result =
+                read_last_checkpoint(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -1888,14 +2160,14 @@ mod tests {
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
-        // Test get_domain_metadata_internal
+        // Test get_domain_metadata_internal_with_engine
         assert_eq!(
-            snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
+            snapshot.get_domain_metadata_internal_with_engine("delta.domain3", &engine)?,
             Some("domain3_commit1".to_string())
         );
 
         // Test get_all_domain_metadata
-        let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
+        let mut metadata = snapshot.get_all_domain_metadata_with_engine(&engine)?;
         metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         let mut expected = vec![
@@ -2029,7 +2301,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
         // When ICT is disabled, get_timestamp should return None
-        let result = snapshot.get_in_commit_timestamp(&engine)?;
+        let result = snapshot.get_in_commit_timestamp_with_engine(&engine)?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2063,7 +2335,7 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
         // This snapshot version predates ICT enablement, so ICT is not available
-        let result_v0 = snapshot_v0.get_in_commit_timestamp(&engine)?;
+        let result_v0 = snapshot_v0.get_in_commit_timestamp_with_engine(&engine)?;
         assert_eq!(result_v0, None);
 
         // Read snapshot at version 2 (after ICT enabled)
@@ -2071,7 +2343,7 @@ mod tests {
             .at_version(2)
             .build(&engine)?;
         // When ICT is enabled and available, timestamp() should return inCommitTimestamp
-        let result_v2 = snapshot_v2.get_in_commit_timestamp(&engine)?;
+        let result_v2 = snapshot_v2.get_in_commit_timestamp_with_engine(&engine)?;
         assert_eq!(result_v2, Some(expected_timestamp));
 
         Ok(())
@@ -2117,7 +2389,7 @@ mod tests {
         let snapshot_predates = Snapshot::builder_for(table_root)
             .at_version(1)
             .build(&engine)?;
-        let result_predates = snapshot_predates.get_in_commit_timestamp(&engine);
+        let result_predates = snapshot_predates.get_in_commit_timestamp_with_engine(&engine);
 
         // Version 1 with enablement at version 5 is invalid - should error
         assert_result_error_with_message(
@@ -2155,7 +2427,7 @@ mod tests {
         let snapshot_missing = Snapshot::builder_for(table_root)
             .at_version(1)
             .build(&engine)?;
-        let result = snapshot_missing.get_in_commit_timestamp(&engine);
+        let result = snapshot_missing.get_in_commit_timestamp_with_engine(&engine);
         assert_result_error_with_message(result, "In-Commit Timestamp not found");
 
         Ok(())
@@ -2193,7 +2465,7 @@ mod tests {
             snapshot.table_configuration().clone(),
         )?;
 
-        let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
+        let result = snapshot_no_commit.get_in_commit_timestamp_with_engine(&engine);
         assert!(matches!(result, Err(Error::MissingVersion(0))));
 
         Ok(())
@@ -2267,7 +2539,7 @@ mod tests {
             .build(&engine)?;
 
         // We should successfully read ICT by falling back to storage
-        let timestamp = snapshot.get_in_commit_timestamp(&engine)?;
+        let timestamp = snapshot.get_in_commit_timestamp_with_engine(&engine)?;
         assert_eq!(timestamp, Some(expected_ict));
 
         Ok(())
@@ -2292,7 +2564,7 @@ mod tests {
         }
 
         let _ = create_table_builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(&engine)?
             .commit(&engine)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
@@ -2305,9 +2577,64 @@ mod tests {
         );
 
         if ict_enabled {
-            let ict_ts = snapshot.get_in_commit_timestamp(&engine)?.unwrap();
+            let ict_ts = snapshot
+                .get_in_commit_timestamp_with_engine(&engine)?
+                .unwrap();
             assert_eq!(ts, ict_ts);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ict_channel_read_continues_past_empty_pages() -> DeltaResult<()> {
+        let temp_dir = tempdir().unwrap();
+        let table_path = Url::from_directory_path(temp_dir.path())
+            .unwrap()
+            .to_string();
+        let engine = SyncEngine::new();
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let _ = create_table(&table_path, schema, "Test/1.0")
+            .with_table_properties(vec![(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .build_with_filesystem_committer(&engine)?
+            .commit(&engine)?;
+        let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
+        let expected = snapshot
+            .get_in_commit_timestamp_with_engine(&engine)?
+            .unwrap();
+
+        let json_strings: StringArray = vec![format!(
+            r#"{{"commitInfo":{{"inCommitTimestamp":{expected}}}}}"#
+        )]
+        .into();
+        let mut batch = Some(engine.json_handler().parse_json(
+            string_array_to_engine_data(json_strings),
+            InCommitTimestampVisitor::schema(),
+        )?);
+
+        let mut workflow =
+            workflow!(async move |channel| { snapshot.get_in_commit_timestamp(channel).await });
+        let timestamp = loop {
+            match workflow.advance()? {
+                WorkflowStep::Done(timestamp) => break timestamp,
+                WorkflowStep::Request(Request::ReadJson(PageRequest::Start(_operation, reply))) => {
+                    reply.send(Ok(Page::new(Vec::new(), Some(Cursor::new(1_i64)))));
+                }
+                WorkflowStep::Request(Request::ReadJson(PageRequest::Continue(cursor, reply))) => {
+                    assert_eq!(cursor.into_inner::<i64>().unwrap(), 1);
+                    let batch = batch.take().expect("first non-empty JSON page");
+                    reply.send(Ok(Page::new(vec![batch], None)));
+                }
+                WorkflowStep::Request(_) => {
+                    panic!("workflow requested an unexpected operation")
+                }
+            }
+        };
+
+        assert!(
+            batch.is_none(),
+            "empty page should have been followed by a batch"
+        );
+        assert_eq!(timestamp, Some(expected));
         Ok(())
     }
 
@@ -2621,15 +2948,15 @@ mod tests {
             .fold_with(column_mapping_mode, |builder, mode| {
                 builder.with_table_properties([("delta.columnMapping.mode", mode)])
             })
-            .build(
-                &engine,
-                Box::new(crate::committer::FileSystemCommitter::new()),
-            )
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-        let result = snapshot.get_clustering_column_infos(&engine).unwrap();
+        let result = run_workflow_with_engine!(&engine, async move |channel| {
+            snapshot.get_clustering_column_infos(channel).await
+        })
+        .unwrap();
 
         match expected_logical {
             None => assert_eq!(result, None),
@@ -2743,10 +3070,11 @@ mod tests {
             let store = Arc::new(InMemory::new());
             let engine = SyncEngine::new_with_store(store);
             create_table("memory:///", schema, "test")
-                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .build_with_filesystem_committer(&engine)
                 .unwrap()
                 .commit(&engine)
                 .unwrap()
+                .0
                 .unwrap_committed();
             Snapshot::builder_for("memory:///").build(&engine).unwrap()
         }

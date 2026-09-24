@@ -10,7 +10,6 @@ use delta_kernel::arrow::array::{
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
@@ -86,9 +85,8 @@ async fn try_main() -> DeltaResult<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
-    let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
+        .transaction_with_filesystem_committer(&engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
@@ -108,7 +106,8 @@ async fn try_main() -> DeltaResult<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        let (result, committer) = txn.commit(&engine)?;
+        txn = match result {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -117,7 +116,7 @@ async fn try_main() -> DeltaResult<()> {
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
-                transaction
+                transaction.with_committer(committer)
             }
         };
         retries += 1;
@@ -195,7 +194,7 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine)?
         .commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
