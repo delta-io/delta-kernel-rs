@@ -95,10 +95,10 @@ pub use crate::parallel::parallel_scan_metadata::{
 
 /// Configures structured and JSON statistics in scan metadata.
 ///
-/// Choosing an output shape does not disable data skipping for indexed predicate columns:
-/// predicates may use internal statistics that are removed from the returned metadata. Explicit
-/// column requests can also make columns outside the table's configured indexed set eligible for
-/// skipping.
+/// Choosing an output shape does not disable data skipping for indexed predicate columns. The shape
+/// is a minimum: structured statistics read for data skipping also appear in `stats_parsed`.
+/// Explicit column requests can also make columns outside the table's configured indexed set
+/// eligible for skipping.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
@@ -124,7 +124,7 @@ pub struct StatsOptions {
 /// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel may still read predicate-referenced statistics for data
+    /// Don't request `stats_parsed`. It still appears when a predicate needs statistics for data
     /// skipping.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
@@ -201,7 +201,7 @@ impl StatsOptions {
         }
     }
 
-    /// No connector-visible statistics. Kernel may still read predicate-referenced statistics for
+    /// No requested statistics. `stats_parsed` still carries any statistics a predicate needs for
     /// data skipping. With no predicate, kernel avoids reading statistics entirely.
     pub fn none() -> Self {
         Self {

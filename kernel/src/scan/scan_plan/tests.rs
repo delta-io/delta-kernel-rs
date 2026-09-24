@@ -18,7 +18,7 @@ use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name, lit, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
-use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
+use crate::scan::{PartitionValuesOptions, Scan, StatsOptions};
 use crate::unit_test_utils::load_test_table;
 use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 
@@ -282,24 +282,26 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 }
 
 #[rstest]
-#[case::json_only(StatsOptions::json_only(), &[JSON_STATS_FIELDS])]
+#[case::json_only(
+    StatsOptions::json_only(),
+    &[JSON_STATS_FIELDS, PARSED_STATS_TABLE_ALL_STATS_FIELDS]
+)]
 #[case::all_struct(StatsOptions::all_struct(), &[PARSED_STATS_TABLE_ALL_STATS_FIELDS])]
 #[case::struct_columns(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     &[ID_STATS_PARSED_FIELDS]
 )]
-#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
+#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[ID_STATS_PARSED_FIELDS])]
 #[case::all(
     StatsOptions::all(),
     &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
 )]
-#[case::none(StatsOptions::none(), &[])]
+#[case::none(StatsOptions::none(), &[ID_STATS_PARSED_FIELDS])]
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
-    let struct_stats = stats.struct_stats.clone();
     let expected_stats = stats.clone();
     let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
     let expected_builder = snapshot
@@ -342,20 +344,10 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .collect();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
-    let parsed_stats_requested = match &struct_stats {
-        StructStats::None => false,
-        StructStats::Columns { requested } => !requested.is_empty(),
-        StructStats::AllIndexed { .. } => true,
-    };
-    if !parsed_stats_requested {
-        let declarative_schema = actual.first().expect("declarative metadata").schema();
-        let imperative_schema = expected.first().expect("imperative metadata").schema();
-        assert!(declarative_schema.field_with_name(STATS_PARSED).is_err());
-        assert!(imperative_schema.field_with_name(STATS_PARSED).is_err());
-    }
-    let ignored_stats = match (stats.emit_json, parsed_stats_requested) {
-        (true, _) => &[][..],
-        (false, _) => &[STATS][..],
+    let ignored_stats = if stats.emit_json {
+        &[][..]
+    } else {
+        &[STATS][..]
     };
     assert_metadata_eq(
         &actual,

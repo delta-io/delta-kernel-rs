@@ -28,7 +28,6 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
-use crate::struct_patch::{project_struct_to_schema, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -38,7 +37,7 @@ use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 pub(crate) struct ScanStatsOptions {
     /// Whether scan metadata emits JSON statistics.
     pub(crate) emit_json: bool,
-    /// Physical schema of connector-visible structured statistics.
+    /// Physical schema of requested structured statistics.
     #[serde(default)]
     pub(crate) output_schema: Option<SchemaRef>,
 }
@@ -163,8 +162,6 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
-    /// Removes or narrows columns used only for internal pruning.
-    output_transform: Option<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -275,23 +272,6 @@ impl ScanLogReplayProcessor {
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
         )?;
-        let (projected_schema, output_projection) = build_scan_output_projection(
-            output_schema.as_ref(),
-            stats_options.output_schema.as_deref(),
-            partition_values_options.parsed_struct,
-        )?;
-        // Pruning-only columns must survive the first transform so DataSkippingFilter can read
-        // them. Projecting them out therefore requires a second evaluator; folding this projection
-        // into get_add_transform_expr would either expose internal columns or parse stats twice.
-        let output_transform = if projected_schema == output_schema {
-            None
-        } else {
-            Some(engine.evaluation_handler().new_expression_evaluator(
-                output_schema.clone(),
-                output_projection,
-                projected_schema.into(),
-            )?)
-        };
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
@@ -341,7 +321,6 @@ impl ScanLogReplayProcessor {
                 ),
                 output_schema.into(),
             )?,
-            output_transform,
             seen_file_keys,
             state_info,
             stats_options,
@@ -520,10 +499,6 @@ impl ScanLogReplayProcessor {
                 actions.len()
             ))
         );
-        let transformed = match &self.output_transform {
-            Some(transform) => transform.evaluate(transformed.as_ref())?,
-            None => transformed,
-        };
         Ok((transformed, selection_vector))
     }
 
@@ -834,38 +809,6 @@ fn scan_row_schema_with_parsed_columns(
             ))
         });
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
-}
-
-fn build_scan_output_projection(
-    input_schema: &StructType,
-    output_stats_schema: Option<&StructType>,
-    emit_partition_values: bool,
-) -> DeltaResult<(SchemaRef, ExpressionRef)> {
-    let mut projection = ProjectionStructPatchBuilder::new(input_schema);
-    match output_stats_schema {
-        Some(requested)
-            if input_schema.field(STATS_PARSED_NAME).is_some_and(|field| {
-                matches!(
-                    field.data_type(),
-                    DataType::Struct(source) if source.as_ref() == requested
-                )
-            }) => {}
-        Some(requested) => {
-            projection = projection.replace(
-                STATS_PARSED_NAME,
-                StructField::nullable(STATS_PARSED_NAME, requested.clone()),
-                project_struct_to_schema([STATS_PARSED_NAME], requested),
-            );
-        }
-        None if input_schema.field(STATS_PARSED_NAME).is_some() => {
-            projection = projection.drop(STATS_PARSED_NAME)
-        }
-        None => {}
-    }
-    if !emit_partition_values && input_schema.field(PARTITION_VALUES_PARSED_NAME).is_some() {
-        projection = projection.drop(PARTITION_VALUES_PARSED_NAME);
-    }
-    projection.build()
 }
 
 /// Build the add transform expression with optional stats and partition value parsing.
@@ -1189,8 +1132,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Each row that is selected in the returned `engine_data` _must_ be processed to complete the
 /// scan. Non-selected rows _must_ be ignored.
 ///
-/// Statistics needed only for data skipping are removed before scan metadata is returned.
-///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
@@ -1225,8 +1166,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        build_scan_output_projection, get_add_transform_expr, scan_action_iter,
-        scan_row_schema_with_parsed_columns, InternalScanState, ScanLogReplayProcessor,
+        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::engine::sync::SyncEngine;
@@ -1280,25 +1220,6 @@ mod tests {
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
-    }
-
-    #[test]
-    fn identical_requested_stats_schema_does_not_add_projection() -> DeltaResult<()> {
-        let stats_schema = schema_ref! { nullable "numRecords": LONG };
-        let input_schema = scan_row_schema_with_parsed_columns(Some(stats_schema.clone()), None)?;
-        let (_, projection) = build_scan_output_projection(
-            input_schema.as_ref(),
-            Some(stats_schema.as_ref()),
-            false,
-        )?;
-        let Expr::StructPatch(patch) = projection.as_ref() else {
-            panic!("expected struct patch")
-        };
-
-        assert!(patch.prepended_fields.is_empty());
-        assert!(patch.field_patches.is_empty());
-        assert!(patch.appended_fields.is_empty());
-        Ok(())
     }
 
     /// A minimal opaque predicate op for testing serialization behavior

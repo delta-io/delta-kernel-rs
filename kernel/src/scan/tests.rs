@@ -2134,7 +2134,7 @@ fn test_default_stats_options_no_struct_output() {
             requested: vec![column_name!("id")],
         },
     },
-    &["id"],
+    &["id", "name", "age", "salary", "ts_col"],
     None,
     "id",
     &[
@@ -2155,21 +2155,21 @@ fn test_default_stats_options_no_struct_output() {
 )]
 #[case::id_predicate_not_requested(
     StatsOptions::struct_columns(vec![column_name!("name")]),
-    &["name"],
+    &["id", "name"],
     Some(col!("id").gt(lit(400i64))),
     "name",
     &[("name_401", "name_500"), ("name_501", "name_600")],
 )]
 #[case::salary_predicate_with_multiple_requested_columns(
     StatsOptions::struct_columns(vec![column_name!("id"), column_name!("name")]),
-    &["id", "name"],
+    &["id", "name", "salary"],
     Some(col!("salary").le(lit(70_000i64))),
     "id",
     &[("1", "100"), ("101", "200")],
 )]
 #[case::salary_requested_with_different_predicate_column(
     StatsOptions::struct_columns(vec![column_name!("salary")]),
-    &["salary"],
+    &["id", "salary"],
     Some(col!("id").gt(lit(500i64))),
     "salary",
     &[("100100", "110000")],

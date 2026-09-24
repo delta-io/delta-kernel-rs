@@ -27,7 +27,7 @@ use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
 };
-use crate::struct_patch::{project_struct_to_schema, ProjectionStructPatchBuilder};
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Error, PlanBuilder};
@@ -265,8 +265,8 @@ impl Scan {
         Ok(StructField::nullable(ADD_NAME, patch.build(&add_schema)?))
     }
 
-    /// Builds the output projection for requested stats and partition values. The base of this
-    /// transformation is constructed by [`Self::normalized_add_field`].
+    /// Builds the output projection over the add struct constructed by
+    /// [`Self::normalized_add_field`].
     ///
     /// The output schema is:
     /// ```text
@@ -282,19 +282,16 @@ impl Scan {
     ///   baseRowId: long,
     ///   defaultRowCommitVersion: long,
     ///   clusteringProvider: string,
-    ///   stats_parsed: struct<...>,             // when parsed stats are requested
-    ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
+    ///   stats_parsed: struct<...>,             // when requested or needed for pruning
+    ///   partitionValues_parsed: struct<...>,   // when requested or needed for pruning
     /// >
     /// ```
-    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
-    /// partition values are selected independently and omitted for unpartitioned tables. Fields
-    /// needed only for pruning are omitted.
+    /// Parsed partition values are omitted for unpartitioned tables.
     fn metadata_output_projection(
         &self,
         add_field: &StructField,
     ) -> DeltaResult<(ExpressionRef, SchemaRef)> {
         let input_schema = schema_ref! { (add_field.clone()) };
-        let has_stats_parsed = input_schema.contains_col([ADD_NAME, STATS_PARSED_NAME]);
         let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
 
         // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
@@ -307,41 +304,6 @@ impl Scan {
                 ));
             }
             (false, true) => projection.drop(STATS),
-        };
-
-        // Parsed stats output.
-        let projection = match (self.physical_stats_output_schema.as_ref(), has_stats_parsed) {
-            (Some(physical_stats), _) => projection.replace(
-                STATS_PARSED,
-                StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),
-                project_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], physical_stats),
-            ),
-            (None, true) => projection.drop(STATS_PARSED),
-            (None, false) => projection,
-        };
-
-        // Parsed partition-values output.
-        let has_partition_values_parsed =
-            input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
-        let physical_partitions = self
-            .partition_values
-            .parsed_struct
-            .then_some(self.state_info.physical_partition_schema.as_ref())
-            .flatten();
-        let projection = match (physical_partitions, has_partition_values_parsed) {
-            (Some(schema), true) => projection.replace(
-                PARTITION_VALUES_PARSED,
-                StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                project_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
-            ),
-            (Some(_), false) => {
-                return Err(Error::internal_error(
-                    "parsed partition values were requested, but add.partitionValues_parsed is \
-                     missing",
-                ));
-            }
-            (None, true) => projection.drop(PARTITION_VALUES_PARSED),
-            (None, false) => projection,
         };
 
         let (add_schema, add_expr) = projection.build()?;

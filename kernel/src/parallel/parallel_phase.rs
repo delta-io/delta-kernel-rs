@@ -1102,8 +1102,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::none(StatsOptions::none(), false, false)]
-    #[case::json_only(StatsOptions::json_only(), true, false)]
+    #[case::none(StatsOptions::none(), false, true)]
+    #[case::json_only(StatsOptions::json_only(), true, true)]
     #[case::all_struct(StatsOptions::all_struct(), false, true)]
     #[case::all(StatsOptions::all(), true, true)]
     fn test_parallel_stats_output_modes_preserve_skipping_after_serde(

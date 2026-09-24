@@ -219,9 +219,9 @@ connector. To override the default, call `ScanBuilder::with_stats` with a
 statistics does not disable data skipping for predicate columns in the table's configured indexed
 set. Explicit column requests can also make columns outside that set eligible for skipping.
 
-### Omitting statistics from scan metadata
+### Requesting no statistics
 
-If your connector does not consume file statistics, you can omit them from scan metadata:
+If your connector doesn't consume file statistics, don't request any:
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -247,6 +247,8 @@ With `StatsOptions::none()`:
 
 - Kernel skips statistics entirely when there is no predicate.
 - Predicate-based statistics and partition-value pruning remain enabled.
+- With a predicate, `stats_parsed` carries the statistics Kernel used for data skipping. Ignore it
+  if you don't need it.
 - The `stats` field on each `ScanFile` is `None`.
 
 ### Including all statistics in scan metadata
@@ -313,8 +315,10 @@ let scan = snapshot
 # }
 ```
 
-Only the named data columns appear in structured output. Kernel removes any additional statistics
-read internally for data skipping. An empty column list is equivalent to `StatsOptions::none()`.
+The named columns always appear in `stats_parsed`. With a predicate, the columns it references can
+appear too, because Kernel keeps the statistics it uses for data skipping. Treat the named columns
+as a minimum and ignore extra columns you don't need. An empty column list is equivalent to
+`StatsOptions::none()`.
 
 Use `StatsOptions::all_struct_with_extra_indexed(cols)` when the connector knows that columns
 outside the table's configured indexed set have on-disk statistics. Those columns are included in
@@ -326,7 +330,7 @@ remain conservative and do not prune the file.
 | Goal | Constructor |
 |------|-------------|
 | JSON statistics only (default) | No call needed (or `StatsOptions::json_only()`) |
-| No statistics output | `StatsOptions::none()` |
+| No statistics requested | `StatsOptions::none()` |
 | All structured statistics without JSON | `StatsOptions::all_struct()` |
 | All indexed structured statistics plus known extra columns | `StatsOptions::all_struct_with_extra_indexed(cols)` |
 | JSON and all structured statistics | `StatsOptions::all()` |
