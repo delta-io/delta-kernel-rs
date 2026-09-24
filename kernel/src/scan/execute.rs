@@ -174,7 +174,8 @@ impl RowVisitor for DeletionVectorVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int64Array};
+    use crate::arrow::array::{ArrayRef, AsArray as _, Int64Array};
+    use crate::arrow::datatypes::Int64Type;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
@@ -240,7 +241,7 @@ mod tests {
             .unwrap();
         assert!(table_schema
             .fields()
-            .all(|field| { field.name().to_lowercase() != index.name().to_lowercase() }));
+            .all(|field| field.name().to_lowercase() != index.name().to_lowercase()));
         let mut columns: Vec<(&str, ArrayRef)> = physical_schema
             .fields()
             .map(|field| {
@@ -271,9 +272,7 @@ mod tests {
             let column = filtered
                 .column_by_name(name)
                 .unwrap()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+                .as_primitive::<Int64Type>();
             assert_eq!(column.value(0), 43);
         }
     }

@@ -115,7 +115,7 @@ pub use crate::parallel::parallel_scan_metadata::{
 ///   through.
 /// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] -- neither, AND disables stats-based file skipping. Kernel reads no stats
+/// - [`Self::none`] -- neither, and disables stats-based file skipping. Kernel reads no stats
 ///   columns from checkpoints.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
@@ -143,7 +143,6 @@ pub struct StatsOptions {
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
     /// Delta file skipping unless the caller picked [`StatsOptions::none`].
-    /// [`StatsOptions::none`] does not disable data-file Parquet predicate pushdown.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
     AllIndexed {
@@ -221,8 +220,8 @@ impl StatsOptions {
     }
 
     /// Disables stats output and stats-based file skipping, even when a predicate is set.
-    /// Kernel reads no stats columns from checkpoints. [`Scan::execute`] still passes the
-    /// predicate to the data-file Parquet reader for conservative pruning.
+    /// Kernel reads no stats columns from checkpoints. This does not affect data-file Parquet
+    /// predicate pushdown, which requires a test-only opt-in in [`Scan::execute`].
     /// Use when the engine handles its own pruning.
     ///
     /// To get internal predicate-based skipping without `stats_parsed` output, use
@@ -1343,10 +1342,10 @@ impl Scan {
         ))
     }
 
-    /// Enables experimental data-file Parquet predicate pushdown for this scan's test execution.
+    /// Returns this scan with experimental data-file Parquet predicate pushdown enabled.
     ///
-    /// Returns the scan with pushdown enabled. For testing only: decimal scale widening and
-    /// timestamp unit conversion can cause incorrect pruning. Ordinary scans leave it disabled.
+    /// For testing only: decimal scale widening and timestamp unit conversion can cause incorrect
+    /// pruning.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn with_parquet_pushdown_for_testing(mut self) -> Self {
@@ -1404,10 +1403,11 @@ impl Scan {
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let table_physical_schema = self.snapshot.table_configuration().physical_schema();
-        let predicate = self
-            .parquet_pushdown
-            .then(|| self.physical_predicate())
-            .flatten();
+        let predicate = if self.parquet_pushdown {
+            self.physical_predicate()
+        } else {
+            None
+        };
         let partition_schema = self.state_info.physical_partition_schema.clone();
         let mut dv_read_setup = None;
         let result = scan_files_iter
@@ -1462,10 +1462,8 @@ impl Scan {
 
                 let mut read_result_iter = read_result_iter.peekable();
 
-                // Only flag an empty iterator as a connector bug when stats are present and report
-                // a positive row count. When stats are absent we cannot distinguish a legitimate
-                // 0-row file from a buggy connector, so we conservatively allow it. A predicate may
-                // also prune every row group.
+                // An empty iterator is valid if a predicate pruned every row group or missing
+                // stats leave open the possibility of an empty file.
                 let expect_data = !has_predicate
                     && scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {

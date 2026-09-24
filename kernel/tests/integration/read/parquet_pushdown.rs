@@ -199,15 +199,24 @@ async fn parquet_pruning_preserves_deletion_vector_positions(
 async fn parquet_predicate_uses_delta_partition_values(
     #[case] partition_value: Option<&str>,
     #[case] predicate: Predicate,
-    #[case] expected: Vec<i64>,
+    #[case] mut expected: Vec<i64>,
     #[values("none", "name")] mapping: &str,
+    #[values(false, true)] with_dv: bool,
+    #[values(1, 3)] batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_batch_size(batch_size.try_into()?)
+            .build(),
+    );
     let schema = schema_ref! { nullable "id": LONG, nullable "part": LONG };
     let snapshot = create_table("memory:///", schema, "partition pushdown test")
         .with_data_layout(DataLayout::partitioned(["part"]))
-        .with_table_properties([("delta.columnMapping.mode", mapping)])
+        .with_table_properties([
+            ("delta.columnMapping.mode", mapping),
+            ("delta.enableDeletionVectors", "true"),
+        ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -243,12 +252,36 @@ async fn parquet_predicate_uses_delta_partition_values(
         }],
     );
     txn.add_files(Box::new(ArrowEngineData::new(metadata)));
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let mut snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let expected_partition_value = partition_value.map(|value| value.parse::<i64>().unwrap());
+    if with_dv {
+        // Deletion positions differ between row groups so a shifted mask deletes the wrong row.
+        let deleted = [0, 3];
+        let mut txn = create_dv_update_transaction(snapshot.table_root(), engine.as_ref())?;
+        let context = txn
+            .write_state()?
+            .write_context_builder()
+            .with_partition_values(HashMap::from([(
+                "part".to_string(),
+                expected_partition_value.into(),
+            )]))
+            .build()?;
+        let mut dv = KernelDeletionVector::new();
+        dv.add_deleted_row_indexes(deleted);
+        let descriptor = write_deletion_vector_to_store(&store, &context, dv, "").await?;
+        txn.update_deletion_vectors(
+            HashMap::from([("data.parquet".to_string(), descriptor)]),
+            get_scan_files(snapshot, engine.as_ref())?
+                .into_iter()
+                .map(Ok),
+        )?;
+        snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        expected.retain(|id| !deleted.contains(&(*id as u64)));
+    }
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(predicate))
         .build()?;
-    let expected_partition_value = partition_value.map(|value| value.parse::<i64>().unwrap());
     let mut actual = Vec::new();
     for data in scan.with_parquet_pushdown_for_testing().execute(engine)? {
         let batch = into_record_batch(data?);
