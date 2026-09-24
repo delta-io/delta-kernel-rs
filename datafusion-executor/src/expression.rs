@@ -391,10 +391,9 @@ fn struct_columns_from_patch(
 /// which must be a struct containing only primitive fields.
 ///
 /// Default options preserve the native DataFusion `named_struct(..)` lowering. Each field uses
-/// `cast(get_field(map, name), T)`. Every field except String and Binary first passes through
-/// `nullif(value, '')`, matching kernel's rule that an empty partition value becomes null, while
-/// invalid non-empty values fail the cast. String and Binary preserve empty values. Missing keys
-/// and null values remain null, and a null input map produces a null struct.
+/// `cast(nullif(get_field(map, name), ''), T)`, matching kernel's rule that an empty partition
+/// value becomes null, while invalid non-empty values fail the cast. Missing keys and null values
+/// remain null, and a null input map produces a null struct.
 ///
 /// KNOWN DIVERGENCES from the kernel parser, confined to malformed or non-spec-compliant values
 /// (spec-compliant writers never emit them):
@@ -432,14 +431,10 @@ fn map_to_struct_to_df_expr(
 }
 
 fn lower_default_map_to_struct(map: DFExpr, target: &StructType) -> DeltaResult<DFExpr> {
+    validate_map_to_struct_target(target)?;
     let mut args = Vec::with_capacity(target.num_fields() * 2);
     for field in target.fields() {
-        let primitive = map_to_struct_primitive(field)?;
-        let raw = get_field(map.clone(), field.name().to_string());
-        let value = match primitive {
-            PrimitiveType::String | PrimitiveType::Binary => raw,
-            _ => nullif(raw, lit("")),
-        };
+        let value = nullif(get_field(map.clone(), field.name().to_string()), lit(""));
         let arrow_type = field
             .data_type()
             .try_into_arrow()
@@ -1120,18 +1115,22 @@ mod tests {
             rendered,
             concat!(
                 r#"CASE WHEN pv IS NOT NULL THEN named_struct("#,
-                r#"Utf8("region"), CAST(get_field(pv, Utf8("region")) AS Utf8), "#,
+                r#"Utf8("region"), CAST(nullif(get_field(pv, Utf8("region")), Utf8("")) AS Utf8), "#,
                 r#"Utf8("id"), CAST(nullif(get_field(pv, Utf8("id")), Utf8("")) AS Int32)) "#,
                 r#"ELSE NULL END"#,
             )
         );
     }
 
-    /// String and Binary targets keep the raw value (empty string is a valid value), so they lower
-    /// to a bare `cast`; every other primitive first maps an empty string to null via `nullif`.
     #[rstest]
-    #[case::string_bare_cast(DataType::STRING, "CAST(get_field(pv, Utf8(\"f\")) AS Utf8)")]
-    #[case::binary_bare_cast(DataType::BINARY, "CAST(get_field(pv, Utf8(\"f\")) AS Binary)")]
+    #[case::string_wraps_nullif(
+        DataType::STRING,
+        "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Utf8)"
+    )]
+    #[case::binary_wraps_nullif(
+        DataType::BINARY,
+        "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Binary)"
+    )]
     #[case::integer_wraps_nullif(
         DataType::INTEGER,
         "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Int32)"

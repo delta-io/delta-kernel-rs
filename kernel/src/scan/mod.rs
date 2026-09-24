@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+use self::log_replay::{
+    get_scan_metadata_transform_expr, native_partition_value_may_be_empty, scan_action_iter,
+};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -243,7 +245,8 @@ impl StatsOptions {
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
 /// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// when present, otherwise from parsing the string map. String and Binary values are always parsed
+/// from the string map, so an empty string is null.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
@@ -1213,11 +1216,15 @@ impl Scan {
         // partition schema rather than the logical names in table metadata.
         let mut partition_columns = HashSet::new();
         let mut floating_partition_columns = HashSet::new();
+        let mut string_partition_columns = HashSet::new();
         if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
             for field in schema.fields() {
                 let column = ColumnName::new([field.name()]);
                 if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
                     floating_partition_columns.insert(column.clone());
+                }
+                if native_partition_value_may_be_empty(field.data_type()) {
+                    string_partition_columns.insert(column.clone());
                 }
                 partition_columns.insert(column);
             }
@@ -1226,6 +1233,7 @@ impl Scan {
             predicate,
             &partition_columns,
             &floating_partition_columns,
+            &string_partition_columns,
             &self.state_info.eligible_physical_stats_columns,
         )?;
 

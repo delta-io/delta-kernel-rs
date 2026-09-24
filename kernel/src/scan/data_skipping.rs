@@ -431,12 +431,15 @@ impl DataSkippingFilter {
 ///
 /// `physical_partition_columns` may be narrowed to the predicate's references; pass an empty set
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
-/// partitions whose parquet min/max may omit NaNs. `physical_stats_columns` is the table-level
-/// stats membership set; references outside it fold to NULL (keeping the file).
+/// partitions whose parquet min/max may omit NaNs. `physical_string_partition_columns` identifies
+/// STRING and BINARY partitions whose parquet null counts may omit empty strings that stand for
+/// null. `physical_stats_columns` is the table-level stats membership set; references outside it
+/// fold to NULL (keeping the file).
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,
     physical_floating_partition_columns: &HashSet<ColumnName>,
+    physical_string_partition_columns: &HashSet<ColumnName>,
     physical_stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     CheckpointDataSkippingPredicateCreator {
@@ -445,6 +448,7 @@ pub(crate) fn as_checkpoint_skipping_predicate(
             physical_stats_columns,
         },
         physical_floating_partition_columns,
+        physical_string_partition_columns,
     }
     .eval(pred)
 }
@@ -766,6 +770,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 struct CheckpointDataSkippingPredicateCreator<'a> {
     data_skipping_columns: DataSkippingColumns<'a>,
     physical_floating_partition_columns: &'a HashSet<ColumnName>,
+    physical_string_partition_columns: &'a HashSet<ColumnName>,
 }
 
 impl CheckpointDataSkippingPredicateCreator<'_> {
@@ -878,6 +883,10 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         if self.data_skipping_columns.is_partition_column(col) {
+            // A row group holding only empty-string nulls has a zero footer null count.
+            if !inverted && self.physical_string_partition_columns.contains(col) {
+                return None;
+            }
             let partition_value = partition_value_expr(col);
             return Some(if inverted {
                 Pred::is_not_null(partition_value)
