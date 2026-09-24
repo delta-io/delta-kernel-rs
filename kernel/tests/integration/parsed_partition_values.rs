@@ -266,12 +266,12 @@ fn checkpoint_table(table_path: &std::path::Path, url: &Url, source: LogSource) 
         .column_by_name("partitionValues_parsed")
         .unwrap()
         .as_struct();
-    let p_str = parsed.column_by_name("p_str").unwrap();
-    let is_empty = BooleanArray::from_iter(
-        (0..add.len()).map(|row| Some(add.is_valid(row) && p_str.is_null(row))),
-    );
     let fill = |name: &str, empty: &dyn Datum| {
-        zip(&is_empty, empty, parsed.column_by_name(name).unwrap()).unwrap()
+        let values = parsed.column_by_name(name).unwrap();
+        let is_empty = BooleanArray::from_iter(
+            (0..add.len()).map(|row| Some(add.is_valid(row) && values.is_null(row))),
+        );
+        zip(&is_empty, empty, values).unwrap()
     };
     let parsed = with_field(parsed, "p_str", fill("p_str", &StringArray::new_scalar("")));
     let parsed = with_field(

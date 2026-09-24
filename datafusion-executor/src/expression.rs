@@ -1199,6 +1199,10 @@ mod tests {
         maps.values().append_value("7");
         maps.keys().append_value("ts");
         maps.values().append_value("2024-06-15 09:30:00");
+        maps.keys().append_value("s");
+        maps.values().append_value("");
+        maps.keys().append_value("b");
+        maps.values().append_value("");
         maps.append(true).unwrap();
         maps.append(false).unwrap();
         let map = Arc::new(maps.finish()) as ArrayRef;
@@ -1208,6 +1212,8 @@ mod tests {
         let target = schema! {
             nullable "id": INTEGER,
             nullable "ts": TIMESTAMP,
+            nullable "s": STRING,
+            nullable "b": BINARY,
         };
         let logical = to_df_expr(
             &KernelExpr::map_to_struct(col!("pv"), options),
@@ -1231,6 +1237,8 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 7);
         assert_eq!(timestamps.value(0), expected_timestamp);
+        assert!(result.column(2).is_null(0), "empty STRING must be null");
+        assert!(result.column(3).is_null(0), "empty BINARY must be null");
         assert!(result.is_null(1));
     }
 

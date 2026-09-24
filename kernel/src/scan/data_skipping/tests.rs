@@ -603,6 +603,8 @@ fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] va
 )]
 #[case::is_not_null(Pred::is_not_null(col!("part_col")), true)]
 #[case::equality(Pred::eq(col!("part_col"), lit("a")), true)]
+#[case::less_than(Pred::lt(col!("part_col"), lit("b")), true)]
+#[case::greater_than(Pred::gt(col!("part_col"), lit("b")), true)]
 fn test_checkpoint_skipping_string_partition_disables_only_is_null(
     #[case] pred: Pred,
     #[case] supported: bool,
