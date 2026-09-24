@@ -6,16 +6,16 @@ the ones your input needs, and materialize them before writing data files.
 
 Before reading this page, make sure you understand [Appending data](./append.md).
 
-## What are column defaults?
+## Column defaults example
 
 Suppose your table has columns `name` (STRING), `age` (INTEGER), and `city` (STRING), with a default
-of `'Seattle'` on `city`. These inputs produce different results:
+of `'Seattle'` on `city`. These SQL inserts into `people` produce different results:
 
-| Input | Row written |
-|-------|-------------|
-| Supply `name = 'Alice'` and `age = 30`, omitting `city` | `('Alice', 30, 'Seattle')` |
-| Supply `('Bob', 25, NULL)` | `('Bob', 25, NULL)` |
-| Supply `('Carol', 35, DEFAULT)` | `('Carol', 35, 'Seattle')` |
+| SQL input | Row written |
+|-----------|-------------|
+| `INSERT INTO people (name, age) VALUES ('Alice', 30)` | `('Alice', 30, 'Seattle')` |
+| `INSERT INTO people VALUES ('Bob', 25, NULL)` | `('Bob', 25, NULL)` |
+| `INSERT INTO people VALUES ('Carol', 35, DEFAULT)` | `('Carol', 35, 'Seattle')` |
 
 An explicit `NULL` is a supplied value, so it doesn't trigger the default. Your connector must
 preserve the distinction between omitted values, `DEFAULT` requests, and explicit nulls until it
@@ -26,6 +26,10 @@ Defaults apply during writes. They don't backfill existing rows or substitute va
 For the protocol contract, see [Default columns in the Delta protocol][default-columns].
 
 ## How Kernel supports column defaults
+
+> [!NOTE]
+> Kernel's transaction API exposes defaults only for top-level columns. See
+> [What about nested defaults?](#what-about-nested-defaults) for field-level metadata access.
 
 Kernel exposes defaults through `Transaction::top_level_column_defaults()`, keyed by logical column
 name. Each `ColumnDefault` provides the original SQL through `raw_sql()`, the column's declared type
@@ -52,7 +56,7 @@ connector fills the required values and then calls `txn.ack_column_defaults()` b
 
 > [!NOTE]
 > Discovery and literal parsing need no dedicated Cargo feature, Arrow dependency, or SQL engine.
-> They don't require `check-constraints-in-dev` or `internal-api`. The Arrow materialization example
+> The Arrow materialization example
 > below uses `arrow-expression` and an Arrow version feature. `delta_kernel_default_engine` supplies
 > both when configured with Arrow. See [Feature flags](../concepts/feature_flags.md).
 
@@ -69,9 +73,20 @@ CREATE TABLE people (
 TBLPROPERTIES ('delta.feature.allowColumnDefaults' = 'supported');
 ```
 
-### Using Kernel to parse defaults
+### Inserting into a table with column defaults
 
-Use this path when your required defaults are literals supported by Kernel. Prepare a column mapping
+For each insert, identify the columns your input omits or explicitly requests as `DEFAULT`. The
+defaults for those columns are the **required defaults** for that insert. Resolve them and fill
+the requested values before passing data to Kernel's write path. Keep explicitly supplied values,
+including nulls, unchanged.
+
+Kernel can parse the [supported literals](#supported-literals-and-parsing-limits) into scalars.
+If a required default falls outside that subset, evaluate it in your connector or reject the insert.
+Your connector can also use its own evaluator for all required defaults.
+
+#### When Kernel can parse the required defaults
+
+Use this path when your required defaults are literals supported by Kernel. Prepare column sources
 once per transaction, then apply it to each incoming batch. Supplied columns keep their values,
 including explicit nulls. Omitted columns receive their parsed default, repeated for the batch's
 row count.
@@ -185,42 +200,7 @@ Interpret the discovery and parsing results separately:
 If Kernel can't parse a required default, use your own evaluator or reject the write. Parse failure
 doesn't prove the stored SQL is invalid: Kernel supports a subset of valid SQL.
 
-#### Supported literals and parsing limits
-
-Kernel parses literals against the column's declared type. Leading and trailing whitespace is
-ignored, and literal keywords are case-insensitive.
-
-| Column type | Supported forms and limits |
-|-------------|----------------------------|
-| Any type | Bare `NULL`, producing a typed null |
-| Integer types | Unquoted signed integers within the target type's range |
-| FLOAT, DOUBLE | Finite numbers, including exponent notation such as `1.5e2` |
-| DECIMAL | Must match declared precision and scale. Scale 2 accepts `1.20`, not `1.2` |
-| BOOLEAN | Bare `TRUE` or `FALSE` |
-| STRING | Single-quoted strings such as `'Seattle'`, `''`, or `'it''s'` |
-| BINARY | Hex literals with an even number of digits, such as `X'DEAD'` or `X''` |
-| DATE | `'2026-01-01'` or `DATE '2026-01-01'` |
-| TIMESTAMP | `'2026-01-01T12:00:00Z'`, optionally prefixed by `TIMESTAMP` or `TIMESTAMP_LTZ` |
-| TIMESTAMP_NTZ | `'2026-01-01 12:00:00'`, optionally prefixed by `TIMESTAMP_NTZ` |
-| Interval types | ANSI literals such as `INTERVAL '1-0' YEAR TO MONTH` |
-| ARRAY, MAP, STRUCT | Only `NULL`. Other expressions remain available as raw SQL |
-| VARIANT | Only `NULL`. A non-null default is rejected when loading the table |
-
-Parser support doesn't enable otherwise unsupported data writes. In particular, parsing a value
-doesn't bypass the table's feature, schema, or write validation.
-
-Kernel doesn't parse function calls such as `current_timestamp()`, arithmetic such as `1 + 1`,
-casts, or numeric suffixes such as `1L`, `1.5F`, and `1.23BD`. Strings containing backslashes or
-using double quotes also aren't supported. A quoted number such as `'42'` isn't parsed as
-an integer.
-
-TIMESTAMP literals require an explicit uppercase UTC `Z` suffix. Zoneless timestamps and numeric
-offsets, including `+00:00`, aren't supported by the default parser. If you use a `T` separator, it
-must be uppercase. TIMESTAMP_NTZ uses a space-separated date and time without a zone. Both support
-fractional seconds. Floating-point parsing rejects non-finite results and non-exponent literals
-whose implied decimal precision exceeds 38.
-
-### Using your own evaluator
+#### When your connector evaluates the required defaults
 
 Use `raw_sql()` and `data_type()` when your connector already evaluates SQL or needs an expression
 outside Kernel's supported subset. For example, `concat('Sea', 'ttle')` requires your evaluator even
@@ -260,6 +240,40 @@ instead of converting through Kernel scalars or Arrow arrays.
 This path doesn't depend on Kernel's parsing result. Constructing a `ColumnDefault` still attempts
 parsing internally, and table metadata validation still applies.
 
+### Supported literals and parsing limits
+
+Kernel parses literals against the column's declared type. Leading and trailing whitespace is
+ignored, and literal keywords are case-insensitive.
+
+| Column type | Supported forms and limits |
+|-------------|----------------------------|
+| Any type | Bare `NULL`, producing a typed null |
+| Integer types | Unquoted signed integers within the target type's range |
+| FLOAT, DOUBLE | Finite numbers, including exponent notation such as `1.5e2` |
+| DECIMAL | Must match declared precision and scale. Scale 2 accepts `1.20`, not `1.2` |
+| BOOLEAN | Bare `TRUE` or `FALSE` |
+| STRING | Single-quoted strings such as `'Seattle'`, `''`, or `'it''s'` |
+| BINARY | Hex literals with an even number of digits, such as `X'DEAD'` or `X''` |
+| DATE | `'2026-01-01'` or `DATE '2026-01-01'` |
+| TIMESTAMP | `'2026-01-01T12:00:00Z'`, optionally prefixed by `TIMESTAMP` or `TIMESTAMP_LTZ` |
+| TIMESTAMP_NTZ | `'2026-01-01 12:00:00'`, optionally prefixed by `TIMESTAMP_NTZ` |
+| ARRAY, MAP, STRUCT | Only `NULL`. Other expressions remain available as raw SQL |
+| VARIANT | Only `NULL`. A non-null default is rejected when loading the table |
+
+Parser support doesn't enable otherwise unsupported data writes. In particular, parsing a value
+doesn't bypass the table's feature, schema, or write validation.
+
+Kernel doesn't parse function calls such as `current_timestamp()`, arithmetic such as `1 + 1`,
+casts, or numeric suffixes such as `1L`, `1.5F`, and `1.23BD`. Strings containing backslashes or
+using double quotes also aren't supported. A quoted number such as `'42'` isn't parsed as
+an integer.
+
+TIMESTAMP literals require an explicit uppercase UTC `Z` suffix. Zoneless timestamps and numeric
+offsets, including `+00:00`, aren't supported by the default parser. If you use a `T` separator, it
+must be uppercase. TIMESTAMP_NTZ uses a space-separated date and time without a zone. Both support
+fractional seconds. Floating-point parsing rejects non-finite results and non-exponent literals
+whose implied decimal precision exceeds 38.
+
 ## Limitations and common questions
 
 ### Why does `write_state()` require acknowledgement?
@@ -293,10 +307,6 @@ Discovery returns logical column names, including partition column names. Resolv
 before grouping rows by partition, then supply every partition column's typed value through
 `write_state.write_context_builder().with_partition_values(...)`. Defaults don't make partition-map
 entries optional.
-
-Your logical data batch excludes partition columns. If a table feature requires their physical
-materialization, Kernel inserts the bound partition values through the logical-to-physical
-transformation. See [Writing to partitioned tables](./partitioned_writes.md).
 
 With column mapping, continue using logical names for discovery and input data. Kernel's write
 context handles the mapping to physical names.
