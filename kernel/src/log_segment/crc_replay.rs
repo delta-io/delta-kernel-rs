@@ -27,7 +27,9 @@ use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
 };
-use crate::engine_data::{GetData, TypedGetData as _};
+use crate::engine_data::{
+    FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData as _,
+};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
@@ -175,8 +177,9 @@ impl LogSegment {
             .actions;
         for batch in batches {
             let batch = batch?;
+            let filtered = FilteredEngineData::with_all_rows_selected(batch.actions);
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
-            visitor.visit_rows_of(batch.actions())?;
+            visitor.visit_rows_of(&filtered)?;
         }
         Ok(acc.into_crc_delta().into_complete_crc(version))
     }
@@ -657,16 +660,20 @@ struct CheckpointCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
 }
 
-impl RowVisitor for CheckpointCrcVisitor<'_> {
+impl FilteredRowVisitor for CheckpointCrcVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| append_protocol_metadata_leaves(shared_columns()).into());
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
         check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
-        for i in 0..row_count {
+        for i in rows {
             self.acc.apply_shared_columns(i, getters)?;
         }
         Ok(())

@@ -52,12 +52,49 @@ Use the returned `SnapshotRef` for subsequent operations (checkpointing,
 publishing) so that downstream code sees the CRC file.
 
 > [!NOTE]
-> `write_checksum()` currently requires a post-commit snapshot with
-> pre-computed CRC information in memory. Calling it on a snapshot loaded from
-> disk (without a pre-computed CRC) returns an
-> `Error::ChecksumWriteUnsupported` error. In practice, this means you call
-> `write_checksum()` on the snapshot returned by
-> `CommittedTransaction::post_commit_snapshot()`.
+> `write_checksum()` can reuse an in-memory CRC or reconstruct one from
+> checkpoints and commits. Reconstruction returns
+> `Error::ChecksumWriteUnsupported` when incremental replay cannot determine
+> complete file statistics. Post-commit snapshots can avoid that replay.
+
+## Validating a checksum
+
+To compare a checksum with the transaction log, call
+`snapshot.validate_crc(&engine)?`. Kernel reads and reconciles commits and
+checkpoints without reading table data files. The call returns
+`CrcValidationResult::Validated` when the checked fields match, or
+`CrcValidationResult::Skipped` when the snapshot has no CRC at its version.
+An in-memory CRC is eligible; an older CRC is not compared with newer state.
+
+Validation checks complete file counts and byte totals, the optional file-size
+histogram, protocol, metadata, and their counts. It also checks complete
+domain metadata and transaction arrays, applying transaction retention to
+both sides. It checks deletion-vector totals and their histogram when present.
+If the CRC contains an in-commit timestamp or `txnId`, validation reads that
+version's commit to check them; the commit must still be available.
+
+When the CRC contains `allFiles`, validation collects the live file actions
+and compares them without relying on their order, `dataChange` flags, or
+per-file `stats`. Without `allFiles`, validation doesn't collect the file list.
+
+A discrepancy returns `Error::ChecksumMismatch` with the version, field,
+expected value, and actual value. Read failures and malformed CRC files also
+return errors.
+
+Kernel also validates CRCs during these operations when the snapshot holds
+a CRC at its version:
+
+- `scan_metadata()` and `execute()` check complete file statistics and the
+  optional file-size histogram when you supply no predicate. Column projection
+  does not disable this check. You must exhaust the iterator to finish
+  validation; stopping early or cancelling does not validate the full table.
+- Checkpoint writing computes the same CRC fields while consuming reconciled
+  actions, then compares them after reconciliation finishes. A mismatch fails
+  the write before finalization. V2 writes
+  may leave unreferenced sidecar files if validation fails after writing them.
+
+Parallel and declarative metadata scans do not perform automatic CRC validation.
+Use `validate_crc()` when you need an independent check with those APIs.
 
 ## Recommended post-commit pattern
 
@@ -83,7 +120,7 @@ if let Some(snapshot) = committed.post_commit_snapshot() {
         .unwrap_or(10);
 
     if stats.commits_since_checkpoint >= interval {
-        let (_result, _new_snapshot) = snapshot.checkpoint(&engine)?;
+        let (_result, _new_snapshot) = snapshot.checkpoint(&engine, None)?;
     }
 }
 ```

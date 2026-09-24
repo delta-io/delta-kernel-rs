@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
@@ -19,6 +19,8 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::crc::validation::with_crc_validation;
+use crate::crc::FileStats;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -445,6 +447,7 @@ impl ScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
+        let validate_crc = self.predicate.is_none();
         let mut state_info = StateInfo::try_new(
             logical_read_schema,
             table_schema,
@@ -477,6 +480,7 @@ impl ScanBuilder {
         }
 
         Ok(Scan {
+            validate_crc,
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
@@ -733,6 +737,8 @@ impl HasSelectionVector for ScanMetadata {
 /// scanning the table.
 pub struct Scan {
     snapshot: SnapshotRef,
+    /// Eligibility depends on the supplied predicate, even if predicate rewriting removes it.
+    validate_crc: bool,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     #[allow(dead_code)] // Only used when `declarative-plans` is enabled
@@ -889,6 +895,10 @@ impl Scan {
     ///
     /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
     /// fully exhausted.
+    ///
+    /// When no predicate was supplied, validates complete CRC file statistics and the optional
+    /// file-size histogram after consuming all metadata. A mismatch yields a terminal
+    /// [`Error::ChecksumMismatch`]. Dropping the iterator early does not complete validation.
     ///
     /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
     ///
@@ -1088,6 +1098,22 @@ impl Scan {
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
         let correlation_id = self.correlation_id.clone();
 
+        let expected_crc = self
+            .validate_crc
+            .then(|| self.snapshot.crc_at_version())
+            .flatten()
+            .filter(|crc| crc.file_stats().is_some())
+            .cloned();
+        let histogram = expected_crc
+            .as_ref()
+            .map(|crc| crc.replay_histogram())
+            .transpose()?;
+        let file_stats = Arc::new(Mutex::new(
+            expected_crc
+                .as_ref()
+                .map(|_| FileStats::replay_accumulator(histogram.flatten())),
+        ));
+
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
                 info!("Predicate statically evaluated to false; skipping all files");
@@ -1101,6 +1127,7 @@ impl Scan {
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
                     self.partition_values_options(),
+                    file_stats.clone(),
                 )?;
                 (Some(it), m)
             }
@@ -1117,7 +1144,15 @@ impl Scan {
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
-        Ok(iter.into_iter().flatten().on_complete(on_complete))
+        Ok(with_crc_validation(iter.into_iter().flatten(), move || {
+            expected_crc.as_ref().map_or(Ok(()), |expected| {
+                let actual = file_stats.lock().map_err(|e| {
+                    Error::internal_error(format!("file statistics accumulator lock poisoned: {e}"))
+                })?;
+                expected.validate_file_stats(actual.as_ref())
+            })
+        })
+        .on_complete(on_complete))
     }
 
     #[cfg(feature = "declarative-plans")]

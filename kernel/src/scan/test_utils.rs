@@ -181,6 +181,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         checkpoint_info,
         ScanStatsOptions::default(),
         ScanPartitionValuesOptions::default(),
+        Arc::default(),
     )
     .unwrap();
     let mut batch_count = 0;
