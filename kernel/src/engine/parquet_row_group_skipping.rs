@@ -164,6 +164,13 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 /// parquet type to the requested logical Delta type.
 fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar> {
     use PrimitiveType::*;
+    // These bounds need the source decimal scale or timestamp unit, not the predicate's type.
+    if matches!(
+        data_type.as_primitive_opt(),
+        Some(Decimal(_) | Timestamp | TimestampNtz)
+    ) {
+        return None;
+    }
     let value = match (data_type.as_primitive_opt()?, stats) {
         (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
         (String, Statistics::FixedLenByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
@@ -213,6 +220,13 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
 /// parquet type to the requested logical Delta type.
 fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar> {
     use PrimitiveType::*;
+    // These bounds need the source decimal scale or timestamp unit, not the predicate's type.
+    if matches!(
+        data_type.as_primitive_opt(),
+        Some(Decimal(_) | Timestamp | TimestampNtz)
+    ) {
+        return None;
+    }
     let value = match (data_type.as_primitive_opt()?, stats) {
         (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
         (String, Statistics::FixedLenByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),

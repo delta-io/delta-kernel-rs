@@ -8,10 +8,11 @@ use roaring::RoaringTreemap;
 
 use super::transform_spec::parse_partition_value_raw;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, Expression, ExpressionStructPatchBuilder};
+use crate::expressions::{column_name, Expression, ExpressionRef, ExpressionStructPatch};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef};
+use crate::struct_patch::ExpressionFieldPatch;
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, PredicateRef};
+use crate::{DeltaResult, EngineData, Error, PredicateRef};
 
 /// Bind partition references to Add-action values, which are authoritative even when the
 /// Parquet file contains materialized partition columns.
@@ -27,25 +28,25 @@ pub(super) fn bind_partition_values(
         schema: partition_schema,
         values: partition_values,
     };
-    Ok(Arc::new(binder.transform_pred(predicate)?.into_owned()))
+    Ok(match binder.transform_pred(predicate)? {
+        Cow::Borrowed(_) => predicate.clone(),
+        Cow::Owned(predicate) => Arc::new(predicate),
+    })
 }
 
-/// Applies a file's DV using original Parquet positions, independent of pruning and batching.
+/// Shared read setup for applying DVs using original Parquet positions.
 pub(super) struct DeletionVectorFilter {
     pub(super) read_schema: SchemaRef,
     row_index_column: ColumnName,
-    deleted: RoaringTreemap,
-    remove_row_index: Option<Arc<dyn ExpressionEvaluator>>,
+    remove_row_index: Option<String>,
 }
 
 impl DeletionVectorFilter {
     /// Reuse an existing row-index column (including one needed for row tracking), or request
-    /// an internal one and arrange to remove it before the physical-to-logical transform.
+    /// an internal one to remove in the physical-to-logical transform.
     pub(super) fn try_new(
-        engine: &dyn Engine,
         physical_schema: &SchemaRef,
         table_physical_schema: &SchemaRef,
-        deleted: RoaringTreemap,
     ) -> DeltaResult<Self> {
         let (read_schema, name, remove_row_index) = if let Some(field) =
             physical_schema.metadata_column(&MetadataColumnSpec::RowIndex)
@@ -54,43 +55,66 @@ impl DeletionVectorFilter {
         } else {
             // Include unprojected table columns to avoid shadowing predicate-only fields.
             let mut name = "row_index_for_deletion_vector".to_string();
-            while physical_schema.field(&name).is_some()
-                || table_physical_schema.field(&name).is_some()
+            while physical_schema
+                .fields()
+                .chain(table_physical_schema.fields())
+                .any(|field| field.name().to_lowercase() == name)
             {
                 name.push('_');
             }
             let schema =
                 Arc::new(physical_schema.add_metadata_column(&name, MetadataColumnSpec::RowIndex)?);
-            let drop_column =
-                Expression::struct_patch(ExpressionStructPatchBuilder::new().drop(name.clone()))?;
-            let evaluator = engine.evaluation_handler().new_expression_evaluator(
-                schema.clone(),
-                Arc::new(drop_column),
-                physical_schema.as_ref().clone().into(),
-            )?;
-            (schema, name, Some(evaluator))
+            (schema, name.clone(), Some(name))
         };
         Ok(Self {
             read_schema,
             row_index_column: ColumnName::new([name]),
-            deleted,
             remove_row_index,
         })
     }
 
-    /// Filter a physical batch and restore its original schema. Invalid or missing indexes are
-    /// errors.
-    pub(super) fn apply(&self, data: Box<dyn EngineData>) -> DeltaResult<Box<dyn EngineData>> {
+    /// Filter a physical batch using the file's DV. Invalid or missing indexes are errors.
+    pub(super) fn apply(
+        &self,
+        data: Box<dyn EngineData>,
+        deleted: &RoaringTreemap,
+    ) -> DeltaResult<Box<dyn EngineData>> {
         let mut visitor = DeletionVectorVisitor {
-            deleted: &self.deleted,
+            deleted,
             selection: Vec::with_capacity(data.len()),
         };
         data.visit_rows(std::slice::from_ref(&self.row_index_column), &mut visitor)?;
-        let data = data.apply_selection_vector(visitor.selection)?;
-        match &self.remove_row_index {
-            Some(evaluator) => evaluator.evaluate(data.as_ref()),
-            None => Ok(data),
+        data.apply_selection_vector(visitor.selection)
+    }
+
+    /// Include removal of the internal index in the file's logical transform. Scan transforms
+    /// are top-level struct patches; any other shape is an internal error.
+    pub(super) fn with_row_index_removed(
+        &self,
+        transform: Option<ExpressionRef>,
+    ) -> DeltaResult<Option<ExpressionRef>> {
+        let Some(name) = &self.remove_row_index else {
+            return Ok(transform);
+        };
+        let mut patch = match transform.as_deref() {
+            Some(Expression::StructPatch(patch)) if patch.input_path.is_none() => patch.clone(),
+            None => ExpressionStructPatch::default(),
+            _ => {
+                return Err(Error::internal_error(
+                    "Expected a top-level scan struct patch",
+                ))
+            }
+        };
+        if patch
+            .field_patches
+            .insert(name.clone(), ExpressionFieldPatch::default())
+            .is_some()
+        {
+            return Err(Error::internal_error(
+                "Internal row-index column overlaps scan transform",
+            ));
         }
+        Ok(Some(Arc::new(Expression::struct_patch(patch)?)))
     }
 }
 
@@ -136,8 +160,11 @@ impl RowVisitor for DeletionVectorVisitor<'_> {
         };
         for row in 0..row_count {
             let index: i64 = indexes.get(row, "row_index")?;
-            let index = u64::try_from(index)
-                .map_err(|_| Error::generic("Parquet row indexes must be non-negative"))?;
+            let index = u64::try_from(index).map_err(|_| {
+                Error::internal_error(format!(
+                    "ParquetHandler returned a negative row index: {index}"
+                ))
+            })?;
             self.selection.push(!self.deleted.contains(index));
         }
         Ok(())
@@ -147,11 +174,22 @@ impl RowVisitor for DeletionVectorVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::Int64Array;
+    use crate::arrow::array::{ArrayRef, Int64Array};
     use crate::arrow::record_batch::RecordBatch;
-    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::schema_ref;
+    use crate::expressions::{col, lit};
+    use crate::schema::{schema_ref, StructField};
+    use crate::Engine as _;
+
+    #[rstest::rstest]
+    fn unchanged_partition_binding_reuses_predicate(#[values(false, true)] partitioned: bool) {
+        let predicate = Arc::new(col!("id").gt(lit(10i64)));
+        let partition_schema = partitioned.then(|| schema_ref! { nullable "part": LONG });
+        let bound =
+            bind_partition_values(&predicate, partition_schema.as_ref(), &HashMap::new()).unwrap();
+        assert!(Arc::ptr_eq(&bound, &predicate));
+    }
 
     #[rstest::rstest]
     #[case::sparse(vec![Some(5), Some(8), Some(10)], Some(vec![false, true, false]))]
@@ -181,24 +219,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn internal_row_index_does_not_shadow_unprojected_table_column() {
-        let physical_schema = schema_ref! { nullable "id": LONG };
+    #[rstest::rstest]
+    fn internal_row_index_does_not_shadow_table_column(
+        #[values("row_index_for_deletion_vector", "ROW_INDEX_FOR_DELETION_VECTOR")] name: &str,
+        #[values(false, true)] projected: bool,
+    ) {
         let table_schema = schema_ref! {
             nullable "id": LONG,
-            nullable "row_index_for_deletion_vector": LONG,
+            (StructField::nullable(name, DataType::LONG)),
         };
-        let filter = DeletionVectorFilter::try_new(
-            &SyncEngine::new(),
-            &physical_schema,
-            &table_schema,
-            RoaringTreemap::new(),
-        )
-        .unwrap();
+        let physical_schema = if projected {
+            table_schema.clone()
+        } else {
+            schema_ref! { nullable "id": LONG }
+        };
+        let filter = DeletionVectorFilter::try_new(&physical_schema, &table_schema).unwrap();
         let index = filter
             .read_schema
             .metadata_column(&MetadataColumnSpec::RowIndex)
             .unwrap();
-        assert!(table_schema.field(index.name()).is_none());
+        assert!(table_schema
+            .fields()
+            .all(|field| { field.name().to_lowercase() != index.name().to_lowercase() }));
+        let mut columns: Vec<(&str, ArrayRef)> = physical_schema
+            .fields()
+            .map(|field| {
+                (
+                    field.name().as_str(),
+                    Arc::new(Int64Array::from(vec![42, 43])) as _,
+                )
+            })
+            .collect();
+        columns.push((index.name(), Arc::new(Int64Array::from(vec![0, 1]))));
+        let data = ArrowEngineData::new(RecordBatch::try_from_iter(columns).unwrap());
+        let deleted = [0].into_iter().collect();
+        let filtered = filter.apply(Box::new(data), &deleted).unwrap();
+        let transform = filter.with_row_index_removed(None).unwrap().unwrap();
+        let filtered = SyncEngine::new()
+            .evaluation_handler()
+            .new_expression_evaluator(
+                filter.read_schema.clone(),
+                transform,
+                physical_schema.as_ref().clone().into(),
+            )
+            .unwrap()
+            .evaluate(filtered.as_ref())
+            .unwrap();
+        let filtered = filtered.try_into_record_batch().unwrap();
+        assert_eq!(filtered.num_columns(), physical_schema.num_fields());
+        if projected {
+            let column = filtered
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(column.value(0), 43);
+        }
     }
 }

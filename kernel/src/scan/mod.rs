@@ -142,8 +142,8 @@ pub struct StatsOptions {
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
-    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
-    /// disables stats reading entirely.
+    /// Delta file skipping unless the caller picked [`StatsOptions::none`].
+    /// [`StatsOptions::none`] does not disable data-file Parquet predicate pushdown.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
     AllIndexed {
@@ -1393,22 +1393,25 @@ impl Scan {
         let table_physical_schema = self.snapshot.table_configuration().physical_schema();
         let predicate = self.physical_predicate();
         let partition_schema = self.state_info.physical_partition_schema.clone();
+        let mut dv_read_setup = None;
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
                 let file_path = table_root.join(&scan_file.path)?;
-                let dv_filter = scan_file
+                let deleted = scan_file
                     .dv_info
-                    .get_treemap(engine.as_ref(), &table_root)?
-                    .map(|deleted| {
-                        execute::DeletionVectorFilter::try_new(
-                            engine.as_ref(),
+                    .get_treemap(engine.as_ref(), &table_root)?;
+                let dv_filter = if deleted.is_some() {
+                    if dv_read_setup.is_none() {
+                        dv_read_setup = Some(Arc::new(execute::DeletionVectorFilter::try_new(
                             &physical_schema,
                             &table_physical_schema,
-                            deleted,
-                        )
-                    })
-                    .transpose()?;
+                        )?));
+                    }
+                    dv_read_setup.clone()
+                } else {
+                    None
+                };
                 let meta = FileMeta {
                     last_modified: scan_file.modification_time,
                     size: scan_file.size.try_into().map_err(|_| {
@@ -1430,7 +1433,11 @@ impl Scan {
                 let has_predicate = predicate.is_some();
                 let read_schema = dv_filter
                     .as_ref()
-                    .map_or(&physical_schema, |filter| &filter.read_schema);
+                    .map_or(&physical_schema, |filter| &filter.read_schema).clone();
+                let transform = match &dv_filter {
+                    Some(filter) => filter.with_row_index_removed(scan_file.transform)?,
+                    None => scan_file.transform,
+                };
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     read_schema.clone(),
@@ -1455,21 +1462,20 @@ impl Scan {
                 }
 
                 let engine = engine.clone(); // Arc clone
-                let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
-                    let read_result = match &dv_filter {
-                        Some(filter) => filter.apply(read_result)?,
-                        None => read_result,
+                    let read_result = match (&dv_filter, &deleted) {
+                        (Some(filter), Some(deleted)) => filter.apply(read_result, deleted)?,
+                        _ => read_result,
                     };
                     // transform the physical data into the correct logical form
                     state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        &physical_schema_inner,
+                        &read_schema,
                         &logical_schema_inner,
-                        scan_file.transform.clone(), // Arc clone
+                        transform.clone(), // Arc clone
                     )
                 }))
             })

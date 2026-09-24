@@ -605,6 +605,7 @@ mod tests {
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::{Expression, Predicate, Scalar};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -872,8 +873,12 @@ mod tests {
     // written by a non-kernel writer). End to end, the default engine must (a) convert the
     // millisecond footer schema to the kernel's microsecond TIMESTAMP / TIMESTAMP_NTZ, and
     // (b) rescale the values to microseconds (x1000) when reading them into that schema.
+    #[rstest::rstest]
+    #[case::unfiltered(None)]
+    #[case::timestamp(Some(("ts_utc", Scalar::Timestamp(1_000_000_000_000_000))))]
+    #[case::timestamp_ntz(Some(("ts_ntz", Scalar::TimestampNtz(1_000_000_000_000_000))))]
     #[tokio::test]
-    async fn test_read_millisecond_timestamps() {
+    async fn test_read_millisecond_timestamps(#[case] filter: Option<(&str, Scalar)>) {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("ms_timestamps.parquet");
 
@@ -934,8 +939,14 @@ mod tests {
         );
 
         // (b) Data path: values are rescaled ms -> us when read into the microsecond schema.
+        let predicate =
+            filter.map(|(name, value)| Arc::new(Predicate::gt(Expression::column([name]), value)));
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(slice::from_ref(&file_meta), footer.schema.clone(), None)
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                footer.schema.clone(),
+                predicate,
+            )
             .unwrap()
             .map(into_record_batch)
             .try_collect()

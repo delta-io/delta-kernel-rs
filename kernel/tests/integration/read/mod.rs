@@ -1,6 +1,7 @@
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
 mod parquet_pushdown;
+mod parquet_pushdown_regressions;
 mod scan_cancellation;
 
 use std::path::PathBuf;
@@ -2583,11 +2584,11 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
 
     // 998us above ms boundary (4.000998s): adjusted to 3_999_999
     //   Delta file2 max=4s > 3_999_999 -> kept (just not prunable from Delta stats).
-    //   Parquet's precise max=4_000_500 < 4_000_998 -> pruned during execute.
+    //   Parquet timestamp bounds are not used for pruning, so execute retains both files.
     assert_eq!(
         row_counts(4_000_998)?,
-        (4, 2),
-        "Delta retains file2+file3; Parquet prunes file2"
+        (4, 4),
+        "Delta retains file2+file3; Parquet timestamp bounds do not prune"
     );
 
     // 999us above ms boundary (4.000999s): adjusted to 4_000_000
