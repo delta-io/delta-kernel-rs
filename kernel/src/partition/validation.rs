@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use crate::expressions::Scalar;
 use crate::partition::serialization::would_serialize_to_null;
 use crate::schema::{DataType, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// Validates and normalizes partition keys and value types against the table schema.
@@ -49,37 +50,93 @@ pub(crate) fn validate_partition_values(
     Ok(normalized)
 }
 
+/// Validates physical partition keys exactly and returns values keyed by logical schema names.
+/// Physical names are opaque and may differ only by case, so they must not be case-normalized.
+pub(crate) fn validate_physical_partition_values(
+    logical_partition_columns: &[String],
+    logical_schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+    physical_partition_values: HashMap<String, Scalar>,
+) -> DeltaResult<HashMap<String, Scalar>> {
+    let mut expected_physical_names = Vec::with_capacity(logical_partition_columns.len());
+    let mut physical_to_logical = HashMap::with_capacity(logical_partition_columns.len());
+    for logical_name in logical_partition_columns {
+        let field = logical_schema.field(logical_name).ok_or_else(|| {
+            Error::invalid_partition_values(format!(
+                "partition column '{logical_name}' not found in table schema"
+            ))
+        })?;
+        let physical_name = field.physical_name(column_mapping_mode);
+        if physical_to_logical
+            .insert(physical_name, logical_name.as_str())
+            .is_some()
+        {
+            return Err(Error::invalid_partition_values(format!(
+                "duplicate physical partition column '{physical_name}' in table schema"
+            )));
+        }
+        expected_physical_names.push(physical_name);
+    }
+
+    let mut logical_values = HashMap::with_capacity(physical_partition_values.len());
+    for (physical_name, value) in physical_partition_values {
+        let logical_name = physical_to_logical
+            .get(physical_name.as_str())
+            .ok_or_else(|| {
+                Error::invalid_partition_values(format!(
+                    "unknown partition column '{physical_name}'. Expected one of: [{}]",
+                    expected_physical_names.join(", ")
+                ))
+            })?;
+        logical_values.insert((*logical_name).to_string(), value);
+    }
+    for (physical_name, logical_name) in expected_physical_names
+        .iter()
+        .zip(logical_partition_columns)
+    {
+        if !logical_values.contains_key(logical_name) {
+            return Err(Error::invalid_partition_values(format!(
+                "missing partition column '{physical_name}'"
+            )));
+        }
+    }
+    validate_types(logical_schema, &logical_values)?;
+    Ok(logical_values)
+}
+
 /// Validates that a connector-provided partition value map contains exactly the expected
 /// partition columns, with case-insensitive key matching. Returns the map re-keyed to
-/// the expected column-name case.
+/// the logical schema case.
 ///
-/// Keys in the input map may use any casing (e.g., "YEAR" or "year" for an expected
-/// column named "Year"). The caller supplies logical or physical expected names.
+/// Keys in the input map are logical column names provided by the connector, which may
+/// use any casing (e.g., "YEAR" or "year" for a schema column named "Year"). The returned
+/// map uses the exact logical names from the schema.
 ///
 /// # Parameters
-/// - `expected_partition_columns`: expected logical or physical partition column names.
-/// - `partition_values`: connector-provided map from column names (any case) to typed values.
+/// - `logical_partition_columns`: logical partition column names from kernel's table metadata.
+/// - `logical_partition_values`: connector-provided map from logical column names (any case) to
+///   typed values.
 ///
 /// # Errors
 /// - A partition column is missing from the map
 /// - An extra key is present that is not a partition column
 /// - Two keys collide after case normalization (e.g., "COL" and "col" both provided)
-pub(crate) fn validate_keys(
-    expected_partition_columns: &[String],
-    partition_values: HashMap<String, Scalar>,
+fn validate_keys(
+    logical_partition_columns: &[String],
+    logical_partition_values: HashMap<String, Scalar>,
 ) -> DeltaResult<HashMap<String, Scalar>> {
-    let schema_lookup: HashMap<String, &str> = expected_partition_columns
+    let schema_lookup: HashMap<String, &str> = logical_partition_columns
         .iter()
         .map(|name| (name.to_lowercase(), name.as_str()))
         .collect();
 
-    let mut normalized = HashMap::with_capacity(partition_values.len());
-    for (key, value) in partition_values {
+    let mut normalized = HashMap::with_capacity(logical_partition_values.len());
+    for (key, value) in logical_partition_values {
         let lower_key = key.to_lowercase();
         let schema_name = schema_lookup.get(&lower_key).ok_or_else(|| {
             Error::invalid_partition_values(format!(
                 "unknown partition column '{key}'. Expected one of: [{}]",
-                expected_partition_columns.join(", ")
+                logical_partition_columns.join(", ")
             ))
         })?;
         // Detect post-normalization duplicates (e.g., "COL" and "col" both provided).
@@ -91,7 +148,7 @@ pub(crate) fn validate_keys(
         normalized.insert(schema_name.to_string(), value);
     }
 
-    for col in expected_partition_columns {
+    for col in logical_partition_columns {
         if !normalized.contains_key(col.as_str()) {
             return Err(Error::invalid_partition_values(format!(
                 "missing partition column '{col}'. Provided: [{}]",

@@ -139,7 +139,7 @@ pub unsafe extern "C" fn write_context_builder_with_partition_values(
     Box::new(builder.with_partition_values(partition_values.inner)).into()
 }
 
-/// Sets physical partition values and consumes both input handles.
+/// Sets partition values keyed by exact physical column names and consumes both input handles.
 ///
 /// The returned handle replaces `builder`; neither input handle remains valid. Kernel validates the
 /// values in [`write_context_builder_build`]. Unpartitioned writers skip this function.

@@ -8,7 +8,7 @@ use url::Url;
 use super::BoundWriteContext;
 use crate::expressions::{lit, ColumnName, ExpressionStructPatchBuilder, Scalar};
 use crate::partition::serialization::serialize_partition_value;
-use crate::partition::validation::{validate_keys, validate_partition_values};
+use crate::partition::validation::{validate_partition_values, validate_physical_partition_values};
 use crate::schema::void_utils::add_void_stripping;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
@@ -113,9 +113,9 @@ impl BoundWriteContextBuilder {
 
     /// Binds one typed value for each physical partition column.
     ///
-    /// Names are matched case-insensitively and must contain every physical partition column and
-    /// no other keys. Values are validated against the logical schema when [`build`](Self::build)
-    /// is called. Null-equivalent values require nullable partition columns.
+    /// Names must exactly match the physical names of every partition column, with no other keys.
+    /// Physical names are case-sensitive. Values are validated against the logical schema when
+    /// [`build`](Self::build) is called. Null-equivalent values require nullable partition columns.
     pub fn with_physical_partition_values(
         mut self,
         partition_values: HashMap<String, Scalar>,
@@ -187,16 +187,20 @@ impl BoundWriteContextBuilder {
         let normalized = self
             .partition_values
             .map(|partition_values| {
-                let logical_values = if self.partition_values_are_physical {
-                    Self::physical_to_logical_partition_values(&self.write_state, partition_values)?
+                if self.partition_values_are_physical {
+                    validate_physical_partition_values(
+                        &self.write_state.logical_partition_columns,
+                        &self.write_state.full_logical_schema,
+                        self.write_state.column_mapping_mode,
+                        partition_values,
+                    )
                 } else {
-                    partition_values
-                };
-                validate_partition_values(
-                    &self.write_state.logical_partition_columns,
-                    &self.write_state.full_logical_schema,
-                    logical_values,
-                )
+                    validate_partition_values(
+                        &self.write_state.logical_partition_columns,
+                        &self.write_state.full_logical_schema,
+                        partition_values,
+                    )
+                }
             })
             .transpose()?;
 
@@ -235,41 +239,6 @@ impl BoundWriteContextBuilder {
             logical_to_physical,
             physical_partition_values: serialized,
         })
-    }
-
-    fn physical_to_logical_partition_values(
-        write_state: &WriteState,
-        partition_values: HashMap<String, Scalar>,
-    ) -> DeltaResult<HashMap<String, Scalar>> {
-        let mut physical_names = Vec::with_capacity(write_state.logical_partition_columns.len());
-        let mut physical_to_logical =
-            HashMap::with_capacity(write_state.logical_partition_columns.len());
-        for logical_name in &write_state.logical_partition_columns {
-            let field = write_state
-                .full_logical_schema
-                .field(logical_name)
-                .ok_or_else(|| {
-                    Error::internal_error(format!(
-                        "partition column '{logical_name}' not found in schema"
-                    ))
-                })?;
-            let physical_name = field
-                .physical_name(write_state.column_mapping_mode)
-                .to_string();
-            physical_to_logical.insert(physical_name.clone(), logical_name.clone());
-            physical_names.push(physical_name);
-        }
-        validate_keys(&physical_names, partition_values)?
-            .into_iter()
-            .map(|(physical_name, value)| {
-                let logical_name = physical_to_logical.get(&physical_name).ok_or_else(|| {
-                    Error::internal_error(format!(
-                        "partition column '{physical_name}' missing after validation"
-                    ))
-                })?;
-                Ok((logical_name.clone(), value))
-            })
-            .collect()
     }
 
     fn build_logical_data_schema(&self) -> DeltaResult<SchemaRef> {
@@ -477,7 +446,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::schema_ref;
+    use crate::schema::{schema_ref, MetadataValue};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::Engine;
@@ -633,7 +602,7 @@ mod tests {
         let physical_context = decoded
             .write_context_builder()
             .with_physical_partition_values(HashMap::from([(
-                expected_partition_key.to_uppercase(),
+                expected_partition_key.to_string(),
                 Scalar::Integer(2024),
             )]))
             .build()
@@ -696,11 +665,11 @@ mod tests {
             Scalar::Integer(2024),
         )]))
         .contains("unknown partition column 'unknown'"));
-        assert!(error_for(HashMap::from([
-            (physical_name.clone(), Scalar::Integer(2024)),
-            (physical_name.to_uppercase(), Scalar::Integer(2025)),
-        ]))
-        .contains("duplicate partition column"));
+        assert!(error_for(HashMap::from([(
+            physical_name.to_uppercase(),
+            Scalar::Integer(2024),
+        )]))
+        .contains("unknown partition column"));
         assert!(error_for(HashMap::from([(
             physical_name.clone(),
             Scalar::String("2024".into()),
@@ -718,6 +687,64 @@ mod tests {
             ]))
             .contains("unknown partition column 'year'"));
         }
+    }
+
+    #[rstest]
+    #[case::id(ColumnMappingMode::Id, "id")]
+    #[case::name(ColumnMappingMode::Name, "name")]
+    fn physical_partition_names_differing_only_by_case_bind_separately(
+        #[case] column_mapping_mode: ColumnMappingMode,
+        #[case] mode_property: &str,
+    ) -> DeltaResult<()> {
+        let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
+            StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(id)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String(physical_name.to_string()),
+                ),
+            ])
+        };
+        let schema = Arc::new(StructType::try_new([
+            physical_field("first", "Part", 1),
+            physical_field("second", "part", 2),
+            StructField::nullable("value", DataType::INTEGER),
+        ])?);
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let txn = create_table("memory:///case_sensitive_partitions", schema, "test")
+            .with_data_layout(DataLayout::partitioned(["first", "second"]))
+            .with_table_properties([("delta.columnMapping.mode", mode_property)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let state = WriteState::decode(&txn.write_state()?.encode()?)?;
+
+        let physical_context = state
+            .write_context_builder()
+            .with_physical_partition_values(HashMap::from([
+                ("Part".to_string(), Scalar::Integer(1)),
+                ("part".to_string(), Scalar::Integer(2)),
+            ]))
+            .build()?;
+        let logical_context = state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([
+                ("first".to_string(), Scalar::Integer(1)),
+                ("second".to_string(), Scalar::Integer(2)),
+            ]))
+            .build()?;
+        assert_eq!(state.column_mapping_mode, column_mapping_mode);
+        assert_eq!(
+            physical_context.physical_partition_values(),
+            &HashMap::from([
+                ("Part".to_string(), Some("1".to_string())),
+                ("part".to_string(), Some("2".to_string())),
+            ])
+        );
+        assert_eq!(
+            physical_context.physical_partition_values(),
+            logical_context.physical_partition_values()
+        );
+        Ok(())
     }
 
     #[rstest]
