@@ -4,21 +4,34 @@ use std::sync::Arc;
 use delta_kernel::actions::{CheckpointMetadata, Sidecar};
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::object_store::memory::InMemory;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::plans::proto::operation as proto_op;
+use delta_kernel::snapshot::SnapshotState;
 use delta_kernel_default_engine::DefaultEngineBuilder;
+#[cfg(feature = "declarative-plans")]
+use prost::Message as _;
 
 use super::*;
 use crate::delta_types::*;
+#[cfg(feature = "declarative-plans")]
+use crate::error::EngineExecResult;
 use crate::error::KernelError;
 use crate::ffi_test_utils::{
     allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
     ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::result::CPlanResult;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{get_plan_based_engine, get_plan_executor};
 use crate::{
     engine_to_handle, free_engine, free_snapshot, free_snapshot_builder, get_snapshot_builder,
     get_snapshot_builder_from, snapshot_builder_build, snapshot_builder_set_version, FfiFileStats,
     KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::{KernelBytesSlice, NullableCvoid};
 
 fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
@@ -132,6 +145,27 @@ fn test_engine() -> Handle<SharedExternEngine> {
     )
 }
 
+#[cfg(feature = "declarative-plans")]
+extern "C" fn no_plan_execution(
+    _context: NullableCvoid,
+    _plan_proto: KernelBytesSlice,
+    _out: *mut EngineExecResult<CPlanResult>,
+) {
+    unreachable!("planning a hinted commit must not execute the plan");
+}
+
+#[cfg(feature = "declarative-plans")]
+unsafe fn plan_based_engine(fallback: &Handle<SharedExternEngine>) -> Handle<SharedExternEngine> {
+    let executor = unsafe { get_plan_executor(None, no_plan_execution) };
+    unsafe {
+        get_plan_based_engine(
+            executor,
+            OptionalValue::Some(fallback.shallow_copy()),
+            allocate_err,
+        )
+    }
+}
+
 fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<MutableFfiSnapshotBuilder> {
     unsafe {
         ok_or_panic(get_snapshot_builder(
@@ -176,6 +210,28 @@ fn externalized_core_borrows_validated_connector_state() {
     );
     unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let owned = unsafe { snapshot.as_ref() };
+    assert_eq!(
+        SnapshotState::table_root(owned).as_str(),
+        "memory:///hinted-table/"
+    );
+    assert_eq!(SnapshotState::version(owned), 0);
+    assert!(!SnapshotState::is_latest(owned));
+    assert_eq!(
+        SnapshotState::protocol(owned).unwrap().min_reader_version(),
+        1
+    );
+    assert_eq!(SnapshotState::metadata(owned).unwrap().id(), "table-id");
+    assert!(SnapshotState::logical_schema(owned).is_ok());
+    assert!(SnapshotState::last_checkpoint(owned).unwrap().is_none());
+    assert!(SnapshotState::crc(owned).unwrap().is_none());
+    let mut path_count = 0;
+    SnapshotState::visit_log_paths(owned, &mut |batch| {
+        path_count += batch.len();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(path_count, 1);
     let mut different_state = test_snapshot_hint(
         std::slice::from_ref(&log_path),
         0,
@@ -241,6 +297,62 @@ fn externalized_core_borrows_validated_connector_state() {
     );
     unsafe {
         free_snapshot_core(core);
+        free_engine(engine);
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+#[rstest::rstest]
+#[case(FfiSnapshotHintFreshness::Unverified)]
+#[case(FfiSnapshotHintFreshness::Latest)]
+fn externalized_core_builds_declarative_plan_from_scoped_host_state(
+    #[case] freshness: FfiSnapshotHintFreshness,
+) {
+    let engine = test_engine();
+    let mut builder = test_builder(&engine);
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        1,
+        1,
+    );
+    let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
+    hint.metadata.schema_string = slice(
+        r#"{"type":"struct","fields":[{"name":"value","type":"long","nullable":true,"metadata":{}}]}"#,
+    );
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let core = unsafe {
+        ok_or_panic(snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(snapshot) };
+
+    let plan_engine = unsafe { plan_based_engine(&engine) };
+    let result = unsafe {
+        snapshot_core_declarative_metadata_plan(
+            core.shallow_copy(),
+            &hint,
+            42,
+            plan_engine.shallow_copy(),
+        )
+    };
+    let bytes = match ok_or_panic(result) {
+        OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
+        OptionalValue::None => panic!("expected a plan for a hinted commit"),
+    };
+    let operation = proto_op::Operation::decode(bytes.as_slice()).unwrap();
+    assert!(matches!(
+        operation.op,
+        Some(proto_op::operation::Op::QueryPlan(_))
+    ));
+
+    unsafe {
+        free_snapshot_core(core);
+        free_engine(plan_engine);
         free_engine(engine);
     }
 }
