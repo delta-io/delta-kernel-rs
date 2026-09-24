@@ -37,13 +37,18 @@ pub(crate) fn validate_schema(
     validator.transform_struct(schema);
     validator.into_result()?;
     if cdf_enabled {
-        validate_cdf_column_names(schema)?;
+        validate_cdf_column_names(schema, column_mapping_mode)?;
     }
     Ok(())
 }
 
-/// Rejects top-level column names reserved by CDF (case-insensitive).
-fn validate_cdf_column_names(schema: &StructType) -> DeltaResult<()> {
+/// Rejects CDF-reserved top-level logical names and top-level physical name `_change_type` (case-insensitive).
+/// Among the CDF-reserved column names, only `_change_type` is stored in parquet, so for top-level physical name
+/// we only need to check it.
+fn validate_cdf_column_names(
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<()> {
     for field in schema.fields() {
         let name = field.name();
         require!(
@@ -57,6 +62,14 @@ fn validate_cdf_column_names(schema: &StructType) -> DeltaResult<()> {
             Error::schema(format!(
                 "Column '{name}' is reserved for Change Data Feed and cannot appear in the \
                  table schema when delta.enableChangeDataFeed is true"
+            ))
+        );
+        let physical_name = field.physical_name(column_mapping_mode);
+        require!(
+            !physical_name.eq_ignore_ascii_case(CHANGE_TYPE_COL_NAME),
+            Error::schema(format!(
+                "Column '{name}' has physical name '{physical_name}', which is reserved for \
+                 Change Data Feed when delta.enableChangeDataFeed is true"
             ))
         );
     }
@@ -354,6 +367,21 @@ mod tests {
             nullable "_commit_timestamp": TIMESTAMP,
         },
     })]
+    #[case::nested_physical(schema! {
+        nullable "nested": {
+            (StructField::nullable("value", DataType::STRING).with_metadata([
+                (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_change_type"),
+            ])),
+        },
+    })]
+    #[case::physical_commit_metadata(schema! {
+        (StructField::nullable("version", DataType::LONG).with_metadata([
+            (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_commit_version"),
+        ])),
+        (StructField::nullable("timestamp", DataType::TIMESTAMP).with_metadata([
+            (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_commit_timestamp"),
+        ])),
+    })]
     fn non_reserved_cdf_column_names_accepted(
         #[case] schema: StructType,
         #[values(
@@ -392,6 +420,32 @@ mod tests {
         cm: ColumnMappingMode,
     ) {
         let schema = schema! { (StructField::nullable(name, DataType::STRING)) };
+        let result = validate_schema(&schema, cm, cdf_enabled);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest]
+    #[case::name_cdf_enabled(ColumnMappingMode::Name, true, Some("has physical name"))]
+    #[case::id_cdf_enabled(ColumnMappingMode::Id, true, Some("has physical name"))]
+    #[case::none_cdf_enabled(ColumnMappingMode::None, true, None)]
+    #[case::name_cdf_disabled(ColumnMappingMode::Name, false, None)]
+    #[case::id_cdf_disabled(ColumnMappingMode::Id, false, None)]
+    #[case::none_cdf_disabled(ColumnMappingMode::None, false, None)]
+    fn reserved_cdf_physical_name_rejected_when_mapping_and_cdf_enabled(
+        #[case] cm: ColumnMappingMode,
+        #[case] cdf_enabled: bool,
+        #[case] expected_error: Option<&str>,
+        #[values("_change_type", "_CHANGE_TYPE", "_Change_Type")] physical_name: &str,
+    ) {
+        let schema = schema! {
+            (StructField::nullable("value", DataType::STRING).with_metadata([
+                (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), physical_name),
+            ])),
+        };
         let result = validate_schema(&schema, cm, cdf_enabled);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);

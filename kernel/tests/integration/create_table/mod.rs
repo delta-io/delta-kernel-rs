@@ -151,6 +151,56 @@ async fn create_table_validates_cdf_column_names(
     Ok(())
 }
 
+#[rstest]
+#[case::name_cdf_enabled("name", Some("true"), Some("has physical name"))]
+#[case::id_cdf_enabled("id", Some("true"), Some("has physical name"))]
+#[case::none_cdf_enabled("none", Some("true"), None)]
+#[case::name_cdf_supported_only("name", None, None)]
+#[case::id_cdf_supported_only("id", None, None)]
+#[case::none_cdf_supported_only("none", None, None)]
+#[tokio::test]
+async fn create_table_validates_cdf_reserved_physical_column_names(
+    #[case] cm_mode: &str,
+    #[case] cdf_enabled: Option<&str>,
+    #[case] expected_error: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        (StructField::nullable("value", DataType::STRING).with_metadata([
+            (ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), "_change_type"),
+        ])),
+    };
+    let mut properties = vec![
+        ("delta.feature.changeDataFeed", "supported"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    if let Some(value) = cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", value));
+    }
+    let result = create_table(&table_path, schema, "test")
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let expected_physical_name =
+            (cm_mode != "none").then(|| MetadataValue::String("_change_type".into()));
+        assert_eq!(
+            snapshot
+                .schema()
+                .field("value")
+                .unwrap()
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            expected_physical_name.as_ref()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
