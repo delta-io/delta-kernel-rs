@@ -4890,6 +4890,13 @@ fn test_combine_checkpoint_predicates(
     "configuration",
     r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
 )]
+// metaData.format.options.k: null
+#[should_panic(expected = "StructArray re-validation failed")]
+#[case::metadata_format_options_known_issue(
+    "metaData",
+    "format.options",
+    r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{"k":null}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#
+)]
 #[tokio::test]
 async fn read_actions_with_null_map_values(
     #[case] action_name: &str,
@@ -4936,12 +4943,12 @@ async fn read_actions_with_null_map_values(
         let Some(action_col) = rb.column_by_name(action_name) else {
             continue;
         };
-        let action_struct = action_col
-            .as_struct_opt()
-            .unwrap_or_else(|| panic!("{action_name} column should be a struct"));
-        let map_col = action_struct
-            .column_by_name(map_field)
-            .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"));
+        // `map_field` may be a dotted path into nested structs (e.g. `format.options`).
+        let map_col = map_field.split('.').fold(action_col, |col, name| {
+            col.as_struct_opt()
+                .and_then(|s| s.column_by_name(name))
+                .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"))
+        });
         let map_array = map_col
             .as_any()
             .downcast_ref::<MapArray>()
