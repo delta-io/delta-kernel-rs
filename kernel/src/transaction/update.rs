@@ -10,20 +10,25 @@
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::null_lit;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
@@ -31,12 +36,16 @@ use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
-    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
+    V2_VALIDATOR, V3_VALIDATOR,
 };
-use crate::utils::current_time_ms;
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::utils::{current_time_ms, require, PhantomType};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -65,6 +74,10 @@ impl Transaction {
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
 
+        // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
+        // and materialized column-name properties. Materialized names must be distinct and must not
+        // collide with physical data columns.
+
         // Read clustering columns from snapshot (returns None if clustering not enabled)
         let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
 
@@ -78,11 +91,17 @@ impl Transaction {
 
         let effective_table_config = read_snapshot.table_configuration().clone();
 
-        // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
-        // kernel parser limitations.
-        if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
-        }
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
+
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
+            &V3_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
 
         Ok(Transaction {
             span,
@@ -101,15 +120,19 @@ impl Transaction {
             commit_timestamp,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         })
     }
 
@@ -133,6 +156,50 @@ impl Transaction {
         self
     }
 
+    /// Stages schema changes for this transaction. Call before staging data-file actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
+    /// enabled, data-file actions have already been staged, or an operation is invalid for the
+    /// current schema or table configuration.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
+        require!(
+            !changes.is_empty(),
+            Error::generic("with_schema_changes requires at least one schema operation")
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::invalid_transaction_state(
+                "with_schema_changes must be called before staging data files"
+            )
+        );
+        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.should_emit_metadata = true;
+        Ok(self)
+    }
+
     /// Remove domain metadata from the Delta log.
     /// If the domain exists in the Delta log, this creates a tombstone to logically delete
     /// the domain. The tombstone preserves the previous configuration value.
@@ -145,6 +212,63 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Acknowledges that the connector correctly preserves Stable Row IDs and Stable Row Commit
+    /// Versions. That is:
+    ///
+    /// - Copied or updated rows retain their Stable Row IDs.
+    /// - Copied rows retain their Stable Row Commit Versions.
+    /// - The connector preserves these values in the materialized Row ID and Row Commit Version
+    ///   columns.
+    /// - The connector also satisfies all protocol MUST requirements for those columns.
+    ///
+    /// See [Row Tracking] in the Delta protocol for more details.
+    ///
+    /// Kernel does not validate rewritten files or materialized values. Calling this method asserts
+    /// that the connector has satisfied these requirements.
+    ///
+    /// The Delta protocol specifies this preservation as a SHOULD requirement. Kernel requires it
+    /// for compatibility.
+    ///
+    /// This acknowledgment is required before committing Remove actions or deletion-vector updates
+    /// on tables with Row Tracking enabled.
+    ///
+    /// [Row Tracking]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#row-tracking
+    pub fn ack_row_tracking_preservation(&mut self) {
+        self.row_tracking_preservation_acknowledged = true;
+    }
+
+    /// Set an explicit row-tracking high-water mark for this transaction.
+    ///
+    /// Use this when row IDs must also be coordinated with another system. Kernel still assigns
+    /// row-tracking fields to added files and rejects this value if it is less than the high-water
+    /// mark calculated from those files. Callers cannot use [`Self::with_domain_metadata`] to
+    /// modify `delta.rowTracking` or other `delta.*` domains. Table-feature and table-state
+    /// validation occurs during commit.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn with_row_tracking_high_water_mark(
+        mut self,
+        high_water_mark: i64,
+    ) -> DeltaResult<Self> {
+        if self.provided_row_tracking_high_water_mark.is_some() {
+            return Err(Error::generic(
+                "Row-tracking high-water mark already specified in this transaction",
+            ));
+        }
+        self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        Ok(self)
+    }
+
+    /// Stages `file` to be committed as the table's root manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
+        let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+            Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+        })?;
+        self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
+        Ok(self)
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
@@ -386,20 +510,14 @@ static NEW_STATS_NAME: &str = "newStats";
 /// Schema for scan row data with an additional column for new deletion vector descriptors.
 /// This is an intermediate schema used during deletion vector updates before transforming to final
 /// add actions.
-static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
-        scan_row_schema().fields().cloned().chain([
-            StructField::nullable(
-                NEW_DELETION_VECTOR_NAME.to_string(),
-                DeletionVectorDescriptor::to_schema(),
-            ),
-            StructField::nullable(NEW_STATS_NAME.to_string(), DataType::STRING),
-        ]),
-    ))
-});
+static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(scan_row_schema().fields()),
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
-fn intermediate_dv_schema() -> &'static SchemaRef {
+pub(super) fn intermediate_dv_schema() -> &'static SchemaRef {
     &INTERMEDIATE_DV_SCHEMA
 }
 
@@ -449,20 +567,13 @@ fn struct_deletion_vector_schema() -> &'static ArrayType {
 
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(
-            NEW_DELETION_VECTOR_NAME,
-            DeletionVectorDescriptor::to_schema(),
-        ),
-        StructField::nullable(NEW_STATS_NAME, DataType::STRING),
-    ]))
-});
+static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-fn new_dv_column_schema() -> &'static SchemaRef {
+pub(super) fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
 
@@ -488,10 +599,11 @@ impl<S> Transaction<S> {
             ));
         }
 
-        // The rewritten stats are for the add action only, so they are dropped here.
-        static COLUMNS_TO_DROP: &[&str] = &[NEW_DELETION_VECTOR_NAME, NEW_STATS_NAME];
-        let remove_actions =
-            self.generate_remove_actions(engine, self.dv_matched_files.iter(), COLUMNS_TO_DROP)?;
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.dv_matched_files.iter(),
+            true, /* has_dv_update_columns */
+        )?;
         let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
         Ok(remove_actions.chain(add_actions))
     }
@@ -508,10 +620,7 @@ impl<S> Transaction<S> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
-        // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns. The engine data has this
-        // temporary column appended by update_deletion_vectors(), but it is not expected by
-        // the transforms used in generate_remove_actions() which expect only the scan row
-        // schema fields.
+        // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME columns.
         let with_new_dv_expr = Expression::struct_patch(
             ExpressionStructPatchBuilder::new()
                 .replace("deletionVector", col!(NEW_DELETION_VECTOR_NAME))
@@ -519,6 +628,8 @@ impl<S> Transaction<S> {
                 .drop(NEW_DELETION_VECTOR_NAME)
                 .drop(NEW_STATS_NAME),
         )?;
+        // TODO(#3263): `file_metadata_batch` may contain `stats_parsed` and
+        // `partitionValues_parsed`; provide its full schema to both evaluators.
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
             Arc::new(with_new_dv_expr),
@@ -529,10 +640,16 @@ impl<S> Transaction<S> {
             get_scan_metadata_transform_expr(),
             nullable_restored_add_schema().clone().into(),
         )?;
-        let with_data_change_patch = Expression::struct_patch(
-            ExpressionStructPatchBuilder::new_nested(["add"])
-                .insert_after("modificationTime", lit(self.data_change)),
-        )?;
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+        let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
+            .insert_after("modificationTime", lit(self.data_change));
+        // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
+        // to keep the produced struct aligned with the `backReference` field of LOG_ADD_SCHEMA.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            add_patch = add_patch.append(null_lit(BackReference::to_schema()));
+        }
+        let with_data_change_patch = Expression::struct_patch(add_patch)?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(
             nullable_restored_add_schema().clone(),
@@ -569,6 +686,7 @@ struct DvUpdateEntry {
 
 impl DvUpdateEntry {
     /// The (null DV, null stats) entry for rows that are not getting a DV update.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn null() -> Self {
         static NULL_DV: LazyLock<Scalar> =
             LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));

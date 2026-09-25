@@ -15,7 +15,7 @@ use delta_kernel::DeltaResult;
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
-use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -223,23 +223,47 @@ pub extern "C" fn visit_expression_unknown(
     name.map_or(0, |name| wrap_expression(state, Expression::Unknown(name)))
 }
 
+/// Builds a column from ordered field-name parts. Periods inside a part are preserved.
+///
+/// Returns an error for zero parts, empty parts, or invalid UTF-8.
+///
 /// # Safety
-/// The string slice must be valid
+/// If `parts_len > 0`, `parts` must point to `parts_len` valid [`KernelStringSlice`] values.
+/// Every slice must remain valid for this call. The field parts are copied before returning.
 #[no_mangle]
 pub unsafe extern "C" fn visit_expression_column(
     state: &mut KernelExpressionVisitorState,
-    name: KernelStringSlice,
+    parts: *const KernelStringSlice,
+    parts_len: usize,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_expression_column_impl(state, name).into_extern_result(&allocate_error)
+    visit_expression_column_impl(state, parts, parts_len).into_extern_result(&allocate_error)
 }
-fn visit_expression_column_impl(
+/// # Safety
+/// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
+/// duration of this call.
+unsafe fn visit_expression_column_impl(
     state: &mut KernelExpressionVisitorState,
-    name: DeltaResult<&str>,
+    parts: *const KernelStringSlice,
+    parts_len: usize,
 ) -> DeltaResult<usize> {
-    // TODO: FIXME: This is incorrect if any field name in the column path contains a period.
-    let name = ColumnName::from_naive_str_split(name?);
+    if parts_len == 0 {
+        return Err(delta_kernel::Error::generic(
+            "column must have at least one field part",
+        ));
+    }
+
+    let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
+    let fields = slices
+        .iter()
+        .map(|slice| unsafe { String::try_from_slice(slice) })
+        .collect::<DeltaResult<Vec<String>>>()?;
+    if fields.iter().any(|field| field.is_empty()) {
+        return Err(delta_kernel::Error::generic(
+            "column field part must not be empty",
+        ));
+    }
+    let name = ColumnName::new(fields);
     Ok(wrap_expression(state, name))
 }
 
@@ -661,14 +685,29 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
-/// Visit a MapToStruct expression. The `child_expr` is the map expression.
+/// Builds a `MapToStruct` expression from its map child and options.
+///
+/// The options and any contained string are copied into the expression before this function
+/// returns.
+///
+/// Returns zero when `child_expr` is invalid or the timezone is not valid UTF-8.
+///
+/// # Safety
+///
+/// `options` must reference a valid [`FfiMapToStructOptions`] for this call. A configured timezone
+/// slice must point to its declared number of initialized bytes.
 #[no_mangle]
-pub extern "C" fn visit_expression_map_to_struct(
+pub unsafe extern "C" fn visit_expression_map_to_struct(
     state: &mut KernelExpressionVisitorState,
     child_expr: usize,
+    options: *const FfiMapToStructOptions,
 ) -> usize {
+    let options = unsafe { &*options };
+    let Ok(options) = (unsafe { options.try_to_kernel() }) else {
+        return 0;
+    };
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
-        wrap_expression(state, Expression::map_to_struct(expr))
+        wrap_expression(state, Expression::map_to_struct(expr, options))
     })
 }
 
@@ -838,11 +877,56 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, Scalar};
-    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
+    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::FfiMapToStructOptions;
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn map_to_struct_preserves_options(#[case] timestamp_timezone: Option<&str>) {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+        let ffi_timezone = timestamp_timezone
+            .map(|timezone| crate::kernel_string_slice!(timezone))
+            .into();
+        let ffi_options = FfiMapToStructOptions {
+            timestamp_timezone: ffi_timezone,
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, &raw const ffi_options) };
+        let expression = unwrap_kernel_expression(&mut state, expression_id).unwrap();
+
+        assert_eq!(
+            expression,
+            Expression::map_to_struct(col!("partitionValues"), options)
+        );
+    }
+
+    #[test]
+    fn map_to_struct_rejects_invalid_timezone_utf8() {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let invalid_utf8 = [0xff_u8];
+        let options = FfiMapToStructOptions {
+            timestamp_timezone: crate::OptionalValue::Some(KernelStringSlice {
+                ptr: invalid_utf8.as_ptr().cast(),
+                len: invalid_utf8.len(),
+            }),
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, &raw const options) };
+
+        assert_eq!(expression_id, 0);
+    }
 
     // ============================================================================
     // NullTypeTag::from_data_type
@@ -886,9 +970,7 @@ mod tests {
 
     #[test]
     fn from_data_type_non_primitive_produces_sentinel() {
-        let struct_type = DataType::from(
-            StructType::try_new(vec![StructField::not_null("a", DataType::INTEGER)]).unwrap(),
-        );
+        let struct_type = DataType::from(schema! { not_null "a": INTEGER });
         assert_eq!(
             NullTypeTag::from_data_type(&struct_type),
             (NullTypeTag::NonPrimitive, 0, 0)
@@ -1085,6 +1167,54 @@ mod tests {
         assert_eq!(expr, lit(expected));
     }
 
+    /// A field name containing a literal period must survive as a single field part.
+    #[test]
+    fn column_with_dotted_field_round_trips_to_three_parts() {
+        let mut state = KernelExpressionVisitorState::default();
+        let (a, b, d) = ("a", "b.c", "d");
+        let parts = [
+            kernel_string_slice!(a),
+            kernel_string_slice!(b),
+            kernel_string_slice!(d),
+        ];
+        let id = unsafe {
+            visit_expression_column_impl(&mut state, parts.as_ptr(), parts.len()).unwrap()
+        };
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, Expression::column(["a", "b.c", "d"]));
+    }
+
+    #[rstest]
+    #[case::no_parts(
+        &[],
+        KernelError::GenericError,
+        Some("Generic delta kernel error: column must have at least one field part")
+    )]
+    #[case::empty_part(
+        &[&b"a"[..], &b""[..], &b"d"[..]],
+        KernelError::GenericError,
+        Some("Generic delta kernel error: column field part must not be empty")
+    )]
+    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], KernelError::Utf8Error, None)]
+    fn invalid_column_parts_are_rejected(
+        #[case] raw_parts: &[&[u8]],
+        #[case] expected_error: KernelError,
+        #[case] expected_message: Option<&str>,
+    ) {
+        let mut state = KernelExpressionVisitorState::default();
+        let slices: Vec<KernelStringSlice> = raw_parts
+            .iter()
+            .map(|bytes| KernelStringSlice {
+                ptr: bytes.as_ptr().cast(),
+                len: bytes.len(),
+            })
+            .collect();
+        let result = unsafe {
+            visit_expression_column(&mut state, slices.as_ptr(), slices.len(), allocate_err)
+        };
+        assert_extern_result_error_with_message(result, expected_error, expected_message);
+    }
+
     // ============================================================================
     // Opaque-op builders (visit_predicate_opaque_impl and friends)
     //
@@ -1171,7 +1301,10 @@ mod tests {
     // miri can validate the unsafe boundary, not just the `_impl` helpers above.
     // ============================================================================
 
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::error::KernelError;
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+    };
     use crate::kernel_string_slice;
 
     #[test]

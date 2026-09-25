@@ -9,6 +9,12 @@ use crate::{
     OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 
+/// The row-tracking high-water mark before any fresh row IDs have been assigned.
+pub const ROW_TRACKING_INITIAL_HIGH_WATER_MARK: i64 = -1;
+
+const _: [(); 1] = [(); (ROW_TRACKING_INITIAL_HIGH_WATER_MARK
+    == delta_kernel::ROW_TRACKING_INITIAL_HIGH_WATER_MARK) as usize];
+
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
 /// domain in this snapshot
 ///
@@ -38,6 +44,29 @@ fn get_domain_metadata_impl(
     Ok(snapshot
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
+}
+
+/// Get the row-tracking high-water mark for this snapshot.
+///
+/// Returns [`OptionalValue::None`] when the snapshot has no active `delta.rowTracking` domain
+/// metadata. [`OptionalValue::Some`] with a value of `ROW_TRACKING_INITIAL_HIGH_WATER_MARK` means
+/// row tracking is active but no row IDs have been assigned yet. Returns an error if the domain
+/// metadata cannot be read or its JSON configuration is malformed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid snapshot and engine handles.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<i64>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
+        .map(OptionalValue::from)
+        .into_extern_result(&engine_ref)
 }
 
 /// Signature of the callback invoked once per clustering column by

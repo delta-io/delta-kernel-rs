@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use derive_more::From;
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
@@ -18,16 +19,10 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, From)]
+#[from(DeletionVectorDescriptor)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
-}
-
-impl From<DeletionVectorDescriptor> for DvInfo {
-    fn from(deletion_vector: DeletionVectorDescriptor) -> Self {
-        let deletion_vector = Some(deletion_vector);
-        DvInfo { deletion_vector }
-    }
 }
 
 /// Give engines an easy way to consume stats
@@ -230,9 +225,9 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::actions::get_commit_schema;
     use crate::scan::state::ScanFile;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::scan::COMMIT_READ_SCHEMA;
 
     #[derive(Clone)]
     struct TestContext {
@@ -264,7 +259,7 @@ mod tests {
     fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple(get_commit_schema().clone())],
+            vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],

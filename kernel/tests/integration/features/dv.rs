@@ -12,7 +12,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
@@ -143,10 +143,10 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table schema with id and value columns
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     // Setup table with deletion vector support
     let temp_dir = tempdir()?;
@@ -218,10 +218,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     txn.add_files(add_metadata);
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(
-        commit_result,
-        CommitResult::CommittedTransaction(_)
-    ));
+    assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 3: Verify we can read all 20 rows before deletion
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -243,7 +240,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     // Step 5: Update deletion vectors for first file only
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let dv_descriptor_1 =
         write_deletion_vector_to_store(&store, &write_context, dv_file1_first, "").await?;
     let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
@@ -253,10 +250,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(
-        commit_result,
-        CommitResult::CommittedTransaction(_)
-    ));
+    assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 6: Verify first deletion - should have 17 rows (7 from file 1 + 10 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -275,12 +269,13 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     dv_file1_second.add_deleted_row_indexes([FILE1_SECOND_DELETE_INDEX]); // Additional deletion
 
     let mut dv_file2 = KernelDeletionVector::new();
-    dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids 12, 15)
+    dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids
+                                                            // 12, 15)
 
     // Step 8: Update deletion vectors for both files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
 
     // Write deletion vectors for both files
     let dv_descriptor_1_second =
@@ -307,10 +302,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
             .map(Ok),
     )?;
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(
-        commit_result,
-        CommitResult::CommittedTransaction(_)
-    ));
+    assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 9: Verify final deletion - should have 14 rows (6 from file 1 + 8 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -420,7 +412,7 @@ async fn test_dv_update_stats_tight_bound(
     dv.add_deleted_row_indexes([3u64]);
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
 
     let scan_files = get_scan_files(snapshot, engine.as_ref())?;

@@ -351,8 +351,8 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     // Compare only the caller-requested stats after checking the declarative schema above.
     let parsed_stats_requested = match &struct_stats {
         StructStats::None => false,
-        StructStats::Columns(columns) => !columns.is_empty(),
-        StructStats::All => true,
+        StructStats::Columns { requested } => !requested.is_empty(),
+        StructStats::AllIndexed { .. } => true,
     };
     if !parsed_stats_requested {
         let declarative_schema = actual.first().expect("declarative metadata").schema();
@@ -565,6 +565,13 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .flat_map(|fields| fields.iter())
             .map(|field| field.to_string())
             .collect();
+        // Back references are part of the adaptive-metadata-tree schema; they appear as `add`
+        // leaves only when that feature is enabled.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            expected.push("add.backReference.manifest".to_string());
+            expected.push("add.backReference.pos".to_string());
+        }
         expected.sort_unstable();
         assert_eq!(leaf_paths(&actual), expected);
         Ok(())

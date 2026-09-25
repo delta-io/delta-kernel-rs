@@ -153,7 +153,7 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
 /// # Safety
 /// - `array` must be a valid FFI_ArrowArray
 /// - `schema` must be a valid pointer to a FFI_ArrowSchema
-/// - `engine` must be a valid Handle to a SharedExternEngine
+/// - `allocate_error` must be a valid error allocation function
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn get_engine_data(

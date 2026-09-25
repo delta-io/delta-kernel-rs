@@ -101,8 +101,12 @@ From this point, writing data works the same as any Kernel transaction. Get the
 write context, write Parquet files to the table's storage location, and add the
 resulting file metadata to the transaction.
 
+This example writes to an unpartitioned table. For a partitioned table, call
+`with_partition_values(...)` before `build()`.
+
 ```rust,ignore
-let write_context = txn.unpartitioned_write_context()?;
+let write_state = txn.write_state()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 ```
@@ -118,30 +122,29 @@ Call `txn.commit()` to stage the commit and ratify it through UC.
 use delta_kernel::transaction::CommitResult;
 
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let version = committed.commit_version();
         let post_commit_snapshot = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
         // Proceed to publish (next step)
     }
-    CommitResult::ConflictedTransaction(conflicted) => {
+    CommitResult::Conflicted(conflicted) => {
         // Another writer committed this version first. Rebase onto the new
         // snapshot and retry. UCCommitter does not retry at this level.
     }
-    CommitResult::RetryableTransaction(_retryable) => {
+    CommitResult::Retryable(_retryable) => {
         // Transient I/O or server error after the UC HTTP client's own retry
         // budget was exhausted. Retry the commit from scratch.
     }
 }
 ```
 
-The REST client automatically retries transport-level failures (HTTP 5xx,
-connection errors) according to the retry knobs on `ClientConfigBuilder`. See
-[Client configuration and retries](./overview.md#client-configuration-and-retries).
-Once that budget is exhausted, `UCCommitter` surfaces the failure as
-`CommitResult::RetryableTransaction`. Transaction-level retries (including
-rebasing after a `ConflictedTransaction`) are the connector's responsibility;
+The REST client automatically retries transport-level failures (HTTP 5xx, connection errors)
+according to the retry knobs on `ClientConfigBuilder`. See [Client configuration and
+retries](./overview.md#client-configuration-and-retries).  Once that budget is exhausted,
+`UCCommitter` surfaces the failure as `CommitResult::Retryable`. Transaction-level retries
+(including rebasing after a `CommitResult::Conflicted`) are the connector's responsibility;
 `UCCommitter` does not retry commits itself.
 
 Under the hood, `UCCommitter::commit` does two things for versions >= 1:
@@ -286,7 +289,8 @@ let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
 
 // 6. Write data
-let write_context = txn.unpartitioned_write_context()?;
+let write_state = txn.write_state()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... write Parquet files using write_context ...
 txn.add_files(file_metadata);
 
@@ -298,7 +302,7 @@ let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::ne
 ));
 
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let post_commit_snapshot = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
@@ -310,8 +314,8 @@ match txn.commit(&engine)? {
         // Checkpoint the published snapshot
         published_snapshot.checkpoint(&engine, None)?;
     }
-    CommitResult::ConflictedTransaction(_) => { /* rebase and retry */ }
-    CommitResult::RetryableTransaction(_) => { /* retry the commit */ }
+    CommitResult::Conflicted(_) => { /* rebase and retry */ }
+    CommitResult::Retryable(_) => { /* retry the commit */ }
 }
 ```
 

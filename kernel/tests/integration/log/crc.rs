@@ -11,11 +11,15 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
+#[cfg(feature = "internal-api")]
+use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::Transaction;
+#[cfg(feature = "internal-api")]
+use delta_kernel::LogPath;
 use delta_kernel::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
     FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
@@ -57,10 +61,10 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
 async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("value", DataType::STRING, true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -108,6 +112,135 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
     let stats = snapshot.get_file_stats_if_present().unwrap();
     assert_eq!(stats.num_files(), 10);
     assert_eq!(stats.table_size_bytes(), 5259);
+
+    Ok(())
+}
+
+// ============================================================================
+// All files from CRC on disk
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_all_files_from_crc() -> DeltaResult<()> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
+    let table_root = url::Url::from_directory_path(path).unwrap();
+
+    let store = Arc::new(LocalFileSystem::new());
+    let engine = DefaultEngineBuilder::new(store).build();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert_eq!(snapshot.version(), 0);
+
+    let all_files = snapshot
+        .crc_at_version()
+        .and_then(|c| c.all_files())
+        .unwrap();
+    assert_eq!(all_files.len(), 10);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_all_files_no_crc() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+
+    // No CRC was written, so there is no at-version CRC to read allFiles from.
+    assert!(snapshot.crc_at_version().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> DeltaResult<()> {
+    // ===== GIVEN =====
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Copy crc-full table (has CRC at version 0 carrying allFiles) into the temp dir.
+    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
+    copy_directory(&source_path, _temp_dir.path()).unwrap();
+
+    let snapshot = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+    assert!(snapshot
+        .crc_at_version()
+        .and_then(|c| c.all_files())
+        .is_some());
+
+    // ===== WHEN =====
+    // Safe (WRITE) commit with no file actions advances to version 1 (no new CRC written).
+    begin_transaction(snapshot, engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // ===== THEN =====
+    // The fresh v1 build advances the stale v0 CRC. File stats stay Complete (served at v1), but
+    // the incremental advance does not reconstruct the file set, so allFiles is dropped.
+    let snapshot = Snapshot::builder_for(table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    assert_eq!(snapshot.crc_at_version().unwrap().version, 1);
+    assert!(snapshot.get_file_stats_if_present().is_some());
+    assert_eq!(snapshot.crc_at_version().and_then(|c| c.all_files()), None);
+
+    Ok(())
+}
+
+#[cfg(feature = "internal-api")]
+#[test]
+fn test_get_all_files_preserved_via_snapshot_hint() -> DeltaResult<()> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
+    let table_root = url::Url::from_directory_path(path).unwrap();
+
+    let store = Arc::new(LocalFileSystem::new());
+    let engine = DefaultEngineBuilder::new(store).build();
+
+    // From-scratch load: the v0 CRC on disk carries allFiles (10 files).
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), 0);
+
+    let listed = &snapshot.log_segment().listed;
+    let log_paths = listed
+        .ascending_commit_files
+        .iter()
+        .chain(listed.checkpoint_parts.iter())
+        .chain(listed.latest_crc_file.iter())
+        .map(|path| LogPath::try_new(path.location.clone()))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let hint = SnapshotHint::try_new(
+        snapshot.version(),
+        log_paths,
+        snapshot.table_configuration().protocol().clone(),
+        snapshot.table_configuration().metadata().clone(),
+        snapshot.log_segment().checkpoint_hint().cloned(),
+        snapshot.crc_at_version().cloned(),
+        SnapshotHintFreshness::Latest,
+    )?;
+
+    // Hint path (not a from-scratch load): the hinted CRC keeps its allFiles.
+    let hinted = Snapshot::builder_for(table_root)
+        .with_snapshot_hint(hint)
+        .build(&engine)?;
+
+    let all_files = hinted
+        .crc_at_version()
+        .and_then(|c| c.all_files())
+        .expect("hinted CRC carries allFiles");
+    assert_eq!(all_files.len(), 10);
 
     Ok(())
 }
@@ -413,7 +546,8 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
     let stats_v2 = crc_v2.file_stats().unwrap();
     assert_eq!(stats_v2.num_files(), 2); // <--- 2 files added
-    assert!(stats_v2.table_size_bytes() > stats_v1.table_size_bytes()); // <--- size is greater than after first insert
+    assert!(stats_v2.table_size_bytes() > stats_v1.table_size_bytes()); // <--- size is greater than
+                                                                        // after first insert
 
     // ===== WHEN: Remove all files =====
     let scan = snapshot_v2.clone().scan_builder().build()?;
@@ -632,7 +766,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         if v == 3 {
             txn = txn.with_domain_metadata_removed(removed_domain.to_string());
         }
-        let write_context = txn.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.write_context_builder().build()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
@@ -818,7 +952,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
             .with_data_change(true);
-        let write_context = txn.unpartitioned_write_context()?;
+        let write_context = txn.write_state()?.write_context_builder().build()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
@@ -1813,10 +1947,10 @@ const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW
 #[tokio::test]
 async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("data", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "data": STRING,
+    };
 
     // ===== v0: empty table =====
     let committed = create_table(&table_path, schema, "test_engine")
@@ -2116,7 +2250,7 @@ async fn commit_data<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
     let mut txn = customize(txn);
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let adds = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;

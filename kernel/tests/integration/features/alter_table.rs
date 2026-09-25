@@ -9,8 +9,8 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
-    StructType,
+    schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
+    SchemaRef, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -19,19 +19,16 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
-    create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    add_commit, assert_result_error_with_message, column_mapping_fixtures as fixtures,
+    create_table as create_test_table, create_table_and_load_snapshot, engine_store_setup,
+    test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
-        .unwrap(),
-    )
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+    }
 }
 
 fn committer() -> Box<FileSystemCommitter> {
@@ -53,6 +50,111 @@ fn max_column_id(snap: &Snapshot) -> Option<i64> {
 // ============================================================================
 // Add column tests
 // ============================================================================
+
+#[rstest]
+#[case::cdf_enabled(Some("true"), Some("reserved for Change Data Feed"))]
+#[case::cdf_supported_only(None, None)]
+#[tokio::test]
+async fn add_column_validates_cdf_column_names(
+    #[case] cdf_enabled: Option<&str>,
+    #[case] expected_error: Option<&str>,
+    #[values(
+        "_change_type",
+        "_commit_version",
+        "_commit_timestamp",
+        "_CHANGE_TYPE",
+        "_COMMIT_VERSION",
+        "_COMMIT_TIMESTAMP"
+    )]
+    column_name: &str,
+    #[values("none", "name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = vec![
+        ("delta.feature.changeDataFeed", "supported"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    if let Some(value) = cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", value));
+    }
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
+    let result = snapshot
+        .alter_table()
+        .add_column(StructField::nullable(column_name, DataType::STRING))
+        .build(engine.as_ref(), committer());
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+        let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_eq!(snapshot.version(), 0);
+        assert!(!snapshot.schema().contains(column_name));
+    } else {
+        let snapshot = result?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert_eq!(snapshot.version(), 1);
+        assert!(snapshot.schema().contains(column_name));
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::name_cdf_enabled("name", true, Some("has physical name"))]
+#[case::id_cdf_enabled("id", true, Some("has physical name"))]
+#[case::none_cdf_enabled("none", true, None)]
+#[case::name_cdf_supported_only("name", false, None)]
+#[case::id_cdf_supported_only("id", false, None)]
+#[case::none_cdf_supported_only("none", false, None)]
+#[tokio::test]
+async fn add_column_validates_cdf_physical_column_names(
+    #[case] cm_mode: &str,
+    #[case] cdf_enabled: bool,
+    #[case] expected_error: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = vec![
+        ("delta.feature.changeDataFeed", "supported"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    if cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", "true"));
+    }
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
+    let result = snapshot
+        .alter_table()
+        .add_column(
+            StructField::nullable("value", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                "_change_type",
+            )]),
+        )
+        .build(engine.as_ref(), committer());
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+        let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_eq!(snapshot.version(), 0);
+        assert!(!snapshot.schema().contains("value"));
+    } else {
+        let snapshot = result?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert_eq!(snapshot.version(), 1);
+        let expected_physical_name =
+            (cm_mode != "none").then(|| MetadataValue::String("_change_type".into()));
+        assert_eq!(
+            snapshot
+                .schema()
+                .field("value")
+                .unwrap()
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            expected_physical_name.as_ref()
+        );
+    }
+    Ok(())
+}
 
 /// End-to-end lifecycle: write, ALTER to add columns, scan, write populated rows, scan again.
 /// Each column is added in its own alter commit with a checkpoint after, exercising
@@ -198,10 +300,10 @@ async fn add_columns_lifecycle(
 #[case::struct_column(
     StructField::nullable(
         "address",
-        StructType::try_new(vec![
-            StructField::nullable("city", DataType::STRING),
-            StructField::nullable("zip", DataType::STRING),
-        ]).unwrap(),
+        schema! {
+            nullable "city": STRING,
+            nullable "zip": STRING,
+        },
     ),
     3,
 )]
@@ -217,11 +319,10 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "items",
         ArrayType::new(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::INTEGER),
-            ])
-            .unwrap(),
+            schema! {
+                nullable "a": STRING,
+                nullable "b": INTEGER,
+            },
             true,
         ),
     ),
@@ -232,11 +333,10 @@ async fn add_columns_lifecycle(
         "by_id",
         MapType::new(
             DataType::STRING,
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::INTEGER),
-            ])
-            .unwrap(),
+            schema! {
+                nullable "a": STRING,
+                nullable "b": INTEGER,
+            },
             true,
         ),
     ),
@@ -246,11 +346,10 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "lookup",
         MapType::new(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::INTEGER),
-            ])
-            .unwrap(),
+            schema! {
+                nullable "a": STRING,
+                nullable "b": INTEGER,
+            },
             DataType::INTEGER,
             true,
         ),
@@ -431,6 +530,287 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+// ============================================================================
+// Add column at tests
+// ============================================================================
+
+#[rstest]
+#[tokio::test]
+async fn add_column_at_round_trip(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "parent": {
+            nullable "existing": INTEGER,
+        },
+    };
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|mode| vec![("delta.columnMapping.mode", mode)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("parent"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let parent = reloaded_schema.field("parent").expect("parent must exist");
+    let DataType::Struct(parent) = parent.data_type() else {
+        panic!("parent must remain a struct")
+    };
+    assert!(parent.field("existing").is_some());
+
+    let added = parent.field("added").expect("added field must exist");
+    assert_eq!(added.data_type(), &DataType::STRING);
+    assert!(added.is_nullable());
+    assert_eq!(added.column_mapping_id().is_some(), cm_mode.is_some());
+    assert_eq!(
+        added
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_some(),
+        cm_mode.is_some()
+    );
+
+    Ok(())
+}
+
+/// Nested `add_column_at` on a column-mapped table: commit + reload must persist the nested
+/// field's CM id / physical name and advance `maxColumnId`.
+#[rstest]
+#[tokio::test]
+async fn add_column_at_nested_struct_with_column_mapping(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![StructField::nullable("city", DataType::STRING)])?,
+        ),
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("zip", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let zip = reloaded_schema.field_at_path(&["address".to_string(), "zip".to_string()]);
+    let cm_id = zip
+        .column_mapping_id()
+        .expect("nested field must receive a column mapping id");
+    assert!(
+        cm_id > original_max,
+        "nested field id {cm_id} must exceed original max {original_max}"
+    );
+    match zip
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .expect("physical name should be assigned")
+    {
+        MetadataValue::String(s) => assert!(s.starts_with("col-")),
+        other => panic!("expected String, got {other:?}"),
+    }
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        cm_id,
+        "table maxColumnId must equal the nested field's assigned id",
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn add_column_at_containers_round_trip(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "items": [ nullable {
+            nullable "existing": STRING,
+        } ],
+        nullable "by_key": {
+            { nullable "existing": STRING } => nullable INTEGER
+        },
+        nullable "by_value": {
+            INTEGER => nullable {
+                nullable "existing": STRING,
+            }
+        },
+    };
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|mode| vec![("delta.columnMapping.mode", mode)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("items.element"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("by_key.key"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("by_value.value"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let mut reloaded_type = DataType::from(reloaded.schema().as_ref().clone());
+    for path in [
+        column_name!("items.element"),
+        column_name!("by_key.key"),
+        column_name!("by_value.value"),
+    ] {
+        let target = reloaded_type
+            .struct_at_path(path.path())
+            .unwrap_or_else(|err| panic!("path '{path}' does not resolve to a struct: {err}"));
+        assert!(target.field("existing").is_some());
+
+        let added = target.field("added").expect("added field must exist");
+        assert_eq!(added.data_type(), &DataType::STRING);
+        assert!(added.is_nullable());
+        assert_eq!(added.column_mapping_id().is_some(), cm_mode.is_some());
+        assert_eq!(
+            added
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_some(),
+            cm_mode.is_some()
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_at_struct_fields_named_like_container_segments() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "address": {
+            nullable "element": {
+                nullable "existing": STRING,
+            },
+            nullable "key": {
+                nullable "existing": STRING,
+            },
+            nullable "value": {
+                nullable "existing": STRING,
+            },
+        },
+    };
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+
+    snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address.element"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("address.key"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("address.value"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let mut reloaded_type = DataType::from(reloaded.schema().as_ref().clone());
+    for path in [
+        column_name!("address.element"),
+        column_name!("address.key"),
+        column_name!("address.value"),
+    ] {
+        let parent = reloaded_type
+            .struct_at_path(path.path())
+            .unwrap_or_else(|err| panic!("path '{path}' does not resolve to a struct: {err}"));
+        assert!(parent.field("existing").is_some());
+        assert_eq!(
+            parent.field("added"),
+            Some(&StructField::nullable("added", DataType::STRING))
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_at_rejects_duplicate_field_in_same_builder() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! {
+        nullable "address": {
+            nullable "existing": STRING,
+        },
+    };
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+
+    let result = snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("dup", DataType::STRING),
+        )
+        .add_column_at(
+            column_name!("address"),
+            StructField::nullable("dup", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer());
+    assert_result_error_with_message(result, "already exists");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_at_rejects_non_struct_parent() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let result = snapshot
+        .alter_table()
+        .add_column_at(
+            column_name!("id"),
+            StructField::nullable("added", DataType::STRING),
+        )
+        .build(engine.as_ref(), committer());
+    assert_result_error_with_message(result, "path target is not a struct");
+
+    Ok(())
+}
+
 /// Empty-schema tables are valid intermediate state, so they need to behave normally
 /// once a column is added. This test runs the full lifecycle (create empty, ALTER ADD
 /// COLUMN, write rows, scan them back, time-travel to v0) across all column-mapping
@@ -447,7 +827,7 @@ async fn empty_create_then_add_column(
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
 
-    let empty_schema = Arc::new(StructType::try_new(vec![])?);
+    let empty_schema = schema_ref! {};
     let v0 =
         create_table_and_load_snapshot(&table_path, empty_schema, engine.as_ref(), &properties)?;
     assert_eq!(v0.version(), 0);
@@ -466,16 +846,16 @@ async fn empty_create_then_add_column(
             && scan_err.to_string().contains("ALTER TABLE ADD COLUMN"),
         "scan error must point at ALTER TABLE ADD COLUMN, got: {scan_err}"
     );
-    let write_err = v0
+    let write_state_err = v0
         .clone()
         .transaction(committer(), engine.as_ref())?
         .with_engine_info("EmptySchemaApp/0.1.0")
-        .unpartitioned_write_context()
-        .expect_err("unpartitioned_write_context() must reject empty-schema snapshots");
+        .write_state()
+        .expect_err("write_state() must reject empty-schema snapshots");
     assert!(
-        write_err.to_string().contains("empty schema")
-            && write_err.to_string().contains("alter_table"),
-        "write_context error must point at alter_table, got: {write_err}"
+        write_state_err.to_string().contains("empty schema")
+            && write_state_err.to_string().contains("alter_table"),
+        "write_state error must point at alter_table, got: {write_state_err}"
     );
 
     v0.alter_table()
@@ -543,23 +923,20 @@ async fn empty_create_then_add_column(
 #[rstest]
 #[case::already_nullable(simple_schema(), column_name!("name"))]
 #[case::required_top_level(
-    Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::nullable("name", DataType::STRING),
-    ]).unwrap()),
+    schema_ref! {
+        not_null "id": INTEGER,
+        nullable "name": STRING,
+    },
     column_name!("id")
 )]
 #[case::required_nested(
-    Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::not_null("city", DataType::STRING),
-                StructField::nullable("zip", DataType::STRING),
-            ]).unwrap(),
-        ),
-    ]).unwrap()),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "address": {
+            not_null "city": STRING,
+            nullable "zip": STRING,
+        },
+    },
     column_name!("address.city")
 )]
 #[tokio::test]
@@ -618,10 +995,10 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     let is_partitioned = matches!(layout, DataLayout::Partitioned { .. });
 
     // v0: create the table with the layout column as non-null.
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::not_null(col_name, DataType::STRING),
-    ])?);
+    let schema = Arc::new(try_schema! {
+        nullable "id": INTEGER,
+        not_null (col_name): STRING,
+    }?);
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
@@ -732,10 +1109,10 @@ async fn chain_add_column_and_set_nullable(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::not_null("name", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        not_null "id": INTEGER,
+        not_null "name": STRING,
+    };
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
@@ -840,7 +1217,9 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     let (field, stripped_path): (StructField, Vec<String>) = if nested {
         let outer = StructField::nullable(
             "outer",
-            StructType::try_new(vec![field_with_stray_key("inner", &key, DataType::STRING)])?,
+            schema! {
+                (field_with_stray_key("inner", &key, DataType::STRING)),
+            },
         );
         (outer, vec!["outer".to_string(), "inner".to_string()])
     } else {
@@ -909,14 +1288,20 @@ async fn add_column_strip_is_none_mode_only(
     Ok(())
 }
 
+#[rstest]
+#[case::v2("delta.enableIcebergCompatV2", "icebergCompatV2")]
+#[case::v3("delta.enableIcebergCompatV3", "icebergCompatV3")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_blocked_when_iceberg_compat_enabled(
+    #[case] enablement_property: &str,
+    #[case] feature_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
         simple_schema(),
         engine.as_ref(),
-        &[("delta.enableIcebergCompatV3", "true")],
+        &[(enablement_property, "true")],
     )?;
 
     let msg = snapshot
@@ -926,7 +1311,9 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         .unwrap_err()
         .to_string();
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
+        msg.contains(&format!(
+            "ALTER TABLE is not yet supported on tables with {feature_name} enabled"
+        )),
         "unexpected error: {msg}",
     );
 
@@ -1152,10 +1539,10 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Pre-populate the table with sparse ids (1, 100) using the create-table preserve path.
-    let schema = Arc::new(StructType::try_new(vec![
-        fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER),
-        fixtures::cm_field("b", 100, "phys-b", DataType::STRING),
-    ])?);
+    let schema = schema_ref! {
+        (fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER)),
+        (fixtures::cm_field("b", 100, "phys-b", DataType::STRING)),
+    };
     let snapshot = create_table_and_load_snapshot(
         &table_path,
         schema,
@@ -1250,11 +1637,11 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
 
     // `value` carries a stale id; protocol omits columnMapping and no mode is set (resolves to
     // None) -- residual annotations already on the table.
-    let stale_schema = StructType::try_new([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::INTEGER)
-            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))]),
-    ])?;
+    let stale_schema = schema! {
+        nullable "id": INTEGER,
+        (StructField::nullable("value", DataType::INTEGER)
+            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))])),
+    };
     let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
     // v0 written directly to bypass create_table validation (which strips stale annotations).
     let v0 = format!(

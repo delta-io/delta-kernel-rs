@@ -1,0 +1,13 @@
+Reading table at ../../../../kernel/tests/data/void-column/
+version: 0
+
+Schema:
+├─ id: long
+└─ void_col: void
+
+id:  [
+  1,
+  2,
+  3
+]
+void_col:  3 nulls

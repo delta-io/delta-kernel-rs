@@ -5,11 +5,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -28,10 +30,11 @@ use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::ParsedLogPath;
+use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
+use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
@@ -41,8 +44,17 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 mod builder;
 mod incremental;
 mod snapshot_crc;
-pub use builder::{IncrementalReplay, SnapshotBuilder};
+#[cfg(test)]
+mod tracing_tests;
+#[doc(hidden)]
+pub use builder::{FromSnapshot, FromTableRoot};
+pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
+#[allow(unused_imports)]
+#[internal_api]
+pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
+
+pub use crate::error::SnapshotHintError;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -81,10 +93,12 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+    /// Whether the last applicable incremental build requested ignoring new checkpoints.
+    skipped_new_checkpoints: bool,
 }
 
 impl PartialEq for Snapshot {
-    // Content equality: `built_as_latest` is best-effort build metadata, deliberately excluded.
+    // Content equality excludes build metadata that does not change the table state.
     fn eq(&self, other: &Self) -> bool {
         self.log_segment == other.log_segment
             && self.table_configuration == other.table_configuration
@@ -106,6 +120,7 @@ impl std::fmt::Debug for Snapshot {
             .field("version", &self.version())
             .field("metadata", &self.table_configuration().metadata())
             .field("log_segment", &self.log_segment)
+            .field("skipped_new_checkpoints", &self.skipped_new_checkpoints)
             .finish()
     }
 }
@@ -128,11 +143,9 @@ impl Snapshot {
         SnapshotBuilder::new_for(table_root)
     }
 
-    /// Create a new [`SnapshotBuilder`] to incrementally update an existing [`Snapshot`] to a
-    /// more recent version.
-    ///
-    /// See `Snapshot::try_new_from` for the case-by-case behavior.
-    pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
+    /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
+    /// to a more recent version.
+    pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
@@ -152,25 +165,52 @@ impl Snapshot {
             table_configuration,
             None,  /* crc */
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
-    /// (best-effort). See [`Snapshot::built_as_latest`].
+    /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
+    /// applicable incremental build's checkpoint policy.
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
+        skipped_new_checkpoints: bool,
     ) -> DeltaResult<Self> {
-        // Will perform version validations.
-        let crc = SnapshotCrc::try_new(
+        let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
+        Ok(Self::new_with_validated_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            skipped_new_checkpoints,
+        ))
+    }
+
+    fn validate_configuration_and_crc(
+        log_segment: &LogSegment,
+        table_configuration: &TableConfiguration,
+        crc: Option<Arc<Crc>>,
+    ) -> DeltaResult<SnapshotCrc> {
+        table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
+        SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
             log_segment.checkpoint_version,
-        )?;
+        )
+    }
+
+    fn new_with_validated_crc(
+        log_segment: LogSegment,
+        table_configuration: TableConfiguration,
+        crc: SnapshotCrc,
+        built_as_latest: bool,
+        skipped_new_checkpoints: bool,
+    ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -178,20 +218,20 @@ impl Snapshot {
             version = table_configuration.version(),
         );
         info!(parent: &span, "Created snapshot");
-        Ok(Self {
+        Self {
             span,
             log_segment,
             table_configuration,
             crc,
             built_as_latest,
-        })
+            skipped_new_checkpoints,
+        }
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
@@ -200,6 +240,64 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> DeltaResult<Self> {
+        let (table_configuration, crc) = Self::prepare_new_from_log_segment(
+            &location,
+            &log_segment,
+            engine,
+            &metric_context,
+            incremental_replay,
+            built_as_latest,
+        )?;
+
+        Ok(Self::new_with_validated_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            false, /* skipped_new_checkpoints */
+        ))
+    }
+
+    #[instrument(name = "try_new_from_log_segment", skip_all, fields(path = %location, enable_call_frame, version = log_segment.end_version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
+    fn prepare_new_from_log_segment(
+        location: &Url,
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+        metric_context: &SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
+    ) -> DeltaResult<(TableConfiguration, SnapshotCrc)> {
+        let result = Self::resolve_table_configuration_and_crc(
+            location,
+            log_segment,
+            engine,
+            metric_context,
+            incremental_replay,
+        )
+        .and_then(|(table_configuration, crc)| {
+            let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
+            Ok((table_configuration, crc))
+        });
+        result.inspect_err(|error| {
+            error!(
+                %error,
+                ?location,
+                ?log_segment,
+                ?metric_context,
+                ?incremental_replay,
+                built_as_latest,
+                "failed to construct snapshot from log segment"
+            );
+        })
+    }
+
+    fn resolve_table_configuration_and_crc(
+        location: &Url,
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+        metric_context: &SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+    ) -> DeltaResult<(TableConfiguration, Option<Arc<Crc>>)> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -207,7 +305,7 @@ impl Snapshot {
         let base_crc = log_segment.read_latest_crc(engine);
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full).
@@ -215,17 +313,19 @@ impl Snapshot {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
                 .read_protocol_metadata(engine, base_crc.as_ref())
-                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
+                .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
-        emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-
-        tracing::Span::current().record("version", table_configuration.version());
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            protocol,
+            location.clone(),
+            log_segment.end_version,
+        )?;
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(log_segment, table_configuration, crc, built_as_latest)
+        Ok((table_configuration, crc))
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -286,6 +386,7 @@ impl Snapshot {
             new_table_configuration,
             new_crc,
             true, /* built_as_latest */
+            self.skipped_new_checkpoints,
         )
     }
 
@@ -297,6 +398,13 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
+    }
+
+    /// Whether the last applicable incremental build requested ignoring new checkpoints.
+    ///
+    /// This records the build policy, not whether its listing actually found a checkpoint.
+    pub(crate) fn skipped_new_checkpoints(&self) -> bool {
+        self.skipped_new_checkpoints
     }
 
     /// The CRC iff it sits exactly at this snapshot's version. When `Some`, queries backed by the
@@ -324,11 +432,11 @@ impl Snapshot {
 
     /// Whether this snapshot was at the latest table version when it was built.
     ///
-    /// This is best-effort: `true` when the build knows this was the newest version. That holds for
-    /// a build (fresh or incremental) with no time-travel version, a build (fresh or incremental)
-    /// at the catalog's ratified latest version, and a post-commit snapshot. It is not a
-    /// liveness guarantee: another writer may commit a newer version afterward, so a `true`
-    /// snapshot can already be stale.
+    /// This is best-effort: `true` for an ordinary latest-version build, the catalog's ratified
+    /// latest version, a post-commit snapshot, or a snapshot hint marked `Latest` by its connector.
+    /// Kernel does not independently verify hint freshness. This is not a liveness guarantee:
+    /// another writer may commit a newer version afterward, so a `true` snapshot can already be
+    /// stale.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
@@ -441,7 +549,6 @@ impl Snapshot {
     /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
-    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(
         parent = &self.span,
         name = SET_TRANSACTION_LOADED_SPAN,
@@ -516,6 +623,20 @@ impl Snapshot {
         Ok(version)
     }
 
+    /// Fetch the latest transaction version for every application id in this snapshot.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn get_app_id_versions(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<SetTransactionMap> {
+        if let Some(crc) = self.crc_at_version() {
+            if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
+                return Ok(map.clone());
+            }
+        }
+        SetTransactionScanner::get_all(self.log_segment(), engine)
+    }
+
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
     /// configuration for the domain, or None if the domain does not exist.
     ///
@@ -532,6 +653,23 @@ impl Snapshot {
         }
 
         self.get_domain_metadata_internal(domain, engine)
+    }
+
+    /// Get the row-tracking high-water mark for this snapshot.
+    ///
+    /// Returns `None` when the snapshot has no active `delta.rowTracking` domain metadata.
+    /// `Some(`[`crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK`]`)` means row tracking is active but
+    /// no row IDs have been assigned yet.
+    ///
+    /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
+    /// cannot be read or its JSON configuration is malformed.
+    pub fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+            .map(|config| parse_row_tracking_high_water_mark(&config))
+            .transpose()
     }
 
     /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
@@ -551,6 +689,7 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_clustering_column_infos(
         &self,
@@ -808,7 +947,7 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(Error::generic("Last commit file not found in log segment")),
+            None => Err(Error::MissingVersion(self.version())),
         }
     }
 
@@ -836,28 +975,18 @@ impl Snapshot {
                         let ts = commit_file_meta.location.last_modified;
                         Ok(ts)
                     }
-                    None => Err(Error::generic(format!(
-                        "Last commit file not found in log segment for version {} \
-                         (ICT disabled): cannot read filesystem modification timestamp",
-                        self.version()
-                    ))),
+                    None => Err(Error::MissingVersion(self.version())),
                 }
             }
-            InCommitTimestampEnablement::Enabled { .. } => self
-                .get_in_commit_timestamp(engine)
-                .map_err(|e| {
-                    Error::generic(format!(
-                        "Unable to read in-commit timestamp for version {}: {e}",
-                        self.version()
-                    ))
-                })?
-                .ok_or_else(|| {
+            InCommitTimestampEnablement::Enabled { .. } => {
+                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
                     Error::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
                         self.version()
                     ))
-                }),
+                })
+            }
         }
     }
 
@@ -908,6 +1037,11 @@ impl Snapshot {
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Kernel does not support reading or writing the table, or if the
+    /// snapshot is not published.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
@@ -954,6 +1088,7 @@ impl Snapshot {
     ///
     /// # Errors
     ///
+    /// - If Kernel does not support reading or writing the table.
     /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
     ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
@@ -982,6 +1117,8 @@ impl Snapshot {
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
+        self.table_configuration().ensure_read_write_supported()?;
+
         let crc = self.resolve_crc_for_write(engine)?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
@@ -995,6 +1132,7 @@ impl Snapshot {
                     self.table_configuration().clone(),
                     Some(crc),
                     self.built_as_latest,
+                    self.skipped_new_checkpoints,
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -1100,6 +1238,7 @@ impl Snapshot {
     ///   write sidecar files.
     ///
     /// # Errors
+    /// - If Kernel does not support reading or writing the table.
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
     ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel limitation.
@@ -1215,6 +1354,7 @@ impl Snapshot {
                 self.table_configuration().clone(),
                 self.crc_at_version().cloned(),
                 self.built_as_latest,
+                false, /* skipped_new_checkpoints */
             )?),
         ))
     }
@@ -1285,6 +1425,7 @@ impl Snapshot {
             self.table_configuration().clone(),
             self.base_crc().cloned(),
             self.built_as_latest,
+            self.skipped_new_checkpoints,
         )?))
     }
 }
@@ -1453,6 +1594,7 @@ mod tests {
             table_cfg,
             None,  /* crc */
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
     }
 
@@ -1504,7 +1646,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
+        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1563,8 +1705,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid =
-            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
+            .expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1598,8 +1740,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result =
-                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
+                .expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -1763,6 +1905,72 @@ mod tests {
         expected.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         assert_eq!(metadata, expected);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::enabled_without_assigned_ids(
+        r#"{"rowIdHighWaterMark":-1}"#,
+        Some(crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
+        None,
+        "memory:///test_row_tracking_high_water_mark_empty/"
+    )]
+    #[case::malformed_configuration(
+        "{not-json",
+        None,
+        Some("key must be a string"),
+        "memory:///test_row_tracking_high_water_mark_malformed/"
+    )]
+    #[tokio::test]
+    async fn test_get_row_tracking_high_water_mark(
+        #[case] configuration: &str,
+        #[case] expected: Option<i64>,
+        #[case] expected_error: Option<&str>,
+        #[case] table_root: &str,
+    ) -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        commit(
+            table_root,
+            store.as_ref(),
+            0,
+            vec![
+                json!({
+                    "protocol": {
+                        "minReaderVersion": 1,
+                        "minWriterVersion": 7,
+                        "writerFeatures": ["domainMetadata", "rowTracking"]
+                    }
+                }),
+                json!({
+                    "metaData": {
+                        "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                        "format": { "provider": "parquet", "options": {} },
+                        "schemaString": r#"{"type":"struct","fields":[]}"#,
+                        "partitionColumns": [],
+                        "configuration": { "delta.enableRowTracking": "true" },
+                        "createdTime": 1587968585495i64
+                    }
+                }),
+                json!({
+                    "domainMetadata": {
+                        "domain": "delta.rowTracking",
+                        "configuration": configuration,
+                        "removed": false
+                    }
+                }),
+            ],
+        )
+        .await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let result = snapshot.get_row_tracking_high_water_mark(&engine);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            assert_eq!(result?, expected);
+        }
 
         Ok(())
     }
@@ -1937,7 +2145,8 @@ mod tests {
                 false,
             ),
         ];
-        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from
+                                                                           // version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];
@@ -1984,9 +2193,8 @@ mod tests {
             snapshot.table_configuration().clone(),
         )?;
 
-        // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert!(matches!(result, Err(Error::MissingVersion(0))));
 
         Ok(())
     }
@@ -2149,7 +2357,44 @@ mod tests {
         )?;
 
         let result = snapshot_no_commit.get_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert!(matches!(result, Err(Error::MissingVersion(0))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_preserves_commit_read_error() -> DeltaResult<()> {
+        let table_root = "memory:///";
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let commit_data = vec![
+            create_commit_info(1677811175819, Some(1677811175999)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
+                Some(("0".to_string(), "1612345678".to_string())),
+                false,
+            ),
+        ];
+        commit(table_root, store.as_ref(), 0, commit_data).await;
+        let loaded_snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        // Drop the synthesized CRC so timestamp resolution reads the referenced commit file.
+        let snapshot = Snapshot::new_with_crc(
+            loaded_snapshot.log_segment().clone(),
+            loaded_snapshot.table_configuration().clone(),
+            None,
+            false,
+            false, /* skipped_new_checkpoints */
+        )?;
+        store.delete(&delta_path_for_version(0, "json")).await?;
+
+        let result = snapshot.get_timestamp(&engine);
+        assert!(
+            matches!(&result, Err(Error::FileNotFound(_))),
+            "expected FileNotFound, got {result:?}"
+        );
 
         Ok(())
     }
@@ -2242,6 +2487,7 @@ mod tests {
             built.table_configuration().clone(),
             Some(stale_crc),
             false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
         )
         .unwrap();
         assert!(parent.crc_at_version().is_none());
@@ -2356,21 +2602,14 @@ mod tests {
 
         let storage = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(storage);
-        let schema = Arc::new(
-            crate::schema::StructType::try_new(vec![
-                crate::schema::StructField::nullable("id", DataType::INTEGER),
-                crate::schema::StructField::nullable("region", DataType::STRING),
-                crate::schema::StructField::nullable(
-                    "address",
-                    crate::schema::StructType::try_new(vec![
-                        crate::schema::StructField::nullable("city", DataType::STRING),
-                        crate::schema::StructField::nullable("zip", DataType::INTEGER),
-                    ])
-                    .unwrap(),
-                ),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "region": STRING,
+            nullable "address": {
+                nullable "city": STRING,
+                nullable "zip": INTEGER,
+            },
+        };
         let _ = create_table("memory:///", schema, "test")
             .fold_with(clustering_cols.as_ref(), |builder, cols| {
                 let columns = cols
@@ -2512,9 +2751,7 @@ mod tests {
             Snapshot::builder_for("memory:///").build(&engine).unwrap()
         }
 
-        let small_schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("a", DataType::INTEGER)]).unwrap(),
-        );
+        let small_schema = schema_ref! { nullable "a": INTEGER };
         let wide_schema = Arc::new(
             StructType::try_new(
                 (0..50)

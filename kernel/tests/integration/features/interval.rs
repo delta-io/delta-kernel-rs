@@ -1,8 +1,6 @@
 //! Reader-side behavior for ANSI interval columns.
 
-use std::sync::Arc;
-
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
 
@@ -14,9 +12,7 @@ async fn test_build_scan_over_interval_table(
     #[case] name: &str,
     #[case] interval: DataType,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "iv", interval,
-    )])?);
+    let schema = schema_ref! { nullable "iv": (interval) };
     let (store, engine, table_location) = engine_store_setup(name, None);
     let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
 

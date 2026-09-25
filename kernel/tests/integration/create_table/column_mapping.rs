@@ -262,9 +262,7 @@ fn test_column_mapping_feature_only_without_mode() -> DeltaResult<()> {
 fn test_column_mapping_invalid_mode_rejected() {
     let (_temp_dir, table_path, engine) = test_table_setup().unwrap();
 
-    let schema = Arc::new(
-        StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
-    );
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // Try to create table with invalid column mapping mode
     let result = create_table(&table_path, schema, "Test/1.0")
@@ -295,11 +293,11 @@ fn test_create_table_strips_stale_column_mapping_when_disabled(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::INTEGER)
-            .add_metadata([(key.as_ref(), MetadataValue::Number(2))]),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        (StructField::nullable("value", DataType::INTEGER)
+            .add_metadata([(key.as_ref(), MetadataValue::Number(2))])),
+    };
 
     // No column mapping mode set -> mode resolves to None -> the stray annotation is stripped.
     let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
@@ -329,10 +327,10 @@ fn test_create_table_column_mapping_strip_is_none_mode_only(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        fixtures::cm_field("value", 2, "col-2f8a", DataType::INTEGER),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        (fixtures::cm_field("value", 2, "col-2f8a", DataType::INTEGER)),
+    };
 
     let snapshot =
         create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), properties)?;
@@ -410,15 +408,13 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create nested schema
-    let address_type = StructType::try_new(vec![
-        StructField::new("street", DataType::STRING, true),
-        StructField::new("city", DataType::STRING, true),
-    ])?;
-
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("address", address_type, true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "address": {
+            nullable "street": STRING,
+            nullable "city": STRING,
+        },
+    };
 
     // Create table and load snapshot (validates column mapping for nested schema on read)
     let snapshot = create_table_and_load_snapshot(
@@ -722,7 +718,7 @@ fn test_create_table_preserves_or_fills_cm_metadata(
     #[case] expected_physical: Option<&str>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![field])?);
+    let schema = schema_ref! { (field) };
 
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -762,14 +758,14 @@ fn test_create_table_preserves_or_fills_cm_metadata(
 fn test_create_table_sparse_preserved_ids_seed_assignment() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("bare1", DataType::STRING, true),
-        fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER),
-        StructField::new("bare2", DataType::STRING, true),
-        fixtures::cm_field("b", 100, "phys-b", DataType::INTEGER),
-        fixtures::cm_field("c", 5, "phys-c", DataType::INTEGER),
-        StructField::new("bare3", DataType::STRING, true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "bare1": STRING,
+        (fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER)),
+        nullable "bare2": STRING,
+        (fixtures::cm_field("b", 100, "phys-b", DataType::INTEGER)),
+        (fixtures::cm_field("c", 5, "phys-c", DataType::INTEGER)),
+        nullable "bare3": STRING,
+    };
 
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -808,17 +804,12 @@ fn test_create_table_preserves_preexisting_metadata_in_nested_types() -> DeltaRe
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Nested struct with one fully-annotated leaf preserved at id=42.
-    let nested_struct = StructType::try_new(vec![fixtures::cm_field(
-        "leaf",
-        42,
-        "phys-leaf",
-        DataType::INTEGER,
-    )])?;
-
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("bare", DataType::STRING, true),
-        StructField::new("outer", DataType::Struct(Box::new(nested_struct)), true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "bare": STRING,
+        nullable "outer": {
+            (fixtures::cm_field("leaf", 42, "phys-leaf", DataType::INTEGER)),
+        },
+    };
 
     let snapshot = create_table_and_load_snapshot(
         &table_path,

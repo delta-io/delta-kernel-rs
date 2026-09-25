@@ -326,13 +326,14 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
             "binary literal must contain an even number of hex digits: {input}"
         )));
     }
-    hex.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let hi = (pair[0] as char)
+    let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|&[hi, lo]| {
+            let hi = (hi as char)
                 .to_digit(16)
                 .ok_or_else(|| Error::generic(format!("invalid hex digit in {input}")))?;
-            let lo = (pair[1] as char)
+            let lo = (lo as char)
                 .to_digit(16)
                 .ok_or_else(|| Error::generic(format!("invalid hex digit in {input}")))?;
             Ok((hi << 4 | lo) as u8)
@@ -347,7 +348,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{DecimalData, Expression};
-    use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+    use crate::schema::{schema, ArrayType, DataType, DecimalType, MapType};
 
     fn date_days(year: i32, month: u32, day: u32) -> i32 {
         let nd = NaiveDate::from_ymd_opt(year, month, day)
@@ -457,7 +458,8 @@ mod tests {
     #[case("'2024-01-01 12:34:56'", "zoneless")]
     #[case("TIMESTAMP '2024-01-01 12:34:56'", "zoneless")]
     #[case("'2024-06-15T14:30:00+05:00'", "offset")]
-    #[case("'2024-06-15T14:30:00+00:00'", "offset")] // +00:00 is UTC-valued but dropped, so rejected
+    #[case("'2024-06-15T14:30:00+00:00'", "offset")] // +00:00 is UTC-valued but dropped, so
+                                                     // rejected
     fn timestamp_ltz_rejection_distinguishes_zoneless_from_offset(
         #[case] sql: &str,
         #[case] needle: &str,
@@ -490,7 +492,8 @@ mod tests {
     #[rstest]
     #[case("TIMESTAMP_NTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP)] // NTZ keyword, LTZ target
     #[case("TIMESTAMP '2024-01-01 12:34:56'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
-    #[case("TIMESTAMP_LTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
+    #[case("TIMESTAMP_LTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ
+                                                                             // target
     fn rejects_mismatched_timestamp_keyword(#[case] sql: &str, #[case] ty: DataType) {
         let result = parse_sql(sql, &ty);
         assert!(
@@ -507,7 +510,8 @@ mod tests {
     #[case("'2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")]
     #[case("TIMESTAMP '2024-06-15T14:30:00.456Z'", "2024-06-15 14:30:00.456")]
     #[case("TIMESTAMP_LTZ '2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")] // explicit LTZ spelling
-    #[case("TIMESTAMP_LTZ'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")] // butted against quote
+    #[case("TIMESTAMP_LTZ'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")] // butted against
+                                                                                  // quote
     fn iso_8601_form_accepted_only_for_timestamp(#[case] sql: &str, #[case] equivalent: &str) {
         let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
         assert_eq!(got, lit(Scalar::Timestamp(ts_micros(equivalent))));
@@ -764,19 +768,15 @@ mod tests {
     }
 
     fn struct_ty() -> DataType {
-        DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
+        DataType::from(schema! { nullable "a": INTEGER })
     }
 
     fn array_ty() -> DataType {
-        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true)))
+        DataType::from(ArrayType::new(DataType::INTEGER, true))
     }
 
     fn map_ty() -> DataType {
-        DataType::Map(Box::new(MapType::new(
-            DataType::STRING,
-            DataType::INTEGER,
-            true,
-        )))
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true))
     }
 
     #[rstest]

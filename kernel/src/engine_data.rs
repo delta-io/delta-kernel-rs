@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use derive_more::Constructor;
 use tracing::debug;
 
 use crate::actions::visitors::SelectionVectorVisitor;
@@ -126,16 +127,13 @@ pub trait StringArrayAccessor {
 /// A pre-resolved view into a single row's list of strings. The string array type is resolved
 /// once at construction, so subsequent element accesses use virtual dispatch rather than
 /// repeated downcasting.
+#[derive(Constructor)]
 pub struct ListItem<'a> {
     values: &'a dyn StringArrayAccessor,
     offsets: Range<usize>,
 }
 
 impl<'a> ListItem<'a> {
-    pub fn new(values: &'a dyn StringArrayAccessor, offsets: Range<usize>) -> ListItem<'a> {
-        ListItem { values, offsets }
-    }
-
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
@@ -167,6 +165,7 @@ impl<'a> ListItem<'a> {
 /// materialize the map using [`MapItem::get`].
 ///
 /// [`materialize`]: MapItem::materialize
+#[derive(Constructor)]
 pub struct MapItem<'a> {
     keys: &'a dyn StringArrayAccessor,
     values: &'a dyn StringArrayAccessor,
@@ -174,18 +173,6 @@ pub struct MapItem<'a> {
 }
 
 impl<'a> MapItem<'a> {
-    pub fn new(
-        keys: &'a dyn StringArrayAccessor,
-        values: &'a dyn StringArrayAccessor,
-        offsets: Range<usize>,
-    ) -> MapItem<'a> {
-        MapItem {
-            keys,
-            values,
-            offsets,
-        }
-    }
-
     pub fn get(&self, key: &str) -> Option<&'a str> {
         let idx = self
             .offsets
@@ -232,16 +219,13 @@ pub trait StructListAccessor {
 
 /// A handle to a single row's array of element structs. Unlike [`ListItem`], which materializes
 /// strings, the elements are structs visited in place by a nested [`RowVisitor`].
+#[derive(Constructor)]
 pub struct StructList<'a> {
     list: &'a dyn StructListAccessor,
     row_index: usize,
 }
 
 impl<'a> StructList<'a> {
-    pub fn new(list: &'a dyn StructListAccessor, row_index: usize) -> StructList<'a> {
-        StructList { list, row_index }
-    }
-
     /// Drives a nested [`RowVisitor`] over this row's element structs, one visited row per
     /// element. The visitor's columns resolve against the element struct's schema, not the outer
     /// row's. Errors if any element struct in this row is null.

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, DeltaResultIterator};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -103,7 +103,8 @@ impl UpdateTableClient for FfiUCCommitClient {
 
             match (self.commit_callback)(self.context, c_commit_request) {
                 OptionalValue::Some(e) => {
-                    let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
+                    let boxed_str = unsafe { e.into_inner() }; // get the string back into
+                                                               // Box<String>
                     let s: String = *boxed_str; // move back onto the stack
                     Err(unity_catalog_delta_client_api::Error::Generic(s))
                 }
@@ -171,9 +172,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: Box<
-            dyn Iterator<Item = DeltaResult<delta_kernel::FilteredEngineData>> + Send + '_,
-        >,
+        actions: DeltaResultIterator<'_, delta_kernel::FilteredEngineData>,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
         // We hold this guard until the end of the function so we stay in the tokio context until

@@ -28,12 +28,14 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
+    self, schema, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField,
+    StructType,
 };
 use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::TestCancellationToken;
 use crate::{
-    DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -66,39 +68,40 @@ fn test_static_skipping() {
 
 #[test]
 fn test_physical_predicate() {
-    let logical_schema = StructType::new_unchecked(vec![
-        StructField::nullable("a", DataType::LONG),
-        StructField::nullable("b", DataType::LONG).with_metadata([(
+    let logical_schema = schema! {
+        nullable "a": LONG,
+        (StructField::nullable("b", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_b",
-        )]),
-        StructField::nullable("phys_b", DataType::LONG).with_metadata([(
+        )])),
+        (StructField::nullable("phys_b", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_c",
-        )]),
-        StructField::nullable(
+        )])),
+        (StructField::nullable(
             "nested",
-            StructType::new_unchecked(vec![
-                StructField::nullable("x", DataType::LONG),
-                StructField::nullable("y", DataType::LONG).with_metadata([(
+            schema! {
+                nullable "x": LONG,
+                (StructField::nullable("y", DataType::LONG).with_metadata([(
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     "phys_y",
-                )]),
-            ]),
-        ),
-        StructField::nullable(
+                )])),
+            },
+        )),
+        (StructField::nullable(
             "mapped",
-            StructType::new_unchecked(vec![StructField::nullable("n", DataType::LONG)
-                .with_metadata([(
+            schema! {
+                (StructField::nullable("n", DataType::LONG).with_metadata([(
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                     "phys_n",
-                )])]),
+                )])),
+            },
         )
         .with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_mapped",
-        )]),
-    ]);
+        )])),
+    };
 
     // NOTE: We break several column mapping rules here because they don't matter for this
     // test. For example, we do not provide field ids, and not all columns have physical names.
@@ -110,92 +113,86 @@ fn test_physical_predicate() {
             column_pred!("a"),
             Some(PhysicalPredicate::Some(
                 column_pred!("a").into(),
-                StructType::new_unchecked(vec![StructField::nullable("a", DataType::LONG)]).into(),
+                schema_ref! { nullable "a": LONG },
             )),
         ),
         (
             column_pred!("b"),
             Some(PhysicalPredicate::Some(
                 column_pred!("phys_b").into(),
-                StructType::new_unchecked(vec![StructField::nullable("phys_b", DataType::LONG)
-                    .with_metadata([(
+                schema_ref! {
+                    (StructField::nullable("phys_b", DataType::LONG).with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_b",
-                    )])])
-                .into(),
+                    )])),
+                },
             )),
         ),
         (
             column_pred!("nested.x"),
             Some(PhysicalPredicate::Some(
                 column_pred!("nested.x").into(),
-                StructType::new_unchecked(vec![StructField::nullable(
-                    "nested",
-                    StructType::new_unchecked(vec![StructField::nullable("x", DataType::LONG)]),
-                )])
-                .into(),
+                schema_ref! {
+                    nullable "nested": {
+                        nullable "x": LONG,
+                    },
+                },
             )),
         ),
         (
             column_pred!("nested.y"),
             Some(PhysicalPredicate::Some(
                 column_pred!("nested.phys_y").into(),
-                StructType::new_unchecked(vec![StructField::nullable(
-                    "nested",
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_y",
-                        DataType::LONG,
-                    )
-                    .with_metadata([(
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_y",
-                    )])]),
-                )])
-                .into(),
+                schema_ref! {
+                    nullable "nested": {
+                        (StructField::nullable("phys_y", DataType::LONG).with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_y",
+                        )])),
+                    },
+                },
             )),
         ),
         (
             column_pred!("mapped.n"),
             Some(PhysicalPredicate::Some(
                 column_pred!("phys_mapped.phys_n").into(),
-                StructType::new_unchecked(vec![StructField::nullable(
-                    "phys_mapped",
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_n",
-                        DataType::LONG,
+                schema_ref! {
+                    (StructField::nullable(
+                        "phys_mapped",
+                        schema! {
+                            (StructField::nullable("phys_n", DataType::LONG).with_metadata([(
+                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                                "phys_n",
+                            )])),
+                        },
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_n",
-                    )])]),
-                )
-                .with_metadata([(
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    "phys_mapped",
-                )])])
-                .into(),
+                        "phys_mapped",
+                    )])),
+                },
             )),
         ),
         (
             Pred::and(column_pred!("mapped.n"), Pred::TRUE),
             Some(PhysicalPredicate::Some(
                 Pred::and(column_pred!("phys_mapped.phys_n"), Pred::TRUE).into(),
-                StructType::new_unchecked(vec![StructField::nullable(
-                    "phys_mapped",
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_n",
-                        DataType::LONG,
+                schema_ref! {
+                    (StructField::nullable(
+                        "phys_mapped",
+                        schema! {
+                            (StructField::nullable("phys_n", DataType::LONG).with_metadata([(
+                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                                "phys_n",
+                            )])),
+                        },
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_n",
-                    )])]),
-                )
-                .with_metadata([(
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    "phys_mapped",
-                )])])
-                .into(),
+                        "phys_mapped",
+                    )])),
+                },
             )),
         ),
         (
@@ -220,10 +217,10 @@ fn test_physical_predicate() {
 #[rstest]
 #[case::without_column_mapping(
     // predicate: createdat > 500 AND value < 100, schema: createdAt, Value
-    StructType::new_unchecked(vec![
-        StructField::nullable("createdAt", DataType::LONG),
-        StructField::nullable("Value", DataType::LONG),
-    ]),
+    schema! {
+        nullable "createdAt": LONG,
+        nullable "Value": LONG,
+    },
     Pred::and(
         Pred::gt(col!("createdat"), lit(500i64)),
         Pred::lt(col!("value"), lit(100i64)),
@@ -234,24 +231,24 @@ fn test_physical_predicate() {
             Pred::gt(col!("createdAt"), lit(500i64)),
             Pred::lt(col!("Value"), lit(100i64)),
         )),
-        StructType::new_unchecked(vec![
-            StructField::nullable("createdAt", DataType::LONG),
-            StructField::nullable("Value", DataType::LONG),
-        ]).into(),
+        schema_ref! {
+            nullable "createdAt": LONG,
+            nullable "Value": LONG,
+        },
     ),
 )]
 #[case::with_column_mapping(
     // predicate: createdat > 500 AND value < 100, schema has physical name metadata
-    StructType::new_unchecked(vec![
-        StructField::nullable("createdAt", DataType::LONG).with_metadata([(
+    schema! {
+        (StructField::nullable("createdAt", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_created",
-        )]),
-        StructField::nullable("Value", DataType::LONG).with_metadata([(
+        )])),
+        (StructField::nullable("Value", DataType::LONG).with_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
             "phys_value",
-        )]),
-    ]),
+        )])),
+    },
     Pred::and(
         Pred::gt(col!("createdat"), lit(500i64)),
         Pred::lt(col!("value"), lit(100i64)),
@@ -262,23 +259,21 @@ fn test_physical_predicate() {
             Pred::gt(col!("phys_created"), lit(500i64)),
             Pred::lt(col!("phys_value"), lit(100i64)),
         )),
-        StructType::new_unchecked(vec![
-            StructField::nullable("phys_created", DataType::LONG).with_metadata([(
+        schema_ref! {
+            (StructField::nullable("phys_created", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 "phys_created",
-            )]),
-            StructField::nullable("phys_value", DataType::LONG).with_metadata([(
+            )])),
+            (StructField::nullable("phys_value", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 "phys_value",
-            )]),
-        ]).into(),
+            )])),
+        },
     ),
 )]
 #[case::duplicate_column_different_casing(
     // predicate references same column with different casings: value > 5 AND VALUE < 10
-    StructType::new_unchecked(vec![
-        StructField::nullable("Value", DataType::LONG),
-    ]),
+    schema! { nullable "Value": LONG },
     Pred::and(
         Pred::gt(col!("value"), lit(5i64)),
         Pred::lt(col!("VALUE"), lit(10i64)),
@@ -289,26 +284,25 @@ fn test_physical_predicate() {
             Pred::gt(col!("Value"), lit(5i64)),
             Pred::lt(col!("Value"), lit(10i64)),
         )),
-        StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)])
-            .into(),
+        schema_ref! { nullable "Value": LONG },
     ),
 )]
 #[case::nested_fields(
     // predicate references nested.fieldname but schema has Nested.FieldName
-    StructType::new_unchecked(vec![StructField::nullable(
-        "Nested",
-        StructType::new_unchecked(vec![StructField::nullable("FieldName", DataType::LONG)]),
-    )]),
+    schema! {
+        nullable "Nested": {
+            nullable "FieldName": LONG,
+        },
+    },
     column_pred!("nested.fieldname"),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
         column_pred!("Nested.FieldName").into(),
-        StructType::new_unchecked(vec![StructField::nullable(
-            "Nested",
-            StructType::new_unchecked(vec![
-                StructField::nullable("FieldName", DataType::LONG)
-            ]),
-        )]).into(),
+        schema_ref! {
+            nullable "Nested": {
+                nullable "FieldName": LONG,
+            },
+        },
     ),
 )]
 fn test_physical_predicate_case_insensitive(
@@ -325,8 +319,7 @@ fn test_physical_predicate_case_insensitive(
 /// Unknown column still fails even with case-insensitive matching.
 #[test]
 fn test_physical_predicate_case_insensitive_unknown_column() {
-    let logical_schema =
-        StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
+    let logical_schema = schema! { nullable "createdAt": LONG };
     let result = PhysicalPredicate::try_new(
         &column_pred!("nonexistent"),
         &logical_schema,
@@ -341,10 +334,10 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
 
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("number", DataType::LONG),
-        StructField::nullable("a_float", DataType::FLOAT),
-    ]));
+    let schema = schema_ref! {
+        nullable "number": LONG,
+        nullable "a_float": FLOAT,
+    };
     create_table(url, schema, "DefaultEngine")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
@@ -532,10 +525,12 @@ fn test_without_row_transforms_rejects_execute() {
     );
 }
 
-/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
-/// build time regardless of `without_row_transforms`.
+/// Row commit version metadata columns require a row-tracking-enabled table, including when row
+/// transforms are disabled.
 #[rstest]
-fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+fn test_scan_rejects_row_commit_version_when_row_tracking_is_disabled(
+    #[values(false, true)] without_row_transforms: bool,
+) {
     let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let schema = Arc::new(
         snapshot
@@ -549,10 +544,10 @@ fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_trans
     }
     let err = builder
         .build()
-        .expect_err("row commit version columns are unsupported by scans");
+        .expect_err("row commit version columns require row tracking");
     assert!(
         err.to_string()
-            .contains("Row commit versions not supported"),
+            .contains("Row commit versions are not enabled on this table"),
         "unexpected error: {err}"
     );
 }
@@ -671,6 +666,38 @@ fn test_scan_metadata_from_same_version() {
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+#[test_log::test]
+fn scan_metadata_from_cancels_cached_metadata_consumption() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let version = snapshot.version();
+    let uncancelled_scan = snapshot.clone().scan_builder().build().unwrap();
+    let files: Vec<_> = uncancelled_scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .map_ok(|ScanMetadata { scan_files, .. }| scan_files.into_parts().0)
+        .try_collect()
+        .unwrap();
+
+    let token = Arc::new(TestCancellationToken::default());
+    let token_ref: CancellationTokenRef = token.clone();
+    let scan = snapshot
+        .scan_builder()
+        .with_cancellation_token(token_ref)
+        .build()
+        .unwrap();
+    let mut metadata = scan
+        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .unwrap();
+
+    token.cancel();
+    assert!(matches!(metadata.next(), Some(Err(Error::Cancelled))));
 }
 
 // reading v0 with 3 files.
@@ -1682,7 +1709,7 @@ fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
 
 #[derive(Debug)]
 struct RecordedParquetRead {
-    files: Vec<String>,
+    files: Vec<FileMeta>,
     physical_schema: schema::SchemaRef,
     predicate: Option<PredicateRef>,
 }
@@ -1713,7 +1740,7 @@ impl ParquetHandler for RecordingParquetHandler {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
-            files: files.iter().map(|file| file.location.to_string()).collect(),
+            files: files.to_vec(),
             physical_schema: physical_schema.clone(),
             predicate: predicate.clone(),
         });
@@ -1732,6 +1759,52 @@ impl ParquetHandler for RecordingParquetHandler {
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
     }
+}
+
+#[test_log::test]
+fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = Arc::new(DelegatingEngine::new(sync).with_parquet_handler(recorder.clone()));
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    fn collect_file_modification_times(
+        file_modification_times: &mut Vec<(String, i64)>,
+        scan_file: ScanFile,
+    ) {
+        file_modification_times.push((scan_file.path.to_string(), scan_file.modification_time));
+    }
+
+    let mut expected = Vec::new();
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        expected = scan_metadata
+            .unwrap()
+            .visit_scan_files(expected, collect_file_modification_times)
+            .unwrap();
+    }
+    recorder.take_reads();
+
+    let _: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let reads = recorder.take_reads();
+    let mut actual: Vec<_> = reads
+        .into_iter()
+        .flat_map(|read| read.files)
+        .filter_map(|file| {
+            file.location
+                .to_string()
+                .strip_prefix(url.as_str())
+                .map(|path| (path.to_string(), file.last_modified))
+        })
+        .collect();
+
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 #[rstest]
@@ -1789,7 +1862,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         .filter(|read| {
             read.files
                 .iter()
-                .any(|file| file.contains(expected_file_fragment))
+                .any(|file| file.location.as_str().contains(expected_file_fragment))
                 && read.physical_schema.field("add").is_some()
         })
         .collect();
@@ -1899,7 +1972,7 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         reads.iter().any(|read| {
             read.files
                 .iter()
-                .any(|file| file.contains(expected_file_fragment))
+                .any(|file| file.location.as_str().contains(expected_file_fragment))
                 && read
                     .predicate
                     .as_ref()
@@ -2032,7 +2105,9 @@ fn test_default_stats_options_no_struct_output() {
 #[case::id_with_json_without_predicate(
     StatsOptions {
         synthesize_json: true,
-        struct_stats: StructStats::Columns(vec![column_name!("id")]),
+        struct_stats: StructStats::Columns {
+            requested: vec![column_name!("id")],
+        },
     },
     &["id"],
     None,
@@ -2198,11 +2273,34 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
-            struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+            struct_stats: StructStats::Columns {
+                requested: vec![column_name!("nonexistent_column")],
+            },
         })
         .build();
 
     assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
+}
+
+#[test]
+fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("nonexistent_column"),
+        ]))
+        .build();
+
+    assert!(
+        result.is_ok(),
+        "unresolvable extra_indexed column should be dropped, not error: {:?}",
+        result.err()
+    );
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
@@ -2333,50 +2431,57 @@ mod scan_metadata_completed_tests {
     }
 
     #[rstest]
-    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, (6, 2, 6, 17236, 0, 0))]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
         Some(Arc::new(Pred::FALSE)),
-        0,
-        0,
-        0,
-        0,
-        0
+        (0, 0, 0, 0, 0, 0)
     )]
-    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, (1, 1, 0, 0, 2, 0))]
     #[case::with_checkpoint(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
         None,
-        2,
-        1,
-        1010,
-        1,
-        0
+        (2, 1, 1, 1010, 1, 0)
     )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(col!("letter"), lit("a")))),
-        2, 2, 1502, 0, 4
+        (6, 6, 2, 1502, 0, 4)
     )]
     fn test_scan_metrics(
         #[case] table: &str,
         #[case] predicate: Option<Arc<Pred>>,
-        #[case] expected_add_seen: u64,
-        #[case] expected_active: u64,
-        #[case] expected_active_bytes: u64,
-        #[case] expected_removes: u64,
-        #[case] expected_filtered: u64,
+        #[case] expected: (u64, u64, u64, u64, u64, u64),
     ) {
+        let (
+            expected_add_seen,
+            expected_add_seen_from_delta,
+            expected_active,
+            expected_active_bytes,
+            expected_removes,
+            expected_filtered,
+        ) = expected;
         let (reporter, _guard, _) = run_scan(table, predicate, None);
         let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
         assert!(e.duration > Duration::ZERO);
         assert_eq!(e.num_add_files_seen, expected_add_seen);
-        assert_eq!(e.num_active_add_files, expected_active);
-        assert_eq!(e.active_add_files_bytes, expected_active_bytes);
-        assert_eq!(e.num_remove_files_seen, expected_removes);
+        assert_eq!(
+            e.num_add_files_seen_from_delta_files,
+            expected_add_seen_from_delta
+        );
+        assert_eq!(e.num_selected_add_files, expected_active);
+        assert_eq!(e.selected_add_files_bytes, expected_active_bytes);
+        assert_eq!(e.num_remove_files_seen_from_delta_files, expected_removes);
         assert_eq!(e.num_predicate_filtered, expected_filtered);
+        let rendered = e.to_string();
+        assert!(rendered.contains(&format!(
+            "add_files_seen_from_delta_files={expected_add_seen_from_delta}"
+        )));
+        assert!(rendered.contains(&format!(
+            "remove_files_seen_from_delta_files={expected_removes}"
+        )));
     }
 
     // The parallel-scan paths (both sequential and parallel phase events) are covered by

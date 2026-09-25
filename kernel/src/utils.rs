@@ -1,5 +1,6 @@
 //! Various utility functions/macros used throughout the kernel
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +9,16 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::{DeltaResult, Error};
+
+/// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
+///
+/// It is covariant in `T`, and Send+Sync even if `T` is not. Use this instead of [`PhantomData<T>`]
+/// when `T` is only a compile-time parameter, because [`PhantomData<T>`] tells the compiler that
+/// the containing type owns and may drop a `T`, and additionally makes Send/Sync follow `T`.
+///
+/// A generic alias cannot be named as a constructor, so construct values with
+/// [`PhantomType::default`] instead of `PhantomType`.
+pub(crate) type PhantomType<T> = PhantomData<fn() -> *const T>;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -161,6 +172,7 @@ pub(crate) trait FoldWithOption: Sized {
 
     /// Fallible [`fold_with`](Self::fold_with): applies `Result`-returning `f` to `self` if `opt`
     /// is [`Some`], otherwise returns `self` unchanged (wrapped in `Ok`).
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn try_fold_with<U, E>(
         self,
         opt: Option<U>,

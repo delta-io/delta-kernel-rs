@@ -30,6 +30,8 @@ pub use partition_value::{
     partition_value_map_new, ExclusivePartitionValueMap,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::EngineSchema;
@@ -133,16 +135,14 @@ fn commit_result_to_committed_handle<S>(
     result: DeltaResult<CommitResult<S>>,
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
-        CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
-        CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
+        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
+        CommitResult::Retryable(_) => Err(delta_kernel::Error::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
-        CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            )))
-        }
+        CommitResult::Conflicted(conflicted) => Err(delta_kernel::Error::Generic(format!(
+            "commit conflict at version {}",
+            conflicted.conflict_version()
+        ))),
     }
 }
 
@@ -275,6 +275,74 @@ fn with_domain_metadata_removed_impl(
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
 }
 
+/// Set an explicit row-tracking high-water mark for this transaction.
+///
+/// Use this when row IDs must also be coordinated with another system. Kernel still assigns
+/// row-tracking fields to files passed to [`add_files`] and rejects `high_water_mark` if it is less
+/// than the value calculated from those files. The generic [`with_domain_metadata`] API cannot
+/// modify `delta.rowTracking` or other system-controlled domains.
+///
+/// Returns the updated transaction handle, or an error if the transaction already has an explicit
+/// high-water mark. Table-feature and current-table-state validation occurs during commit.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn with_row_tracking_high_water_mark(
+    txn: Handle<ExclusiveTransaction>,
+    high_water_mark: i64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_row_tracking_high_water_mark_impl(*txn, high_water_mark).into_extern_result(&engine)
+}
+
+fn with_row_tracking_high_water_mark_impl(
+    txn: Transaction,
+    high_water_mark: i64,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
+}
+
+/// Stages `file` to be committed as this transaction's root manifest.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn with_root_manifest_file(
+    txn: Handle<ExclusiveTransaction>,
+    file: &FileMeta,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_root_manifest_file_impl(*txn, file).into_extern_result(&engine)
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn with_root_manifest_file_impl(
+    txn: Transaction,
+    file: &FileMeta,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
+    let location = Url::parse(path)?;
+    let size = file
+        .size
+        .try_into()
+        .map_err(|_| delta_kernel::Error::generic("manifest size does not fit a FileSize"))?;
+    let delta_file = delta_kernel::FileMeta {
+        location,
+        last_modified: file.last_modified,
+        size,
+    };
+    Ok(Box::new(txn.with_root_manifest_file(delta_file)?).into())
+}
+
 /// Add file metadata to the transaction for files that have been written. The metadata contains
 /// information about files written during the transaction that will be added to the Delta log
 /// during commit.
@@ -362,6 +430,38 @@ fn create_table_with_engine_info_impl(
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
     Ok(Box::new(txn.with_engine_info(info)).into())
+}
+
+/// Add domain metadata to a create-table transaction.
+///
+/// `domain` identifies the user-controlled metadata domain, and `configuration` is its arbitrary
+/// string value. Returns the updated transaction handle. Invalid strings are returned as errors;
+/// domain and table-feature validation occurs when the transaction is committed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_with_domain_metadata(
+    txn: Handle<ExclusiveCreateTransaction>,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    create_table_with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
+}
+
+fn create_table_with_domain_metadata_impl(
+    txn: CreateTableTransaction,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
 }
 
 /// Add file metadata to a create-table transaction for files that have been written. The metadata
@@ -792,15 +892,16 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
-        StructType,
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
     };
     use delta_kernel::table_features::TableFeature;
+    use delta_kernel_ffi::delta_types::FfiColumnNameArray;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        engine_handle_for_store, ok_or_panic, recover_error, recover_string,
+        allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
+        assert_extern_result_error_with_message, build_snapshot, engine_handle_for_store,
+        ok_or_panic, recover_bytes, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
@@ -811,9 +912,11 @@ mod tests {
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
-        create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
-        get_partitioned_write_context, get_physical_write_schema, get_unpartitioned_write_context,
-        get_write_dir, get_write_path, get_write_schema, resolve_file_path, visit_partition_values,
+        create_table_get_partitioned_write_context, create_table_get_unpartitioned_write_context,
+        free_write_context, get_logical_to_physical, get_partitioned_write_context,
+        get_physical_write_schema, get_unpartitioned_write_context, get_write_dir, get_write_path,
+        get_write_schema, resolve_file_path, visit_partition_values, write_context_builder_build,
+        write_context_builder_with_partition_values, FfiRowTrackingMetadataColumns,
         SharedWriteContext,
     };
 
@@ -824,8 +927,8 @@ mod tests {
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
-        KernelStringSlice, NullableCvoid, OptionalValue,
+        free_engine, free_schema, free_snapshot, kernel_bytes_slice, kernel_string_slice,
+        logical_schema, version, KernelStringSlice, NullableCvoid, OptionalValue,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -978,10 +1081,10 @@ mod tests {
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
     )]
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+        };
 
         // TODO: test with partitions
         let (_tmp_test_dir, tables) = setup_local_test_tables(schema, &[], "test_table").await?;
@@ -1150,6 +1253,258 @@ mod tests {
         collected.push((key, value, is_null));
     }
 
+    extern "C" fn allocate_column_names(columns: FfiColumnNameArray) -> NullableCvoid {
+        let columns = unsafe { columns.try_as_slice() }.unwrap();
+        let columns: Vec<Vec<String>> = columns
+            .iter()
+            .map(|column| {
+                let path = unsafe { column.path.try_as_slice() }.unwrap();
+                path.iter()
+                    .map(|part| unsafe { String::try_from_slice(part) }.unwrap())
+                    .collect()
+            })
+            .collect();
+        std::ptr::NonNull::new(Box::into_raw(Box::new(columns)).cast())
+    }
+
+    fn recover_column_names(ptr: std::ptr::NonNull<c_void>) -> Vec<Vec<String>> {
+        *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
+    }
+
+    #[rstest]
+    #[case::unpartitioned(false)]
+    #[case::partitioned(true)]
+    #[tokio::test]
+    async fn test_distributed_write_state_outlives_transaction(
+        #[case] partitioned: bool,
+        #[values(false, true)] roundtrip: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "part": INTEGER,
+        };
+        let columns = if partitioned { vec!["part"] } else { vec![] };
+        let tables = setup_test_tables(schema, &columns, None, "distributed_write").await?;
+        for (table_url, _engine, store, _table_name) in tables {
+            let engine = engine_handle_for_store(store);
+            let table_url_str = table_url.as_str();
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            });
+            let state = ok_or_panic(unsafe {
+                write_context::transaction_write_state(txn.shallow_copy(), engine.shallow_copy())
+            });
+            unsafe { free_transaction(txn) };
+            let state = if roundtrip {
+                let encoded = recover_bytes(
+                    ok_or_panic(unsafe {
+                        write_context::write_state_encode(
+                            state.shallow_copy(),
+                            allocate_bytes,
+                            engine.shallow_copy(),
+                        )
+                    })
+                    .unwrap(),
+                );
+                unsafe { write_context::free_write_state(state) };
+                ok_or_panic(unsafe {
+                    write_context::write_state_decode(
+                        kernel_bytes_slice!(encoded),
+                        engine.shallow_copy(),
+                    )
+                })
+            } else {
+                state
+            };
+
+            let stats = recover_column_names(
+                unsafe {
+                    write_context::get_write_state_stats_columns(
+                        state.shallow_copy(),
+                        allocate_column_names,
+                    )
+                }
+                .unwrap(),
+            );
+            assert!(stats.contains(&vec!["number".to_string()]));
+
+            let invalid_partitions = partition_value_map_new();
+            let unknown = "unknown";
+            ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    invalid_partitions.shallow_copy(),
+                    kernel_string_slice!(unknown),
+                    1,
+                    engine.shallow_copy(),
+                )
+            });
+            let builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            let builder =
+                unsafe { write_context_builder_with_partition_values(builder, invalid_partitions) };
+            let invalid_partition_build =
+                unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
+            assert_extern_result_error_contains(
+                invalid_partition_build,
+                KernelError::UnknownError,
+                if partitioned {
+                    "unknown partition column 'unknown'"
+                } else {
+                    "table is not partitioned; partition values are not allowed"
+                },
+            );
+
+            if partitioned {
+                let builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+                let builder = unsafe {
+                    write_context_builder_with_partition_values(builder, partition_value_map_new())
+                };
+                let missing_partition_build =
+                    unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
+                assert_extern_result_error_contains(
+                    missing_partition_build,
+                    KernelError::UnknownError,
+                    "missing partition column 'part'",
+                );
+            }
+
+            let invalid_utf8 = [0xff];
+            let builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            let invalid_columns = FfiRowTrackingMetadataColumns {
+                row_id_col_name: OptionalValue::Some(KernelStringSlice {
+                    ptr: invalid_utf8.as_ptr().cast(),
+                    len: invalid_utf8.len(),
+                }),
+                row_commit_version_col_name: OptionalValue::None,
+            };
+            let invalid_row_tracking = unsafe {
+                write_context::write_context_builder_with_row_tracking_columns(
+                    builder,
+                    &invalid_columns,
+                    engine.shallow_copy(),
+                )
+            };
+            assert_extern_result_error_with_message(
+                invalid_row_tracking,
+                KernelError::Utf8Error,
+                None,
+            );
+
+            let mut builder = unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            if partitioned {
+                let partitions = partition_value_map_new();
+                let part_name = "part";
+                ok_or_panic(unsafe {
+                    partition_value_map_insert_int(
+                        partitions.shallow_copy(),
+                        kernel_string_slice!(part_name),
+                        1,
+                        engine.shallow_copy(),
+                    )
+                });
+                builder =
+                    unsafe { write_context_builder_with_partition_values(builder, partitions) };
+            }
+            let row_id_col_name = "row_id";
+            let row_commit_version_col_name = "row_commit_version";
+            let columns = FfiRowTrackingMetadataColumns {
+                row_id_col_name: OptionalValue::Some(kernel_string_slice!(row_id_col_name)),
+                row_commit_version_col_name: OptionalValue::Some(kernel_string_slice!(
+                    row_commit_version_col_name
+                )),
+            };
+            let builder = ok_or_panic(unsafe {
+                write_context::write_context_builder_with_row_tracking_columns(
+                    builder,
+                    &columns,
+                    engine.shallow_copy(),
+                )
+            });
+            let unsupported_row_tracking_build =
+                unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
+            assert_extern_result_error_with_message(
+                unsupported_row_tracking_build,
+                KernelError::UnsupportedError,
+                None,
+            );
+
+            let unused_builder =
+                unsafe { write_context::write_context_builder(state.shallow_copy()) };
+            unsafe { write_context::free_write_context_builder(unused_builder) };
+
+            let mut builders = Vec::new();
+            for value in [42, 43] {
+                let mut builder =
+                    unsafe { write_context::write_context_builder(state.shallow_copy()) };
+                if partitioned {
+                    let partitions = partition_value_map_new();
+                    let part_name = "part";
+                    ok_or_panic(unsafe {
+                        partition_value_map_insert_int(
+                            partitions.shallow_copy(),
+                            kernel_string_slice!(part_name),
+                            value,
+                            engine.shallow_copy(),
+                        )
+                    });
+                    builder =
+                        unsafe { write_context_builder_with_partition_values(builder, partitions) };
+                }
+                builders.push((value, builder));
+            }
+            unsafe { write_context::free_write_state(state) };
+
+            let mut contexts = Vec::new();
+            for (value, builder) in builders {
+                let context = ok_or_panic(unsafe {
+                    write_context_builder_build(builder, engine.shallow_copy())
+                });
+                contexts.push((value, context));
+            }
+            for (value, context) in contexts {
+                let dir = recover_string(
+                    unsafe { get_write_dir(context.shallow_copy(), allocate_str) }.unwrap(),
+                );
+                assert_eq!(dir.ends_with(&format!("part={value}/")), partitioned);
+                let mut collected: Vec<(String, String, bool)> = Vec::new();
+                unsafe {
+                    visit_partition_values(
+                        context.shallow_copy(),
+                        std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                        collect_partition_value,
+                    );
+                }
+                assert_eq!(collected.len(), usize::from(partitioned));
+                if partitioned {
+                    assert_eq!(collected[0], ("part".into(), value.to_string(), false));
+                }
+                let malformed = b"{}".to_vec();
+                let result = unsafe {
+                    write_context::write_state_decode(
+                        kernel_bytes_slice!(malformed),
+                        engine.shallow_copy(),
+                    )
+                };
+                assert_extern_result_error_with_message(
+                    result,
+                    KernelError::MalformedJsonError,
+                    None,
+                );
+                let snapshot = unsafe {
+                    build_snapshot(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                };
+                let physical = unsafe { crate::snapshot_physical_schema(snapshot.shallow_copy()) };
+                assert_eq!(unsafe { physical.as_ref() }.num_fields(), 2);
+                unsafe {
+                    crate::free_schema(physical);
+                    free_snapshot(snapshot);
+                    free_write_context(context);
+                }
+            }
+            unsafe { free_engine(engine) };
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     // Keeps local storage: the test creates the Hive partition directory on disk, which an object
     // store does not have.
@@ -1163,11 +1518,11 @@ mod tests {
     async fn test_partitioned_append() -> Result<(), Box<dyn std::error::Error>> {
         // Partition column `part` is listed last in the schema; the physical write schema must
         // exclude it (CM=none, partition columns are not materialized).
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-            StructField::nullable("part", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+            nullable "part": INTEGER,
+        };
 
         let (_tmp_test_dir, tables) =
             setup_local_test_tables(schema, &["part"], "test_partitioned_table").await?;
@@ -1353,10 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn test_partitioned_write_context_rejects_unpartitioned_table(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "number",
-            DataType::INTEGER,
-        )])?);
+        let schema = schema_ref! { nullable "number": INTEGER };
         let tables = setup_test_tables(schema, &[], None, "test_unpartitioned").await?;
 
         for (table_url, _engine, store, _table_name) in tables {
@@ -1405,10 +1757,10 @@ mod tests {
     async fn test_visit_partition_values_surfaces_null() -> Result<(), Box<dyn std::error::Error>> {
         // A null partition value must surface across the visitor as `is_null = true` with an
         // empty value slice (the documented C contract).
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("part", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "part": INTEGER,
+        };
         let tables = setup_test_tables(schema, &["part"], None, "test_null_partition").await?;
 
         for (table_url, _engine, store, _table_name) in tables {
@@ -1461,11 +1813,11 @@ mod tests {
     {
         // Multiple partition columns must be visited in deterministic (sorted) key order,
         // regardless of insertion order or the underlying HashMap layout.
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("year", DataType::INTEGER),
-        ])?);
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "region": STRING,
+            nullable "year": INTEGER,
+        };
         let tables =
             setup_test_tables(schema, &["year", "region"], None, "test_multi_partition").await?;
 
@@ -1546,14 +1898,19 @@ mod tests {
             .expect("commit should contain a domainMetadata action")
     }
 
-    /// Create a table with the `domainMetadata` writer feature enabled and return the table
-    /// URL, object store, and FFI engine handle.
+    /// Create a table with the requested domain-metadata features.
     async fn setup_domain_metadata_table(
         name: &str,
+        row_tracking: bool,
     ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
-        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) = test_utils::engine_store_setup(name, None);
+        let writer_features = if row_tracking {
+            vec!["rowTracking", "domainMetadata"]
+        } else {
+            vec!["domainMetadata"]
+        };
         let table_url = test_utils::create_table(
             store.clone(),
             table_location,
@@ -1561,7 +1918,7 @@ mod tests {
             &[],
             true,
             vec![],
-            vec!["domainMetadata"],
+            writer_features,
         )
         .await?;
         let engine = engine_handle_for_store(Arc::clone(&store));
@@ -1570,7 +1927,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_domain_metadata_add_and_remove() -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, store, engine) = setup_domain_metadata_table("test_dm").await?;
+        let (table_url, store, engine) = setup_domain_metadata_table("test_dm", false).await?;
         let table_path_str = table_url.as_str();
 
         // === Transaction 1: add domain metadata ===
@@ -1625,7 +1982,7 @@ mod tests {
     #[tokio::test]
     async fn test_domain_metadata_system_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys").await?;
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys", false).await?;
         let table_path_str = table_url.as_str();
 
         // with_domain_metadata succeeds (validation is lazy), but commit should fail
@@ -1657,9 +2014,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_row_tracking_high_water_mark_requires_row_tracking_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_feature", false).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        assert_extern_result_error_contains(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "requires the 'rowTracking' feature",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_rejects_duplicate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_duplicate", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        assert_extern_result_error_contains(
+            unsafe { with_row_tracking_high_water_mark(txn, 8, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "already specified in this transaction",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
+        assert_eq!(
+            row_tracking["domainMetadata"]["domain"],
+            "delta.rowTracking"
+        );
+        assert_eq!(
+            row_tracking["domainMetadata"]["configuration"],
+            r#"{"rowIdHighWaterMark":7}"#
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_rejects_regression(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_regression", true).await?;
+        let table_path = table_url.as_str();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 6, engine.shallow_copy())
+        });
+        assert_extern_result_error_contains(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "cannot be less than the calculated value 7",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_with_add_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_with_adds", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+
+        let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+            .as_ref()
+            .try_into_arrow()?;
+        let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
+        let file_info_engine_data = ok_or_panic(unsafe {
+            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+        });
+        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
+        assert_eq!(
+            row_tracking["domainMetadata"]["configuration"],
+            r#"{"rowIdHighWaterMark":7}"#
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_rejects_value_below_added_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_below_adds", true).await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+
+        let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+            .as_ref()
+            .try_into_arrow()?;
+        let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
+        let file_info_engine_data = ok_or_panic(unsafe {
+            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+        });
+        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 0, engine.shallow_copy())
+        });
+        assert_extern_result_error_contains(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            "cannot be less than the calculated value 1",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_domain_metadata_duplicate_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_dup").await?;
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_dup", false).await?;
         let table_path_str = table_url.as_str();
 
         // Adding the same domain twice should cause commit to fail
@@ -1706,7 +2235,7 @@ mod tests {
         let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
 
         // Create a table WITHOUT the domainMetadata writer feature (v1/v1 protocol)
-        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
         let table_url = test_utils::create_table(
@@ -1786,10 +2315,10 @@ mod tests {
             OptionalValue::None
         }
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+        };
 
         // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
         let (store, _test_engine, table_location) =
@@ -2077,18 +2606,21 @@ mod tests {
                             state,
                             kernel_string_slice!(name),
                             nullable,
+                            std::ptr::null(),
                             allocate_err,
                         ),
                         DataType::STRING => visit_field_string(
                             state,
                             kernel_string_slice!(name),
                             nullable,
+                            std::ptr::null(),
                             allocate_err,
                         ),
                         DataType::LONG => visit_field_long(
                             state,
                             kernel_string_slice!(name),
                             nullable,
+                            std::ptr::null(),
                             allocate_err,
                         ),
                         _ => panic!("Unsupported test field type: {:?}", field.data_type),
@@ -2104,6 +2636,7 @@ mod tests {
                 field_ids.as_ptr(),
                 field_ids.len(),
                 false,
+                std::ptr::null(),
                 allocate_err,
             ))
         }
@@ -2184,6 +2717,125 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table_domain_metadata", None);
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let domain_feature = "delta.feature.domainMetadata";
+        let supported = "supported";
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_table_property(
+                builder,
+                kernel_string_slice!(domain_feature),
+                kernel_string_slice!(supported),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let domain = "test.domain";
+        let configuration = r#"{"key":"value"}"#;
+        let txn = ok_or_panic(unsafe {
+            create_table_with_domain_metadata(
+                txn,
+                kernel_string_slice!(domain),
+                kernel_string_slice!(configuration),
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 0);
+        let domain_metadata = read_domain_metadata_action(&store, &table_url, 0).await;
+        assert_eq!(domain_metadata["domainMetadata"]["domain"], domain);
+        assert_eq!(
+            domain_metadata["domainMetadata"]["configuration"],
+            configuration
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn root_manifest_file_meta(manifest_path: &str) -> FileMeta {
+        FileMeta {
+            path: kernel_string_slice!(manifest_path),
+            last_modified: 0,
+            size: 1024,
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::feature_enabled(true)]
+    #[case::feature_disabled(false)]
+    #[tokio::test]
+    async fn test_with_root_manifest_file_commit(
+        #[case] feature_enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_root_manifest_file", None);
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let mut reader_features = vec!["columnMapping", "deletionVectors"];
+        let mut writer_features = vec![
+            "columnMapping",
+            "deletionVectors",
+            "rowTracking",
+            "domainMetadata",
+            "inCommitTimestamp",
+        ];
+        if feature_enabled {
+            reader_features.push("adaptiveMetadata-preview");
+            writer_features.push("adaptiveMetadata-preview");
+        }
+        test_utils::create_table_with_column_mapping_mode(
+            store.clone(),
+            table_url.clone(),
+            schema,
+            &[],
+            true,
+            reader_features,
+            writer_features,
+            "id",
+        )
+        .await?;
+
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let table_path = table_url.to_string();
+        let table_path_str = table_path.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
+        let file = root_manifest_file_meta(&manifest_path);
+        let txn =
+            ok_or_panic(unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) });
+
+        if feature_enabled {
+            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            assert_eq!(unsafe { version_and_free(committed) }, 1);
+        } else {
+            assert_extern_result_error_with_message(
+                unsafe { commit(txn, engine.shallow_copy()) },
+                KernelError::GenericError,
+                Some(
+                    "Generic delta kernel error: root manifest file commit requires the \
+                     adaptiveMetadata-preview feature",
+                ),
+            );
+        }
+
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -2275,7 +2927,48 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
-        build_and_commit(builder, &engine);
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+
+        let partition_values = partition_value_map_new();
+        let value = "2024-01-01";
+        assert!(ok_or_panic(unsafe {
+            partition_value_map_insert_string(
+                partition_values.shallow_copy(),
+                kernel_string_slice!(col),
+                kernel_string_slice!(value),
+                engine.shallow_copy(),
+            )
+        }));
+        let write_context = ok_or_panic(unsafe {
+            create_table_get_partitioned_write_context(
+                txn.shallow_copy(),
+                partition_values,
+                engine.shallow_copy(),
+            )
+        });
+        let write_dir = recover_string(
+            unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
+        );
+        assert!(write_dir.ends_with("date=2024-01-01/"), "{write_dir}");
+        unsafe { free_write_context(write_context) };
+
+        let missing_partition_value = unsafe {
+            create_table_get_partitioned_write_context(
+                txn.shallow_copy(),
+                partition_value_map_new(),
+                engine.shallow_copy(),
+            )
+        };
+        assert_extern_result_error_with_message(
+            missing_partition_value,
+            KernelError::UnknownError,
+            Some("Invalid partition values: missing partition column 'date'. Provided: []"),
+        );
+
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let version = unsafe { version_and_free(committed) };
+        assert_eq!(version, 0);
 
         // A partitioned create records the partition columns in the table metadata.
         let log = read_v0_commit(&store, &table_url).await;
@@ -2987,7 +3680,7 @@ mod tests {
 
         // Build a DV-enabled table; create_table sets delta.enableDeletionVectors for the
         // writer feature.
-        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let schema = schema_ref! { nullable "id": INTEGER };
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dv_ffi", None);
         let table_url = test_utils::create_table(
@@ -3174,5 +3867,89 @@ mod tests {
         unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    /// The kernel's column-default acknowledgement gate, observed through the FFI: a write context
+    /// is only obtainable after [`transaction_ack_column_defaults`]. The column-default accessors
+    /// themselves are tested in [`crate::column_default`].
+    mod column_default_ack_gate {
+        use delta_kernel_ffi::column_default::{
+            transaction_ack_column_defaults, transaction_visit_top_level_column_defaults,
+        };
+
+        use super::*;
+
+        /// A table declaring three top-level defaults and enabling `allowColumnDefaults`.
+        const FIXTURE_WITH_DEFAULTS: &str = "../kernel/tests/data/table-with-column-defaults/";
+        /// A table with no column defaults, so no acknowledgement is required.
+        const FIXTURE_WITHOUT_DEFAULTS: &str = "../kernel/tests/data/table-with-dv-small/";
+
+        extern "C" fn ignore_default(
+            _engine_context: NullableCvoid,
+            _name: KernelStringSlice,
+            _raw_sql: KernelStringSlice,
+        ) {
+        }
+
+        /// Open a transaction on the fixture at `table_path`, returning `(engine, txn)`.
+        fn transaction_on(
+            table_path: &str,
+        ) -> (Handle<SharedExternEngine>, Handle<ExclusiveTransaction>) {
+            let table_root = delta_kernel::try_parse_uri(table_path).unwrap().to_string();
+            let engine = get_default_engine(&table_root);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_root), engine.shallow_copy())
+            });
+            (engine, txn)
+        }
+
+        #[test]
+        fn write_context_is_blocked_until_the_defaults_are_acknowledged() {
+            let (engine, txn) = transaction_on(FIXTURE_WITH_DEFAULTS);
+
+            // Visiting the defaults must not implicitly acknowledge them.
+            let visited = ok_or_panic(unsafe {
+                transaction_visit_top_level_column_defaults(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                    None,
+                    ignore_default,
+                )
+            });
+            assert_eq!(visited, 3);
+
+            assert_extern_result_error_with_message(
+                unsafe {
+                    get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+                },
+                KernelError::InvalidTransactionStateError,
+                Some(
+                    "Invalid transaction state: Writing data to a table with column defaults \
+                     requires calling Transaction::ack_column_defaults() first",
+                ),
+            );
+
+            unsafe { transaction_ack_column_defaults(txn.shallow_copy()) };
+            let write_context = ok_or_panic(unsafe {
+                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+            });
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
+
+        #[test]
+        fn write_context_needs_no_acknowledgement_without_defaults() {
+            let (engine, txn) = transaction_on(FIXTURE_WITHOUT_DEFAULTS);
+
+            let write_context = ok_or_panic(unsafe {
+                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+            });
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
     }
 }

@@ -5,9 +5,10 @@ pub(crate) mod apply_schema;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel_derive::internal_api;
+use derive_more::Constructor;
 use itertools::Itertools;
 use tracing::debug;
 
@@ -35,7 +36,7 @@ use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
     PrimitiveType, Schema, SchemaRef, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -70,6 +71,36 @@ macro_rules! prim_array_cmp {
 }
 
 pub(crate) use prim_array_cmp;
+
+/// Rebuilds a variable-length Arrow list type with a replacement element field while preserving
+/// its wrapper.
+///
+/// # Parameters
+///
+/// - `list_type`: The list type whose wrapper is preserved.
+/// - `element`: The replacement element field.
+///
+/// # Returns
+///
+/// The corresponding list type containing `element`.
+///
+/// # Errors
+///
+/// Returns an error if `list_type` is not `List`, `LargeList`, `ListView`, or `LargeListView`.
+pub(crate) fn list_type_with_element(
+    list_type: &ArrowDataType,
+    element: ArrowFieldRef,
+) -> DeltaResult<ArrowDataType> {
+    match list_type {
+        ArrowDataType::List(_) => Ok(ArrowDataType::List(element)),
+        ArrowDataType::LargeList(_) => Ok(ArrowDataType::LargeList(element)),
+        ArrowDataType::ListView(_) => Ok(ArrowDataType::ListView(element)),
+        ArrowDataType::LargeListView(_) => Ok(ArrowDataType::LargeListView(element)),
+        _ => Err(Error::internal_error(format!(
+            "Expected a variable-length list type, got {list_type:?}."
+        ))),
+    }
+}
 
 type FieldIndex = usize;
 type FlattenedRangeIterator<T> = std::iter::Flatten<std::vec::IntoIter<Range<T>>>;
@@ -325,7 +356,7 @@ pub(crate) fn fixup_parquet_read(
 /// position. The `index` of the element is the position that the column should appear in the final
 /// output. The `transform` indicates what, if any, transforms are needed. See the docs for
 /// [`ReorderIndexTransform`] for the meaning.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Constructor)]
 #[internal_api]
 pub(crate) struct ReorderIndex {
     pub index: usize,
@@ -335,7 +366,7 @@ pub(crate) struct ReorderIndex {
 #[derive(Debug, PartialEq)]
 #[internal_api]
 pub(crate) enum ReorderIndexTransform {
-    /// For a non-nested type, indicates that we need to cast to the contained type
+    /// Cast the input column to the contained Arrow type.
     Cast(ArrowDataType),
     /// Used for struct/list/map. Potentially transform child fields using contained reordering
     Nested(Vec<ReorderIndex>),
@@ -350,10 +381,6 @@ pub(crate) enum ReorderIndexTransform {
 }
 
 impl ReorderIndex {
-    fn new(index: usize, transform: ReorderIndexTransform) -> Self {
-        ReorderIndex { index, transform }
-    }
-
     fn cast(index: usize, target: ArrowDataType) -> Self {
         ReorderIndex::new(index, ReorderIndexTransform::Cast(target))
     }
@@ -527,15 +554,18 @@ fn get_indices(
                 }
                 ArrowDataType::List(list_field)
                 | ArrowDataType::LargeList(list_field)
-                | ArrowDataType::ListView(list_field) => {
+                | ArrowDataType::ListView(list_field)
+                | ArrowDataType::LargeListView(list_field) => {
                     // we just want to transparently recurse into lists, need to transform the
                     // kernel list data type into a schema
                     if let DataType::Array(array_type) = requested_field.data_type() {
-                        let requested_schema = StructType::new_unchecked([StructField::new(
-                            list_field.name().clone(), // so we find it in the inner call
-                            array_type.element_type.clone(),
-                            array_type.contains_null,
-                        )]);
+                        let requested_schema = schema! {
+                            (StructField::new(
+                                list_field.name().clone(), // so we find it in the inner call
+                                array_type.element_type.clone(),
+                                array_type.contains_null,
+                            )),
+                        };
                         let mask_before = mask_indices.len();
                         let (parquet_advance, mut children) = get_indices(
                             parquet_index + parquet_offset,
@@ -558,11 +588,36 @@ fn get_indices(
                             ));
                         } else {
                             // safety, checked that we have 1 element
-                            let mut children = children.swap_remove(0);
+                            let mut child = children.swap_remove(0);
+                            if let ReorderIndexTransform::Cast(element_target) = &child.transform {
+                                // The recursive plan targets the element type, but this reorder
+                                // entry consumes the outer list column. Cast the complete list so
+                                // Arrow applies the element conversion recursively while retaining
+                                // the physical list wrapper at each nesting level.
+                                let target_field: ArrowField = requested_field.try_into_arrow()?;
+                                let ArrowDataType::List(target_element_field) =
+                                    target_field.data_type()
+                                else {
+                                    return Err(Error::internal_error(
+                                        "Kernel array converted to a non-list Arrow type.",
+                                    ));
+                                };
+                                let target_element_field = Arc::new(
+                                    target_element_field
+                                        .as_ref()
+                                        .clone()
+                                        .with_data_type(element_target.clone()),
+                                );
+                                let target = list_type_with_element(
+                                    field.data_type(),
+                                    target_element_field,
+                                )?;
+                                child.transform = ReorderIndexTransform::Cast(target);
+                            }
                             // the index is wrong, as it's the index from the inner schema.
                             // Adjust it to be our index
-                            children.index = index;
-                            reorder_indices.push(children);
+                            child.index = index;
+                            reorder_indices.push(child);
                         }
                     } else {
                         return Err(Error::unexpected_column_type(list_field.name()));
@@ -912,7 +967,7 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] = Some((new_field, col));
                 }
                 ReorderIndexTransform::Nested(children) => {
-                    let input_field_name = input_fields[parquet_position].name();
+                    let field = &input_fields[parquet_position];
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -926,28 +981,37 @@ pub(crate) fn reorder_struct_array(
                             )?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
-                                input_field_name,
+                                field.name(),
                                 result_array.fields().clone(),
-                                input_fields[parquet_position].is_nullable(),
+                                field.is_nullable(),
                             ));
                             final_fields_cols[reorder_index.index] =
                                 Some((new_field, result_array));
                         }
                         ArrowDataType::List(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i32>().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_list(list_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_list(
+                                list_array,
+                                field.name(),
+                                field.is_nullable(),
+                                children,
+                            )?;
                         }
                         ArrowDataType::LargeList(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i64>().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_list(list_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_list(
+                                list_array,
+                                field.name(),
+                                field.is_nullable(),
+                                children,
+                            )?;
                         }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
                             final_fields_cols[reorder_index.index] =
-                                reorder_map(map_array, input_field_name, children)?;
+                                reorder_map(map_array, field.name(), children)?;
                         }
+                        // TODO(#3178): ListView/LargeListView fall through here.
                         _ => {
                             return Err(Error::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
@@ -1012,9 +1076,10 @@ pub(crate) fn reorder_struct_array(
 fn reorder_list<O: OffsetSizeTrait>(
     list_array: GenericListArray<O>,
     input_field_name: &str,
+    list_nullable: bool,
     children: &[ReorderIndex],
 ) -> DeltaResult<FieldArrayOpt> {
-    let (list_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
+    let (list_values_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
         let struct_array = struct_array.clone();
         let result_array = Arc::new(reorder_struct_array(
@@ -1025,14 +1090,9 @@ fn reorder_list<O: OffsetSizeTrait>(
             None, // No file_location passed since metadata columns can't be nested
         )?);
         let new_list_field = Arc::new(ArrowField::new_struct(
-            list_field.name(),
+            list_values_field.name(),
             result_array.fields().clone(),
             result_array.is_nullable(),
-        ));
-        let new_field = Arc::new(ArrowField::new_list(
-            input_field_name,
-            new_list_field.clone(),
-            list_field.is_nullable(),
         ));
         let list = Arc::new(GenericListArray::try_new(
             new_list_field,
@@ -1040,6 +1100,12 @@ fn reorder_list<O: OffsetSizeTrait>(
             result_array,
             null_buf,
         )?);
+        // Take the field's type from the rebuilt array so a LargeList isn't forced to List.
+        let new_field = Arc::new(ArrowField::new(
+            input_field_name,
+            list.data_type().clone(),
+            list_nullable,
+        ));
         Ok(Some((new_field, list)))
     } else {
         Err(Error::internal_error(
@@ -1413,25 +1479,8 @@ pub(crate) fn filter_to_record_batch(
 // we want to keep nulls in our partition map, so we end up with data in the log like:
 // {partitionValues:{"foo": null}}, which is what is generally expected. Without this we would
 // get: {partitionValues:{}}
-struct NullValueMapEncoder<'a> {
-    field: &'a ArrowFieldRef,
-    array: &'a MapArray,
-}
-
-impl<'a> Encoder for NullValueMapEncoder<'a> {
-    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        let options = EncoderOptions::default().with_explicit_nulls(true);
-        // this unwrap is technically unsafe, but we _know_ that the array is a MapArray, and that
-        // `make_encoder` won't return an error for that. It would still be nice if we could return
-        // a `Result`, but we cannot
-        #[allow(clippy::unwrap_used)]
-        let mut encoder = make_encoder(self.field, self.array, &options).unwrap();
-        encoder.encode(idx, out);
-    }
-}
-
 /// This is a special encoder factory that will use the default encoder for all array types except
-/// MapArrays. For MapArrays, it will make a `NullValueMapEncoder` which encodes the map preserving
+/// MapArrays. For MapArrays, it uses Arrow's map encoder with options preserving
 /// keys that have null values.
 #[derive(Debug)]
 struct NullValueMapEncoderFactory;
@@ -1443,22 +1492,39 @@ impl EncoderFactory for NullValueMapEncoderFactory {
         array: &'a dyn ArrowArray,
         _options: &'a EncoderOptions,
     ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
-        // It would be tempting to use `make_encoder` below, but we can't because we have to create
-        // a new `EncoderOptions` in order to set `with_explicit_nulls`. Then the lifetime of the
-        // created encoder becomes tied to the lifetime of the `EncoderOptions`, and we cannot
-        // return it from this method as the options would be freed here.  We _also_ can't put the
-        // options inside the NullValueMapEncoderFactory, because this method takes `&self` not
-        // `&'a self`, and we can't change that as it's part of the trait definition.
+        // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
+        // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
+        // and local options would be freed here. We also can't put the options inside the
+        // NullValueMapEncoderFactory, because this method takes `&self` not `&'a self`, and we
+        // can't change that as it's part of the trait definition. Static options satisfy the
+        // required lifetime. Building here returns Arrow errors because `Encoder::encode` cannot
+        // return a `Result`; a per-row wrapper would have to unwrap them.
         match array.data_type() {
             ArrowDataType::Map(_, _) => {
-                let array = array.as_map();
-                let encoder = NullValueMapEncoder { field, array };
-                let array_encoder = Box::new(encoder) as Box<dyn Encoder + 'a>;
-                let nulls = array.nulls().cloned();
-                Ok(Some(NullableEncoder::new(array_encoder, nulls)))
+                static MAP_OPTIONS: LazyLock<EncoderOptions> =
+                    LazyLock::new(|| EncoderOptions::default().with_explicit_nulls(true));
+                // A map with non-string keys is valid Arrow but unsupported by Arrow's JSON map
+                // encoder. If every map is null (for example, `[null, null]`), the JSON writer
+                // omits the field and never encodes a key, so preserve that generic behavior.
+                if array.null_count() == array.len() {
+                    let encoder = Box::new(NullMapPlaceholderEncoder);
+                    return Ok(Some(NullableEncoder::new(encoder, array.nulls().cloned())));
+                }
+                // The writer retains this encoder for the batch, avoiding reconstruction of its
+                // key and value encoders for every row.
+                make_encoder(field, array, &MAP_OPTIONS).map(Some)
             }
             _ => Ok(None),
         }
+    }
+}
+
+// Every row is null, so the JSON writer uses the null buffer without calling this placeholder.
+struct NullMapPlaceholderEncoder;
+
+impl Encoder for NullMapPlaceholderEncoder {
+    fn encode(&mut self, _idx: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"null");
     }
 }
 
@@ -1559,7 +1625,8 @@ mod tests {
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
         Int32Builder, Int64Array, LargeStringArray, ListArray, MapArray, MapBuilder, MapFieldNames,
-        NullArray, StringArray, StringBuilder, StringViewArray, StructArray, StructBuilder,
+        NullArray, OffsetSizeTrait, StringArray, StringBuilder, StringViewArray, StructArray,
+        StructBuilder,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1686,14 +1753,11 @@ mod tests {
             );
         }
 
-        let requested_schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::STRING),
-                StructField::nullable("c", DataType::INTEGER),
-            ])
-            .unwrap(),
-        );
+        let requested_schema = schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+            nullable "c": INTEGER,
+        };
         let input: Vec<&str> = vec![];
         let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
@@ -1728,9 +1792,7 @@ mod tests {
     #[test]
     fn test_parse_json_with_long_strings() {
         // See issue#1139: https://github.com/delta-io/delta-kernel-rs/issues/1139
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("long_val", DataType::STRING)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "long_val": STRING };
         let long_string = "a".repeat(1_000_000); // 1MB string
         let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
@@ -1755,10 +1817,10 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(large_strings) as ArrowArrayRef]).unwrap();
         let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
 
-        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ]));
+        let output_schema: crate::schema::SchemaRef = schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        };
         let result = parse_json(engine_data, output_schema).unwrap();
         let result = ArrowEngineData::try_from_engine_data(result).unwrap();
         let batch: RecordBatch = result.into();
@@ -1780,10 +1842,10 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(view_strings) as ArrowArrayRef]).unwrap();
         let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
 
-        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ]));
+        let output_schema: crate::schema::SchemaRef = schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        };
         let result = parse_json(engine_data, output_schema).unwrap();
         let result = ArrowEngineData::try_from_engine_data(result).unwrap();
         let batch: RecordBatch = result.into();
@@ -1816,9 +1878,7 @@ mod tests {
     fn test_parse_json_impl_strict_leaf_errors_propagate() {
         // Type mismatches on strict (non-failure-prone) leaves still surface as batch-level
         // errors, so the expression-level caller can fall back to its all-null backstop.
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("a", DataType::LONG)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "a": LONG };
         let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
         assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
     }
@@ -1833,9 +1893,7 @@ mod tests {
         inputs: &[&str],
         expected_null_rows: &[usize],
     ) {
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable(column_name, leaf_type)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable (column_name): (leaf_type) };
         let inputs: Vec<Option<&str>> = inputs.iter().copied().map(Some).collect();
         let batch = parse_json_impl(&StringArray::from(inputs.clone()), schema)
             .expect("parse_json_impl should not error on failure-prone leaf parse failures");
@@ -1904,15 +1962,12 @@ mod tests {
         // Single struct with mixed failure-prone and strict leaves. The bad EventTime on row 1
         // must not contaminate IngestTime / Price / UserId on the same row, nor any field on
         // rows 0 / 2. This is the per-cell isolation property end-to-end.
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("EventTime", DataType::TIMESTAMP),
-                StructField::nullable("IngestTime", DataType::TIMESTAMP),
-                StructField::nullable("Price", DataType::decimal(10, 2).unwrap()),
-                StructField::nullable("UserId", DataType::LONG),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "EventTime": TIMESTAMP,
+            nullable "IngestTime": TIMESTAMP,
+            nullable "Price": (DataType::decimal(10, 2).unwrap()),
+            nullable "UserId": LONG,
+        };
         let inputs: Vec<Option<&str>> = vec![
             Some(
                 r#"{"EventTime": "2024-01-01T00:00:00Z", "IngestTime": "2024-01-01T00:00:01Z", "Price": "10.50", "UserId": 1}"#,
@@ -1951,26 +2006,22 @@ mod tests {
         //     minValues: { EventTime: Timestamp, UserId: Long },
         //     maxValues: { EventTime: Timestamp, UserId: Long },
         //     tightBounds: Bool }
-        let null_count_struct = StructType::try_new(vec![
-            StructField::nullable("EventTime", DataType::LONG),
-            StructField::nullable("UserId", DataType::LONG),
-        ])
-        .unwrap();
-        let min_max_struct = StructType::try_new(vec![
-            StructField::nullable("EventTime", DataType::TIMESTAMP),
-            StructField::nullable("UserId", DataType::LONG),
-        ])
-        .unwrap();
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("numRecords", DataType::LONG),
-                StructField::nullable("nullCount", null_count_struct),
-                StructField::nullable("minValues", min_max_struct.clone()),
-                StructField::nullable("maxValues", min_max_struct),
-                StructField::nullable("tightBounds", DataType::BOOLEAN),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "numRecords": LONG,
+            nullable "nullCount": {
+                nullable "EventTime": LONG,
+                nullable "UserId": LONG,
+            },
+            nullable "minValues": {
+                nullable "EventTime": TIMESTAMP,
+                nullable "UserId": LONG,
+            },
+            nullable "maxValues": {
+                nullable "EventTime": TIMESTAMP,
+                nullable "UserId": LONG,
+            },
+            nullable "tightBounds": BOOLEAN,
+        };
 
         let inputs: Vec<Option<&str>> = vec![
             Some(
@@ -2017,13 +2068,10 @@ mod tests {
     fn test_parse_json_safe_cast_all_null_input() {
         // Every row decodes to `{}` (the unwrap_or default for `None`), so every output cell
         // is NULL and no error surfaces from the safe-cast pass.
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("ts", DataType::TIMESTAMP),
-                StructField::nullable("n", DataType::LONG),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "ts": TIMESTAMP,
+            nullable "n": LONG,
+        };
         let inputs: Vec<Option<&str>> = vec![None, None, None];
         let batch = parse_json_impl(&StringArray::from(inputs), schema).unwrap();
         assert_eq!(batch.num_rows(), 3);
@@ -2049,14 +2097,14 @@ mod tests {
     #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2150,10 +2198,11 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Struct of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "struct_v",
-            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]),
-        )]));
+        let requested_schema = schema_ref! {
+            nullable "struct_v": {
+                nullable "v": unshredded_variant(),
+            },
+        };
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "struct_v",
             ArrowDataType::Struct(vec![unshredded_variant_parquet_schema()].into()),
@@ -2171,10 +2220,9 @@ mod tests {
         assert!(matches!(result_shredded,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
         // Array of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "array_v",
-            ArrayType::new(DataType::unshredded_variant(), true),
-        )]));
+        let requested_schema = schema_ref! {
+            nullable "array_v": [ nullable unshredded_variant() ],
+        };
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "array_v",
             ArrowDataType::List(Arc::new(unshredded_variant_parquet_schema())),
@@ -2193,10 +2241,9 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Map of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "map_v",
-            MapType::new(DataType::STRING, DataType::unshredded_variant(), true),
-        )]));
+        let requested_schema = schema_ref! {
+            nullable "map_v": { STRING => nullable unshredded_variant() },
+        };
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
             "map_v",
             "struc_v",
@@ -2224,12 +2271,12 @@ mod tests {
     #[test]
     fn ensure_data_types_fails_correctly() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2245,12 +2292,12 @@ mod tests {
                 "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
             );
 
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2269,11 +2316,13 @@ mod tests {
     #[test]
     fn mask_with_map() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
-                logical_name(0),
-                MapType::new(DataType::INTEGER, DataType::STRING, false),
-            )
-            .with_metadata(column_mapping_metadata(0, mode))])
+            let requested_schema = schema! {
+                (StructField::not_null(
+                    logical_name(0),
+                    MapType::new(DataType::INTEGER, DataType::STRING, false),
+                )
+                .with_metadata(column_mapping_metadata(0, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2300,14 +2349,14 @@ mod tests {
     #[test]
     fn simple_reorder_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2335,14 +2384,14 @@ mod tests {
     #[test]
     fn simple_nullable_field_missing() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2372,14 +2421,14 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_only() {
-        let requested_schema = StructType::new_unchecked([
-            StructField::not_null("i_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(1, "i_physical")),
-            StructField::nullable("s_logical", DataType::STRING)
-                .with_metadata(kernel_fid_and_name(2, "s_physical")),
-            StructField::nullable("i2_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(3, "i2_physical")),
-        ])
+        let requested_schema = schema! {
+            (StructField::not_null("i_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(1, "i_physical"))),
+            (StructField::nullable("s_logical", DataType::STRING)
+                .with_metadata(kernel_fid_and_name(2, "s_physical"))),
+            (StructField::nullable("i2_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(3, "i2_physical"))),
+        }
         .make_physical(ColumnMappingMode::Id)
         .unwrap()
         .into();
@@ -2406,14 +2455,14 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_falls_back_to_name() {
-        let requested_schema = StructType::new_unchecked([
-            StructField::not_null("i_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(1, "i_physical")),
-            StructField::nullable("s_logical", DataType::STRING)
-                .with_metadata(kernel_fid_and_name(2, "s_physical")),
-            StructField::nullable("i2_logical", DataType::INTEGER)
-                .with_metadata(kernel_fid_and_name(3, "i2_physical")),
-        ])
+        let requested_schema = schema! {
+            (StructField::not_null("i_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(1, "i_physical"))),
+            (StructField::nullable("s_logical", DataType::STRING)
+                .with_metadata(kernel_fid_and_name(2, "s_physical"))),
+            (StructField::nullable("i2_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(3, "i2_physical"))),
+        }
         .make_physical(ColumnMappingMode::Id)
         .unwrap()
         .into();
@@ -2463,11 +2512,14 @@ mod tests {
 
     #[test]
     fn test_match_parquet_fields_filters_metadata_columns() {
-        let kernel_schema = StructType::new_unchecked([
-            StructField::not_null("regular_field", DataType::INTEGER),
-            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
-            StructField::nullable("another_field", DataType::STRING),
-        ]);
+        let kernel_schema = schema! {
+            not_null "regular_field": INTEGER,
+            (StructField::create_metadata_column(
+                "row_index",
+                MetadataColumnSpec::RowIndex,
+            )),
+            nullable "another_field": STRING,
+        };
 
         let parquet_fields: ArrowFields = vec![
             ArrowField::new("regular_field", ArrowDataType::Int32, false),
@@ -2566,11 +2618,11 @@ mod tests {
 
     #[test]
     fn simple_row_index_field() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::create_metadata_column("my_row_index", MetadataColumnSpec::RowIndex),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "i": INTEGER,
+            (StructField::create_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)),
+            nullable "i2": INTEGER,
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("i2", ArrowDataType::Int32, true),
@@ -2595,11 +2647,11 @@ mod tests {
 
     #[test]
     fn simple_file_path_field() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "i": INTEGER,
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+            nullable "i2": INTEGER,
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("i2", ArrowDataType::Int32, true),
@@ -2766,22 +2818,22 @@ mod tests {
     #[test]
     fn nested_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([
-                        StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4, mode)),
-                        StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5, mode)),
-                    ]),
+                    schema! {
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                        (StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(3, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(3, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2804,22 +2856,22 @@ mod tests {
     #[test]
     fn nested_indices_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([
-                        StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5, mode)),
-                        StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4, mode)),
-                    ]),
+                    schema! {
+                        (StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5, mode))),
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(3, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(3, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2843,21 +2895,20 @@ mod tests {
     #[test]
     fn nested_indices_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([StructField::not_null(
-                        logical_name(4),
-                        DataType::INTEGER,
-                    )
-                    .with_metadata(column_mapping_metadata(4, mode))]),
+                    schema! {
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(3, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(3, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2880,13 +2931,12 @@ mod tests {
         // Regression: when a struct with no matching children appears BEFORE a selected
         // leaf in parquet order, the Missing entry must be deferred so the leaf's
         // Identity entry gets the correct parquet_position in reorder_struct_array.
-        let requested_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]),
-            ),
-        ]));
+        let requested_schema: SchemaRef = schema_ref! {
+            nullable "a": LONG,
+            nullable "stats": {
+                nullable "age": LONG,
+            },
+        };
         // Parquet has stats BEFORE a
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(
@@ -2922,14 +2972,14 @@ mod tests {
     #[test]
     fn simple_list_mask() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
-                    .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
+                    .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2963,13 +3013,109 @@ mod tests {
     }
 
     #[test]
+    fn list_element_cast_propagates_invalid_nested_ids_error() {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null("values", ArrayType::new(DataType::LONG, false)).with_metadata(
+                [(
+                    ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
+                    MetadataValue::String("not a json object".to_string()),
+                )],
+            )),
+        }
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "element",
+                ArrowDataType::Int32,
+                false,
+            ))),
+            false,
+        )]));
+
+        assert_result_error_with_message(
+            get_requested_indices(&requested_schema, &parquet_schema),
+            "must be a JSON object",
+        );
+    }
+
+    #[rstest]
+    #[case::list(
+        ArrowDataType::List(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::List(arrow_list_element(ArrowDataType::Int64))
+    )]
+    #[case::large_list(
+        ArrowDataType::LargeList(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::LargeList(arrow_list_element(ArrowDataType::Int64))
+    )]
+    #[case::list_view(
+        ArrowDataType::ListView(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::ListView(arrow_list_element(ArrowDataType::Int64))
+    )]
+    #[case::large_list_view(
+        ArrowDataType::LargeListView(arrow_list_element(ArrowDataType::Int32)),
+        ArrowDataType::LargeListView(arrow_list_element(ArrowDataType::Int64))
+    )]
+    fn list_element_cast_preserves_physical_wrapper(
+        #[case] physical_type: ArrowDataType,
+        #[case] expected_type: ArrowDataType,
+    ) {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null("values", ArrayType::new(DataType::LONG, true))),
+        }
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            physical_type,
+            false,
+        )]));
+
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+
+        assert_eq!(mask_indices, vec![0]);
+        assert_eq!(reorder_indices, vec![ReorderIndex::cast(0, expected_type)]);
+    }
+
+    #[test]
+    fn nested_list_element_cast_preserves_each_physical_wrapper() {
+        let requested_schema: SchemaRef = schema! {
+            (StructField::not_null(
+                "values",
+                ArrayType::new(ArrayType::new(DataType::LONG, true), true),
+            )),
+        }
+        .into();
+        let physical_type = ArrowDataType::LargeList(arrow_list_element(ArrowDataType::ListView(
+            arrow_list_element(ArrowDataType::Int32),
+        )));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "values",
+            physical_type,
+            false,
+        )]));
+        let expected_type = ArrowDataType::LargeList(arrow_list_element(ArrowDataType::ListView(
+            arrow_list_element(ArrowDataType::Int64),
+        )));
+
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+
+        assert_eq!(mask_indices, vec![0]);
+        assert_eq!(reorder_indices, vec![ReorderIndex::cast(0, expected_type)]);
+    }
+
+    fn arrow_list_element(data_type: ArrowDataType) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new("element", data_type, true))
+    }
+
+    #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
-                logical_name(1),
-                ArrayType::new(DataType::INTEGER, false),
-            )
-            .with_metadata(column_mapping_metadata(1, mode))])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), ArrayType::new(DataType::INTEGER, false))
+                    .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2998,25 +3144,25 @@ mod tests {
     #[test]
     fn nested_indices_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode))),
+                (StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
-                        StructType::new_unchecked([
-                            StructField::not_null(logical_name(3), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(3, mode)),
-                            StructField::not_null(logical_name(4), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(4, mode)),
-                        ]),
+                        schema! {
+                            (StructField::not_null(logical_name(3), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(3, mode))),
+                            (StructField::not_null(logical_name(4), DataType::STRING)
+                                .with_metadata(column_mapping_metadata(4, mode))),
+                        },
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3063,12 +3209,12 @@ mod tests {
     #[test]
     fn nested_indices_unselected_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3108,24 +3254,23 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new_unchecked([StructField::not_null(
-                            logical_name(4),
-                            DataType::INTEGER,
-                        )
-                        .with_metadata(column_mapping_metadata(4, mode))]),
+                        schema! {
+                            (StructField::not_null(logical_name(4), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(4, mode))),
+                        },
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3169,25 +3314,25 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new_unchecked([
-                            StructField::not_null(logical_name(6), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(6, mode)),
-                            StructField::not_null(logical_name(5), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(5, mode)),
-                        ]),
+                        schema! {
+                            (StructField::not_null(logical_name(6), DataType::STRING)
+                                .with_metadata(column_mapping_metadata(6, mode))),
+                            (StructField::not_null(logical_name(5), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(5, mode))),
+                        },
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3236,22 +3381,22 @@ mod tests {
     #[test]
     fn skipped_struct() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::not_null(
+            let requested_schema = schema! {
+                (StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::not_null(
                     logical_name(2),
-                    StructType::new_unchecked([
-                        StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4, mode)),
-                        StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5, mode)),
-                    ]),
+                    schema! {
+                        (StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4, mode))),
+                        (StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5, mode))),
+                    },
                 )
-                .with_metadata(column_mapping_metadata(2, mode)),
-                StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3, mode)),
-            ])
+                .with_metadata(column_mapping_metadata(2, mode))),
+                (StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3488,6 +3633,61 @@ mod tests {
         }
     }
 
+    // Reorder must keep a nullable list column nullable, for both List and LargeList.
+    #[rstest]
+    #[case::list(false)]
+    #[case::large_list(true)]
+    fn reorder_nullable_list_of_non_nullable_struct_with_null_rows(#[case] large_list: bool) {
+        if large_list {
+            reorder_nullable_list_preserves_outer_nullability::<i64>();
+        } else {
+            reorder_nullable_list_preserves_outer_nullability::<i32>();
+        }
+    }
+
+    fn reorder_nullable_list_preserves_outer_nullability<O: OffsetSizeTrait>() {
+        // Row 0 holds two elements; row 1 is a null list entry.
+        let boolean = Arc::new(BooleanArray::from(vec![false, true])) as ArrowArrayRef;
+        let int = Arc::new(Int32Array::from(vec![42, 28])) as ArrowArrayRef;
+        let list_sa = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
+                boolean,
+            ),
+            (
+                Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
+                int,
+            ),
+        ]);
+        let offsets = OffsetBuffer::<O>::from_lengths([2, 0]);
+        let item_field = Arc::new(ArrowField::new("item", list_sa.data_type().clone(), false));
+        let nulls = NullBuffer::from(vec![true, false]);
+        let list = Arc::new(
+            GenericListArray::<O>::try_new(item_field, offsets, Arc::new(list_sa), Some(nulls))
+                .unwrap(),
+        );
+        let list_field = Arc::new(ArrowField::new("list", list.data_type().clone(), true));
+        let struct_array = StructArray::from(vec![(list_field, list as ArrowArrayRef)]);
+        let reorder = vec![ReorderIndex::nested(
+            0,
+            vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+        )];
+
+        let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
+
+        assert!(ordered.fields()[0].is_nullable());
+        let ordered_list_col = ordered.column(0).as_list::<O>();
+        assert!(!ordered_list_col.is_null(0));
+        assert!(ordered_list_col.is_null(1));
+        // The reordered column stays a list whose element struct is non-nullable.
+        assert!(matches!(
+            ordered.fields()[0].data_type(),
+            ArrowDataType::List(f) | ArrowDataType::LargeList(f) if !f.is_nullable()
+        ));
+        let present = ordered_list_col.value(0);
+        assert_eq!(present.as_struct().column_names(), vec!["c", "b"]);
+    }
+
     // boy howdy this is more complicated than expected
     fn build_arrow_map() -> MapArray {
         let key_struct_builder = StructBuilder::from_fields(
@@ -3571,12 +3771,12 @@ mod tests {
     #[test]
     fn no_matches() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
-                StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1, mode)),
-                StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2, mode)),
-            ])
+            let requested_schema = schema! {
+                (StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1, mode))),
+                (StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3610,7 +3810,7 @@ mod tests {
 
     #[test]
     fn empty_requested_schema() {
-        let requested_schema = Arc::new(StructType::new_unchecked([]));
+        let requested_schema = schema_ref! {};
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Utf8, true),
@@ -3828,40 +4028,40 @@ mod tests {
     /// correctly insert (or omit) the `_file` column at the position declared in the schema.
     #[rstest]
     #[case::no_file_path(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::INTEGER),
-        ]),
+        schema: schema! {
+            not_null "a": INTEGER,
+            nullable "b": INTEGER,
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["a", "b"],
         file_path_col: None,
     })]
     #[case::file_path_at_start(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::INTEGER),
-        ]),
+        schema: schema! {
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+            not_null "a": INTEGER,
+            nullable "b": INTEGER,
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["_file", "a", "b"],
         file_path_col: Some(0),
     })]
     #[case::file_path_in_middle(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            StructField::nullable("b", DataType::INTEGER),
-        ]),
+        schema: schema! {
+            not_null "a": INTEGER,
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+            nullable "b": INTEGER,
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["a", "_file", "b"],
         file_path_col: Some(1),
     })]
     #[case::file_path_at_end(JsonInsertCase {
-        schema: StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-        ]),
+        schema: schema! {
+            not_null "a": INTEGER,
+            nullable "b": INTEGER,
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+        },
         expected_json_names: &["a", "b"],
         expected_output_names: &["a", "b", "_file"],
         file_path_col: Some(2),
@@ -3917,10 +4117,13 @@ mod tests {
         // RowIndex is not supported for JSON reads. All metadata column specs are non-nullable,
         // so the Missing transform inserts a null array — reorder_struct_array errors because
         // the field is declared non-nullable.
-        let schema = StructType::new_unchecked([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
-        ]);
+        let schema = schema! {
+            not_null "a": INTEGER,
+            (StructField::create_metadata_column(
+                "row_index",
+                MetadataColumnSpec::RowIndex,
+            )),
+        };
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "a",
             ArrowDataType::Int32,
@@ -3937,7 +4140,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_we_encode_maps_with_null_values() {
+    fn encodes_map_rows_with_explicit_null_values() {
         let schema = ArrowSchema::new(vec![
             ArrowField::new("str_col", ArrowDataType::Utf8, false),
             ArrowField::new(
@@ -3956,19 +4159,30 @@ mod tests {
                     )),
                     false, // sorted
                 ),
-                false,
+                true,
             ),
         ]);
-        let s_array = StringArray::from(vec!["foo"]);
+        let s_array = StringArray::from(vec!["values", "empty", "null", "after_null"]);
 
         let string_builder = StringBuilder::new();
         let string_builder2 = StringBuilder::new();
         let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
 
-        // Append one entry: "bar" -> null
-        map_builder.keys().append_value("bar");
+        // Preserve a null value inside a non-null map as `"b": null`.
+        map_builder.keys().append_value("a");
+        map_builder.values().append_value("1");
+        map_builder.keys().append_value("b");
         map_builder.values().append_null();
-        map_builder.append(true).unwrap(); // finish the map row
+        map_builder.append(true).unwrap();
+
+        // An empty map emits `"map_col": {}`; a null map omits `map_col`.
+        map_builder.append(true).unwrap();
+        map_builder.append(false).unwrap();
+
+        // A non-null map after the null row verifies batch encoder reuse.
+        map_builder.keys().append_value("c");
+        map_builder.values().append_value("3");
+        map_builder.append(true).unwrap();
 
         let map_array: MapArray = map_builder.finish();
         let batch = RecordBatch::try_new(
@@ -3982,8 +4196,34 @@ mod tests {
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
         assert_eq!(
             json,
-            "{\"str_col\":\"foo\",\"map_col\":{\"bar\":null}}\n".as_bytes()
+            concat!(
+                "{\"str_col\":\"values\",\"map_col\":{\"a\":\"1\",\"b\":null}}\n",
+                "{\"str_col\":\"empty\",\"map_col\":{}}\n",
+                "{\"str_col\":\"null\"}\n",
+                "{\"str_col\":\"after_null\",\"map_col\":{\"c\":\"3\"}}\n",
+            )
+            .as_bytes()
         );
+    }
+
+    #[test]
+    fn omits_map_field_when_all_rows_are_null_and_key_type_is_unsupported() {
+        let mut map_builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        map_builder.append(false).unwrap();
+        let map_array = map_builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "map_col",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
+
+        // This is the outer JSON row; the null `map_col` field is omitted.
+        assert_eq!(json, b"{}\n");
     }
 
     #[rstest]
@@ -3993,20 +4233,14 @@ mod tests {
         // When a struct exists in parquet but none of its children match the requested
         // schema, the struct should be treated as missing regardless of its nullability.
         let info_field = if struct_nullable {
-            StructField::nullable(
-                "info",
-                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
-            )
+            StructField::nullable("info", schema! { nullable "z": LONG })
         } else {
-            StructField::not_null(
-                "info",
-                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
-            )
+            StructField::not_null("info", schema! { nullable "z": LONG })
         };
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("a", DataType::LONG),
-            info_field,
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "a": LONG,
+            (info_field),
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int64, true),
             ArrowField::new(
@@ -4097,10 +4331,10 @@ mod tests {
     fn empty_struct_is_matched() {
         // Delta protocol allows empty structs. An empty struct has no children, so no
         // leaf columns are selected, but the struct itself should still be matched.
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("a", DataType::LONG),
-            StructField::not_null("empty", StructType::new_unchecked([])),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "a": LONG,
+            not_null "empty": {},
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int64, true),
             ArrowField::new("empty", ArrowDataType::Struct(ArrowFields::empty()), false),
@@ -4195,17 +4429,12 @@ mod tests {
         let batch = RecordBatch::try_new(src_schema, vec![outer_col]).unwrap();
 
         // Kernel target: all nullable where Arrow allows it.
-        let target_schema: SchemaRef =
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "outer",
-                StructType::new_unchecked([
-                    StructField::nullable("lst", ArrayType::new(DataType::INTEGER, true)),
-                    StructField::nullable(
-                        "mp",
-                        MapType::new(DataType::STRING, DataType::INTEGER, true),
-                    ),
-                ]),
-            )]));
+        let target_schema: SchemaRef = schema_ref! {
+            nullable "outer": {
+                nullable "lst": [ nullable INTEGER ],
+                nullable "mp": { STRING => nullable INTEGER },
+            },
+        };
 
         let ordering = [ReorderIndex::identity(0)];
         let result =

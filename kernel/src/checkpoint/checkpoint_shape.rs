@@ -1,20 +1,27 @@
-//! Resolves a checkpoint shape. This falls into the following cases: no checkpoint,
-//! leaf (file actions inline, including multi-part), or manifest (which references sidecar files).
-//! When stats are requested, also reports whether the checkpoint has compatible parsed stats.
+//! Resolves a checkpoint shape:
+//! - A single-part checkpoint has one checkpoint leaf storing file actions (`add` and `remove`).
+//! - A multipart checkpoint has one checkpoint leaf per checkpoint part.
+//! - A manifest checkpoint has sidecars as its checkpoint leaves.
+//!
+//! A checkpoint leaf directly stores file actions. When requested, this module also retains the
+//! checkpoint leaf schema.
 //! Driven through a [`PlanExecutor`].
 
 // No in-crate caller yet; following PRs will use this.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use url::Url;
 
+use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
 
@@ -29,23 +36,54 @@ pub(crate) enum CheckpointType {
     Manifest,
 }
 
-/// A snapshot's resolved checkpoint type and parsed-stats schema.
+/// A snapshot's resolved checkpoint type and checkpoint leaf schema.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CheckpointShape {
     /// What kind of checkpoint this is.
     pub(crate) checkpoint_type: CheckpointType,
-    /// The requested stats schema when the checkpoint has a compatible `add.stats_parsed` struct
-    /// to read it from; `None` when stats were not requested or no compatible parsed stats exist.
-    pub(crate) parsed_stats_schema: Option<SchemaRef>,
+    /// Schema of the checkpoint leaves, when requested.
+    pub(crate) leaf_checkpoint_schema: Option<SchemaRef>,
 }
 
 impl CheckpointShape {
-    /// Resolve `snapshot`'s checkpoint shape. Determines the checkpoint type and, when
-    /// `stats_schema` is `Some`, whether the checkpoint contains parsed stats compatible with it.
+    /// Resolves `snapshot`'s checkpoint topology without retaining the checkpoint leaf schema.
+    ///
+    /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
+    /// read.
+    #[tracing::instrument(
+        name = "checkpoint_shape.try_new",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn try_new(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
-        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<CheckpointShape> {
+        Self::try_new_impl(exec, snapshot, false)
+    }
+
+    /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
+    ///
+    /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
+    /// read.
+    #[tracing::instrument(
+        name = "checkpoint_shape.try_new_with_leaf_schema",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
+    pub(crate) fn try_new_with_leaf_schema(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> DeltaResult<CheckpointShape> {
+        Self::try_new_impl(exec, snapshot, true)
+    }
+
+    fn try_new_impl(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+        needs_leaf_schema: bool,
     ) -> DeltaResult<CheckpointShape> {
         let segment = snapshot.log_segment();
 
@@ -55,16 +93,20 @@ impl CheckpointShape {
             None => {
                 return Ok(CheckpointShape {
                     checkpoint_type: CheckpointType::None,
-                    parsed_stats_schema: None,
+                    leaf_checkpoint_schema: None,
                 })
             }
         };
 
         // Classify from a V2 checkpoint's `_last_checkpoint` hint when possible, else inspect the
         // file.
-        if let Some(shape) =
-            Self::from_v2_checkpoint_hint(exec, segment, root_checkpoint, file_type, stats_schema)?
-        {
+        if let Some(shape) = Self::from_v2_checkpoint_hint(
+            exec,
+            segment,
+            root_checkpoint,
+            file_type,
+            needs_leaf_schema,
+        )? {
             return Ok(shape);
         }
 
@@ -73,26 +115,37 @@ impl CheckpointShape {
             FileType::Parquet => {
                 let cp_schema = match segment.checkpoint_hint_schema() {
                     Some(schema) => schema,
-                    None => exec.read_parquet_footer(root_checkpoint.clone())?.schema,
+                    None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                 };
                 // No `sidecar` column means the file actions are inline, so this is a leaf.
                 if !cp_schema.contains(SIDECAR_NAME) {
-                    return Ok(Self::try_new_leaf(Some(cp_schema), stats_schema));
+                    return Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema)));
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
                 match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(exec, sidecar, stats_schema),
-                    None => Ok(Self::try_new_leaf(Some(cp_schema), stats_schema)),
+                    Some(sidecar) => Self::try_new_manifest(
+                        exec,
+                        sidecar,
+                        needs_leaf_schema,
+                        segment.checkpoint_hint_sidecar_file_schema(),
+                    ),
+                    None => Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema))),
                 }
             }
             // A JSON checkpoint has no footer schema to inspect, so try to collect a sidecar to
-            // decide if it is a manifest or a leaf. A JSON leaf has no readable schema,
-            // hence no parsed stats.
+            // decide if it is a manifest or a leaf.
             FileType::Json => {
                 match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(exec, sidecar, stats_schema),
-                    None => Ok(Self::try_new_leaf(None, stats_schema)),
+                    Some(sidecar) => Self::try_new_manifest(
+                        exec,
+                        sidecar,
+                        needs_leaf_schema,
+                        segment.checkpoint_hint_sidecar_file_schema(),
+                    ),
+                    None => Ok(Self::new_leaf(
+                        needs_leaf_schema.then(|| CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
+                    )),
                 }
             }
         }
@@ -103,79 +156,112 @@ impl CheckpointShape {
     /// caller to inspect the file. A non-empty sidecar list is a manifest; an empty list is a leaf
     /// (the writer emits an empty list only for a leaf, and trims an oversized manifest to absent,
     /// never to empty).
+    #[tracing::instrument(
+        name = "checkpoint_shape.from_v2_checkpoint_hint",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn from_v2_checkpoint_hint(
         exec: &dyn PlanExecutor,
         segment: &LogSegment,
         root_checkpoint: &FileMeta,
         file_type: FileType,
-        stats_schema: Option<&SchemaRef>,
+        needs_leaf_schema: bool,
     ) -> DeltaResult<Option<CheckpointShape>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
                 let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
-                let result = Self::try_new_manifest(exec, sidecar_meta, stats_schema)?;
+                let result = Self::try_new_manifest(
+                    exec,
+                    sidecar_meta,
+                    needs_leaf_schema,
+                    segment.checkpoint_hint_sidecar_file_schema(),
+                )?;
                 Ok(Some(result))
             }
             Some([]) => {
-                // A parquet leaf's stats live in its own schema; read it only when stats are
-                // requested. A JSON leaf has no readable schema.
-                let leaf_schema = match file_type {
-                    FileType::Parquet if stats_schema.is_some() => {
-                        Some(match segment.checkpoint_hint_schema() {
-                            Some(schema) => schema,
-                            None => exec.read_parquet_footer(root_checkpoint.clone())?.schema,
-                        })
-                    }
-                    _ => None,
+                let leaf_schema = match (needs_leaf_schema, file_type) {
+                    (false, _) => None,
+                    (true, FileType::Json) => Some(CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
+                    (true, FileType::Parquet) => Some(match segment.checkpoint_hint_schema() {
+                        Some(schema) => schema,
+                        None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
+                    }),
                 };
-                Ok(Some(Self::try_new_leaf(leaf_schema, stats_schema)))
+                Ok(Some(Self::new_leaf(leaf_schema)))
             }
             None => Ok(None),
         }
     }
 
-    /// Build the shape for a manifest checkpoint. Its file actions and their stats live in the
-    /// sidecars, so probe a sidecar's (parquet) footer -- but only when stats were requested. All
+    /// Build the shape for a manifest checkpoint. Its file actions live in the sidecars. All
     /// sidecars of a checkpoint share one schema, so probing the first is sufficient.
+    ///
+    /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, use it directly. Otherwise,
+    /// read the sidecar's footer when the leaf schema is requested.
+    #[tracing::instrument(
+        name = "checkpoint_shape.try_new_manifest",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
         sidecar: FileMeta,
-        stats_schema: Option<&SchemaRef>,
+        needs_leaf_schema: bool,
+        hint_sidecar_schema: Option<StructType>,
     ) -> DeltaResult<CheckpointShape> {
-        let parsed_stats_schema = match stats_schema {
-            Some(stats_schema) => {
-                let footer_schema = exec.read_parquet_footer(sidecar)?.schema;
-                LogSegment::schema_has_compatible_stats_parsed(footer_schema.as_ref(), stats_schema)
-                    .then(|| stats_schema.clone())
-            }
-            None => None,
+        let leaf_checkpoint_schema = match (needs_leaf_schema, hint_sidecar_schema) {
+            (false, _) => None,
+            (true, Some(schema)) => Some(Arc::new(schema)),
+            (true, None) => Some(read_parquet_footer_schema(exec, sidecar)?),
         };
         Ok(CheckpointShape {
             checkpoint_type: CheckpointType::Manifest,
-            parsed_stats_schema,
+            leaf_checkpoint_schema,
         })
     }
 
-    /// Build the shape for a leaf checkpoint. Its file actions are inline, so `leaf_schema` carries
-    /// their stats (`None` for a JSON leaf, which has no readable footer schema).
-    fn try_new_leaf(
-        leaf_schema: Option<SchemaRef>,
-        stats_schema: Option<&SchemaRef>,
-    ) -> CheckpointShape {
-        let parsed_stats_schema = stats_schema.filter(|stats_schema| {
-            leaf_schema.as_ref().is_some_and(|leaf_schema| {
-                LogSegment::schema_has_compatible_stats_parsed(leaf_schema.as_ref(), stats_schema)
-            })
-        });
+    fn new_leaf(leaf_checkpoint_schema: Option<SchemaRef>) -> CheckpointShape {
         CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
-            parsed_stats_schema: parsed_stats_schema.cloned(),
+            leaf_checkpoint_schema,
         }
     }
+
+    /// Returns `stats_schema` when the checkpoint has compatible parsed stats.
+    pub(crate) fn compatible_stats_parsed_schema<'a>(
+        &self,
+        stats_schema: &'a SchemaRef,
+    ) -> Option<&'a SchemaRef> {
+        self.leaf_checkpoint_schema
+            .as_ref()
+            .is_some_and(|checkpoint_schema| {
+                LogSegment::schema_has_compatible_stats_parsed(checkpoint_schema, stats_schema)
+            })
+            .then_some(stats_schema)
+    }
+}
+
+#[tracing::instrument(
+    name = "checkpoint_shape.read_parquet_footer_schema",
+    skip_all,
+    fields(enable_call_frame),
+    err
+)]
+fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<SchemaRef> {
+    Ok(exec.read_parquet_footer(file)?.schema)
 }
 
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's
 /// [`FileMeta`] (enough to classify and probe; not a full enumeration).
+#[tracing::instrument(
+    name = "checkpoint_shape.collect_single_sidecar",
+    skip_all,
+    fields(enable_call_frame),
+    err
+)]
 fn collect_single_sidecar(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
@@ -207,16 +293,23 @@ fn collect_single_sidecar(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
+    use crate::actions::{
+        CheckpointMetadata, Sidecar, ADD_NAME, MAX_VALUES, MIN_VALUES, NUM_RECORDS,
+        SIDECAR_FILE_SCHEMA_TAG, STATS_PARSED,
+    };
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::engine::sync::SyncEngine;
+    use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+    use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::{IoOperation, PlanResult};
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::unit_test_utils::load_test_table;
+    use crate::schema::{schema, schema_ref};
+    use crate::unit_test_utils::{
+        copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
+    };
 
     /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
     /// performs.
@@ -301,8 +394,15 @@ mod tests {
         let exec = SyncPlanExecutor::default();
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
-        let shape =
-            CheckpointShape::try_new(&exec, snapshot.as_ref(), stats_schema.as_ref()).unwrap();
+        let shape = if stats_schema.is_some() {
+            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+        } else {
+            CheckpointShape::try_new(&exec, snapshot.as_ref())
+        }
+        .unwrap();
+        let parsed_stats_schema = stats_schema
+            .as_ref()
+            .and_then(|stats_schema| shape.compatible_stats_parsed_schema(stats_schema));
 
         assert_eq!(
             shape.checkpoint_type, expected_checkpoint,
@@ -312,49 +412,86 @@ mod tests {
         match expect_parsed {
             // Stats not requested: no parsed-stats schema regardless of the checkpoint.
             None => assert!(
-                shape.parsed_stats_schema.is_none(),
+                parsed_stats_schema.is_none(),
                 "{table}: stats not requested"
             ),
             // Requested with compatible parsed stats: the requested schema is echoed back.
             Some(true) => assert_eq!(
-                shape.parsed_stats_schema.as_ref(),
+                parsed_stats_schema,
                 stats_schema.as_ref(),
                 "{table}: parsed stats available, schema echoed"
             ),
             // Requested but no compatible parsed stats: `None`.
             Some(false) => assert!(
-                shape.parsed_stats_schema.is_none(),
-                "{table}: no compatible parsed stats"
+                parsed_stats_schema.is_none(),
+                "{table}: no compatible stats"
             ),
+        }
+
+        let needs_leaf_schema = stats_schema.is_some();
+        assert_eq!(
+            shape.leaf_checkpoint_schema.is_some(),
+            needs_leaf_schema && expected_checkpoint != CheckpointType::None,
+            "{table}: checkpoint leaf schema"
+        );
+        if let Some(schema) = &shape.leaf_checkpoint_schema {
+            assert!(schema.contains("add"), "{table}: retained add action");
+            assert!(schema.contains("remove"), "{table}: retained remove action");
         }
     }
 
     /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`),
     /// so compatibility does real per-column matching.
     fn probe_stats_schema() -> SchemaRef {
-        let columns = || {
-            StructType::new_unchecked([
-                StructField::nullable("id", DataType::LONG),
-                StructField::nullable("value", DataType::STRING),
-            ])
+        let columns = || schema! { nullable "id": LONG, nullable "value": STRING };
+        schema_ref! {
+            nullable NUM_RECORDS: LONG,
+            nullable MIN_VALUES: (columns()),
+            nullable MAX_VALUES: (columns()),
+        }
+    }
+
+    #[test]
+    fn incompatible_parsed_stats_schema_is_rejected() {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v2-classic-parquet-struct-stats-only").unwrap();
+        let columns = || schema! { nullable "value": LONG };
+        let incompatible = schema_ref! {
+            nullable NUM_RECORDS: LONG,
+            nullable MIN_VALUES: (columns()),
+            nullable MAX_VALUES: (columns()),
         };
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable(NUM_RECORDS, DataType::LONG),
-            StructField::nullable(MIN_VALUES, columns()),
-            StructField::nullable(MAX_VALUES, columns()),
-        ]))
+
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &SyncPlanExecutor::default(),
+            snapshot.as_ref(),
+        )
+        .unwrap();
+
+        assert!(shape
+            .compatible_stats_parsed_schema(&incompatible)
+            .is_none());
     }
 
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards
     /// against the optimization silently not firing (result-only checks pass via the drain too).
-    #[test]
-    fn fast_path_skips_checkpoint_drain_when_hint_lists_sidecars() {
+    #[rstest]
+    #[case::without_leaf_schema(false, 0)]
+    #[case::with_leaf_schema(true, 1)]
+    fn fast_path_skips_checkpoint_drain_when_hint_lists_sidecars(
+        #[case] needs_leaf_schema: bool,
+        #[case] expected_footer_reads: usize,
+    ) {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
         let exec = CountingExecutor::new();
 
-        let shape = CheckpointShape::try_new(&exec, snapshot.as_ref(), Some(&probe_stats_schema()))
-            .unwrap();
+        let shape = if needs_leaf_schema {
+            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+        } else {
+            CheckpointShape::try_new(&exec, snapshot.as_ref())
+        }
+        .unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert_eq!(
@@ -364,16 +501,25 @@ mod tests {
         );
         assert_eq!(
             exec.footer_reads.load(Ordering::Relaxed),
-            1,
-            "fast path footer-reads exactly the hint's first sidecar"
+            expected_footer_reads,
+            "fast path reads the sidecar footer only when its schema is needed"
         );
+        assert_eq!(shape.leaf_checkpoint_schema.is_some(), needs_leaf_schema);
     }
 
-    /// With the hint removed, a JSON manifest must drain the `sidecar` column (`query_scans >= 1`).
-    #[test]
-    fn resolve_json_manifest_via_drain_without_hint() {
-        let (engine, snapshot, _tempdir) =
-            load_test_table("v2-checkpoints-json-with-sidecars").unwrap();
+    /// Without a hint, a manifest must drain the `sidecar` column (`query_scans >= 1`).
+    #[rstest]
+    #[case::json("v2-checkpoints-json-with-sidecars", false)]
+    #[case::parquet("v2-parquet-sidecars-struct-stats-only", true)]
+    fn resolve_manifest_via_drain_without_hint(
+        #[case] table: &str,
+        #[case] expect_parsed_stats: bool,
+    ) {
+        let (table_root, _tempdir) = copy_test_table(table).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(table_root)
+            .build(engine.as_ref())
+            .unwrap();
         // Remove the hint so resolve must drain.
         let hint = snapshot
             .log_segment()
@@ -391,13 +537,18 @@ mod tests {
             .unwrap();
 
         let exec = CountingExecutor::new();
-        let shape = CheckpointShape::try_new(&exec, snapshot.as_ref(), Some(&probe_stats_schema()))
-            .unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref()).unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert!(
             exec.query_scans.load(Ordering::Relaxed) >= 1,
             "must drain, not fast-path"
+        );
+        assert_eq!(
+            shape
+                .compatible_stats_parsed_schema(&probe_stats_schema())
+                .is_some(),
+            expect_parsed_stats
         );
     }
 
@@ -406,10 +557,6 @@ mod tests {
     /// empty sidecar list, so this synthetic segment is the only way to exercise the leaf fast
     /// path.
     fn segment_with_empty_sidecars_hint(extension: &str) -> LogSegment {
-        use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
-        use crate::log_segment_files::LogSegmentFiles;
-        use crate::unit_test_utils::{create_log_path, create_log_path_with_size};
-
         let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
         let selected = format!(
             "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.{extension}"
@@ -439,17 +586,17 @@ mod tests {
     }
 
     /// An empty-sidecars hint (`Some([])`) classifies as a leaf without inspecting the checkpoint.
-    /// A JSON leaf never reports parsed stats; a parquet leaf reads its schema only when stats are
+    /// A JSON leaf uses the canonical action schema; a parquet leaf reads its schema only when
     /// requested. `None` here means the hint short-circuited (a fall-through would return `Some`).
     #[rstest]
-    // JSON leaf: no readable schema, so never any parsed stats, and never any I/O.
-    #[case::json_no_stats("json", false, None, 0)]
-    #[case::json_with_stats("json", true, None, 0)]
-    // Parquet leaf: no stats requested -> no schema read, no parsed stats.
-    #[case::parquet_no_stats("parquet", false, None, 0)]
+    // JSON leaf: use the canonical schema without I/O.
+    #[case::json_without_leaf_schema("json", false, None, 0)]
+    #[case::json_with_leaf_schema("json", true, None, 0)]
+    // Parquet leaf: schema not retained -> no footer read or parsed stats.
+    #[case::parquet_without_leaf_schema("parquet", false, None, 0)]
     fn empty_sidecars_hint_classifies_leaf_without_drain(
         #[case] extension: &str,
-        #[case] request_stats: bool,
+        #[case] needs_leaf_schema: bool,
         #[case] expect_parsed: Option<bool>,
         #[case] expected_footer_reads: usize,
     ) {
@@ -459,7 +606,7 @@ mod tests {
             "json" => FileType::Json,
             _ => FileType::Parquet,
         };
-        let stats_schema = request_stats.then(probe_stats_schema);
+        let stats_schema = needs_leaf_schema.then(probe_stats_schema);
         let exec = CountingExecutor::new();
 
         let shape = CheckpointShape::from_v2_checkpoint_hint(
@@ -467,16 +614,22 @@ mod tests {
             &segment,
             root,
             file_type,
-            stats_schema.as_ref(),
+            needs_leaf_schema,
         )
         .unwrap()
         .expect("an empty-sidecars hint must classify without falling through");
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Leaf);
-        assert_eq!(
-            shape.parsed_stats_schema.is_some(),
-            expect_parsed == Some(true)
-        );
+        if file_type == FileType::Json && needs_leaf_schema {
+            assert_eq!(
+                shape.leaf_checkpoint_schema.as_ref(),
+                Some(&*CHECKPOINT_ACTIONS_SCHEMA_V2)
+            );
+        }
+        let parsed_stats_schema = stats_schema
+            .as_ref()
+            .and_then(|stats_schema| shape.compatible_stats_parsed_schema(stats_schema));
+        assert_eq!(parsed_stats_schema.is_some(), expect_parsed == Some(true));
         assert_eq!(
             exec.query_scans.load(Ordering::Relaxed),
             0,
@@ -485,6 +638,141 @@ mod tests {
         assert_eq!(
             exec.footer_reads.load(Ordering::Relaxed),
             expected_footer_reads
+        );
+    }
+
+    /// Builds a segment whose applicable hint lists one sidecar and carries a `checkpointMetadata`
+    /// action with a synthetic `sidecarFileSchema` tag, exercising the footer-read short-circuit.
+    /// When `compatible`, the tagged schema's `add.stats_parsed` matches [`probe_stats_schema`];
+    /// otherwise `add` has no `stats_parsed` field at all, so the compatibility check fails.
+    fn segment_with_manifest_hint(extension: &str, compatible: bool) -> LogSegment {
+        let columns = || schema! { nullable "id": LONG, nullable "value": STRING };
+        let stats_parsed = schema! {
+            nullable NUM_RECORDS: LONG,
+            nullable MIN_VALUES: (columns()),
+            nullable MAX_VALUES: (columns()),
+        };
+        let add = if compatible {
+            schema! { nullable STATS_PARSED: (stats_parsed) }
+        } else {
+            schema! { nullable "path": STRING }
+        };
+        let sidecar_file_schema =
+            serde_json::to_string(&schema! { nullable ADD_NAME: (add) }).unwrap();
+        let tags = std::collections::HashMap::from([(
+            SIDECAR_FILE_SCHEMA_TAG.to_string(),
+            sidecar_file_schema,
+        )]);
+
+        let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
+        let selected = format!(
+            "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.{extension}"
+        );
+        let checkpoint_file = log_root.join(&selected).unwrap().to_string();
+        let commit = create_log_path(log_root.join("00000000000000000002.json").unwrap().as_str());
+        LogSegment::try_new(
+            LogSegmentFiles {
+                checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+                ascending_commit_files: vec![commit.clone()],
+                latest_commit_file: Some(commit),
+                ..Default::default()
+            },
+            log_root,
+            None,
+            Some(LastCheckpointHint {
+                version: 1,
+                v2_checkpoint: Some(LastCheckpointV2 {
+                    path: selected,
+                    sidecar_files: Some(vec![Sidecar {
+                        path: "sidecar-1.parquet".to_string(),
+                        size_in_bytes: 1,
+                        modification_time: 0,
+                        tags: None,
+                    }]),
+                    non_file_actions: Some(vec![HintAction::CheckpointMetadata(
+                        CheckpointMetadata {
+                            version: 1,
+                            tags: Some(tags),
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+    }
+
+    /// A manifest hint carrying a `sidecarFileSchema` answers the stats-compatibility question from
+    /// the hint alone: the checkpoint classifies as a manifest, parsed stats are reported per the
+    /// hint schema's compatibility, and no sidecar footer is read (nor is the checkpoint drained).
+    #[rstest]
+    #[case::compatible_parquet("parquet", true, true)]
+    #[case::compatible_json("json", true, true)]
+    #[case::incompatible_parquet("parquet", false, false)]
+    #[case::incompatible_json("json", false, false)]
+    fn manifest_hint_sidecar_file_schema_skips_footer_read(
+        #[case] extension: &str,
+        #[case] compatible: bool,
+        #[case] expect_parsed: bool,
+    ) {
+        let segment = segment_with_manifest_hint(extension, compatible);
+        let root = &segment.listed.checkpoint_parts[0].location;
+        let file_type = match extension {
+            "json" => FileType::Json,
+            _ => FileType::Parquet,
+        };
+        let stats_schema = probe_stats_schema();
+        let exec = CountingExecutor::new();
+
+        let shape =
+            CheckpointShape::from_v2_checkpoint_hint(&exec, &segment, root, file_type, true)
+                .unwrap()
+                .expect("a sidecar-listing hint must classify as a manifest");
+
+        assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
+        let parsed_stats_schema = shape.compatible_stats_parsed_schema(&stats_schema);
+        assert_eq!(parsed_stats_schema.is_some(), expect_parsed);
+        if expect_parsed {
+            assert_eq!(parsed_stats_schema, Some(&stats_schema));
+        }
+        assert_eq!(
+            exec.footer_reads.load(Ordering::Relaxed),
+            0,
+            "sidecarFileSchema hint must skip the sidecar footer read"
+        );
+        assert_eq!(
+            exec.query_scans.load(Ordering::Relaxed),
+            0,
+            "the hint fast path must not drain the checkpoint"
+        );
+    }
+
+    /// The hint schema must match the sidecar's actual parquet footer, so substituting it is
+    /// behavior-preserving. Uses a real table whose parquet sidecars carry compatible struct stats.
+    #[test]
+    fn manifest_hint_schema_matches_footer_read_result() {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
+        let exec = SyncPlanExecutor::default();
+        let segment = snapshot.log_segment();
+        let sidecar = segment
+            .checkpoint_hint_sidecars()
+            .and_then(|s| s.first())
+            .expect("table's hint lists sidecars")
+            .to_filemeta(&segment.log_root)
+            .unwrap();
+        let hint_schema = segment
+            .checkpoint_hint_sidecar_file_schema()
+            .expect("table's hint carries the sidecar schema");
+        let footer_shape =
+            CheckpointShape::try_new_manifest(&exec, sidecar.clone(), true, None).unwrap();
+        let hinted =
+            CheckpointShape::try_new_manifest(&exec, sidecar, true, Some(hint_schema)).unwrap();
+
+        assert_eq!(
+            hinted.leaf_checkpoint_schema, footer_shape.leaf_checkpoint_schema,
+            "hint schema must match the footer schema"
         );
     }
 }

@@ -223,7 +223,7 @@ async fn run_ctas_test(
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?;
         match result {
-            CommitResult::CommittedTransaction(c) => c
+            CommitResult::Committed(c) => c
                 .post_commit_snapshot()
                 .expect("should have post_commit_snapshot")
                 .clone(),
@@ -260,15 +260,15 @@ async fn run_ctas_test(
     }
     let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let write_context = Arc::new(tgt_txn.unpartitioned_write_context()?);
+    let write_context = tgt_txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
-        .write_parquet(&ArrowEngineData::new(source_data), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(source_data), &write_context)
         .await?;
     tgt_txn.add_files(add_meta);
 
     let commit_result = tgt_txn.commit(engine.as_ref())?;
     let tgt_snapshot = match commit_result {
-        CommitResult::CommittedTransaction(c) => c
+        CommitResult::Committed(c) => c
             .post_commit_snapshot()
             .expect("should have post_commit_snapshot")
             .clone(),

@@ -13,7 +13,8 @@ use delta_kernel::expressions::{
 
 use super::kernel_visitor::NullTypeTag;
 use crate::expressions::{
-    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
+    FfiMapToStructOptions, SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp,
+    SharedPredicate,
 };
 use crate::handle::Handle;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
@@ -30,6 +31,18 @@ type VisitParseJsonFn = extern "C" fn(
     sibling_list_id: usize,
     child_list_id: usize,
     output_schema: Handle<SharedSchema>,
+);
+type VisitMapToStructFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    options: *const FfiMapToStructOptions,
+);
+type VisitColumnFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    parts: *const KernelStringSlice,
+    parts_len: usize,
 );
 
 /// The [`EngineExpressionVisitor`] defines a visitor system to allow engines to build their own
@@ -168,10 +181,9 @@ pub struct EngineExpressionVisitor {
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
     /// into.
     pub visit_parse_json: VisitParseJsonFn,
-    /// Visits the `MapToStruct` expression belonging to the list identified by `sibling_list_id`.
-    /// The sub-expression (map column) will be in a _one_ item list identified by `child_list_id`.
-    /// The output struct schema is determined by the evaluator's result type.
-    pub visit_map_to_struct: VisitUnaryFn,
+    /// Visits a `MapToStruct` expression. The sub-expression is in the one-item list identified by
+    /// `child_list_id`. `options` and its contents are borrowed for the duration of the callback.
+    pub visit_map_to_struct: VisitMapToStructFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by
     /// `sibling_list_id`. The operands will be in a _two_ item list identified by
     /// `child_list_id`
@@ -210,9 +222,11 @@ pub struct EngineExpressionVisitor {
     /// `sibling_list_id`. The element expressions will be in a list identified by
     /// `child_list_id`.
     pub visit_array: VisitVariadicFn,
-    /// Visits the `column` belonging to the list identified by `sibling_list_id`.
-    pub visit_column:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    /// Visits a `column` belonging to the list identified by `sibling_list_id`.
+    ///
+    /// `parts` contains the ordered field-name parts of the column. Each part is valid only for
+    /// the duration of this callback.
+    pub visit_column: VisitColumnFn,
     /// Visits a `Struct` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions (fields) of the struct are in a list identified by `child_list_id`
     pub visit_struct_expr:
@@ -406,9 +420,18 @@ fn visit_expression_column(
     name: &ColumnName,
     sibling_list_id: usize,
 ) {
-    let name = name.to_string();
-    let name = kernel_string_slice!(name);
-    call!(visitor, visit_column, sibling_list_id, name);
+    let parts: Vec<_> = name
+        .path()
+        .iter()
+        .map(|part| kernel_string_slice!(part))
+        .collect();
+    call!(
+        visitor,
+        visit_column,
+        sibling_list_id,
+        parts.as_ptr(),
+        parts.len()
+    );
 }
 
 fn visit_expression_struct(
@@ -679,10 +702,17 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
-        Expression::MapToStruct(MapToStructExpression { map_expr }) => {
+        Expression::MapToStruct(MapToStructExpression { map_expr, options }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, map_expr, child_list_id);
-            call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
+            let options = FfiMapToStructOptions::from_kernel(options);
+            call!(
+                visitor,
+                visit_map_to_struct,
+                sibling_list_id,
+                child_list_id,
+                &raw const options
+            );
         }
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
         Expression::Cast(cast) => visit_unknown(
@@ -754,15 +784,36 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{lit, Expression, Scalar};
+    use delta_kernel::expressions::{lit, Expression, MapToStructOptions, Scalar};
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::FfiMapToStructOptions;
+    use crate::TryFromStringSlice;
 
     #[derive(Debug, PartialEq, Eq)]
     enum LiteralEvent {
-        IntervalYearMonth { sibling_list_id: usize, value: i32 },
-        IntervalDayTime { sibling_list_id: usize, value: i64 },
+        IntervalYearMonth {
+            sibling_list_id: usize,
+            value: i32,
+        },
+        IntervalDayTime {
+            sibling_list_id: usize,
+            value: i64,
+        },
+        Column {
+            sibling_list_id: usize,
+            parts: Vec<String>,
+        },
+        Unknown {
+            sibling_list_id: usize,
+            name: String,
+        },
+        MapToStruct {
+            sibling_list_id: usize,
+            child_list_id: usize,
+            timestamp_timezone: Option<String>,
+        },
     }
 
     #[derive(Default)]
@@ -776,6 +827,23 @@ mod tests {
         let list_id = builder.next_list_id;
         builder.next_list_id += 1;
         list_id
+    }
+
+    extern "C" fn visit_map_to_struct(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        child_list_id: usize,
+        options: *const FfiMapToStructOptions,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let options = unsafe { &*options };
+        let timestamp_timezone = Option::<&KernelStringSlice>::from(&options.timestamp_timezone)
+            .map(|timezone| unsafe { String::try_from_slice(timezone).unwrap() });
+        builder.events.push(LiteralEvent::MapToStruct {
+            sibling_list_id,
+            child_list_id,
+            timestamp_timezone,
+        });
     }
 
     extern "C" fn visit_literal_interval_year_month(
@@ -799,6 +867,36 @@ mod tests {
         builder.events.push(LiteralEvent::IntervalDayTime {
             sibling_list_id,
             value,
+        });
+    }
+
+    extern "C" fn visit_column(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        parts: *const KernelStringSlice,
+        parts_len: usize,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let parts = unsafe { std::slice::from_raw_parts(parts, parts_len) }
+            .iter()
+            .map(|part| unsafe { String::try_from_slice(part).unwrap() })
+            .collect();
+        builder.events.push(LiteralEvent::Column {
+            sibling_list_id,
+            parts,
+        });
+    }
+
+    extern "C" fn visit_unknown_name(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let name = unsafe { String::try_from_slice(&name) }.unwrap();
+        builder.events.push(LiteralEvent::Unknown {
+            sibling_list_id,
+            name,
         });
     }
 
@@ -828,7 +926,6 @@ mod tests {
     ignore_fn!(ignore_map_literal, usize, usize);
     ignore_fn!(ignore_null, u8, u8, u8);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
-    ignore_fn!(ignore_column, KernelStringSlice);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
     ignore_fn!(ignore_opaque_expr, Handle<SharedOpaqueExpressionOp>, usize);
@@ -863,7 +960,7 @@ mod tests {
             visit_is_null: ignore_child_list,
             visit_to_json: ignore_child_list,
             visit_parse_json: ignore_parse_json,
-            visit_map_to_struct: ignore_child_list,
+            visit_map_to_struct,
             visit_lt: ignore_child_list,
             visit_gt: ignore_child_list,
             visit_eq: ignore_child_list,
@@ -875,14 +972,32 @@ mod tests {
             visit_divide: ignore_child_list,
             visit_coalesce: ignore_child_list,
             visit_array: ignore_child_list,
-            visit_column: ignore_column,
+            visit_column,
             visit_struct_expr: ignore_child_list,
             visit_struct_patch_expr: ignore_struct_patch,
             visit_field_patch: ignore_field_patch,
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
-            visit_unknown: ignore_column,
+            visit_unknown: visit_unknown_name,
         }
+    }
+
+    #[test]
+    fn visit_expression_column_uses_structured_parts() {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id =
+            visit_expression_internal(&Expression::column(["a", "b.c", "d"]), &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Column {
+                sibling_list_id: 0,
+                parts: vec!["a".to_string(), "b.c".to_string(), "d".to_string()],
+            }]
+        );
     }
 
     #[rstest]
@@ -929,5 +1044,36 @@ mod tests {
 
         assert_eq!(top_level_id, 0);
         assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn map_to_struct_visits_options(#[case] timestamp_timezone: Option<&str>) {
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+        let expression =
+            Expression::map_to_struct(Expression::column(["partitionValues"]), options);
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![
+                LiteralEvent::Column {
+                    sibling_list_id: 1,
+                    parts: vec!["partitionValues".to_string()],
+                },
+                LiteralEvent::MapToStruct {
+                    sibling_list_id: 0,
+                    child_list_id: 1,
+                    timestamp_timezone: timestamp_timezone.map(str::to_string),
+                }
+            ]
+        );
     }
 }

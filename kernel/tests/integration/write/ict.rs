@@ -65,9 +65,9 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let write_context = txn.write_state()?.write_context_builder().build()?;
     let file_meta = engine
-        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(file_meta);
     Ok(())
@@ -117,20 +117,20 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // First commit
     let commit_result = txn.commit(&engine)?;
     match commit_result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 1,
                 "First commit should result in version 1"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "First commit should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("First commit should not be retryable error");
         }
     }
@@ -162,20 +162,20 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // Second commit
     let commit_result2 = txn2.commit(&engine)?;
     match commit_result2 {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 2,
                 "Second commit should result in version 2"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "Second commit should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("Second commit should not be retryable error");
         }
     }

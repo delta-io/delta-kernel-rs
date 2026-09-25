@@ -122,7 +122,7 @@ define_sweeps! {
     // TODO: max-CM=id / max-CM=name full set (needs checkpointProtection, clustering,
     //       materializePartitionColumns, invariants, checkConstraints, generatedColumns,
     //       allowColumnDefaults, identityColumns, NTZ/variant (schema-driven),
-    //       catalogManaged, collations for CM=name, typeWidening write support).
+    //       catalogManaged, collations for CM=name).
     // TODO: iceV2+writer (needs icebergCompatV2 + icebergWriterCompatV1).
     // TODO: iceV3 (needs icebergCompatV3).
     feature_set_values = (no_features(), all_features_cm_id(), all_features_cm_name()),
@@ -166,7 +166,7 @@ use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
-    CapturingReporter, CountingReporter, RelaxedCounter,
+    CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
 };
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
@@ -196,13 +196,15 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancelledFuture, DeltaResult, DeltaResultIterator, Engine,
-    EngineData, Error, FileMeta, FilteredEngineData, LogPath, Snapshot,
+    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
+    DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FilteredEngineData, JsonHandler, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
+    Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -743,8 +745,58 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        "name",
+    )
+    .await
+}
+
+/// Like [`create_table`], but writes `delta.columnMapping.mode` as `column_mapping_mode` instead
+/// of always `"name"`. No-op when `columnMapping` isn't in `reader_features`.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table_with_column_mapping_mode(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+    column_mapping_mode: &str,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        column_mapping_mode,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_table_impl(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
+    column_mapping_mode: &str,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
 
@@ -762,13 +814,24 @@ pub async fn create_table(
         }
     }
 
+    // adaptiveMetadata auto-enables its dependencies (see `enable_adaptive_metadata_dependencies`)
+    // so callers can pass just `adaptiveMetadata-preview` and get a loadable table.
+    let enable_adaptive_metadata = reader_features.contains(&"adaptiveMetadata-preview")
+        || writer_features.contains(&"adaptiveMetadata-preview");
+    if enable_adaptive_metadata {
+        enable_adaptive_metadata_dependencies(&mut reader_features, &mut writer_features);
+    }
+
     // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
-    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
-    // `delta.columnMapping.maxColumnId` below.
+    // fails. Assign it here (with nested ids for iceberg v3 / adaptiveMetadata); `max_column_id`
+    // feeds `delta.columnMapping.maxColumnId` below.
     let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
         let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
-        let schema =
-            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        let schema = assign_column_mapping_metadata(
+            &schema,
+            &mut max_id,
+            enable_iceberg_compat_v3 || enable_adaptive_metadata,
+        )?;
         (Arc::new(schema), max_id)
     } else {
         (schema, 0i64)
@@ -797,7 +860,10 @@ pub async fn create_table(
         let mut config = serde_json::Map::new();
 
         if reader_features.contains(&"columnMapping") {
-            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.mode".to_string(),
+                json!(column_mapping_mode),
+            );
             config.insert(
                 "delta.columnMapping.maxColumnId".to_string(),
                 json!(max_column_id.to_string()),
@@ -897,6 +963,36 @@ pub async fn create_table(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
+}
+
+/// Adds the features `adaptiveMetadata-preview` depends on to `reader_features` and
+/// `writer_features` (each only if not already present).
+///
+/// adaptiveMetadata requires column mapping (in `id` mode, set by the caller) plus RowTracking,
+/// DomainMetadata, DeletionVectors, and InCommitTimestamp. The ReaderWriter dependencies are
+/// mirrored into both feature lists; the writer-only dependencies are added to `writer_features`.
+fn enable_adaptive_metadata_dependencies<'a>(
+    reader_features: &mut Vec<&'a str>,
+    writer_features: &mut Vec<&'a str>,
+) {
+    // ReaderWriter features must appear in both reader and writer feature lists.
+    for f in [
+        "adaptiveMetadata-preview",
+        "columnMapping",
+        "deletionVectors",
+    ] {
+        if !reader_features.contains(&f) {
+            reader_features.push(f);
+        }
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
+    for f in ["rowTracking", "domainMetadata", "inCommitTimestamp"] {
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
 }
 
 /// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
@@ -1109,7 +1205,8 @@ pub async fn insert_data_with<E: TaskExecutor>(
         txn = txn.with_blind_append();
     }
 
-    let write_context = txn.unpartitioned_write_context()?;
+    let write_state = txn.write_state()?;
+    let write_context = write_state.write_context_builder().build()?;
     let add_files_metadata = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
@@ -1184,20 +1281,17 @@ pub fn set_json_value(
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
 pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::nullable("row_number", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("score", DataType::DOUBLE),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::nullable("street", DataType::STRING),
-                StructField::nullable("city", DataType::STRING),
-            ])?,
-        ),
-        StructField::nullable("tag", DataType::STRING),
-        StructField::nullable("value", DataType::INTEGER),
-    ])?))
+    Ok(schema_ref! {
+        nullable "row_number": LONG,
+        nullable "name": STRING,
+        nullable "score": DOUBLE,
+        nullable "address": {
+            nullable "street": STRING,
+            nullable "city": STRING,
+        },
+        nullable "tag": STRING,
+        nullable "value": INTEGER,
+    })
 }
 
 /// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
@@ -1269,32 +1363,30 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 
 /// Schema with one column of the given type: `(id INT, col <dtype>)`.
 pub fn schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col": (dtype),
+    }
 }
 
 /// Schema with the given type nested inside a struct:
 /// `(id INT, nested STRUCT<inner <dtype>>)`.
 pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new(
-            "nested",
-            StructType::new_unchecked(vec![StructField::new("inner", dtype, true)]),
-            true,
-        ),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "nested": {
+            nullable "inner": (dtype),
+        },
+    }
 }
 
 /// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
 pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("col1", dtype.clone(), true),
-        StructField::new("col2", dtype, true),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "col1": (dtype.clone()),
+        nullable "col2": (dtype),
+    }
 }
 
 pub fn top_level_ntz_schema() -> SchemaRef {
@@ -1527,21 +1619,25 @@ pub async fn write_batch_to_table(
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     txn.ack_column_defaults();
+    let write_state = txn.write_state()?;
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
             "partition_values should be empty for unpartitioned tables"
         );
-        txn.unpartitioned_write_context()?
+        write_state.write_context_builder().build()?
     } else {
-        txn.partitioned_write_context(partition_values)?
+        write_state
+            .write_context_builder()
+            .with_partition_values(partition_values)
+            .build()?
     };
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+        delta_kernel::transaction::CommitResult::Committed(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
             .clone()),
@@ -1602,6 +1698,169 @@ impl CancellationToken for TestCancellationToken {
             }
             notified.await;
         })
+    }
+}
+
+/// An [`Engine`] decorator that records the [`CancellationTokenRef`] kernel passes to the JSON and
+/// Parquet cancellation-aware reads, so a test can assert kernel threaded the caller's own token
+/// through by identity. Every other handler call, and the non-cancellation reads, delegate to the
+/// wrapped engine unchanged.
+///
+/// Only the first token observed on each path is retained: a scan drives the read path once with
+/// the caller's token, but a subsequent empty-sidecar read must not clobber it with `None`.
+pub struct TokenCapturingEngine {
+    inner: Arc<dyn Engine>,
+    json: Arc<CapturingJsonHandler>,
+    parquet: Arc<CapturingParquetHandler>,
+}
+
+impl TokenCapturingEngine {
+    /// Wrap `inner`, capturing tokens on both read paths.
+    pub fn new(inner: Arc<dyn Engine>) -> Self {
+        let json = Arc::new(CapturingJsonHandler {
+            inner: inner.json_handler(),
+            seen: Mutex::new(None),
+        });
+        let parquet = Arc::new(CapturingParquetHandler {
+            inner: inner.parquet_handler(),
+            seen: Mutex::new(None),
+        });
+        Self {
+            inner,
+            json,
+            parquet,
+        }
+    }
+
+    /// The token the JSON read path received, or `None` if it never ran or was handed no token.
+    pub fn json_token(&self) -> Option<CancellationTokenRef> {
+        self.json.seen.lock().unwrap().clone()
+    }
+
+    /// The token the Parquet read path received, or `None` if it never ran or was handed no token.
+    pub fn parquet_token(&self) -> Option<CancellationTokenRef> {
+        self.parquet.seen.lock().unwrap().clone()
+    }
+}
+
+impl Engine for TokenCapturingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.json.clone()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet.clone()
+    }
+}
+
+/// Records the first token handed to a `Mutex`-guarded slot, leaving a token already there intact.
+fn capture_first_token(
+    seen: &Mutex<Option<CancellationTokenRef>>,
+    token: &Option<CancellationTokenRef>,
+) {
+    let mut seen = seen.lock().unwrap();
+    if seen.is_none() {
+        seen.clone_from(token);
+    }
+}
+
+struct CapturingJsonHandler {
+    inner: Arc<dyn JsonHandler>,
+    seen: Mutex<Option<CancellationTokenRef>>,
+}
+
+impl JsonHandler for CapturingJsonHandler {
+    fn parse_json(
+        &self,
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        self.inner.parse_json(json_strings, output_schema)
+    }
+
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.inner
+            .read_json_files(files, physical_schema, predicate)
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        capture_first_token(&self.seen, &cancellation_token);
+        self.inner.read_json_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn write_json_file(
+        &self,
+        path: &Url,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
+        overwrite: bool,
+    ) -> DeltaResult<u64> {
+        self.inner.write_json_file(path, data, overwrite)
+    }
+}
+
+struct CapturingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    seen: Mutex<Option<CancellationTokenRef>>,
+}
+
+impl ParquetHandler for CapturingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        capture_first_token(&self.seen, &cancellation_token);
+        self.inner.read_parquet_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: FileDataReadResultIterator,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
     }
 }
 
@@ -1846,7 +2105,7 @@ pub fn remove_all_and_get_remove_actions(
         txn.remove_files(sm.scan_files);
     }
     let committed = match txn.commit(engine)? {
-        CommitResult::CommittedTransaction(c) => c,
+        CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
     read_actions_from_commit(table_url, committed.commit_version(), "remove")

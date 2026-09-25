@@ -93,11 +93,9 @@ async fn try_main() -> DeltaResult<()> {
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
 
-    // Write the data using the engine
-    let write_context = Arc::new(txn.unpartitioned_write_context()?);
-    let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref())
-        .await?;
+    // This example assumes the table is unpartitioned.
+    let write_context = txn.write_state()?.write_context_builder().build()?;
+    let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
@@ -111,13 +109,13 @@ async fn try_main() -> DeltaResult<()> {
             ));
         }
         txn = match txn.commit(&engine)? {
-            CommitResult::CommittedTransaction(committed) => break committed,
-            CommitResult::ConflictedTransaction(conflicted) => {
+            CommitResult::Committed(committed) => break committed,
+            CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
                 return Err(Error::generic("Commit failed"));
             }
-            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+            CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
                 transaction
             }

@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use delta_kernel::expressions::{
     col, column_name, column_pred, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-    Expression as Expr, ExpressionStructPatchBuilder, MapData, OpaqueExpressionOp,
-    OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
+    Expression as Expr, ExpressionStructPatchBuilder, MapData, MapToStructOptions,
+    OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator,
+    StructData,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -158,7 +159,11 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::struct_from([lit(5_i32), lit(20_i64)]),
         Expr::opaque(OpaqueTestOp("foo".to_string()), vec![lit(42), lit(1.111)]),
         Expr::unknown("mystery"),
-        Expr::map_to_struct(col!("pv")),
+        Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
+        Expr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
         Expr::coalesce([col!("col"), lit(0_i32)]),
         Expr::array([lit(1_i32), lit(2_i32)]),
     ];
@@ -254,9 +259,25 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         Expr::binary(BinaryExpressionOp::Multiply, lit(5), lit(6)),
         Expr::binary(BinaryExpressionOp::Divide, lit(100), lit(4)),
         Expr::struct_from([lit(1_i32), lit(2_i64), lit(3.0_f64)]),
-        Expr::map_to_struct(col!("partitionValues")),
+        Expr::map_to_struct(col!("partitionValues"), MapToStructOptions::default()),
+        Expr::map_to_struct(
+            col!("partitionValues"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
     ];
     Arc::new(Expr::struct_from(sub_exprs)).into()
+}
+
+/// Constructs a reference column expression whose middle field name contains a literal period
+/// (`a`, `b.c`, `d`). The C example builds the same column from a structured parts array and
+/// checks it round-trips to this reference.
+///
+/// # Safety
+/// The caller must free the returned handle with
+/// [`crate::expressions::free_kernel_expression`].
+#[no_mangle]
+pub unsafe extern "C" fn get_testing_dotted_field_column() -> Handle<SharedExpression> {
+    Arc::new(Expr::column(["a", "b.c", "d"])).into()
 }
 
 /// Constructs a simple kernel predicate using only primitive types for round-trip testing.

@@ -67,7 +67,10 @@ let mut txn = snapshot
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the
 // [Appending data](../writing/append.md) how-to for the full Parquet-writing flow.
-let write_context = txn.unpartitioned_write_context()?;
+// This example writes to an unpartitioned table. For a partitioned table, call
+// with_partition_values(...) before build().
+let write_state = txn.write_state()?;
+let write_context = write_state.write_context_builder().build()?;
 // ... use write_context to produce add_metadata: Box<dyn EngineData>
 //     matching txn.add_files_schema() ...
 txn.add_files(add_metadata);
@@ -106,7 +109,7 @@ snapshot** that reflects the newly committed state:
 use delta_kernel::transaction::CommitResult;
 
 match commit_result {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let version = committed.commit_version();
         // post_commit_snapshot() returns an Option. For catalog-managed
         // commits today, Kernel returns Some. The Option exists for
@@ -127,12 +130,12 @@ match commit_result {
         // Proceed to publish (Phase 4).
         let published_snapshot = post_commit.publish(&engine, &publish_committer)?;
     }
-    CommitResult::ConflictedTransaction(conflicted) => {
+    CommitResult::Conflicted(conflicted) => {
         // Another writer already committed at this version.
         // `conflicted.conflict_version()` returns the version this transaction
         // attempted. Rebase onto the new table state and retry.
     }
-    CommitResult::RetryableTransaction(retryable) => {
+    CommitResult::Retryable(retryable) => {
         // Transient I/O error. `retryable.error` gives the underlying cause;
         // `retryable.transaction` is the original transaction you can retry
         // without rebasing. Kernel reaches this arm only for `Error::IOError`

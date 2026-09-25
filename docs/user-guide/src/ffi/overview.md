@@ -161,6 +161,7 @@ engine-owned memory.
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
 | `visit_metadata` | Invoke a single callback with `(id, name, description, format_provider, has_created_time, created_time_ms)` |
+| `visit_metadata_format_options` | Iterate arbitrary format option key/value pairs from a `SharedMetadata` handle |
 | `visit_metadata_configuration` | Iterate the `configuration` key/value map (takes a snapshot handle, not a metadata handle) |
 | `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
 
@@ -170,14 +171,20 @@ See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
 The build-side counterpart to `visit_schema`: per-field callbacks that let the
 engine construct a Kernel `StructType` from its own type system (for example,
-to pass to `scan_builder_with_schema`).
+to pass to `scan_builder_with_schema`). Every field function takes a nullable
+`const EngineMetadata*` descriptor: an opaque engine-owned value plus a synchronous callback that
+inserts the field's metadata into a Kernel-owned `CMetadataMap`. A null descriptor means the field
+has no metadata. Kernel copies incoming keys and values; it doesn't retain the descriptor or
+borrowed slices. Don't retain the callback's state.
 
 | Function | Purpose |
 |----------|---------|
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
+| `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
+| `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
 
 **Reading (scans)**
 
@@ -228,10 +235,10 @@ feature is enabled; the rest are always available.
 
 **Write context and file writing**
 
-Use a `WriteContext` to learn where to write parquet files and what schema to
+Use a `BoundWriteContext` to learn where to write parquet files and what schema to
 write. For unpartitioned writes, one context serves the whole transaction.
-Partitioned writes (which would use one context per partition) are tracked in
-[#2355](https://github.com/delta-io/delta-kernel-rs/issues/2355).
+For partitioned writes, create one context per partition by passing a
+`PartitionValueMap` to `get_partitioned_write_context`.
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
 layout) onto the returned table root. For partitioned tables, use
@@ -266,7 +273,7 @@ unpartitioned writes.
 | `create_table_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
 | `create_table_with_engine_info` | Attach a free-form engine identifier to a create-table transaction (consumes and returns a new handle) |
 | `create_table_set_data_change` | Toggle the data-change flag on a create-table transaction (does not consume the handle) |
-| `create_table_get_unpartitioned_write_context` | Get a `WriteContext` to stage initial data files during table creation |
+| `create_table_get_unpartitioned_write_context` | Get a `BoundWriteContext` to stage initial data files during table creation |
 | `create_table_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
 | `create_table_commit` | Commit the create-table transaction |
 | `free_create_table_builder` | Release a create-table builder handle (before it is consumed by `create_table_builder_build*`) |
@@ -382,7 +389,7 @@ pattern is the same in every case:
 
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the
-call; copy them if you need to retain them beyond the callback.
+call. Copy them if you need to retain them beyond the callback.
 
 ## Error handling
 

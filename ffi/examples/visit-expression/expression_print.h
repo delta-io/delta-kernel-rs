@@ -284,13 +284,22 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       break;
     }
     case Column: {
-      char* column_name = ref.ref;
-      printf("Column(%s)\n", column_name);
+      struct Column* column = ref.ref;
+      printf("Column(");
+      for (size_t i = 0; i < column->len; i++) {
+        printf("%s", i > 0 ? ", " : "");
+        fwrite(column->parts[i].ptr, sizeof(char), column->parts[i].len, stdout);
+      }
+      printf(")\n");
       break;
     }
     case MapToStruct: {
       struct MapToStructExpr* m2s = ref.ref;
-      printf("MapToStruct\n");
+      if (m2s->timestamp_timezone == NULL) {
+        printf("MapToStruct\n");
+      } else {
+        printf("MapToStruct(timestamp_timezone=%s)\n", m2s->timestamp_timezone);
+      }
       print_expression_item_list(m2s->child_expr, depth + 1);
       break;
     }

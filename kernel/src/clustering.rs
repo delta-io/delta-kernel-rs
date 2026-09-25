@@ -49,6 +49,7 @@ pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 /// Callers needing to correlate a clustering column with per-file statistics must use
 /// [`physical_column`]: stats are keyed on physical names.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 #[internal_api]
 pub(crate) struct ClusteringColumnInfo {
     /// The physical column reference as stored in the `delta.clustering` domain.
@@ -192,8 +193,7 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_not_found() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
@@ -236,8 +236,7 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_nested_intermediate_not_struct() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("flat_col", DataType::STRING, false)]);
+        let schema = schema! { not_null "flat_col": STRING };
 
         // Trying to traverse into a non-struct field should fail
         let columns = vec![column_name!("flat_col", "child")];
@@ -367,7 +366,7 @@ mod tests {
     #[case::ten(10)]
     fn test_validate_clustering_column_count(#[case] num_columns: usize) {
         let schema = schema! {
-            ..((0..num_columns).map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false)))
+            ..((0..num_columns).map(|i| StructField::not_null(format!("col{i}"), DataType::INTEGER)))
         };
 
         let columns: Vec<ColumnName> = (0..num_columns)
@@ -385,8 +384,7 @@ mod tests {
         #[case] column_names: Vec<&str>,
         #[case] expected_error: &str,
     ) {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         let columns: Vec<ColumnName> = column_names
             .into_iter()
             .map(|s| ColumnName::new([s]))
@@ -402,8 +400,7 @@ mod tests {
 
     #[test]
     fn test_validate_clustering_columns_empty_name_rejected() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let schema = schema! { not_null "id": INTEGER };
         // Create a ColumnName with empty path (can't easily express in rstest case)
         let columns: Vec<ColumnName> = vec![ColumnName::new(Vec::<String>::new())];
         let result = validate_clustering_columns(&schema, &columns);

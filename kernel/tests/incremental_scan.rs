@@ -21,7 +21,7 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, StructType};
 use delta_kernel::{
     Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, SnapshotRef, StorageHandler,
 };
@@ -1870,10 +1870,9 @@ type MtEngine = DefaultEngine<TokioMultiThreadExecutor>;
 
 // Single-column `id: integer` table.
 fn id_schema() -> Arc<StructType> {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )]))
+    schema_ref! {
+        nullable "id": INTEGER,
+    }
 }
 
 // One `RecordBatch` holding a single `id` value, so each written file gets a tight [id, id] range.

@@ -32,11 +32,9 @@ files (as bytes) from storage.
 
 ```rust,ignore
 pub trait StorageHandler {
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
 
-    fn read_files(&self, files: Vec<FileSlice>)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 
@@ -185,35 +183,22 @@ projection, predicate pushdown, metadata columns, and field-ID-based column matc
 
 When a caller attaches a `CancellationToken` to a scan (see
 [Cancelling a scan](../reading/scan_metadata.md#cancelling-a-scan)), Kernel threads it down to the
-`JsonHandler` and `ParquetHandler` reads through three optional methods:
+Engine through cancellation-aware variants of the relevant `StorageHandler`, `JsonHandler`, and
+`ParquetHandler` methods. Their names end in `_with_cancellation`.
 
-```rust,ignore
-fn read_json_files_with_cancellation(
-    &self,
-    files: &[FileMeta],
-    physical_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<FileDataReadResultIterator>;
+You do not have to override these variants. For iterator-producing operations, the provided
+implementation checks the token before calling the plain method and again before each iterator pull. It
+cannot interrupt I/O initiated inside the plain method. The provided footer implementation checks
+before calling the plain method but cannot interrupt the footer read after it starts.
 
-fn read_parquet_files_with_cancellation(/* same shape as above */) -> DeltaResult<FileDataReadResultIterator>;
+A custom override replaces the provided implementation and must follow the
+[Engine cancellation contract](../concepts/engine_trait.md#cancellation). In summary, check before
+initiating I/O and before iterator pulls that may initiate more I/O. Do not start another request
+after a check reports cancellation. A request already in flight may complete, but cancellation
+does not permit draining an arbitrary prefetch queue before terminating.
 
-fn read_parquet_footer_with_cancellation(
-    &self,
-    file: &FileMeta,
-    cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<ParquetFooter>;
-```
-
-You do not have to implement these. Each has a default that returns `Error::Cancelled` if the
-token is already cancelled and otherwise delegates to its plain counterpart. So an engine that
-never overrides them still reads correctly and still stops between batches (Kernel polls the token
-at every action-batch boundary on its own) — it just won't interrupt a read that is already in
-flight.
-
-Override them when a single file read can block long enough that waiting for it defeats the point
-of cancelling — a large checkpoint over slow storage, say. The `DefaultEngine` does this by racing
-each read against the token:
+Override a variant when interrupting one slow request materially improves cancellation latency. The
+`DefaultEngine` races its asynchronous reads against the token:
 
 ```rust,ignore
 fn read_parquet_files_with_cancellation(
@@ -229,32 +214,21 @@ fn read_parquet_files_with_cancellation(
 }
 ```
 
-### The contract you must uphold
-
-- **Surface cancellation as `Error::Cancelled`, never as a short read.** A cancelled read must not
-  return fewer rows, an empty iterator, or a bare `None` — anything Kernel could mistake for a
-  complete result. Emit `Error::Cancelled` as the terminal item so a partial log replay can never
-  look like a finished one.
-- **Kernel already handles the pre-read check.** The default bodies fail fast on an
-  already-cancelled token before delegating, so an override can skip that and focus on interrupting
-  I/O once it has started.
-
 ### The CancellationToken trait
 
 The token a caller supplies implements this trait:
 
 ```rust,ignore
-pub trait CancellationToken: Send + Sync {
+pub trait CancellationToken: AsAny {
     fn is_cancelled(&self) -> bool;
     fn cancelled_future(&self) -> CancelledFuture<'_>;
 }
 ```
 
-Kernel and your engine only *consume* a token; the caller creates and fires it. `is_cancelled` is
-the cheap synchronous poll Kernel uses between batches. `cancelled_future` returns a future that
-resolves once the token fires — this is what an async engine selects against to wake a read that is
-blocked in I/O. Back it with your runtime's own notification primitive (for example, wrapping
-`tokio_util::sync::CancellationToken`); it cannot be synthesized from `is_cancelled` alone without
+Kernel and your Engine only *consume* a token; the caller creates and fires it. `is_cancelled`
+provides a cheap synchronous pre-flight check. `cancelled_future` lets an asynchronous Engine wake
+a read blocked in I/O. Back it with your runtime's notification primitive, such as
+`tokio_util::sync::CancellationToken`; Kernel cannot synthesize it from `is_cancelled` without
 busy-polling.
 
 ## EvaluationHandler
@@ -278,13 +252,10 @@ pub trait EvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
-    fn null_row(&self, output_schema: SchemaRef)
-        -> DeltaResult<Box<dyn EngineData>>;
-
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
+        rows: Vec<Vec<Scalar>>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
 ```
@@ -310,13 +281,10 @@ pub trait PredicateEvaluator {
 - **Predicate evaluators** produce a single nullable boolean column. `true` means the row
   matches, `false` or `null` means it doesn't.
 
-- **`null_row`** creates a single-row `EngineData` with all null values. The kernel uses
-  this internally for partition column construction.
-
-- **`create_many`** creates a multi-row `EngineData` by applying the given schema to
-  multiple rows of `Scalar` values. Each element in `rows` contains one scalar per top-level
-  field in the schema. Returns an error if any row's scalar count doesn't match the schema's
-  field count, or if a scalar value's type doesn't match its corresponding field.
+- **`create_many`** creates a multi-row `EngineData` by applying the given schema to multiple rows
+  of `Scalar` values. Each row contains one scalar per top-level field in the schema. Returns an
+  error if any row's scalar count doesn't match the schema's field count, or if a scalar value's
+  type doesn't match its corresponding field.
 
 ### Default implementation
 

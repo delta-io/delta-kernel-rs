@@ -174,16 +174,16 @@ mod tests {
 
     use super::*;
     use crate::expressions::Scalar;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::schema::{schema, ArrayType, DataType, MapType};
 
     fn assert_type_ok(data_type: DataType, value: Scalar) {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
+        let schema = schema! { not_null "p": (data_type) };
         let values = HashMap::from([("p".to_string(), value)]);
         validate_types(&schema, &values).unwrap();
     }
 
     fn assert_type_err(data_type: DataType, value: Scalar) -> String {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
+        let schema = schema! { not_null "p": (data_type) };
         let values = HashMap::from([("p".to_string(), value)]);
         validate_types(&schema, &values).unwrap_err().to_string()
     }
@@ -191,7 +191,7 @@ mod tests {
     /// Like [`assert_type_ok`] but uses a `nullable` schema field. Used by null-value cases,
     /// since null scalars are only valid for nullable partition columns.
     fn assert_type_ok_nullable(data_type: DataType, value: Scalar) {
-        let schema = StructType::new_unchecked(vec![StructField::nullable("p", data_type)]);
+        let schema = schema! { nullable "p": (data_type) };
         let values = HashMap::from([("p".to_string(), value)]);
         validate_types(&schema, &values).unwrap();
     }
@@ -452,7 +452,7 @@ mod tests {
     /// Complex types (struct, array, map) are rejected as partition column types.
     #[rstest]
     #[case(
-        DataType::from(StructType::new_unchecked(vec![StructField::not_null("x", DataType::INTEGER)])),
+        DataType::from(schema! { not_null "x": INTEGER }),
         Scalar::Null(DataType::STRING)
     )]
     #[case(
@@ -473,8 +473,7 @@ mod tests {
 
     #[test]
     fn test_validate_types_column_not_in_schema_returns_error() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::not_null("year", DataType::INTEGER)]);
+        let schema = schema! { not_null "year": INTEGER };
         let values = HashMap::from([("nonexistent".to_string(), Scalar::Integer(42))]);
         let result = validate_types(&schema, &values);
         assert!(result.is_err());
@@ -486,11 +485,11 @@ mod tests {
     #[test]
     fn test_validate_partition_values_with_case_mismatch_succeeds() {
         let partition_cols = vec!["Year".to_string(), "Region".to_string()];
-        let schema = StructType::new_unchecked(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::not_null("Year", DataType::INTEGER),
-            StructField::nullable("Region", DataType::STRING),
-        ]);
+        let schema = schema! {
+            not_null "id": INTEGER,
+            not_null "Year": INTEGER,
+            nullable "Region": STRING,
+        };
         let values = HashMap::from([
             ("YEAR".to_string(), Scalar::Integer(2024)),
             ("region".to_string(), Scalar::String("US".into())),

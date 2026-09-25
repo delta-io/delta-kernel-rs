@@ -37,7 +37,7 @@ StructExpression
             Short(0)
   StructPatch
     input_path
-      Column(foo.bar.baz)
+      Column(foo, bar, baz)
     prepended_fields
       String(prepended)
     field_patches
@@ -87,7 +87,7 @@ StructExpression
   StructPatch
   StructPatch
     input_path
-      Column(empty.nested)
+      Column(empty, nested)
   Array
     Short(5)
     Short(0)
@@ -102,6 +102,8 @@ StructExpression
     Double(1.111000)
   Unknown(mystery)
   MapToStruct
+    Column(pv)
+  MapToStruct(timestamp_timezone=America/Los_Angeles)
     Column(pv)
   Coalesce
     Column(col)
@@ -216,6 +218,8 @@ StructExpression
     Double(3.000000)
   MapToStruct
     Column(partitionValues)
+  MapToStruct(timestamp_timezone=America/Los_Angeles)
+    Column(partitionValues)
 
 === Expression Round-trip Test ===
 SUCCESS: Round-trip expression matches original!
@@ -264,3 +268,6 @@ And
 
 === Predicate Round-trip Test ===
 SUCCESS: Round-trip predicate matches original!
+
+=== Dotted-field Column Round-trip Test ===
+SUCCESS: dotted field "b.c" survived as a single column part!

@@ -226,10 +226,8 @@ fn evaluate_expression_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use delta_kernel::expressions::lit;
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::schema_ref;
 
     use super::{free_expression_evaluator, new_expression_evaluator};
     use crate::ffi_test_utils::ok_or_panic;
@@ -240,9 +238,7 @@ mod tests {
     #[test]
     fn test_new_expression_evaluator() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
-        let in_schema = Arc::new(
-            StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
-        );
+        let in_schema = schema_ref! { nullable "a": LONG };
         let expr = lit(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();

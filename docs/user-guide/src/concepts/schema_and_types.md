@@ -191,7 +191,7 @@ let id = StructField::not_null("id", DataType::LONG);
 let name = StructField::nullable("name", DataType::STRING);
 
 // Field with explicit nullability
-let score = StructField::new("score", DataType::DOUBLE, true);
+let score = StructField::nullable("score", DataType::DOUBLE);
 ```
 
 ### Field metadata

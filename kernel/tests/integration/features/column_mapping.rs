@@ -9,7 +9,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-use delta_kernel::schema::{DataType, StructType};
+use delta_kernel::schema::{schema, DataType};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::Snapshot;
 use rstest::rstest;
@@ -30,15 +30,15 @@ const PAYLOAD_FIELD_ID: i64 = 2;
 /// the per-field `delta.columnMapping.{id,physicalName}` metadata; the physical names differ from
 /// the logical ones so the two read paths stay distinguishable.
 fn metadata_action(mode: &str) -> serde_json::Value {
-    let schema = StructType::new_unchecked([
-        cm_field(ID_LOGICAL, ID_FIELD_ID, ID_PHYSICAL, DataType::INTEGER),
-        cm_field(
+    let schema = schema! {
+        (cm_field(ID_LOGICAL, ID_FIELD_ID, ID_PHYSICAL, DataType::INTEGER)),
+        (cm_field(
             PAYLOAD_LOGICAL,
             PAYLOAD_FIELD_ID,
             PAYLOAD_PHYSICAL,
             DataType::STRING,
-        ),
-    ]);
+        )),
+    };
 
     json!({
         "metaData": {

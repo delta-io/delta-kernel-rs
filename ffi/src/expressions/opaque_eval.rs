@@ -147,13 +147,10 @@ impl Drop for FfiOpaqueEvalCallbacks {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use super::*;
-
-    pub(crate) static TEST_FREES: AtomicUsize = AtomicUsize::new(0);
 
     pub(crate) unsafe extern "C" fn noop_eval_pred(
         _state: *mut c_void,
@@ -164,13 +161,16 @@ pub(crate) mod tests {
     ) {
     }
 
-    pub(crate) unsafe extern "C" fn counting_free_state(_state: *mut c_void) {
-        TEST_FREES.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "C" fn counting_free_state(state: *mut c_void) {
+        // SAFETY: counting_callbacks created this pointer with Arc::into_raw and transfers exactly
+        // one strong reference to FfiOpaqueEvalCallbacks.
+        let frees = unsafe { Arc::from_raw(state.cast::<AtomicUsize>()) };
+        frees.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn counting_callbacks() -> COpaqueEvalCallbacks {
+    fn counting_callbacks(frees: &Arc<AtomicUsize>) -> COpaqueEvalCallbacks {
         COpaqueEvalCallbacks {
-            engine_state: ptr::null_mut(),
+            engine_state: Arc::into_raw(frees.clone()).cast_mut().cast(),
             eval_pred_rows: noop_eval_pred,
             eval_pred_stats: noop_eval_pred,
             free_state: counting_free_state,
@@ -179,21 +179,21 @@ pub(crate) mod tests {
 
     #[test]
     fn drop_invokes_free_state_once() {
-        TEST_FREES.store(0, Ordering::SeqCst);
-        let wrapper = FfiOpaqueEvalCallbacks::new(counting_callbacks());
-        assert_eq!(TEST_FREES.load(Ordering::SeqCst), 0);
+        let frees = Arc::new(AtomicUsize::new(0));
+        let wrapper = FfiOpaqueEvalCallbacks::new(counting_callbacks(&frees));
+        assert_eq!(frees.load(Ordering::SeqCst), 0);
         drop(wrapper);
-        assert_eq!(TEST_FREES.load(Ordering::SeqCst), 1);
+        assert_eq!(frees.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn drop_via_arc_clone_fires_free_only_once() {
-        TEST_FREES.store(0, Ordering::SeqCst);
-        let arc1 = Arc::new(FfiOpaqueEvalCallbacks::new(counting_callbacks()));
+        let frees = Arc::new(AtomicUsize::new(0));
+        let arc1 = Arc::new(FfiOpaqueEvalCallbacks::new(counting_callbacks(&frees)));
         let arc2 = arc1.clone();
         drop(arc1);
-        assert_eq!(TEST_FREES.load(Ordering::SeqCst), 0);
+        assert_eq!(frees.load(Ordering::SeqCst), 0);
         drop(arc2);
-        assert_eq!(TEST_FREES.load(Ordering::SeqCst), 1);
+        assert_eq!(frees.load(Ordering::SeqCst), 1);
     }
 }

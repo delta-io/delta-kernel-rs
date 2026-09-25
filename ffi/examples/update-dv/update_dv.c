@@ -114,9 +114,9 @@ int main(int argc, char* argv[]) {
   HandleExclusiveCommittedTransaction committed = NULL;
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
+  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
     err = (Error*)engine_builder_res.err;
     print_error("Could not get engine builder.", err);
     goto cleanup;
@@ -163,12 +163,12 @@ int main(int argc, char* argv[]) {
 
   ExternResultbool insert_res =
       dv_descriptor_map_insert(map, data_file_path_slice, descriptor, engine);
+  descriptor = NULL; // consumed by dv_descriptor_map_insert regardless of result
   if (insert_res.tag != Okbool) {
     err = (Error*)insert_res.err;
     print_error("dv_descriptor_map_insert failed.", err);
     goto cleanup;
   }
-  descriptor = NULL; // consumed by dv_descriptor_map_insert on success
 
   // === Build a fresh scan metadata iterator for the update call ===
   ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =

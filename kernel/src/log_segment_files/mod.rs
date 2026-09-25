@@ -18,6 +18,7 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+use crate::cancellation::CancellationTokenRef;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
@@ -64,17 +65,21 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
+///
+/// With a `cancellation_token`, [`StorageHandler::list_from_with_cancellation`] owns cancellation
+/// for the underlying listing. This pipeline preserves any cancellation error through its filters.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
     end_version: Version,
+    cancellation_token: Option<&CancellationTokenRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     let log_root_str = log_root.to_string();
     let files = storage
-        .list_from(&start_from)?
+        .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
         // The listing is sorted by full path, so nothing relevant follows the first relative path
         // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
         // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
@@ -229,6 +234,19 @@ pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     false
 }
 
+/// Controls whether listing adopts discovered checkpoints as the replay base.
+///
+/// See [`crate::snapshot::IncrementalSnapshotBuilder::skip_new_checkpoints`] for why `Ignore` is
+/// needed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CheckpointHandling {
+    /// Adopt the latest complete checkpoint and discard the files it covers.
+    #[default]
+    Adopt,
+    /// Recognize complete checkpoints without adopting them, retaining all listed commits.
+    Ignore,
+}
+
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
 /// share the same version number (e.g., commit, checkpoint parts, CRC files).
 ///
@@ -252,6 +270,7 @@ struct ListingAccumulator {
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
+    checkpoint_handling: CheckpointHandling,
 }
 
 impl ListingAccumulator {
@@ -315,31 +334,37 @@ impl ListingAccumulator {
     /// only the latest commit.
     fn select_checkpoint_for_group(&mut self, version: Version) {
         let pending_checkpoint_parts = std::mem::take(&mut self.pending_checkpoint_parts);
-        if let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
+        let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
             .into_iter()
             .filter(|(instance, part_files)| instance.is_complete(part_files))
             .max_by(|(a, _), (b, _)| a.cmp(b))
+        else {
+            return;
+        };
+        if self.checkpoint_handling == CheckpointHandling::Ignore {
+            // TODO(#3269): Return `complete_checkpoint` separately so `Snapshot` can
+            //              track it outside its active `LogSegment`.
+            return;
+        }
+        self.output.checkpoint_parts = complete_checkpoint;
+        // Keep the commit at the checkpoint version (if any) before clearing all older commits.
+        self.output.latest_commit_file = self
+            .output
+            .ascending_commit_files
+            .last()
+            .filter(|c| c.version == version)
+            .cloned();
+        // Log replay only uses commits/compactions after a complete checkpoint
+        self.output.ascending_commit_files.clear();
+        self.output.ascending_compaction_files.clear();
+        // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
+        if self
+            .output
+            .latest_crc_file
+            .as_ref()
+            .is_some_and(|crc| crc.version < version)
         {
-            self.output.checkpoint_parts = complete_checkpoint;
-            // Keep the commit at the checkpoint version (if any) before clearing all older commits.
-            self.output.latest_commit_file = self
-                .output
-                .ascending_commit_files
-                .last()
-                .filter(|c| c.version == version)
-                .cloned();
-            // Log replay only uses commits/compactions after a complete checkpoint
-            self.output.ascending_commit_files.clear();
-            self.output.ascending_compaction_files.clear();
-            // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
-            if self
-                .output
-                .latest_crc_file
-                .as_ref()
-                .is_some_and(|crc| crc.version < version)
-            {
-                self.output.latest_crc_file = None;
-            }
+            self.output.latest_crc_file = None;
         }
     }
 }
@@ -357,11 +382,13 @@ impl LogSegmentFiles {
     /// - `start_version`: start version of the entire listing range provided; in practice, this is
     ///   the lower bound (inclusive) for log_tail entries included in the result
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
+    /// - `checkpoint_handling`: whether complete checkpoints replace the replay base
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
     ) -> DeltaResult<Self> {
         // check log_tail is only commits
         // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
@@ -375,6 +402,7 @@ impl LogSegmentFiles {
 
         let mut acc = ListingAccumulator {
             end_version,
+            checkpoint_handling,
             ..Default::default()
         };
 
@@ -432,8 +460,8 @@ impl LogSegmentFiles {
             acc.select_checkpoint_for_group(gv);
         }
 
-        // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
-        // it contains only commits after the most recent checkpoint. The last element is the
+        // Since ascending_commit_files is cleared when a checkpoint is adopted, a non-empty list
+        // contains only commits after the most recent adopted checkpoint. The last element is the
         // highest version commit overall, so we update latest_commit_file to it. If it's empty,
         // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
         // or remains None.
@@ -502,6 +530,7 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
@@ -509,7 +538,8 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
+        let fs_iter =
+            list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
@@ -561,18 +591,40 @@ impl LogSegmentFiles {
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
     //   version)
-    #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
+    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<Self> {
+        Self::list_with_checkpoint_handling(
+            storage,
+            log_root,
+            log_tail,
+            start_version,
+            end_version,
+            CheckpointHandling::Adopt,
+            cancellation_token,
+        )
+    }
+
+    pub(crate) fn list_with_checkpoint_handling(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
-        Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
+        let fs_iter =
+            list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
+        Self::build_log_segment_files(fs_iter, log_tail, start, end_version, checkpoint_handling)
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
@@ -588,6 +640,7 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
             storage,
@@ -595,6 +648,7 @@ impl LogSegmentFiles {
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
+            cancellation_token,
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
@@ -659,12 +713,18 @@ impl LogSegmentFiles {
     /// - Window 4 [8501, 9501): checkpoint at v8900 found -> stop
     /// All files from windows 1-4 are combined with `log_tail` to produce a log segment
     /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
-    #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
+    #[instrument(
+        name = "log.list_with_backward_checkpoint_scan",
+        skip_all,
+        fields(enable_call_frame, end = end_version),
+        err
+    )]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
@@ -676,8 +736,14 @@ impl LogSegmentFiles {
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> =
-                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
+            let window_files: Vec<_> = list_delta_log_from_storage(
+                storage,
+                log_root,
+                lower,
+                upper - 1,
+                cancellation_token,
+            )?
+            .try_collect()?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);
@@ -690,6 +756,12 @@ impl LogSegmentFiles {
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
         let start = found_checkpoint_version.unwrap_or(0);
-        Self::build_log_segment_files(fs_iter, log_tail, start, Some(end_version))
+        Self::build_log_segment_files(
+            fs_iter,
+            log_tail,
+            start,
+            Some(end_version),
+            CheckpointHandling::Adopt,
+        )
     }
 }

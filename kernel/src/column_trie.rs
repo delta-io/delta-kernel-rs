@@ -94,6 +94,7 @@ impl<'col> ColumnTrie<'col> {
     /// - `["a"]` -> false (not terminal)
     ///
     /// [`contains_prefix_of`]: Self::contains_prefix_of
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_terminal(&self, path: &[String]) -> bool {
         let mut node = self;

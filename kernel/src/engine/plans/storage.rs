@@ -3,44 +3,34 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
+#[derive(Constructor)]
 pub struct PlanBasedStorageHandler {
     executor: Arc<dyn PlanExecutor>,
 }
 
 impl PlanBasedStorageHandler {
-    pub fn new(executor: Arc<dyn PlanExecutor>) -> Self {
-        Self { executor }
-    }
-
     fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
         self.executor.execute_op(Operation::IoOperation(op))
     }
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        Ok(self
-            .execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()?)
+    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        self.execute_io(IoOperation::file_listing(path.clone()))?
+            .into_file_meta()
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        Ok(self
-            .execute_io(IoOperation::read_bytes(files))?
-            .into_bytes()?)
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
+        self.execute_io(IoOperation::read_bytes(files))?
+            .into_bytes()
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {

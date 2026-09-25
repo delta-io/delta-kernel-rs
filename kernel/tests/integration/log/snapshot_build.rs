@@ -1,10 +1,11 @@
 //! Integration tests for [`Snapshot`] build semantics.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::{schema, schema_ref};
 use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
@@ -37,11 +38,11 @@ impl TableKind {
     }
 }
 
-fn maybe_attach_max_catalog_version(
-    builder: SnapshotBuilder,
+fn maybe_attach_max_catalog_version<Mode>(
+    builder: SnapshotBuilder<Mode>,
     max_catalog_version: Version,
     kind: TableKind,
-) -> SnapshotBuilder {
+) -> SnapshotBuilder<Mode> {
     match kind {
         TableKind::FileSystem => builder,
         TableKind::CatalogManaged => builder.with_max_catalog_version(max_catalog_version),
@@ -106,10 +107,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 async fn deeply_nested_schema_snapshot_load_returns_schema_error(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deeply_nested_schema = (0..42).fold(
-        StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
-        |schema, depth| {
-            StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
-        },
+        schema! { nullable "leaf": INTEGER },
+        |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
     );
     let (store, engine, table_url) = engine_store_setup("deeply_nested_schema", None);
     let commit = [
@@ -143,6 +142,162 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
         error => error,
     };
     assert!(matches!(error, Error::Schema(_)));
+    Ok(())
+}
+
+#[rstest]
+#[case::supported(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors"],
+    expected_error: None,
+})]
+#[case::unknown_reader(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["futureFeature"],
+    writer_features: &["futureFeature"],
+    expected_error: Some("Feature 'futureFeature' is not supported"),
+})]
+#[case::mixed_reader(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["deletionVectors", "futureFeature"],
+    writer_features: &["deletionVectors", "futureFeature"],
+    expected_error: Some("Feature 'futureFeature' is not supported"),
+})]
+#[case::unknown_writer_only(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors", "futureFeature"],
+    expected_error: None,
+})]
+#[case::unsupported_writer_only(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors", "generatedColumns"],
+    expected_error: None,
+})]
+#[case::future_reader_version(SnapshotLoadProtocolCase {
+    min_reader_version: 4,
+    reader_features: &[],
+    writer_features: &[],
+    expected_error: Some("Unsupported minimum reader version 4"),
+})]
+#[cfg_attr(
+    not(feature = "adaptive-metadata-in-dev"),
+    case::adaptive_metadata(SnapshotLoadProtocolCase {
+        min_reader_version: 3,
+        reader_features: &["adaptiveMetadata-preview"],
+        writer_features: &["adaptiveMetadata-preview"],
+        expected_error: Some("Feature 'adaptiveMetadata-preview' is not supported"),
+    })
+)]
+#[tokio::test]
+async fn snapshot_load_validates_reader_protocol(
+    #[case] case: SnapshotLoadProtocolCase,
+    #[values(false, true)] incremental: bool,
+    #[values(false, true)] time_travel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_url) = engine_store_setup("snapshot_feature_validation", None);
+    create_table(
+        table_url.as_str(),
+        schema_ref! { nullable "id": INTEGER },
+        "test_engine",
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?
+    .unwrap_committed();
+    let base = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
+    assert_eq!(base.version(), 0);
+
+    // Unsupported protocols cannot be introduced through Kernel's write APIs.
+    let mut commit = json!({
+        "protocol": {
+            "minReaderVersion": case.min_reader_version,
+            "minWriterVersion": 7,
+            "writerFeatures": case.writer_features,
+        }
+    });
+    if case.min_reader_version == 3 {
+        commit["protocol"]["readerFeatures"] = json!(case.reader_features);
+    }
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit.to_string()).await?;
+
+    let result = match (incremental, time_travel) {
+        (false, false) => Snapshot::builder_for(table_url.as_str()).build(&engine),
+        (false, true) => Snapshot::builder_for(table_url.as_str())
+            .at_version(1)
+            .build(&engine),
+        (true, false) => Snapshot::builder_from(base).build(&engine),
+        (true, true) => Snapshot::builder_from(base).at_version(1).build(&engine),
+    };
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        assert_eq!(result?.version(), 1);
+    }
+
+    let original = Snapshot::builder_for(table_url.as_str())
+        .at_version(0)
+        .build(&engine)?;
+    assert_eq!(original.version(), 0);
+    Ok(())
+}
+
+#[rstest]
+#[case(None, None, false)]
+#[case(None, Some(false), false)]
+#[case(None, Some(true), false)]
+#[case(Some(false), None, false)]
+#[case(Some(false), Some(false), false)]
+#[case(Some(false), Some(true), false)]
+#[case(Some(true), None, false)]
+#[case(Some(true), Some(false), false)]
+#[case(Some(true), Some(true), true)]
+#[tokio::test]
+async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
+    #[case] enabled: Option<bool>,
+    #[case] suspended: Option<bool>,
+    #[case] expect_error: bool,
+    #[values(false, true)] incremental: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configuration: HashMap<_, _> = [
+        ("delta.enableRowTracking", enabled),
+        ("delta.rowTrackingSuspended", suspended),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key, value.to_string())))
+    .collect();
+
+    // === Create version 0 with row-tracking support ===
+    let schema = schema_ref! { nullable "value": INTEGER };
+    let (store, engine, table_url) = engine_store_setup("row_tracking_configuration", None);
+    create_table(&table_url, schema, "test_engine")
+        .with_table_properties([("delta.feature.rowTracking", "supported")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    let base = Snapshot::builder_for(&table_url).build(&engine)?;
+
+    // === Commit the case's enabled and suspended properties at version 1 ===
+    let mut metadata = json!({"metaData": base.table_configuration().metadata()});
+    metadata["metaData"]["configuration"] = json!(configuration);
+    add_commit(table_url.as_str(), store.as_ref(), 1, metadata.to_string()).await?;
+
+    // === Version 1 loads successfully unless row tracking is both enabled and suspended ===
+    let result = if incremental {
+        Snapshot::builder_from(base).build(&engine)
+    } else {
+        Snapshot::builder_for(table_url).build(&engine)
+    };
+    if expect_error {
+        assert_result_error_with_message(
+            result,
+            "Row tracking cannot be enabled and suspended at the same time",
+        );
+    } else {
+        assert_eq!(result.unwrap().version(), 1);
+    }
     Ok(())
 }
 
@@ -243,4 +398,11 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     );
 
     Ok(())
+}
+
+struct SnapshotLoadProtocolCase {
+    min_reader_version: i32,
+    reader_features: &'static [&'static str],
+    writer_features: &'static [&'static str],
+    expected_error: Option<&'static str>,
 }

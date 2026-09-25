@@ -344,7 +344,8 @@ pub trait ExpressionTransform<'a> {
         expr: &'a MapToStructExpression,
     ) -> Self::Output<MapToStructExpression> {
         let nested = self.transform_expr(&expr.map_expr);
-        map_owned_or_else(expr, nested, MapToStructExpression::new)
+        let rebuild = |map_expr| MapToStructExpression::new(map_expr, expr.options.clone());
+        map_owned_or_else(expr, nested, rebuild)
     }
 
     /// Recursively transforms the child expression of a cast expression (unary).
@@ -563,15 +564,15 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_name, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
-        OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
+        col, column_name, column_pred, lit, Expression, Expression as Expr, MapToStructOptions,
+        OpaqueExpressionOp, OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
         ScalarExpressionEvaluator, VariadicExpression,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructType};
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -836,10 +837,10 @@ mod tests {
     }
 
     fn test_output_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]))
+        schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        }
     }
 
     #[test]
@@ -875,6 +876,23 @@ mod tests {
             // Schema should be preserved
             assert_eq!(result_expr.output_schema, test_output_schema());
         }
+    }
+
+    #[test]
+    fn test_map_to_struct_options_survive_child_transform() {
+        let expr = Expr::map_to_struct(
+            col!("old_col"),
+            MapToStructOptions::default().with_timestamp_timezone("Europe/Berlin"),
+        );
+        let Expr::MapToStruct(transformed) = ColumnReplacer.transform_expr(&expr).into_owned()
+        else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(transformed.map_expr.as_ref(), &col!("new_col"));
+        assert_eq!(
+            transformed.options.timestamp_timezone(),
+            Some("Europe/Berlin")
+        );
     }
 
     #[test]

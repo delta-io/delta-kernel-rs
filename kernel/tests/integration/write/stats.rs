@@ -12,7 +12,7 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowS
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit, ColumnName};
-use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::{Predicate as Pred, Snapshot};
 use test_utils::{
@@ -131,15 +131,12 @@ async fn test_write_stats_for_complex_type_columns(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
-        StructField::nullable(
-            "props",
-            MapType::new(DataType::STRING, DataType::LONG, true),
-        ),
-        StructField::nullable("v", DataType::unshredded_variant()),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "tags": [ nullable STRING ],
+        nullable "props": { STRING => nullable LONG },
+        nullable "v": (DataType::unshredded_variant()),
+    };
 
     let mode_str = match cm_mode {
         ColumnMappingMode::None => "none",
@@ -278,20 +275,14 @@ async fn test_write_stats_nested_complex_types_respect_column_limit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable(
-            "data",
-            DataType::try_struct_type(vec![
-                StructField::nullable("name", DataType::STRING),
-                StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
-                StructField::nullable(
-                    "props",
-                    MapType::new(DataType::STRING, DataType::LONG, true),
-                ),
-            ])?,
-        ),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "data": {
+            nullable "name": STRING,
+            nullable "tags": [ nullable STRING ],
+            nullable "props": { STRING => nullable LONG },
+        },
+    };
 
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();

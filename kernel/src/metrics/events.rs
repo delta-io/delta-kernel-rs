@@ -323,36 +323,79 @@ impl fmt::Display for MetricEvent {
 
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
-/// The kind of log-segment load: a full listing from the base up to the target, or an
-/// incremental listing of the commits above an existing segment.
+/// How the snapshot was constructed.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    EnumString,
+    StrumDisplay,
+    AsRefStr,
+    IntoStaticStr,
 )]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
-pub enum LogSegmentLoadType {
+pub enum SnapshotLoadType {
     /// The segment was listed from its base (a checkpoint, else version 0) up to the target. A
     /// fresh snapshot build (`LogSegment::for_snapshot`) reads this way.
     Full,
-    /// The segment was listed as a delta above an existing base. An incremental snapshot update
-    /// (`Snapshot::try_new_from`) reads only the commits above the existing snapshot.
+    /// The build started from an existing snapshot. It may return that snapshot unchanged, replay
+    /// newer commits, or rebuild from a newly discovered checkpoint.
     Incremental,
+    /// The snapshot was constructed from complete caller-supplied state without asking the engine
+    /// to list or read Delta log files.
+    SnapshotHint,
     /// Decode fell back here because the span's `load_type` field was unset or unrecognized.
     /// Kernel never emits this deliberately.
     #[default]
     Unknown,
 }
 
+impl SnapshotLoadType {
+    fn parse_or_unknown(s: &str) -> Self {
+        parse_load_type_or_unknown(s)
+    }
+}
+
+/// How the log segment and protocol/metadata state were loaded.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum LogSegmentLoadType {
+    /// The segment was listed from its base through the target version.
+    Full,
+    /// The segment load started from an existing snapshot. It may reuse that segment, extend it,
+    /// or replace it after discovering a newer checkpoint.
+    Incremental,
+    /// Decode fell back here because the span field was unset or unrecognized.
+    #[default]
+    Unknown,
+}
+
 impl LogSegmentLoadType {
     fn parse_or_unknown(s: &str) -> Self {
-        if s.is_empty() {
-            return Self::Unknown;
-        }
-        Self::from_str(s).unwrap_or_else(|e| {
-            warn!("Invalid load_type '{s}': {e}. Using Unknown.");
-            Self::Unknown
-        })
+        parse_load_type_or_unknown(s)
     }
+}
+
+fn parse_load_type_or_unknown<T>(s: &str) -> T
+where
+    T: Default + FromStr,
+    T::Err: fmt::Display,
+{
+    if s.is_empty() {
+        return T::default();
+    }
+    s.parse().unwrap_or_else(|error| {
+        warn!("Invalid load_type '{s}': {error}. Using Unknown.");
+        T::default()
+    })
 }
 
 /// A log segment was listed and assembled for a snapshot.
@@ -655,7 +698,7 @@ pub struct SnapshotBuildSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 
     // === Set during span lifetime ===
     pub version: u64,
@@ -722,7 +765,7 @@ pub struct SnapshotBuildFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
@@ -1273,7 +1316,7 @@ pub struct SnapshotLoadMetricContext {
     pub(crate) operation_id: MetricId,
     pub(crate) correlation_id: Option<Arc<str>>,
     pub(crate) is_catalog_managed: bool,
-    pub(crate) load_type: LogSegmentLoadType,
+    pub(crate) load_type: SnapshotLoadType,
 }
 
 #[cfg(test)]
@@ -1285,7 +1328,7 @@ impl SnapshotLoadMetricContext {
             operation_id: MetricId::nil(),
             correlation_id: None,
             is_catalog_managed: false,
-            load_type: LogSegmentLoadType::default(),
+            load_type: SnapshotLoadType::default(),
         }
     }
 }
@@ -1345,13 +1388,13 @@ pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<st
     v.0
 }
 
-pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType {
+pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
     #[derive(Default)]
-    struct V(LogSegmentLoadType);
+    struct V(SnapshotLoadType);
     impl Visit for V {
         fn record_str(&mut self, field: &Field, value: &str) {
             if field.name() == "load_type" {
-                self.0 = LogSegmentLoadType::parse_or_unknown(value);
+                self.0 = SnapshotLoadType::parse_or_unknown(value);
             }
         }
         fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
@@ -1361,8 +1404,13 @@ pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType
     v.0
 }
 
-/// A `parallel_scan_metadata` scan emits **two** events (one per phase) sharing the same
-/// `operation_id`; `scan_metadata` emits one event with [`ScanType::Full`].
+/// A `scan_metadata` scan emits one event with [`ScanType::Full`] after iterator exhaustion.
+/// Calling [`SequentialScanMetadata::finish`](crate::scan::SequentialScanMetadata::finish) emits
+/// a [`ScanType::SequentialPhase`] event. If it returns parallel work, the caller emits a
+/// [`ScanType::ParallelPhase`] event by calling
+/// [`ParallelState::log_metrics`](crate::scan::ParallelState::log_metrics) after all workers
+/// complete. The two phase events share an `operation_id`. Action counts and timings are
+/// phase-local, while `peak_hash_set_size` is the whole-scan high-water mark.
 #[derive(Debug, Clone)]
 pub struct ScanMetadataCompleted {
     // === Set on span creation ===
@@ -1377,17 +1425,17 @@ pub struct ScanMetadataCompleted {
     pub scan_type: ScanType,
     /// Wall-clock time from scan start to iterator exhaustion.
     pub duration: Duration,
-    /// Add files that entered deduplication. This normally excludes add files filtered by data
-    /// skipping. During parse-error fallback, deduplication runs first, so add files filtered by
-    /// retry-time data skipping are included. See
-    /// [`LogReplayProcessor::process_actions_batch`](crate::log_replay::LogReplayProcessor::process_actions_batch).
+    /// Add actions in replay input before predicate filtering and deduplication. Includes
+    /// checkpoint and delta files.
     pub num_add_files_seen: u64,
+    /// Add actions in delta-file replay input before predicate filtering and deduplication.
+    pub num_add_files_seen_from_delta_files: u64,
     /// Add files that survived log replay (the files the connector reads).
-    pub num_active_add_files: u64,
+    pub num_selected_add_files: u64,
     /// Size in bytes of the files that survived log replay (files to read).
-    pub active_add_files_bytes: u64,
-    /// Remove files seen (from delta/commit files only).
-    pub num_remove_files_seen: u64,
+    pub selected_add_files_bytes: u64,
+    /// Remove actions in delta-file replay input before deduplication.
+    pub num_remove_files_seen_from_delta_files: u64,
     /// Non-file actions seen (protocol, metadata, etc.).
     pub num_non_file_actions: u64,
     /// Files filtered by predicates (data skipping + partition pruning).
@@ -1396,6 +1444,12 @@ pub struct ScanMetadataCompleted {
     pub peak_hash_set_size: usize,
     /// Time spent in the deduplication visitor.
     pub dedup_visitor_time: Duration,
+    /// Total time spent transforming log actions into scan rows, including retry attempts.
+    ///
+    /// This includes extracting Add fields, parsing JSON statistics into typed columns, and
+    /// converting partition-value strings to their schema types. Concurrent transforms contribute
+    /// separately, so their total can exceed the wall-clock `duration`.
+    pub action_transform_time: Duration,
     /// Time spent evaluating predicates.
     pub predicate_eval_time: Duration,
 }
@@ -1413,13 +1467,15 @@ impl ScanMetadataCompleted {
             scan_type: ScanType::parse_lenient(&v.scan_type),
             duration: Duration::from_nanos(v.duration_ns),
             num_add_files_seen: v.num_add_files_seen,
-            num_active_add_files: v.num_active_add_files,
-            active_add_files_bytes: v.active_add_files_bytes,
-            num_remove_files_seen: v.num_remove_files_seen,
+            num_add_files_seen_from_delta_files: v.num_add_files_seen_from_delta_files,
+            num_selected_add_files: v.num_selected_add_files,
+            selected_add_files_bytes: v.selected_add_files_bytes,
+            num_remove_files_seen_from_delta_files: v.num_remove_files_seen_from_delta_files,
             num_non_file_actions: v.num_non_file_actions,
             num_predicate_filtered: v.num_predicate_filtered,
             peak_hash_set_size: v.peak_hash_set_size as usize,
             dedup_visitor_time: Duration::from_nanos(v.dedup_visitor_time_ns),
+            action_transform_time: Duration::from_nanos(v.action_transform_time_ns),
             predicate_eval_time: Duration::from_nanos(v.predicate_eval_time_ns),
         }
     }
@@ -1434,24 +1490,31 @@ impl fmt::Display for ScanMetadataCompleted {
             scan_type,
             duration,
             num_add_files_seen,
-            num_active_add_files,
-            active_add_files_bytes,
-            num_remove_files_seen,
+            num_add_files_seen_from_delta_files,
+            num_selected_add_files,
+            selected_add_files_bytes,
+            num_remove_files_seen_from_delta_files,
             num_non_file_actions,
             num_predicate_filtered,
             peak_hash_set_size,
             dedup_visitor_time,
+            action_transform_time,
             predicate_eval_time,
         } = self;
         write!(
             f,
             "ScanMetadataCompleted(id={operation_id}, table_type={table_type}, \
              correlation_id={correlation_id:?}, scan_type={scan_type}, duration={duration:?}, \
-             add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, \
-             active_add_files_bytes={active_add_files_bytes}, \
-             remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
+             add_files_seen={num_add_files_seen}, \
+             add_files_seen_from_delta_files={num_add_files_seen_from_delta_files}, \
+             selected_add_files={num_selected_add_files}, \
+             selected_add_files_bytes={selected_add_files_bytes}, \
+             remove_files_seen_from_delta_files={num_remove_files_seen_from_delta_files}, \
+             non_file_actions={num_non_file_actions}, \
              predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \
-             dedup_visitor_time={dedup_visitor_time:?}, predicate_eval_time={predicate_eval_time:?})"
+             dedup_visitor_time={dedup_visitor_time:?}, \
+             action_transform_time={action_transform_time:?}, \
+             predicate_eval_time={predicate_eval_time:?})"
         )
     }
 }
@@ -1464,13 +1527,15 @@ struct ScanMetadataCompletedAttrs {
     scan_type: String,
     duration_ns: u64,
     num_add_files_seen: u64,
-    num_active_add_files: u64,
-    active_add_files_bytes: u64,
-    num_remove_files_seen: u64,
+    num_add_files_seen_from_delta_files: u64,
+    num_selected_add_files: u64,
+    selected_add_files_bytes: u64,
+    num_remove_files_seen_from_delta_files: u64,
     num_non_file_actions: u64,
     num_predicate_filtered: u64,
     peak_hash_set_size: u64,
     dedup_visitor_time_ns: u64,
+    action_transform_time_ns: u64,
     predicate_eval_time_ns: u64,
 }
 
@@ -1491,13 +1556,19 @@ impl Visit for ScanMetadataCompletedAttrs {
         match field.name() {
             "duration_ns" => self.duration_ns = value,
             "num_add_files_seen" => self.num_add_files_seen = value,
-            "num_active_add_files" => self.num_active_add_files = value,
-            "active_add_files_bytes" => self.active_add_files_bytes = value,
-            "num_remove_files_seen" => self.num_remove_files_seen = value,
+            "num_add_files_seen_from_delta_files" => {
+                self.num_add_files_seen_from_delta_files = value
+            }
+            "num_selected_add_files" => self.num_selected_add_files = value,
+            "selected_add_files_bytes" => self.selected_add_files_bytes = value,
+            "num_remove_files_seen_from_delta_files" => {
+                self.num_remove_files_seen_from_delta_files = value
+            }
             "num_non_file_actions" => self.num_non_file_actions = value,
             "num_predicate_filtered" => self.num_predicate_filtered = value,
             "peak_hash_set_size" => self.peak_hash_set_size = value,
             "dedup_visitor_time_ns" => self.dedup_visitor_time_ns = value,
+            "action_transform_time_ns" => self.action_transform_time_ns = value,
             "predicate_eval_time_ns" => self.predicate_eval_time_ns = value,
             _ => {}
         }
@@ -1720,13 +1791,15 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         scan_type = %e.scan_type,
         duration_ns = e.duration.as_nanos() as u64,
         num_add_files_seen = e.num_add_files_seen,
-        num_active_add_files = e.num_active_add_files,
-        active_add_files_bytes = e.active_add_files_bytes,
-        num_remove_files_seen = e.num_remove_files_seen,
+        num_add_files_seen_from_delta_files = e.num_add_files_seen_from_delta_files,
+        num_selected_add_files = e.num_selected_add_files,
+        selected_add_files_bytes = e.selected_add_files_bytes,
+        num_remove_files_seen_from_delta_files = e.num_remove_files_seen_from_delta_files,
         num_non_file_actions = e.num_non_file_actions,
         num_predicate_filtered = e.num_predicate_filtered,
         peak_hash_set_size = e.peak_hash_set_size as u64,
         dedup_visitor_time_ns = e.dedup_visitor_time.as_nanos() as u64,
+        action_transform_time_ns = e.action_transform_time.as_nanos() as u64,
         predicate_eval_time_ns = e.predicate_eval_time.as_nanos() as u64,
     );
 }
@@ -1909,6 +1982,31 @@ mod tests {
     }
 
     #[rstest]
+    #[case::full(SnapshotLoadType::Full, "full")]
+    #[case::incremental(SnapshotLoadType::Incremental, "incremental")]
+    #[case::snapshot_hint(SnapshotLoadType::SnapshotHint, "snapshot_hint")]
+    #[case::unknown(SnapshotLoadType::Unknown, "unknown")]
+    fn snapshot_load_type_serializes_to_wire_name_and_parses_back(
+        #[case] load_type: SnapshotLoadType,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = load_type.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(SnapshotLoadType::from_str(wire).unwrap(), load_type);
+    }
+
+    #[rstest]
+    #[case::known("incremental", SnapshotLoadType::Incremental)]
+    #[case::empty_maps_to_unknown("", SnapshotLoadType::Unknown)]
+    #[case::unrecognized_maps_to_unknown("totally_unknown", SnapshotLoadType::Unknown)]
+    fn snapshot_load_type_parse_or_unknown(
+        #[case] value: &str,
+        #[case] expected: SnapshotLoadType,
+    ) {
+        assert_eq!(SnapshotLoadType::parse_or_unknown(value), expected);
+    }
+
+    #[rstest]
     #[case::full(LogSegmentLoadType::Full, "full")]
     #[case::incremental(LogSegmentLoadType::Incremental, "incremental")]
     #[case::unknown(LogSegmentLoadType::Unknown, "unknown")]
@@ -2011,7 +2109,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: Some("snap-req-3".into()),
-            load_type: LogSegmentLoadType::Incremental,
+            load_type: SnapshotLoadType::Incremental,
             version: 0,
             duration: Duration::default(),
         };
@@ -2021,6 +2119,6 @@ mod tests {
             panic!("expected SnapshotBuildFailure");
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
-        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+        assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
     }
 }

@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.12)
 project(read_table)
 option(PRINT_DATA "Print out the table data. Requires arrow-glib" ON)
 option(VERBOSE "Enable for more diagnostics messages." OFF)
+option(
+  GEO_TYPE_IN_DEV
+  "Register the geometry/geography schema test. Requires delta_kernel_ffi built with --features geo-type-in-dev."
+  OFF)
 add_executable(read_table read_table.c arrow.c ../common/kernel_utils.c)
 target_compile_definitions(read_table PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
 target_include_directories(read_table PUBLIC 
@@ -23,6 +27,7 @@ add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_type
 add_test(NAME read_and_print_nested_cols COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types-cols.expected -cmap,struct,array)
 add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/basic_partitioned/delta/ ${ExpectedPath}/basic-partitioned.expected)
 add_test(NAME read_and_print_with_dv_small COMMAND ${TestRunner} ${KernelTestPath}/table-with-dv-small/ ${ExpectedPath}/table-with-dv-small.expected)
+add_test(NAME read_and_print_void_col COMMAND ${TestRunner} ${KernelTestPath}/void-column/ ${ExpectedPath}/void-column.expected -cid,void_col)
 add_test(NAME read_and_print_with_short_dv COMMAND ${TestRunner} ${KernelTestPath}/with-short-dv/ ${ExpectedPath}/with-short-dv.expected)
 # Exercises the Arrow batch-mode scan metadata path (scan_metadata_next_arrow). The arrow path
 # does not call read_parquet_file, so the data section is "[No data]"; this test still
@@ -32,6 +37,10 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # `delta.columnMapping.id`, which the schema visitor reads back via get_from_metadata_map and
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
+add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
+if(GEO_TYPE_IN_DEV)
+  add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
+endif()
 
 if(WIN32)
   set(CMAKE_C_FLAGS_DEBUG "/MT")

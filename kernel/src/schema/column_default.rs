@@ -233,15 +233,17 @@ mod tests {
 
     use super::*;
     use crate::expressions::col;
-    use crate::schema::{ArrayType, MapType, StructField};
+    use crate::schema::{schema, ArrayType, MapType, StructField};
 
     fn struct_ty() -> DataType {
-        DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
+        DataType::from(schema! { nullable "a": INTEGER })
     }
 
     /// A struct type whose single field `inner` carries an integer default.
     fn struct_with_inner_default() -> DataType {
-        DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap()
+        DataType::from(schema! {
+            (field_with_default("inner", DataType::INTEGER, "42")),
+        })
     }
 
     fn date_days(year: i32, month: u32, day: u32) -> i32 {
@@ -366,7 +368,9 @@ mod tests {
     #[case::nested_default(
         vec![StructField::nullable(
             "s",
-            DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
+            schema! {
+                (field_with_default("inner", DataType::INTEGER, "42")),
+            },
         )],
         true,
         None
@@ -401,7 +405,7 @@ mod tests {
         #[case] container: DataType,
         #[case] expected_path: [&str; 3],
     ) {
-        let schema = StructType::try_new([StructField::nullable("arr", container)]).unwrap();
+        let schema = schema! { nullable "arr": (container) };
         let defaults = try_collect_column_defaults(&schema).unwrap();
         let [(path, _)] = defaults.try_into().expect("exactly one default");
         assert_eq!(path, expected_path.join("."));

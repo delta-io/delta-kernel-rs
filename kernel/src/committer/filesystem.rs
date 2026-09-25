@@ -91,12 +91,13 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
+    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
-    use crate::IntoEngineData;
+    use crate::schema::schema_ref;
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -139,12 +140,9 @@ mod tests {
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let action = metadata
-            .clone()
-            .into_engine_data(LOG_METADATA_SCHEMA.clone(), &engine)
-            .unwrap();
+        let action = create_row(&engine, LOG_METADATA_SCHEMA.clone(), metadata.clone()).unwrap();
         let commit_metadata = CommitMetadata::new(
             log_root,
             1,
@@ -187,7 +185,7 @@ mod tests {
 
         let committer = FileSystemCommitter::new();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let metadata1 =
             Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let metadata2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();

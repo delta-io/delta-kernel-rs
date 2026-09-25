@@ -119,8 +119,19 @@ struct OpaquePredicate {
 struct Unknown {
   char* name;
 };
+// A column is a list of field-name parts. Keeping the parts structured (rather than a single
+// dotted string) lets a field name that itself contains a period survive the FFI round-trip.
+struct ColumnPart {
+  char* ptr;
+  size_t len;
+};
+struct Column {
+  struct ColumnPart* parts;
+  size_t len;
+};
 struct MapToStructExpr {
   ExpressionItemList child_expr;
+  char* timestamp_timezone;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -418,9 +429,13 @@ void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSli
 
 void visit_map_to_struct_expr(void* data,
                               uintptr_t sibling_list_id,
-                              uintptr_t child_list_id) {
+                              uintptr_t child_list_id,
+                              const struct FfiMapToStructOptions* options) {
   struct MapToStructExpr* m2s = malloc(sizeof(struct MapToStructExpr));
   m2s->child_expr = get_expr_list(data, child_list_id);
+  m2s->timestamp_timezone = options->timestamp_timezone.tag == SomeKernelStringSlice
+      ? allocate_string(options->timestamp_timezone.some)
+      : NULL;
   put_expr_item(data, sibling_list_id, m2s, MapToStruct);
 }
 
@@ -468,9 +483,18 @@ DEFINE_UNARY(visit_expr_not, Not)
 /*************************************************************
  * Column Expression
  ************************************************************/
-void visit_expr_column(void* data, uintptr_t sibling_id_list, KernelStringSlice col_name) {
-  char* column_name = allocate_string(col_name);
-  put_expr_item(data, sibling_id_list, column_name, Column);
+void visit_expr_column(void* data,
+                       uintptr_t sibling_id_list,
+                       const KernelStringSlice* parts,
+                       uintptr_t parts_len) {
+  struct Column* column = malloc(sizeof(struct Column));
+  column->len = parts_len;
+  column->parts = malloc(sizeof(struct ColumnPart) * parts_len);
+  for (size_t i = 0; i < parts_len; i++) {
+    column->parts[i].ptr = allocate_string(parts[i]);
+    column->parts[i].len = parts[i].len;
+  }
+  put_expr_item(data, sibling_id_list, column, Column);
 }
 
 /*************************************************************
@@ -699,12 +723,18 @@ void free_expression_item(ExpressionItem ref) {
       break;
     }
     case Column: {
-      free(ref.ref);
+      struct Column* column = ref.ref;
+      for (size_t i = 0; i < column->len; i++) {
+        free(column->parts[i].ptr);
+      }
+      free(column->parts);
+      free(column);
       break;
     }
     case MapToStruct: {
       struct MapToStructExpr* m2s = ref.ref;
       free_expression_list(m2s->child_expr);
+      free(m2s->timestamp_timezone);
       free(m2s);
       break;
     }

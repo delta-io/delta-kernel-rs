@@ -115,19 +115,17 @@ use crate::actions::{
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{
-    lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, StructData,
-};
+use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType};
+use crate::schema::{lazy_schema_ref, schema, DataType, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
-    EvaluationHandlerExtension, FileMeta, Version,
+    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -302,16 +300,13 @@ pub enum V2CheckpointConfig {
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
 /// field, which is only known at runtime.
-static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new_unchecked([
-        StructField::not_null("version", DataType::LONG),
-        StructField::not_null("size", DataType::LONG),
-        StructField::nullable("parts", DataType::LONG),
-        StructField::nullable("sizeInBytes", DataType::LONG),
-        StructField::nullable("numOfAddFiles", DataType::LONG),
-    ])
-    .into()
-});
+static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "version": LONG,
+    not_null "size": LONG,
+    nullable "parts": LONG,
+    nullable "sizeInBytes": LONG,
+    nullable "numOfAddFiles": LONG,
+};
 
 /// Action fields shared by V1 and V2 checkpoint schemas.
 fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
@@ -336,11 +331,12 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
 fn checkpoint_metadata_field() -> StructField {
     StructField::nullable(
         CHECKPOINT_METADATA_NAME,
-        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
+        schema! { not_null "version": LONG },
     )
 }
 
-/// Schema for V2 checkpoints (includes checkpointMetadata action)
+/// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
+/// a schema, so readers assume this schema for them.
 static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (checkpoint_metadata_field()),
@@ -383,6 +379,10 @@ impl RetentionCalculator for CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
+        snapshot
+            .table_configuration()
+            .ensure_read_write_supported()?;
+
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
@@ -688,26 +688,25 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
-        // Start with an all-null row
-        let null_row = engine.evaluation_handler().null_row(schema.clone())?;
-
         // Build the checkpointMetadata struct value
         let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
             vec![StructField::not_null("version", DataType::LONG)],
             vec![Scalar::from(self.version)],
         )?);
-
-        // Use a struct patch to set just the checkpointMetadata field, keeping others null
-        let patch = ExpressionStructPatchBuilder::new()
-            .replace(CHECKPOINT_METADATA_NAME, lit(checkpoint_metadata_value));
-
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            schema.clone(),
-            Arc::new(Expression::struct_patch(patch)?),
-            schema.clone().into(),
-        )?;
-
-        let checkpoint_metadata_batch = evaluator.evaluate(null_row.as_ref())?;
+        // Build an action row with only the checkpointMetadata field set.
+        let row: Vec<Scalar> = schema
+            .fields()
+            .map(|field| {
+                if field.name() == CHECKPOINT_METADATA_NAME {
+                    checkpoint_metadata_value.clone()
+                } else {
+                    Scalar::null(field.data_type().clone())
+                }
+            })
+            .collect();
+        let checkpoint_metadata_batch = engine
+            .evaluation_handler()
+            .create_many(schema.clone(), vec![row])?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
@@ -755,8 +754,8 @@ impl CheckpointWriter {
     }
 }
 
-/// Creates the data for the _last_checkpoint file containing checkpoint
-/// metadata with the `create_one` method. Factored out to facilitate testing.
+/// Creates the data for the _last_checkpoint file containing checkpoint metadata. Factored out to
+/// facilitate testing.
 ///
 /// # Parameters
 /// - `engine`: Engine for data processing
@@ -784,15 +783,15 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_one(
+    engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
-        &[
+        vec![vec![
             version.into(),
             actions_counter.into(),
             None::<i64>.into(), // parts = None since we only support single-part checkpoints
             size_in_bytes.into(),
             add_actions_counter.into(),
-        ],
+        ]],
     )
 }
 

@@ -1,5 +1,6 @@
 //! Scan related ffi code
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
+use derive_more::From;
 use tracing::debug;
 use url::Url;
 
@@ -639,15 +641,9 @@ type CScanCallback = extern "C" fn(
     partition_map: &CStringMap,
 );
 
-#[derive(Default)]
+#[derive(Default, From)]
 pub struct CStringMap {
     values: HashMap<String, String>,
-}
-
-impl From<HashMap<String, String>> for CStringMap {
-    fn from(val: HashMap<String, String>) -> Self {
-        Self { values: val }
-    }
 }
 
 #[no_mangle]
@@ -731,14 +727,33 @@ impl From<&MetadataValue> for CMetadataValueKind {
 /// A field-metadata map that preserves each value's [`MetadataValue`] type. Used for schema field
 /// metadata, where the kernel knows each value's type; the engine recovers that type via
 /// [`CMetadataValueKind`] rather than inferring it from the key name.
-#[derive(Default)]
+///
+/// An engine metadata callback also uses this map to accumulate incoming field metadata. That map
+/// is owned by Kernel and exclusively borrowed for the callback duration; the engine must not
+/// retain it.
+#[derive(Default, From)]
 pub struct CMetadataMap {
     values: HashMap<String, MetadataValue>,
 }
 
-impl From<HashMap<String, MetadataValue>> for CMetadataMap {
-    fn from(values: HashMap<String, MetadataValue>) -> Self {
-        Self { values }
+impl CMetadataMap {
+    /// Insert a value without replacing an existing key.
+    pub(crate) fn insert(&mut self, key: String, value: MetadataValue) -> DeltaResult<()> {
+        match self.values.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(Error::schema(format!(
+                "Duplicate metadata key: {}",
+                entry.key()
+            ))),
+        }
+    }
+
+    /// Consume the map and return its metadata values.
+    pub(crate) fn into_values(self) -> HashMap<String, MetadataValue> {
+        self.values
     }
 }
 
@@ -1108,6 +1123,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(id),
                 true,
+                std::ptr::null(),
                 allocate_err,
             ))
         };
@@ -1120,6 +1136,7 @@ mod scan_builder_tests {
                 field_ids.as_ptr(),
                 1,
                 false,
+                std::ptr::null(),
                 allocate_err,
             ))
         }
@@ -1131,10 +1148,12 @@ mod scan_builder_tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let id = "id";
+        let parts = [kernel_string_slice!(id)];
         let col = unsafe {
             ok_or_panic(visit_expression_column(
                 state,
-                kernel_string_slice!(id),
+                parts.as_ptr(),
+                parts.len(),
                 allocate_err,
             ))
         };
@@ -1268,6 +1287,7 @@ mod scan_builder_tests {
                 state,
                 kernel_string_slice!(bare_field),
                 true,
+                std::ptr::null(),
                 allocate_err,
             ))
         }

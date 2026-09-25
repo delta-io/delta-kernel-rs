@@ -6,9 +6,14 @@ use super::{
     check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatCheck,
     IcebergCompatValidator, IcebergCompatVersion,
 };
-use crate::schema::PrimitiveType::*;
+use crate::schema::PrimitiveType::{
+    Binary, Boolean, Byte, Date, Decimal, Double, Float, Integer, Long, Short,
+    String as StringType, Timestamp, TimestampNtz,
+};
 use crate::schema::{try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
+use crate::table_features::TableFeature;
+use crate::transforms::SchemaTransform;
 use crate::DeltaResult;
 
 /// V3 invariants paired with the version constant. Fed to
@@ -18,7 +23,12 @@ pub(crate) const V3_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
     checks: V3_CHECKS,
 };
 
-const V3_CHECKS: &[IcebergCompatCheck] = &[check_v3_supported_types, check_no_legacy_nested_ids];
+const V3_CHECKS: &[IcebergCompatCheck] = &[
+    IcebergCompatCheck::always(check_v3_supported_types),
+    IcebergCompatCheck::always(check_no_legacy_nested_ids),
+    IcebergCompatCheck::write_only(iceberg_compat_v3_type_changes_validation),
+    IcebergCompatCheck::write_only(iceberg_compat_v3_column_defaults_validation),
+];
 
 fn is_v3_supported_type(dt: &DataType) -> bool {
     matches!(
@@ -31,7 +41,7 @@ fn is_v3_supported_type(dt: &DataType) -> bool {
                 | Double
                 | Boolean
                 | Binary
-                | String
+                | StringType
                 | Date
                 | Timestamp
                 | TimestampNtz
@@ -49,6 +59,30 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
         is_v3_supported_type,
         IcebergCompatVersion::V3.as_table_feature().as_ref(),
     )
+}
+
+/// Validates that historical type changes on an IcebergCompatV3 table are compatible with Iceberg
+/// schema evolution rules.
+///
+/// This is a write-side guard because unsupported type changes do not prevent Delta reads. They
+/// only violate the IcebergCompatV3 writer contract that the table remains convertible to Iceberg.
+///
+/// # Errors
+///
+/// Returns an error if `delta.typeChanges` metadata is malformed, or if any recorded type change
+/// is outside Iceberg V3's allowed widening list.
+fn iceberg_compat_v3_type_changes_validation(tc: &TableConfiguration) -> DeltaResult<()> {
+    if !tc.is_feature_supported(&TableFeature::TypeWidening)
+        && !tc.is_feature_supported(&TableFeature::TypeWideningPreview)
+    {
+        return Ok(());
+    }
+
+    let mut validator = super::TypeChangesValidator {
+        path: vec![],
+        version: IcebergCompatVersion::V3,
+    };
+    validator.transform_struct(tc.logical_schema_ref())
 }
 
 /// Validates IcebergCompatV3 column defaults and logs warnings kernel cannot verify.
@@ -134,18 +168,15 @@ mod tests {
 
 #[cfg(test)]
 mod column_default_tests {
-    use std::collections::HashMap;
-
     use rstest::rstest;
     use test_utils::LoggingTest;
-    use url::Url;
 
     use super::iceberg_compat_v3_column_defaults_validation;
-    use crate::actions::{Metadata, Protocol};
     use crate::schema::ColumnMetadataKey::CurrentDefault;
-    use crate::schema::{ArrayType, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{schema, ArrayType, DataType, MetadataValue, StructField, StructType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
 
     /// Builds a `TableConfiguration` carrying `schema` with `allowColumnDefaults` enabled, so
     /// the IcebergCompatV3 column-default validation can be driven directly. The config does not
@@ -153,22 +184,15 @@ mod column_default_tests {
     /// validation is invoked directly instead, and the end-to-end V3 path is covered by the
     /// integration tests.
     fn table_config_with_schema(schema: StructType) -> TableConfiguration {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            std::sync::Arc::new(schema),
-            vec![],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            [TableFeature::AllowColumnDefaults],
-        )
-        .unwrap();
-        TableConfiguration::try_new(metadata, protocol, Url::parse("file:///t/").unwrap(), 0)
-            .unwrap()
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AllowColumnDefaults])
+                    .build(),
+            )
+            .with_table_root("file:///t/")
+            .build()
     }
 
     fn field_with_default(
@@ -184,51 +208,50 @@ mod column_default_tests {
 
     #[rstest]
     #[case::primitive_literal(
-        StructType::try_new([field_with_default("a", DataType::INTEGER, "42")]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::INTEGER, "42")),
+        },
         "a",
         None
     )]
     #[case::primitive_null(
-        StructType::try_new([field_with_default("a", DataType::INTEGER, "NULL")]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::INTEGER, "NULL")),
+        },
         "a",
         None
     )]
     #[case::non_literal_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            DataType::TIMESTAMP,
-            "current_timestamp()"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::TIMESTAMP, "current_timestamp()")),
+        },
         "a",
         Some("could not verify")
     )]
     #[case::null_on_non_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            ArrayType::new(DataType::INTEGER, true),
-            "NULL"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", ArrayType::new(DataType::INTEGER, true), "NULL")),
+        },
         "a",
         None
     )]
     #[case::non_null_on_non_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            ArrayType::new(DataType::INTEGER, true),
-            "ARRAY(1)"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")),
+        },
         "a",
         Some("could not verify")
     )]
     #[case::nested_non_literal(
-        StructType::try_new([StructField::nullable(
-            "s",
-            DataType::try_struct_type([field_with_default(
+        schema! {
+            nullable "s": {
+                (field_with_default(
                 "inner",
                 DataType::TIMESTAMP,
                 "current_timestamp()"
-            )]).unwrap(),
-        )]).unwrap(),
+                )),
+            },
+        },
         "s.inner",
         Some("could not verify")
     )]
@@ -252,5 +275,213 @@ mod column_default_tests {
                 assert!(logs.contains(needle), "logs: {logs}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod type_change_tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::iceberg_compat_v3_type_changes_validation;
+    use crate::schema::{
+        schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
+    use crate::table_configuration::TableConfiguration;
+    use crate::table_features::{ColumnMappingMode, TableFeature};
+    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V3, ENABLE_ROW_TRACKING};
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
+
+    fn table_config_with_schema_and_features(
+        schema: StructType,
+        features: impl IntoIterator<Item = TableFeature>,
+    ) -> TableConfiguration {
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .with_table_root("file:///t/")
+            .build()
+    }
+
+    fn table_config_with_schema(schema: StructType) -> TableConfiguration {
+        table_config_with_schema_and_features(
+            schema,
+            [TableFeature::IcebergCompatV3, TableFeature::TypeWidening],
+        )
+    }
+
+    fn field_with_type_change(name: &str, from_type: &str, to_type: &str) -> StructField {
+        StructField::nullable(name, DataType::STRING).add_metadata([(
+            ColumnMetadataKey::TypeChanges.as_ref(),
+            MetadataValue::Other(json!([{
+                "fromType": from_type,
+                "toType": to_type,
+                "tableVersion": 2
+            }])),
+        )])
+    }
+
+    fn field_with_type_change_and_column_mapping(
+        name: &str,
+        from_type: &str,
+        to_type: &str,
+    ) -> StructField {
+        field_with_type_change(name, from_type, to_type).add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-1".to_string()),
+            ),
+        ])
+    }
+
+    #[rstest]
+    #[case::byte_short("byte", "short")]
+    #[case::byte_integer("byte", "integer")]
+    #[case::byte_long("byte", "long")]
+    #[case::short_integer("short", "integer")]
+    #[case::short_long("short", "long")]
+    #[case::integer_long("integer", "long")]
+    #[case::float_double("float", "double")]
+    #[case::decimal_same_scale("decimal(10,2)", "decimal(20,2)")]
+    fn v3_type_change_validation_allows_iceberg_promotions(
+        #[case] from_type: &str,
+        #[case] to_type: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema! {
+            (field_with_type_change("a", from_type, to_type)),
+        });
+
+        iceberg_compat_v3_type_changes_validation(&table_configuration).unwrap();
+    }
+
+    #[rstest]
+    #[case::integer_double("integer", "double")]
+    #[case::integer_decimal("integer", "decimal(11,1)")]
+    #[case::decimal_scale_change("decimal(10,2)", "decimal(20,5)")]
+    #[case::date_timestamp_ntz("date", "timestamp_ntz")]
+    #[case::long_double("long", "double")]
+    fn v3_type_change_validation_rejects_non_iceberg_promotions(
+        #[case] from_type: &str,
+        #[case] to_type: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema! {
+            (field_with_type_change("a", from_type, to_type)),
+        });
+
+        let err = iceberg_compat_v3_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("icebergCompatV3 does not support type change")
+                && err.contains("a")
+                && err.contains(from_type)
+                && err.contains(to_type),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::nested_struct(
+        schema! {
+            nullable "s": {
+                (field_with_type_change("inner", "integer", "double")),
+            },
+        },
+        "s.inner",
+    )]
+    #[case::array_element_struct(
+        schema! {
+            nullable "arr": [ nullable {
+                (field_with_type_change("inner", "integer", "double")),
+            } ],
+        },
+        "arr.element.inner",
+    )]
+    #[case::map_value_struct(
+        schema! {
+            nullable "m": { STRING => nullable {
+                (field_with_type_change("inner", "integer", "double")),
+            } },
+        },
+        "m.value.inner",
+    )]
+    fn v3_type_change_validation_reports_field_path(
+        #[case] schema: StructType,
+        #[case] expected_path: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema);
+
+        let err = iceberg_compat_v3_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected_path), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn v3_type_change_validation_rejects_malformed_type_change_metadata() {
+        let table_configuration = table_config_with_schema(schema! {
+            (StructField::nullable("a", DataType::STRING).add_metadata([(
+                ColumnMetadataKey::TypeChanges.as_ref(),
+                MetadataValue::String("not an array".to_string()),
+            )])),
+        });
+
+        let err = iceberg_compat_v3_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-array") && err.contains(ColumnMetadataKey::TypeChanges.as_ref()),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v3_type_change_validation_skips_tables_without_type_widening_support() {
+        let table_configuration = table_config_with_schema_and_features(
+            schema! {
+                (field_with_type_change("a", "integer", "double")),
+            },
+            [TableFeature::IcebergCompatV3],
+        );
+
+        iceberg_compat_v3_type_changes_validation(&table_configuration).unwrap();
+    }
+
+    #[test]
+    fn v3_type_change_validation_blocks_writes_but_not_table_configuration() {
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                (field_with_type_change_and_column_mapping("a", "integer", "double")),
+            })
+            .with_properties([
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ])
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::IcebergCompatV3,
+                        TableFeature::ColumnMapping,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                        TableFeature::TypeWidening,
+                    ])
+                    .build(),
+            )
+            .build();
+
+        assert!(table_configuration.is_feature_enabled(&TableFeature::IcebergCompatV3));
+        let err = iceberg_compat_v3_type_changes_validation(&table_configuration)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("icebergCompatV3 does not support type change"),
+            "unexpected error: {err}"
+        );
     }
 }

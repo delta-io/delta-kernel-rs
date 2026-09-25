@@ -136,7 +136,7 @@ mod tests {
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::util::pretty::pretty_format_columns;
     use delta_kernel::schema::{
-        ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+        schema, ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
     };
     use rstest::rstest;
 
@@ -156,11 +156,10 @@ mod tests {
     }
 
     fn sample_struct_type() -> StructType {
-        StructType::try_new([
-            StructField::not_null("a", KernelDataType::INTEGER),
-            StructField::nullable("b", KernelDataType::STRING),
-        ])
-        .unwrap()
+        schema! {
+            not_null "a": INTEGER,
+            nullable "b": STRING,
+        }
     }
 
     fn sample_struct_scalar() -> KernelScalar {
@@ -272,11 +271,10 @@ mod tests {
 
     #[test]
     fn null_struct_with_non_null_subfields_converts_to_null_struct() {
-        let struct_type = StructType::try_new([
-            StructField::not_null("a", KernelDataType::INTEGER),
-            StructField::not_null("b", KernelDataType::STRING),
-        ])
-        .unwrap();
+        let struct_type = schema! {
+            not_null "a": INTEGER,
+            not_null "b": STRING,
+        };
         let value = to_df_scalar(&KernelScalar::null(struct_type)).unwrap();
         assert!(matches!(value, DFScalarValue::Struct(_)), "got {value:?}");
         assert!(value.is_null(), "expected a null struct, got {value:?}");

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use derive_more::From;
 use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -25,8 +26,6 @@ use crate::utils::CollectInto;
 use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
-pub(crate) mod literal_expression_transform;
-pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 mod sql;
 pub(crate) use self::sql::parse_sql;
@@ -479,12 +478,14 @@ where
 /// These expressions do not track or validate data types, other than the type
 /// of literals. It is up to the expression evaluator to validate the
 /// expression against a schema and add appropriate casts as required.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, From)]
 pub enum Expression {
     /// A literal value.
+    #[from]
     Literal(Scalar),
     /// A column reference by name. A [`ColumnName`] is a path, so a multi-segment name like
     /// `add.stats.numRecords` descends one nested struct field per segment, matching by name.
+    #[from]
     Column(ColumnName),
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
@@ -532,8 +533,10 @@ pub enum Expression {
     /// which includes an empty string, must yield NULL rather than error; see
     /// [`ParseJsonExpression`].
     ParseJson(ParseJsonExpression),
-    /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
-    /// [`MapToStructExpression`] for how values are parsed.
+    /// Parse an Add action's `partitionValues` map into a typed struct. A null map produces a null
+    /// struct, and the behavior for duplicate keys is undefined. See [`MapToStructExpression`] for
+    /// the complete Delta partition-value contract.
+    // TODO: Rename MapToStruct to ParsePartitionValues.
     MapToStruct(MapToStructExpression),
     /// Cast a child expression to a target type. See [`CastExpression`].
     Cast(CastExpression),
@@ -659,29 +662,127 @@ impl ParseJsonExpression {
     }
 }
 
-/// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
-/// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
-/// the output struct column: a `key` -> `value` mapping in the map means the struct field named
-/// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
-/// An empty-string value is the exception (aligning with Spark): it casts to itself for string, to
-/// empty bytes for binary, and to null for every other type. This empty-string rule is specific to
-/// this operator; [`ParseJsonExpression`] does not share it.
+/// Connector-supplied options controlling how a [`MapToStructExpression`] parses map values.
 ///
-/// - Missing keys produce null values
-/// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
-/// - Duplicate map keys are resolved by taking the rightmost entry
+/// Kernel does not infer these settings from the host environment or table metadata.
+/// Expression producers must use one reader timezone for all partition-value expressions in a
+/// scan so materialization and pruning cannot interpret the same value differently.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp_timezone: Option<String>,
+}
+
+impl MapToStructOptions {
+    /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
+    ///
+    /// Accepts an IANA timezone identifier or a fixed offset in `+HH:MM` or `-HH:MM` form. Named
+    /// zones preserve their clock-transition rules; fixed offsets apply when the reader
+    /// configuration itself is fixed. Use [`MapToStructOptions::default`] for UTC.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
+    }
+
+    /// Returns the configured IANA timezone or fixed offset, or `None` when UTC applies.
+    ///
+    /// Fixed offsets use `+HH:MM` or `-HH:MM` form.
+    pub fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp_timezone.as_deref()
+    }
+
+    /// Returns whether no parsing options are configured.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// A Delta-specific expression that parses an Add action's `partitionValues` map into a typed
+/// `partitionValues_parsed` struct.
 ///
+/// This is not a generic map-to-struct conversion. The input expression must evaluate to
+/// `Map<String, String>`, and the evaluator supplies a target [`StructType`] as this expression's
+/// result type. The expression does not carry this type itself and cannot be evaluated from
+/// `map_expr` alone. Its evaluation context must provide and propagate the target output type. The
+/// target struct is semantic input: field names select partition values, field types determine how
+/// they are parsed, and field order and nullability define the result struct. Names are matched
+/// exactly and case-sensitively against the map keys. With column mapping, both the map keys and
+/// target-schema field names are physical names.
+///
+/// # Null and Missing Key behavior
+///
+/// For each input row:
+///
+/// - A null map produces a null struct, not a non-null struct whose fields are all null.
+/// - A non-null map, including an empty map, produces a non-null struct.
+/// - A key that is in the target output schema, but missing from the map, produces a null field.
+/// - A key that is in the input map, but not in the target output schema, is ignored.
+/// - A key with a null value in the input map produces a null field in the output struct.
+/// - Fields appear in target-schema order and must have primitive types.
+/// - Duplicate keys are not valid `partitionValues` input and their result is undefined. Engines
+///   may ignore, reject, or arbitrarily select one; callers must not depend on the behavior.
+///
+/// # Value parsing
+///
+/// A literal empty string has special read compatibility behavior: it stays empty for STRING,
+/// becomes empty bytes for BINARY, and becomes null for every other primitive type. Delta writers
+/// normally encode an empty partition value as JSON null, but readers must preserve this behavior
+/// for existing tables that contain a literal empty string.
+///
+/// Non-empty strings must follow the Delta [protocol] partition value serialization rules. Kernel's
+/// reference evaluator implements these rules with [`PrimitiveType::parse_scalar`] and equivalent
+/// Arrow parsers for dates and timestamps, establishing this engine-facing behavior:
+///
+/// - STRING: return the input string unchanged.
+/// - BINARY: return the input string's UTF-8 bytes after JSON string unescaping, not hex or base64.
+/// - BYTE, SHORT, INTEGER, and LONG: parse a signed base-10 integer in the target type's range.
+/// - FLOAT and DOUBLE: parse a floating-point number, including `NaN`, `Infinity`, and `-Infinity`.
+/// - DECIMAL(p, s): require an effective scale of exactly `s` and precision that fits `p`; never
+///   round or rescale.
+/// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
+/// - DATE: parse `{year}-{month}-{day}`.
+/// - TIMESTAMP: accept date-only values and timestamps with a space, `T`, or `t` separator,
+///   optional fractional seconds, an optional numeric offset, or a trailing IANA timezone. Parse
+///   values with an offset or timezone as absolute instants; parse offset-less values in the reader
+///   timezone from [`MapToStructOptions`], or UTC by default.
+/// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
+///   wall-clock value.
+/// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
+/// - VOID: reject every non-empty value.
+///
+/// The reader timezone does not affect a timestamp carrying its own time zone or offset. Modern
+/// writers use the protocol's UTC-adjusted ISO 8601 form, which therefore reads independently of
+/// the configured reader timezone.
+///
+/// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
+/// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
+/// returns [`Error::ParseError`] and fails evaluation; it does not silently become null.
+///
+/// # Implementing this expression
+///
+/// A connector generally cannot implement this contract as `CAST(map[key] AS target_type)`.
+/// Generic casts may accept additional boolean spellings, round or rescale decimals, use a session
+/// time zone, or turn malformed values into null. Implement a dedicated parser (or validate before
+/// casting), handle the empty-string cases before parsing, and preserve the input map's row-level
+/// nulls on the output struct.
+///
+/// [protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+/// [`StructType`]: crate::schema::StructType
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructExpression {
     /// The expression that evaluates to a `Map<String, String>` column.
     pub map_expr: Box<Expression>,
+    /// Options controlling value parsing.
+    #[serde(default, skip_serializing_if = "MapToStructOptions::is_default")]
+    pub options: MapToStructOptions,
 }
 
 impl MapToStructExpression {
-    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
+            options,
         }
     }
 }
@@ -869,12 +970,13 @@ impl Expression {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
 
-    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct. The output
-    /// struct schema is determined by the evaluator's `result_type`. An empty-string value is the
-    /// exception (aligning with Spark): it casts to itself for string, to empty bytes for binary,
-    /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
-    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
-        Self::MapToStruct(MapToStructExpression::new(map_expr))
+    /// Parses an Add action's `partitionValues` map into a typed struct whose schema comes from the
+    /// evaluator's result type. A null map produces a null struct; missing and null values produce
+    /// null fields; literal empty strings stay empty only for STRING and BINARY. Duplicate-key
+    /// behavior is undefined. `options` controls timestamp parsing. See [`MapToStructExpression`]
+    /// for the complete contract.
+    pub fn map_to_struct(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
     /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
@@ -1165,7 +1267,16 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            MapToStruct(m) => match m.options.timestamp_timezone() {
+                Some(timezone) => {
+                    write!(
+                        f,
+                        "MAP_TO_STRUCT({}, timestamp_timezone={timezone:?})",
+                        m.map_expr
+                    )
+                }
+                None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            },
             Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
@@ -1198,18 +1309,6 @@ impl Display for Predicate {
             }
             Unknown(name) => write!(f, "<unknown: {name}>"),
         }
-    }
-}
-
-impl From<Scalar> for Expression {
-    fn from(value: Scalar) -> Self {
-        Self::literal(value)
-    }
-}
-
-impl From<ColumnName> for Expression {
-    fn from(value: ColumnName) -> Self {
-        Self::Column(value)
     }
 }
 
@@ -1276,7 +1375,9 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
+    use super::{
+        col, column_pred, lit, DataType, Expression as Expr, MapToStructOptions, Predicate as Pred,
+    };
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1311,6 +1412,41 @@ mod tests {
             let result = format!("{expr}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_map_to_struct_options_state_and_format() {
+        let default = Expr::map_to_struct(col!("m"), MapToStructOptions::default());
+        let Expr::MapToStruct(default_state) = &default else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(default_state.options.timestamp_timezone(), None);
+        assert_eq!(format!("{default}"), "MAP_TO_STRUCT(Column(m))");
+
+        let configured = Expr::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let Expr::MapToStruct(configured_state) = &configured else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(
+            configured_state.options.timestamp_timezone(),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            format!("{configured}"),
+            "MAP_TO_STRUCT(Column(m), timestamp_timezone=\"America/Los_Angeles\")"
+        );
+
+        let escaped = Expr::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("bad\"\nzone"),
+        );
+        assert_eq!(
+            format!("{escaped}"),
+            "MAP_TO_STRUCT(Column(m), timestamp_timezone=\"bad\\\"\\nzone\")"
+        );
     }
 
     #[test]
@@ -1353,7 +1489,8 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
+            Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
+            UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1584,13 +1721,40 @@ mod tests {
         #[test]
         fn test_map_to_struct_expression_roundtrip() {
             let cases: Vec<Expression> = vec![
-                Expression::map_to_struct(col!("pv")),
-                Expression::map_to_struct(lit("ignored")),
+                Expression::map_to_struct(col!("pv"), MapToStructOptions::default()),
+                Expression::map_to_struct(lit("ignored"), MapToStructOptions::default()),
+                Expression::map_to_struct(
+                    col!("pv"),
+                    MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
             ];
 
             for expr in &cases {
                 assert_roundtrip(expr);
             }
+        }
+
+        #[test]
+        fn test_map_to_struct_options_wire_defaults() {
+            // Default options stay absent from the serialized shape.
+            let default = Expression::map_to_struct(col!("pv"), MapToStructOptions::default());
+            let default_json = serde_json::to_value(&default).unwrap();
+            assert!(default_json.pointer("/MapToStruct/options").is_none());
+            assert_eq!(
+                serde_json::from_value::<Expression>(default_json).unwrap(),
+                default
+            );
+
+            // Explicit UTC is configured input and remains on the wire.
+            let explicit_utc = Expression::map_to_struct(
+                col!("pv"),
+                MapToStructOptions::default().with_timestamp_timezone("UTC"),
+            );
+            let explicit_utc_json = serde_json::to_value(&explicit_utc).unwrap();
+            assert_eq!(
+                explicit_utc_json.pointer("/MapToStruct/options/timestamp_timezone"),
+                Some(&serde_json::json!("UTC"))
+            );
         }
 
         // ==================== Predicate Tests ====================

@@ -838,10 +838,12 @@ mod tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let id = "id";
+        let parts = [kernel_string_slice!(id)];
         let col = unsafe {
             ok_or_panic(visit_expression_column(
                 state,
-                kernel_string_slice!(id),
+                parts.as_ptr(),
+                parts.len(),
                 allocate_err,
             ))
         };
@@ -932,10 +934,12 @@ mod tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let missing = "nonexistent";
+        let parts = [kernel_string_slice!(missing)];
         let col = unsafe {
             ok_or_panic(visit_expression_column(
                 state,
-                kernel_string_slice!(missing),
+                parts.as_ptr(),
+                parts.len(),
                 allocate_err,
             ))
         };

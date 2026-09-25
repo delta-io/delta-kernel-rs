@@ -11,21 +11,20 @@ use url::Url;
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
-    ExpressionRef, Predicate,
+    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
+    MapToStructOptions, Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType, ToSchema as _,
+    StructField, StructType,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
@@ -49,6 +48,12 @@ impl Scan {
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
     /// Returns `None` for an empty result or a statically false predicate.
+    #[tracing::instrument(
+        name = "scan_plan.build_metadata_scan_plan",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(super) fn build_metadata_scan_plan(
         &self,
         shape: &CheckpointShape,
@@ -137,7 +142,8 @@ impl Scan {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
-        let source_physical_stats = shape.parsed_stats_schema.as_ref();
+        let source_physical_stats =
+            physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
@@ -325,9 +331,7 @@ impl Scan {
         };
 
         let (add_schema, add_expr) = projection.build()?;
-        let schema = schema_ref! {
-            (StructField::nullable(ADD_NAME, add_schema.as_ref().clone()))
-        };
+        let schema = schema_ref! { nullable ADD_NAME: (add_schema.as_ref().clone()) };
         Ok((Arc::new(Expr::struct_from([add_expr])), schema))
     }
 }
@@ -342,21 +346,19 @@ fn sidecar_actions(
     const FILE_PATH: &str = "path";
     const FILE_SIZE: &str = "size";
     const FILE_MOD: &str = "filemod";
-    const DV: &str = "dv";
     const SIDECAR_SIZE: &str = "sizeInBytes";
     const SIDECAR_FILE_MOD: &str = "modificationTime";
 
     static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-        not_null (FILE_PATH): STRING,
-        not_null (FILE_SIZE): LONG,
-        not_null (FILE_MOD): LONG,
-        nullable (DV): (DeletionVectorDescriptor::to_schema()),
-        nullable (VERSION): LONG,
+        not_null FILE_PATH: STRING,
+        not_null FILE_SIZE: LONG,
+        not_null FILE_MOD: LONG,
+        nullable VERSION: LONG,
     };
 
     static SIDECAR_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         (&SIDECAR_FIELD),
-        nullable (VERSION): LONG,
+        nullable VERSION: LONG,
     };
 
     let scan = match file_type {
@@ -370,7 +372,6 @@ fn sidecar_actions(
                 col!(SIDECAR_NAME, FILE_PATH),
                 col!(SIDECAR_NAME, SIDECAR_SIZE),
                 col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
-                null_lit(DeletionVectorDescriptor::to_schema()),
                 col!(VERSION),
             ]),
             SIDECAR_FILE_META_SCHEMA.clone(),
@@ -385,7 +386,7 @@ fn sidecar_actions(
         column_name!(FILE_PATH),
         column_name!(FILE_SIZE),
         column_name!(FILE_MOD),
-        column_name!(DV),
+        None,
     )?;
 
     sidecar_files.dynamic_scan(dynamic_scan)
@@ -399,7 +400,7 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
     schema_ref! {
         (&ADD_FIELD),
         ..(include_remove.then_some(&REMOVE_FIELD)),
-        nullable (VERSION): LONG,
+        nullable VERSION: LONG,
     }
 }
 
@@ -419,8 +420,8 @@ fn parquet_read_schema(
             ))
         });
     Ok(schema_ref! {
-        (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
-        nullable (VERSION): LONG,
+        nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
+        nullable VERSION: LONG,
     })
 }
 
@@ -492,7 +493,10 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         match physical_partitions {
             Some(schema) => {
                 let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone());
-                let expr = Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES));
+                let expr = Expr::map_to_struct(
+                    col!(ADD_NAME, PARTITION_VALUES),
+                    MapToStructOptions::default(),
+                );
                 if has_partition_values_parsed {
                     let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
                     self.replace_at(add, PARTITION_VALUES_PARSED, field, expr)
@@ -560,7 +564,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     let skipping = as_sql_data_skipping_predicate_with_stats_columns(
         pred,
         &partition_column_names,
-        &state.physical_stats_columns,
+        &state.eligible_physical_stats_columns,
     )?;
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
     let skipping = Predicate::distinct(skipping, lit(false));
@@ -574,10 +578,7 @@ mod execution_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
@@ -591,33 +592,26 @@ mod tests {
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
-    use crate::table_configuration::TableConfiguration;
-    use crate::unit_test_utils::create_log_path;
+    use crate::unit_test_utils::{
+        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
     use crate::Engine as _;
 
     fn mock_snapshot(log_segment: LogSegment) -> DeltaResult<Arc<Snapshot>> {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            partitioned_schema(),
-            vec!["p".to_string()],
-            0,
-            HashMap::new(),
-        )?;
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            Protocol::try_new_legacy(2, 5)?,
-            Url::parse("memory:///")?,
-            0,
-        )?;
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .with_table_root("memory:///")
+            .try_build()?;
         Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))
     }
 
     fn partitioned_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("x", DataType::LONG),
-            StructField::nullable("p", DataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "x": LONG,
+            nullable "p": STRING,
+        }
     }
 
     fn log_root() -> Url {
@@ -661,9 +655,12 @@ mod tests {
     }
 
     fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
+        let leaf_checkpoint_schema = parsed_stats
+            .as_ref()
+            .map(|stats| parquet_read_schema(Some(stats), None).unwrap());
         CheckpointShape {
             checkpoint_type,
-            parsed_stats_schema: parsed_stats,
+            leaf_checkpoint_schema,
         }
     }
 
@@ -844,6 +841,10 @@ mod tests {
                 .field(PARTITION_VALUES_PARSED)
                 .is_none(),
             "native parsed partition values are not requested yet"
+        );
+        assert!(
+            dynamic_scan.dv_column.is_none(),
+            "sidecar scan sets no dv column"
         );
         Ok(())
     }
