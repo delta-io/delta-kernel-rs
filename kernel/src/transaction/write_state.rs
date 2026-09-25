@@ -90,8 +90,7 @@ pub struct RowTrackingMetadataColumns<'a> {
 #[derive(Debug)]
 pub struct BoundWriteContextBuilder {
     write_state: Arc<WriteState>,
-    partition_values: Option<HashMap<String, Scalar>>,
-    partition_values_are_physical: bool,
+    partition_values: Option<PartitionValueBinding>,
     logical_row_id_col_name: Option<String>,
     logical_row_commit_version_col_name: Option<String>,
 }
@@ -106,8 +105,7 @@ impl BoundWriteContextBuilder {
     /// Names are matched case-insensitively and normalized to schema case. The map must contain
     /// every partition column and no other keys.
     pub fn with_partition_values(mut self, partition_values: HashMap<String, Scalar>) -> Self {
-        self.partition_values = Some(partition_values);
-        self.partition_values_are_physical = false;
+        self.partition_values = Some(PartitionValueBinding::Logical(partition_values));
         self
     }
 
@@ -120,8 +118,7 @@ impl BoundWriteContextBuilder {
         mut self,
         partition_values: HashMap<String, Scalar>,
     ) -> Self {
-        self.partition_values = Some(partition_values);
-        self.partition_values_are_physical = true;
+        self.partition_values = Some(PartitionValueBinding::Physical(partition_values));
         self
     }
 
@@ -186,18 +183,17 @@ impl BoundWriteContextBuilder {
 
         let normalized = self
             .partition_values
-            .map(|partition_values| {
-                if self.partition_values_are_physical {
+            .map(|binding| match binding {
+                PartitionValueBinding::Logical(partition_values) => validate_partition_values(
+                    &self.write_state.logical_partition_columns,
+                    &self.write_state.full_logical_schema,
+                    partition_values,
+                ),
+                PartitionValueBinding::Physical(partition_values) => {
                     validate_physical_partition_values(
                         &self.write_state.logical_partition_columns,
                         &self.write_state.full_logical_schema,
                         self.write_state.column_mapping_mode,
-                        partition_values,
-                    )
-                } else {
-                    validate_partition_values(
-                        &self.write_state.logical_partition_columns,
-                        &self.write_state.full_logical_schema,
                         partition_values,
                     )
                 }
@@ -307,6 +303,12 @@ impl BoundWriteContextBuilder {
     }
 }
 
+#[derive(Debug)]
+enum PartitionValueBinding {
+    Logical(HashMap<String, Scalar>),
+    Physical(HashMap<String, Scalar>),
+}
+
 #[derive(Serialize)]
 struct WriteStateWire<'a> {
     version: u32,
@@ -328,7 +330,6 @@ impl WriteState {
         BoundWriteContextBuilder {
             write_state: Arc::clone(self),
             partition_values: None,
-            partition_values_are_physical: false,
             logical_row_id_col_name: None,
             logical_row_commit_version_col_name: None,
         }
