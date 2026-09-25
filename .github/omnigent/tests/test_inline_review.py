@@ -282,7 +282,11 @@ class InlineReviewTest(unittest.TestCase):
                     "path": "kernel/src/example.rs",
                     "line": 10,
                     "side": "RIGHT",
-                    "body": "**Nit1** This is attached to the added line.",
+                    "body": (
+                        "**Nit1** This is attached to the added line.\n\n---\n"
+                        "<sub>Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, "
+                        "or 👀 if out of scope.</sub>"
+                    ),
                 }
             ],
         )
@@ -852,7 +856,7 @@ class InlineReviewTest(unittest.TestCase):
                     "path": "kernel/src/example.rs",
                     "line": 10,
                     "side": "RIGHT",
-                    "body": "**Nit1** Finding.",
+                    "body": "**Nit1** Finding." + self.inline_review.INLINE_FEEDBACK_FOOTER,
                 }
             ],
         )
@@ -937,7 +941,9 @@ class InlineReviewTest(unittest.TestCase):
                                                 "path": finding["path"],
                                                 "line": finding["line"],
                                                 "side": finding["side"],
-                                                "body": "**Nit9** Repeated finding.",
+                                                "body": first_payload["comments"][0]["body"].replace(
+                                                    "**Nit1**", "**Nit9**", 1
+                                                ),
                                             }
                                         ]
                                     },
