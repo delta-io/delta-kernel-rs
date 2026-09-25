@@ -28,24 +28,16 @@ impl ManifestCommitState {
     /// # Errors
     ///
     /// Returns an error if `table_config` does not support the `adaptiveMetadata-preview` feature,
-    /// if an explicit root manifest was already staged (`has_explicit_root_manifest`), or if delta
-    /// log commits exist after the last manifest commit (not yet supported).
+    /// or if delta log commits exist after the last manifest commit (not yet supported).
     pub(super) fn try_new(
         engine: &dyn Engine,
         read_snapshot: SnapshotRef,
         version_to_write: Version,
         table_config: &TableConfiguration,
-        has_explicit_root_manifest: bool,
     ) -> DeltaResult<Self> {
         require!(
             table_config.is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
             Error::unsupported("manifest commit requires the adaptiveMetadata-preview feature")
-        );
-        require!(
-            !has_explicit_root_manifest,
-            Error::invalid_transaction_state(
-                "explicit root manifest and manifest commit are mutually exclusive"
-            )
         );
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
@@ -96,12 +88,9 @@ impl ManifestCommitState {
     }
 
     /// Folds a finished leaf's [`LeafNodeWriterResult`] into this commit.
-    ///
-    /// # Errors
-    ///
-    /// Currently always [`Error::Unsupported`]: the manifest-commit write path is not yet built.
     #[internal_api]
     pub(crate) fn add_leaf(&mut self, _result: LeafNodeWriterResult) -> DeltaResult<()> {
+        // TODO(#2866): fold the finished leaf's result into the commit.
         Err(Error::unsupported(
             "manifest commit add_leaf is not yet supported",
         ))

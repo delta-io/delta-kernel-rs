@@ -43,30 +43,23 @@ impl LeafNodeWriter {
     ///
     /// `add_metadata` follows the add-file metadata schema
     /// ([`Transaction::add_files_schema`](crate::transaction::Transaction::add_files_schema)).
-    ///
-    /// # Errors
-    ///
-    /// Currently always [`Error::Unsupported`]: the manifest-commit write path is not yet built.
-    // TODO(#2866): implement buffering appends, and add the other update kinds a leaf must accept
-    // (existing-file moves/removals and deletion-vector updates).
     #[internal_api]
     pub(crate) fn add_files(
         &mut self,
         _engine: &dyn Engine,
         _add_metadata: Box<dyn EngineData>,
     ) -> DeltaResult<()> {
+        // TODO(#2866): implement buffering appends, and add the other update kinds a leaf must
+        // accept (existing-file moves/removals and deletion-vector updates).
         Err(Error::unsupported(
             "manifest commit leaf writer add_files is not yet supported",
         ))
     }
 
     /// Writes the buffered changes as a leaf manifest and returns its [`LeafNodeWriterResult`].
-    ///
-    /// # Errors
-    ///
-    /// Currently always [`Error::Unsupported`]: the manifest-commit write path is not yet built.
     #[internal_api]
     pub(crate) fn finish(self, _engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
+        // TODO(#2866): write the buffered changes as a leaf manifest.
         Err(Error::unsupported(
             "manifest commit leaf writer finish is not yet supported",
         ))
