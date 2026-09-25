@@ -664,18 +664,6 @@ mod tests {
         }
     }
 
-    fn shape_with_partitions(
-        checkpoint_type: CheckpointType,
-        parsed_partitions: SchemaRef,
-    ) -> CheckpointShape {
-        CheckpointShape {
-            checkpoint_type,
-            leaf_checkpoint_schema: Some(
-                parquet_read_schema(None, Some(&parsed_partitions)).unwrap(),
-            ),
-        }
-    }
-
     fn no_checkpoint() -> CheckpointShape {
         shape(CheckpointType::None, None)
     }
@@ -818,9 +806,11 @@ mod tests {
     #[rstest::rstest]
     #[case::with_parsed_stats(Some(struct_stats_schema()), true)]
     #[case::without_parsed_stats(None, false)]
-    fn metadata_plan_manifest_sidecar_dynamic_scan_stats_columns(
+    fn metadata_plan_checkpoint_metadata_columns(
         #[case] parsed_stats: Option<SchemaRef>,
         #[case] expect_parsed_columns: bool,
+        #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+        #[values(false, true)] native_parsed_partitions: bool,
     ) -> DeltaResult<()> {
         let stats = StatsOptions::all();
         let partition_values = PartitionValuesOptions::with_struct();
@@ -830,84 +820,57 @@ mod tests {
             .with_stats(stats)
             .with_partition_values(partition_values)
             .build()?;
-        let plan = scan
-            .build_metadata_scan_plan(&shape(CheckpointType::Manifest, parsed_stats))?
-            .expect("non-empty");
-
-        let dynamic_scan = plan
-            .nodes
-            .iter()
-            .find_map(|n| match &n.op {
-                Operator::DynamicScan(dynamic_scan) => Some(dynamic_scan),
-                _ => None,
-            })
-            .expect("sidecar dynamic scan");
-        assert_eq!(
-            add_struct(&dynamic_scan.schema)
-                .field(STATS_PARSED)
-                .is_some(),
-            expect_parsed_columns,
-        );
-        assert!(
-            add_struct(&dynamic_scan.schema)
-                .field(PARTITION_VALUES_PARSED)
-                .is_none(),
-            "native parsed partition values are not requested yet"
-        );
-        assert!(
-            dynamic_scan.dv_column.is_none(),
-            "sidecar scan sets no dv column"
-        );
-        Ok(())
-    }
-
-    #[rstest::rstest]
-    #[case::native_struct(true)]
-    #[case::string_map_fallback(false)]
-    fn metadata_plan_checkpoint_partition_value_source(
-        #[case] native_struct: bool,
-    ) -> DeltaResult<()> {
-        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
-        let scan = mock_snapshot(segment)?
-            .scan_builder()
-            .with_partition_values(PartitionValuesOptions::with_struct())
-            .build()?;
-        let partition_schema = scan
-            .state_info
-            .physical_partition_schema
-            .clone()
-            .expect("partition schema");
-        let shape = if native_struct {
-            shape_with_partitions(CheckpointType::Leaf, partition_schema)
-        } else {
-            shape(CheckpointType::Leaf, None)
+        let parsed_partitions = native_parsed_partitions
+            .then(|| scan.state_info.physical_partition_schema.as_ref().unwrap());
+        let shape = CheckpointShape {
+            checkpoint_type,
+            leaf_checkpoint_schema: Some(parquet_read_schema(
+                parsed_stats.as_ref(),
+                parsed_partitions,
+            )?),
         };
         let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
 
-        let checkpoint_scan = plan
+        let checkpoint_schema = plan
             .nodes
             .iter()
             .find_map(|node| match &node.op {
-                Operator::ScanParquet(scan) => Some(scan),
+                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
+                    Some(&scan.schema)
+                }
+                Operator::DynamicScan(scan) => {
+                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
+                    Some(&scan.schema)
+                }
                 _ => None,
             })
-            .expect("checkpoint parquet scan");
+            .expect("checkpoint leaf scan");
         assert_eq!(
-            add_struct(&checkpoint_scan.schema)
+            add_struct(checkpoint_schema).field(STATS_PARSED).is_some(),
+            expect_parsed_columns,
+        );
+        assert_eq!(
+            add_struct(checkpoint_schema)
                 .field(PARTITION_VALUES_PARSED)
                 .is_some(),
-            native_struct,
+            native_parsed_partitions,
         );
 
         let normalization = plan
             .nodes
             .iter()
+            .rev()
             .find_map(|node| match &node.op {
-                Operator::Project(project) => Some(project.expr.to_string()),
+                Operator::Project(project) if project.schema.field(IS_ADD).is_some() => {
+                    Some(project.expr.to_string())
+                }
                 _ => None,
             })
             .expect("checkpoint normalization project");
-        assert_eq!(normalization.contains("MAP_TO_STRUCT"), !native_struct);
+        assert_eq!(
+            normalization.contains("MAP_TO_STRUCT"),
+            !native_parsed_partitions
+        );
         assert!(!normalization.contains("COALESCE"));
         Ok(())
     }
