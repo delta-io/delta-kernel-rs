@@ -113,12 +113,10 @@ pub(crate) struct AmtCheckpoint {
     pub(crate) leaves: Option<Vec<RawJson>>,
 }
 
-/// A JSON value retained as *normalized* JSON text, so a field kernel does not yet model as a typed
-/// structure (currently AMT `leaves`) still round-trips through the hint. It is not byte-verbatim:
-/// `serde_json` collapses insignificant whitespace and sorts object keys (no `preserve_order`
-/// feature), and that normalization is exactly what makes `RawJson` `Eq` where
-/// [`serde_json::Value`] (which contains `f64`) is not -- letting the enclosing hint keep its
-/// derived equality.
+/// A JSON value kept as normalized text so a field kernel does not yet model as a typed structure
+/// (currently AMT `leaves`) still round-trips through the hint. Text rather than
+/// [`serde_json::Value`] because `Value` holds `f64` and so is not `Eq`, which would block the hint
+/// deriving `Eq`; the text is normalized (whitespace collapsed, keys sorted), not byte-verbatim.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
