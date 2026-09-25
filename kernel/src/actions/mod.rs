@@ -1885,6 +1885,7 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) version: i64,
 
     /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[allow_null_container_values]
     pub(crate) tags: Option<HashMap<String, String>>,
 }
