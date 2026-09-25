@@ -1143,10 +1143,12 @@ impl Scan {
         err
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed stats are
+        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
-        let shape = if self.state_info.physical_stats_schema.is_some() {
+        let needs_leaf_schema = self.state_info.physical_stats_schema.is_some()
+            || self.state_info.physical_partition_schema.is_some();
+        let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
