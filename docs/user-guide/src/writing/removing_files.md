@@ -198,8 +198,9 @@ match txn.commit(&engine)? {
 > [!WARNING]
 > If the table has Change Data Feed enabled
 > (`delta.enableChangeDataFeed = true`), you cannot add _and_ remove files in
-> the same transaction. Kernel does not yet support writing the CDC files that
-> Delta requires for DML operations that both add and remove data. If you
+> the same transaction when `data_change = true`.
+> Kernel does not yet support writing the CDC files that
+> Delta requires for data-changing DML operations that both add and remove data. If you
 > attempt this, `commit()` returns an error. Use separate transactions: one to
 > add files, another to remove files.
 
