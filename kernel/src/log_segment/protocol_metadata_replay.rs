@@ -18,6 +18,8 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::{col, Predicate};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
@@ -25,6 +27,8 @@ use crate::path::ParsedLogPath;
 use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{
@@ -148,13 +152,9 @@ impl LogSegment {
         resolve_pm_batches(self.read_pm_batches(engine)?)
     }
 
-    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
-    /// its version.
+    /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
-    fn read_pm_batches_via_plan(
-        &self,
-        executor: &dyn PlanExecutor,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+    fn build_pm_plan(&self) -> DeltaResult<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -184,7 +184,16 @@ impl LogSegment {
             })
             .transpose()?;
 
-        let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+        let relevant_action = Predicate::or(
+            col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
+            col!(METADATA_NAME, "id").is_not_null(),
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let relevant_action =
+            Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
+
+        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+            .filter(relevant_action)?
             .aggregate_ungrouped(|a| {
                 let protocol = || column_name!(PROTOCOL_NAME);
                 let metadata = || column_name!(METADATA_NAME);
@@ -209,7 +218,17 @@ impl LogSegment {
                 );
                 a
             })?
-            .build()?;
+            .build()
+    }
+
+    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
+    /// its version.
+    #[cfg(feature = "declarative-plans")]
+    fn read_pm_batches_via_plan(
+        &self,
+        executor: &dyn PlanExecutor,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+        let plan = self.build_pm_plan()?;
 
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
@@ -484,6 +503,10 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
     #[cfg(feature = "declarative-plans")]
+    use crate::expressions::{col, Predicate};
+    #[cfg(feature = "declarative-plans")]
+    use crate::plans::ir::nodes::Operator;
+    #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
@@ -539,6 +562,35 @@ mod tests {
         // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
         // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
         assert_eq!(data.len(), 4);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
+    fn test_declarative_pm_plan_filters_irrelevant_actions() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .build(&SyncEngine::new())
+            .unwrap();
+        let plan = snapshot.log_segment().build_pm_plan().unwrap();
+
+        let filter = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::Filter(filter) => Some(filter),
+                _ => None,
+            })
+            .expect("P&M plan must filter irrelevant actions");
+
+        let expected = Predicate::or(
+            col!("protocol.minReaderVersion").is_not_null(),
+            col!("metaData.id").is_not_null(),
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = Predicate::or(expected, col!("checkpoint").is_not_null());
+        assert_eq!(filter.predicate.as_ref(), &expected);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
