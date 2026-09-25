@@ -86,10 +86,12 @@ Your connector can also use its own evaluator for all required defaults.
 
 #### When Kernel can parse the required defaults
 
-Use this path when your required defaults are literals supported by Kernel. Prepare column sources
-once per transaction, then apply it to each incoming batch. Supplied columns keep their values,
-including explicit nulls. Omitted columns receive their parsed default, repeated for the batch's
-row count.
+Use this path when your required defaults are literals supported by Kernel. Defaults apply to omitted
+values and explicit `DEFAULT` requests. This example handles only columns omitted from the input
+schema. Build a list in table-column order containing each column's input index or parsed default.
+Prepare this list once per transaction and reuse it for each incoming batch. Supplied columns keep
+their values, including explicit nulls. For columns omitted from the input schema, repeat the parsed
+default for the batch's row count.
 
 This example accepts batches with a fixed input schema and writes to an existing unpartitioned
 table. Columns can arrive in any order. The function rejects omitted columns without a default,
