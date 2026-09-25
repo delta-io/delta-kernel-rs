@@ -453,6 +453,10 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                 StructField::nullable(STATS, DataType::STRING),
                 Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
             ),
+            // (true, true, _) passes `add.stats` through unchanged. (true, false, false) cannot
+            // occur: both arms read the checkpoint with `reads_json_stats` set whenever JSON output
+            // has no `stats_parsed` source, so `emit_json` implies `has_json_stats ||
+            // has_stats_parsed`.
             _ => self,
         }
     }

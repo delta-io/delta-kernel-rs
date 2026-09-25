@@ -36,10 +36,15 @@ use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanStatsOptions {
     /// Whether scan metadata emits JSON statistics.
+    #[serde(default = "default_emit_json")]
     pub(crate) emit_json: bool,
     /// Physical schema of requested structured statistics.
     #[serde(default)]
     pub(crate) output_schema: Option<SchemaRef>,
+}
+
+fn default_emit_json() -> bool {
+    true
 }
 
 impl Default for ScanStatsOptions {
@@ -2153,6 +2158,7 @@ mod tests {
     #[case::json_from_parsed_stats(false, true, 1, false)]
     #[case::json_passthrough(true, true, 0, true)]
     #[case::no_json_output(false, false, 0, false)]
+    #[case::no_json_output_with_json_stats(true, false, 0, false)]
     fn add_transform_json_stats_follow_source_columns(
         #[case] has_json_stats: bool,
         #[case] emit_json: bool,
