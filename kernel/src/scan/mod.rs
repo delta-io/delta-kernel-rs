@@ -63,6 +63,79 @@ pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
 
+/// Validation of a default metadata scan against an immutable snapshot.
+///
+/// This retains only identity. JSON stats and string partition values need no table schema.
+/// Connectors must bind this validation to the generation of the immutable state they supply.
+#[cfg(feature = "declarative-plans")]
+#[derive(Debug)]
+#[internal_api]
+pub(crate) struct ValidatedMetadataScan {
+    table_root: Url,
+    version: Version,
+    latest: bool,
+}
+
+#[cfg(feature = "declarative-plans")]
+impl ValidatedMetadataScan {
+    /// Validate against an already loaded snapshot without retaining its schemas.
+    #[internal_api]
+    pub(crate) fn try_new(snapshot: &SnapshotRef) -> DeltaResult<Self> {
+        let schema = snapshot.schema();
+        if schema.num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
+                 to add at least one column before scanning",
+            ));
+        }
+        snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Scan)?;
+        // Ordinary table fields already passed TableConfiguration validation at load. Explicit
+        // metadata columns have extra scan rules; use the existing validator for this rare case.
+        if schema.metadata_columns().next().is_some() {
+            snapshot.clone().scan_builder().build()?;
+        }
+        Ok(Self {
+            table_root: snapshot.table_root().clone(),
+            version: snapshot.version(),
+            latest: snapshot.is_built_as_latest(),
+        })
+    }
+
+    /// Plan the validated default scan, decoding only log paths from the supplied state.
+    ///
+    /// The connector must supply the same immutable state validated at handoff. Identity checks
+    /// detect version/freshness changes; they cannot detect mutation under an unchanged generation.
+    #[internal_api]
+    pub(crate) fn plan(
+        &self,
+        state: &dyn SnapshotState,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Plan>> {
+        if state.table_root() != &self.table_root
+            || state.version() != self.version
+            || state.is_latest() != self.latest
+        {
+            return Err(Error::generic("validated metadata scan identity changed"));
+        }
+        let log_segment = log_segment_from_state(state)?;
+        let executor = engine.require_plan_executor()?;
+        let shape = CheckpointShape::try_new_for_segment(executor.as_ref(), &log_segment, None)?;
+        scan_plan::MetadataScanPlan {
+            log_segment: &log_segment,
+            skip_all: false,
+            pruning_predicate: None,
+            physical_stats_schema: &None,
+            physical_partition_schema: &None,
+            stats: &StatsOptions::default(),
+            physical_stats_output_schema: &None,
+            partition_values: &PartitionValuesOptions::default(),
+        }
+        .build_metadata_scan_plan(&shape)
+    }
+}
+
 /// Plan a default full-table scan from connector-owned snapshot components for one call.
 ///
 /// The table configuration and scan state live only until plan construction finishes. The
@@ -111,7 +184,10 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
     )?;
     scan_plan::MetadataScanPlan {
         log_segment: &log_segment,
-        state_info: &state_info,
+        skip_all: state_info.physical_predicate == PhysicalPredicate::StaticSkipAll,
+        pruning_predicate: scan_plan::stats_skipping_predicate(&state_info),
+        physical_stats_schema: &state_info.physical_stats_schema,
+        physical_partition_schema: &state_info.physical_partition_schema,
         stats: &stats,
         physical_stats_output_schema: &physical_stats_output_schema,
         partition_values: &partition_values,

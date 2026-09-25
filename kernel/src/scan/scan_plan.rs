@@ -57,7 +57,10 @@ impl Scan {
 /// Inputs the metadata plan needs after scan-state construction has finished.
 pub(super) struct MetadataScanPlan<'a> {
     pub(super) log_segment: &'a LogSegment,
-    pub(super) state_info: &'a StateInfo,
+    pub(super) skip_all: bool,
+    pub(super) pruning_predicate: Option<Predicate>,
+    pub(super) physical_stats_schema: &'a Option<SchemaRef>,
+    pub(super) physical_partition_schema: &'a Option<SchemaRef>,
     pub(super) stats: &'a StatsOptions,
     pub(super) physical_stats_output_schema: &'a Option<SchemaRef>,
     pub(super) partition_values: &'a PartitionValuesOptions,
@@ -67,7 +70,10 @@ impl<'a> MetadataScanPlan<'a> {
     fn from_scan(scan: &'a Scan) -> Self {
         Self {
             log_segment: scan.snapshot.log_segment(),
-            state_info: scan.state_info.as_ref(),
+            skip_all: scan.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll,
+            pruning_predicate: stats_skipping_predicate(&scan.state_info),
+            physical_stats_schema: &scan.state_info.physical_stats_schema,
+            physical_partition_schema: &scan.state_info.physical_partition_schema,
             stats: &scan.stats,
             physical_stats_output_schema: &scan.physical_stats_output_schema,
             partition_values: &scan.partition_values,
@@ -87,14 +93,12 @@ impl<'a> MetadataScanPlan<'a> {
         &self,
         shape: &CheckpointShape,
     ) -> DeltaResult<Option<Plan>> {
-        let state = self.state_info;
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
-        if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
+        if self.skip_all {
             return Ok(None);
         }
 
-        let prune = stats_skipping_predicate(state);
-        let prune = prune.as_ref();
+        let prune = self.pruning_predicate.as_ref();
 
         // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's
         // dedup carrier and both terminal `{ add }` projections, so every arm agrees on the
@@ -169,8 +173,8 @@ impl<'a> MetadataScanPlan<'a> {
     /// replaces `add.stats_parsed` above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.log_segment;
-        let physical_stats = self.state_info.physical_stats_schema.as_ref();
-        let physical_partitions = self.state_info.physical_partition_schema.as_ref();
+        let physical_stats = self.physical_stats_schema.as_ref();
+        let physical_partitions = self.physical_partition_schema.as_ref();
         let source_physical_stats = shape.parsed_stats_schema.as_ref();
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
@@ -243,10 +247,8 @@ impl<'a> MetadataScanPlan<'a> {
                 // Commits never carry source-native parsed columns, so normalize from the raw
                 // encodings.
                 patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_schema.as_ref())
-                    .with_parsed_add_partition_values(
-                        self.state_info.physical_partition_schema.as_ref(),
-                    )
+                    .with_parsed_add_stats(self.physical_stats_schema.as_ref())
+                    .with_parsed_add_partition_values(self.physical_partition_schema.as_ref())
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
                         Expr::from(col!("add.path").is_not_null()),
@@ -264,8 +266,8 @@ impl<'a> MetadataScanPlan<'a> {
     }
 
     fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_schema = self.state_info.physical_stats_schema.as_ref();
-        let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
+        let physical_stats_schema = self.physical_stats_schema.as_ref();
+        let physical_partition_schema = self.physical_partition_schema.as_ref();
         let patch = SchemaStructPatchBuilder::new()
             .fold_with(physical_stats_schema, |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
@@ -340,7 +342,7 @@ impl<'a> MetadataScanPlan<'a> {
         let physical_partitions = self
             .partition_values
             .parsed_struct
-            .then_some(self.state_info.physical_partition_schema.as_ref())
+            .then_some(self.physical_partition_schema.as_ref())
             .flatten();
         let projection = match (physical_partitions, has_partition_values_parsed) {
             (Some(schema), true) => projection.replace(
@@ -558,7 +560,7 @@ fn project_nested_struct_to_schema(
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
-fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
+pub(super) fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     /// Re-roots metadata columns under `add`.
     struct MetadataSkippingColumnPrefixer;
 

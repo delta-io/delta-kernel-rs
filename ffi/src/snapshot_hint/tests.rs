@@ -320,6 +320,22 @@ fn externalized_core_borrows_validated_connector_state() {
     };
     unsafe { crate::free_metadata(metadata) };
 
+    // Empty schemas can still be externalized and read through getters, but not scanned.
+    #[cfg(feature = "declarative-plans")]
+    {
+        let plan_engine = unsafe { plan_based_engine(&engine) };
+        let rejected = unsafe {
+            snapshot_core_declarative_metadata_plan(
+                core.shallow_copy(),
+                &hint,
+                42,
+                plan_engine.shallow_copy(),
+            )
+        };
+        assert_extern_result_error_contains(rejected, KernelError::GenericError, "empty schema");
+        unsafe { free_engine(plan_engine) };
+    }
+
     let wrong_generation = unsafe {
         snapshot_core_logical_schema(core.shallow_copy(), &hint, 43, engine.shallow_copy())
     };
@@ -340,6 +356,7 @@ fn externalized_core_borrows_validated_connector_state() {
 #[case(FfiSnapshotHintFreshness::Latest)]
 fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     #[case] freshness: FfiSnapshotHintFreshness,
+    #[values(false, true)] partitioned: bool,
 ) {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
@@ -350,8 +367,12 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     );
     let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
     hint.metadata.schema_string = slice(
-        r#"{"type":"struct","fields":[{"name":"value","type":"long","nullable":true,"metadata":{}}]}"#,
+        r#"{"type":"struct","fields":[{"name":"value","type":"long","nullable":true,"metadata":{}},{"name":"nested","type":{"type":"struct","fields":[{"name":"child","type":"string","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
     );
+    let partition_columns = [slice("value")];
+    if partitioned {
+        hint.metadata.partition_columns = unsafe { FfiStringArray::new_unsafe(&partition_columns) };
+    }
     unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let core = unsafe {
@@ -366,6 +387,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     let inner_engine = unsafe { plan_engine.as_ref() }.engine();
     let native_snapshot = unsafe { snapshot.into_inner() };
     let native_plan = native_snapshot
+        .clone()
         .scan_builder()
         .build()
         .unwrap()
@@ -373,6 +395,30 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         .unwrap()
         .expect("expected a native plan for a hinted commit");
     let native_bytes = delta_kernel::Operation::QueryPlan(native_plan).to_proto_bytes();
+
+    // Fail immediately if the narrow planner asks for schema, metadata, protocol, or CRC.
+    let validation = delta_kernel::scan::ValidatedMetadataScan::try_new(&native_snapshot).unwrap();
+    let host_state = BorrowedSnapshotState {
+        hint: &hint,
+        table_root: native_snapshot.table_root(),
+    };
+    let narrow_plan = validation
+        .plan(&LogOnlyState(&host_state), inner_engine.as_ref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        delta_kernel::Operation::QueryPlan(narrow_plan).to_proto_bytes(),
+        native_bytes
+    );
+    let rejected = unsafe {
+        snapshot_core_declarative_metadata_plan(
+            core.shallow_copy(),
+            &hint,
+            43,
+            plan_engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
 
     let result = unsafe {
         snapshot_core_declarative_metadata_plan(
@@ -397,6 +443,43 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         free_snapshot_core(core);
         free_engine(plan_engine);
         free_engine(engine);
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+struct LogOnlyState<'a>(&'a dyn SnapshotState);
+
+#[cfg(feature = "declarative-plans")]
+impl SnapshotState for LogOnlyState<'_> {
+    fn table_root(&self) -> &url::Url {
+        self.0.table_root()
+    }
+    fn version(&self) -> delta_kernel::Version {
+        self.0.version()
+    }
+    fn is_latest(&self) -> bool {
+        self.0.is_latest()
+    }
+    fn protocol(&self) -> delta_kernel::DeltaResult<delta_kernel::actions::Protocol> {
+        panic!("metadata planning must not decode protocol")
+    }
+    fn metadata(&self) -> delta_kernel::DeltaResult<delta_kernel::actions::Metadata> {
+        panic!("metadata planning must not decode metadata")
+    }
+    fn logical_schema(&self) -> delta_kernel::DeltaResult<delta_kernel::schema::SchemaRef> {
+        panic!("metadata planning must not materialize the table schema")
+    }
+    fn crc(&self) -> delta_kernel::DeltaResult<Option<Arc<delta_kernel::crc::Crc>>> {
+        panic!("metadata planning must not decode CRC state")
+    }
+    fn last_checkpoint(&self) -> delta_kernel::DeltaResult<Option<LastCheckpointHint>> {
+        self.0.last_checkpoint()
+    }
+    fn visit_log_paths(
+        &self,
+        visitor: &mut dyn FnMut(&[delta_kernel::LogPath]) -> delta_kernel::DeltaResult<()>,
+    ) -> delta_kernel::DeltaResult<()> {
+        self.0.visit_log_paths(visitor)
     }
 }
 
