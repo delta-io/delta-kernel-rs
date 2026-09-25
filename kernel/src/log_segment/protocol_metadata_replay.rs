@@ -184,6 +184,8 @@ impl LogSegment {
             })
             .transpose()?;
 
+        // Required fields are non-null exactly when their Protocol or Metadata action is present.
+        // Filter on required leaf fields so readers can use row group skipping.
         let relevant_action = Predicate::or(
             col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
             col!(METADATA_NAME, "id").is_not_null(),
