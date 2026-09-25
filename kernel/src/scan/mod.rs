@@ -1150,6 +1150,7 @@ impl Scan {
             plan_executor.as_ref(),
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
+            self.state_info.physical_partition_schema.as_ref(),
         )?;
         self.build_metadata_scan_plan(&shape)
     }
