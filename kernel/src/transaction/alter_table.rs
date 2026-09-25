@@ -67,6 +67,7 @@ impl AlterTableTransaction {
             provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: false,
+            full_overwrite: false,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
