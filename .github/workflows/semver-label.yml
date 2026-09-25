@@ -26,26 +26,22 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     steps:
-      # Resolve PR number from the triggering workflow run's branch. For fork PRs the branch
-      # must be prefixed with `<owner>:` so gh pr view can locate it.
-      # Pattern from: https://github.com/orgs/community/discussions/25220#discussioncomment-11316244
+      # Resolve the PR number from GitHub's association with the triggering workflow run.
       - name: Find PR number
         id: pr-context
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_TARGET_REPO: ${{ github.repository }}
-          PR_BRANCH: |-
-            ${{
-              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
-                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
-                || github.event.workflow_run.head_branch
-            }}
+          RUN_PULL_REQUESTS: ${{ toJson(github.event.workflow_run.pull_requests) }}
         run: |
-          echo "Looking up PR for branch '${PR_BRANCH}' in repo '${PR_TARGET_REPO}'"
-          gh pr view --repo "${PR_TARGET_REPO}" "${PR_BRANCH}" \
-            --json 'number' --jq '"number=\(.number)"' \
-            >> "${GITHUB_OUTPUT}"
-          echo "PR lookup complete: $(cat "${GITHUB_OUTPUT}")"
+          set -euo pipefail
+
+          number=$(jq -er '
+            if type == "array" and length == 1 and
+                (.[0].number | type == "number" and . > 0)
+            then .[0].number
+            else error("expected exactly one associated PR with a positive number")
+            end
+          ' <<< "$RUN_PULL_REQUESTS")
+          echo "number=$number" >> "$GITHUB_OUTPUT"
 
       # Download the classified semver outcome artifact written by semver-checks.yml.
       - name: Download semver outcome
