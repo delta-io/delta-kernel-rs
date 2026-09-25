@@ -335,7 +335,8 @@ fn checkpoint_metadata_field() -> StructField {
     )
 }
 
-/// Schema for V2 checkpoints (includes checkpointMetadata action)
+/// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
+/// a schema, so readers assume this schema for them.
 static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (checkpoint_metadata_field()),
