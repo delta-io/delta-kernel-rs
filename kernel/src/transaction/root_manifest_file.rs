@@ -486,6 +486,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn latest_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
+        Ok(())
+    }
+
+    // The log is replayed newest-first, so the most recent `checkpoint` action wins.
+    #[test]
+    fn latest_checkpoint_action_returns_the_latest_of_multiple() -> DeltaResult<()> {
+        let (engine, table_root) = setup_table()?;
+        let write = |version, data| write_commit(&engine, &table_root, version, data);
+        write(
+            1,
+            minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        )?;
+        write(
+            2,
+            minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        )?;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        assert_eq!(snapshot.version(), 2);
+        let checkpoint = snapshot
+            .latest_checkpoint_action(&engine)?
+            .expect("checkpoint present");
+        assert_eq!(checkpoint.version(), 2);
+        assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
+        Ok(())
+    }
+
     // A domain and txn active in top-level commits, then dropped by omission in a later checkpoint
     // (as an external writer would, with no tombstone), must not come back in the rebuilt
     // checkpoint from those older log entries.
