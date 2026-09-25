@@ -317,6 +317,77 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
     parse_json_batch(json_strings)
 }
 
+/// Test fixtures for building adaptiveMetadata tables and their `checkpoint` (content-root)
+/// actions.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) mod adaptive_metadata_fixtures {
+    use std::iter;
+
+    use super::*;
+    use crate::actions::{CheckpointAction, ContentRoot};
+    use crate::engine_data::FilteredEngineData;
+    use crate::path::LogRoot;
+    use crate::version_as_i64;
+
+    /// The protocol and metadata of a minimal adaptiveMetadata table.
+    pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
+        let table_config =
+            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        (
+            table_config.protocol().clone(),
+            table_config.metadata().clone(),
+        )
+    }
+
+    /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
+    pub(crate) fn minimal_checkpoint_action(
+        path: &str,
+        version: Version,
+    ) -> DeltaResult<CheckpointAction> {
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        let version = version_as_i64(version)?;
+        Ok(CheckpointAction::new(
+            version,
+            ContentRoot::new(path.to_string(), 1024, version),
+            protocol,
+            metadata,
+            vec![],
+            vec![],
+        ))
+    }
+
+    /// Creates an empty in-memory table and returns its engine and table-root URL.
+    pub(crate) fn setup_table() -> DeltaResult<(SyncEngine, Url)> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let _ = create_table("memory:///", schema, "test")
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+        let table_root = Snapshot::builder_for("memory:///")
+            .build(&engine)?
+            .table_root()
+            .clone();
+        Ok((engine, table_root))
+    }
+
+    /// Writes a JSON commit at `version` containing `data`.
+    pub(crate) fn write_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        data: Box<dyn EngineData>,
+    ) -> DeltaResult<()> {
+        let filtered = FilteredEngineData::with_all_rows_selected(data);
+        let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
+        engine.json_handler().write_json_file(
+            &commit_path.location,
+            Box::new(iter::once(Ok(filtered))),
+            false,
+        )?;
+        Ok(())
+    }
+}
+
 // TODO: allow tests to pass in context (issue#1133)
 #[track_caller]
 pub(crate) fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
