@@ -18,7 +18,7 @@ use crate::{
     engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
     SharedExternEngine, SharedSnapshot,
 };
-use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
 // Used to allocate EngineErrors with test information from Rust tests
 #[cfg(test)]
@@ -47,6 +47,12 @@ pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> Nullable
     Some(ptr)
 }
 
+#[no_mangle]
+pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoid {
+    let bytes = unsafe { bytes.try_as_slice() }.unwrap().to_vec();
+    NonNull::new(Box::into_raw(Box::new(bytes)).cast())
+}
+
 /// Recover an error from 'allocate_err'
 pub(crate) unsafe fn recover_error(ptr: *mut EngineError) -> EngineErrorWithMessage {
     *Box::from_raw(ptr as *mut EngineErrorWithMessage)
@@ -56,6 +62,11 @@ pub(crate) unsafe fn recover_error(ptr: *mut EngineError) -> EngineErrorWithMess
 pub(crate) fn recover_string(ptr: NonNull<c_void>) -> String {
     let ptr = ptr.as_ptr().cast();
     *unsafe { Box::from_raw(ptr) }
+}
+
+/// Recover bytes from `allocate_bytes`.
+pub(crate) fn recover_bytes(ptr: NonNull<c_void>) -> Vec<u8> {
+    *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
 }
 
 pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {

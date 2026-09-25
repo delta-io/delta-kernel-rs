@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use futures::StreamExt as _;
 use url::Url;
 
@@ -9,15 +10,12 @@ use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler};
 
+#[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
 }
 
 impl SyncStorageHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
-    }
-
     /// The backing store, or `None` for the per-URL [`LocalFileSystem`] fallback.
     ///
     /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
@@ -27,9 +25,9 @@ impl SyncStorageHandler {
     }
 }
 
-// This handler collects eagerly under `block_on`, so there is no in-flight I/O for a cancellation
-// token to interrupt. It deliberately does not override the `*_with_cancellation` methods: their
-// default up-front check is the only cancellation it can honor.
+// This handler collects eagerly under `block_on`, so it cannot interrupt that I/O after it starts.
+// It relies on the default `*_with_cancellation` methods to check before delegation and before
+// pulling the resulting in-memory iterator.
 impl StorageHandler for SyncStorageHandler {
     fn list_from(&self, url_path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;

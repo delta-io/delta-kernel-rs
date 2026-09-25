@@ -63,10 +63,10 @@ static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
     ExternResultusize r;
     switch (f->type) {
       case FIELD_LONG:
-        r = visit_field_long(state, name, f->nullable, allocate_error);
+        r = visit_field_long(state, name, f->nullable, NULL, allocate_error);
         break;
       case FIELD_STRING:
-        r = visit_field_string(state, name, f->nullable, allocate_error);
+        r = visit_field_string(state, name, f->nullable, NULL, allocate_error);
         break;
       default:
         fprintf(stderr, "Unknown field type %d\n", f->type);
@@ -85,7 +85,7 @@ static uintptr_t build_schema(void* data, KernelSchemaVisitorState* state) {
   // pass a stable placeholder.
   KernelStringSlice root_name = { "root", 4 };
   ExternResultusize root = visit_field_struct(
-      state, root_name, child_ids, spec->field_count, /*nullable*/ false, allocate_error);
+      state, root_name, child_ids, spec->field_count, /*nullable*/ false, NULL, allocate_error);
   free(child_ids);
   if (root.tag != Okusize) {
     print_error("visit_field_struct failed for top-level", (Error*)root.err);
@@ -105,9 +105,9 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
+  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return 1;

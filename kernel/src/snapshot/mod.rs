@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -30,10 +30,11 @@ use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::ParsedLogPath;
+use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
+use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
@@ -43,6 +44,8 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 mod builder;
 mod incremental;
 mod snapshot_crc;
+#[cfg(test)]
+mod tracing_tests;
 #[doc(hidden)]
 pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
@@ -178,12 +181,36 @@ impl Snapshot {
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
     ) -> DeltaResult<Self> {
-        // Will perform version validations.
-        let crc = SnapshotCrc::try_new(
+        let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
+        Ok(Self::new_with_validated_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            skipped_new_checkpoints,
+        ))
+    }
+
+    fn validate_configuration_and_crc(
+        log_segment: &LogSegment,
+        table_configuration: &TableConfiguration,
+        crc: Option<Arc<Crc>>,
+    ) -> DeltaResult<SnapshotCrc> {
+        table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
+        SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
             log_segment.checkpoint_version,
-        )?;
+        )
+    }
+
+    fn new_with_validated_crc(
+        log_segment: LogSegment,
+        table_configuration: TableConfiguration,
+        crc: SnapshotCrc,
+        built_as_latest: bool,
+        skipped_new_checkpoints: bool,
+    ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -191,21 +218,20 @@ impl Snapshot {
             version = table_configuration.version(),
         );
         info!(parent: &span, "Created snapshot");
-        Ok(Self {
+        Self {
             span,
             log_segment,
             table_configuration,
             crc,
             built_as_latest,
             skipped_new_checkpoints,
-        })
+        }
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
     /// replay when no CRC is present.
-    #[instrument(err, fields(enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
@@ -214,6 +240,64 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> DeltaResult<Self> {
+        let (table_configuration, crc) = Self::prepare_new_from_log_segment(
+            &location,
+            &log_segment,
+            engine,
+            &metric_context,
+            incremental_replay,
+            built_as_latest,
+        )?;
+
+        Ok(Self::new_with_validated_crc(
+            log_segment,
+            table_configuration,
+            crc,
+            built_as_latest,
+            false, /* skipped_new_checkpoints */
+        ))
+    }
+
+    #[instrument(name = "try_new_from_log_segment", skip_all, fields(path = %location, enable_call_frame, version = log_segment.end_version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
+    fn prepare_new_from_log_segment(
+        location: &Url,
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+        metric_context: &SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
+    ) -> DeltaResult<(TableConfiguration, SnapshotCrc)> {
+        let result = Self::resolve_table_configuration_and_crc(
+            location,
+            log_segment,
+            engine,
+            metric_context,
+            incremental_replay,
+        )
+        .and_then(|(table_configuration, crc)| {
+            let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
+            Ok((table_configuration, crc))
+        });
+        result.inspect_err(|error| {
+            error!(
+                %error,
+                ?location,
+                ?log_segment,
+                ?metric_context,
+                ?incremental_replay,
+                built_as_latest,
+                "failed to construct snapshot from log segment"
+            );
+        })
+    }
+
+    fn resolve_table_configuration_and_crc(
+        location: &Url,
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+        metric_context: &SnapshotLoadMetricContext,
+        incremental_replay: IncrementalReplay,
+    ) -> DeltaResult<(TableConfiguration, Option<Arc<Crc>>)> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -221,7 +305,7 @@ impl Snapshot {
         let base_crc = log_segment.read_latest_crc(engine);
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
+            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full).
@@ -229,23 +313,19 @@ impl Snapshot {
             Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
             None => log_segment
                 .read_protocol_metadata(engine, base_crc.as_ref())
-                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
+                .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
-        emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-
-        tracing::Span::current().record("version", table_configuration.version());
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            protocol,
+            location.clone(),
+            log_segment.end_version,
+        )?;
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Self::new_with_crc(
-            log_segment,
-            table_configuration,
-            crc,
-            built_as_latest,
-            false, /* skipped_new_checkpoints */
-        )
+        Ok((table_configuration, crc))
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -573,6 +653,23 @@ impl Snapshot {
         }
 
         self.get_domain_metadata_internal(domain, engine)
+    }
+
+    /// Get the row-tracking high-water mark for this snapshot.
+    ///
+    /// Returns `None` when the snapshot has no active `delta.rowTracking` domain metadata.
+    /// `Some(`[`crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK`]`)` means row tracking is active but
+    /// no row IDs have been assigned yet.
+    ///
+    /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
+    /// cannot be read or its JSON configuration is malformed.
+    pub fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+            .map(|config| parse_row_tracking_high_water_mark(&config))
+            .transpose()
     }
 
     /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
@@ -1808,6 +1905,72 @@ mod tests {
         expected.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         assert_eq!(metadata, expected);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::enabled_without_assigned_ids(
+        r#"{"rowIdHighWaterMark":-1}"#,
+        Some(crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
+        None,
+        "memory:///test_row_tracking_high_water_mark_empty/"
+    )]
+    #[case::malformed_configuration(
+        "{not-json",
+        None,
+        Some("key must be a string"),
+        "memory:///test_row_tracking_high_water_mark_malformed/"
+    )]
+    #[tokio::test]
+    async fn test_get_row_tracking_high_water_mark(
+        #[case] configuration: &str,
+        #[case] expected: Option<i64>,
+        #[case] expected_error: Option<&str>,
+        #[case] table_root: &str,
+    ) -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        commit(
+            table_root,
+            store.as_ref(),
+            0,
+            vec![
+                json!({
+                    "protocol": {
+                        "minReaderVersion": 1,
+                        "minWriterVersion": 7,
+                        "writerFeatures": ["domainMetadata", "rowTracking"]
+                    }
+                }),
+                json!({
+                    "metaData": {
+                        "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                        "format": { "provider": "parquet", "options": {} },
+                        "schemaString": r#"{"type":"struct","fields":[]}"#,
+                        "partitionColumns": [],
+                        "configuration": { "delta.enableRowTracking": "true" },
+                        "createdTime": 1587968585495i64
+                    }
+                }),
+                json!({
+                    "domainMetadata": {
+                        "domain": "delta.rowTracking",
+                        "configuration": configuration,
+                        "removed": false
+                    }
+                }),
+            ],
+        )
+        .await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let result = snapshot.get_row_tracking_high_water_mark(&engine);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            assert_eq!(result?, expected);
+        }
 
         Ok(())
     }

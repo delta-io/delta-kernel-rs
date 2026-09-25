@@ -63,7 +63,10 @@ fn test_verify_written_size(
     let path = Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet").unwrap();
     let result = super::verify_written_size(&path, written_size, observed_size);
     if expect_ok {
-        assert!(result.is_ok(), "expected Ok for equal sizes, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok for equal sizes, got {result:?}"
+        );
     } else {
         assert!(
             matches!(result, Err(crate::Error::Generic(_))),

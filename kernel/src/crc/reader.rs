@@ -158,12 +158,22 @@ mod tests {
         assert!(hist.file_counts[1..].iter().all(|&c| c == 0));
         assert!(hist.total_bytes[1..].iter().all(|&b| b == 0));
 
-        // These fields are on the Crc struct but not yet round-tripped through CrcRaw.
-        assert!(crc.txn_id.is_none());
-        assert!(crc.all_files.is_none());
-        assert!(crc.num_deleted_records_opt.is_none());
-        assert!(crc.num_deletion_vectors_opt.is_none());
-        assert!(crc.deleted_record_counts_histogram_opt.is_none());
+        assert_eq!(
+            crc.txn_id.as_deref(),
+            Some("29ebf587-9705-4bb4-ac40-2f02324065c8")
+        );
+        let all_files = crc.all_files.as_ref().unwrap();
+        assert_eq!(all_files.len(), 10);
+        assert_eq!(all_files.iter().map(|add| add.size).sum::<i64>(), 5259);
+        assert_eq!(crc.num_deleted_records_opt, Some(0));
+        assert_eq!(crc.num_deletion_vectors_opt, Some(0));
+        assert_eq!(
+            crc.deleted_record_counts_histogram_opt
+                .as_ref()
+                .unwrap()
+                .deleted_record_counts,
+            [10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
 
         let crc_events: Vec<_> = reporter
             .events()

@@ -56,7 +56,7 @@ snapshot gives you a checkpoint-ready `SnapshotRef`:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 
@@ -145,7 +145,7 @@ The typical pattern is to check `commits_since_checkpoint` against the table's
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 

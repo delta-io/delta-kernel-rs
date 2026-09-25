@@ -23,7 +23,7 @@ void* allocate_string(const KernelStringSlice slice);
 EngineError* allocate_error(KernelError etype, const KernelStringSlice msg);
 // utility function to convert key/val into slices and set them on a builder
 // returns false on failure
-bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val);
+bool set_builder_opt(HandleMutableFfiEngineBuilder* engine_builder, char* key, char* val);
 // Compile-time smoke test for snapshot-hint ABI types and entry-point signatures.
 void compile_snapshot_hint_abi(void);
 // print out metric info
