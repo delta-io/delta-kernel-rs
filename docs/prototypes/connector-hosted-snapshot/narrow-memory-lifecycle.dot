@@ -1,0 +1,33 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", pad="0.25", nodesep="0.6", ranksep="0.5",
+    label="Native Rust memory lifecycle: baseline and current candidate\nSchematic ownership, not a measured time series",
+    labelloc=t, fontname="DejaVu Sans", fontsize=20];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12,
+    margin="0.16,0.14"];
+  edge [color="#52606d", arrowsize=0.8];
+  b0 [label="BASELINE\nLoad native snapshot\nParse and validate full schema",
+    fillcolor="#e8f1fb", group="baseline"];
+  b1 [label="Between calls\nRetain Snapshot + TableConfiguration\n4,272.8 MB across 1,107 contexts",
+    fillcolor="#e8f1fb", group="baseline"];
+  b2 [label="Plan\nRetained state + scan state + result\n6,138.1-6,138.5 MB phase peak",
+    fillcolor="#e8f1fb", group="baseline"];
+  b3 [label="Close\nFree result, scan and snapshot\nZero tracked allocation delta",
+    fillcolor="#e8f1fb", group="baseline"];
+  c0 [label="CANDIDATE\nLoad full native snapshot\nValidate handoff + scan support\nRelease full graph after export",
+    fillcolor="#dff1e9", group="candidate"];
+  c1 [label="Between calls\nJava keeps immutable hint\nRust core + validation token\n26.5 MB across 1,107 contexts",
+    fillcolor="#dff1e9", group="candidate"];
+  c2 [label="Plan\nDecode log paths; build plan\nNo full table schema / scan state\n30.4-30.9 MB phase peak",
+    fillcolor="#dff1e9", group="candidate"];
+  c3 [label="Close\nFree result and core\nZero tracked allocation delta",
+    fillcolor="#dff1e9", group="candidate"];
+  b0 -> b1 -> b2 -> b3;
+  c0 -> c1 -> c2 -> c3;
+  {rank=same; b0; c0;}
+  {rank=same; b1; c1;}
+  {rank=same; b2; c2;}
+  {rank=same; b3; c3;}
+  note [shape=note, fillcolor="#fff0d5", label="16-worker tracked runs, three repeats.\nCandidate overall peak: 122.4-131.4 MB during LOAD.\nJava heap and JNR buffers are outside this Rust tracker.\nExplicit schema getters still materialize a full owned schema.\nThis metadata plan does not request one."];
+  b3 -> note [style=invis];
+  c3 -> note [style=invis];
+}

@@ -1,0 +1,21 @@
+digraph G {
+graph [bgcolor="white",pad="0.25",splines=polyline,overlap=true,label="Validated metadata planning: schema work only when requested",labelloc=t,fontname="DejaVu Sans",fontsize=20];
+node [shape=box,style="rounded,filled",fontname="DejaVu Sans",fontsize=12,width=3.2,height=0.75];
+edge [fontname="DejaVu Sans",fontsize=11,color="#334e68",arrowsize=0.8];
+j0 [pos="160,620!",label="Java connector",fillcolor="#e8f1fb"];
+r0 [pos="810,620!",label="Rust kernel",fillcolor="#dff1e9"];
+j1 [pos="160,495!",label="Hold immutable SnapshotHint\nand its generation",fillcolor="#e8f1fb"];
+r1 [pos="810,495!",label="Compare hint with loaded snapshot\nValidate scan support once\nKeep identity + validation token",fillcolor="#dff1e9"];
+j2 [pos="160,340!",label="Pack hint for a default plan\n(includes schema JSON today)",fillcolor="#e8f1fb"];
+r2 [pos="810,340!",label="Check generation/version/freshness\nRead log paths + checkpoint hint\nBuild metadata plan; no table schema",fillcolor="#dff1e9"];
+j3 [pos="160,210!",label="Receive plan; free result buffer\nKeep immutable hint",fillcolor="#e8f1fb"];
+r3 [pos="810,210!",label="Release scoped planning inputs\nKeep small core + validation token",fillcolor="#dff1e9"];
+j4 [pos="160,65!",label="Optional explicit schema request",fillcolor="#fff0d5"];
+r4 [pos="810,65!",label="Materialize an owned Rust schema\nCaller must free returned handle",fillcolor="#fff0d5"];
+j0 -> j1 -> j2 -> j3 -> j4 [style=dashed,arrowhead=none,color="#9fb3c8"];
+r0 -> r1 -> r2 -> r3 -> r4 [style=dashed,arrowhead=none,color="#73bda8"];
+j1 -> r1 [label="externalize_core(hint, generation)"];
+j2 -> r2 [label="plan(core, hint, generation)"];
+r3 -> j3 [label="serialized plan bytes"];
+j4 -> r4 [label="logical_schema(core, hint, generation)"];
+}
