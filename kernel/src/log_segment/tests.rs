@@ -16,6 +16,7 @@ use crate::actions::{
 };
 use crate::arrow::array::{StringArray, StructArray};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
+use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -5298,12 +5299,9 @@ async fn read_actions_with_null_map_values(
         let Some(action_col) = rb.column_by_name(action_name) else {
             continue;
         };
-        // `map_field` may be a dotted path into nested structs (e.g. `format.options`).
-        let map_col = map_field.split('.').fold(action_col, |col, name| {
-            col.as_struct_opt()
-                .and_then(|s| s.column_by_name(name))
-                .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"))
-        });
+        let map_path = map_field.split('.').collect_vec();
+        let map_col = extract_column_ref(action_col.as_struct(), &map_path)
+            .unwrap_or_else(|e| panic!("{action_name}.{map_field}: {e}"));
         let map_array = map_col
             .as_any()
             .downcast_ref::<MapArray>()
