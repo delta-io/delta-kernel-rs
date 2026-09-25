@@ -1,77 +1,79 @@
 # Feature flags
 
-The Delta Kernel ships as two crates with Cargo feature flags to keep each lightweight. The
-`delta_kernel` crate has no required runtime dependencies beyond the Rust standard library.
-The `delta_kernel_default_engine` crate adds Arrow, Tokio, and `object_store`. Everything else
-is opt-in.
+Cargo feature flags choose how Kernel integrates with your connector. Pick an Engine, a TLS
+backend, and an Arrow compatibility level. Enable experimental Kernel APIs only when the workflow
+requires them.
 
-## Recommended starting point
+For exhaustive, release-specific inventories, use the generated feature lists for
+[`delta_kernel`] and [`delta_kernel_default_engine`]. Those lists come from the published crate
+manifests and stay aligned with each release.
 
-For most connectors that use the built-in engine with Arrow:
+[`delta_kernel`]: https://docs.rs/crate/delta_kernel/latest/features
+[`delta_kernel_default_engine`]: https://docs.rs/crate/delta_kernel_default_engine/latest/features
+
+## Choose an Engine
+
+Most connectors should start with the default engine:
 
 ```toml
 [dependencies]
-delta_kernel = "0.23"
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
+delta_kernel = "0.28.0"
+delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
 
-## Complete feature reference
+The default engine supplies Arrow data, Tokio execution, expression evaluation, Parquet and JSON
+handling, and `object_store` integration. Its dependencies activate the matching Kernel support
+automatically.
 
-### `delta_kernel_default_engine` features
-
-`delta_kernel_default_engine` provides out-of-the-box support for reading and writing Delta
-tables on local filesystems and cloud object stores.
-
-| Feature | Description |
-|---------|-------------|
-| `rustls` | TLS via `rustls`. Recommended for most users because it requires no native dependency. |
-| `native-tls` | TLS via your platform's native library (OpenSSL on Linux, Schannel on Windows, Secure Transport on macOS). |
-| `arrow` | Build against the latest supported Arrow version (currently 59). |
-| `arrow-59` | Pin to Arrow 59 (with `parquet` 59 and `object_store` 0.13). |
-| `arrow-58` | Pin to Arrow 58 (with `parquet` 58 and `object_store` 0.13). |
-
-Pick exactly one of `rustls` or `native-tls`. Picking an `arrow-*` version on the default
-engine automatically activates the same version on `delta_kernel` (the two crates must agree).
-
-### `delta_kernel` features
-
-| Feature | Description |
-|---------|-------------|
-| `arrow-conversion` | Convert between Kernel schema types and Arrow types (`TryIntoArrow`, `TryFromArrow`). |
-| `arrow-expression` | Evaluate Kernel expressions over Arrow data. |
-| `default-engine-base` | Shared Arrow modules used by the default engine. Pulled in automatically by `delta_kernel_default_engine`. |
-| `arrow-59` / `arrow-58` | Pin the Arrow version used by Kernel's arrow modules. |
-| `schema-diff` | Experimental schema diffing. |
-| `internal-api` | Expose additional APIs that aren't yet stabilized. Some examples in this guide need this. |
-| `prettyprint` | Arrow pretty-print helpers. Useful for debugging and examples. |
-| `test-utils` | Test-only constructors for downstream crate tests. Pulls in `prettyprint`. Not for production use. |
-| `integration-test` | Heavy integration tests (e.g., HDFS via `hdfs-native-object-store`). |
-
-> [!TIP]
-> Each `arrow-*` version feature pulls in the matching `parquet` and `object_store` crate
-> versions. If your connector already depends on a specific Arrow version, pin the matching
-> feature on both crates to avoid duplicate transitive dependencies.
-
-## Common combinations
-
-**Read and write with the default engine:**
+If your connector implements every Engine capability in its own data format, depend on Kernel
+without Arrow features:
 
 ```toml
-delta_kernel = "0.23"
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
+[dependencies]
+delta_kernel = "0.28.0"
 ```
 
-**Custom engine using Arrow (no default engine):**
+For a custom Engine that still uses Kernel's Arrow conversion and expression modules, enable those
+capabilities directly:
 
 ```toml
-delta_kernel = { version = "0.23", features = ["arrow-conversion", "arrow-expression"] }
+[dependencies]
+delta_kernel = { version = "0.28.0", features = ["arrow-conversion", "arrow-expression"] }
 ```
 
-**Minimal custom engine with no Arrow dependency at all:**
+## Choose a TLS backend
 
-```toml
-delta_kernel = "0.23"
-```
+The default engine needs one TLS backend for HTTPS object stores. Use `rustls` for a portable
+default without native TLS dependencies. Use `native-tls` when your deployment must use the
+platform's TLS library or certificate integration.
 
-That gives you only the core Kernel types and traits. You implement `Engine` and `EngineData`
-entirely in your own data format.
+Choose one backend explicitly when you disable default features. Enabling both adds dependencies
+without giving the connector a useful second transport path.
+
+## Align Arrow versions
+
+The `arrow` feature tracks the newest Arrow version supported by that Kernel release. Use it when
+your connector does not expose Arrow types in its own public API.
+
+If your connector already depends on Arrow, select the matching `arrow-N` feature on the default
+engine. It activates the same version in Kernel. This prevents duplicate Arrow types from crossing
+the connector boundary.
+
+Check the generated crate feature lists for the Arrow versions supported by the release you use.
+Do not infer the current versions from examples written for another release.
+
+## Use unstable and development features
+
+The `internal-api` feature exposes APIs that have not reached Kernel's public stability boundary.
+Code that depends on it must expect source changes between minor releases.
+
+Development and test features exist for in-progress protocol work, generated plans, test helpers,
+and heavyweight integration environments. Treat their manifest descriptions and feature
+dependencies as authoritative. They are intended for contributors or targeted adopters rather
+than as a default connector configuration.
+
+## What's next
+
+- [Installation](../getting_started/installation.md) shows the complete dependency setup.
+- [The Engine trait](./engine_trait.md) helps you choose between the default and custom Engines.
+- [Implementing the Engine trait](../connector/implementing_engine.md) covers custom integration.

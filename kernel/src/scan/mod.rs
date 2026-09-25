@@ -266,6 +266,10 @@ impl PartitionValuesOptions {
 }
 
 /// Builder to scan a snapshot of a table.
+///
+/// See the [scan guide] for the projection, predicate, and execution workflow.
+///
+/// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     logical_read_schema: Option<SchemaRef>,
@@ -731,6 +735,10 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+///
+/// See the [scan guide] for choosing between the execution APIs.
+///
+/// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,

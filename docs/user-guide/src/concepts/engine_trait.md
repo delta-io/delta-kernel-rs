@@ -1,136 +1,77 @@
 # The Engine trait
 
-The `Engine` trait is the integration point between Delta Kernel and your connector. Kernel
-implements the Delta protocol and gives you scan and write APIs, but it needs help with the
-mechanics: listing files, reading and writing JSON and Parquet, and evaluating expressions for
-data skipping and logical-to-physical transformations. Kernel never does any of this directly.
-Instead, it calls into the `Engine` trait, which your connector implements.
+The `Engine` trait separates Kernel's protocol logic from connector-provided I/O and computation.
+This boundary lets you use Kernel with different storage systems, columnar formats, and runtimes.
+The [`Engine` rustdoc] owns the exact trait and handler contracts.
 
-This matters because it lets Kernel stay format-agnostic and runtime-agnostic. You control
-how I/O happens, what columnar format you use, and how expressions are evaluated.
+[`Engine` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.Engine.html
 
-A [DefaultEngine](#the-default-engine) is provided that you can use out of the box. If you
-need better performance or want to use your own data formats, you can build a custom engine.
-See [Building a Connector](../connector/overview.md) for details.
+## Where the Engine fits
 
-## The trait
+Kernel decides what a connector must do, such as listing a transaction log or evaluating a data
+skipping predicate. Your Engine decides how to do it with the systems your connector already uses.
 
-```rust,ignore
-trait Engine: AsAny {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
-    fn storage_handler(&self) -> Arc<dyn StorageHandler>;
-    fn json_handler(&self) -> Arc<dyn JsonHandler>;
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-}
+```text
+Connector workflow
+       |
+       v
+Kernel protocol and transaction logic
+       |
+       v
+Engine capabilities
+       |
+       v
+Storage, columnar data, and expression runtime
 ```
 
-Kernel calls these methods whenever it needs to interact with the outside world. Each returns
-a handler trait object that Kernel uses for a specific category of work. The four handlers
-cover storage, JSON, Parquet, and expression evaluation. For observability, see
-[Observability](../observability/observability.md).
+Kernel's public APIs stay synchronous and runtime-independent. An Engine can use asynchronous I/O
+internally, as the default engine does, without requiring every Kernel caller to adopt that runtime.
 
-## The four handlers
+## Capability boundaries
 
-### StorageHandler
+An Engine supplies four kinds of capability:
 
-File system operations. Kernel calls this to list and read files from the Delta log, and to
-write commit and checkpoint files.
+| Handler | Responsibility | API contract |
+|---------|----------------|--------------|
+| `StorageHandler` | List objects and read or write raw bytes | [`StorageHandler` rustdoc] |
+| `JsonHandler` | Translate Delta JSON files and strings to and from `EngineData` | [`JsonHandler` rustdoc] |
+| `ParquetHandler` | Read and write data files and checkpoints | [`ParquetHandler` rustdoc] |
+| `EvaluationHandler` | Evaluate Kernel expressions and predicates | [`EvaluationHandler` rustdoc] |
 
-| Method | Purpose |
-|--------|---------|
-| `list_from(path)` | List files lexicographically after `path` in the same directory |
-| `read_files(files)` | Read byte ranges from one or more files |
-| `copy_atomic(src, dst)` | Atomically copy a file (used for publishing commits) |
-| `put(path, data, overwrite)` | Write raw bytes to a path (fails if `overwrite` is false and file exists) |
-| `head(path)` | Get file metadata (size, modification time) without reading content |
+[`StorageHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.StorageHandler.html
+[`JsonHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.JsonHandler.html
+[`ParquetHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.ParquetHandler.html
+[`EvaluationHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.EvaluationHandler.html
 
-Storage listing and byte reads also have cancellation-aware variants described below.
+The split lets you replace one capability without coupling Kernel to the rest of your connector.
+For example, a connector can keep the default storage and JSON handlers while providing a Parquet
+reader that produces its native columnar format.
 
-### JsonHandler
+Handlers exchange columnar values through `EngineData`. Kernel treats those values as opaque and
+uses visitors when it needs typed values. [The EngineData trait](../connector/engine_data.md)
+explains how that abstraction works.
 
-Reads and writes JSON. Kernel uses this for Delta log commits (the `_delta_log/*.json`
-files) and the JSON checkpoint manifest that references parquet sidecars. The sidecar
-files themselves are parquet and are read by the `ParquetHandler` below.
+## Cancellation
 
-| Method | Purpose |
-|--------|---------|
-| `parse_json(strings, schema)` | Parse JSON strings into columnar `EngineData` |
-| `read_json_files(files, schema, predicate)` | Read JSON files and return `EngineData` (predicate is an optional hint) |
-| `read_json_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires. Optional to override — see [Cancellation](#cancellation) |
-| `write_json_file(path, data, overwrite)` | Atomically write a stream of `FilteredEngineData` rows as a newline-delimited JSON file (one JSON object per row, nulls omitted) and return its exact serialized byte size |
+A connector can attach a cancellation token to a scan so long-running reads stop when their caller
+goes away. Kernel carries that token to cancellation-aware storage, JSON, and Parquet operations.
+The default implementations stop before new work but cannot interrupt I/O already started by a
+non-aware handler.
 
-### ParquetHandler
+Override the cancellation-aware operations when one slow request would otherwise dominate
+cancellation latency. Check the token before starting I/O and before an iterator pull that may
+start more I/O. A request that is already in flight may still complete.
 
-Reads and writes Parquet. Kernel uses this for checkpoint files (including parquet
-checkpoint sidecars) and for reading data files during scans.
+See the [Engine operation cancellation contract] for exact behavior and
+[Implementing the Engine trait](../connector/implementing_engine.md#support-cancellation) for the
+implementation workflow.
 
-| Method | Purpose |
-|--------|---------|
-| `read_parquet_files(files, schema, predicate)` | Read Parquet files into `EngineData` |
-| `read_parquet_files_with_cancellation(files, schema, predicate, token)` | As above, but a cooperative engine can abandon the read when `token` fires — see [Cancellation](#cancellation) |
-| `write_parquet_file(url, data)` | Write a stream of `EngineData` batches as a single Parquet file at the given URL |
-| `read_parquet_footer(file)` | Read file footer metadata (schema, field IDs) without reading data |
-| `read_parquet_footer_with_cancellation(file, token)` | As above, but a cooperative engine can abandon the footer read when `token` fires — see [Cancellation](#cancellation) |
-
-The Parquet handler also supports metadata columns (row index, file path) and field-ID-based
-column matching for column mapping.
-
-### Cancellation
-
-Reading the Delta log for a large table can touch many commit and checkpoint files, and a
-connector often wants to abandon that work when the request behind it goes away — a cancelled
-query, a dropped RPC, a closed session. Kernel supports this cooperatively through an optional
-[`CancellationToken`] that a caller attaches to a scan (see
-[Advanced reads with scan_metadata()](../reading/scan_metadata.md#cancelling-a-scan)).
-
-Cancellation-aware handlers respond at two boundaries:
-
-- **Before starting or pulling work.** Cancellation-aware handler methods check the token before
-  starting. Their iterator-producing defaults also check before each pull, preventing new I/O from
-  being triggered after cancellation.
-
-- **In flight.** An Engine can additionally interrupt I/O already in flight. This matters when
-  one request may otherwise block for a noticeable time.
-
-These variants are optional. Their default implementations return early if the token is already
-cancelled and otherwise delegate to their plain versions so that an existing handler keeps working
-unchanged and simply doesn't interrupt mid-read. Cancellation can race with successful completion,
-so a request already in flight may complete normally. Custom cancellation-aware handler
-implementations own this behavior because Kernel does not add another polling layer around their
-iterators.
-
-For how to implement the cancellation-aware variants, see
-[Implementing the Engine Trait](../connector/implementing_engine.md#cancellation-aware-reads).
-The public API defines the full [Engine operation cancellation contract].
-
-[`CancellationToken`]: https://docs.rs/delta_kernel/latest/delta_kernel/cancellation/trait.CancellationToken.html
 [Engine operation cancellation contract]: https://docs.rs/delta_kernel/latest/delta_kernel/cancellation/index.html#engine-operation-contract
 
-### EvaluationHandler
+## The default engine
 
-Expression evaluation. Kernel uses this for data skipping (evaluating predicates against
-file statistics) and for applying per-file transformations (partition value injection, column
-mapping).
-
-| Method | Purpose |
-|--------|---------|
-| `new_expression_evaluator(schema, expr, output_type)` | Create a reusable evaluator for an expression |
-| `new_predicate_evaluator(schema, predicate)` | Create a reusable evaluator for a boolean predicate |
-| `create_many(schema, rows)` | Create a multi-row `EngineData` from scalar values |
-
-The expression and predicate evaluators are reusable objects that you can call repeatedly on
-different batches of `EngineData`.
-
-## The Default Engine
-
-The `DefaultEngine` is a batteries-included implementation that works out of the box:
-
-- Uses **Apache Arrow** as the in-memory data format
-- Uses **`object_store`** for I/O (supports local FS, S3, GCS, Azure)
-- Runs async I/O on a **Tokio** thread pool
-- Supports multiple Arrow versions (see [Feature Flags](./feature_flags.md))
-
-To construct one, create an object store and pass it to the builder:
+`DefaultEngine` combines Arrow, `object_store`, and Tokio into a ready-to-use Engine. Use it when
+your connector doesn't need its own columnar representation or I/O implementation.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -143,165 +84,50 @@ To construct one, create an object store and pass it to the builder:
 let url = url::Url::parse("file:///path/to/table")?;
 let store = store_from_url(&url)?;
 let engine = DefaultEngine::builder(store).build();
+# let _ = engine;
 # Ok(())
 # }
 ```
 
-`DefaultEngine` also provides a convenience method for writing Parquet files:
+The builder lets you replace the task executor and configure observability without changing
+Kernel's APIs. See the [`DefaultEngine` rustdoc] for its current options.
 
-```rust,ignore
-let engine_data = engine
-    .write_parquet(&data, &write_context)
-    .await?;
-```
-
-This is not part of the `Engine` trait itself. It's a helper on `DefaultEngine` that
-orchestrates the lower-level `ParquetHandler` methods with a `BoundWriteContext` (write directory,
-schema, stats columns, partition values).
-
-## Configuring the Default Engine
-
-`DefaultEngine` uses a builder pattern that lets you customize the task executor and plug in a
-metrics reporter. The builder starts from `DefaultEngine::builder(store)` and chains optional
-configuration before calling `build()`:
-
-```rust,ignore
-let engine = DefaultEngine::builder(store)
-    .with_metrics_reporter(reporter)
-    .with_task_executor(executor)
-    .build();
-```
-
-All builder methods are optional. Calling `DefaultEngine::builder(store).build()` gives you a
-fully functional engine with sensible defaults.
-
-### The TaskExecutor trait
-
-`DefaultEngine` uses asynchronous I/O internally, but Kernel's public APIs are synchronous.
-The `TaskExecutor` trait bridges this gap by defining how async work gets scheduled and
-awaited. It has four methods:
-
-| Method | Purpose |
-|--------|---------|
-| `block_on(future)` | Run an async future to completion and return the result. Must not panic when called inside an async context. |
-| `spawn(future)` | Run a future in the background without waiting for its result. |
-| `spawn_blocking(closure)` | Run a blocking closure on a thread where blocking is safe, returning a future of the result. |
-| `enter()` | Enter the executor's runtime context, returning a guard. While the guard is held, `tokio::runtime::Handle::current()` resolves to the executor's runtime. |
-
-You don't need to implement `TaskExecutor` yourself unless you have a non-Tokio async runtime.
-Kernel ships two Tokio-based implementations behind the `tokio` feature flag.
-
-### TokioBackgroundExecutor
-
-`TokioBackgroundExecutor` is the default executor. It spawns a **dedicated background thread**
-running a single-threaded Tokio runtime. All async work is dispatched to that thread over a
-channel.
-
-```rust,ignore
-use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-
-let executor = TokioBackgroundExecutor::new();
-```
-
-This is the right choice when:
-
-- You don't already have a Tokio runtime in your application.
-- You want Kernel's I/O isolated from the rest of your process.
-- You're building a standalone connector or CLI tool.
-
-Because it owns its runtime, `TokioBackgroundExecutor` works even when no external Tokio
-runtime is active. On drop, it shuts down the background thread cleanly.
-
-### TokioMultiThreadExecutor
-
-`TokioMultiThreadExecutor` runs async work on a multi-threaded Tokio runtime. It comes in two
-flavors.
-
-**Share an existing runtime.** If your application already has a Tokio runtime (for example,
-a web server or a query engine), pass its handle so Kernel's I/O shares the same thread pool:
-
-```rust,ignore
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
-
-let handle = tokio::runtime::Handle::current();
-let executor = TokioMultiThreadExecutor::new(handle);
-```
-
-The handle must come from a multi-threaded runtime. Passing a current-thread handle causes a
-panic.
-
-**Own a dedicated runtime.** If you want a multi-threaded runtime that Kernel manages, use
-`new_owned_runtime`. You can optionally set the number of worker threads and the maximum number
-of blocking threads. Pass `None` for either to use Tokio's defaults:
-
-```rust,ignore
-let executor = TokioMultiThreadExecutor::new_owned_runtime(
-    Some(4),   // 4 worker threads
-    Some(64),  // up to 64 blocking threads
-)?;
-```
-
-> [!WARNING]
-> Deeply nested `block_on` calls can exhaust Tokio's blocking thread pool and deadlock. If you
-> set a small `max_blocking_threads`, keep nesting depth low.
+[`DefaultEngine` rustdoc]: https://docs.rs/delta_kernel_default_engine/latest/delta_kernel_default_engine/struct.DefaultEngine.html
 
 ### Choosing an executor
 
-| Scenario | Executor |
-|----------|----------|
-| No existing Tokio runtime | `TokioBackgroundExecutor` (the default) |
-| You have an existing multi-threaded Tokio runtime you want to share | `TokioMultiThreadExecutor::new(handle)` |
-| You want a dedicated multi-threaded pool with custom sizing | `TokioMultiThreadExecutor::new_owned_runtime(workers, blocking)` |
-| You need to isolate Kernel I/O from other async work | `TokioBackgroundExecutor` |
+The default background executor owns a single-threaded Tokio runtime on a dedicated thread. It is a
+good fit when your process has no runtime to share or when you want to isolate Kernel I/O.
 
-To use a custom executor, pass it to the builder with `with_task_executor`:
+Use the multi-thread executor when your connector already owns a multi-threaded Tokio runtime or
+needs a dedicated pool with explicit sizing. Do not give it a current-thread runtime handle.
 
-```rust,ignore
-let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
-let engine = DefaultEngine::builder(store)
-    .with_task_executor(executor)
-    .build();
-```
+| Connector environment | Executor choice |
+|-----------------------|-----------------|
+| No existing Tokio runtime | Background executor, which is the default |
+| Existing multi-threaded Tokio runtime | Multi-thread executor with that runtime's handle |
+| Dedicated pool with connector-defined limits | Owned multi-thread executor |
 
-### Entering the runtime context
-
-Some libraries (for example, `object_store` or `reqwest`) require an active Tokio runtime
-context to construct clients or resolve configuration. If you call such code outside of an
-async function, `tokio::runtime::Handle::current()` will panic because no runtime is active.
-
-`DefaultEngine::enter()` solves this by entering the executor's runtime context:
-
-```rust,ignore
-let guard = engine.enter();
-// Code here can call Handle::current() safely.
-// The guard must be dropped before acquiring another.
-drop(guard);
-```
-
-The returned guard keeps the runtime context active until it is dropped. If you acquire
-multiple guards, you must drop them in reverse order. Dropping out of order causes a panic.
+If a client library requires an active Tokio context during construction, enter the default
+engine's runtime context while constructing that client. Drop the returned guard before entering
+another context.
 
 ## When to implement your own Engine
 
-You should implement `Engine` if:
+Implement an Engine when your connector needs at least one of these boundaries to behave
+differently:
 
-- You have your own columnar data format (not Arrow)
-- You need custom I/O (e.g. your own distributed file system client)
-- You want to use your own expression evaluation engine
-- You need to control parallelism or resource usage beyond what `DefaultEngine` offers
+- data must stay in a non-Arrow columnar representation;
+- storage access must use an existing distributed or authenticated client;
+- expression evaluation should reuse the compute engine's optimizer and kernels; or
+- I/O scheduling and resource ownership must integrate with the connector's runtime.
 
-You do **not** need a custom engine to use different storage (S3, Azure, etc.). The
-`DefaultEngine` supports all `object_store` backends. See
-[Configuring Storage](../storage/configuring_storage.md).
-
-For a guide on implementing `Engine`, see
-[Implementing the Engine Trait](../connector/implementing_engine.md).
+Changing only the object-store backend does not require a custom Engine. Configure the default
+engine for local storage, S3, GCS, or Azure instead.
 
 ## What's next
 
-- [Building a Connector](../connector/overview.md) explains the role of a connector and how
-  the `Engine` fits into the bigger picture.
-- [Implementing the Engine Trait](../connector/implementing_engine.md) walks through building
-  a custom `Engine` from scratch.
-- [Configuring Storage](../storage/configuring_storage.md) shows how to point `DefaultEngine`
-  at S3, GCS, or Azure storage.
+- [Implementing the Engine trait](../connector/implementing_engine.md) walks through a custom
+  implementation.
+- [The EngineData trait](../connector/engine_data.md) explains the opaque data boundary.
+- [Configuring storage](../storage/configuring_storage.md) configures the default engine's storage.
