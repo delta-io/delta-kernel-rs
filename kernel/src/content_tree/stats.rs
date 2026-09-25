@@ -597,9 +597,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::scan::data_skipping::stats_schema::{
-        expected_stats_schema, StatsConfig, VariantMinMaxStats,
-    };
+    use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
     use crate::schema::{ArrayType, MapType};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1561,7 +1559,7 @@ mod tests {
         let config = StatsConfig {
             data_skipping_stats_columns: None,
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
-            variant_min_max: VariantMinMaxStats::Omit,
+            variant_min_max: false,
         };
         let delta = expected_stats_schema(&table, &config, None, None).expect("stats schema");
 

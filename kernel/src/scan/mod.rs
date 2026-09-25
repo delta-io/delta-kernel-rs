@@ -256,9 +256,8 @@ impl StatsOptions {
     /// `stats_parsed`, the engine's [`ParseJson`] must decode it. A compatible checkpoint's
     /// `stats_parsed` stores the statistic as its physical struct, which kernel reads directly.
     ///
-    /// With the default engine, a `ParseJson` failure on any file's statistic logs
-    /// `Using null stats.` and nulls the stats of every file in that batch, so kernel cannot prune
-    /// those files either.
+    /// With the default engine, a [`ParseJson`] failure on any file's statistic nulls the stats of
+    /// every file in that batch, so kernel cannot prune those files either.
     ///
     /// [`ParseJson`]: crate::expressions::ParseJsonExpression
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -816,8 +815,7 @@ fn build_physical_stats_output_schema(
                 .with_required_physical_columns(Some(requested))
                 .with_requested_physical_columns(Some(requested))
                 .with_variant_min_max(stats.variant_stats)
-                .build()?
-                .physical;
+                .build()?;
             Ok(stats_schema_with_data_columns(stats_schema))
         }
     }

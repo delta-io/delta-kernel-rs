@@ -1548,8 +1548,7 @@ impl LogSegment {
             };
 
             match (available_field.data_type(), needed_field.data_type()) {
-                // Both are structs, or a needed variant against the physical struct a checkpoint
-                // stores it as: recurse
+                // Struct, or a variant against its physical struct: recurse
                 (DataType::Struct(avail_struct), DataType::Struct(need_struct))
                 | (DataType::Struct(avail_struct), DataType::Variant(need_struct)) => {
                     let nested_context = format!("{}.{}", context, needed_field.name());

@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 
 use crate::column_trie::ColumnTrie;
-use crate::scan::data_skipping::stats_schema::VariantMinMaxStats;
 use crate::schema::{ColumnName, DataType, Schema, StructField};
 use crate::table_properties::DataSkippingNumIndexedCols;
 
@@ -19,10 +18,10 @@ pub(crate) struct StatsConfig<'a> {
     /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is
     /// set. See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
     pub(crate) data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
-    /// Whether a VARIANT column's min/max statistic is admitted. Orthogonal to the filtering
-    /// above: a VARIANT leaf counts against the column limit and appears in `nullCount` either
-    /// way.
-    pub(crate) variant_min_max: VariantMinMaxStats,
+    /// Whether a VARIANT column's min/max statistic is admitted, typed as the variant's physical
+    /// struct. Orthogonal to the filtering above: a VARIANT leaf counts against the column limit
+    /// and appears in `nullCount` either way.
+    pub(crate) variant_min_max: bool,
 }
 
 /// Handles column filtering logic for statistics based on table properties.
@@ -317,7 +316,7 @@ mod tests {
         let config = StatsConfig {
             data_skipping_stats_columns: props.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
-            variant_min_max: VariantMinMaxStats::Omit,
+            variant_min_max: false,
         };
         let mut filter = StatsColumnFilter::new(&config, required_cols, None);
         let mut columns = Vec::new();

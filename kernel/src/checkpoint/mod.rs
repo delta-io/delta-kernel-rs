@@ -740,8 +740,7 @@ impl CheckpointWriter {
         let stats_schema = tc
             .stats_schema_builder()
             .with_required_physical_columns(physical_clustering_columns.as_deref())
-            .build()?
-            .physical;
+            .build()?;
 
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
         let partition_schema = tc.build_partition_values_parsed_schema();

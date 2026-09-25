@@ -1101,12 +1101,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schemas = self
-            .effective_table_config
+        self.effective_table_config
             .stats_schema_builder()
             .with_required_physical_columns(self.physical_clustering_columns.as_deref())
-            .build()?;
-        Ok(stats_schemas.physical)
+            .build()
     }
 
     /// Returns the list of column names that should have statistics collected.

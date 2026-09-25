@@ -14,16 +14,6 @@ use crate::schema::{
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
 
-/// Whether a VARIANT column's min/max statistic belongs in the stats schema.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum VariantMinMaxStats {
-    /// Leave the VARIANT leaf out of `minValues`/`maxValues`.
-    Omit,
-
-    /// Keep the VARIANT leaf, typed as the variant's physical struct.
-    Include,
-}
-
 /// Generates the expected schema for file statistics.
 ///
 /// The base stats schema is dependent on the current table configuration and derived via:
@@ -39,7 +29,7 @@ pub(crate) enum VariantMinMaxStats {
 ///
 /// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful for
 /// these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping). A
-/// Variant is the one exception: a caller can opt in via [`VariantMinMaxStats::Include`] to admit
+/// Variant is the one exception: a caller can opt in via [`StatsConfig::variant_min_max`] to admit
 /// its min/max statistic. All of them count as leaf columns against the indexed column limit. The
 /// `nullCount` schema also includes primitive types that aren't eligible for min/max
 /// (e.g., Boolean, Binary) since null counts are still meaningful for those types.
@@ -358,7 +348,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
 //
 // should only be applied to schema processed via `BaseStatsTransform`.
 struct MinMaxStatsTransform {
-    variant_min_max: VariantMinMaxStats,
+    variant_min_max: bool,
 }
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
@@ -373,16 +363,10 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
         None
     }
 
-    /// A VARIANT column's min/max statistic is one VARIANT value per file. An opted-in caller keeps
-    /// the leaf at the variant type; everyone else drops it like an Array or Map.
-    ///
     /// Not recursed into: the `metadata` and `value` binaries are the statistic's own encoding, not
     /// columns that carry statistics of their own.
     fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        match self.variant_min_max {
-            VariantMinMaxStats::Omit => None,
-            VariantMinMaxStats::Include => Some(Cow::Borrowed(stype)),
-        }
+        self.variant_min_max.then_some(Cow::Borrowed(stype))
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
@@ -446,7 +430,7 @@ mod tests {
         StatsConfig {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-            variant_min_max: VariantMinMaxStats::Omit,
+            variant_min_max: false,
         }
     }
 
@@ -901,11 +885,11 @@ mod tests {
         };
 
         assert_eq!(
-            stats_schema(VariantMinMaxStats::Omit),
+            stats_schema(false),
             expected_stats(expected_null_count.clone(), schema! { nullable "id": LONG },),
         );
         assert_eq!(
-            stats_schema(VariantMinMaxStats::Include),
+            stats_schema(true),
             expected_stats(
                 expected_null_count,
                 schema! {

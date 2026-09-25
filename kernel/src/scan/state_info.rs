@@ -185,8 +185,7 @@ fn build_data_skipping_schemas(
             .with_required_physical_columns(required)
             .with_requested_physical_columns(requested)
             .with_variant_min_max(stats.variant_stats)
-            .build()?
-            .physical;
+            .build()?;
         Ok(stats_schema
             .field(NULL_COUNT)
             .is_some()

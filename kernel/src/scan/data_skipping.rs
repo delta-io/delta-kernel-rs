@@ -264,8 +264,7 @@ impl DataSkippingFilter {
             .stats_schema_builder()
             .with_requested_physical_columns(Some(&predicate_refs))
             .build()
-            .ok()?
-            .physical;
+            .ok()?;
         let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
 
         // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
