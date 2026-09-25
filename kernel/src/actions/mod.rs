@@ -1356,7 +1356,10 @@ pub(crate) struct CheckpointAction {
 /// is a single-key tagged object (e.g. `{"contentRoot": {...}}`), so exactly one field is set;
 /// serializing skips the `None` fields. On deserialize, unknown keys are ignored (no
 /// `deny_unknown_fields`), matching [`visitors::CheckpointElementVisitor`]'s forward-compatible
-/// skip of element kinds a newer writer added.
+/// skip of element kinds a newer writer added. This is the serde-JSON twin of the
+/// `Scalar`/EngineData builder [`checkpoint_action_union_element`]: parallel by necessity (each
+/// targets a different transport), with the shared required-field/validation policy in
+/// [`CheckpointAction::from_parts`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1458,15 +1461,6 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
     /// `txn` and `domainMetadata` are collected inline; `sidecar` elements are routed by their
     /// `type`.
     fn try_from(elements: Vec<CheckpointUnionElement>) -> DeltaResult<Self> {
-        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
-            require!(
-                slot.is_none(),
-                Error::generic(format!("duplicate checkpoint `{name}` element"))
-            );
-            *slot = Some(value);
-            Ok(())
-        }
-
         let mut version = None;
         let mut content_root = None;
         let mut protocol = None;
@@ -1496,15 +1490,12 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
                 domain_metadata.push(dm);
             }
             if let Some(ts) = element.sidecar {
-                match ts.sidecar_type.as_str() {
-                    SET_TRANSACTION_NAME => txn_sidecars.push(ts.sidecar),
-                    DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(ts.sidecar),
-                    other => {
-                        return Err(Error::generic(format!(
-                            "unrecognized checkpoint sidecar type {other:?}"
-                        )))
-                    }
-                }
+                route_content_sidecar(
+                    &ts.sidecar_type,
+                    ts.sidecar,
+                    &mut txn_sidecars,
+                    &mut domain_metadata_sidecars,
+                )?;
             }
         }
 
@@ -1519,6 +1510,40 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
             domain_metadata_sidecars,
         )
     }
+}
+
+/// Store `value` in `slot`, erroring if it was already occupied. Checkpoint singleton elements
+/// named by `name` (`checkpointMetadata`/`contentRoot`/`protocol`/`metaData`) may appear at most
+/// once, so a second occurrence is malformed rather than an override. Shared by both decoders --
+/// the [`visitors`] `RowVisitor` and the serde `TryFrom` path.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
+    require!(
+        slot.replace(value).is_none(),
+        Error::generic(format!("duplicate `{name}` element in checkpoint action"))
+    );
+    Ok(())
+}
+
+/// Route a `sidecar` element to its list by the `type` discriminator, erroring on any other type.
+/// Shared by both decoders so the routing and error message live in one place.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn route_content_sidecar(
+    sidecar_type: &str,
+    sidecar: Sidecar,
+    txn_sidecars: &mut Vec<Sidecar>,
+    domain_metadata_sidecars: &mut Vec<Sidecar>,
+) -> DeltaResult<()> {
+    match sidecar_type {
+        SET_TRANSACTION_NAME => txn_sidecars.push(sidecar),
+        DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(sidecar),
+        other => {
+            return Err(Error::generic(format!(
+                "checkpoint sidecar has unsupported type `{other}`"
+            )))
+        }
+    }
+    Ok(())
 }
 
 // === CheckpointAction -> EngineData ===

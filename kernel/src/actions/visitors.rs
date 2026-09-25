@@ -917,15 +917,15 @@ impl RowVisitor for CheckpointElementVisitor {
             if let Some(version) =
                 getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
             {
-                set_once(&mut self.version, version, "checkpointMetadata")?;
+                super::set_once(&mut self.version, version, "checkpointMetadata")?;
             } else if let Some(content_root) =
                 visit_content_root_at(i, &getters[r.content_root.clone()])?
             {
-                set_once(&mut self.content_root, content_root, "contentRoot")?;
+                super::set_once(&mut self.content_root, content_root, "contentRoot")?;
             } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
-                set_once(&mut self.protocol, protocol, "protocol")?;
+                super::set_once(&mut self.protocol, protocol, "protocol")?;
             } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
-                set_once(&mut self.metadata, metadata, "metaData")?;
+                super::set_once(&mut self.metadata, metadata, "metaData")?;
             } else if let Some(domain) =
                 getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
             {
@@ -944,31 +944,16 @@ impl RowVisitor for CheckpointElementVisitor {
             } else if let Some(path) = getters[r.sidecar.start].get_opt(i, "sidecar.path")? {
                 let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
                 let sidecar_type: String = getters[r.sidecar_type].get(i, "sidecar.type")?;
-                match sidecar_type.as_str() {
-                    SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
-                    DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
-                    other => {
-                        return Err(Error::generic(format!(
-                            "checkpoint sidecar has unsupported type `{other}`"
-                        )))
-                    }
-                }
+                super::route_content_sidecar(
+                    &sidecar_type,
+                    sidecar,
+                    &mut self.txn_sidecars,
+                    &mut self.domain_metadata_sidecars,
+                )?;
             }
         }
         Ok(())
     }
-}
-
-/// Store `value` in `slot`, erroring if it was already occupied. Checkpoint elements named by
-/// `name` are singletons, so a second occurrence is malformed rather than an override.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
-    if slot.replace(value).is_some() {
-        return Err(Error::generic(format!(
-            "duplicate `{name}` element in checkpoint action"
-        )));
-    }
-    Ok(())
 }
 
 /// Get a [`ContentRoot`] out of engine data. Returns `Ok(None)` when the (required) `path` leaf is
