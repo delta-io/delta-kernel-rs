@@ -21,8 +21,8 @@ Your `Cargo.toml` should look like:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.23", features = ["internal-api"] }
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
+delta_kernel = { version = "0.28.0", features = ["internal-api"] }
+delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
 
 > [!NOTE]
