@@ -18,7 +18,8 @@ fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
     let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
-    let literal_exprs = vec![
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+    let mut literal_exprs = vec![
         ("timestamp", Arc::new(lit(commit_info.timestamp))),
         (
             "inCommitTimestamp",
@@ -42,6 +43,11 @@ fn commit_info_literal_exprs(
             string_map_literal_expr(commit_info.tags, &string_map_type)?,
         ),
     ];
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    literal_exprs.push((
+        "lastManifestCommit",
+        Arc::new(lit(commit_info.last_manifest_commit)),
+    ));
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
         return Err(Error::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
@@ -569,5 +575,47 @@ mod tests {
             assert_eq!(ci.fields()[i].name(), field.name());
         }
         Ok(())
+    }
+
+    /// A `None` `last_manifest_commit` emits a present-but-null `lastManifestCommit` struct column;
+    /// a `Some` emits the struct values.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::absent(None)]
+    #[case::present(Some((5, 3)))]
+    fn test_build_commit_info_last_manifest_commit(
+        #[case] last_manifest_commit: Option<(i64, i64)>,
+    ) {
+        use crate::actions::LastManifestCommit;
+
+        let (engine, txn) = make_txn(None).unwrap();
+        let mut commit_info = make_kernel_commit_info();
+        commit_info.last_manifest_commit =
+            last_manifest_commit.map(|(version, content_root_version)| {
+                LastManifestCommit::new(version, content_root_version).unwrap()
+            });
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), commit_info)
+                .unwrap(),
+        )
+        .unwrap();
+        let ci = commit_info_struct(&result);
+        let column = ci
+            .column_by_name("lastManifestCommit")
+            .expect("lastManifestCommit column should be present");
+
+        match last_manifest_commit {
+            None => assert!(column.is_null(0)),
+            Some((version, content_root_version)) => {
+                let lmc = column
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("lastManifestCommit should be a StructArray");
+                assert!(lmc.is_valid(0));
+                assert_eq!(get_i64(lmc, "version"), version);
+                assert_eq!(get_i64(lmc, "contentRootVersion"), content_root_version);
+            }
+        }
     }
 }

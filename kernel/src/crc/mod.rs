@@ -41,6 +41,8 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::{DeltaResult, Error, Version};
@@ -107,6 +109,10 @@ pub struct Crc {
     pub(crate) num_deletion_vectors_opt: Option<i64>,
     /// Distribution of deleted record counts across files.
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+    /// The latest manifest commit up to this version (adaptiveMetadata). Absent until the table's
+    /// first manifest commit.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit_opt: Option<LastManifestCommit>,
 }
 
 impl Crc {
@@ -130,6 +136,9 @@ impl Crc {
         num_deleted_records_opt: Option<i64>,
         num_deletion_vectors_opt: Option<i64>,
         deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+        #[cfg(feature = "adaptive-metadata-in-dev")] last_manifest_commit_opt: Option<
+            LastManifestCommit,
+        >,
     ) -> DeltaResult<Self> {
         let crc = Self {
             version,
@@ -144,6 +153,8 @@ impl Crc {
             num_deleted_records_opt,
             num_deletion_vectors_opt,
             deleted_record_counts_histogram_opt,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit_opt,
         };
         crc.validate()?;
         Ok(crc)
@@ -219,6 +230,9 @@ struct CrcRaw {
     num_deletion_vectors_opt: Option<i64>,
     #[serde(default, skip_serializing)]
     deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogramRaw>,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_manifest_commit: Option<LastManifestCommit>,
     /// The Delta protocol spec names this field `fileSizeHistogram`, but Delta-Spark writers
     /// historically emit it as `histogramOpt`. To remain compatible with CRC files written by
     /// those tools, deserialization accepts either name, but not both. If both are present
@@ -296,6 +310,8 @@ impl Crc {
             raw.deleted_record_counts_histogram_opt
                 .map(TryInto::try_into)
                 .transpose()?,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            raw.last_manifest_commit,
         )
     }
 }
@@ -335,6 +351,8 @@ impl TryFrom<&Crc> for CrcRaw {
             num_deletion_vectors_opt: None,
             deleted_record_counts_histogram_opt: None,
             file_size_histogram: stats.file_size_histogram.clone(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: crc.last_manifest_commit_opt.clone(),
         })
     }
 }
@@ -505,6 +523,11 @@ impl Crc {
                 ));
             }
         }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(last_manifest_commit) = &self.last_manifest_commit_opt {
+            last_manifest_commit.validate()?;
+        }
         Ok(())
     }
 }
@@ -667,6 +690,8 @@ mod tests {
         Crc, CrcRaw, DeletedRecordCountsHistogram, DomainMetadataState, FileStats, FileStatsState,
         SetTransactionState, ENABLE_IN_COMMIT_TIMESTAMPS,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::LastManifestCommit;
     use crate::actions::{Add, DomainMetadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
 
@@ -1010,6 +1035,55 @@ mod tests {
         assert_eq!(crc, deserialized);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn round_trip_last_manifest_commit() {
+        let crc = Crc {
+            protocol: valid_protocol(),
+            file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+            last_manifest_commit_opt: Some(LastManifestCommit::new(5, 3).unwrap()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&crc).unwrap();
+        assert_eq!(json["lastManifestCommit"]["version"], 5);
+        assert_eq!(json["lastManifestCommit"]["contentRootVersion"], 3);
+
+        let deserialized = Crc::try_from_json_bytes(json.to_string().as_bytes(), 0).unwrap();
+        assert_eq!(crc, deserialized);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn de_missing_last_manifest_commit_is_none() {
+        let crc = Crc::try_from_json_bytes(crc_json_with_counts(0, 0, 1, 1).as_bytes(), 0).unwrap();
+        assert_eq!(crc.last_manifest_commit_opt, None);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn de_last_manifest_commit_content_root_newer_than_version_is_rejected() {
+        // LastManifestCommit derives Deserialize, so an invalid pair bypasses `new`'s check.
+        // Crc::validate must catch it on the deserialization path.
+        let crc = Crc {
+            protocol: valid_protocol(),
+            file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&crc).unwrap();
+        json["lastManifestCommit"] = serde_json::json!({
+            "version": 3,
+            "contentRootVersion": 5,
+        });
+
+        let err = Crc::try_from_json_bytes(json.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contentRootVersion 5 exceeds version 3"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ===== numMetadata / numProtocol rejection =====
 
     /// Minimal CRC JSON with the supplied numMetadata / numProtocol values; used to construct
@@ -1301,6 +1375,8 @@ mod tests {
             Some(all_files),
             None,
             None,
+            None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
             None,
         )
         .unwrap_err();

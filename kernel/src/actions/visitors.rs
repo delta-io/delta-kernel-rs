@@ -883,7 +883,7 @@ struct CheckpointElementVisitor {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointElementVisitor {
     /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
-    /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
+    /// was absent or if `CheckpointAction::validate` rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
         let missing = |field: &str| {
             Error::generic(format!(

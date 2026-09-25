@@ -782,6 +782,8 @@ impl FfiCrc {
             Option::<&i64>::from(&self.num_deleted_records).copied(),
             Option::<&i64>::from(&self.num_deletion_vectors).copied(),
             deleted_record_counts_histogram,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            None,
         )
     }
 }

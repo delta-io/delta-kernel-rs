@@ -908,6 +908,11 @@ pub(crate) struct CommitInfo {
     pub(crate) txn_id: Option<String>,
     /// Map of tags associated with this commit.
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
+    /// Identifies the latest manifest commit up to this version. Absent until the table's first
+    /// manifest commit (adaptiveMetadata).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
 }
 
 impl CommitInfo {
@@ -929,6 +934,8 @@ impl CommitInfo {
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
             tags: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: None,
         }
     }
 
@@ -1303,6 +1310,58 @@ pub(crate) struct ContentRoot {
     /// version). Distinct from [`CheckpointAction::version`], which is
     /// `checkpointMetadata.version`.
     version: i64,
+}
+
+/// Identifies the latest manifest commit up to a given table version.
+///
+/// Recorded on the `commitInfo` action and in the version checksum (`.crc`) file so readers can
+/// locate the most recent `checkpoint` action without scanning the log. See the
+/// [adaptiveMetadata RFC].
+///
+/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct LastManifestCommit {
+    /// Version of the manifest commit that emitted the latest [`CheckpointAction`].
+    pub(crate) version: i64,
+    /// The [`ContentRoot::version`] of that checkpoint action. Never newer than [`Self::version`].
+    pub(crate) content_root_version: i64,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl LastManifestCommit {
+    /// Builds a reference to the manifest commit at `version` whose checkpoint action's content
+    /// root reflects `content_root_version`.
+    ///
+    /// Enforces the adaptiveMetadata invariant that the referenced content root version never
+    /// exceeds the manifest commit version, so an invalid pair can never be constructed. Mirrors
+    /// the validation on `CheckpointAction`.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn new(version: i64, content_root_version: i64) -> DeltaResult<Self> {
+        let last_manifest_commit = LastManifestCommit {
+            version,
+            content_root_version,
+        };
+        last_manifest_commit.validate()?;
+        Ok(last_manifest_commit)
+    }
+
+    /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
+    /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
+    /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.
+    pub(crate) fn validate(&self) -> DeltaResult<()> {
+        require!(
+            self.content_root_version <= self.version,
+            Error::generic(format!(
+                "lastManifestCommit contentRootVersion {} exceeds version {}",
+                self.content_root_version, self.version
+            ))
+        );
+        Ok(())
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
@@ -1802,6 +1861,30 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_last_manifest_commit_schema() {
+        let expected = schema! {
+            not_null "version": LONG,
+            not_null "contentRootVersion": LONG,
+        };
+        assert_eq!(LastManifestCommit::to_schema(), expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::equal(5, 5, true)]
+    #[case::content_root_older(5, 3, true)]
+    #[case::content_root_newer(3, 5, false)]
+    fn test_last_manifest_commit_new_validates(
+        #[case] version: i64,
+        #[case] content_root_version: i64,
+        #[case] ok: bool,
+    ) {
+        let result = LastManifestCommit::new(version, content_root_version);
+        assert_eq!(result.is_ok(), ok);
+    }
+
     #[test]
     fn test_metadata_schema() {
         let schema = get_commit_schema()
@@ -2098,6 +2181,26 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = schema_ref! {
+            nullable "commitInfo": {
+                nullable "timestamp": LONG,
+                nullable "inCommitTimestamp": LONG,
+                nullable "operation": STRING,
+                nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
+                nullable "kernelVersion": STRING,
+                nullable "isBlindAppend": BOOLEAN,
+                nullable "engineInfo": STRING,
+                nullable "txnId": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                nullable "lastManifestCommit": {
+                    not_null "version": LONG,
+                    not_null "contentRootVersion": LONG,
+                },
+            },
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let expected = schema_ref! {
             nullable "commitInfo": {
                 nullable "timestamp": LONG,
