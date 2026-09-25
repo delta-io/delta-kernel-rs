@@ -31,6 +31,8 @@ pub(crate) struct ScanMetrics {
     peak_hash_set_size: AtomicUsize,
     /// Time spent in the deduplication visitor (ns).
     dedup_visitor_time_ns: AtomicU64,
+    /// Time spent transforming log actions into scan metadata (ns).
+    action_transform_time_ns: AtomicU64,
     /// Time spent evaluating predicates (ns). This includes data skipping and partition pruning.
     predicate_eval_time_ns: AtomicU64,
 }
@@ -47,6 +49,7 @@ impl Default for ScanMetrics {
             num_predicate_filtered: AtomicU64::new(0),
             peak_hash_set_size: AtomicUsize::new(0),
             dedup_visitor_time_ns: AtomicU64::new(0),
+            action_transform_time_ns: AtomicU64::new(0),
             predicate_eval_time_ns: AtomicU64::new(0),
         }
     }
@@ -91,6 +94,11 @@ impl ScanMetrics {
             .fetch_add(duration_ns, Ordering::Relaxed);
     }
 
+    pub(crate) fn add_action_transform_time_ns(&self, duration_ns: u64) {
+        self.action_transform_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
     pub(crate) fn add_predicate_eval_time_ns(&self, duration_ns: u64) {
         self.predicate_eval_time_ns
             .fetch_add(duration_ns, Ordering::Relaxed);
@@ -112,6 +120,7 @@ impl ScanMetrics {
         self.num_non_file_actions.store(0, Ordering::Relaxed);
         self.num_predicate_filtered.store(0, Ordering::Relaxed);
         self.dedup_visitor_time_ns.store(0, Ordering::Relaxed);
+        self.action_transform_time_ns.store(0, Ordering::Relaxed);
         self.predicate_eval_time_ns.store(0, Ordering::Relaxed);
     }
 
@@ -148,6 +157,9 @@ impl ScanMetrics {
             dedup_visitor_time: Duration::from_nanos(
                 self.dedup_visitor_time_ns.load(Ordering::Relaxed),
             ),
+            action_transform_time: Duration::from_nanos(
+                self.action_transform_time_ns.load(Ordering::Relaxed),
+            ),
             predicate_eval_time: Duration::from_nanos(
                 self.predicate_eval_time_ns.load(Ordering::Relaxed),
             ),
@@ -169,6 +181,7 @@ impl ScanMetrics {
         let predicate_filtered = self.num_predicate_filtered.load(Ordering::Relaxed);
         let peak_hash_set_size = self.peak_hash_set_size.load(Ordering::Relaxed);
         let dedup_visitor_time_ns = self.dedup_visitor_time_ns.load(Ordering::Relaxed);
+        let action_transform_time_ns = self.action_transform_time_ns.load(Ordering::Relaxed);
         let predicate_eval_time_ns = self.predicate_eval_time_ns.load(Ordering::Relaxed);
         info!(
             add_files_seen,
@@ -180,9 +193,44 @@ impl ScanMetrics {
             predicate_filtered,
             peak_hash_set_size,
             dedup_visitor_time_ns,
+            action_transform_time_ns,
             predicate_eval_time_ns,
             "{}",
             message.as_ref()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_counters_clears_phase_metrics_and_preserves_peak() {
+        let metrics = ScanMetrics::default();
+        metrics.record_add_file_seen(true);
+        metrics.record_selected_add_file(100);
+        metrics.incr_remove_files_seen_from_delta_files();
+        metrics.incr_non_file_actions();
+        metrics.add_predicate_filtered(1);
+        metrics.update_peak_hash_set_size(10);
+        metrics.add_dedup_visitor_time_ns(20);
+        metrics.add_action_transform_time_ns(30);
+        metrics.add_predicate_eval_time_ns(40);
+
+        metrics.reset_counters();
+
+        let event = metrics.to_event(MetricId::new(), false, None, ScanType::Full, Duration::ZERO);
+        assert_eq!(event.num_add_files_seen, 0);
+        assert_eq!(event.num_add_files_seen_from_delta_files, 0);
+        assert_eq!(event.num_selected_add_files, 0);
+        assert_eq!(event.selected_add_files_bytes, 0);
+        assert_eq!(event.num_remove_files_seen_from_delta_files, 0);
+        assert_eq!(event.num_non_file_actions, 0);
+        assert_eq!(event.num_predicate_filtered, 0);
+        assert_eq!(event.dedup_visitor_time, Duration::ZERO);
+        assert_eq!(event.action_transform_time, Duration::ZERO);
+        assert_eq!(event.predicate_eval_time, Duration::ZERO);
+        assert_eq!(event.peak_hash_set_size, 10);
     }
 }

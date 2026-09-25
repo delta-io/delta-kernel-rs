@@ -1,4 +1,4 @@
-//! REST [`RestObjectStore`] wiring for [`EngineBuilder`](crate::EngineBuilder).
+//! REST [`RestObjectStore`] wiring for [`FfiEngineBuilder`](crate::FfiEngineBuilder).
 //!
 //! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) with a
 //! [`CRestEndpointConfig`] to select the REST backend. The builder `url` must be the REST service
@@ -21,6 +21,7 @@ use delta_kernel_default_engine::rest_store::{
     build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
 };
+use derive_more::Constructor;
 use url::Url;
 
 use crate::error::AllocateErrorFn;
@@ -147,7 +148,8 @@ pub struct CAuthHeaders {
 pub type CAuthHeaderCallback =
     extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders, allocate_error: AllocateErrorFn);
 
-/// State for [`crate::ObjectStoreBackend::Rest`], stored on [`EngineBuilder`](crate::EngineBuilder)
+/// State for [`crate::ObjectStoreBackend::Rest`], stored on
+/// [`FfiEngineBuilder`](crate::FfiEngineBuilder)
 /// after [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 pub(crate) struct RestBuilderState {
     endpoint_config: RestEndpointConfig,
@@ -157,7 +159,7 @@ pub(crate) struct RestBuilderState {
 /// Upcalls a [`CAuthHeaderCallback`] whenever the REST client needs fresh auth headers.
 ///
 /// Registered via [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Constructor)]
 pub(crate) struct FfiAuthHeaderProvider {
     callback: CAuthHeaderCallback,
     context: NullableCvoid,
@@ -169,18 +171,6 @@ unsafe impl Send for FfiAuthHeaderProvider {}
 unsafe impl Sync for FfiAuthHeaderProvider {}
 
 impl FfiAuthHeaderProvider {
-    pub(crate) fn new(
-        callback: CAuthHeaderCallback,
-        context: NullableCvoid,
-        allocate_error: AllocateErrorFn,
-    ) -> Self {
-        Self {
-            callback,
-            context,
-            allocate_error,
-        }
-    }
-
     fn collect(&self) -> DeltaResult<(HeaderMap, Option<Duration>)> {
         let mut headers = MaybeUninit::<CAuthHeaders>::uninit();
         let out = headers.as_mut_ptr();
@@ -379,7 +369,7 @@ mod tests {
     use crate::ffi_test_utils::allocate_err;
     use crate::kernel_string_slice;
 
-    // Miri policy for this module. See ffi/CLAUDE.md "Testing under Miri" for the policy;
+    // Miri policy for this module. See ffi/AGENTS.md "Testing under Miri" for the policy;
     // tests below are grouped by their relationship to `unsafe`, in file order:
     //
     //   1. Pure-logic tests: no `unsafe`. Run under Miri.

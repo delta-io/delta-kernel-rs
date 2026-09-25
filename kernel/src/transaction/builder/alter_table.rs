@@ -24,7 +24,6 @@
 //! snapshot.alter_table().build(engine, committer)?;  // compile error
 //! ```
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -36,6 +35,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::utils::PhantomType;
 use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -71,13 +71,13 @@ pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
     correlation_id: Option<Arc<str>>,
-    // PhantomData marker for builder state (Ready or Modifying).
+    // PhantomType marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
-    _state: PhantomData<S>,
+    _state: PhantomType<S>,
 }
 
 impl<S> AlterTableTransactionBuilder<S> {
-    // Reconstructs the builder with a different PhantomData marker, changing which methods
+    // Reconstructs the builder with a different PhantomType marker, changing which methods
     // are available at compile time (e.g. Ready -> Modifying enables `build()`). All real
     // fields are moved as-is; only the zero-sized type state changes.
     //
@@ -88,7 +88,7 @@ impl<S> AlterTableTransactionBuilder<S> {
             snapshot: self.snapshot,
             operations: self.operations,
             correlation_id: self.correlation_id,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         }
     }
 
@@ -107,7 +107,7 @@ impl AlterTableTransactionBuilder<Ready> {
             snapshot,
             operations: Vec::new(),
             correlation_id: None,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         }
     }
 }
@@ -175,9 +175,10 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
-    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which ALTER TABLE does not
-    ///   yet support
+    /// - The table enables `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults`, which
+    ///   ALTER TABLE does not yet support
     /// - Any individual operation fails validation (see per-method errors above)
+    /// - CDF is enabled and the evolved schema contains a top-level column reserved for CDF
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
     ///   `timestampNtz` column without the `timestampNtz` feature)
@@ -187,12 +188,15 @@ impl AlterTableTransactionBuilder<Modifying> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
-        // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
-        // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
-        if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
-                "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
-            ));
+        // kernel doesn't currently support altering tables with these features
+        let unsupported_iceberg_compat =
+            [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
+                .into_iter()
+                .find(|feature| table_config.is_feature_enabled(feature));
+        if let Some(feature) = unsupported_iceberg_compat {
+            return Err(Error::unsupported(format!(
+                "ALTER TABLE is not yet supported on tables with {feature} enabled"
+            )));
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {

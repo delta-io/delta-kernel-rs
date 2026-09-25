@@ -277,8 +277,8 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     )
     .await?;
 
-    let CommitResult::CommittedTransaction(committed) = result else {
-        panic!("Expected CommittedTransaction");
+    let CommitResult::Committed(committed) = result else {
+        panic!("Expected Committed");
     };
 
     let snapshot = committed

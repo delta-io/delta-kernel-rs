@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use derive_more::From;
 use itertools::Itertools;
 use strum::Display;
 use url::Url;
@@ -27,7 +28,7 @@ use crate::{DeltaResult, Error, FileMeta};
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
 /// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
 /// they inherit an input's schema; each payload's docs name which input.
-#[derive(Debug, Clone, Display)]
+#[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
@@ -47,30 +48,6 @@ pub enum Operator {
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
 }
-
-/// Generate `From<Payload> for Operator` for each listed variant, wrapping the payload in the
-/// same-named [`Operator`] variant. Example: `Filter { .. }.into()` yields `Operator::Filter`).
-macro_rules! impl_from_payload_for_operator {
-    ($($variant:ident),+ $(,)?) => {
-        $(impl From<$variant> for Operator {
-            fn from(payload: $variant) -> Self {
-                Operator::$variant(payload)
-            }
-        })+
-    };
-}
-
-impl_from_payload_for_operator!(
-    ScanParquet,
-    ScanJson,
-    Values,
-    Project,
-    Filter,
-    DynamicScan,
-    Aggregate,
-    SemiJoin,
-    UnionAll,
-);
 
 /// One file to scan plus literal values broadcast to every row read from that file.
 ///

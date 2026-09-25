@@ -42,20 +42,14 @@ fn none_i64() -> OptionalValue<i64> {
 
 fn empty_strings(present: bool) -> OptionalValue<FfiStringArray> {
     if present {
-        OptionalValue::Some(FfiStringArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        })
+        OptionalValue::Some(FfiStringArray::empty())
     } else {
         OptionalValue::None
     }
 }
 
 fn empty_map() -> FfiStringMap {
-    FfiStringMap {
-        ptr: std::ptr::null(),
-        len: 0,
-    }
+    FfiStringMap::empty()
 }
 
 fn none_map() -> OptionalValue<FfiStringMap> {
@@ -95,10 +89,7 @@ fn test_metadata() -> FfiMetadata {
         format_provider: slice("parquet"),
         format_options: empty_map(),
         schema_string: slice(r#"{"type":"struct","fields":[]}"#),
-        partition_columns: FfiStringArray {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
+        partition_columns: FfiStringArray::empty(),
         created_time: none_i64(),
         configuration: empty_map(),
     }
@@ -120,17 +111,11 @@ fn empty_crc() -> FfiCrc {
         in_commit_timestamp: none_i64(),
         set_transaction_state: FfiSetTransactionState {
             kind: FfiSetTransactionStateKind::Partial,
-            transactions: FfiSetTransactionArray {
-                ptr: std::ptr::null(),
-                len: 0,
-            },
+            transactions: FfiSetTransactionArray::empty(),
         },
         domain_metadata_state: FfiDomainMetadataState {
             kind: FfiDomainMetadataStateKind::Partial,
-            domain_metadata: FfiDomainMetadataArray {
-                ptr: std::ptr::null(),
-                len: 0,
-            },
+            domain_metadata: FfiDomainMetadataArray::empty(),
         },
         txn_id: none_string(),
         all_files: OptionalValue::None,
@@ -374,7 +359,7 @@ fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str
 }
 
 #[test]
-fn aggregate_setter_treats_null_log_path_pointer_as_empty() {
+fn aggregate_setter_rejects_null_nonempty_log_path_array() {
     let engine = test_engine();
     let mut builder = test_builder(&engine);
     let hint = FfiSnapshotHint {
@@ -389,7 +374,12 @@ fn aggregate_setter_treats_null_log_path_pointer_as_empty() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
     };
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    assert_extern_result_error_contains(
+        result,
+        KernelError::InvalidSnapshotHint,
+        "supplied log paths are invalid",
+    );
 
     unsafe {
         free_snapshot_builder(builder);
@@ -474,9 +464,29 @@ fn aggregate_setter_rejects_single_bin_histogram() {
 }
 
 #[test]
-fn aggregate_setter_builds_latest_snapshot_without_storage_files() {
+fn aggregate_setter_builds_latest_snapshot_from_rich_crc() {
+    const PARTITIONED_SCHEMA: &str = concat!(
+        r#"{"type":"struct","fields":[{"name":"p","type":"string","nullable":true,"#,
+        r#""metadata":{}}]}"#,
+    );
+
     let engine = test_engine();
     let mut builder = test_builder(&engine);
+    let partition_columns = [slice("p")];
+    let metadata = || FfiMetadata {
+        id: slice("table-id"),
+        name: none_string(),
+        description: none_string(),
+        format_provider: slice("parquet"),
+        format_options: empty_map(),
+        schema_string: slice(PARTITIONED_SCHEMA),
+        partition_columns: FfiStringArray {
+            ptr: partition_columns.as_ptr(),
+            len: partition_columns.len(),
+        },
+        created_time: none_i64(),
+        configuration: empty_map(),
+    };
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
         1,
@@ -493,12 +503,102 @@ fn aggregate_setter_builds_latest_snapshot_without_storage_files() {
         tags: none_map(),
         v2_checkpoint: std::ptr::null(),
     };
-    let crc = empty_crc();
+    let partition_value = FfiStringMapEntry {
+        key: slice("p"),
+        value: slice("one"),
+    };
+    let tag = FfiNullableStringMapEntry {
+        key: slice("optional"),
+        value: OptionalValue::None,
+    };
+    let add = FfiAdd {
+        path: slice("p=one/part-00000.parquet"),
+        partition_values: FfiStringMap {
+            ptr: &partition_value,
+            len: 1,
+        },
+        size: 17,
+        modification_time: 19,
+        data_change: true,
+        stats: OptionalValue::Some(slice(r#"{"numRecords":23}"#)),
+        tags: OptionalValue::Some(FfiNullableStringMap { ptr: &tag, len: 1 }),
+        deletion_vector: std::ptr::null(),
+        base_row_id: OptionalValue::None,
+        default_row_commit_version: OptionalValue::None,
+        clustering_provider: OptionalValue::None,
+    };
+    let transaction = FfiSetTransaction {
+        app_id: slice("app"),
+        version: 7,
+        last_updated: OptionalValue::Some(29),
+    };
+    let domain_metadata = FfiDomainMetadata {
+        domain: slice("example.domain"),
+        configuration: slice("payload"),
+        removed: false,
+    };
+    let boundaries = [0, 18];
+    let counts = [1, 0];
+    let total_bytes = [17, 0];
+    let histogram = FfiFileSizeHistogram {
+        sorted_bin_boundaries: KernelI64Slice {
+            ptr: boundaries.as_ptr(),
+            len: boundaries.len(),
+        },
+        file_counts: KernelI64Slice {
+            ptr: counts.as_ptr(),
+            len: counts.len(),
+        },
+        total_bytes: KernelI64Slice {
+            ptr: total_bytes.as_ptr(),
+            len: total_bytes.len(),
+        },
+    };
+    let deleted_record_counts = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let deleted_record_counts_histogram = FfiDeletedRecordCountsHistogram {
+        deleted_record_counts: KernelI64Slice {
+            ptr: deleted_record_counts.as_ptr(),
+            len: deleted_record_counts.len(),
+        },
+    };
+    let crc = FfiCrc {
+        metadata: metadata(),
+        file_stats_state: FfiFileStatsState {
+            kind: FfiFileStatsStateKind::Complete,
+            file_stats: FfiFileStats {
+                num_files: 1,
+                table_size_bytes: 17,
+            },
+            file_size_histogram: &histogram,
+        },
+        in_commit_timestamp: OptionalValue::Some(31),
+        set_transaction_state: FfiSetTransactionState {
+            kind: FfiSetTransactionStateKind::Complete,
+            transactions: FfiSetTransactionArray {
+                ptr: &transaction,
+                len: 1,
+            },
+        },
+        domain_metadata_state: FfiDomainMetadataState {
+            kind: FfiDomainMetadataStateKind::Complete,
+            domain_metadata: FfiDomainMetadataArray {
+                ptr: &domain_metadata,
+                len: 1,
+            },
+        },
+        txn_id: OptionalValue::Some(slice("txn-id")),
+        all_files: OptionalValue::Some(FfiAddArray { ptr: &add, len: 1 }),
+        num_deleted_records: OptionalValue::Some(0),
+        num_deletion_vectors: OptionalValue::Some(0),
+        deleted_record_counts_histogram: &deleted_record_counts_histogram,
+        ..empty_crc()
+    };
     let mut hint = test_snapshot_hint(
         std::slice::from_ref(&log_path),
         0,
         FfiSnapshotHintFreshness::Latest,
     );
+    hint.metadata = metadata();
     hint.last_checkpoint = &last_checkpoint;
     hint.crc = &crc;
     unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
@@ -512,7 +612,21 @@ fn aggregate_setter_builds_latest_snapshot_without_storage_files() {
             .get_file_stats_if_present()
             .unwrap()
             .num_files(),
-        0
+        1
+    );
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    assert_eq!(
+        snapshot_ref
+            .get_app_id_version("app", kernel_engine.as_ref())
+            .unwrap(),
+        Some(7)
+    );
+    assert_eq!(
+        snapshot_ref
+            .get_domain_metadata("example.domain", kernel_engine.as_ref())
+            .unwrap()
+            .as_deref(),
+        Some("payload")
     );
 
     unsafe {

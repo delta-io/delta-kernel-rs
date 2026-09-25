@@ -428,5 +428,5 @@ Read these when relevant to the task at hand:
 **Keeping docs current:** If you notice renamed structs, traits, functions, modules, crates, APIs,
 stale data flows, or wrong file paths in these docs,
 inform the user so they can be updated. After major changes, update this file,
-`CLAUDE/architecture.md`, `ffi/CLAUDE.md`, `.github/CLAUDE.md`, and any relevant
+`CLAUDE/architecture.md`, `ffi/AGENTS.md`, `.github/CLAUDE.md`, and any relevant
 `<crate>/CLAUDE.md` files.

@@ -223,7 +223,7 @@ async fn run_ctas_test(
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?;
         match result {
-            CommitResult::CommittedTransaction(c) => c
+            CommitResult::Committed(c) => c
                 .post_commit_snapshot()
                 .expect("should have post_commit_snapshot")
                 .clone(),
@@ -268,7 +268,7 @@ async fn run_ctas_test(
 
     let commit_result = tgt_txn.commit(engine.as_ref())?;
     let tgt_snapshot = match commit_result {
-        CommitResult::CommittedTransaction(c) => c
+        CommitResult::Committed(c) => c
             .post_commit_snapshot()
             .expect("should have post_commit_snapshot")
             .clone(),
