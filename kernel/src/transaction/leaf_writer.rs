@@ -2,7 +2,7 @@
 
 use delta_kernel_derive::internal_api;
 
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, Version};
 
@@ -43,31 +43,24 @@ impl LeafNodeWriter {
     ///
     /// `add_metadata` follows the add-file metadata schema
     /// ([`Transaction::add_files_schema`](crate::transaction::Transaction::add_files_schema)).
-    ///
-    /// # Errors
-    ///
-    /// Currently always [`Error::Unsupported`]: the manifest-commit write path is not yet built.
-    // TODO(#2866): implement buffering appends, and add the other update kinds a leaf must accept
-    // (existing-file moves/removals and deletion-vector updates).
     #[internal_api]
     pub(crate) fn add_files(
         &mut self,
         _engine: &dyn Engine,
         _add_metadata: Box<dyn EngineData>,
     ) -> DeltaResult<()> {
-        Err(Error::unsupported(
+        // TODO(#2866): implement buffering appends, and add the other update kinds a leaf must
+        // accept (existing-file moves/removals and deletion-vector updates).
+        Err(KernelError::unsupported(
             "manifest commit leaf writer add_files is not yet supported",
         ))
     }
 
     /// Writes the buffered changes as a leaf manifest and returns its [`LeafNodeWriterResult`].
-    ///
-    /// # Errors
-    ///
-    /// Currently always [`Error::Unsupported`]: the manifest-commit write path is not yet built.
     #[internal_api]
     pub(crate) fn finish(self, _engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
-        Err(Error::unsupported(
+        // TODO(#2866): write the buffered changes as a leaf manifest.
+        Err(KernelError::unsupported(
             "manifest commit leaf writer finish is not yet supported",
         ))
     }

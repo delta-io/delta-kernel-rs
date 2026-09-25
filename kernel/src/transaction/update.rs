@@ -279,14 +279,14 @@ impl Transaction {
     /// [`ManifestCommitState`] that hands out leaf writers accepting file changes.
     ///
     /// Mutually exclusive with [`with_root_manifest_file`](Self::with_root_manifest_file), which
-    /// commits a caller-supplied root manifest instead of having kernel build the tree. Repeated
-    /// calls return the state initialized by the first call.
+    /// commits a caller-supplied root manifest instead of having kernel build the tree; that
+    /// exclusion is enforced at commit. Repeated calls return the state initialized by the first
+    /// call.
     ///
     /// # Errors
     ///
-    /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, if a
-    /// root manifest file was already staged, or if delta log commits exist after the last
-    /// manifest commit (not yet supported).
+    /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
+    /// delta log commits exist after the last manifest commit (not yet supported).
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[internal_api]
     pub(crate) fn with_manifest_commit(
@@ -295,18 +295,19 @@ impl Transaction {
     ) -> DeltaResult<&mut ManifestCommitState> {
         if self.manifest_commit_state.is_none() {
             let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-                Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+                KernelError::internal_error(
+                    "existing-table transaction unexpectedly has no snapshot",
+                )
             })?;
             self.manifest_commit_state = Some(ManifestCommitState::try_new(
                 engine,
                 read_snapshot,
                 self.get_commit_version(),
                 &self.effective_table_config,
-                self.root_manifest_file.is_some(),
             )?);
         }
         self.manifest_commit_state.as_mut().ok_or_else(|| {
-            Error::internal_error("manifest commit state missing after initialization")
+            KernelError::internal_error("manifest commit state missing after initialization")
         })
     }
 
