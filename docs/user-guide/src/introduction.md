@@ -50,31 +50,11 @@ making it usable from virtually any language.
 ```
 
 The **Engine trait** is the boundary between Kernel and your connector. Kernel defines
-_what_ needs to happen (read JSON, read Parquet, evaluate expressions); the engine
-defines _how_. A batteries-included `DefaultEngine` is provided for common use cases.
-See [Architecture Overview](./concepts/architecture.md) for details.
+_what_ needs to happen; the engine defines _how_. A ready-to-use `DefaultEngine` covers common
+Arrow and object-store connectors. [Architecture overview](./concepts/architecture.md) explains
+the boundary, while [rustdoc] defines the exact public APIs.
 
-## Key APIs
-
-**Snapshot** is a point-in-time view of a Delta table. Every operation starts here:
-reading the schema, scanning data, or starting a Transaction.
-
-**Scan** reads data from a table. It supports predicate pushdown for file skipping and
-column projection. See [Building a Scan](./reading/building_a_scan.md).
-
-**Transaction** writes data to a table. It supports creating tables, blind appends, and
-committing changes atomically. See [Creating a Table](./writing/create_table.md) and
-[Appending Data](./writing/append.md).
-
-**CheckpointWriter** compacts the transaction log into a checkpoint for faster reads.
-See [Checkpointing](./maintenance/checkpointing.md).
-
-### Data types and schema
-
-Kernel defines its own protocol-compliant type system, independent of any engine's type
-system. This includes primitive types (integers, strings, timestamps, decimals, etc.) and
-complex types (structs, arrays, maps). The Kernel schema is the source of truth for a
-table's structure. Your engine converts to and from it as needed.
+[rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/
 
 ## FFI layer
 
@@ -86,37 +66,13 @@ semantics, and every fallible function returns a structured error type.
 This means you can build a Delta connector in C, C++, or any language with a C FFI
 without writing any Rust. See the [FFI overview](./ffi/overview.md) for details.
 
-## Design principles
-
-1. **Protocol abstraction.** Kernel encapsulates the Delta protocol. Connectors pick up
-   new protocol features by updating their Kernel dependency.
-2. **Engine-agnostic.** Kernel defines _what_ to do; engines define _how_. The `Engine`
-   trait is the only integration point.
-3. **Feature flag modularity.** Core functionality works without optional dependencies.
-   Pay only for what you use via Cargo feature flags.
-4. **Clear I/O boundaries.** APIs clearly indicate when I/O operations occur, giving
-   connectors control over scheduling and parallelism.
-
-## Crate structure
-
-| Crate | Purpose |
-|-------|---------|
-| `delta_kernel` | Core library: protocol logic, table operations, trait definitions, default engine |
-| `delta_kernel_ffi` | C/C++ FFI bindings ([overview](./ffi/overview.md)) |
-| `delta_kernel_derive` | Procedural macros for internal code generation |
-| `acceptance` | Delta Acceptance Tests (DAT) validation suite |
-| `benchmarks` | Performance benchmarks for the core library |
-| `delta-kernel-unity-catalog` | Unity Catalog integration ([overview](./unity_catalog/overview.md)) |
-| `unity-catalog-delta-client-api` | Transport-agnostic client traits and wire models for the Unity Catalog Delta Tables API |
-| `unity-catalog-delta-rest-client` | REST/HTTP client for the Unity Catalog Delta Tables API |
-
 ## Getting started
 
 For Rust projects, add to `Cargo.toml`:
 
 ```toml
-delta_kernel = "0.23"
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
+delta_kernel = "0.28.0"
+delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
 
 For C/C++ projects, build the FFI crate and link against it. See the

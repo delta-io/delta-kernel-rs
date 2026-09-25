@@ -19,8 +19,8 @@ For the common case (use the default engine), add both crates:
 
 ```toml
 [dependencies]
-delta_kernel = "0.23"
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
+delta_kernel = "0.28.0"
+delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
 
 That gives you Kernel plus a default engine that handles I/O and expression evaluation for you,
@@ -31,49 +31,20 @@ and enable whatever Arrow interop flags you want:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.23", features = ["arrow-conversion", "arrow-expression"] }
+delta_kernel = { version = "0.28.0", features = ["arrow-conversion", "arrow-expression"] }
 ```
 
-## Feature flags
+## Choosing features
 
-You only pay for what you enable.
+The default engine needs a TLS backend for HTTPS object stores. Use `rustls` for a portable default
+or `native-tls` when the connector must use its platform TLS stack.
 
-### `delta_kernel_default_engine` features
+If your connector already exposes Arrow types, select the matching `arrow-N` feature to avoid two
+incompatible Arrow versions at the boundary. Otherwise, let the default `arrow` feature track the
+newest version supported by your Kernel release.
 
-| Feature | Description |
-|---------|-------------|
-| `rustls` | Default engine with `rustls` for TLS. **Recommended for most users.** |
-| `native-tls` | Default engine using your platform's native TLS (OpenSSL on Linux, Schannel on Windows, Secure Transport on macOS). Use this if `rustls` doesn't work in your environment. |
-| `arrow` | Use the latest Arrow version Kernel supports. Currently maps to Arrow 59. |
-
-You need exactly one of `rustls` or `native-tls`. See
-[Building a Connector](../connector/overview.md) for when a custom engine makes sense instead.
-
-### Arrow version pinning
-
-If you need a specific Arrow version (e.g. to match your existing Arrow dependency), pin it
-explicitly on both crates:
-
-| Feature | Arrow version |
-|---------|---------------|
-| `arrow-59` | Arrow 59 (current default) |
-| `arrow-58` | Arrow 58 |
-
-For more details on managing Arrow version compatibility, see
-[Feature Flags](../concepts/feature_flags.md).
-
-### `delta_kernel` features
-
-| Feature | Description |
-|---------|-------------|
-| `arrow-conversion` | Convert between kernel types and Arrow types |
-| `arrow-expression` | Evaluate kernel expressions over Arrow data |
-| `internal-api` | Expose additional APIs that aren't yet stabilized. Some examples in this guide need this. |
-| `schema-diff` | Experimental schema diffing |
-
-The `arrow-conversion` and `arrow-expression` flags are pulled in automatically by
-`delta_kernel_default_engine`, so you typically only set them when building a custom Arrow-based
-engine yourself.
+[Feature flags](../concepts/feature_flags.md) explains these choices and links to the exhaustive
+feature inventories generated from the published crate manifests.
 
 ## Example `Cargo.toml`
 
@@ -86,11 +57,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-delta_kernel = "0.23"
-delta_kernel_default_engine = { version = "0.23", features = ["rustls"] }
-
-# Kernel re-exports arrow, but you can also depend on it directly:
-# arrow = "59"
+delta_kernel = "0.28.0"
+delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 ```
 
 ## What's next

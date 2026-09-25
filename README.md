@@ -130,6 +130,7 @@ and then checking what version of `object_store` it depends on.
 
 ## Documentation
 
+- [User Guide](https://docs.delta.io/kernel/rust/) for connector workflows and cross-API concepts
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
 
 ## Examples
