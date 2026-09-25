@@ -105,8 +105,8 @@ arrow-expression = ["need-arrow", "dep:chrono-tz"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# Protobuf transport for kernel-owned snapshot state. This is independent of declarative plans so
-# imperative connectors can use the wire format without enabling plan execution.
+# Protobuf transport for kernel-owned control-plane state. This is independent of declarative
+# plans so imperative connectors can use the wire format without enabling plan execution.
 state-proto = ["dep:prost", "dep:prost-build"]
 
 # Declarative plan IR (experimental).

@@ -1748,15 +1748,17 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
     snapshot.schema().into()
 }
 
-/// Serialize a borrowed schema handle as protobuf. The caller owns the returned buffer and must
-/// free it exactly once with [`free_kernel_bytes`].
+/// Serialize a borrowed snapshot's schema as protobuf. The caller owns the returned buffer and
+/// must free it exactly once with [`free_kernel_bytes`].
 ///
 /// # Safety
-/// Caller is responsible for passing a valid schema handle.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
-pub unsafe extern "C" fn get_schema_as_proto(schema: Handle<SharedSchema>) -> KernelOwnedBytes {
-    let schema = unsafe { schema.as_ref() };
-    proto_schema::StructType::from(schema)
+pub unsafe extern "C" fn get_snapshot_schema_as_proto(
+    snapshot: Handle<SharedSnapshot>,
+) -> KernelOwnedBytes {
+    let snapshot = unsafe { snapshot.as_ref() };
+    proto_schema::StructType::from(snapshot.schema().as_ref())
         .encode_to_vec()
         .into()
 }
@@ -1784,6 +1786,23 @@ pub unsafe extern "C" fn snapshot_table_root(
     let snapshot = unsafe { snapshot.as_ref() };
     let table_root = snapshot.table_root().to_string();
     allocate_fn(kernel_string_slice!(table_root))
+}
+
+/// Serialize a borrowed snapshot's table root as protobuf. The caller owns the returned buffer and
+/// must free it exactly once with [`free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_snapshot_table_root_as_proto(
+    snapshot: Handle<SharedSnapshot>,
+) -> KernelOwnedBytes {
+    let snapshot = unsafe { snapshot.as_ref() };
+    proto_state::TableRoot {
+        uri: snapshot.table_root().to_string(),
+    }
+    .encode_to_vec()
+    .into()
 }
 
 /// Get a count of the number of partition columns for this snapshot
@@ -1862,17 +1881,19 @@ pub unsafe extern "C" fn snapshot_get_protocol(
     Arc::new(snapshot.table_configuration().protocol().clone()).into()
 }
 
-/// Serialize a borrowed protocol handle as protobuf. The caller owns the returned buffer and must
-/// free it exactly once with [`free_kernel_bytes`].
+/// Serialize a borrowed snapshot's protocol as protobuf. The caller owns the returned buffer and
+/// must free it exactly once with [`free_kernel_bytes`].
 ///
 /// # Safety
-/// Caller is responsible for passing a valid protocol handle.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
-pub unsafe extern "C" fn get_protocol_as_proto(
-    protocol: Handle<SharedProtocol>,
+pub unsafe extern "C" fn get_snapshot_protocol_as_proto(
+    snapshot: Handle<SharedSnapshot>,
 ) -> KernelOwnedBytes {
-    let protocol = unsafe { protocol.as_ref() };
-    proto_state::Protocol::from(protocol).encode_to_vec().into()
+    let snapshot = unsafe { snapshot.as_ref() };
+    proto_state::Protocol::from(snapshot.table_configuration().protocol())
+        .encode_to_vec()
+        .into()
 }
 
 /// Free a protocol handle obtained from [`snapshot_get_protocol`].
@@ -1938,17 +1959,19 @@ pub unsafe extern "C" fn snapshot_get_metadata(
     Arc::new(snapshot.table_configuration().metadata().clone()).into()
 }
 
-/// Serialize a borrowed metadata handle as protobuf. The caller owns the returned buffer and must
-/// free it exactly once with [`free_kernel_bytes`].
+/// Serialize a borrowed snapshot's metadata as protobuf. The caller owns the returned buffer and
+/// must free it exactly once with [`free_kernel_bytes`].
 ///
 /// # Safety
-/// Caller is responsible for passing a valid metadata handle.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
-pub unsafe extern "C" fn get_metadata_as_proto(
-    metadata: Handle<SharedMetadata>,
+pub unsafe extern "C" fn get_snapshot_metadata_as_proto(
+    snapshot: Handle<SharedSnapshot>,
 ) -> KernelOwnedBytes {
-    let metadata = unsafe { metadata.as_ref() };
-    proto_state::Metadata::from(metadata).encode_to_vec().into()
+    let snapshot = unsafe { snapshot.as_ref() };
+    proto_state::Metadata::from(snapshot.table_configuration().metadata())
+        .encode_to_vec()
+        .into()
 }
 
 /// Serialize the schema, metadata, and protocol of a borrowed snapshot in one protobuf buffer.
@@ -1970,6 +1993,9 @@ pub unsafe extern "C" fn get_snapshot_state_as_proto(
         protocol: Some(proto_state::Protocol::from(
             snapshot.table_configuration().protocol(),
         )),
+        table_root: Some(proto_state::TableRoot {
+            uri: snapshot.table_root().to_string(),
+        }),
     }
     .encode_to_vec()
     .into()
@@ -2371,6 +2397,36 @@ mod tests {
         assert!(snapshot_table_root_str.is_some());
         let s = recover_string(snapshot_table_root_str.unwrap());
         assert_eq!(&s, table_root);
+
+        let schema = unsafe { get_snapshot_schema_as_proto(snapshot1.shallow_copy()).into_vec() };
+        assert_eq!(
+            proto_schema::StructType::decode(schema.as_slice())?
+                .fields
+                .len(),
+            2
+        );
+        let metadata =
+            unsafe { get_snapshot_metadata_as_proto(snapshot1.shallow_copy()).into_vec() };
+        assert!(!proto_state::Metadata::decode(metadata.as_slice())?
+            .id
+            .is_empty());
+        let protocol =
+            unsafe { get_snapshot_protocol_as_proto(snapshot1.shallow_copy()).into_vec() };
+        assert_eq!(
+            proto_state::Protocol::decode(protocol.as_slice())?.min_reader_version,
+            1
+        );
+        let root = unsafe { get_snapshot_table_root_as_proto(snapshot1.shallow_copy()).into_vec() };
+        assert_eq!(
+            proto_state::TableRoot::decode(root.as_slice())?.uri,
+            table_root
+        );
+        let state = unsafe { get_snapshot_state_as_proto(snapshot1.shallow_copy()).into_vec() };
+        let state = proto_state::SnapshotState::decode(state.as_slice())?;
+        assert!(state.schema.is_some());
+        assert!(state.metadata.is_some());
+        assert!(state.protocol.is_some());
+        assert_eq!(state.table_root.unwrap().uri, table_root);
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }

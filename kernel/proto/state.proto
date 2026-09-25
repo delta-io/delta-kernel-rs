@@ -1,4 +1,4 @@
-// Proto transport for kernel-owned snapshot state.
+// Proto transport for kernel-owned control-plane state.
 
 syntax = "proto3";
 
@@ -32,8 +32,19 @@ message Protocol {
   FeatureList writer_features = 4;
 }
 
+message TableRoot {
+  string uri = 1;
+}
+
 message SnapshotState {
   delta.kernel.schema.StructType schema = 1;
   Metadata metadata = 2;
   Protocol protocol = 3;
+  TableRoot table_root = 4;
+}
+
+message ScanState {
+  TableRoot table_root = 1;
+  delta.kernel.schema.StructType logical_schema = 2;
+  delta.kernel.schema.StructType physical_schema = 3;
 }
