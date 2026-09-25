@@ -100,16 +100,16 @@ async fn add_column_validates_cdf_column_names(
 }
 
 #[rstest]
-#[case::name_cdf_enabled("name", Some("true"), Some("has physical name"))]
-#[case::id_cdf_enabled("id", Some("true"), Some("has physical name"))]
-#[case::none_cdf_enabled("none", Some("true"), None)]
-#[case::name_cdf_supported_only("name", None, None)]
-#[case::id_cdf_supported_only("id", None, None)]
-#[case::none_cdf_supported_only("none", None, None)]
+#[case::name_cdf_enabled("name", true, Some("has physical name"))]
+#[case::id_cdf_enabled("id", true, Some("has physical name"))]
+#[case::none_cdf_enabled("none", true, None)]
+#[case::name_cdf_supported_only("name", false, None)]
+#[case::id_cdf_supported_only("id", false, None)]
+#[case::none_cdf_supported_only("none", false, None)]
 #[tokio::test]
 async fn add_column_validates_cdf_physical_column_names(
     #[case] cm_mode: &str,
-    #[case] cdf_enabled: Option<&str>,
+    #[case] cdf_enabled: bool,
     #[case] expected_error: Option<&str>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -117,8 +117,8 @@ async fn add_column_validates_cdf_physical_column_names(
         ("delta.feature.changeDataFeed", "supported"),
         ("delta.columnMapping.mode", cm_mode),
     ];
-    if let Some(value) = cdf_enabled {
-        properties.push(("delta.enableChangeDataFeed", value));
+    if cdf_enabled {
+        properties.push(("delta.enableChangeDataFeed", "true"));
     }
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
