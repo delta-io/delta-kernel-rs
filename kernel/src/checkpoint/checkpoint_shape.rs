@@ -251,6 +251,7 @@ impl CheckpointShape {
         partition_schema: &'a SchemaRef,
     ) -> Option<&'a SchemaRef> {
         let checkpoint_schema = self.leaf_checkpoint_schema.as_ref()?;
+        // Missing stats only weaken pruning; missing partition values change scan output.
         let contains_all_partition_columns = partition_schema.fields().all(|field| {
             checkpoint_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME, field.name()])
         });
