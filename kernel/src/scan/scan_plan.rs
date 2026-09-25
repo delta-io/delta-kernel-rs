@@ -766,7 +766,8 @@ mod tests {
             .expect("parsed stats schema");
         // The retained leaf schema drives `has_json_stats()`: including the JSON `add.stats`
         // column makes the checkpoint report JSON stats, omitting it forces synthesis.
-        let leaf_checkpoint_schema = parquet_read_schema(Some(&parsed_stats), None, has_json_stats)?;
+        let leaf_checkpoint_schema =
+            parquet_read_schema(Some(&parsed_stats), None, has_json_stats)?;
         let shape = CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema: Some(leaf_checkpoint_schema),

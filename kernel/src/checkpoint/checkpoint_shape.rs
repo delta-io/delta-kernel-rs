@@ -481,6 +481,31 @@ mod tests {
             .is_none());
     }
 
+    /// `has_json_stats` reflects the retained leaf schema: a checkpoint whose file actions carry a
+    /// JSON `add.stats` column reports `true`, a struct-only checkpoint reports `false`, and a
+    /// shape resolved without the leaf schema conservatively reports `true`.
+    #[rstest]
+    #[case::json_sidecars("v2-checkpoints-parquet-with-sidecars", true)]
+    #[case::struct_only_sidecars("v2-parquet-sidecars-struct-stats-only", false)]
+    fn has_json_stats_reflects_retained_leaf_schema(#[case] table: &str, #[case] expected: bool) {
+        let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
+        let exec = SyncPlanExecutor::default();
+
+        let with_leaf =
+            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref()).unwrap();
+        assert_eq!(
+            with_leaf.has_json_stats(),
+            expected,
+            "{table}: retained schema"
+        );
+
+        let without_leaf = CheckpointShape::try_new(&exec, snapshot.as_ref()).unwrap();
+        assert!(
+            without_leaf.has_json_stats(),
+            "{table}: no retained schema defaults to true"
+        );
+    }
+
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards
     /// against the optimization silently not firing (result-only checks pass via the drain too).
     #[rstest]
