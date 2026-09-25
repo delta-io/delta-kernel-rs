@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray,
 };
-use delta_kernel::arrow::compute::{concat, concat_batches};
+use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -35,7 +35,8 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_add_files_metadata,
-    create_default_engine, create_default_engine_mt_executor, insert_data, into_record_batch,
+    create_default_engine, create_default_engine_mt_executor,
+    create_table_with_column_mapping_mode, engine_store_setup, insert_data, into_record_batch,
     load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_table_p37,
     setup_test_tables, test_table_setup,
 };
@@ -421,21 +422,9 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     // Not populated in the dataset are (covered by row_tracking tests):
     // baseRowId (optional i64)
     // defaultRowCommitVersion (optional i64)
-    use std::path::PathBuf;
-
     let _ = tracing_subscriber::fmt::try_init();
 
-    let tmp_dir = tempdir()?;
-    let tmp_table_path = tmp_dir.path().join("table-with-dv-small");
-    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
-    copy_directory(&source_path, &tmp_table_path)?;
-
-    let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
-    let engine = create_default_engine(&table_url)?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone())
-        .at_version(1)
-        .build(engine.as_ref())?;
+    let (_tmp_dir, tmp_table_path, engine, snapshot) = setup_table_with_dv_small()?;
 
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
@@ -587,37 +576,11 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 #[tokio::test]
 async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let tmp_dir = tempdir()?;
-    let tmp_dir_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let (store, engine, table_location) =
-        test_utils::engine_store_setup("adaptive_remove", Some(&tmp_dir_url));
-    let engine = Arc::new(engine);
-    let schema = schema_ref! { nullable "number": INTEGER };
-
-    let table_url = test_utils::create_table_with_column_mapping_mode(
-        store,
-        table_location,
-        schema,
-        &[],  // no partition columns
-        true, // (3, 7) protocol
-        vec!["adaptiveMetadata-preview"],
-        vec![],
-        "id",
-    )
-    .await?;
-
-    // v1: append a data file.
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    insert_data(
-        snapshot,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_committed();
+    // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
+    let (_tmp_dir, table_url, engine, snapshot) =
+        create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
 
     // v2: remove the file.
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan_files = snapshot
         .clone()
         .scan_builder()
@@ -667,21 +630,8 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     #[case] missing_fields: &[ExtendedMetadataField],
     #[case] expected_extended_file_metadata: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-    let schema = schema_ref! { nullable "number": INTEGER };
-
-    let snapshot = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-    let snapshot = insert_data(
-        snapshot,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_post_commit_snapshot();
+    let (_temp_dir, table_url, engine, snapshot) =
+        create_number_table(vec![], vec![], "none", true).await?;
 
     let scan = snapshot.clone().scan_builder().build()?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
@@ -752,21 +702,9 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     // - All file metadata is preserved (size, stats, tags, partitionValues)
     // - dataChange is properly set to true
     // - deletionTimestamp matches commit timestamp
-    use std::path::PathBuf;
-
     let _ = tracing_subscriber::fmt::try_init();
 
-    let tmp_dir = tempdir()?;
-    let tmp_table_path = tmp_dir.path().join("table-with-dv-small");
-    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
-    copy_directory(&source_path, &tmp_table_path)?;
-
-    let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
-    let engine = create_default_engine(&table_url)?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone())
-        .at_version(1)
-        .build(engine.as_ref())?;
+    let (_tmp_dir, tmp_table_path, engine, snapshot) = setup_table_with_dv_small()?;
 
     // Create transaction with DV update mode enabled
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
@@ -2144,7 +2082,6 @@ fn modify_staged_remove_file(
     modification: StagedRemoveFileModification,
 ) -> Result<RecordBatch, ArrowError> {
     let field_index = batch.schema().index_of(modification.field)?;
-    let mut columns = batch.columns().to_vec();
     let modified_value = match modification.value {
         StagedRemoveFileFieldValue::Null => {
             new_null_array(batch.schema().field(field_index).data_type(), 1)
@@ -2156,19 +2093,80 @@ fn modify_staged_remove_file(
             Arc::new(Int64Array::from(vec![value])) as ArrayRef
         }
     };
-    let column = batch.column(field_index);
-    let slices = [
-        column.slice(0, modification.modified_row_index),
+    let mut columns = batch.columns().to_vec();
+    columns[field_index] = replace_array_row(
+        batch.column(field_index),
         modified_value,
-        column.slice(
-            modification.modified_row_index + 1,
-            batch.num_rows() - modification.modified_row_index - 1,
-        ),
-    ];
-    let arrays = slices
-        .iter()
-        .map(|array| array.as_ref())
-        .collect::<Vec<&dyn Array>>();
-    columns[field_index] = concat(&arrays)?;
+        modification.modified_row_index,
+    );
     RecordBatch::try_new(batch.schema(), columns)
+}
+
+/// `(temp_dir, table_path, engine, snapshot)` returned by [`setup_table_with_dv_small`].
+type DvSmallTableSetup = (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Arc<dyn Engine>,
+    Arc<Snapshot>,
+);
+
+/// Copies the `table-with-dv-small` fixture into a fresh tempdir, builds a default engine, and
+/// loads a snapshot at version 1.
+///
+/// Returns `(temp_dir, table_path, engine, snapshot)`. Keep `temp_dir` alive for the test;
+/// `table_path` lets callers read commit JSON directly off disk.
+fn setup_table_with_dv_small() -> Result<DvSmallTableSetup, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let table_path = temp_dir.path().join("table-with-dv-small");
+    let source_path = std::fs::canonicalize(std::path::PathBuf::from(
+        "./tests/data/table-with-dv-small/",
+    ))?;
+    copy_directory(&source_path, &table_path)?;
+
+    let table_url = Url::from_directory_path(&table_path).expect("table path must be a valid URL");
+    let engine: Arc<dyn Engine> = create_default_engine(&table_url)?;
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    Ok((temp_dir, table_path, engine, snapshot))
+}
+
+/// Creates a `number: INTEGER` table with the given protocol/features/column-mapping mode and
+/// appends one data file with values `[1, 2, 3]`.
+///
+/// Returns `(temp_dir, table_url, engine, snapshot)` with `snapshot` at version 1 (post-append).
+/// Backed by a local filesystem store so callers can use `read_actions_from_commit`.
+async fn create_number_table(
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+    column_mapping_mode: &str,
+    use_37_protocol: bool,
+) -> Result<(tempfile::TempDir, Url, Arc<dyn Engine>, Arc<Snapshot>), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let temp_dir_url =
+        Url::from_directory_path(temp_dir.path()).expect("tempdir path must be a valid URL");
+    let (store, engine, table_location) = engine_store_setup("number_table", Some(&temp_dir_url));
+    let engine = Arc::new(engine);
+
+    let table_url = create_table_with_column_mapping_mode(
+        store,
+        table_location,
+        get_simple_int_schema(),
+        &[],
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        column_mapping_mode,
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    Ok((temp_dir, table_url, engine, snapshot))
 }

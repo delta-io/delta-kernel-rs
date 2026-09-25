@@ -529,6 +529,7 @@ void print_metric(MetricEvent event) {
     PM_U64(smc, num_predicate_filtered);
     PM_U64(smc, peak_hash_set_size);
     PM_U64(smc, dedup_visitor_time_ns);
+    PM_U64(smc, action_transform_time_ns);
     PM_U64(smc, predicate_eval_time_ns);
     PM_END;
     return;

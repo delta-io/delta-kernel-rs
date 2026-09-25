@@ -178,6 +178,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// - The table enables `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults`, which
     ///   ALTER TABLE does not yet support
     /// - Any individual operation fails validation (see per-method errors above)
+    /// - CDF is enabled and the evolved schema contains a top-level column reserved for CDF
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
     ///   `timestampNtz` column without the `timestampNtz` feature)

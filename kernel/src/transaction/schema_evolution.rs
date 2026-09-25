@@ -14,7 +14,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     find_max_column_id_in_schema, schema_has_column_mapping_metadata,
     strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
-    validate_column_mapping_id, ColumnMappingMode,
+    validate_column_mapping_id, ColumnMappingMode, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -127,6 +127,7 @@ pub(crate) fn apply_schema_operations(
     operations: Vec<SchemaOperation>,
     column_mapping_mode: ColumnMappingMode,
     current_max_column_id: Option<i64>,
+    cdf_enabled: bool,
 ) -> DeltaResult<SchemaEvolutionResult> {
     let cm_enabled = column_mapping_mode != ColumnMappingMode::None;
 
@@ -226,7 +227,7 @@ pub(crate) fn apply_schema_operations(
         schema = *updated_schema;
     }
 
-    validate_schema(&schema, column_mapping_mode)?;
+    validate_schema(&schema, column_mapping_mode, cdf_enabled)?;
 
     // `max_id` is only ever incremented by `try_assign_flat_column_mapping_info`. If it grew,
     // the new value must be persisted; if it went backwards, that's a bug.
@@ -272,6 +273,7 @@ pub(crate) fn evolve_table_config(
         operations,
         column_mapping_mode,
         current_max_column_id,
+        table_config.is_feature_enabled(&TableFeature::ChangeDataFeed),
     )?;
 
     // Only in `None` mode: if this evolution introduced column-mapping annotations into a table
@@ -434,7 +436,14 @@ mod tests {
         #[case] ops: Vec<SchemaOperation>,
         #[case] error_contains: &str,
     ) {
-        let err = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap_err();
+        let err = apply_schema_operations(
+            schema,
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains(error_contains),
             "expected error to contain '{error_contains}', got: {err}"
@@ -458,6 +467,7 @@ mod tests {
             vec![operation],
             ColumnMappingMode::None,
             None,
+            false, /* cdf_enabled */
         )
         .unwrap_err();
         assert!(
@@ -495,6 +505,7 @@ mod tests {
             vec![operation],
             ColumnMappingMode::None,
             None,
+            false, /* cdf_enabled */
         )
         .unwrap_err();
         assert!(
@@ -514,8 +525,14 @@ mod tests {
         #[case] ops: Vec<SchemaOperation>,
         #[case] expected_names: &[&str],
     ) {
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let actual: Vec<&str> = result.schema.fields().map(|f| f.name().as_str()).collect();
         assert_eq!(&actual, expected_names);
     }
@@ -556,9 +573,14 @@ mod tests {
         let operation =
             SchemaOperation::add_column(parent, StructField::nullable("added", DataType::INTEGER));
 
-        let result =
-            apply_schema_operations(schema, vec![operation], ColumnMappingMode::None, None)
-                .unwrap();
+        let result = apply_schema_operations(
+            schema,
+            vec![operation],
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let mut container_type = result
             .schema
             .field("container")
@@ -595,7 +617,14 @@ mod tests {
             ),
         ];
         // With CM: parent struct + existing leaf (op1) + child (op2) => three new IDs after max 10.
-        let result = apply_schema_operations(simple_schema(), ops, mode, current_max).unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            mode,
+            current_max,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let parent = result.schema.field("parent").unwrap();
         let DataType::Struct(s) = parent.data_type() else {
             panic!("Expected Struct, got: {:?}", parent.data_type());
@@ -623,7 +652,14 @@ mod tests {
         let ops = vec![SchemaOperation::SetNullable {
             column: column.clone(),
         }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_schema_operations(
+            schema,
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         assert!(result.schema.field_at_path(column.path()).is_nullable());
     }
 
@@ -633,8 +669,14 @@ mod tests {
     #[case::empty_path(ColumnName::new(Vec::<String>::new()), "empty column path")]
     fn set_nullable_fails(#[case] column: ColumnName, #[case] error_contains: &str) {
         let ops = vec![SchemaOperation::SetNullable { column }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None)
-            .unwrap_err();
+        let err = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains(error_contains),
             "expected error to contain '{error_contains}', got: {err}"
@@ -661,7 +703,14 @@ mod tests {
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("address.city"),
         }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_schema_operations(
+            schema,
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
 
         let names: Vec<&str> = result.schema.fields().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["alpha", "address", "gamma"]);
@@ -687,7 +736,14 @@ mod tests {
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("address"),
         }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_schema_operations(
+            schema,
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let addr = result.schema.field("address").unwrap();
         assert!(addr.is_nullable(), "struct itself must be nullable");
         let DataType::Struct(s) = addr.data_type() else {
@@ -707,8 +763,14 @@ mod tests {
                 column: column_name!("id"),
             },
         ];
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         assert_eq!(result.schema.fields().count(), 3);
         assert!(result.schema.field("email").is_some());
         assert!(result.schema.field("id").unwrap().is_nullable());
@@ -728,7 +790,14 @@ mod tests {
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("beta.nested"),
         }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_schema_operations(
+            schema,
+            ops,
+            ColumnMappingMode::None,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let names: Vec<&String> = result.schema.fields().map(|f| f.name()).collect();
         assert_eq!(names, vec!["alpha", "beta", "gamma"]);
     }
@@ -758,7 +827,14 @@ mod tests {
             parent.clone(),
             StructField::nullable(name, DataType::STRING),
         )];
-        let result = apply_schema_operations(schema, ops, mode, Some(current_max)).unwrap();
+        let result = apply_schema_operations(
+            schema,
+            ops,
+            mode,
+            Some(current_max),
+            false, /* cdf_enabled */
+        )
+        .unwrap();
 
         let mut parent_path = parent.map_or_else(Vec::new, ColumnName::into_inner);
         parent_path.push(name.to_string());
@@ -775,8 +851,14 @@ mod tests {
             None,
             StructField::nullable("email", DataType::STRING),
         )];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
-            .unwrap_err();
+        let err = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            None,
+            false, /* cdf_enabled */
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidProtocol(_)));
         assert!(err.to_string().contains("maxColumnId"));
     }
@@ -791,9 +873,14 @@ mod tests {
             SchemaOperation::add_column(None, StructField::nullable("b", DataType::STRING)),
             SchemaOperation::add_column(None, StructField::nullable("c", DataType::STRING)),
         ];
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(10))
-                .unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(10),
+            false, /* cdf_enabled */
+        )
+        .unwrap();
 
         let id_a = get_cm_id(result.schema.field("a").unwrap());
         let id_b = get_cm_id(result.schema.field("b").unwrap());
@@ -846,9 +933,14 @@ mod tests {
             None,
             StructField::nullable("col", data_type),
         )];
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(10))
-                .unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(10),
+            false, /* cdf_enabled */
+        )
+        .unwrap();
 
         let added = result.schema.field("col").unwrap();
         let ids = added.collect_column_mapping_ids();
@@ -889,9 +981,14 @@ mod tests {
     ))]
     fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
         let ops = vec![SchemaOperation::add_column(None, field)];
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
-                .unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            false, /* cdf_enabled */
+        )
+        .unwrap();
 
         assert_eq!(find_max_column_id_in_schema(&result.schema), Some(99));
         assert_eq!(result.new_max_column_id, Some(99));
@@ -907,9 +1004,14 @@ mod tests {
             MetadataValue::String("user-supplied-name".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(7))
-                .unwrap();
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(7),
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let added = result.schema.field("named").unwrap();
         assert_eq!(get_cm_id(added), 8);
         assert_eq!(get_physical_name(added), "user-supplied-name");
@@ -929,10 +1031,15 @@ mod tests {
             None,
             StructField::nullable("anything", DataType::INTEGER),
         )];
-        let err =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(seed))
-                .unwrap_err()
-                .to_string();
+        let err = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(seed),
+            false, /* cdf_enabled */
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("Invalid column mapping id")
                 && err.contains("Table property `delta.columnMapping.maxColumnId`")
@@ -950,9 +1057,15 @@ mod tests {
             MetadataValue::String("not-a-number".to_string()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
-            .unwrap_err()
-            .to_string();
+        let err = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            false, /* cdf_enabled */
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("non-numeric") && err.contains("delta.columnMapping.id"),
             "error should name the wrong-typed id annotation, got: {err}"
@@ -977,8 +1090,14 @@ mod tests {
             StructField::nullable("new", DataType::STRING),
         )];
         // Persisted maxColumnId is stale at 5, but the schema actually contains id=42.
-        let result =
-            apply_schema_operations(schema, ops, ColumnMappingMode::Name, Some(5)).unwrap();
+        let result = apply_schema_operations(
+            schema,
+            ops,
+            ColumnMappingMode::Name,
+            Some(5),
+            false, /* cdf_enabled */
+        )
+        .unwrap();
         let new_id = get_cm_id(result.schema.field("new").unwrap());
         assert_eq!(
             new_id, 43,

@@ -941,6 +941,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema has `delta.invariants` metadata on any column
+    /// - CDF is enabled and the schema contains a top-level column reserved for CDF
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -981,7 +982,11 @@ impl CreateTableTransactionBuilder {
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
-        validate_schema(&effective_schema, column_mapping_mode)?;
+        validate_schema(
+            &effective_schema,
+            column_mapping_mode,
+            validated.is_property_true(ENABLE_CHANGE_DATA_FEED),
+        )?;
 
         // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
         // any annotation the caller supplied is newly introduced (see
