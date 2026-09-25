@@ -300,12 +300,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
-    let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
-    let expected_stats = if no_stats {
-        StatsOptions::json_only()
-    } else {
-        stats.clone()
-    };
+    let expected_stats = stats.clone();
     let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
     let expected_builder = snapshot
         .clone()
@@ -347,8 +342,6 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .collect();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
-    // Imperative metadata exposes source and predicate stats even when they were not requested.
-    // Compare only the caller-requested stats after checking the declarative schema above.
     let parsed_stats_requested = match &struct_stats {
         StructStats::None => false,
         StructStats::Columns { requested } => !requested.is_empty(),
@@ -358,28 +351,11 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         let declarative_schema = actual.first().expect("declarative metadata").schema();
         let imperative_schema = expected.first().expect("imperative metadata").schema();
         assert!(declarative_schema.field_with_name(STATS_PARSED).is_err());
-        imperative_schema
-            .field_with_name(STATS_PARSED)
-            .expect("imperative predicate stats");
+        assert!(imperative_schema.field_with_name(STATS_PARSED).is_err());
     }
-    let ignored_stats = match (stats.synthesize_json, parsed_stats_requested) {
-        (true, true) => {
-            // Both representations were requested, so the outputs are directly comparable.
-            &[][..]
-        }
-        (true, false) => {
-            // Only JSON was requested; imperative metadata also exposes predicate stats.
-            &[STATS_PARSED][..]
-        }
-        (false, true) => {
-            // Only parsed stats were requested; imperative metadata also retains source JSON.
-            &[STATS][..]
-        }
-        (false, false) => {
-            // Neither representation was requested, but imperative metadata retains source JSON
-            // and predicate-required parsed stats.
-            &[STATS, STATS_PARSED][..]
-        }
+    let ignored_stats = match (stats.emit_json, parsed_stats_requested) {
+        (true, _) => &[][..],
+        (false, _) => &[STATS][..],
     };
     assert_metadata_eq(
         &actual,
@@ -444,13 +420,11 @@ const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
 const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 
 #[rstest]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_string_map(
     StatsOptions::json_only(),
     PartitionValuesOptions::string_map_only(),
     &[ADD_FIELDS, JSON_STATS_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_with_struct(
     StatsOptions::json_only(),
     PartitionValuesOptions::with_struct(),
@@ -464,7 +438,11 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::all_struct_with_struct(
     StatsOptions::all_struct(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
 )]
 #[case::struct_columns_string_map(
     StatsOptions::struct_columns(vec![column_name!("id")]),
@@ -474,7 +452,11 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::struct_columns_with_struct(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_FIELDS,
+        ID_STATS_PARSED_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
 )]
 #[case::empty_struct_columns_string_map(
     StatsOptions::struct_columns(vec![]),
@@ -486,13 +468,11 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
     PartitionValuesOptions::with_struct(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_string_map(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
     &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_with_struct(
     StatsOptions::all(),
     PartitionValuesOptions::with_struct(),
@@ -519,7 +499,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] expected_field_groups: &[&[&str]],
 ) {
     (|| -> DeltaResult<()> {
-        let json_requested = stats.synthesize_json;
+        let json_requested = stats.emit_json;
         let (engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let scan = snapshot
@@ -538,14 +518,14 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .map(|batch| batch?.try_into_record_batch())
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        if json_requested {
-            for batch in &actual {
-                let add = batch
-                    .column_by_name(ADD_NAME)
-                    .expect("add column")
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("add struct");
+        for batch in &actual {
+            let add = batch
+                .column_by_name(ADD_NAME)
+                .expect("add column")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("add struct");
+            if json_requested {
                 let stats = add
                     .column_by_name(STATS)
                     .expect("requested JSON stats")
@@ -556,6 +536,11 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
                     stats.null_count(),
                     0,
                     "requested JSON stats must be populated"
+                );
+            } else {
+                assert!(
+                    add.column_by_name(STATS).is_none(),
+                    "unrequested JSON stats must be omitted"
                 );
             }
         }
@@ -671,8 +656,6 @@ fn declarative_metadata_output_options_across_log_shapes(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint()
 )]
-// TODO: https://github.com/delta-io/delta-kernel-rs/issues/3040
-#[should_panic(expected = "requested JSON stats must be populated")]
 fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
@@ -687,7 +670,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
 ) -> DeltaResult<()> {
-    let json_requested = stats.synthesize_json;
+    let json_requested = stats.emit_json;
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
@@ -713,8 +696,8 @@ fn assert_metadata_output_options(
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
-    if json_requested {
-        for batch in &actual {
+    for batch in &actual {
+        if json_requested {
             let stats = batch.column_by_name(STATS).expect("requested JSON stats");
             let stats = stats
                 .as_any()
@@ -725,23 +708,24 @@ fn assert_metadata_output_options(
                 0,
                 "requested JSON stats must be populated"
             );
+        } else {
+            assert!(
+                batch.column_by_name(STATS).is_none(),
+                "unrequested JSON stats must be omitted"
+            );
         }
     }
 
-    if json_requested {
-        assert_metadata_eq(
-            &actual,
-            &expected,
-            "metadata output options across log shapes",
-        )?;
+    let expected = if json_requested {
+        expected
     } else {
-        // Imperative metadata exposes source JSON even when it was not requested.
-        assert_metadata_eq(
-            &actual,
-            &without_columns(&expected, &[STATS])?,
-            "metadata output options across log shapes",
-        )?;
-    }
+        without_columns(&expected, &[STATS])?
+    };
+    assert_metadata_eq(
+        &actual,
+        &expected,
+        "metadata output options across log shapes",
+    )?;
     Ok(())
 }
 

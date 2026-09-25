@@ -12,12 +12,13 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    ADD_NAME, ADD_SCHEMA, ADD_SCHEMA_NO_JSON_STATS, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
+    STATS, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
-    MapToStructOptions, Predicate,
+    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
+    ExpressionRef, MapToStructOptions, Predicate, UnaryExpressionOp,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -26,9 +27,9 @@ use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::struct_patch::{project_struct_to_schema, ProjectionStructPatchBuilder};
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Error, PlanBuilder};
 
 // === Internal column names ===
@@ -37,7 +38,6 @@ use crate::{DeltaResult, Error, PlanBuilder};
 // materialize them as one top-level `file_action_key` column that are used by the plan's
 // aggregate and anti-join operators.
 const FILE_ACTION_KEY: &str = "file_action_key";
-const STATS: &str = "stats";
 const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 // Generated partition pruning predicates reference this to retain removes.
@@ -140,25 +140,28 @@ impl Scan {
     /// replaces `add.stats_parsed` above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
-        let physical_stats = self.state_info.physical_stats_schema.as_ref();
+        let physical_stats = self.required_parsed_stats_schema();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
-        let source_physical_stats = shape.parsed_stats_schema.as_ref();
+        let needs_stats = !self.skip_stats();
+        let source_physical_stats = shape.parsed_stats_schema.as_ref().filter(|_| needs_stats);
+        let reads_json_stats =
+            needs_stats && (self.stats.emit_json || source_physical_stats.is_none());
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats, None)?;
+                let schema = parquet_read_schema(source_physical_stats, None, reads_json_stats)?;
                 PlanBuilder::scan_parquet(parts, &[VERSION], schema)
             }
             (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
                 PlanBuilder::scan_json(
                     parts,
                     &[VERSION],
-                    json_read_schema(/* include_remove */ false),
+                    json_read_schema(/* include_remove */ false, reads_json_stats),
                 )
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats, None)?;
+                let schema = parquet_read_schema(source_physical_stats, None, reads_json_stats)?;
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the manifest.
@@ -166,7 +169,10 @@ impl Scan {
                 }
             }
             (CheckpointType::None, _) | (_, None) => {
-                PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
+                PlanBuilder::values(
+                    json_read_schema(/* include_remove */ false, reads_json_stats),
+                    vec![],
+                )
             }
         }?;
 
@@ -174,6 +180,7 @@ impl Scan {
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| {
                 patch
+                    .with_output_add_json_stats(self.stats.emit_json)
                     .with_parsed_add_stats(physical_stats)
                     .with_parsed_add_partition_values(physical_partitions)
                     .append(
@@ -205,38 +212,44 @@ impl Scan {
     fn commit_arm(&self) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-        PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
-            .filter(Predicate::or(
-                col!("add.path").is_not_null(),
-                col!("remove.path").is_not_null(),
-            ))?
-            .project_patch(|patch| {
-                // Commits never carry source-native parsed columns, so normalize from the raw
-                // encodings.
-                patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_schema.as_ref())
-                    .with_parsed_add_partition_values(
-                        self.state_info.physical_partition_schema.as_ref(),
-                    )
-                    .append(
-                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                        Expr::from(col!("add.path").is_not_null()),
-                    )
-                    .append(
-                        FILE_ACTION_KEY_FIELD.clone(),
-                        file_action_key_expr(|col| {
-                            Expr::coalesce([
-                                joined_column_expr!("add", col),
-                                joined_column_expr!("remove", col),
-                            ])
-                        }),
-                    )
-            })
+        PlanBuilder::scan_json(
+            commit_files,
+            &[VERSION],
+            json_read_schema(true, !self.skip_stats()),
+        )?
+        .filter(Predicate::or(
+            col!("add.path").is_not_null(),
+            col!("remove.path").is_not_null(),
+        ))?
+        .project_patch(|patch| {
+            // Commits never carry source-native parsed columns, so normalize from the raw
+            // encodings.
+            patch
+                .with_output_add_json_stats(self.stats.emit_json)
+                .with_parsed_add_stats(self.required_parsed_stats_schema())
+                .with_parsed_add_partition_values(
+                    self.state_info.physical_partition_schema.as_ref(),
+                )
+                .append(
+                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                    Expr::from(col!("add.path").is_not_null()),
+                )
+                .append(
+                    FILE_ACTION_KEY_FIELD.clone(),
+                    file_action_key_expr(|col| {
+                        Expr::coalesce([
+                            joined_column_expr!("add", col),
+                            joined_column_expr!("remove", col),
+                        ])
+                    }),
+                )
+        })
     }
 
     fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_schema = self.state_info.physical_stats_schema.as_ref();
+        let physical_stats_schema = self.required_parsed_stats_schema();
         let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
+        let add_schema = add_read_schema(true);
         let patch = SchemaStructPatchBuilder::new()
             .fold_with(physical_stats_schema, |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
@@ -247,7 +260,7 @@ impl Scan {
                     schema.as_ref().clone(),
                 ))
             });
-        Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
+        Ok(StructField::nullable(ADD_NAME, patch.build(&add_schema)?))
     }
 
     /// Builds the output projection for requested stats and partition values. The base of this
@@ -284,7 +297,7 @@ impl Scan {
 
         // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
         let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
-        let projection = match (self.stats.synthesize_json, has_json_stats) {
+        let projection = match (self.stats.emit_json, has_json_stats) {
             (true, true) | (false, false) => projection,
             (true, false) => {
                 return Err(Error::internal_error(
@@ -299,7 +312,7 @@ impl Scan {
             (Some(physical_stats), _) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], physical_stats),
+                project_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], physical_stats),
             ),
             (None, true) => projection.drop(STATS_PARSED),
             (None, false) => projection,
@@ -317,7 +330,7 @@ impl Scan {
             (Some(schema), true) => projection.replace(
                 PARTITION_VALUES_PARSED,
                 StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
+                project_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
             ),
             (Some(_), false) => {
                 return Err(Error::internal_error(
@@ -393,11 +406,20 @@ fn sidecar_actions(
 
 // === Helpers ===
 
+fn add_read_schema(include_json_stats: bool) -> StructType {
+    if include_json_stats {
+        ADD_SCHEMA.clone()
+    } else {
+        ADD_SCHEMA_NO_JSON_STATS.clone()
+    }
+}
+
 /// Read schema for JSON actions tagged with their log version.
 /// Commits include removes; JSON checkpoint leaves do not.
-fn json_read_schema(include_remove: bool) -> SchemaRef {
+fn json_read_schema(include_remove: bool, include_json_stats: bool) -> SchemaRef {
+    let add_schema = add_read_schema(include_json_stats);
     schema_ref! {
-        (&ADD_FIELD),
+        nullable ADD_NAME: (add_schema),
         ..(include_remove.then_some(&REMOVE_FIELD)),
         nullable VERSION: LONG,
     }
@@ -407,7 +429,9 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
 fn parquet_read_schema(
     physical_stats: Option<&SchemaRef>,
     physical_partitions: Option<&SchemaRef>,
+    include_json_stats: bool,
 ) -> DeltaResult<SchemaRef> {
+    let add_schema = add_read_schema(include_json_stats);
     let add_patch = SchemaStructPatchBuilder::new()
         .fold_with(physical_stats, |patch, schema| {
             patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
@@ -419,7 +443,7 @@ fn parquet_read_schema(
             ))
         });
     Ok(schema_ref! {
-        nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
+        nullable ADD_NAME: (add_patch.build(&add_schema)?),
         nullable VERSION: LONG,
     })
 }
@@ -454,10 +478,14 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 trait ProjectionStructPatchBuilderExt<'a> {
+    /// Emits requested JSON stats, or a null placeholder when JSON stats are disabled.
+    fn with_output_add_json_stats(self, emit_json: bool) -> Self;
+
     /// Parses add stats, preferring a compatible parsed field.
     ///
     /// When `physical_stats` is present, the input must contain either
-    /// `add.stats_parsed` or the fallback `add.stats` JSON field.
+    /// `add.stats_parsed` or the fallback `add.stats` JSON field. When absent, any native
+    /// `add.stats_parsed` field is removed from the normalized row.
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self;
 
     /// Parses add partition values, preferring a compatible parsed field.
@@ -465,6 +493,33 @@ trait ProjectionStructPatchBuilderExt<'a> {
 }
 
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
+    fn with_output_add_json_stats(self, emit_json: bool) -> Self {
+        let has_json_stats = self.input_schema().contains_col([ADD_NAME, STATS]);
+        if !emit_json {
+            return if has_json_stats {
+                self.replace_expr_at([ADD_NAME], STATS, null_lit(DataType::STRING))
+            } else {
+                self.insert_after_at(
+                    [ADD_NAME],
+                    "dataChange",
+                    StructField::nullable(STATS, DataType::STRING),
+                    null_lit(DataType::STRING),
+                )
+            };
+        }
+        if !self
+            .input_schema()
+            .contains_col([ADD_NAME, STATS_PARSED_NAME])
+        {
+            return self;
+        }
+        let stats = Expr::coalesce([
+            col!(ADD_NAME, STATS),
+            Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
+        ]);
+        self.replace_expr_at([ADD_NAME], STATS, stats)
+    }
+
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self {
         let has_stats_parsed = self
             .input_schema()
@@ -480,6 +535,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                     self.append_at(add, field, expr)
                 }
             }
+            None if has_stats_parsed => self.drop_at(add, STATS_PARSED),
             None => self,
         }
     }
@@ -506,26 +562,6 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             None => self,
         }
     }
-}
-
-/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct. A direct
-/// column reference would retain fields not requested by the caller.
-fn project_nested_struct_to_schema(
-    root: impl CollectInto<ColumnName>,
-    schema: &StructType,
-) -> Expr {
-    let root = root.collect_into();
-    let fields = schema.fields().map(|field| {
-        let column = root.join(&ColumnName::new([field.name()]));
-        match field.data_type() {
-            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
-            _ => Expr::from(column),
-        }
-    });
-    Expr::struct_with_nullability_from(
-        fields,
-        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
-    )
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
@@ -760,6 +796,36 @@ mod tests {
             .physical_stats_schema
             .clone()
             .expect("stats schema")
+    }
+
+    #[test]
+    fn checkpoint_with_parsed_stats_does_not_read_json_stats() -> DeltaResult<()> {
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let scan = mock_snapshot(segment)?
+            .scan_builder()
+            .with_stats(StatsOptions::all_struct())
+            .build()?;
+        let parsed_stats = scan
+            .state_info
+            .physical_stats_schema
+            .clone()
+            .expect("parsed stats schema");
+        let plan = scan
+            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, Some(parsed_stats)))?
+            .expect("metadata plan");
+        let checkpoint_scan = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanParquet(scan) => Some(scan),
+                _ => None,
+            })
+            .expect("checkpoint parquet scan");
+        let add = add_struct(&checkpoint_scan.schema);
+
+        assert!(add.field(STATS).is_none());
+        assert!(add.field(STATS_PARSED).is_some());
+        Ok(())
     }
 
     // Commit-arm operator sequence without optional pruning.
