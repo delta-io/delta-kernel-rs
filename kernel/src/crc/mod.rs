@@ -523,6 +523,11 @@ impl Crc {
                 ));
             }
         }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(last_manifest_commit) = &self.last_manifest_commit_opt {
+            last_manifest_commit.validate()?;
+        }
         Ok(())
     }
 }
@@ -1053,6 +1058,30 @@ mod tests {
     fn de_missing_last_manifest_commit_is_none() {
         let crc = Crc::try_from_json_bytes(crc_json_with_counts(0, 0, 1, 1).as_bytes(), 0).unwrap();
         assert_eq!(crc.last_manifest_commit_opt, None);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn de_last_manifest_commit_content_root_newer_than_version_is_rejected() {
+        // LastManifestCommit derives Deserialize, so an invalid pair bypasses `new`'s check.
+        // Crc::validate must catch it on the deserialization path.
+        let crc = Crc {
+            protocol: valid_protocol(),
+            file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&crc).unwrap();
+        json["lastManifestCommit"] = serde_json::json!({
+            "version": 3,
+            "contentRootVersion": 5,
+        });
+
+        let err = Crc::try_from_json_bytes(json.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contentRootVersion 5 exceeds version 3"),
+            "unexpected error: {err}"
+        );
     }
 
     // ===== numMetadata / numProtocol rejection =====

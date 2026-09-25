@@ -1341,16 +1341,26 @@ impl LastManifestCommit {
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn new(version: i64, content_root_version: i64) -> DeltaResult<Self> {
-        require!(
-            content_root_version <= version,
-            Error::generic(format!(
-                "lastManifestCommit contentRootVersion {content_root_version} exceeds version {version}"
-            ))
-        );
-        Ok(LastManifestCommit {
+        let last_manifest_commit = LastManifestCommit {
             version,
             content_root_version,
-        })
+        };
+        last_manifest_commit.validate()?;
+        Ok(last_manifest_commit)
+    }
+
+    /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
+    /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
+    /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.
+    pub(crate) fn validate(&self) -> DeltaResult<()> {
+        require!(
+            self.content_root_version <= self.version,
+            Error::generic(format!(
+                "lastManifestCommit contentRootVersion {} exceeds version {}",
+                self.content_root_version, self.version
+            ))
+        );
+        Ok(())
     }
 }
 
