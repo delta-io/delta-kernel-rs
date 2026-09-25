@@ -33,6 +33,7 @@ use delta_kernel::schema::{StructField, StructType};
 use crate::expression::to_df_struct_columns;
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
+use crate::scan::{lower_json_scan, lower_parquet_scan};
 use crate::utils::column_to_df_expr;
 
 /// Lowers one kernel [`Operator`](KernelOperator) over its already-lowered inputs.
@@ -82,8 +83,19 @@ pub(crate) fn lower_operator(
             lower_semi_join(semi_join, probe, build)
         }
         KernelOperator::UnionAll(union_all) => lower_union_all(union_all, inputs),
-        // TODO: lower the remaining operators (scans and Load), each in its own change.
-        _ => Err(DataFusionError::NotImplemented(format!(
+        KernelOperator::ScanParquet(scan) => {
+            let [] = inputs else {
+                return Err(input_count_error(0));
+            };
+            lower_parquet_scan(scan)
+        }
+        KernelOperator::ScanJson(scan) => {
+            let [] = inputs else {
+                return Err(input_count_error(0));
+            };
+            lower_json_scan(scan)
+        }
+        KernelOperator::DynamicScan(_) => Err(DataFusionError::NotImplemented(format!(
             "lowering operator {op} to a DataFusion LogicalPlan"
         ))),
     }
