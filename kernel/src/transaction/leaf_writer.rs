@@ -8,10 +8,7 @@ use crate::{DeltaResult, Engine, EngineData, Version};
 
 /// Writes a single leaf manifest for a manifest (content-tree) commit.
 ///
-/// Obtained from
-/// [`ManifestCommitState::new_leaf_node_writer`](super::manifest_commit_state::ManifestCommitState::new_leaf_node_writer).
-/// A leaf accepts file changes, then [`finish`](Self::finish) writes the manifest and returns a
-/// [`LeafNodeWriterResult`] the caller folds back into the owning `ManifestCommitState`.
+/// A `LeafNodeWriter` accepts file changes, then [`finish`](Self::finish) writes the manifest.
 #[internal_api]
 #[derive(Debug)]
 pub(crate) struct LeafNodeWriter {
