@@ -30,6 +30,7 @@ peak_alloc = { version = "0.3.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
   "state-proto",
+  "vendored-protoc",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.28.0" }
