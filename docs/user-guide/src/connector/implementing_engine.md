@@ -1,291 +1,137 @@
 # Implementing the Engine trait
 
-The `Engine` trait is the main integration point between your connector and Delta Kernel. For
-background on what the Engine trait is and when you need a custom one, see the
-[Connector Overview](./overview.md) and [The Engine Trait](../concepts/engine_trait.md).
+To integrate Kernel with your connector's storage, data format, and runtime, implement the
+capabilities required by `Engine` and assemble them behind one Engine value. Read
+[The Engine trait](../concepts/engine_trait.md) first for the role of each capability.
 
-## The Engine trait
+The [`Engine` rustdoc] defines the current trait. Follow its links for every handler's exact
+parameters, return values, errors, and ordering requirements. This page focuses on implementation
+sequence and design choices.
 
-The `Engine` trait has four required methods, each returning a handler:
+[`Engine` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.Engine.html
 
-```rust,ignore
-pub trait Engine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
-    fn storage_handler(&self) -> Arc<dyn StorageHandler>;
-    fn json_handler(&self) -> Arc<dyn JsonHandler>;
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-}
-```
+## Choose what to replace
 
-You don't have to implement all four handlers from scratch. A common approach is to start
-with `DefaultEngine` and selectively replace handlers. For example, you might provide a
-custom `ParquetHandler` that reads into your engine's native columnar format while reusing
-the default handlers for everything else.
+Start from the data and I/O boundaries your connector already owns. A custom Engine does not imply
+four unrelated implementations from scratch.
 
-Many of the `Engine` handlers take or return `EngineData`. See [EngineData](engine_data.md) for more
-information about this type.
+1. Decide which columnar representation crosses the Engine boundary.
+2. Reuse default handlers that already produce and consume that representation.
+3. Replace only the handlers that must integrate with connector-native services.
+4. Wrap the chosen handlers in one Engine implementation.
 
-## StorageHandler
+If your connector uses Arrow and `object_store`, prefer `DefaultEngine`. If it uses Arrow with a
+custom filesystem client, a custom storage handler may be enough. A non-Arrow connector usually
+needs matching JSON, Parquet, and evaluation handlers because those handlers exchange
+`EngineData`.
 
-`StorageHandler` provides file system operations. The kernel calls this to list and read
-files (as bytes) from storage.
+## Define the EngineData boundary
 
-```rust,ignore
-pub trait StorageHandler {
-    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>>;
+Implement `EngineData` before handlers that produce it. Kernel must be able to:
 
-    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
+- visit typed row values;
+- append computed or partition columns; and
+- apply a selection vector without assuming a concrete batch type.
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+Keep the concrete columnar type inside your Engine implementation. Kernel production code does not
+downcast `EngineData`. See [The EngineData trait](engine_data.md) for the visitor workflow and the
+[`EngineData` rustdoc] for exact method contracts.
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
+[`EngineData` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/engine_data/trait.EngineData.html
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
-}
-```
+## Implement storage access
 
-### Key contracts
+Your `StorageHandler` connects Kernel's object-level operations to the connector's filesystem or
+object-store client. Decide how the handler will preserve listing order, represent byte ranges, map
+not-found and already-exists conditions, and provide atomic publication where Kernel requires it.
 
-- **`list_from`**: Results must be sorted lexicographically by path. If the path ends with
-  `/`, list all files in that directory. Otherwise, list files lexicographically greater than
-  the given path in the same directory.
+Do not translate these rules from examples on this page. Implement against the current
+[`StorageHandler` rustdoc], then test the behavior through Kernel operations such as snapshot load
+and commit publication.
 
-- **`copy_atomic`**: Must fail with `Error::FileAlreadyExists` if the destination exists.
-  This is used for commit publishing in catalog-managed tables.
+[`StorageHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.StorageHandler.html
 
-- **`put`**: Writes raw bytes to the given path. If `overwrite` is false and the file already
-  exists, must fail with `Error::FileAlreadyExists`.
+## Implement JSON handling
 
-- **`head`**: Must return `Error::FileNotFound` if the file doesn't exist.
+Your `JsonHandler` converts Delta log data between JSON and your `EngineData` representation. Reuse
+the storage client from the previous step rather than creating a second I/O path with different
+authentication or retry behavior.
 
-- **`read_files`**: Each `FileSlice` is a `(Url, Option<Range<u64>>)`. When the range is
-  `None`, read the entire file.
+Test parsing and file reads with projected schemas, nullable fields, multiple input files, and
+predicates the implementation cannot evaluate. Test writes with null fields and conflicting
+destinations. The [`JsonHandler` rustdoc] defines the required ordering and serialization behavior.
 
-### Default implementation
+[`JsonHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.JsonHandler.html
 
-The `DefaultEngine` uses [`object_store`](https://docs.rs/object_store) for storage, which supports
-local filesystem, S3, GCS, and Azure out of the box.
+## Implement Parquet handling
 
-## JsonHandler
+The `ParquetHandler` is usually the performance-critical boundary because scans use it for table
+data and checkpoints. Integrate the connector's native reader when avoiding conversion or sharing
+its I/O scheduler matters.
 
-`JsonHandler` reads and writes JSON. The kernel uses this for Delta log commits
-(`_delta_log/*.json`) and checkpoint sidecars.
+Validate column projection, missing nullable columns, physical field IDs, metadata columns,
+multiple batches per file, and conservative predicate handling. Preserve the file and row ordering
+defined by the [`ParquetHandler` rustdoc].
 
-```rust,ignore
-pub trait JsonHandler {
-    fn parse_json(
-        &self,
-        json_strings: Box<dyn EngineData>,
-        output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+[`ParquetHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.ParquetHandler.html
 
-    fn read_json_files(
-        &self,
-        files: &[FileMeta],
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator>;
+## Implement expression evaluation
 
-    fn write_json_file(
-        &self,
-        path: &Url,
-        data: DeltaResultIterator<'_, FilteredEngineData>,
-        overwrite: bool,
-    ) -> DeltaResult<FileSize>;
-}
-```
+Your `EvaluationHandler` turns Kernel expressions and predicates into reusable evaluators over the
+chosen `EngineData` representation. Translate Kernel's schema and scalar types at evaluator
+construction time so repeated batch evaluation stays cheap.
 
-### Key contracts
+Treat unsupported expressions as an explicit compatibility decision. A predicate used as a
+best-effort hint must remain conservative: uncertainty keeps data instead of dropping possible
+matches. The [`EvaluationHandler` rustdoc] and evaluator trait links define their output contracts.
 
-- **`parse_json`**: Input is a single-column batch of strings (JSON objects). Output
-  columns match the `output_schema`. Missing fields should produce nulls for nullable columns.
+[`EvaluationHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.EvaluationHandler.html
 
-- **`read_json_files`**: Data must be returned in file order (same order as the `files` slice
-  argument), and rows within a file must be in source order. The predicate is an optional hint that
-  the engine may ignore. If applied, evaluate exact row values conservatively; unsupported
-  expressions and missing references remain unknown.
+## Support cancellation
 
-- **`write_json_file`**: Must write newline-delimited JSON (one JSON object per line). Null
-  columns should be omitted from the output to save space. The write must be atomic. If
-  `overwrite` is false and the file exists, fail with an error. On success, return the exact
-  number of serialized bytes written to the file.
-
-### Default implementation
-
-The `DefaultEngine` uses `arrow_json` for parsing and the `object_store` crate for I/O.
-
-## ParquetHandler
-
-`ParquetHandler` reads and writes Parquet files. This is typically the most important
-handler to customize, since it's on the critical path for data reading performance.
-
-```rust,ignore
-pub trait ParquetHandler {
-    fn read_parquet_files(
-        &self,
-        files: &[FileMeta],
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator>;
-
-    fn write_parquet_file(
-        &self,
-        location: Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()>;
-
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
-}
-```
-
-### Key contracts for `read_parquet_files`
-
-**Column resolution**: When reading, the handler must resolve columns from the Parquet file
-to the `physical_schema`:
-
-1. If a `StructField` in the schema has a field ID (via `ColumnMetadataKey::ParquetFieldId`
-   metadata), match by field ID first.
-2. Otherwise, fall back to matching by column name.
-3. If no match is found: return nulls for nullable columns, or an error for non-nullable
-   columns.
-
-**Column Ordering**: Columns must be returned in the order specified in the `physical_schema`
-argument, which is _not_ necessarily the order they may be specified in the parquet file itself.
-
-**Missing Columns**: If a column is specified in the schema, and is nullable, the parquet reader
-must return a column of all nulls.
-
-**Ordering**: Like `JsonHandler`, data must be returned in file order, and rows within a
-file must be in source order.
-
-**Predicate hint**: If applied, the complete predicate may discard data only when conservative
-evaluation proves it cannot match. Footer min/max may be cast only when the cast preserves their
-bounds; unsupported expressions and missing references remain unknown.
-
-**Metadata columns**: The handler must support two virtual metadata columns that are not
-stored in the Parquet file but generated at read time:
-
-| Metadata column | How to detect | Type | Values |
-|-----------------|---------------|------|--------|
-| Row index | `StructField` created with `MetadataColumnSpec::RowIndex` | `LONG`, non-nullable | Sequential 0-based position within the file |
-| File name | `StructField` has reserved field ID `2147483646` | `STRING`, non-nullable | Full file path/URL |
-
-**Footer reading**: `read_parquet_footer` reads only the Parquet metadata (no data). If the
-file has field IDs (column mapping), they must be preserved in the returned schema's
-`StructField` metadata under the `ParquetFieldId` key.
-
-### Default implementation
-
-The `DefaultEngine` uses the Apache Arrow Parquet reader/writer with support for column
-projection, predicate pushdown, metadata columns, and field-ID-based column matching.
-
-## Cancellation-aware reads
-
-When a caller attaches a `CancellationToken` to a scan (see
-[Cancelling a scan](../reading/scan_metadata.md#cancelling-a-scan)), Kernel threads it down to the
-Engine through cancellation-aware variants of the relevant `StorageHandler`, `JsonHandler`, and
-`ParquetHandler` methods. Their names end in `_with_cancellation`.
-
-You do not have to override these variants. For iterator-producing operations, the provided
-implementation checks the token before calling the plain method and again before each iterator pull. It
-cannot interrupt I/O initiated inside the plain method. The provided footer implementation checks
-before calling the plain method but cannot interrupt the footer read after it starts.
-
-A custom override replaces the provided implementation and must follow the
-[Engine cancellation contract](../concepts/engine_trait.md#cancellation). In summary, check before
-initiating I/O and before iterator pulls that may initiate more I/O. Do not start another request
-after a check reports cancellation. A request already in flight may complete, but cancellation
-does not permit draining an arbitrary prefetch queue before terminating.
-
-Override a variant when interrupting one slow request materially improves cancellation latency. The
-`DefaultEngine` races its asynchronous reads against the token:
-
-```rust,ignore
-fn read_parquet_files_with_cancellation(
-    &self,
-    files: &[FileMeta],
-    physical_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<FileDataReadResultIterator> {
-    // Kick off the async read as usual, then poll the read future and the token's
-    // `cancelled_future()` together. If cancellation wins the race, drop the in-flight
-    // work and yield `Err(Error::Cancelled)` as the iterator's terminal item.
-}
-```
-
-### The CancellationToken trait
-
-The token a caller supplies implements this trait:
-
-```rust,ignore
-pub trait CancellationToken: AsAny {
-    fn is_cancelled(&self) -> bool;
-    fn cancelled_future(&self) -> CancelledFuture<'_>;
-}
-```
-
-Kernel and your Engine only *consume* a token; the caller creates and fires it. `is_cancelled`
-provides a cheap synchronous pre-flight check. `cancelled_future` lets an asynchronous Engine wake
-a read blocked in I/O. Back it with your runtime's notification primitive, such as
-`tokio_util::sync::CancellationToken`; Kernel cannot synthesize it from `is_cancelled` without
-busy-polling.
-
-## EvaluationHandler
-
-`EvaluationHandler` creates reusable evaluators for expressions and predicates. The kernel
-uses this for data skipping (evaluating predicates against file statistics) and for per-file
-transformations (partition value injection, row tracking).
-
-```rust,ignore
-pub trait EvaluationHandler {
-    fn new_expression_evaluator(
-        &self,
-        input_schema: SchemaRef,
-        expression: ExpressionRef,
-        output_type: DataType,
-    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>>;
-
-    fn new_predicate_evaluator(
-        &self,
-        input_schema: SchemaRef,
-        predicate: PredicateRef,
-    ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
-
-    fn create_many(
-        &self,
-        schema: SchemaRef,
-        rows: Vec<Vec<Scalar>>,
-    ) -> DeltaResult<Box<dyn EngineData>>;
-}
-```
-
-The returned evaluators are reusable objects. The kernel creates them once and calls
-`evaluate()` on multiple batches:
-
-```rust,ignore
-pub trait ExpressionEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
-}
-
-pub trait PredicateEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
-}
-```
-
-### Key contracts
-
-- **Expression evaluators** produce one output row per input row. If `output_type` is a
-  struct, its fields describe the output columns. Otherwise, the output is a single column.
-
-- **Predicate evaluators** produce a single nullable boolean column. `true` means the row
-  matches, `false` or `null` means it doesn't.
-
-- **`create_many`** creates a multi-row `EngineData` by applying the given schema to multiple rows
-  of `Scalar` values. Each row contains one scalar per top-level field in the schema. Returns an
-  error if any row's scalar count doesn't match the schema's field count, or if a scalar value's
-  type doesn't match its corresponding field.
-
-### Default implementation
-
-The `DefaultEngine` uses Arrow compute kernels for expression evaluation.
+Kernel provides cancellation-aware variants for storage, JSON, and Parquet reads. The defaults
+check before calling a plain handler and before iterator pulls. Override them if your runtime can
+also interrupt a request waiting on I/O.
+
+Use the runtime's notification primitive to implement `CancellationToken::cancelled_future`.
+Avoid polling `is_cancelled` in a loop. Race the I/O future against cancellation, stop initiating
+new requests after cancellation wins, and allow already-completed work to finish normally.
+
+The [Engine cancellation contract] owns the exact semantics. Add tests for cancellation before a
+read, during an in-flight read, and between iterator pulls.
+
+[Engine cancellation contract]: https://docs.rs/delta_kernel/latest/delta_kernel/cancellation/index.html#engine-operation-contract
+
+## Assemble the Engine
+
+Store one shared instance of each handler in your Engine value. Returning the same handler instance
+lets evaluators, caches, clients, and runtime resources retain connector-defined lifetimes.
+
+Keep cross-handler configuration at this assembly boundary. For example, pass one storage client
+to the JSON and Parquet handlers instead of making each handler discover credentials independently.
+This avoids inconsistent retries, endpoints, and observability labels.
+
+If you reuse parts of `DefaultEngine`, make the ownership boundary visible in the Engine's
+constructor. Callers should configure the connector once and receive an Engine ready for Kernel
+operations.
+
+## Validate through public workflows
+
+Handler unit tests catch local contract violations. Add integration tests that exercise the Engine
+through public Kernel APIs:
+
+- load the latest snapshot and a specific historical version;
+- scan projected columns with supported and unsupported predicates;
+- read files that produce more than one `EngineData` batch;
+- apply partition values, column mapping, and deletion vectors;
+- write and reload a commit; and
+- cancel work at each supported I/O boundary.
+
+For cloud storage, run the write path against S3, Azure, and GCS. Object stores differ in conditional
+writes, listing behavior, and error mapping even when one client library abstracts them.
+
+## What's next
+
+- [The EngineData trait](engine_data.md) explains row visitors and selection vectors.
+- [Building a scan](../reading/building_a_scan.md) uses the Engine on the read path.
+- [Configuring storage](../storage/configuring_storage.md) covers the default engine's backends.

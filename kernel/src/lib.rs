@@ -7,6 +7,9 @@
 //! The [`delta_kernel_default_engine`](https://docs.rs/delta_kernel_default_engine) crate provides
 //! a ready-to-use implementation based on Arrow, `object_store`, and Tokio.
 //!
+//! The [Delta Kernel user guide](https://docs.delta.io/kernel/rust/) explains end-to-end connector
+//! workflows. This crate's rustdoc is the source of truth for exact API contracts.
+//!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
 //! [read-table-multi-threaded] example). An example for reading the table changes for a table
@@ -1044,6 +1047,10 @@ pub trait ParquetHandler: AsAny {
 /// on Delta tables.
 ///
 /// Connectors pass an implementation of this trait to Delta Kernel operations.
+/// See the [Engine implementation guide] for the cross-API workflow.
+///
+/// [Engine implementation guide]:
+/// https://docs.delta.io/kernel/rust/connector/implementing_engine.html
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;

@@ -83,6 +83,10 @@ pub enum CheckpointWriteResult {
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
+///
+/// See the [snapshot management guide] for construction and refresh workflows.
+///
+/// [snapshot management guide]: https://docs.delta.io/kernel/rust/reading/time_travel.html
 pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,

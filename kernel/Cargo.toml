@@ -21,6 +21,12 @@ all-features = true
 pre-release-replacements = [
   { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
   { file = "../README.md", search = "version = \"[a-z0-9\\.-]+\"", replace = "version = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = { version = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/concepts/feature_flags.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/concepts/feature_flags.md", search = "delta_kernel = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = { version = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/introduction.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/getting_started/quick_start_read.md", search = "delta_kernel = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = { version = \"{{version}}\"" },
 ]
 pre-release-hook = [
   "../release.sh",
