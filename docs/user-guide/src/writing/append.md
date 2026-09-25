@@ -108,6 +108,10 @@ The builder methods:
 
 ## WriteState and BoundWriteContext
 
+If the table declares column defaults, resolve any defaults your input needs and acknowledge them
+before requesting write state. See [Column defaults](./column_defaults.md) for both Kernel-parsed
+and connector-evaluated defaults.
+
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
 
