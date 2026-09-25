@@ -3296,64 +3296,64 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_with_manifest_commit_succeeds_on_adaptive_table() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.effective_table_config = adaptive_table_config();
-        txn.with_manifest_commit(engine.as_ref())?;
-        assert!(txn.manifest_commit_state.is_some());
-        Ok(())
-    }
+    mod manifest_commit_tests {
+        use super::*;
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_with_manifest_commit_rejects_non_adaptive_table() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        let result = txn.with_manifest_commit(engine.as_ref());
-        assert_result_error_with_message(result, "adaptiveMetadata-preview");
-        Ok(())
-    }
+        #[test]
+        fn with_manifest_commit_succeeds_on_adaptive_table() -> DeltaResult<()> {
+            let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+            txn.effective_table_config = adaptive_table_config();
+            txn.with_manifest_commit(engine.as_ref())?;
+            assert!(txn.manifest_commit_state.is_some());
+            Ok(())
+        }
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_with_manifest_commit_rejects_when_root_manifest_set() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
-        txn.effective_table_config = adaptive_table_config();
-        txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
-        let result = txn.with_manifest_commit(engine.as_ref());
-        assert_result_error_with_message(result, "mutually exclusive");
-        Ok(())
-    }
+        #[test]
+        fn with_manifest_commit_rejects_non_adaptive_table() -> DeltaResult<()> {
+            let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+            let result = txn.with_manifest_commit(engine.as_ref());
+            assert_result_error_with_message(result, "adaptiveMetadata-preview");
+            Ok(())
+        }
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_commit_rejects_pending_manifest_commit() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.effective_table_config = adaptive_table_config();
-        txn.with_manifest_commit(engine.as_ref())?;
-        assert_result_error_with_message(
-            txn.validate_manifest_commit_semantics(),
-            "not yet supported",
-        );
-        Ok(())
-    }
+        #[test]
+        fn with_manifest_commit_rejects_when_root_manifest_set() -> DeltaResult<()> {
+            let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+            let read_snapshot = txn.read_snapshot_opt.clone().unwrap();
+            txn.effective_table_config = adaptive_table_config();
+            txn.root_manifest_file = Some(dummy_root_manifest_file(read_snapshot));
+            let result = txn.with_manifest_commit(engine.as_ref());
+            assert_result_error_with_message(result, "mutually exclusive");
+            Ok(())
+        }
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_manifest_commit_leaf_writer_ops_unsupported() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.effective_table_config = adaptive_table_config();
-        let mut leaf_writer = txn
-            .with_manifest_commit(engine.as_ref())?
-            .new_leaf_node_writer(engine.as_ref())?;
-        let add_batch = create_valid_add_file_batch(false /* all_nullable */);
-        assert_result_error_with_message(
-            leaf_writer.add_files(engine.as_ref(), Box::new(ArrowEngineData::new(add_batch))),
-            "not yet supported",
-        );
-        assert_result_error_with_message(leaf_writer.finish(engine.as_ref()), "not yet supported");
-        Ok(())
+        #[test]
+        fn commit_rejects_pending_manifest_commit() -> DeltaResult<()> {
+            let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+            txn.effective_table_config = adaptive_table_config();
+            txn.with_manifest_commit(engine.as_ref())?;
+            assert_result_error_with_message(txn.commit(engine.as_ref()), "not yet supported");
+            Ok(())
+        }
+
+        #[test]
+        fn leaf_writer_ops_unsupported() -> DeltaResult<()> {
+            let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+            txn.effective_table_config = adaptive_table_config();
+            let mut leaf_writer = txn
+                .with_manifest_commit(engine.as_ref())?
+                .new_leaf_node_writer(engine.as_ref())?;
+            let add_batch = create_valid_add_file_batch(false /* all_nullable */);
+            assert_result_error_with_message(
+                leaf_writer.add_files(engine.as_ref(), Box::new(ArrowEngineData::new(add_batch))),
+                "not yet supported",
+            );
+            assert_result_error_with_message(
+                leaf_writer.finish(engine.as_ref()),
+                "not yet supported",
+            );
+            Ok(())
+        }
     }
 
     #[test]
