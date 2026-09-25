@@ -28,6 +28,7 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -165,6 +166,9 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
+    /// Applied to `checkpoint_transform` output to replace native partition values that may be
+    /// empty strings; see [`native_partition_value_may_be_empty`].
+    checkpoint_partition_values_merge: Option<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -285,6 +289,36 @@ impl ScanLogReplayProcessor {
             partition_schema_for_transform.clone(),
         )?;
 
+        // Native partition values that may be empty strings are reparsed from the string map into
+        // an extra checkpoint transform column, which a second evaluator merges.
+        let reparsed_partition_schema = partition_schema_for_transform
+            .as_ref()
+            .filter(|_| has_partition_values_parsed)
+            .and_then(|schema| reparsed_partition_schema(schema));
+        let checkpoint_output_schema = match &reparsed_partition_schema {
+            Some(schema) => Arc::new(
+                SchemaStructPatchBuilder::new()
+                    .append(StructField::nullable(
+                        REPARSED_PARTITION_VALUES_NAME,
+                        schema.clone(),
+                    ))
+                    .build(&output_schema)?,
+            ),
+            None => output_schema.clone(),
+        };
+        let checkpoint_partition_values_merge = partition_schema_for_transform
+            .as_ref()
+            .zip(reparsed_partition_schema.as_ref())
+            .map(|(partition_schema, reparsed_schema)| {
+                partition_values_merge_evaluator(
+                    engine,
+                    checkpoint_output_schema.clone(),
+                    partition_schema,
+                    reparsed_schema,
+                )
+            })
+            .transpose()?;
+
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
         // JSON once, then data skipping reads the already-parsed columns from the output.
@@ -323,8 +357,9 @@ impl ScanLogReplayProcessor {
                     synthesize_json,
                     partition_schema_for_transform.clone(),
                     false,
+                    false,
                 ),
-                output_schema.clone().into(),
+                output_schema.into(),
             )?,
             // Checkpoint transform: read pre-parsed columns directly when available
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
@@ -336,9 +371,11 @@ impl ScanLogReplayProcessor {
                     synthesize_json,
                     partition_schema_for_transform,
                     has_partition_values_parsed,
+                    reparsed_partition_schema.is_some(),
                 ),
-                output_schema.into(),
+                checkpoint_output_schema.into(),
             )?,
+            checkpoint_partition_values_merge,
             seen_file_keys,
             state_info,
             stats_options,
@@ -489,13 +526,19 @@ impl ScanLogReplayProcessor {
         actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> DeltaResult<(Box<dyn EngineData>, Vec<bool>)> {
-        let transform = if is_log_batch {
-            &self.commit_transform
-        } else {
-            &self.checkpoint_transform
-        };
         let start = std::time::Instant::now();
-        let transformed = transform.evaluate(actions);
+        let transformed = if is_log_batch {
+            self.commit_transform.evaluate(actions)
+        } else {
+            self.checkpoint_transform
+                .evaluate(actions)
+                .and_then(
+                    |transformed| match &self.checkpoint_partition_values_merge {
+                        Some(merge) => merge.evaluate(transformed.as_ref()),
+                        None => Ok(transformed),
+                    },
+                )
+        };
         self.metrics
             .add_action_transform_time_ns(start.elapsed().as_nanos() as u64);
         let transformed = transformed?;
@@ -780,6 +823,7 @@ pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
 pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
+const REPARSED_PARTITION_VALUES_NAME: &str = "__reparsedPartitionValues";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
@@ -848,6 +892,8 @@ fn scan_row_schema_with_parsed_columns(
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
 ///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
 ///   the `partitionValues` string map.
+/// - `reparse_partition_values`: With a native column, also appends the string map reconstruction
+///   as [`REPARSED_PARTITION_VALUES_NAME`] for [`partition_values_merge_evaluator`].
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -859,6 +905,7 @@ fn get_add_transform_expr(
     synthesize_json: bool,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
+    reparse_partition_values: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(null_lit(DataType::STRING))
@@ -905,17 +952,73 @@ fn get_add_transform_expr(
     // Add partitionValues_parsed when partition columns are needed for data skipping or for the
     // engine-facing typed output column.
     if partition_schema.is_some() {
-        let pv_parsed_expr = if has_partition_values_parsed {
+        let map_to_struct = || {
+            Arc::new(Expression::map_to_struct(
+                col!("add.partitionValues"),
+                MapToStructOptions::default(),
+            ))
+        };
+        if has_partition_values_parsed {
             // Checkpoint carries a native partitionValues_parsed column - read it directly.
-            col!("add.partitionValues_parsed")
+            fields.push(column_expr_ref!("add.partitionValues_parsed"));
+            if reparse_partition_values {
+                fields.push(map_to_struct());
+            }
         } else {
             // No native column (JSON commit): reconstruct from the string map.
-            Expression::map_to_struct(col!("add.partitionValues"), MapToStructOptions::default())
-        };
-        fields.push(Arc::new(pv_parsed_expr));
+            fields.push(map_to_struct());
+        }
     }
 
     Arc::new(Expression::struct_from(fields))
+}
+
+/// Whether a checkpoint's native `partitionValues_parsed` field of this type may hold a writer's
+/// literal empty string, which the Delta protocol reads as a null partition value.
+pub(crate) fn native_partition_value_may_be_empty(data_type: &DataType) -> bool {
+    *data_type == DataType::STRING || *data_type == DataType::BINARY
+}
+
+/// Returns the partition fields to reparse from `partitionValues` instead of reading natively, or
+/// `None` if every field can be read natively.
+fn reparsed_partition_schema(partition_schema: &StructType) -> Option<StructType> {
+    let fields: Vec<_> = partition_schema
+        .fields()
+        .filter(|field| native_partition_value_may_be_empty(field.data_type()))
+        .cloned()
+        .collect();
+    (!fields.is_empty()).then(|| StructType::new_unchecked(fields))
+}
+
+/// Builds an evaluator over the checkpoint transform output that rebuilds `partitionValues_parsed`
+/// with the fields of `reparsed_schema` taken from [`REPARSED_PARTITION_VALUES_NAME`], then drops
+/// that column. The merged struct keeps the native column's nullability.
+fn partition_values_merge_evaluator(
+    engine: &dyn Engine,
+    input_schema: SchemaRef,
+    partition_schema: &StructType,
+    reparsed_schema: &StructType,
+) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    let fields = partition_schema.fields().map(|field| {
+        let source = if reparsed_schema.contains(field.name()) {
+            REPARSED_PARTITION_VALUES_NAME
+        } else {
+            PARTITION_VALUES_PARSED_NAME
+        };
+        Expression::column([source, field.name()])
+    });
+    let native = Expression::column([PARTITION_VALUES_PARSED_NAME]);
+    let merged = Expression::struct_with_nullability_from(
+        fields,
+        Expression::from_pred(native.is_not_null()),
+    );
+    let (output_schema, expr) = ProjectionStructPatchBuilder::new(&input_schema)
+        .replace_expr(PARTITION_VALUES_PARSED_NAME, merged)
+        .drop(REPARSED_PARTITION_VALUES_NAME)
+        .build()?;
+    engine
+        .evaluation_handler()
+        .new_expression_evaluator(input_schema, expr, output_schema.into())
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -1195,9 +1298,12 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        get_add_transform_expr, scan_action_iter, scan_row_schema_with_parsed_columns,
+        InternalScanState, ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+        SerializableScanState,
     };
+    use crate::arrow::array::StringArray;
+    use crate::engine::sync::json::SyncJsonHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
@@ -1221,11 +1327,16 @@ mod tests {
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
-    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
+    use crate::schema::{
+        schema_ref, DataType, MetadataColumnSpec, SchemaRef, SchemaStructPatchBuilder, StructField,
+    };
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::{
+        assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data,
+    };
     use crate::{
         DeltaResult, EngineData, Error, Expression as Expr, ExpressionEvaluator, ExpressionRef,
+        JsonHandler as _,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -2195,6 +2306,7 @@ mod tests {
             true,  // synthesize_json
             partition_schema.clone(),
             false, // has_partition_values_parsed
+            false, // reparse_partition_values
         );
         assert_eq!(
             count_to_json(&with_synthesis),
@@ -2210,6 +2322,7 @@ mod tests {
             false, // synthesize_json
             partition_schema,
             false, // has_partition_values_parsed
+            false, // reparse_partition_values
         );
         assert_eq!(
             count_to_json(&without_synthesis),
@@ -2230,5 +2343,83 @@ mod tests {
             &null_lit(DataType::STRING),
             "structured-only checkpoint stats output must be a typed NULL"
         );
+    }
+
+    #[test]
+    fn checkpoint_partition_values_reparse_strings_and_keep_native_timestamps() {
+        let engine = SyncEngine::new();
+        let partition_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "event_time": TIMESTAMP,
+        };
+        let read_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .append_at(
+                    ["add"],
+                    StructField::nullable(
+                        "partitionValues_parsed",
+                        partition_schema.as_ref().clone(),
+                    ),
+                )
+                .build(&COMMIT_READ_SCHEMA)
+                .unwrap(),
+        );
+        let data_schema = schema_ref! { nullable "id": INTEGER };
+        let state_info = Arc::new(StateInfo {
+            logical_schema: data_schema.clone(),
+            physical_schema: data_schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            physical_partition_schema: Some(partition_schema.clone()),
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
+        });
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            has_partition_values_parsed: true,
+            checkpoint_read_schema: read_schema.clone(),
+        };
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            checkpoint_info,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions {
+                parsed_struct: true,
+            },
+        )
+        .unwrap();
+
+        // The native timestamps differ from their string-map form to show which source is read.
+        let handler = SyncJsonHandler::new(None);
+        let input = handler
+            .parse_json(
+                string_array_to_engine_data(StringArray::from(vec![
+                    r#"{"add":{"path":"a","size":1,"modificationTime":2,"dataChange":true,"partitionValues":{"name":"","event_time":"1970-01-01 00:00:00"},"partitionValues_parsed":{"name":"","event_time":"1970-01-01T08:00:00Z"}}}"#,
+                    r#"{"add":{"path":"b","size":1,"modificationTime":2,"dataChange":true,"partitionValues":{"name":"x","event_time":"1970-01-01 00:00:00"},"partitionValues_parsed":{"name":"x","event_time":"1970-01-01T09:00:00Z"}}}"#,
+                    r#"{}"#,
+                ])),
+                read_schema,
+            )
+            .unwrap();
+        let (actual, _) = processor
+            .transform_and_data_skip(input.as_ref(), false)
+            .unwrap();
+
+        let expected = handler
+            .parse_json(
+                string_array_to_engine_data(StringArray::from(vec![
+                    r#"{"path":"a","size":1,"modificationTime":2,"fileConstantValues":{"partitionValues":{"name":"","event_time":"1970-01-01 00:00:00"}},"partitionValues_parsed":{"name":null,"event_time":"1970-01-01T08:00:00Z"}}"#,
+                    r#"{"path":"b","size":1,"modificationTime":2,"fileConstantValues":{"partitionValues":{"name":"x","event_time":"1970-01-01 00:00:00"}},"partitionValues_parsed":{"name":"x","event_time":"1970-01-01T09:00:00Z"}}"#,
+                    r#"{"fileConstantValues":{}}"#,
+                ])),
+                scan_row_schema_with_parsed_columns(None, Some(partition_schema)).unwrap(),
+            )
+            .unwrap();
+        assert_batch_matches(actual, expected);
     }
 }

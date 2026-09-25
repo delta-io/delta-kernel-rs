@@ -283,7 +283,8 @@ adds the typed column.
 
 > [!TIP]
 > When the checkpoint already stores typed partition values, Kernel reads that column directly
-> and skips parsing entirely.
+> and skips parsing, except for String and Binary values, which it parses from the string map so
+> that an empty string becomes null.
 
 ## Cancelling a scan
 
