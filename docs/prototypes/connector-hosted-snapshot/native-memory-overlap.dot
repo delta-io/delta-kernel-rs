@@ -1,0 +1,14 @@
+digraph G {
+graph [bgcolor="white",pad="0.2"];
+node [shape=plain,fontname="DejaVu Sans"];
+life [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="9" CELLPADDING="12">
+<TR><TD COLSPAN="3" ALIGN="LEFT"><FONT POINT-SIZE="22"><B>Why concurrent planning changes the peak</B></FONT></TD></TR>
+<TR><TD ALIGN="LEFT">1,107 snapshot contexts</TD><TD BGCOLOR="#dce8f7"><B>Native baseline</B></TD><TD BGCOLOR="#dff1e9"><B>Borrowed candidate</B></TD></TR>
+<TR><TD ALIGN="LEFT"><B>Between calls</B></TD><TD BGCOLOR="#dce8f7">All native snapshot graphs retained<BR/><B>~4,273 MB after load</B></TD><TD BGCOLOR="#dff1e9">All small cores retained<BR/><B>~26 MB after load</B></TD></TR>
+<TR><TD ALIGN="LEFT"><B>16 active workers</B><BR/>Three repeats</TD><TD BGCOLOR="#dce8f7">Retained fleet + scan allocations<BR/><B>6,138.1-6,138.3 MB overall peak</B></TD><TD BGCOLOR="#fff0d5">Small cores + limited temporary overlap<BR/><B>120.5-127.3 MB overall peak</B><BR/>Load sets overall peak;<BR/>scan phase: 102.8-108.9 MB</TD></TR>
+<TR><TD ALIGN="LEFT"><B>1,107 workers released together</B><BR/>One candidate stress repeat</TD><TD BGCOLOR="#dce8f7">Retained fleet + concurrent scan state<BR/><B>6,138.7 MB overall peak</B><BR/>Baseline rerun: 6,138.65 MB</TD><TD BGCOLOR="#fff0d5">Many schema/configuration builds overlap<BR/><B>3,998.9 MB overall peak</B><BR/>Scan phase sets overall peak</TD></TR>
+<TR><TD COLSPAN="3" ALIGN="LEFT">Measured live allocator-tracked Rust bytes; decimal MB. Java heap and other native allocations are excluded.</TD></TR>
+<TR><TD COLSPAN="3" ALIGN="LEFT">Synchronized runs logged native Parquet reader OOMs despite passing benchmark checks; these are stress observations.</TD></TR>
+<TR><TD COLSPAN="3" ALIGN="LEFT"><B>Next, unmeasured:</B> lazy access can lower each temporary peak only if planning avoids the full schema/configuration.</TD></TR>
+</TABLE>>];
+}

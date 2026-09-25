@@ -1,0 +1,14 @@
+digraph G {
+graph [bgcolor="white",pad="0.2"];
+node [shape=plain,fontname="DejaVu Sans"];
+life [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="8" CELLPADDING="12">
+<TR><TD COLSPAN="5" ALIGN="LEFT"><FONT POINT-SIZE="22"><B>Rust memory lifetime: before and after</B></FONT></TD></TR>
+<TR><TD ALIGN="LEFT">Time moves right</TD><TD BGCOLOR="#e9eef4"><B>Load / handoff</B></TD><TD BGCOLOR="#e9eef4"><B>Between calls</B></TD><TD BGCOLOR="#e9eef4"><B>Plan call</B></TD><TD BGCOLOR="#e9eef4"><B>After plan + cleanup</B></TD></TR>
+<TR><TD ALIGN="LEFT"><B>BEFORE</B><BR/>Native baseline</TD><TD BGCOLOR="#dce8f7">Build Snapshot<BR/>and table configuration</TD><TD BGCOLOR="#dce8f7">Keep Snapshot,<BR/>schemas and configuration</TD><TD BGCOLOR="#dce8f7">Reuse retained state<BR/>+ allocate scan/plan state</TD><TD BGCOLOR="#dce8f7">Snapshot, schemas and<BR/>configuration remain</TD></TR>
+<TR><TD ALIGN="LEFT"><B>AFTER</B><BR/>Borrowed candidate</TD><TD BGCOLOR="#fff0d5">Load native snapshot;<BR/>validate Java handoff;<BR/>release large native state</TD><TD BGCOLOR="#dff1e9">Keep small<BR/>SnapshotCore</TD><TD BGCOLOR="#fff0d5">Decode metadata;<BR/>parse schema;<BR/>build temporary config/state</TD><TD BGCOLOR="#dff1e9">Scoped inputs released;<BR/>keep SnapshotCore</TD></TR>
+<TR><TD ALIGN="LEFT"><B>At close</B></TD><TD COLSPAN="4" ALIGN="LEFT">Both modes: measured tracked Rust allocation delta returns to zero.</TD></TR>
+<TR><TD COLSPAN="5" ALIGN="LEFT">Java keeps immutable hint state in the candidate. Result buffers live until the connector frees them.</TD></TR>
+<TR><TD COLSPAN="5" ALIGN="LEFT"><B>Schematic lifetimes, not a sampled memory trace. Cell sizes do not represent bytes.</B></TD></TR>
+<TR><TD COLSPAN="5" ALIGN="LEFT">One candidate plan still materializes schemas/configuration. An isolated per-snapshot peak reduction has not been measured.</TD></TR>
+</TABLE>>];
+}
