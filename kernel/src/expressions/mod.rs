@@ -665,8 +665,8 @@ impl ParseJsonExpression {
 /// Connector-supplied options controlling how a [`MapToStructExpression`] parses map values.
 ///
 /// Kernel does not infer these settings from the host environment or table metadata.
-/// Expression producers must use one reader timezone for all partition-value expressions in a
-/// scan so materialization and pruning cannot interpret the same value differently.
+/// Expression producers must use one timezone for all partition-value expressions in a scan so
+/// materialization and final predicate pruning cannot interpret the same value differently.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -674,7 +674,7 @@ pub struct MapToStructOptions {
 }
 
 impl MapToStructOptions {
-    /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
+    /// Interpret space-separated `TIMESTAMP` values in `timestamp_timezone`.
     ///
     /// Accepts an IANA timezone identifier or a fixed offset in `+HH:MM` or `-HH:MM` form. Named
     /// zones preserve their clock-transition rules; fixed offsets apply when the reader
@@ -730,8 +730,7 @@ impl MapToStructOptions {
 /// for existing tables that contain a literal empty string.
 ///
 /// Non-empty strings must follow the Delta [protocol] partition value serialization rules. Kernel's
-/// reference evaluator implements these rules with [`PrimitiveType::parse_scalar`] and equivalent
-/// Arrow parsers for dates and timestamps, establishing this engine-facing behavior:
+/// reference evaluator establishes this engine-facing behavior:
 ///
 /// - STRING: return the input string unchanged.
 /// - BINARY: return the input string's UTF-8 bytes after JSON string unescaping, not hex or base64.
@@ -741,18 +740,16 @@ impl MapToStructOptions {
 ///   round or rescale.
 /// - BOOLEAN: accept case-insensitive `true` or `false`, with no numeric or yes/no aliases.
 /// - DATE: parse `{year}-{month}-{day}`.
-/// - TIMESTAMP: accept date-only values and timestamps with a space, `T`, or `t` separator,
-///   optional fractional seconds, an optional numeric offset, or a trailing IANA timezone. Parse
-///   values with an offset or timezone as absolute instants; parse offset-less values in the reader
-///   timezone from [`MapToStructOptions`], or UTC by default.
+/// - TIMESTAMP: parse a protocol-formatted space-separated timestamp in the timezone from
+///   [`MapToStructOptions`], or UTC by default. Parse a protocol-formatted ISO 8601 timestamp with
+///   an explicit offset as an absolute instant. Truncate fractional seconds to microseconds.
 /// - TIMESTAMP_NTZ: parse a space-separated timestamp without an offset and preserve the local
 ///   wall-clock value.
 /// - Interval types: parse an ANSI interval literal accepted by [`PrimitiveType::parse_scalar`].
 /// - VOID: reject every non-empty value.
 ///
-/// The reader timezone does not affect a timestamp carrying its own time zone or offset. Modern
-/// writers use the protocol's UTC-adjusted ISO 8601 form, which therefore reads independently of
-/// the configured reader timezone.
+/// The configured timezone does not affect a timestamp carrying an explicit offset. The
+/// protocol's UTC-adjusted ISO 8601 form therefore reads independently of the configured timezone.
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
