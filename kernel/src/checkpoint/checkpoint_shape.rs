@@ -51,17 +51,25 @@ impl CheckpointShape {
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
     /// read.
+    pub(crate) fn try_new(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> KernelResult<CheckpointShape> {
+        Self::try_new_for_segment(exec, snapshot.log_segment(), false)
+    }
+
     #[tracing::instrument(
         name = "checkpoint_shape.try_new",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_for_segment(
         exec: &dyn PlanExecutor,
-        snapshot: &Snapshot,
+        segment: &LogSegment,
+        needs_leaf_schema: bool,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, false)
+        Self::try_new_impl(exec, segment, needs_leaf_schema)
     }
 
     /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
@@ -78,16 +86,14 @@ impl CheckpointShape {
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, true)
+        Self::try_new_for_segment(exec, snapshot.log_segment(), true)
     }
 
     fn try_new_impl(
         exec: &dyn PlanExecutor,
-        snapshot: &Snapshot,
+        segment: &LogSegment,
         needs_leaf_schema: bool,
     ) -> KernelResult<CheckpointShape> {
-        let segment = snapshot.log_segment();
-
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
             Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
             Some(checkpoint) => (&checkpoint.location, FileType::Parquet),

@@ -55,6 +55,8 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[internal_api]
 pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+pub(crate) use state::log_segment_from_state;
 #[cfg(feature = "internal-api")]
 pub use state::SnapshotState;
 
