@@ -1,5 +1,6 @@
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
+mod empty_projection;
 mod parquet_pushdown;
 mod scan_cancellation;
 

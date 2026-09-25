@@ -269,7 +269,14 @@ fn evaluate_struct_patch_expression(
             .and_then(|s| s.nulls().cloned())
     });
 
-    let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
+    let data = StructArray::try_new_with_length(
+        output_fields.into(),
+        output_cols,
+        source_null_buffer,
+        source_array
+            .as_ref()
+            .map_or(batch.num_rows(), |source| source.len()),
+    )?;
     Ok(Arc::new(data))
 }
 
@@ -1404,6 +1411,39 @@ mod tests {
 
         // Verify inserted field (literal 555)
         validate_i32_column(modify_result, 2, &[555, 555, 555]);
+    }
+
+    #[rstest]
+    fn dropping_all_struct_fields_preserves_row_count(
+        #[values(false, true)] nested: bool,
+        #[values(0, 3)] row_count: usize,
+    ) {
+        let (batch, patch) = if nested {
+            (
+                create_nested_test_batch(),
+                ExpressionStructPatchBuilder::new_nested(["nested"])
+                    .drop("x")
+                    .drop("y"),
+            )
+        } else {
+            (
+                create_test_batch(),
+                ExpressionStructPatchBuilder::new()
+                    .drop("a")
+                    .drop("b")
+                    .drop("c"),
+            )
+        };
+        let expr = Expr::struct_patch(patch).unwrap();
+        let result = evaluate_expression(
+            &expr,
+            &batch.slice(0, row_count),
+            Some(&DataType::from(schema! {})),
+        )
+        .unwrap();
+        let result = result.as_struct();
+        assert_eq!(result.num_columns(), 0);
+        assert_eq!(result.len(), row_count);
     }
 
     #[test]

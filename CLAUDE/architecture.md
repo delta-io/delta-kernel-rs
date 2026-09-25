@@ -63,9 +63,8 @@ column mapping, schema evolution).
 Data-file Parquet predicate pushdown requires an explicit `with_parquet_pushdown_for_testing()`
 opt-in, exposed only for tests and the `test-utils` feature. The opt-in binds partition references
 to Add-action values before pushdown. Ordinary execution leaves pushdown disabled because the
-built-in Parquet reader can misinterpret decimal scales and timestamp units. Direct Parquet reads
-and checkpoint pruning retain their existing behavior. Callers must still apply the predicate for
-exact row-level filtering.
+built-in Parquet reader can misinterpret decimal scales and timestamp units. Callers must still
+apply the predicate for exact row-level filtering.
 
 **Key modules** (`kernel/src/scan/`): `log_replay.rs` (reconcile Add/Remove into active file
 set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and partition values).

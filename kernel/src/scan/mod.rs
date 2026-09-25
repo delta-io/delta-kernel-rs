@@ -1361,7 +1361,11 @@ impl Scan {
     /// The scan predicate is used for Delta file skipping. Data-file Parquet predicate pushdown
     /// is disabled unless explicitly enabled through the test-only opt-in. Returned rows are not
     /// guaranteed to satisfy the predicate; callers must apply any remaining row-level filter.
-    /// Deletion vectors are applied using original file row indexes.
+    /// Deletion vectors use original file row indexes. Even with pushdown disabled, the engine's
+    /// [`crate::ParquetHandler`] must supply [`crate::schema::MetadataColumnSpec::RowIndex`]
+    /// for DV-bearing files, including scans without an explicit row-index projection.
+    /// Missing, null, or negative indexes produce errors in the returned iterator.
+    /// Internal row-index columns are removed from the logical output.
     ///
     /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
     /// [`Scan::scan_metadata`] instead.

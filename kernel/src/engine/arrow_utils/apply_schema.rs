@@ -15,6 +15,7 @@ use crate::arrow::array::{
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
+use crate::arrow::record_batch::RecordBatchOptions;
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -35,11 +36,14 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
+    let row_count = applied.len();
     let (fields, columns, _nulls) = applied.into_parts();
+    let options = RecordBatchOptions::default().with_row_count(Some(row_count));
 
-    Ok(RecordBatch::try_new(
+    Ok(RecordBatch::try_new_with_options(
         Arc::new(ArrowSchema::new(fields)),
         columns,
+        &options,
     )?)
 }
 
@@ -116,10 +120,11 @@ fn transform_struct(
             transformed_cols.len()
         )));
     }
-    Ok(StructArray::try_new(
+    Ok(StructArray::try_new_with_length(
         transformed_fields.into(),
         transformed_cols,
         nulls,
+        struct_array.len(),
     )?)
 }
 
@@ -399,6 +404,14 @@ mod apply_schema_validation_tests {
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
+
+    #[rstest]
+    fn apply_schema_preserves_empty_struct_row_count(#[values(0, 3)] row_count: usize) {
+        let array = StructArray::new_empty_fields(row_count, None);
+        let result = apply_schema(&array, &DataType::from(schema! {})).unwrap();
+        assert_eq!(result.num_columns(), 0);
+        assert_eq!(result.num_rows(), row_count);
+    }
 
     #[rstest]
     fn apply_schema_accepts_any_binary_representation_for_variant(

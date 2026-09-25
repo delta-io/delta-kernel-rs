@@ -4,6 +4,7 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::arrow::array::AsArray as _;
 use delta_kernel::arrow::datatypes::Int64Type;
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit, Predicate};
@@ -18,8 +19,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     begin_transaction, create_add_files_metadata, generate_batch, into_record_batch,
-    modify_add_file_partition_keys, record_batch_to_bytes_with_props, AddFilePartitionKeyModify,
-    IntoArray,
+    modify_add_file_partition_keys, read_scan, record_batch_to_bytes_with_props,
+    AddFilePartitionKeyModify, IntoArray,
 };
 use url::Url;
 
@@ -171,35 +172,45 @@ async fn parquet_pruning_preserves_deletion_vector_positions(
 
 #[rstest::rstest]
 #[case::and(
-    Some("7"),
+    vec![Some("7")],
     Predicate::and(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))),
-    vec![2, 3]
+    vec![(Some(7), 2), (Some(7), 3)]
 )]
 #[case::or(
-    Some("7"),
+    vec![Some("7")],
     Predicate::or(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))),
-    vec![0, 1, 2, 3]
+    vec![(Some(7), 0), (Some(7), 1), (Some(7), 2), (Some(7), 3)]
+)]
+#[case::or_multiple_files(
+    vec![Some("7"), Some("8")],
+    Predicate::or(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))),
+    vec![(Some(7), 0), (Some(7), 1), (Some(7), 2), (Some(7), 3), (Some(8), 2), (Some(8), 3)]
+)]
+#[case::or_multiple_files_reversed(
+    vec![Some("8"), Some("7")],
+    Predicate::or(col!("part").eq(lit(7i64)), col!("id").ge(lit(2i64))),
+    vec![(Some(7), 0), (Some(7), 1), (Some(7), 2), (Some(7), 3), (Some(8), 2), (Some(8), 3)]
 )]
 #[case::not(
-    Some("7"),
+    vec![Some("7")],
     Predicate::not(Predicate::or(col!("part").eq(lit(8i64)), col!("id").lt(lit(2i64)))),
-    vec![2, 3]
+    vec![(Some(7), 2), (Some(7), 3)]
 )]
 #[case::null(
-    None,
+    vec![None],
     Predicate::and(col!("part").is_null(), col!("id").ge(lit(2i64))),
-    vec![2, 3]
+    vec![(None, 2), (None, 3)]
 )]
 #[case::not_null(
-    None,
+    vec![None],
     Predicate::or(col!("part").is_not_null(), col!("id").ge(lit(2i64))),
-    vec![2, 3]
+    vec![(None, 2), (None, 3)]
 )]
 #[tokio::test]
 async fn parquet_predicate_uses_delta_partition_values(
-    #[case] partition_value: Option<&str>,
+    #[case] partition_values: Vec<Option<&str>>,
     #[case] predicate: Predicate,
-    #[case] mut expected: Vec<i64>,
+    #[case] mut expected: Vec<(Option<i64>, i64)>,
     #[values("none", "name")] mapping: &str,
     #[values(false, true)] with_dv: bool,
     #[values(1, 3)] batch_size: usize,
@@ -238,65 +249,74 @@ async fn parquet_predicate_uses_delta_partition_values(
             .build(),
     );
     let size = bytes.len() as i64;
-    store.put(&Path::from("data.parquet"), bytes.into()).await?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
-    let metadata = create_add_files_metadata(
-        txn.add_files_schema(),
-        vec![("data.parquet", size, 0, Some(4))],
-    )?;
-    let metadata = modify_add_file_partition_keys(
-        into_record_batch(metadata),
-        &[AddFilePartitionKeyModify::Insert {
-            key: part_name,
-            value: partition_value,
-        }],
-    );
-    txn.add_files(Box::new(ArrowEngineData::new(metadata)));
+    for (file, partition_value) in partition_values.iter().enumerate() {
+        let path = format!("{file}.parquet");
+        store
+            .put(&Path::from(path.as_str()), bytes.clone().into())
+            .await?;
+        let metadata =
+            create_add_files_metadata(txn.add_files_schema(), vec![(&path, size, 0, Some(4))])?;
+        let metadata = modify_add_file_partition_keys(
+            into_record_batch(metadata),
+            &[AddFilePartitionKeyModify::Insert {
+                key: part_name,
+                value: *partition_value,
+            }],
+        );
+        txn.add_files(Box::new(ArrowEngineData::new(metadata)));
+    }
     let mut snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-    let expected_partition_value = partition_value.map(|value| value.parse::<i64>().unwrap());
     if with_dv {
         // Deletion positions differ between row groups so a shifted mask deletes the wrong row.
         let deleted = [0, 3];
         let mut txn = create_dv_update_transaction(snapshot.table_root(), engine.as_ref())?;
-        let context = txn
-            .write_state()?
-            .write_context_builder()
-            .with_partition_values(HashMap::from([(
-                "part".to_string(),
-                expected_partition_value.into(),
-            )]))
-            .build()?;
-        let mut dv = KernelDeletionVector::new();
-        dv.add_deleted_row_indexes(deleted);
-        let descriptor = write_deletion_vector_to_store(&store, &context, dv, "").await?;
+        let state = txn.write_state()?;
+        let mut descriptors = HashMap::new();
+        for (file, partition_value) in partition_values.iter().enumerate() {
+            let value = partition_value.map(|value| value.parse::<i64>().unwrap());
+            let context = state
+                .write_context_builder()
+                .with_partition_values(HashMap::from([("part".to_string(), value.into())]))
+                .build()?;
+            let mut dv = KernelDeletionVector::new();
+            dv.add_deleted_row_indexes(deleted);
+            let descriptor = write_deletion_vector_to_store(&store, &context, dv, "").await?;
+            descriptors.insert(format!("{file}.parquet"), descriptor);
+        }
         txn.update_deletion_vectors(
-            HashMap::from([("data.parquet".to_string(), descriptor)]),
+            descriptors,
             get_scan_files(snapshot, engine.as_ref())?
                 .into_iter()
                 .map(Ok),
         )?;
         snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-        expected.retain(|id| !deleted.contains(&(*id as u64)));
+        expected.retain(|(_, id)| !deleted.contains(&(*id as u64)));
     }
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(predicate))
         .build()?;
-    let mut actual = Vec::new();
-    for data in scan.with_parquet_pushdown_for_testing().execute(engine)? {
-        let batch = into_record_batch(data?);
-        assert_eq!(batch.num_columns(), 2);
-        actual.extend(
-            batch
-                .column(0)
-                .as_primitive::<Int64Type>()
-                .values()
-                .iter()
-                .copied(),
-        );
-        let parts = batch.column(1).as_primitive::<Int64Type>();
-        assert!(parts.iter().all(|value| value == expected_partition_value));
-    }
-    assert_eq!(actual, expected);
+    let batches = read_scan(&scan.with_parquet_pushdown_for_testing(), engine)?;
+    assert_eq!(collect_partition_id_pairs(&batches), expected);
     Ok(())
+}
+
+fn collect_partition_id_pairs(batches: &[RecordBatch]) -> Vec<(Option<i64>, i64)> {
+    let mut actual = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "id");
+        assert_eq!(batch.schema().field(1).name(), "part");
+        let ids = batch.column(0).as_primitive::<Int64Type>();
+        let parts = batch.column(1).as_primitive::<Int64Type>();
+        actual.extend(
+            parts
+                .iter()
+                .zip(ids.iter())
+                .map(|(part, id)| (part, id.unwrap())),
+        );
+    }
+    actual.sort_unstable();
+    actual
 }
