@@ -121,8 +121,9 @@ fn collect_scan_paths(
     engine: Arc<TestEngine>,
     use_parallel: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    fn push_path(paths: &mut Vec<String>, scan_file: delta_kernel::scan::state::ScanFile) {
+    fn push_path(paths: &mut Vec<String>, scan_file: delta_kernel::scan::state::ScanFile) -> bool {
         paths.push(scan_file.path);
+        true
     }
 
     let mut paths: Vec<String> = Vec::new();
