@@ -205,7 +205,8 @@ worker with `write_state_decode`. Local writers can skip this round trip.
 Create-table writes use the `create_table_get_*_write_context` functions and do not expose
 transportable write state.
 Create a builder for each output partition with `write_context_builder`. Partitioned writers set
-values with `write_context_builder_with_partition_values`; writers that provide materialized
+values keyed by logical names with `write_context_builder_with_partition_values` or exact physical
+names with `write_context_builder_with_physical_partition_values`; writers that provide materialized
 row-tracking columns also call `write_context_builder_with_row_tracking_columns`. Finish with
 `write_context_builder_build`. Builders and bound contexts hold their own state reference, so they
 remain valid after `free_write_state`. Drop an unused builder with `free_write_context_builder` and

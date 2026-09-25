@@ -8,7 +8,7 @@ use url::Url;
 use super::BoundWriteContext;
 use crate::expressions::{lit, ColumnName, ExpressionStructPatchBuilder, Scalar};
 use crate::partition::serialization::serialize_partition_value;
-use crate::partition::validation::validate_partition_values;
+use crate::partition::validation::{validate_partition_values, validate_physical_partition_values};
 use crate::schema::void_utils::add_void_stripping;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
@@ -90,7 +90,7 @@ pub struct RowTrackingMetadataColumns<'a> {
 #[derive(Debug)]
 pub struct BoundWriteContextBuilder {
     write_state: Arc<WriteState>,
-    partition_values: Option<HashMap<String, Scalar>>,
+    partition_values: Option<PartitionValueBinding>,
     logical_row_id_col_name: Option<String>,
     logical_row_commit_version_col_name: Option<String>,
 }
@@ -105,7 +105,20 @@ impl BoundWriteContextBuilder {
     /// Names are matched case-insensitively and normalized to schema case. The map must contain
     /// every partition column and no other keys.
     pub fn with_partition_values(mut self, partition_values: HashMap<String, Scalar>) -> Self {
-        self.partition_values = Some(partition_values);
+        self.partition_values = Some(PartitionValueBinding::Logical(partition_values));
+        self
+    }
+
+    /// Binds one typed value for each physical partition column.
+    ///
+    /// Names must exactly match the physical names of every partition column, with no other keys.
+    /// Physical names are case-sensitive. Values are validated against the logical schema when
+    /// [`build`](Self::build) is called. Null-equivalent values require nullable partition columns.
+    pub fn with_physical_partition_values(
+        mut self,
+        partition_values: HashMap<String, Scalar>,
+    ) -> Self {
+        self.partition_values = Some(PartitionValueBinding::Physical(partition_values));
         self
     }
 
@@ -170,12 +183,20 @@ impl BoundWriteContextBuilder {
 
         let normalized = self
             .partition_values
-            .map(|partition_values| {
-                validate_partition_values(
+            .map(|binding| match binding {
+                PartitionValueBinding::Logical(partition_values) => validate_partition_values(
                     &self.write_state.logical_partition_columns,
                     &self.write_state.full_logical_schema,
                     partition_values,
-                )
+                ),
+                PartitionValueBinding::Physical(partition_values) => {
+                    validate_physical_partition_values(
+                        &self.write_state.logical_partition_columns,
+                        &self.write_state.full_logical_schema,
+                        self.write_state.column_mapping_mode,
+                        partition_values,
+                    )
+                }
             })
             .transpose()?;
 
@@ -282,6 +303,12 @@ impl BoundWriteContextBuilder {
     }
 }
 
+#[derive(Debug)]
+enum PartitionValueBinding {
+    Logical(HashMap<String, Scalar>),
+    Physical(HashMap<String, Scalar>),
+}
+
 #[derive(Serialize)]
 struct WriteStateWire<'a> {
     version: u32,
@@ -298,7 +325,7 @@ impl WriteState {
     /// Creates a builder for a write context.
     ///
     /// For an unpartitioned table, call [`BoundWriteContextBuilder::build`] directly. For a
-    /// partitioned table, call [`BoundWriteContextBuilder::with_partition_values`] first.
+    /// partitioned table, supply logical or physical partition values before building.
     pub fn write_context_builder(self: &Arc<Self>) -> BoundWriteContextBuilder {
         BoundWriteContextBuilder {
             write_state: Arc::clone(self),
@@ -420,7 +447,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::schema_ref;
+    use crate::schema::{schema_ref, MetadataValue};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::Engine;
@@ -477,6 +504,7 @@ mod tests {
     #[rstest]
     #[case::default(ColumnMappingMode::None, false, false, 2, false, false, false)]
     #[case::column_mapping(ColumnMappingMode::Name, false, false, 7, false, false, true)]
+    #[case::column_mapping_id(ColumnMappingMode::Id, false, false, 7, false, false, true)]
     #[case::materialized_partition(ColumnMappingMode::None, true, false, 2, false, false, false)]
     #[case::randomized_prefix(ColumnMappingMode::None, false, true, 7, false, false, true)]
     #[case::row_tracking(ColumnMappingMode::None, false, false, 2, true, false, false)]
@@ -572,6 +600,22 @@ mod tests {
             .field("year")
             .unwrap()
             .physical_name(column_mapping_mode);
+        let physical_context = decoded
+            .write_context_builder()
+            .with_physical_partition_values(HashMap::from([(
+                expected_partition_key.to_string(),
+                Scalar::Integer(2024),
+            )]))
+            .build()
+            .unwrap();
+        assert_eq!(
+            physical_context.physical_partition_values(),
+            decoded_context.physical_partition_values()
+        );
+        assert_eq!(
+            physical_context.logical_to_physical(),
+            decoded_context.logical_to_physical()
+        );
         assert_eq!(
             decoded_context.physical_partition_values(),
             &HashMap::from([(expected_partition_key.into(), Some("2024".into()))])
@@ -591,6 +635,117 @@ mod tests {
         } else {
             assert_eq!(write_dir, "/table/year=2024/");
         }
+    }
+
+    #[rstest]
+    #[case::none(ColumnMappingMode::None)]
+    #[case::id(ColumnMappingMode::Id)]
+    #[case::name(ColumnMappingMode::Name)]
+    fn physical_partition_values_reject_invalid_keys_and_values(
+        #[case] column_mapping_mode: ColumnMappingMode,
+    ) {
+        let state = partitioned_write_state(column_mapping_mode, false, false, 2, false);
+        let physical_name = state
+            .full_logical_schema
+            .field("year")
+            .unwrap()
+            .physical_name(column_mapping_mode)
+            .to_string();
+        let error_for = |values| {
+            state
+                .write_context_builder()
+                .with_physical_partition_values(values)
+                .build()
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert!(error_for(HashMap::new()).contains("missing partition column"));
+        assert!(error_for(HashMap::from([(
+            "unknown".to_string(),
+            Scalar::Integer(2024),
+        )]))
+        .contains("unknown partition column 'unknown'"));
+        assert!(error_for(HashMap::from([(
+            physical_name.to_uppercase(),
+            Scalar::Integer(2024),
+        )]))
+        .contains("unknown partition column"));
+        assert!(error_for(HashMap::from([(
+            physical_name.clone(),
+            Scalar::String("2024".into()),
+        )]))
+        .contains("value of type"));
+        assert!(error_for(HashMap::from([(
+            physical_name.clone(),
+            Scalar::Null(DataType::INTEGER),
+        )]))
+        .contains("is not nullable"));
+        if column_mapping_mode != ColumnMappingMode::None {
+            assert_ne!(physical_name, "year");
+            assert!(error_for(HashMap::from([
+                ("year".to_string(), Scalar::Integer(2024),)
+            ]))
+            .contains("unknown partition column 'year'"));
+        }
+    }
+
+    #[rstest]
+    #[case::id(ColumnMappingMode::Id, "id")]
+    #[case::name(ColumnMappingMode::Name, "name")]
+    fn physical_partition_names_differing_only_by_case_bind_separately(
+        #[case] column_mapping_mode: ColumnMappingMode,
+        #[case] mode_property: &str,
+    ) -> DeltaResult<()> {
+        let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
+            StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(id)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String(physical_name.to_string()),
+                ),
+            ])
+        };
+        let schema = Arc::new(StructType::try_new([
+            physical_field("first", "Part", 1),
+            physical_field("second", "part", 2),
+            StructField::nullable("value", DataType::INTEGER),
+        ])?);
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let txn = create_table("memory:///case_sensitive_partitions", schema, "test")
+            .with_data_layout(DataLayout::partitioned(["first", "second"]))
+            .with_table_properties([("delta.columnMapping.mode", mode_property)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let state = WriteState::decode(&txn.write_state()?.encode()?)?;
+
+        let physical_context = state
+            .write_context_builder()
+            .with_physical_partition_values(HashMap::from([
+                ("Part".to_string(), Scalar::Integer(1)),
+                ("part".to_string(), Scalar::Integer(2)),
+            ]))
+            .build()?;
+        let logical_context = state
+            .write_context_builder()
+            .with_partition_values(HashMap::from([
+                ("first".to_string(), Scalar::Integer(1)),
+                ("second".to_string(), Scalar::Integer(2)),
+            ]))
+            .build()?;
+        assert_eq!(state.column_mapping_mode, column_mapping_mode);
+        assert_eq!(
+            physical_context.physical_partition_values(),
+            &HashMap::from([
+                ("Part".to_string(), Some("1".to_string())),
+                ("part".to_string(), Some("2".to_string())),
+            ])
+        );
+        assert_eq!(
+            physical_context.physical_partition_values(),
+            logical_context.physical_partition_values()
+        );
+        Ok(())
     }
 
     #[rstest]

@@ -916,7 +916,8 @@ mod tests {
         free_write_context, get_logical_to_physical, get_partitioned_write_context,
         get_physical_write_schema, get_unpartitioned_write_context, get_write_dir, get_write_path,
         get_write_schema, resolve_file_path, visit_partition_values, write_context_builder_build,
-        write_context_builder_with_partition_values, FfiRowTrackingMetadataColumns,
+        write_context_builder_with_partition_values,
+        write_context_builder_with_physical_partition_values, FfiRowTrackingMetadataColumns,
         SharedWriteContext,
     };
 
@@ -1278,6 +1279,7 @@ mod tests {
     async fn test_distributed_write_state_outlives_transaction(
         #[case] partitioned: bool,
         #[values(false, true)] roundtrip: bool,
+        #[values(false, true)] physical_partition_keys: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let schema = schema_ref! {
             nullable "number": INTEGER,
@@ -1446,8 +1448,15 @@ mod tests {
                             engine.shallow_copy(),
                         )
                     });
-                    builder =
-                        unsafe { write_context_builder_with_partition_values(builder, partitions) };
+                    builder = if physical_partition_keys {
+                        unsafe {
+                            write_context_builder_with_physical_partition_values(
+                                builder, partitions,
+                            )
+                        }
+                    } else {
+                        unsafe { write_context_builder_with_partition_values(builder, partitions) }
+                    };
                 }
                 builders.push((value, builder));
             }

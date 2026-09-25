@@ -13,11 +13,11 @@
 //! See the encoding tables in the [`super`] module for the full set of partition-eligible
 //! types and their expected serializations.
 //!
-//! The primary entry point is [`validate_partition_values`], which combines key validation
-//! and type checking. The two phases are also exposed individually for testing:
+//! The entry points are [`validate_partition_values`] for logical keys and
+//! [`validate_physical_partition_values`] for physical keys. Both combine:
 //!
-//! - [`validate_keys`]: checks key completeness (case-insensitive matching, normalizes to schema
-//!   case, detects post-normalization duplicates).
+//! - [`validate_keys`]: checks key completeness using the selected matching rule and re-keys values
+//!   to logical schema names.
 //! - [`validate_types`]: checks that each `Scalar`'s type matches the partition column's schema
 //!   type, and that non-null partition columns are never assigned a value that would serialize to a
 //!   null partition value.
@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use crate::expressions::Scalar;
 use crate::partition::serialization::would_serialize_to_null;
 use crate::schema::{DataType, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// Validates and normalizes partition keys and value types against the table schema.
@@ -44,60 +45,149 @@ pub(crate) fn validate_partition_values(
     logical_schema: &StructType,
     logical_partition_values: HashMap<String, Scalar>,
 ) -> DeltaResult<HashMap<String, Scalar>> {
-    let normalized = validate_keys(logical_partition_columns, logical_partition_values)?;
+    let expected_keys: Vec<_> = logical_partition_columns
+        .iter()
+        .map(|name| ExpectedPartitionKey {
+            input_name: name,
+            logical_name: name,
+        })
+        .collect();
+    validate_and_rekey_partition_values(
+        &expected_keys,
+        logical_schema,
+        logical_partition_values,
+        PartitionKeyMatching::LogicalCaseInsensitive,
+    )
+}
+
+/// Validates physical partition keys exactly and returns values keyed by logical schema names.
+/// Physical names are opaque and may differ only by case, so they must not be case-normalized.
+pub(crate) fn validate_physical_partition_values(
+    logical_partition_columns: &[String],
+    logical_schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+    physical_partition_values: HashMap<String, Scalar>,
+) -> DeltaResult<HashMap<String, Scalar>> {
+    let mut expected_keys = Vec::with_capacity(logical_partition_columns.len());
+    for logical_name in logical_partition_columns {
+        let field = logical_schema.field(logical_name).ok_or_else(|| {
+            Error::invalid_partition_values(format!(
+                "partition column '{logical_name}' not found in table schema"
+            ))
+        })?;
+        let physical_name = field.physical_name(column_mapping_mode);
+        expected_keys.push(ExpectedPartitionKey {
+            input_name: physical_name,
+            logical_name,
+        });
+    }
+    validate_and_rekey_partition_values(
+        &expected_keys,
+        logical_schema,
+        physical_partition_values,
+        PartitionKeyMatching::PhysicalExact,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PartitionKeyMatching {
+    LogicalCaseInsensitive,
+    PhysicalExact,
+}
+
+impl PartitionKeyMatching {
+    fn lookup_key(self, name: &str) -> String {
+        match self {
+            Self::LogicalCaseInsensitive => name.to_lowercase(),
+            Self::PhysicalExact => name.to_string(),
+        }
+    }
+
+    fn namespace(self) -> &'static str {
+        match self {
+            Self::LogicalCaseInsensitive => "logical",
+            Self::PhysicalExact => "physical",
+        }
+    }
+}
+
+struct ExpectedPartitionKey<'a> {
+    input_name: &'a str,
+    logical_name: &'a str,
+}
+
+fn validate_and_rekey_partition_values(
+    expected_keys: &[ExpectedPartitionKey<'_>],
+    logical_schema: &StructType,
+    partition_values: HashMap<String, Scalar>,
+    matching: PartitionKeyMatching,
+) -> DeltaResult<HashMap<String, Scalar>> {
+    let normalized = validate_keys(expected_keys, partition_values, matching)?;
     validate_types(logical_schema, &normalized)?;
     Ok(normalized)
 }
 
 /// Validates that a connector-provided partition value map contains exactly the expected
-/// partition columns, with case-insensitive key matching. Returns the map re-keyed to
-/// the logical schema case.
-///
-/// Keys in the input map are logical column names provided by the connector, which may
-/// use any casing (e.g., "YEAR" or "year" for a schema column named "Year"). The returned
-/// map uses the exact logical names from the schema.
+/// partition columns and returns the map re-keyed to logical schema names.
 ///
 /// # Parameters
-/// - `logical_partition_columns`: logical partition column names from kernel's table metadata.
-/// - `logical_partition_values`: connector-provided map from logical column names (any case) to
-///   typed values.
+/// - `expected_keys`: accepted input names and their corresponding logical schema names.
+/// - `partition_values`: connector-provided map from partition column names to typed values.
+/// - `matching`: matching rule for connector-provided names.
 ///
 /// # Errors
 /// - A partition column is missing from the map
 /// - An extra key is present that is not a partition column
-/// - Two keys collide after case normalization (e.g., "COL" and "col" both provided)
+/// - Two provided keys resolve to the same logical partition column
+/// - Two expected input names collide under the selected matching rule
 fn validate_keys(
-    logical_partition_columns: &[String],
-    logical_partition_values: HashMap<String, Scalar>,
+    expected_keys: &[ExpectedPartitionKey<'_>],
+    partition_values: HashMap<String, Scalar>,
+    matching: PartitionKeyMatching,
 ) -> DeltaResult<HashMap<String, Scalar>> {
-    let schema_lookup: HashMap<String, &str> = logical_partition_columns
+    let mut schema_lookup = HashMap::with_capacity(expected_keys.len());
+    for expected in expected_keys {
+        if schema_lookup
+            .insert(matching.lookup_key(expected.input_name), expected)
+            .is_some()
+        {
+            return Err(Error::invalid_partition_values(format!(
+                "duplicate {} partition column '{}' in table schema",
+                matching.namespace(),
+                expected.input_name
+            )));
+        }
+    }
+    let expected_names = expected_keys
         .iter()
-        .map(|name| (name.to_lowercase(), name.as_str()))
-        .collect();
+        .map(|expected| expected.input_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let provided_names = partition_values.keys().cloned().collect::<Vec<_>>();
 
-    let mut normalized = HashMap::with_capacity(logical_partition_values.len());
-    for (key, value) in logical_partition_values {
-        let lower_key = key.to_lowercase();
-        let schema_name = schema_lookup.get(&lower_key).ok_or_else(|| {
+    let mut normalized = HashMap::with_capacity(partition_values.len());
+    for (key, value) in partition_values {
+        let lookup_key = matching.lookup_key(&key);
+        let expected = schema_lookup.get(&lookup_key).ok_or_else(|| {
             Error::invalid_partition_values(format!(
                 "unknown partition column '{key}'. Expected one of: [{}]",
-                logical_partition_columns.join(", ")
+                expected_names
             ))
         })?;
-        // Detect post-normalization duplicates (e.g., "COL" and "col" both provided).
-        if normalized.contains_key(*schema_name) {
+        if normalized.contains_key(expected.logical_name) {
             return Err(Error::invalid_partition_values(format!(
                 "duplicate partition column '{key}' (normalized to same key as a previously provided entry)"
             )));
         }
-        normalized.insert(schema_name.to_string(), value);
+        normalized.insert(expected.logical_name.to_string(), value);
     }
 
-    for col in logical_partition_columns {
-        if !normalized.contains_key(col.as_str()) {
+    for expected in expected_keys {
+        if !normalized.contains_key(expected.logical_name) {
             return Err(Error::invalid_partition_values(format!(
-                "missing partition column '{col}'. Provided: [{}]",
-                normalized.keys().cloned().collect::<Vec<_>>().join(", ")
+                "missing partition column '{}'. Provided: [{}]",
+                expected.input_name,
+                provided_names.join(", ")
             )));
         }
     }
@@ -200,6 +290,24 @@ mod tests {
     // validate_keys
     // ============================================================================
 
+    fn validate_logical_keys(
+        logical_partition_columns: &[String],
+        logical_partition_values: HashMap<String, Scalar>,
+    ) -> DeltaResult<HashMap<String, Scalar>> {
+        let expected_keys = logical_partition_columns
+            .iter()
+            .map(|name| ExpectedPartitionKey {
+                input_name: name,
+                logical_name: name,
+            })
+            .collect::<Vec<_>>();
+        validate_keys(
+            &expected_keys,
+            logical_partition_values,
+            PartitionKeyMatching::LogicalCaseInsensitive,
+        )
+    }
+
     #[test]
     fn test_validate_partition_keys_matching_keys_returns_ok() {
         let cols = vec!["year".to_string(), "region".to_string()];
@@ -207,7 +315,7 @@ mod tests {
             ("year".to_string(), Scalar::Integer(2024)),
             ("region".to_string(), Scalar::String("US".into())),
         ]);
-        let result = validate_keys(&cols, values).unwrap();
+        let result = validate_logical_keys(&cols, values).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("year"), Some(&Scalar::Integer(2024)));
         assert_eq!(result.get("region"), Some(&Scalar::String("US".into())));
@@ -217,7 +325,7 @@ mod tests {
     fn test_validate_partition_keys_empty_columns_and_values_returns_ok() {
         let cols: Vec<String> = vec![];
         let values = HashMap::new();
-        let result = validate_keys(&cols, values).unwrap();
+        let result = validate_logical_keys(&cols, values).unwrap();
         assert!(result.is_empty());
     }
 
@@ -225,7 +333,7 @@ mod tests {
     fn test_validate_partition_keys_missing_key_returns_error() {
         let cols = vec!["year".to_string(), "region".to_string()];
         let values = HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
-        let result = validate_keys(&cols, values);
+        let result = validate_logical_keys(&cols, values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("missing partition column 'region'"), "{err}");
@@ -238,7 +346,7 @@ mod tests {
             ("year".to_string(), Scalar::Integer(2024)),
             ("region".to_string(), Scalar::String("US".into())),
         ]);
-        let result = validate_keys(&cols, values);
+        let result = validate_logical_keys(&cols, values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown partition column 'region'"), "{err}");
@@ -248,7 +356,7 @@ mod tests {
     fn test_validate_partition_keys_case_normalizes_to_schema_case() {
         let cols = vec!["Year".to_string()];
         let values = HashMap::from([("YEAR".to_string(), Scalar::Integer(2024))]);
-        let result = validate_keys(&cols, values).unwrap();
+        let result = validate_logical_keys(&cols, values).unwrap();
         assert!(result.contains_key("Year"));
         assert!(!result.contains_key("YEAR"));
     }
@@ -260,7 +368,7 @@ mod tests {
             ("COL".to_string(), Scalar::Integer(1)),
             ("col".to_string(), Scalar::Integer(2)),
         ]);
-        let result = validate_keys(&cols, values);
+        let result = validate_logical_keys(&cols, values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("duplicate"), "{err}");
