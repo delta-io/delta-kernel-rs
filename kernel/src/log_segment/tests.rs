@@ -20,6 +20,8 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -398,6 +400,10 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -496,6 +502,10 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -544,6 +554,10 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -597,6 +611,10 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -654,6 +672,10 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -780,6 +802,10 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -895,6 +921,10 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -945,6 +975,10 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         checkpoint_schema: None,
         checksum: None,
         tags: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_type: None,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        amt_checkpoint: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -989,6 +1023,10 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     checkpoint_schema: None,
     checksum: None,
     tags: None,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_type: None,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    amt_checkpoint: None,
 }))]
 #[tokio::test]
 async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
@@ -5391,4 +5429,48 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
     );
 
     Ok(())
+}
+
+/// The AMT hint accessors are gated on `checkpoint_type == AdaptiveMetadataTree`: a hint that tags
+/// itself otherwise (or carries no type) is suppressed even when it still holds an `amtCheckpoint`,
+/// and an AMT-typed hint with no `amtCheckpoint` object yields `None`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn amt_checkpoint_hint_accessor_gates_on_checkpoint_type() {
+    let amt = || AmtCheckpoint {
+        manifest_commit_version: 6,
+        checkpoint: None,
+        leaves: None,
+    };
+    let segment = |hint: Option<LastCheckpointHint>| LogSegment {
+        end_version: 7,
+        checkpoint_version: Some(7),
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        listed: LogSegmentFiles::default(),
+        last_checkpoint_metadata: hint,
+    };
+    let hint = |checkpoint_type, amt_checkpoint| LastCheckpointHint {
+        version: 7,
+        checkpoint_type,
+        amt_checkpoint,
+        ..Default::default()
+    };
+
+    // AMT-typed hint carrying an amtCheckpoint: exposed, and manifestCommitVersion surfaces.
+    let seg = segment(Some(hint(
+        Some(CheckpointType::AdaptiveMetadataTree),
+        Some(amt()),
+    )));
+    assert_eq!(seg.amt_checkpoint_hint(), Some(&amt()));
+    assert_eq!(seg.checkpoint_hint_manifest_commit_version(), Some(6));
+
+    // A non-AMT checkpoint type suppresses the accessor even though amtCheckpoint is present.
+    let seg = segment(Some(hint(Some(CheckpointType::Unknown), Some(amt()))));
+    assert_eq!(seg.amt_checkpoint_hint(), None);
+    assert_eq!(seg.checkpoint_hint_manifest_commit_version(), None);
+
+    // AMT type but no amtCheckpoint object, and no hint at all, both yield None.
+    let seg = segment(Some(hint(Some(CheckpointType::AdaptiveMetadataTree), None)));
+    assert_eq!(seg.amt_checkpoint_hint(), None);
+    assert_eq!(segment(None).amt_checkpoint_hint(), None);
 }

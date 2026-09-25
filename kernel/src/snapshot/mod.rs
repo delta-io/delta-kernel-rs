@@ -1661,6 +1661,10 @@ mod tests {
             checkpoint_schema: None,
             checksum: None,
             tags: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_type: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            amt_checkpoint: None,
         };
         let data = checkpoint.to_json_bytes();
         (data, checkpoint)

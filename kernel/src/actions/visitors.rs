@@ -882,26 +882,20 @@ struct CheckpointElementVisitor {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointElementVisitor {
-    /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
-    /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
+    /// Assemble the visited elements into a [`CheckpointAction`] via the shared
+    /// [`CheckpointAction::from_parts`], which errors if a required element was absent or if
+    /// [`CheckpointAction::validate`] rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
-        let missing = |field: &str| {
-            Error::generic(format!(
-                "checkpoint action is missing required `{field}` element"
-            ))
-        };
-        let action = CheckpointAction {
-            version: self.version.ok_or_else(|| missing("checkpointMetadata"))?,
-            content_root: self.content_root.ok_or_else(|| missing("contentRoot"))?,
-            protocol: self.protocol.ok_or_else(|| missing("protocol"))?,
-            metadata: self.metadata.ok_or_else(|| missing("metaData"))?,
-            transactions: self.transactions,
-            domain_metadata: self.domain_metadata,
-            txn_sidecars: self.txn_sidecars,
-            domain_metadata_sidecars: self.domain_metadata_sidecars,
-        };
-        action.validate()?;
-        Ok(action)
+        CheckpointAction::from_parts(
+            self.version,
+            self.content_root,
+            self.protocol,
+            self.metadata,
+            self.transactions,
+            self.domain_metadata,
+            self.txn_sidecars,
+            self.domain_metadata_sidecars,
+        )
     }
 }
 
@@ -916,65 +910,73 @@ impl RowVisitor for CheckpointElementVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let r = &*CHECKPOINT_ELEMENT_RANGES;
         for i in 0..row_count {
-            // Each element is a single-key tagged object, so at most one variant has a non-null
-            // required leaf. Probe each variant's required leaf in turn to identify it. An element
-            // matching none of them is a variant added by a newer writer; skip it for forward
-            // compatibility rather than failing the whole action.
-            if let Some(version) =
-                getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
-            {
-                set_once(&mut self.version, version, "checkpointMetadata")?;
-            } else if let Some(content_root) =
-                visit_content_root_at(i, &getters[r.content_root.clone()])?
-            {
-                set_once(&mut self.content_root, content_root, "contentRoot")?;
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
-                set_once(&mut self.protocol, protocol, "protocol")?;
-            } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
-                set_once(&mut self.metadata, metadata, "metaData")?;
-            } else if let Some(domain) =
-                getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
-            {
+            // Extract each variant by its required leaf (`Ok(None)` when that variant is absent),
+            // so the extraction doubles as a presence probe. The element grammar is one-hot -- a
+            // single-key tagged object -- so `require_one_hot_element` rejects a malformed element
+            // that sets more than one variant, matching the serde `TryFrom` decoder so both fail
+            // closed instead of interpreting it differently. Zero set variants is a forward-compat
+            // element a newer writer added; it sets nothing below and is skipped.
+            let checkpoint_metadata: Option<i64> =
+                getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?;
+            let content_root = visit_content_root_at(i, &getters[r.content_root.clone()])?;
+            let protocol = visit_protocol_at(i, &getters[r.protocol.clone()])?;
+            let metadata = visit_metadata_at(i, &getters[r.metadata.clone()])?;
+            let domain: Option<String> =
+                getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?;
+            let app_id: Option<String> = getters[r.txn.start].get_opt(i, "txn.appId")?;
+            let sidecar_path: Option<String> =
+                getters[r.sidecar.start].get_opt(i, "sidecar.path")?;
+
+            super::require_one_hot_element(&[
+                checkpoint_metadata.is_some(),
+                content_root.is_some(),
+                protocol.is_some(),
+                metadata.is_some(),
+                domain.is_some(),
+                app_id.is_some(),
+                sidecar_path.is_some(),
+            ])?;
+
+            if let Some(version) = checkpoint_metadata {
+                super::set_once(&mut self.version, version, "checkpointMetadata")?;
+            }
+            if let Some(content_root) = content_root {
+                super::set_once(&mut self.content_root, content_root, "contentRoot")?;
+            }
+            if let Some(protocol) = protocol {
+                super::set_once(&mut self.protocol, protocol, "protocol")?;
+            }
+            if let Some(metadata) = metadata {
+                super::set_once(&mut self.metadata, metadata, "metaData")?;
+            }
+            if let Some(domain) = domain {
                 self.domain_metadata
                     .push(DomainMetadataVisitor::visit_domain_metadata(
                         i,
                         domain,
                         &getters[r.domain_metadata.clone()],
                     )?);
-            } else if let Some(app_id) = getters[r.txn.start].get_opt(i, "txn.appId")? {
+            }
+            if let Some(app_id) = app_id {
                 self.transactions.push(SetTransactionVisitor::visit_txn(
                     i,
                     app_id,
                     &getters[r.txn.clone()],
                 )?);
-            } else if let Some(path) = getters[r.sidecar.start].get_opt(i, "sidecar.path")? {
+            }
+            if let Some(path) = sidecar_path {
                 let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
                 let sidecar_type: String = getters[r.sidecar_type].get(i, "sidecar.type")?;
-                match sidecar_type.as_str() {
-                    SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
-                    DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
-                    other => {
-                        return Err(Error::generic(format!(
-                            "checkpoint sidecar has unsupported type `{other}`"
-                        )))
-                    }
-                }
+                super::route_content_sidecar(
+                    &sidecar_type,
+                    sidecar,
+                    &mut self.txn_sidecars,
+                    &mut self.domain_metadata_sidecars,
+                )?;
             }
         }
         Ok(())
     }
-}
-
-/// Store `value` in `slot`, erroring if it was already occupied. Checkpoint elements named by
-/// `name` are singletons, so a second occurrence is malformed rather than an override.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
-    if slot.replace(value).is_some() {
-        return Err(Error::generic(format!(
-            "duplicate `{name}` element in checkpoint action"
-        )));
-    }
-    Ok(())
 }
 
 /// Get a [`ContentRoot`] out of engine data. Returns `Ok(None)` when the (required) `path` leaf is
@@ -1264,130 +1266,6 @@ mod tests {
             .expect("checkpoint action should be present");
         assert_eq!(checkpoint.version, 1);
         assert_eq!(checkpoint.metadata.id, "id1");
-        Ok(())
-    }
-
-    /// Fully-populated checkpoint array elements, used to build valid and malformed variants.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    mod checkpoint_elements {
-        pub(super) const CHECKPOINT_METADATA: &str = r#"{"checkpointMetadata":{"version":42}}"#;
-        pub(super) const CONTENT_ROOT: &str =
-            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40}}"#;
-        pub(super) const PROTOCOL: &str =
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
-        pub(super) const METADATA: &str = r#"{"metaData":{"id":"id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn checkpoint_commit(elements: &[&str]) -> Box<dyn crate::EngineData> {
-        use crate::unit_test_utils::parse_json_batch;
-        let commit = format!(r#"{{"checkpoint":[{}]}}"#, elements.join(","));
-        parse_json_batch(StringArray::from(vec![commit]))
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest::rstest]
-    // A repeated singleton element is malformed, not an override.
-    #[case::duplicate_metadata(&[
-        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
-        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA, checkpoint_elements::METADATA,
-    ], "duplicate `metaData` element in checkpoint action")]
-    #[case::duplicate_checkpoint_metadata(&[
-        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CHECKPOINT_METADATA,
-        checkpoint_elements::CONTENT_ROOT, checkpoint_elements::PROTOCOL,
-        checkpoint_elements::METADATA,
-    ], "duplicate `checkpointMetadata` element in checkpoint action")]
-    // Missing a required element.
-    #[case::missing_protocol(&[
-        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
-        checkpoint_elements::METADATA,
-    ], "checkpoint action is missing required `protocol` element")]
-    #[case::missing_content_root(&[
-        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::PROTOCOL,
-        checkpoint_elements::METADATA,
-    ], "checkpoint action is missing required `contentRoot` element")]
-    #[case::missing_metadata(&[
-        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
-        checkpoint_elements::PROTOCOL,
-    ], "checkpoint action is missing required `metaData` element")]
-    // Empty `checkpoint: []` array -> the first required element checked (checkpointMetadata) is
-    // reported missing.
-    #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
-    // Unsupported sidecar `type`.
-    #[case::bad_sidecar_type(&[
-        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
-        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
-        r#"{"sidecar":{"type":"bogus","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
-    ], "checkpoint sidecar has unsupported type `bogus`")]
-    // contentRoot.version must be <= checkpointMetadata.version.
-    #[case::content_root_version_too_high(&[
-        checkpoint_elements::CHECKPOINT_METADATA,
-        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
-        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
-    ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
-    fn test_parse_checkpoint_action_errors(#[case] elements: &[&str], #[case] expected_msg: &str) {
-        let err = CheckpointAction::try_new_from_data(checkpoint_commit(elements).as_ref())
-            .expect_err("checkpoint action should fail to parse");
-        assert!(
-            err.to_string().contains(expected_msg),
-            "expected error containing {expected_msg:?}, got: {err}"
-        );
-    }
-
-    /// An element whose variant kernel does not know -- written by a newer writer -- must be
-    /// skipped rather than failing the surrounding action.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_parse_checkpoint_action_skips_unknown_element_variant() -> DeltaResult<()> {
-        let data = checkpoint_commit(&[
-            checkpoint_elements::CHECKPOINT_METADATA,
-            checkpoint_elements::CONTENT_ROOT,
-            checkpoint_elements::PROTOCOL,
-            checkpoint_elements::METADATA,
-            r#"{"somethingNew":{"path":"a","size":1}}"#,
-        ]);
-        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
-            .expect("checkpoint action should be present");
-        assert_eq!(checkpoint.version, 42);
-        assert!(checkpoint.transactions.is_empty());
-        assert!(checkpoint.domain_metadata.is_empty());
-        Ok(())
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_parse_checkpoint_action_minimal_round_trip() -> DeltaResult<()> {
-        let data = checkpoint_commit(&[
-            checkpoint_elements::CHECKPOINT_METADATA,
-            checkpoint_elements::CONTENT_ROOT,
-            checkpoint_elements::PROTOCOL,
-            checkpoint_elements::METADATA,
-        ]);
-        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
-            .expect("checkpoint action should be present");
-        assert_eq!(checkpoint.version, 42);
-        assert!(checkpoint.transactions.is_empty());
-        assert!(checkpoint.domain_metadata.is_empty());
-        assert!(checkpoint.txn_sidecars.is_empty());
-        assert!(checkpoint.domain_metadata_sidecars.is_empty());
-        Ok(())
-    }
-
-    /// `contentRoot.version == checkpointMetadata.version` is the boundary of the `<=` invariant
-    /// and must parse successfully (the error rstest covers only `<` and `>`).
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> DeltaResult<()> {
-        let data = checkpoint_commit(&[
-            checkpoint_elements::CHECKPOINT_METADATA,
-            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":42}}"#,
-            checkpoint_elements::PROTOCOL,
-            checkpoint_elements::METADATA,
-        ]);
-        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
-            .expect("checkpoint action should be present");
-        assert_eq!(checkpoint.version, 42);
-        assert_eq!(checkpoint.content_root.version, 42);
         Ok(())
     }
 
