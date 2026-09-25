@@ -30,8 +30,8 @@ use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
-    ParquetWriteResult, PredicateRef,
+    FileDataReadResultIterator, FileMeta, FileSize, FoldWithOption as _, ParquetFooter,
+    ParquetHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -365,13 +365,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] containing a [`ParquetWriteResult`] with the written file's
-    /// `size_in_bytes`.
+    /// The exact number of bytes written to the parquet file.
     fn write_parquet_file(
         &self,
         location: url::Url,
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<ParquetWriteResult> {
+    ) -> DeltaResult<FileSize> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
@@ -402,9 +401,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             // finish() writes the footer; bytes_written() is accurate only after finish().
             writer.finish().await?;
-            Ok(ParquetWriteResult {
-                size_in_bytes: writer.bytes_written() as u64,
-            })
+            Ok(writer.bytes_written() as u64)
         })
     }
 
@@ -1191,7 +1188,7 @@ mod tests {
 
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
-        let write_result = parquet_handler
+        let write_size = parquet_handler
             .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
@@ -1199,8 +1196,8 @@ mod tests {
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
         // The reported size must be non-zero and match the size reported by storage.
-        assert_ne!(write_result.size_in_bytes, 0);
-        assert_eq!(write_result.size_in_bytes, metadata.size);
+        assert_ne!(write_size, 0);
+        assert_eq!(write_size, metadata.size);
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await

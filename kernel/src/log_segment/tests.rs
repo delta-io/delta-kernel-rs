@@ -46,8 +46,8 @@ use crate::unit_test_utils::{
 };
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetFooter, ParquetHandler, ParquetWriteResult, Predicate, PredicateRef,
-    RowVisitor, StorageHandler,
+    FileSize, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -239,7 +239,7 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<ParquetWriteResult> {
+    ) -> DeltaResult<FileSize> {
         self.0.write_parquet_file(location, data)
     }
 

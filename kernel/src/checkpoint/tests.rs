@@ -51,6 +51,27 @@ fn test_deleted_file_retention_timestamp(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::equal_sizes(100, 100, true)]
+#[case::writer_reported_less(100, 200, false)]
+#[case::writer_reported_more(200, 100, false)]
+fn test_verify_written_size(
+    #[case] written_size: u64,
+    #[case] observed_size: u64,
+    #[case] expect_ok: bool,
+) {
+    let path = Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet").unwrap();
+    let result = super::verify_written_size(&path, written_size, observed_size);
+    if expect_ok {
+        assert!(result.is_ok(), "expected Ok for equal sizes, got {result:?}");
+    } else {
+        assert!(
+            matches!(result, Err(crate::Error::Generic(_))),
+            "expected Error::Generic for size mismatch, got {result:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();

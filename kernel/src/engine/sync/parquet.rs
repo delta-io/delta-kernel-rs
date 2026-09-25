@@ -18,7 +18,7 @@ use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, ParquetWriteResult, PredicateRef,
+    FileSize, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 pub(crate) struct SyncParquetHandler {
@@ -92,7 +92,7 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         location: Url,
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<ParquetWriteResult> {
+    ) -> DeltaResult<FileSize> {
         let first_batch = data.next().ok_or_else(|| {
             crate::Error::generic("Cannot write parquet file with empty data iterator")
         })??;
@@ -116,7 +116,7 @@ impl ParquetHandler for SyncParquetHandler {
         let size_in_bytes = buf.len() as u64;
 
         put_bytes(self.store.as_ref(), &location, buf.into(), true)?;
-        Ok(ParquetWriteResult { size_in_bytes })
+        Ok(size_in_bytes)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
@@ -172,7 +172,7 @@ mod tests {
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
 
-        let write_result = handler
+        let write_size = handler
             .write_parquet_file(url.clone(), test_data_iter())
             .unwrap();
         assert!(file_path.exists());
@@ -185,8 +185,8 @@ mod tests {
         let schema = reader.schema().clone();
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         // The reported size must be non-zero and match the on-disk file length.
-        assert_ne!(write_result.size_in_bytes, 0);
-        assert_eq!(write_result.size_in_bytes, file_size);
+        assert_ne!(write_size, 0);
+        assert_eq!(write_size, file_size);
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
