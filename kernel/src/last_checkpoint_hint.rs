@@ -76,14 +76,34 @@ pub(crate) struct LastCheckpointHint {
 /// (adaptiveMetadata RFC). An unrecognized wire value deserializes to [`CheckpointType::Unknown`],
 /// signaling the reader to fall back to log replay rather than misinterpreting the hint.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum CheckpointType {
     /// An adaptive-metadata (Iceberg V4) embedded-tree checkpoint.
     AdaptiveMetadataTree,
-    /// Any value kernel does not recognize; treated as "fall back to log replay".
+    /// Any value kernel does not recognize; treated as "fall back to log replay". Read-only: it
+    /// is produced only by deserializing an unrecognized wire value, never written by kernel (see
+    /// the hand-written [`Serialize`], which refuses it).
     #[serde(other)]
     Unknown,
+}
+
+// `Serialize` is hand-written rather than derived so it can refuse `Unknown`: that variant is a
+// read-only fallback sentinel with no wire representation a writer should produce, and the derived
+// impl would emit the bogus string `"Unknown"`. Kernel never writes `Unknown` today, so this only
+// fires if a read-in hint is ever serialized back -- in which case failing closed is correct.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Serialize for CheckpointType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CheckpointType::AdaptiveMetadataTree => {
+                serializer.serialize_str("AdaptiveMetadataTree")
+            }
+            CheckpointType::Unknown => Err(serde::ser::Error::custom(
+                "refusing to serialize CheckpointType::Unknown, a read-only fallback sentinel",
+            )),
+        }
+    }
 }
 
 /// The `amtCheckpoint` object embedded in a `_last_checkpoint` hint for an adaptive-metadata
@@ -551,6 +571,18 @@ mod tests {
         assert_eq!(hint.checkpoint_type, Some(CheckpointType::Unknown));
     }
 
+    /// `AdaptiveMetadataTree` serializes to its wire string, but `Unknown` refuses to serialize --
+    /// it is a read-only fallback sentinel with no value a writer should emit.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn checkpoint_type_unknown_is_not_serializable() {
+        assert_eq!(
+            serde_json::to_string(&CheckpointType::AdaptiveMetadataTree).unwrap(),
+            r#""AdaptiveMetadataTree""#
+        );
+        assert!(serde_json::to_string(&CheckpointType::Unknown).is_err());
+    }
+
     /// A malformed `amtCheckpoint` -- missing the required `manifestCommitVersion` -- fails the
     /// whole-hint parse. `try_read` swallows that to `None`, so the reader falls back to log replay
     /// rather than trusting a partially-parsed hint.
@@ -585,6 +617,54 @@ mod tests {
             }
         }"#;
         let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
+        assert_eq!(hint, reparsed);
+    }
+
+    /// A writer may omit the optional prefetch: an `amtCheckpoint` carrying only the required
+    /// `manifestCommitVersion` parses with `checkpoint` and `leaves` as `None` and round-trips
+    /// unchanged. Guards the `Option`/`default` serde behavior of the prefetch fields -- a
+    /// regression that made them required, or renamed them, would fail here rather than silently
+    /// drop the prefetch on the happy path.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_omitting_prefetch_parses_and_round_trips() {
+        let json = br#"{
+            "version": 6,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {"manifestCommitVersion": 6}
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let amt = hint.amt_checkpoint.as_ref().expect("amtCheckpoint present");
+        assert_eq!(amt.manifest_commit_version, 6);
+        assert!(amt.checkpoint.is_none());
+        assert!(amt.leaves.is_none());
+        let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
+        assert_eq!(hint, reparsed);
+    }
+
+    /// A multi-element `leaves` array parses to a `Vec` of the same length and round-trips,
+    /// exercising the prefetch beyond the single-leaf happy path.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_with_multiple_leaves_parses_and_round_trips() {
+        let json = br#"{
+            "version": 7,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {
+                "manifestCommitVersion": 7,
+                "leaves": [
+                    {"contentType": 0, "location": "data/part-0.parquet", "recordCount": 3},
+                    {"contentType": 0, "location": "data/part-1.parquet", "recordCount": 5}
+                ]
+            }
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let amt = hint.amt_checkpoint.as_ref().expect("amtCheckpoint present");
+        assert!(amt.checkpoint.is_none());
+        assert_eq!(amt.leaves.as_ref().expect("leaves present").len(), 2);
         let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
         assert_eq!(hint, reparsed);
     }

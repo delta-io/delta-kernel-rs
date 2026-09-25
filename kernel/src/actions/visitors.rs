@@ -910,38 +910,61 @@ impl RowVisitor for CheckpointElementVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let r = &*CHECKPOINT_ELEMENT_RANGES;
         for i in 0..row_count {
-            // Each element is a single-key tagged object, so at most one variant has a non-null
-            // required leaf. Probe each variant's required leaf in turn to identify it. An element
-            // matching none of them is a variant added by a newer writer; skip it for forward
-            // compatibility rather than failing the whole action.
-            if let Some(version) =
-                getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
-            {
+            // Extract each variant by its required leaf (`Ok(None)` when that variant is absent),
+            // so the extraction doubles as a presence probe. The element grammar is one-hot -- a
+            // single-key tagged object -- so `require_one_hot_element` rejects a malformed element
+            // that sets more than one variant, matching the serde `TryFrom` decoder so both fail
+            // closed instead of interpreting it differently. Zero set variants is a forward-compat
+            // element a newer writer added; it sets nothing below and is skipped.
+            let checkpoint_metadata: Option<i64> =
+                getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?;
+            let content_root = visit_content_root_at(i, &getters[r.content_root.clone()])?;
+            let protocol = visit_protocol_at(i, &getters[r.protocol.clone()])?;
+            let metadata = visit_metadata_at(i, &getters[r.metadata.clone()])?;
+            let domain: Option<String> =
+                getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?;
+            let app_id: Option<String> = getters[r.txn.start].get_opt(i, "txn.appId")?;
+            let sidecar_path: Option<String> =
+                getters[r.sidecar.start].get_opt(i, "sidecar.path")?;
+
+            super::require_one_hot_element(&[
+                checkpoint_metadata.is_some(),
+                content_root.is_some(),
+                protocol.is_some(),
+                metadata.is_some(),
+                domain.is_some(),
+                app_id.is_some(),
+                sidecar_path.is_some(),
+            ])?;
+
+            if let Some(version) = checkpoint_metadata {
                 super::set_once(&mut self.version, version, "checkpointMetadata")?;
-            } else if let Some(content_root) =
-                visit_content_root_at(i, &getters[r.content_root.clone()])?
-            {
+            }
+            if let Some(content_root) = content_root {
                 super::set_once(&mut self.content_root, content_root, "contentRoot")?;
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
+            }
+            if let Some(protocol) = protocol {
                 super::set_once(&mut self.protocol, protocol, "protocol")?;
-            } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
+            }
+            if let Some(metadata) = metadata {
                 super::set_once(&mut self.metadata, metadata, "metaData")?;
-            } else if let Some(domain) =
-                getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
-            {
+            }
+            if let Some(domain) = domain {
                 self.domain_metadata
                     .push(DomainMetadataVisitor::visit_domain_metadata(
                         i,
                         domain,
                         &getters[r.domain_metadata.clone()],
                     )?);
-            } else if let Some(app_id) = getters[r.txn.start].get_opt(i, "txn.appId")? {
+            }
+            if let Some(app_id) = app_id {
                 self.transactions.push(SetTransactionVisitor::visit_txn(
                     i,
                     app_id,
                     &getters[r.txn.clone()],
                 )?);
-            } else if let Some(path) = getters[r.sidecar.start].get_opt(i, "sidecar.path")? {
+            }
+            if let Some(path) = sidecar_path {
                 let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
                 let sidecar_type: String = getters[r.sidecar_type].get(i, "sidecar.type")?;
                 super::route_content_sidecar(

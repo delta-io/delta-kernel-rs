@@ -1471,6 +1471,15 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
         let mut domain_metadata_sidecars = vec![];
 
         for element in elements {
+            require_one_hot_element(&[
+                element.checkpoint_metadata.is_some(),
+                element.content_root.is_some(),
+                element.protocol.is_some(),
+                element.metadata.is_some(),
+                element.txn.is_some(),
+                element.domain_metadata.is_some(),
+                element.sidecar.is_some(),
+            ])?;
             if let Some(cm) = element.checkpoint_metadata {
                 set_once(&mut version, cm.version, "checkpointMetadata")?;
             }
@@ -1543,6 +1552,20 @@ pub(crate) fn route_content_sidecar(
             )))
         }
     }
+    Ok(())
+}
+
+/// Reject a checkpoint union element that sets more than one variant key. Each element is a
+/// single-key tagged object, so a multi-key element is malformed -- rejected identically on both
+/// decode transports rather than silently interpreted differently. Zero keys is a forward-compat
+/// unknown element (added by a newer writer), which callers allow and skip. Shared by both decoders
+/// -- the [`visitors`] `RowVisitor` and the serde `TryFrom` path.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn require_one_hot_element(populated: &[bool]) -> DeltaResult<()> {
+    require!(
+        populated.iter().filter(|p| **p).count() <= 1,
+        Error::generic("checkpoint action element sets multiple keys")
+    );
     Ok(())
 }
 
@@ -3316,6 +3339,13 @@ mod tests {
           r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
           elements::PROTOCOL, elements::METADATA],
         "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    // A single element setting more than one variant key violates the one-hot grammar; both
+    // transports must reject it rather than interpret it (the serde loop would process every set
+    // field, the visitor only the first).
+    #[case::multiple_keys_in_one_element(
+        &[r#"{"checkpointMetadata":{"version":42},"sidecar":{"type":"txn","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
+          elements::CONTENT_ROOT, elements::PROTOCOL, elements::METADATA],
+        "checkpoint action element sets multiple keys")]
     fn checkpoint_action_decode_rejects_malformed(
         #[case] elements: &[&str],
         #[case] expected_msg: &str,
