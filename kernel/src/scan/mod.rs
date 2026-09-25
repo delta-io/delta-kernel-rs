@@ -42,6 +42,8 @@ use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
     StructField, StructType, ToSchema as _,
 };
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+use crate::snapshot::{log_segment_from_state, SnapshotState};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
@@ -60,6 +62,62 @@ pub(crate) mod scan_plan;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
+
+/// Plan a default full-table scan from connector-owned snapshot components for one call.
+///
+/// The table configuration and scan state live only until plan construction finishes. The
+/// returned plan owns the file paths and schemas it needs; no native Snapshot or Scan is retained.
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+#[internal_api]
+pub(crate) fn declarative_metadata_scan_plan_from_state(
+    state: &dyn SnapshotState,
+    engine: &dyn Engine,
+) -> DeltaResult<Option<Plan>> {
+    let log_segment = log_segment_from_state(state)?;
+    let table_configuration = TableConfiguration::try_new(
+        state.metadata()?,
+        state.protocol()?,
+        state.table_root().clone(),
+        state.version(),
+    )?;
+    table_configuration.ensure_operation_supported(Operation::Scan)?;
+    let table_schema = table_configuration.logical_schema();
+    if table_schema.num_fields() == 0 {
+        return Err(Error::generic(
+            "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
+             to add at least one column before scanning",
+        ));
+    }
+    let stats = StatsOptions::default();
+    let partition_values = PartitionValuesOptions::default();
+    let state_info = StateInfo::try_new(
+        table_schema.clone(),
+        table_schema,
+        &table_configuration,
+        None,
+        &stats,
+        &partition_values,
+        (),
+    )?;
+    let physical_stats_output_schema =
+        build_physical_stats_output_schema(&table_configuration, &state_info, &stats)?;
+    drop(table_configuration);
+
+    let executor = engine.require_plan_executor()?;
+    let shape = CheckpointShape::try_new_for_segment(
+        executor.as_ref(),
+        &log_segment,
+        state_info.physical_stats_schema.as_ref(),
+    )?;
+    scan_plan::MetadataScanPlan {
+        log_segment: &log_segment,
+        state_info: &state_info,
+        stats: &stats,
+        physical_stats_output_schema: &physical_stats_output_schema,
+        partition_values: &partition_values,
+    }
+    .build_metadata_scan_plan(&shape)
+}
 
 #[cfg(test)]
 pub(crate) mod test_utils;

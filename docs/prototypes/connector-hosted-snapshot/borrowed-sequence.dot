@@ -1,0 +1,38 @@
+digraph Sequence {
+  graph [bgcolor="white", rankdir=TB, nodesep=1.1, ranksep=0.55, pad=0.25, splines=polyline];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, margin="0.18,0.12"];
+  edge [fontname="DejaVu Sans", fontsize=11, color="#243b53", penwidth=1.8, arrowsize=0.8];
+
+  j0 [label="Java connector", fillcolor="#e8f1fb", color="#365b86", penwidth=2, fontsize=16];
+  r0 [label="Rust kernel", fillcolor="#e7f6f1", color="#17866f", penwidth=2, fontsize=16];
+  { rank=same; j0; r0; }
+
+  j1 [label="Keep immutable SnapshotHint", fillcolor="#f5f9fd", color="#9fb3c8"];
+  r1 [label="Validate handoff\nRetain root, version, freshness, and generation\nin SnapshotCore", fillcolor="#f1faf7", color="#73bda8"];
+  { rank=same; j1; r1; }
+  j1 -> r1 [label="  1. externalize_core(hint)  "];
+
+  j2 [label="For each plan:\npack current hint", fillcolor="#f5f9fd", color="#9fb3c8"];
+  r2 [label="Borrow SnapshotState for this call\nDecode paths, metadata, and protocol", fillcolor="#f1faf7", color="#73bda8"];
+  { rank=same; j2; r2; }
+  j2 -> r2 [label="  2. plan(core, hint)  "];
+
+  j3 [label="Hint remains owned by Java\nwhile the call is in progress", fillcolor="#f5f9fd", color="#9fb3c8"];
+  r3 [label="Build scoped LogSegment, TableConfiguration,\nStateInfo, checkpoint shape, and plan", fillcolor="#f1faf7", color="#73bda8"];
+  { rank=same; j3; r3; }
+
+  j4 [label="Receive plan\nFree native result buffer\nKeep hint for next call", fillcolor="#f5f9fd", color="#9fb3c8"];
+  r4 [label="Drop scoped planning inputs\nRetain SnapshotCore only", fillcolor="#f1faf7", color="#73bda8"];
+  { rank=same; j4; r4; }
+  r4 -> j4 [label="  3. serialized plan bytes  "];
+
+  j0 -> j1 -> j2 -> j3 -> j4 [style=dashed, color="#9fb3c8", arrowhead=none, constraint=true];
+  r0 -> r1 [style=dashed, color="#73bda8", arrowhead=none, constraint=true];
+  r1 -> r2 [style=dashed, color="#73bda8", arrowhead=none, constraint=true];
+  r2 -> r3 [style=dashed, color="#73bda8", arrowhead=none, constraint=true];
+  r3 -> r4 [style=dashed, color="#73bda8", arrowhead=none, constraint=true];
+
+  note [shape=plaintext, label="Borrow lifetime: one FFI call. Schema and path getters still return owned Rust values in this prototype.", fontcolor="#52606d", fontsize=10];
+  j4 -> note [style=invis];
+  r4 -> note [style=invis];
+}

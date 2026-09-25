@@ -10,7 +10,7 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, Scan};
+use super::{PartitionValuesOptions, PhysicalPredicate, Scan, StatsOptions};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
@@ -19,6 +19,7 @@ use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
     MapToStructOptions, Predicate,
 };
+use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
@@ -45,6 +46,34 @@ const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
 
 impl Scan {
+    pub(super) fn build_metadata_scan_plan(
+        &self,
+        shape: &CheckpointShape,
+    ) -> DeltaResult<Option<Plan>> {
+        MetadataScanPlan::from_scan(self).build_metadata_scan_plan(shape)
+    }
+}
+
+/// Inputs the metadata plan needs after scan-state construction has finished.
+pub(super) struct MetadataScanPlan<'a> {
+    pub(super) log_segment: &'a LogSegment,
+    pub(super) state_info: &'a StateInfo,
+    pub(super) stats: &'a StatsOptions,
+    pub(super) physical_stats_output_schema: &'a Option<SchemaRef>,
+    pub(super) partition_values: &'a PartitionValuesOptions,
+}
+
+impl<'a> MetadataScanPlan<'a> {
+    fn from_scan(scan: &'a Scan) -> Self {
+        Self {
+            log_segment: scan.snapshot.log_segment(),
+            state_info: scan.state_info.as_ref(),
+            stats: &scan.stats,
+            physical_stats_output_schema: &scan.physical_stats_output_schema,
+            partition_values: &scan.partition_values,
+        }
+    }
+
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
     /// Returns `None` for an empty result or a statically false predicate.
@@ -58,7 +87,7 @@ impl Scan {
         &self,
         shape: &CheckpointShape,
     ) -> DeltaResult<Option<Plan>> {
-        let state = &self.state_info;
+        let state = self.state_info;
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
@@ -139,7 +168,7 @@ impl Scan {
     /// When the checkpoint lacks native parsed stats, `FROM_JSON(add.stats, physical_stats)`
     /// replaces `add.stats_parsed` above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
+        let log_segment = self.log_segment;
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
         let source_physical_stats = shape.parsed_stats_schema.as_ref();
@@ -203,7 +232,7 @@ impl Scan {
     ///
     /// A parsed field is omitted when its schema is absent.
     fn commit_arm(&self) -> DeltaResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
+        let log_segment = self.log_segment;
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
         PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
             .filter(Predicate::or(

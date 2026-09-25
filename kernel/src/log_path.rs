@@ -20,6 +20,12 @@ impl From<LogPath> for ParsedLogPath {
     }
 }
 
+impl From<ParsedLogPath> for LogPath {
+    fn from(path: ParsedLogPath) -> Self {
+        Self(path)
+    }
+}
+
 impl LogPath {
     /// Attempt to create a `LogPath` from `FileMeta`. This returns an error if the path isn't a
     /// valid log path.

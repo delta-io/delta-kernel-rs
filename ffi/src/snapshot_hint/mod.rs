@@ -1,6 +1,8 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
+use delta_kernel::snapshot::{
+    SnapshotHint, SnapshotHintError, SnapshotHintFreshness, SnapshotState,
+};
 use delta_kernel::{DeltaResult, Error, Version};
 
 use crate::delta_types::{FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol};
@@ -8,6 +10,11 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::{FfiSnapshotBuilder, FfiSnapshotBuilderSource, MutableFfiSnapshotBuilder};
+
+mod state;
+use state::BorrowedSnapshotState;
+mod core;
+pub use core::*;
 
 /// Freshness claim attached to a connector-provided snapshot hint.
 ///
@@ -80,30 +87,28 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
 ) -> DeltaResult<bool> {
-    if matches!(
-        &builder.source,
-        FfiSnapshotBuilderSource::ExistingSnapshot(_)
-    ) {
-        return Err(Error::unsupported(
-            "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
-        ));
-    }
+    let table_root = match &builder.source {
+        FfiSnapshotBuilderSource::TableRoot(table_root) => table_root,
+        FfiSnapshotBuilderSource::ExistingSnapshot(_) => {
+            return Err(Error::unsupported(
+                "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
+            ))
+        }
+    };
+    let state = BorrowedSnapshotState {
+        hint: value,
+        table_root,
+    };
     let freshness = value.freshness.into();
-    let log_paths = unsafe { value.log_paths.log_paths() }
-        .map_err(|source| invalid_with_source("supplied log paths are invalid", source))?;
-    let protocol = unsafe { value.protocol.try_to_kernel() }
-        .map_err(|source| invalid_with_source("supplied protocol is invalid", source))?;
-    let metadata = unsafe { value.metadata.try_to_kernel() }
-        .map_err(|source| invalid_with_source("supplied metadata is invalid", source))?;
-    let last_checkpoint_hint = unsafe { value.last_checkpoint.as_ref() }
-        .map(|checkpoint| unsafe { checkpoint.try_to_kernel() })
-        .transpose()
-        .map_err(|source| invalid_with_source("supplied _last_checkpoint is invalid", source))?;
-    let crc = unsafe { value.crc.as_ref() }
-        .map(|crc_value| unsafe { crc_value.try_to_kernel() })
-        .map(|result| result.map_err(invalid_crc))
-        .transpose()?
-        .map(std::sync::Arc::new);
+    let mut log_paths = Vec::new();
+    state.visit_log_paths(&mut |batch| {
+        log_paths.extend_from_slice(batch);
+        Ok(())
+    })?;
+    let protocol = state.protocol()?;
+    let metadata = state.metadata()?;
+    let last_checkpoint_hint = state.last_checkpoint()?;
+    let crc = state.crc()?;
     let snapshot_hint = SnapshotHint::try_new(
         value.version,
         log_paths,
@@ -147,6 +152,24 @@ pub unsafe extern "C" fn snapshot_builder_set_snapshot_hint(
     let builder = unsafe { builder.as_mut() };
     let result = unsafe { snapshot_builder_set_snapshot_hint_impl(builder, value) };
     report(builder, result)
+}
+
+pub(super) fn validate_handoff(
+    owned: &delta_kernel::Snapshot,
+    host: &dyn SnapshotState,
+) -> DeltaResult<bool> {
+    if owned.version() != host.version() || owned.is_built_as_latest() != host.is_latest() {
+        return Err(invalid(
+            "host version or freshness differs from the native snapshot",
+        ));
+    }
+    if owned.table_root() != host.table_root() {
+        return Err(invalid("host table root differs from the native snapshot"));
+    }
+    if !owned.matches_state(host)? {
+        return Err(invalid("host state differs from the native snapshot"));
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
