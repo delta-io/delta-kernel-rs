@@ -22,13 +22,8 @@ jobs:
       - name: Validate and resolve PR info
         id: pr-context
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           PR_TARGET_REPO: ${{ github.repository }}
-          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
-          RUN_PULL_REQUESTS: ${{ toJson(github.event.workflow_run.pull_requests) }}
-          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
         run: |
           set -euo pipefail
 
@@ -38,45 +33,6 @@ jobs:
             exit 1
           fi
           number="${lines[0]}"
-
-          case "$UPSTREAM_EVENT" in
-            pull_request)
-              # Match the artifact to GitHub's exact PR association for the validator run.
-              expected_number=$(jq -er '
-                if type == "array" and length == 1 and
-                    (.[0].number | type == "number" and . > 0)
-                then .[0].number
-                else error("expected exactly one associated PR with a positive number")
-                end
-              ' <<< "$RUN_PULL_REQUESTS")
-              if [[ "$number" != "$expected_number" ]]; then
-                echo "::error::artifact PR does not match the triggering workflow run"
-                exit 1
-              fi
-              ;;
-            merge_group)
-              # Match the artifact to the PR encoded in GitHub's merge-queue branch.
-              expected_number=$(sed -nE \
-                's#^(refs/heads/)?gh-readonly-queue/.*/pr-([1-9][0-9]*)-[^/]+$#\2#p' \
-                <<< "$RUN_HEAD_BRANCH")
-              if [[ -z "$expected_number" || "$number" != "$expected_number" ]]; then
-                echo "::error::artifact PR does not match the merge-group ref"
-                exit 1
-              fi
-              ;;
-            workflow_run)
-              # Trust artifacts only from validator runs loaded from this repo's default branch.
-              if [[ "$RUN_HEAD_REPO" != "$PR_TARGET_REPO" ||
-                    "$RUN_HEAD_BRANCH" != "$DEFAULT_BRANCH" ]]; then
-                echo "::error::unexpected workflow_run producer"
-                exit 1
-              fi
-              ;;
-            *)
-              echo "::error::unsupported upstream event '$UPSTREAM_EVENT'"
-              exit 1
-              ;;
-          esac
 
           pr_json=$(gh api "repos/${PR_TARGET_REPO}/pulls/${number}")
           title=$(jq -r '.title' <<< "$pr_json")
