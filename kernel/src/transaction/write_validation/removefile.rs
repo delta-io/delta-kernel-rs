@@ -2,9 +2,12 @@
 
 use std::sync::LazyLock;
 
-use super::utils::validate_required_field_exist;
+use super::utils::{validate_required_field_exist, validate_row_tracking_metadata};
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+};
 use crate::schema::{lazy_schema_ref, ColumnNamesAndTypes, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -12,20 +15,28 @@ use crate::{DeltaResult, Error};
 /// Column indices, matching the order in [`MANDATORY_REMOVE_FILE_COLUMNS`].
 const PATH: usize = 0;
 const SIZE: usize = 1;
+const BASE_ROW_ID: usize = 2;
+const DEFAULT_ROW_COMMIT_VERSION: usize = 3;
 
 static MANDATORY_REMOVE_FILE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "path": STRING,
     nullable "size": LONG,
+    nullable FILE_CONSTANT_VALUES_NAME: {
+        nullable BASE_ROW_ID_NAME: LONG,
+        nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+    },
 };
 
 static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| MANDATORY_REMOVE_FILE_SCHEMA.leaves(None));
 
 impl StagedDataValidator {
-    pub(crate) fn staged_remove_file() -> Self {
+    pub(crate) fn staged_remove_file(row_tracking_enabled: bool) -> Self {
         StagedDataValidator::new(
             &MANDATORY_REMOVE_FILE_COLUMNS,
-            vec![Box::new(RemoveFileRequiredFields)],
+            vec![Box::new(RemoveFileRequiredFields {
+                row_tracking_enabled,
+            })],
         )
     }
 }
@@ -35,7 +46,9 @@ impl StagedDataValidator {
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct RemoveFileRequiredFields;
+struct RemoveFileRequiredFields {
+    row_tracking_enabled: bool,
+}
 
 impl Validation for RemoveFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
@@ -57,6 +70,14 @@ impl Validation for RemoveFileRequiredFields {
                 "RemoveFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );
+        if self.row_tracking_enabled {
+            validate_row_tracking_metadata(
+                path,
+                getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
+                getters[DEFAULT_ROW_COMMIT_VERSION]
+                    .get_opt(row, DEFAULT_ROW_COMMIT_VERSION_NAME)?,
+            )?;
+        }
         Ok(())
     }
 }
@@ -68,7 +89,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
@@ -83,7 +104,15 @@ mod tests {
         let (names, _) = MANDATORY_REMOVE_FILE_COLUMNS.as_ref();
         assert_eq!(names[PATH], ColumnName::new(["path"]));
         assert_eq!(names[SIZE], ColumnName::new(["size"]));
-        assert_eq!(names.len(), 2);
+        assert_eq!(
+            names[BASE_ROW_ID],
+            ColumnName::new([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
+        );
+        assert_eq!(
+            names[DEFAULT_ROW_COMMIT_VERSION],
+            ColumnName::new([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
+        );
+        assert_eq!(names.len(), 4);
     }
 
     #[rstest]
@@ -189,11 +218,13 @@ mod tests {
             .try_into_arrow()
             .expect("remove-file schema should convert to Arrow");
 
+        let file_constant_values = new_null_array(arrow_schema.field(2).data_type(), 1);
         RecordBatch::try_new(
             Arc::new(arrow_schema),
             vec![
                 Arc::new(StringArray::from(vec!["dummy"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                file_constant_values,
             ],
         )
         .expect("valid staged remove-file batch")
@@ -210,6 +241,6 @@ mod tests {
     }
 
     fn remove_validator() -> StagedDataValidator {
-        StagedDataValidator::staged_remove_file()
+        StagedDataValidator::staged_remove_file(false /* row_tracking_enabled */)
     }
 }

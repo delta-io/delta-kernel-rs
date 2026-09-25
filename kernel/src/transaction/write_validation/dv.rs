@@ -3,12 +3,15 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use super::utils::{validate_partition_keys, validate_required_field_exist};
+use super::utils::{
+    validate_partition_keys, validate_required_field_exist, validate_row_tracking_metadata,
+};
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{
-    FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+    PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::ColumnNamesAndTypes;
@@ -19,6 +22,8 @@ const PATH: usize = 0;
 const SIZE: usize = 1;
 const MODIFICATION_TIME: usize = 2;
 const PARTITION_VALUES: usize = 3;
+const BASE_ROW_ID: usize = 4;
+const DEFAULT_ROW_COMMIT_VERSION: usize = 5;
 const MODIFICATION_TIME_NAME: &str = "modificationTime";
 
 static DV_MATCHED_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> = LazyLock::new(|| {
@@ -27,6 +32,8 @@ static DV_MATCHED_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> = Laz
         column_name!(SIZE_NAME),
         column_name!(MODIFICATION_TIME_NAME),
         column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
+        column_name!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME),
+        column_name!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME),
     ];
     // Derive types from the canonical scan schema so this projection stays compatible with scan
     // metadata if those field definitions change.
@@ -43,6 +50,7 @@ static DV_MATCHED_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> = Laz
 
 struct DvMatchedFileRequiredFields {
     physical_partition_columns: HashSet<String>,
+    row_tracking_enabled: bool,
 }
 
 impl Validation for DvMatchedFileRequiredFields {
@@ -78,6 +86,14 @@ impl Validation for DvMatchedFileRequiredFields {
             path,
             MODIFICATION_TIME_NAME,
         )?;
+        if self.row_tracking_enabled {
+            validate_row_tracking_metadata(
+                path,
+                getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
+                getters[DEFAULT_ROW_COMMIT_VERSION]
+                    .get_opt(row, DEFAULT_ROW_COMMIT_VERSION_NAME)?,
+            )?;
+        }
         Ok(())
     }
 }
@@ -88,6 +104,7 @@ impl StagedDataValidator {
     /// Errors if the required columns are absent from the scan-row schema.
     pub(crate) fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
+        row_tracking_enabled: bool,
     ) -> DeltaResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS.as_ref().map_err(|error| {
             Error::internal_error(format!(
@@ -98,6 +115,7 @@ impl StagedDataValidator {
             columns,
             vec![Box::new(DvMatchedFileRequiredFields {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
+                row_tracking_enabled,
             })],
         ))
     }
@@ -183,6 +201,15 @@ mod tests {
             names[PARTITION_VALUES],
             column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME)
         );
+        assert_eq!(
+            names[BASE_ROW_ID],
+            column_name!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME)
+        );
+        assert_eq!(
+            names[DEFAULT_ROW_COMMIT_VERSION],
+            column_name!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME)
+        );
+        assert_eq!(names.len(), 6);
     }
 
     #[rstest]
@@ -195,10 +222,13 @@ mod tests {
             Arc::new(Int64Array::from(vec![value])),
         );
         let batches = [make_staged_dv_from_addfile(batch, vec![true])];
-        StagedDataValidator::staged_dv_matched_file(std::iter::empty())
-            .expect("DV validator should use the scan-row schema")
-            .validate_filtered(&batches)
-            .expect("protocol-valid boundary value should be accepted");
+        StagedDataValidator::staged_dv_matched_file(
+            std::iter::empty(),
+            false, /* row_tracking_enabled */
+        )
+        .expect("DV validator should use the scan-row schema")
+        .validate_filtered(&batches)
+        .expect("protocol-valid boundary value should be accepted");
     }
 
     #[rstest]
@@ -224,9 +254,12 @@ mod tests {
             })
             .collect();
         assert_result_error_with_message(
-            StagedDataValidator::staged_dv_matched_file(std::iter::empty())
-                .expect("DV validator should use the scan-row schema")
-                .validate_filtered(&batches),
+            StagedDataValidator::staged_dv_matched_file(
+                std::iter::empty(),
+                false, /* row_tracking_enabled */
+            )
+            .expect("DV validator should use the scan-row schema")
+            .validate_filtered(&batches),
             field,
         );
     }
@@ -247,10 +280,12 @@ mod tests {
             batch,
             selection_vector.to_vec(),
         )];
-        let result =
-            StagedDataValidator::staged_dv_matched_file(["p1".to_string(), "p2".to_string()])
-                .expect("DV validator should use the scan-row schema")
-                .validate_filtered(&batches);
+        let result = StagedDataValidator::staged_dv_matched_file(
+            ["p1".to_string(), "p2".to_string()],
+            false, /* row_tracking_enabled */
+        )
+        .expect("DV validator should use the scan-row schema")
+        .validate_filtered(&batches);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {

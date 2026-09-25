@@ -279,6 +279,8 @@ impl Transaction {
     /// this will be the result of passing [`FilteredEngineData`] returned from a scan
     /// with the selection vector modified to select rows for removal (selected rows in the
     /// selection vector are the ones to be removed).
+    /// When row tracking is enabled, selected rows must have non-null `baseRowId` and
+    /// `defaultRowCommitVersion` in `fileConstantValues`.
     ///
     /// # Example
     ///
@@ -350,6 +352,8 @@ impl Transaction {
     /// Required AddFile fields on matched rows are validated at commit. Staging can therefore
     /// succeed for metadata that commit later rejects, including an empty path, negative size,
     /// or incorrect physical partition keys.
+    /// When row tracking is enabled, matched rows must also have non-null `baseRowId` and
+    /// `defaultRowCommitVersion` in `fileConstantValues`.
     ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
     ///
