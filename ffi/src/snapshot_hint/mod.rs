@@ -157,7 +157,6 @@ pub unsafe extern "C" fn snapshot_builder_set_snapshot_hint(
 pub(super) fn validate_handoff(
     owned: &delta_kernel::Snapshot,
     host: &dyn SnapshotState,
-    engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<bool> {
     if owned.version() != host.version() || owned.is_built_as_latest() != host.is_latest() {
         return Err(invalid(
@@ -167,35 +166,7 @@ pub(super) fn validate_handoff(
     if owned.table_root() != host.table_root() {
         return Err(invalid("host table root differs from the native snapshot"));
     }
-    let mut paths = Vec::new();
-    host.visit_log_paths(&mut |batch| {
-        paths.extend_from_slice(batch);
-        Ok(())
-    })?;
-    let freshness = if host.is_latest() {
-        SnapshotHintFreshness::Latest
-    } else {
-        SnapshotHintFreshness::Unverified
-    };
-    let hint = SnapshotHint::try_new(
-        host.version(),
-        paths,
-        host.protocol()?,
-        host.metadata()?,
-        host.last_checkpoint()?,
-        host.crc()?,
-        freshness,
-    )?;
-    let mut builder =
-        delta_kernel::Snapshot::builder_for(host.table_root().as_str()).with_snapshot_hint(hint);
-    if owned.table_configuration().is_catalog_managed() {
-        builder = builder.with_max_catalog_version(owned.version());
-    }
-    let reconstructed = builder.build(engine)?;
-    if reconstructed.as_ref() != owned
-        || reconstructed.schema() != host.logical_schema()?
-        || SnapshotState::crc(reconstructed.as_ref())? != SnapshotState::crc(owned)?
-    {
+    if !owned.matches_state(host)? {
         return Err(invalid("host state differs from the native snapshot"));
     }
     Ok(true)

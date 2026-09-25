@@ -6,13 +6,19 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
 use crate::crc::Crc;
+use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
+use crate::log_segment::LogSegment;
+use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
+use crate::utils::require;
 use crate::{DeltaResult, Snapshot, Version};
 
 /// Immutable components of a snapshot, independently backed by Rust or a connector.
@@ -84,4 +90,61 @@ impl SnapshotState for Snapshot {
         }
         Ok(())
     }
+}
+
+impl Snapshot {
+    /// Validate connector state against this snapshot without constructing another snapshot.
+    /// Each component is read and released before the next is requested. Log paths are grouped
+    /// using the same rules as snapshot-hint construction before comparing log segments.
+    #[internal_api]
+    pub(crate) fn matches_state(&self, state: &dyn SnapshotState) -> DeltaResult<bool> {
+        if self.table_root() != state.table_root()
+            || self.version() != state.version()
+            || self.is_built_as_latest() != state.is_latest()
+            || *self.table_configuration().protocol() != state.protocol()?
+            || *self.table_configuration().metadata() != state.metadata()?
+        {
+            return Ok(false);
+        }
+
+        let crc = state.crc()?;
+        if self.base_crc().map(Arc::as_ref) != crc.as_deref() {
+            return Ok(false);
+        }
+
+        let segment = log_segment_from_state(state)?;
+        Ok(segment == *self.log_segment())
+    }
+}
+
+/// Resolve borrowed log paths into the segment needed by scan planning and handoff validation.
+pub(crate) fn log_segment_from_state(state: &dyn SnapshotState) -> DeltaResult<LogSegment> {
+    let mut paths: Vec<ParsedLogPath> = Vec::new();
+    state.visit_log_paths(&mut |batch| {
+        paths.extend(batch.iter().cloned().map(Into::into));
+        Ok(())
+    })?;
+    require!(
+        !paths
+            .iter()
+            .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
+        SnapshotHintError::LogCompaction.into()
+    );
+    paths.sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
+    let files = LogSegmentFiles::build_log_segment_files(
+        paths.into_iter().map(Ok),
+        Vec::new(),
+        0,
+        None,
+        CheckpointHandling::Adopt,
+    )?;
+    Ok(LogSegment::try_new(
+        files,
+        state.table_root().join("_delta_log/")?,
+        Some(state.version()),
+        state.last_checkpoint()?,
+    )
+    .map_err(|source| SnapshotHintError::LogSegment {
+        source: Box::new(source),
+    })?)
 }

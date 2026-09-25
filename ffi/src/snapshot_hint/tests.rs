@@ -261,6 +261,25 @@ fn externalized_core_borrows_validated_connector_state() {
         )
     };
     assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "differs");
+    let changed_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        2,
+        1,
+    );
+    let different_files = test_snapshot_hint(
+        std::slice::from_ref(&changed_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    let rejected = unsafe {
+        snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &different_files,
+            42,
+            engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "differs");
     assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
     let core = unsafe {
         ok_or_panic(snapshot_externalize_core(
@@ -343,9 +362,18 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
             engine.shallow_copy(),
         ))
     };
-    unsafe { free_snapshot(snapshot) };
-
     let plan_engine = unsafe { plan_based_engine(&engine) };
+    let inner_engine = unsafe { plan_engine.as_ref() }.engine();
+    let native_snapshot = unsafe { snapshot.into_inner() };
+    let native_plan = native_snapshot
+        .scan_builder()
+        .build()
+        .unwrap()
+        .declarative_metadata_scan_plan(inner_engine.as_ref())
+        .unwrap()
+        .expect("expected a native plan for a hinted commit");
+    let native_bytes = delta_kernel::Operation::QueryPlan(native_plan).to_proto_bytes();
+
     let result = unsafe {
         snapshot_core_declarative_metadata_plan(
             core.shallow_copy(),
@@ -358,6 +386,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
         OptionalValue::None => panic!("expected a plan for a hinted commit"),
     };
+    assert_eq!(bytes, native_bytes);
     let operation = proto_op::Operation::decode(bytes.as_slice()).unwrap();
     assert!(matches!(
         operation.op,

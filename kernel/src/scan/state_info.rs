@@ -295,10 +295,19 @@ impl StateInfo {
         let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
+        // Full-table scans can reuse the physical fields validated during snapshot construction.
+        // Projected schemas and metadata columns still need their own physical conversion.
+        let table_logical_schema = table_configuration.logical_schema();
+        let table_physical_schema = table_configuration.physical_schema();
+        let mut physical_fields = (Arc::ptr_eq(&logical_read_schema, &table_schema)
+            && Arc::ptr_eq(&table_schema, &table_logical_schema))
+        .then(|| table_physical_schema.fields());
+
         let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;
 
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_read_schema.fields().enumerate() {
+            let validated_physical_field = physical_fields.as_mut().and_then(Iterator::next);
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
             {
@@ -379,7 +388,10 @@ impl StateInfo {
                         // note that RowIndex and FilePath are handled in the parquet reader so we
                         // just add them as if they're normal physical
                         // columns
-                        let physical_field = logical_field.make_physical(column_mapping_mode)?;
+                        let physical_field = match validated_physical_field {
+                            Some(field) => field.clone(),
+                            None => logical_field.make_physical(column_mapping_mode)?,
+                        };
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
@@ -430,7 +442,13 @@ impl StateInfo {
         // Stats-eligible column set. Partition columns are excluded; they flow through
         // `partitionValues_parsed` instead.
         let eligible_physical_stats_columns =
-            table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref);
+            if matches!(physical_predicate, PhysicalPredicate::Some(_, _))
+                || !matches!(stats.struct_stats, StructStats::None)
+            {
+                table_configuration.physical_stats_columns_set(requested_physical_stats_columns_ref)
+            } else {
+                HashSet::new()
+            };
         // Observability: predicate refs outside `eligible_physical_stats_columns` fold to NULL
         // by the gate. Surface the dropped set so an engine operator can see what got folded.
         // The filter walk is bounded by predicate width but still does a physical-name
@@ -1543,7 +1561,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None, // no predicate; just check the cached set
+            Some(Arc::new(col!("c0").gt(lit(1i64)))),
             &[],
             num_indexed_cols_config(2),
             vec![],
@@ -1551,6 +1569,17 @@ pub(crate) mod tests {
         .unwrap();
         let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
         assert_eq!(state_info.eligible_physical_stats_columns, cols);
+
+        let no_predicate = get_state_info(
+            flat_long_schema(5),
+            vec![],
+            None,
+            &[],
+            num_indexed_cols_config(2),
+            vec![],
+        )
+        .unwrap();
+        assert!(no_predicate.eligible_physical_stats_columns.is_empty());
     }
 
     /// Predicate on a past-cap column: stats schema goes to `None` (no skipping), but
@@ -1649,7 +1678,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None,
+            Some(Arc::new(col!("c0").gt(lit(1i64)))),
             &[],
             stats_columns_config(listed),
             vec![],
@@ -1731,7 +1760,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None,
+            Some(Arc::new(col!("a").gt(lit(1i64)))),
             &[],
             stats_columns_config(&["s"]),
             vec![],
@@ -1755,7 +1784,7 @@ pub(crate) mod tests {
         let state_info = get_state_info(
             schema,
             vec![],
-            None,
+            Some(Arc::new(col!("c0").gt(lit(1i64)))),
             &[],
             both_configs(listed, num_indexed),
             vec![],

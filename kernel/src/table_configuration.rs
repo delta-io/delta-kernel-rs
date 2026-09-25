@@ -10,7 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::warn;
@@ -103,7 +103,7 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
 /// After construction, call `ensure_operation_supported` to verify that the kernel supports the
 /// required operations for the table's protocol features.
 #[internal_api]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -111,17 +111,31 @@ pub(crate) struct TableConfiguration {
     logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
-    /// The subset of the logical schema that remains after excluding partition columns.
-    logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
     physical_schema: SchemaRef,
-    /// The subset of the physical schema that remains after excluding partition columns.
-    physical_data_schema_without_partition_columns: SchemaRef,
+    /// Derived data schemas, built only for operations that use them.
+    filtered_data_schemas: OnceLock<(SchemaRef, SchemaRef)>,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
     version: Version,
 }
+
+impl PartialEq for TableConfiguration {
+    fn eq(&self, other: &Self) -> bool {
+        self.metadata == other.metadata
+            && self.protocol == other.protocol
+            && self.logical_schema == other.logical_schema
+            && self.has_column_with_default == other.has_column_with_default
+            && self.physical_schema == other.physical_schema
+            && self.table_properties == other.table_properties
+            && self.column_mapping_mode == other.column_mapping_mode
+            && self.table_root == other.table_root
+            && self.version == other.version
+    }
+}
+
+impl Eq for TableConfiguration {}
 
 impl TableConfiguration {
     /// Constructs a [`TableConfiguration`] for a table located in `table_root` at `version`.
@@ -181,41 +195,12 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let partition_columns: HashSet<&str> = metadata
-            .partition_columns()
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let (
-            physical_data_schema_without_partition_columns,
-            logical_schema_without_partition_columns,
-        ) = if partition_columns.is_empty() {
-            (physical_schema.clone(), logical_schema.clone())
-        } else {
-            let physical_fields = logical_schema
-                .fields()
-                .zip(physical_schema.fields())
-                .filter(|(logical_field, _)| {
-                    !partition_columns.contains(logical_field.name().as_str())
-                })
-                .map(|(_, physical_field)| physical_field.clone());
-            let logical_fields = logical_schema
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name().as_str()))
-                .cloned();
-            // Both are subsets of already-valid schemas.
-            (
-                Arc::new(StructType::new_unchecked(physical_fields)),
-                Arc::new(StructType::new_unchecked(logical_fields)),
-            )
-        };
 
         let mut table_config = Self {
             logical_schema,
             has_column_with_default: false,
-            logical_schema_without_partition_columns,
             physical_schema,
-            physical_data_schema_without_partition_columns,
+            filtered_data_schemas: OnceLock::new(),
             metadata,
             protocol,
             table_properties,
@@ -454,12 +439,44 @@ impl TableConfiguration {
 
     /// Returns the logical schema excluding partition columns.
     pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
-        self.logical_schema_without_partition_columns.clone()
+        self.filtered_data_schemas().0.clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
     pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
-        self.physical_data_schema_without_partition_columns.clone()
+        self.filtered_data_schemas().1.clone()
+    }
+
+    fn filtered_data_schemas(&self) -> &(SchemaRef, SchemaRef) {
+        self.filtered_data_schemas.get_or_init(|| {
+            let partition_columns: HashSet<&str> = self
+                .metadata
+                .partition_columns()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if partition_columns.is_empty() {
+                return (self.logical_schema.clone(), self.physical_schema.clone());
+            }
+            let physical_fields = self
+                .logical_schema
+                .fields()
+                .zip(self.physical_schema.fields())
+                .filter(|(logical_field, _)| {
+                    !partition_columns.contains(logical_field.name().as_str())
+                })
+                .map(|(_, physical_field)| physical_field.clone());
+            let logical_fields = self
+                .logical_schema
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
+                .cloned();
+            // Both are subsets of already-validated schemas.
+            (
+                Arc::new(StructType::new_unchecked(logical_fields)),
+                Arc::new(StructType::new_unchecked(physical_fields)),
+            )
+        })
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
@@ -996,11 +1013,11 @@ mod test {
 
         assert!(Arc::ptr_eq(
             &table_config.logical_schema,
-            &table_config.logical_schema_without_partition_columns
+            &table_config.logical_schema_without_partition_columns()
         ));
         assert!(Arc::ptr_eq(
             &table_config.physical_schema,
-            &table_config.physical_data_schema_without_partition_columns
+            &table_config.physical_data_schema_without_partition_columns()
         ));
     }
 
@@ -1016,13 +1033,13 @@ mod test {
 
         assert_eq!(
             table_config
-                .logical_schema_without_partition_columns
+                .logical_schema_without_partition_columns()
                 .num_fields(),
             1
         );
         assert_eq!(
             table_config
-                .physical_data_schema_without_partition_columns
+                .physical_data_schema_without_partition_columns()
                 .num_fields(),
             1
         );

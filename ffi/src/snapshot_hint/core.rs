@@ -8,8 +8,6 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
 use super::{invalid, validate_handoff, BorrowedSnapshotState, FfiSnapshotHint};
-#[cfg(feature = "declarative-plans")]
-use super::{FfiSnapshotHintFreshness, SnapshotHint, SnapshotHintFreshness};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{SharedExternEngine, SharedMetadata, SharedProtocol, SharedSchema, SharedSnapshot};
@@ -50,8 +48,7 @@ pub unsafe extern "C" fn snapshot_externalize_core(
         table_root: owned.table_root(),
     };
     let engine_ref = unsafe { engine.as_ref() };
-    let engine_impl = engine_ref.engine();
-    let result = validate_handoff(owned, &state, engine_impl.as_ref()).map(|_| {
+    let result = validate_handoff(owned, &state).map(|_| {
         Arc::new(SnapshotCore {
             table_root: owned.table_root().clone(),
             version: owned.version(),
@@ -164,8 +161,8 @@ pub unsafe extern "C" fn snapshot_core_get_metadata(
 
 /// Build a declarative scan plan from one scoped borrow of connector state.
 ///
-/// This prototype holds the expanded snapshot and scan only during this call. It supports the
-/// default full-table scan; projection and predicate variants are separate future API work.
+/// This prototype holds only the planning inputs needed for this call. It supports the default
+/// full-table scan; projection and predicate variants are separate future API work.
 ///
 /// # Safety
 ///
@@ -182,30 +179,10 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan(
     let extern_engine = unsafe { engine.as_ref() };
     let inner_engine = extern_engine.engine();
     let result = borrowed_state(core, value, generation).and_then(|state| {
-        let mut paths = Vec::new();
-        state.visit_log_paths(&mut |batch| {
-            paths.extend_from_slice(batch);
-            Ok(())
-        })?;
-        let freshness = if matches!(value.freshness, FfiSnapshotHintFreshness::Latest) {
-            SnapshotHintFreshness::Latest
-        } else {
-            SnapshotHintFreshness::Unverified
-        };
-        let hint = SnapshotHint::try_new(
-            state.version(),
-            paths,
-            state.protocol()?,
-            state.metadata()?,
-            state.last_checkpoint()?,
-            state.crc()?,
-            freshness,
+        let plan = delta_kernel::scan::declarative_metadata_scan_plan_from_state(
+            &state,
+            inner_engine.as_ref(),
         )?;
-        let snapshot = delta_kernel::Snapshot::builder_for(state.table_root().as_str())
-            .with_snapshot_hint(hint)
-            .build(inner_engine.as_ref())?;
-        let scan = snapshot.scan_builder().build()?;
-        let plan = scan.declarative_metadata_scan_plan(inner_engine.as_ref())?;
         Ok(plan
             .map(|plan| {
                 delta_kernel::Operation::QueryPlan(plan)

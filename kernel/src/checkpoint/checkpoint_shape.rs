@@ -41,19 +41,25 @@ pub(crate) struct CheckpointShape {
 impl CheckpointShape {
     /// Resolve `snapshot`'s checkpoint shape. Determines the checkpoint type and, when
     /// `stats_schema` is `Some`, whether the checkpoint contains parsed stats compatible with it.
+    pub(crate) fn try_new(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<CheckpointShape> {
+        Self::try_new_for_segment(exec, snapshot.log_segment(), stats_schema)
+    }
+
     #[tracing::instrument(
         name = "checkpoint_shape.try_new",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_for_segment(
         exec: &dyn PlanExecutor,
-        snapshot: &Snapshot,
+        segment: &LogSegment,
         stats_schema: Option<&SchemaRef>,
     ) -> DeltaResult<CheckpointShape> {
-        let segment = snapshot.log_segment();
-
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
             Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
             Some(checkpoint) => (&checkpoint.location, FileType::Parquet),
