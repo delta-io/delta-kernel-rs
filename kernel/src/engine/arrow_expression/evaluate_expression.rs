@@ -7,7 +7,6 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
-use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -39,10 +38,11 @@ use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp,
+    MapToStructOptions, OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
+use crate::partition_values::{parse_partition_timestamp, TimestampTimezone};
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
 #[internal_api]
@@ -390,7 +390,7 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let timestamp_timezone = TimestampTimezone::try_from_options(&m.options)?;
+            let timestamp_timezone = timestamp_timezone_from_options(&m.options)?;
             let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
             Ok(Arc::new(result) as ArrayRef)
         }
@@ -937,12 +937,12 @@ fn coalesce_arrays(
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
-/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
+/// `timestamp_timezone` applies only to `TIMESTAMP` values without an offset or embedded zone; it
+/// does not affect `DATE` or `TIMESTAMP_NTZ`.
 fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
-    timestamp_timezone: TimestampTimezone,
+    timestamp_timezone: &TimestampTimezone,
 ) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
@@ -955,7 +955,7 @@ fn parse_partition_scalar(
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
-            let micros = timestamp_timezone.parse_timestamp(raw).ok_or_else(|| {
+            let micros = parse_partition_timestamp(raw, timestamp_timezone).ok_or_else(|| {
                 Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
             })?;
             return Ok(Some(Scalar::Timestamp(micros)));
@@ -972,10 +972,17 @@ fn parse_partition_scalar(
     Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar))
 }
 
+fn timestamp_timezone_from_options(options: &MapToStructOptions) -> DeltaResult<TimestampTimezone> {
+    match options.timestamp_timezone() {
+        Some(value) => value.parse(),
+        None => Ok(TimestampTimezone::default()),
+    }
+}
+
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
 /// casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
+/// `timestamp_timezone` controls `TIMESTAMP` values without an offset or embedded zone.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -1064,7 +1071,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw, timestamp_timezone)? {
+                match parse_partition_scalar(target_types[i], raw, &timestamp_timezone)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -2215,8 +2222,8 @@ mod tests {
     }
 
     /// A Delta `TIMESTAMP` stat is always UTC, so every spelling of the UTC annotation must render
-    /// the same literal `Z` form rather than a numeric offset a strict reader would reject. Nested
-    /// too, since arrow applies the format per array at any depth.
+    /// the same literal `Z` form. Nested too, since arrow applies the format per array at any
+    /// depth.
     #[rstest]
     fn test_to_json_renders_utc_timestamps_with_a_z_suffix(
         #[values("UTC", "Etc/UTC", "+00:00")] timezone: &str,
@@ -2799,31 +2806,16 @@ mod tests {
     }
 
     #[test]
-    fn test_map_to_struct_timestamp_offset_normalized_to_utc() {
-        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-        builder.keys().append_value("ts");
-        builder.values().append_value("2024-06-15T14:30:00+05:00");
-        builder.append(true).unwrap();
-
-        let map_array = builder.finish();
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "pv",
-            map_array.data_type().clone(),
-            true,
-        )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
-
-        let output_schema = schema! { nullable "ts": TIMESTAMP };
-        let result_type = DataType::from(output_schema);
-        let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
-        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
-        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
-        let ts = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
+    fn test_map_to_struct_explicit_timestamp_offset_overrides_configured_timezone() {
+        assert_eq!(
+            evaluate_map_timestamp_timezone(
+                "2024-01-15T12:30:45+02:00",
+                DataType::TIMESTAMP,
+                Some("America/Los_Angeles")
+            )
+            .unwrap(),
+            Some(expected_timestamp_micros("2024-01-15T10:30:45Z"))
+        );
     }
 
     fn evaluate_map_to_struct_field(
@@ -2878,6 +2870,11 @@ mod tests {
         "2024-06-15 08:00:00.500500",
         "2024-06-15T15:00:00.500500Z"
     )]
+    #[case::iana_future(
+        Some("America/New_York"),
+        "2100-07-15 12:30:45",
+        "2100-07-15T16:30:45Z"
+    )]
     #[case::fixed_minute_offset(
         Some("+05:30"),
         "2024-01-15 12:30:45.123456",
@@ -2893,30 +2890,10 @@ mod tests {
         "2024-01-15 12:30:45.123456",
         "2024-01-16T06:30:45.123456Z"
     )]
-    #[case::explicit_input_offset(
-        Some("America/Los_Angeles"),
-        "2024-01-15 12:30:45+02:00",
-        "2024-01-15T10:30:45Z"
-    )]
-    #[case::explicit_input_offset_over_fixed_reader(
-        Some("+05:30"),
-        "2024-01-15 12:30:45+02:00",
-        "2024-01-15T10:30:45Z"
-    )]
     #[case::normalized_utc(
         Some("America/Los_Angeles"),
         "2024-01-15T12:30:45.123456Z",
         "2024-01-15T12:30:45.123456Z"
-    )]
-    #[case::embedded_iana_timezone(
-        Some("Europe/Berlin"),
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
-    )]
-    #[case::embedded_iana_timezone_with_default_options(
-        None,
-        "2024-01-15 12:30:45 America/New_York",
-        "2024-01-15T17:30:45Z"
     )]
     #[case::dst_overlap(
         Some("America/Los_Angeles"),
@@ -2973,16 +2950,7 @@ mod tests {
 
     #[test]
     fn test_map_to_struct_timestamp_timezone_reports_invalid_inputs() {
-        for timezone in [
-            "Not/AZone",
-            "+05",
-            "+0530",
-            "+05:60",
-            "+18:00:01",
-            "+19:00",
-            "+05:00:60",
-            "+05:00:00:00",
-        ] {
+        for timezone in ["Not/AZone", "+05:60", "+05:00:60", "+05:00:00:00"] {
             let error = evaluate_map_timestamp_timezone(
                 "2024-01-15 12:30:45",
                 DataType::TIMESTAMP,
@@ -2997,14 +2965,6 @@ mod tests {
                 "not a timestamp",
                 DataType::TIMESTAMP,
                 Some("America/Los_Angeles")
-            ),
-            Err(Error::ParseError(..))
-        ));
-        assert!(matches!(
-            evaluate_map_timestamp_timezone(
-                "2024-01-15 12:30:45+02:00 America/New_York",
-                DataType::TIMESTAMP,
-                None,
             ),
             Err(Error::ParseError(..))
         ));

@@ -404,10 +404,9 @@ fn struct_columns_from_patch(
 ///   while kernel accepts only `"true"`/`"false"`.
 /// - Decimal: arrow's cast silently rescales/rounds to the target scale, while kernel requires the
 ///   value's scale to match the target's exactly (and hard-errors otherwise).
-/// - A timestamp with a trailing named timezone is accepted by the kernel parser but not by the
-///   native DataFusion cast.
+/// - Timestamp: Arrow and Kernel may accept different non-protocol forms.
 ///
-/// Configured options use a kernel-backed UDF so reader-timezone parsing follows kernel semantics.
+/// Configured options use a kernel-backed UDF so timezone parsing follows kernel semantics.
 ///
 /// # Errors
 ///
