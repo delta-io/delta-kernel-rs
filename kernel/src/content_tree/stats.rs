@@ -331,9 +331,8 @@ fn leaf_stats_field(
         // A variant's inner fields carry no field IDs, so the base stats ID covers the whole
         // variant and its bounds are typed as an unshredded variant regardless of shredding.
         //
-        // TODO: variants are min/max-ineligible (see `MinMaxStatsTransform`), so today they carry
-        // only counts -- the projection drops their bounds. If kernel ever derives variant bounds
-        // (e.g. from shredded sub-fields), they flow through here without further changes.
+        // TODO: kernel does not yet plumb variant min/max bounds through (see
+        // `MinMaxStatsTransform`), so they carry only counts; the projection drops their bounds.
         DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
         }
@@ -2176,9 +2175,8 @@ mod tests {
 
     #[test]
     fn pivot_variant_null_count_only_emits_counts_and_returns_some() {
-        // Variants are min/max-ineligible, so they appear only in nullCount. With nullCount as the
-        // sole category, both leaves project to just the count sub-fields (no bounds, no
-        // tight_bounds), and the table still produces content_stats.
+        // TODO: kernel does not yet plumb variant min/max bounds through, so they appear only in
+        // nullCount. With nullCount the sole category, both leaves project to just the counts.
         let table = StructType::new_unchecked([
             field_with_id("id", DataType::INTEGER, true, 0),
             field_with_id("v", DataType::unshredded_variant(), true, 1),
