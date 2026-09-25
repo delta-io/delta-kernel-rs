@@ -809,11 +809,13 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - **Column name**: User-specified (commonly `"row_index"` or `"_metadata.row_index"`)
     /// - **Type**: `LONG` (non-nullable)
-    /// - **Values**: Sequential integers starting at 0 for each file
+    /// - **Values**: Original file row positions, preserving gaps when predicate push-down skips
+    ///   rows
     /// - **Use case**: Track row positions for downstream processing, or internally used to compute
     ///   Row IDs
     ///
-    /// Example: A file with 5 rows would have row_index values `[0, 1, 2, 3, 4]`.
+    /// Example: A file with 5 rows has positions `[0, 1, 2, 3, 4]`. If pruning skips the first
+    /// two rows, the returned positions are `[2, 3, 4]`, not `[0, 1, 2]`.
     ///
     /// ## File Name Column (Reserved Field ID)
     ///

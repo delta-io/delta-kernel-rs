@@ -12,9 +12,7 @@ use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
-use crate::actions::deletion_vector::{
-    deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
-};
+use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
@@ -52,6 +50,7 @@ use crate::{
 };
 
 pub(crate) mod data_skipping;
+mod execute;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
@@ -116,8 +115,8 @@ pub use crate::parallel::parallel_scan_metadata::{
 ///   through.
 /// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
-///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
+/// - [`Self::none`] -- neither, and disables stats-based file skipping. Kernel reads no stats
+///   columns from checkpoints.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
     /// Whether to surface JSON stats on parsed-stats checkpoints (where the
@@ -143,8 +142,7 @@ pub struct StatsOptions {
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
-    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
-    /// disables stats reading entirely.
+    /// Delta file skipping unless the caller picked [`StatsOptions::none`].
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
     AllIndexed {
@@ -221,8 +219,9 @@ impl StatsOptions {
         }
     }
 
-    /// **Disables all stats work**: no stats output, no internal data skipping (even
-    /// when a predicate is set). Kernel reads no stats columns from parquet at all.
+    /// Disables stats output and stats-based file skipping, even when a predicate is set.
+    /// Kernel reads no stats columns from checkpoints. This does not affect data-file Parquet
+    /// predicate pushdown, which requires a test-only opt-in in [`Scan::execute`].
     /// Use when the engine handles its own pruning.
     ///
     /// To get internal predicate-based skipping without `stats_parsed` output, use
@@ -484,6 +483,7 @@ impl ScanBuilder {
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
+            parquet_pushdown: false,
         })
     }
 }
@@ -742,6 +742,7 @@ pub struct Scan {
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+    parquet_pushdown: bool,
 }
 
 /// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
@@ -1341,10 +1342,30 @@ impl Scan {
         ))
     }
 
+    /// Returns this scan with experimental data-file Parquet predicate pushdown enabled.
+    ///
+    /// For testing only: decimal scale widening and timestamp unit conversion can cause incorrect
+    /// pruning.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn with_parquet_pushdown_for_testing(mut self) -> Self {
+        self.parquet_pushdown = true;
+        self
+    }
+
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
     /// the data for the query. Each [`EngineData`] in the resultant iterator is a portion of the
     /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
     /// they can have more control over the execution of the scan.
+    ///
+    /// The scan predicate is used for Delta file skipping. Data-file Parquet predicate pushdown
+    /// is disabled unless explicitly enabled through the test-only opt-in. Returned rows are not
+    /// guaranteed to satisfy the predicate; callers must apply any remaining row-level filter.
+    /// Deletion vectors use original file row indexes. Even with pushdown disabled, the engine's
+    /// [`crate::ParquetHandler`] must supply [`crate::schema::MetadataColumnSpec::RowIndex`]
+    /// for DV-bearing files, including scans without an explicit row-index projection.
+    /// Missing, null, or negative indexes produce errors in the returned iterator.
+    /// Internal row-index columns are removed from the logical output.
     ///
     /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
     /// [`Scan::scan_metadata`] instead.
@@ -1385,13 +1406,32 @@ impl Scan {
 
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
+        let table_physical_schema = self.snapshot.table_configuration().physical_schema();
+        let predicate = if self.parquet_pushdown {
+            self.physical_predicate()
+        } else {
+            None
+        };
+        let partition_schema = self.state_info.physical_partition_schema.clone();
+        let mut dv_read_setup = None;
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
                 let file_path = table_root.join(&scan_file.path)?;
-                let mut selection_vector = scan_file
+                let deleted = scan_file
                     .dv_info
-                    .get_selection_vector(engine.as_ref(), &table_root)?;
+                    .get_treemap(engine.as_ref(), &table_root)?;
+                let dv_filter = if deleted.is_some() {
+                    if dv_read_setup.is_none() {
+                        dv_read_setup = Some(Arc::new(execute::DeletionVectorFilter::try_new(
+                            &physical_schema,
+                            &table_physical_schema,
+                        )?));
+                    }
+                    dv_read_setup.clone()
+                } else {
+                    None
+                };
                 let meta = FileMeta {
                     last_modified: scan_file.modification_time,
                     size: scan_file.size.try_into().map_err(|_| {
@@ -1400,24 +1440,36 @@ impl Scan {
                     location: file_path,
                 };
 
-                // WARNING: We validated the physical predicate against a schema that includes
-                // partition columns, but the read schema we use here does _NOT_ include partition
-                // columns. So we cannot safely assume that all column references are valid. See
-                // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                //
-                // TODO(#860): we disable predicate pushdown until we support row indexes.
+                let predicate = predicate
+                    .as_ref()
+                    .map(|predicate| {
+                        execute::bind_partition_values(
+                            predicate,
+                            partition_schema.as_ref(),
+                            &scan_file.partition_values,
+                        )
+                    })
+                    .transpose()?;
+                let has_predicate = predicate.is_some();
+                let read_schema = dv_filter
+                    .as_ref()
+                    .map_or(&physical_schema, |filter| &filter.read_schema).clone();
+                let transform = match &dv_filter {
+                    Some(filter) => filter.with_row_index_removed(scan_file.transform)?,
+                    None => scan_file.transform,
+                };
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
-                    physical_schema.clone(),
-                    None,
+                    read_schema.clone(),
+                    predicate,
                 )?;
 
                 let mut read_result_iter = read_result_iter.peekable();
 
-                // Only flag an empty iterator as a connector bug when stats are present and report
-                // a positive row count. When stats are absent we cannot distinguish a legitimate
-                // 0-row file from a buggy connector, so we conservatively allow it.
-                let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
+                // An empty iterator is valid if a predicate pruned every row group or missing
+                // stats leave open the possibility of an empty file.
+                let expect_data = !has_predicate
+                    && scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {
                     return Err(Error::internal_error(format!(
                         "ParquetHandler returned no data for file '{}'. This is likely a connector \
@@ -1428,30 +1480,21 @@ impl Scan {
                 }
 
                 let engine = engine.clone(); // Arc clone
-                let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
+                    let read_result = match (&dv_filter, &deleted) {
+                        (Some(filter), Some(deleted)) => filter.apply(read_result, deleted)?,
+                        _ => read_result,
+                    };
                     // transform the physical data into the correct logical form
-                    let logical = state::transform_to_logical(
+                    state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        &physical_schema_inner,
+                        &read_schema,
                         &logical_schema_inner,
-                        scan_file.transform.clone(), // Arc clone
-                    );
-                    let len = logical.as_ref().map_or(0, |res| res.len());
-                    // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-                    // will cover the following results. we `take()` out of `selection_vector` to avoid
-                    // trying to return a captured variable. We're going to reassign `selection_vector`
-                    // to `rest` in a moment anyway
-                    let mut sv = selection_vector.take();
-                    let rest = split_vector(sv.as_mut(), len, None);
-                    let result = logical.fold_with(sv, |logical, sv| {
-                        logical.and_then(|data| data.apply_selection_vector(sv))
-                    });
-                    selection_vector = rest;
-                    result
+                        transform.clone(), // Arc clone
+                    )
                 }))
             })
             // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>

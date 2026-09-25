@@ -10,8 +10,10 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::expressions::{col, lit};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef, StructField};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
@@ -24,10 +26,10 @@ use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 use test_utils::{
     add_commit, assert_result_error_with_message, begin_transaction, collect_row_ids,
-    create_default_engine_mt_executor, create_table, create_table_and_load_snapshot,
-    engine_store_setup, get_materialized_row_tracking_column_names, load_and_begin_transaction,
-    read_actions_from_commit, read_add_infos, read_scan, record_batch_to_bytes, test_read,
-    test_table_setup,
+    create_add_files_metadata, create_default_engine_mt_executor, create_table,
+    create_table_and_load_snapshot, engine_store_setup, get_materialized_row_tracking_column_names,
+    load_and_begin_transaction, read_actions_from_commit, read_add_infos, read_scan,
+    record_batch_to_bytes, record_batch_to_bytes_with_props, test_read, test_table_setup,
 };
 use url::Url;
 
@@ -1191,14 +1193,28 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     )
     .await?;
 
-    // Write a single file with 10 rows: values 100..=109 at physical indexes 0..=9
-    let data = generate_data(
-        schema.clone(),
-        [vec![int32_array((100..110).collect::<Vec<_>>())]],
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from_iter_values(100..110))],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .unwrap_committed();
+    let bytes = record_batch_to_bytes_with_props(
+        &batch,
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build(),
+    );
+    let size = bytes.len().try_into()?;
+    let data_url = table_url.join("data.parquet")?;
+    store
+        .put(&Path::from_url_path(data_url.path())?, bytes.into())
+        .await?;
+    let mut txn = load_and_begin_transaction(&table_url, engine.as_ref())?;
+    // Only numRecords is recorded in Delta, so predicates exercise Parquet row-group pruning.
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![("data.parquet", size, 0, Some(10))],
+    )?);
+    txn.commit(engine.as_ref())?.unwrap_committed();
 
     let column_name = metadata_column.text_value();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -1251,7 +1267,7 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let after = collect_number_to_column(
-        &read_row_tracking_scan(snapshot, engine.clone(), [metadata_column])?,
+        &read_row_tracking_scan(snapshot.clone(), engine.clone(), [metadata_column])?,
         column_name,
     );
 
@@ -1265,6 +1281,36 @@ async fn test_read_row_tracking_metadata_stable_across_deletion_vector_update(
     assert_eq!(
         after, expected_survivors,
         "surviving rows must keep their original {column_name} values"
+    );
+
+    let scan_schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column(column_name, metadata_column)?,
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_schema(scan_schema)
+        .with_predicate(Arc::new(col!("number").ge(lit(104i32))))
+        .build()?
+        .with_parquet_pushdown_for_testing();
+    let batches = read_scan(&scan, engine.clone())?;
+    for batch in &batches {
+        assert_eq!(
+            batch.num_columns(),
+            2,
+            "internal row-index columns must not leak"
+        );
+        assert_eq!(batch.schema().field(0).name(), "number");
+        assert_eq!(batch.schema().field(1).name(), column_name);
+    }
+    let actual = collect_number_to_column(&batches, column_name);
+    assert_eq!(
+        actual,
+        expected_survivors
+            .into_iter()
+            .filter(|(number, _)| *number >= 104)
+            .collect()
     );
 
     // The DV update must preserve the original row-tracking fields on the rewritten Add.
