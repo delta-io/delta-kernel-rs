@@ -12,6 +12,8 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -33,6 +35,8 @@ use crate::path::ParsedLogPath;
 use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::StructType;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
@@ -419,6 +423,27 @@ impl Snapshot {
     /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
     fn base_crc(&self) -> Option<&Arc<Crc>> {
         self.crc.base()
+    }
+
+    /// The latest `checkpoint` action (the adaptiveMetadata content root) in this snapshot's log
+    /// segment, or `None` if the table has no checkpoint action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log segment cannot be read or a checkpoint action fails to parse.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
+        for batch in self.log_segment().read_actions(engine, schema)? {
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
+            {
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
     }
 
     pub fn table_root(&self) -> &Url {
