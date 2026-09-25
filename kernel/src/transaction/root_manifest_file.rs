@@ -2,13 +2,10 @@
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
-use crate::actions::{
-    CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, CHECKPOINT_ACTION_FIELD,
-};
+use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
 use crate::error::Error;
 use crate::log_segment::DomainMetadataMap;
-use crate::schema::StructType;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
@@ -117,15 +114,9 @@ impl RootManifestFile {
             Some(SetTransactionState::Complete(_))
         );
 
-        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
-        let mut checkpoint_action = None;
-        for batch in snapshot.log_segment().read_actions(engine, schema)? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
-            {
-                checkpoint_action = Some(checkpoint);
-                break;
-            }
-        }
+        // TODO: the last checkpoint action should ultimately be cached on the Snapshot (resolved
+        // at construction), which would let us remove LogSegment::find_last_checkpoint_action.
+        let checkpoint_action = snapshot.log_segment().find_last_checkpoint_action(engine)?;
 
         // Reject a checkpoint that spilled txns/domain metadata to sidecars, since sidecars aren't
         // read yet and that state would be lost.
@@ -171,78 +162,25 @@ impl RootManifestFile {
 
 #[cfg(test)]
 mod tests {
-    use std::iter;
     use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol, Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
+    use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
+    use crate::create_row;
     use crate::engine::sync::SyncEngine;
-    use crate::engine_data::FilteredEngineData;
     use crate::object_store::memory::InMemory;
-    use crate::path::LogRoot;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
-    use crate::unit_test_utils::{
-        adaptive_metadata_table_configuration, assert_result_error_with_message,
-        test_schema_flat_with_column_mapping, MockTableConfigurationBuilder,
+    use crate::unit_test_utils::adaptive_metadata_fixtures::{
+        adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
+        write_commit,
     };
-    use crate::{create_row, Engine};
-
-    fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
-        let table_config =
-            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
-        (
-            table_config.protocol().clone(),
-            table_config.metadata().clone(),
-        )
-    }
-
-    fn minimal_checkpoint_action(path: &str, version: Version) -> DeltaResult<CheckpointAction> {
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let version = version_as_i64(version)?;
-        Ok(CheckpointAction::new(
-            version,
-            ContentRoot::new(path.to_string(), 1024, version),
-            protocol,
-            metadata,
-            vec![],
-            vec![],
-        ))
-    }
-
-    fn setup_table() -> DeltaResult<(SyncEngine, url::Url)> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let schema = schema_ref! { nullable "id": INTEGER };
-        let _ = create_table("memory:///", schema, "test")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
-        let table_root = Snapshot::builder_for("memory:///")
-            .build(&engine)?
-            .table_root()
-            .clone();
-        Ok((engine, table_root))
-    }
-
-    fn write_commit(
-        engine: &SyncEngine,
-        table_root: &url::Url,
-        version: Version,
-        data: Box<dyn crate::EngineData>,
-    ) -> DeltaResult<()> {
-        let filtered = FilteredEngineData::with_all_rows_selected(data);
-        let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
-        engine.json_handler().write_json_file(
-            &commit_path.location,
-            Box::new(iter::once(Ok(filtered))),
-            false,
-        )?;
-        Ok(())
-    }
+    use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
 
     fn manifest_file(location: &str, size: u64) -> DeltaResult<FileMeta> {
         Ok(FileMeta {

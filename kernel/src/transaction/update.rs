@@ -16,6 +16,8 @@ use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use super::manifest_commit_state::ManifestCommitState;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -131,6 +133,8 @@ impl Transaction {
             num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             root_manifest_file: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            manifest_commit_state: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
         })
@@ -269,6 +273,40 @@ impl Transaction {
         })?;
         self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
         Ok(self)
+    }
+
+    /// Enables a manifest (content-tree) commit for this transaction, returning the
+    /// [`ManifestCommitState`] that hands out leaf writers accepting file changes.
+    ///
+    /// Mutually exclusive with [`with_root_manifest_file`](Self::with_root_manifest_file), which
+    /// commits a caller-supplied root manifest instead of having kernel build the tree; that
+    /// exclusion is enforced at commit. Repeated calls return the state initialized by the first
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
+    /// delta log commits exist after the last manifest commit (not yet supported).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    pub(crate) fn with_manifest_commit(
+        &mut self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<&mut ManifestCommitState> {
+        if self.manifest_commit_state.is_none() {
+            let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+                Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+            })?;
+            self.manifest_commit_state = Some(ManifestCommitState::try_new(
+                engine,
+                read_snapshot,
+                self.get_commit_version(),
+                &self.effective_table_config,
+            )?);
+        }
+        self.manifest_commit_state.as_mut().ok_or_else(|| {
+            Error::internal_error("manifest commit state missing after initialization")
+        })
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
