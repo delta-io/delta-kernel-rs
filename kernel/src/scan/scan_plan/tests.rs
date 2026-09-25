@@ -792,7 +792,7 @@ fn declarative_metadata_data_skipping(
 #[case::part_zero(col!("part").eq(lit(0i32)), 1)]
 #[case::part_one(col!("part").eq(lit(1i32)), 2)]
 #[case::missing_part(col!("part").eq(lit(4i32)), 0)]
-fn declarative_metadata_reconstructs_partition_values_for_pruning(
+fn declarative_metadata_partition_values_prune_without_stats(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
 ) -> DeltaResult<()> {
@@ -804,7 +804,6 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
@@ -814,16 +813,11 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_metadata_eq(
-        &without_columns(&actual, &[STATS])?,
-        &without_columns(&expected, &[STATS])?,
-        "partition pruning",
-    )
+    assert_metadata_eq(&actual, &expected, "partition pruning")
 }
 
 #[test]

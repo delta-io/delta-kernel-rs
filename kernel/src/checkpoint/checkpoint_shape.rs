@@ -16,11 +16,12 @@ use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::SIDECAR_NAME;
+use crate::actions::{ADD_NAME, SIDECAR_NAME};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
@@ -242,6 +243,24 @@ impl CheckpointShape {
             })
             .then_some(stats_schema)
     }
+
+    /// Returns `partition_schema` when the checkpoint has compatible parsed partition values for
+    /// every requested partition column.
+    pub(crate) fn compatible_partition_values_parsed_schema<'a>(
+        &self,
+        partition_schema: &'a SchemaRef,
+    ) -> Option<&'a SchemaRef> {
+        let checkpoint_schema = self.leaf_checkpoint_schema.as_ref()?;
+        let contains_all_partition_columns = partition_schema.fields().all(|field| {
+            checkpoint_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME, field.name()])
+        });
+        (contains_all_partition_columns
+            && LogSegment::schema_has_compatible_partition_values_parsed(
+                checkpoint_schema,
+                partition_schema,
+            ))
+        .then_some(partition_schema)
+    }
 }
 
 #[tracing::instrument(
@@ -451,6 +470,10 @@ mod tests {
         }
     }
 
+    fn probe_partition_schema() -> SchemaRef {
+        schema_ref! { nullable "part": INTEGER }
+    }
+
     #[test]
     fn incompatible_parsed_stats_schema_is_rejected() {
         let (_engine, snapshot, _tempdir) =
@@ -470,6 +493,36 @@ mod tests {
 
         assert!(shape
             .compatible_stats_parsed_schema(&incompatible)
+            .is_none());
+    }
+
+    #[test]
+    fn parsed_partition_values_require_all_requested_columns() {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &SyncPlanExecutor::default(),
+            snapshot.as_ref(),
+        )
+        .unwrap();
+
+        let compatible = probe_partition_schema();
+        assert_eq!(
+            shape.compatible_partition_values_parsed_schema(&compatible),
+            Some(&compatible)
+        );
+
+        let incomplete = schema_ref! {
+            nullable "part": INTEGER,
+            nullable "missing": STRING,
+        };
+        assert!(shape
+            .compatible_partition_values_parsed_schema(&incomplete)
+            .is_none());
+
+        let incompatible = schema_ref! { nullable "part": STRING };
+        assert!(shape
+            .compatible_partition_values_parsed_schema(&incompatible)
             .is_none());
     }
 
