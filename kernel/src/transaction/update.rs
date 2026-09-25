@@ -16,6 +16,8 @@ use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use super::manifest_commit_state::ManifestCommitState;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use super::root_manifest_file::RootManifestFile;
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -44,6 +46,8 @@ use crate::table_features::{
 };
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::{current_time_ms, require, PhantomType};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::version_as_i64;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
@@ -131,6 +135,8 @@ impl Transaction {
             num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             root_manifest_file: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            manifest_commit_state: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
         })
@@ -269,6 +275,73 @@ impl Transaction {
         })?;
         self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
         Ok(self)
+    }
+
+    /// Enables a manifest (content-tree) commit for this transaction, returning the
+    /// [`ManifestCommitState`] that hands out leaf writers accepting file changes.
+    ///
+    /// Mutually exclusive with [`with_root_manifest_file`](Self::with_root_manifest_file), which
+    /// commits a caller-supplied root manifest instead of having kernel build the tree. Repeated
+    /// calls return the state initialized by the first call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, if a
+    /// root manifest file was already staged, or if delta log commits remain after the last
+    /// manifest commit.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    pub(crate) fn with_manifest_commit(
+        &mut self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<&mut ManifestCommitState> {
+        if self.manifest_commit_state.is_none() {
+            self.check_manifest_commit_preconditions(engine)?;
+            let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+                Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+            })?;
+            let version_to_write = self.get_commit_version();
+            self.manifest_commit_state =
+                Some(ManifestCommitState::new(version_to_write, read_snapshot));
+        }
+        self.manifest_commit_state.as_mut().ok_or_else(|| {
+            Error::internal_error("manifest commit state missing after initialization")
+        })
+    }
+
+    /// Validates that a manifest commit can be started on this transaction.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn check_manifest_commit_preconditions(&self, engine: &dyn Engine) -> DeltaResult<()> {
+        require!(
+            self.effective_table_config
+                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
+            Error::unsupported("manifest commit requires the adaptiveMetadata-preview feature")
+        );
+        require!(
+            self.root_manifest_file.is_none(),
+            Error::invalid_transaction_state(
+                "explicit root manifest and manifest commit are mutually exclusive"
+            )
+        );
+        let read_snapshot = self.read_snapshot_opt.as_ref().ok_or_else(|| {
+            Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+        })?;
+        // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
+        // the precise "since the last manifest commit" semantics) once the manifest-commit write
+        // path lands.
+        if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
+            let snapshot_version = version_as_i64(read_snapshot.version())?;
+            require!(
+                checkpoint.version() >= snapshot_version,
+                Error::invalid_transaction_state(format!(
+                    "manifest commit requires no delta log commits after the last manifest commit; \
+                     the latest checkpoint covers version {} but the snapshot is at \
+                     {snapshot_version}",
+                    checkpoint.version()
+                ))
+            );
+        }
+        Ok(())
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
