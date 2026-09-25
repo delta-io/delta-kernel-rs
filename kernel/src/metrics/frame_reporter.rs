@@ -374,7 +374,7 @@ mod tests {
             &callstacks,
             &[
                 "scan.declarative_metadata_scan_plan",
-                "checkpoint_shape.try_new",
+                "checkpoint_shape.try_new_with_leaf_schema",
                 "checkpoint_shape.from_v2_checkpoint_hint",
                 "checkpoint_shape.try_new_manifest",
             ],

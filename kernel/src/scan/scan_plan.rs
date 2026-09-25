@@ -16,8 +16,8 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
-    MapToStructOptions, Predicate, UnaryExpressionOp,
+    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
+    ExpressionRef, MapToStructOptions, Predicate, UnaryExpressionOp,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -104,12 +104,11 @@ impl Scan {
             .checkpoint_arm(shape)?
             .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
 
-        let checkpoint_live_adds = checkpoint_adds
-            .anti_join(
-                deduped_commit.clone(),
-                [column_name!(FILE_ACTION_KEY)],
-                [column_name!(FILE_ACTION_KEY)],
-            )?;
+        let checkpoint_live_adds = checkpoint_adds.anti_join(
+            deduped_commit.clone(),
+            [column_name!(FILE_ACTION_KEY)],
+            [column_name!(FILE_ACTION_KEY)],
+        )?;
         // A struct-only checkpoint retains its complete parsed stats until reconciliation, then
         // serializes them only when JSON stats were requested.
         let checkpoint_live_adds = if self.stats.synthesize_json && !shape.has_json_stats() {
@@ -259,7 +258,7 @@ impl Scan {
         // one of the following cases:
         //     1) The user requested JSON stats, but the checkpoint only has parsed stats. This
         //        reads the full stats schema so JSON can be synthesized.
-        //     2) The user requested structured stats using `StructStats::All` or
+        //     2) The user requested structured stats using `StructStats::AllIndexed` or
         //        `StructStats::Columns`.
         //     3) The user provided a predicate that can be evaluated using parsed stats.
         //
@@ -555,11 +554,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                     let expr = Expr::parse_json(col!("add.stats"), Arc::clone(schema));
                     self.append_at(add, field, expr)
                 } else {
-                    self.append_at(
-                        add,
-                        field,
-                        Expr::null_literal(schema.as_ref().clone().into()),
-                    )
+                    self.append_at(add, field, null_lit(schema.as_ref().clone()))
                 }
             }
             None => self,
@@ -596,7 +591,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         let expr = if has_stats_parsed {
             Expr::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed"))
         } else {
-            Expr::null_literal(DataType::STRING)
+            null_lit(DataType::STRING)
         };
         self.insert_after_at(
             [ADD_NAME],

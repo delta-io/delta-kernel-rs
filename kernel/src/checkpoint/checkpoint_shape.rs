@@ -10,6 +10,8 @@
 // No in-crate caller yet; following PRs will use this.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;

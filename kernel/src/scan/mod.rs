@@ -247,6 +247,7 @@ impl StatsOptions {
 #[derive(Clone, Debug)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the raw `partitionValues` string map.
+    #[cfg_attr(not(feature = "declarative-plans"), allow(dead_code))]
     pub(crate) string_map: bool,
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
@@ -1166,7 +1167,8 @@ impl Scan {
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_schema.is_some()
+        let needs_leaf_schema = self.stats.synthesize_json
+            || self.state_info.physical_stats_schema.is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
