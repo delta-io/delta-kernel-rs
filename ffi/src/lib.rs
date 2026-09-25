@@ -19,8 +19,6 @@ use delta_kernel::history_manager::{
     get_earliest_commit as kernel_get_earliest_commit,
     latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
-#[cfg(feature = "default-engine-base")]
-use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotHint, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
@@ -1120,27 +1118,30 @@ fn get_default_engine_impl(
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel_default_engine::storage::store_from_url_opts;
+    use delta_kernel_default_engine::storage::EngineStore;
 
-    let store = match object_store_backend {
-        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
-        ObjectStoreBackend::Rest(rest) => {
-            rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
-        }
-    };
+    let store =
+        match object_store_backend {
+            ObjectStoreBackend::UrlScheme => EngineStore::from_url_opts(&url, options)?,
+            ObjectStoreBackend::Rest(rest) => EngineStore::plain(
+                rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?,
+            ),
+        };
     build_engine_from_store(store, executor_config, io_config, allocate_error)
 }
 
-/// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
+/// Assemble a default engine from pre-built storage handles, applying executor and read-path I/O
 /// tuning. Shared by the URL-scheme and REST engine builder paths.
 #[cfg(feature = "default-engine-base")]
 pub(crate) fn build_engine_from_store(
-    store: Arc<dyn ObjectStore>,
+    store: impl Into<delta_kernel_default_engine::storage::EngineStore>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
+
+    let store = store.into();
 
     // The builder is generic over the executor type, so apply the shared I/O config via a generic
     // helper to both branches without naming the concrete builder type.
@@ -2237,7 +2238,7 @@ mod tests {
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;

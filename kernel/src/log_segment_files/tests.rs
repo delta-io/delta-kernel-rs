@@ -197,6 +197,46 @@ impl StorageHandler for CountingStorageHandler {
     }
 }
 
+/// Simulates a connector whose `list_from` output includes recursive descendants.
+struct RecursiveListingHandler {
+    files: Vec<FileMeta>,
+    items_pulled: Arc<AtomicU32>,
+}
+
+impl StorageHandler for RecursiveListingHandler {
+    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        let items_pulled = self.items_pulled.clone();
+        let iter = self.files.clone().into_iter().map(move |file| {
+            items_pulled.fetch_add(1, Ordering::Relaxed);
+            Ok(file)
+        });
+        Ok(Box::new(iter))
+    }
+
+    fn read_files(
+        &self,
+        _files: Vec<crate::FileSlice>,
+    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        panic!("read_files should not be called during listing");
+    }
+
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        panic!("put should not be called during listing");
+    }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        panic!("copy_atomic should not be called during listing");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        panic!("head should not be called during listing");
+    }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
+}
+
 /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
 /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
 ///          latest_crc_file, latest_commit_file, max_published_version).
@@ -478,14 +518,13 @@ async fn test_listing_omits_staged_commits() {
 }
 
 #[tokio::test]
-async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
+async fn test_listing_does_not_yield_staged_commits() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
     ];
-    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
-    // reaches them only after all relevant files. None should be consumed beyond the first.
+    // Staged commits sort after every version-named file ('_' > '9') but live in a subdirectory.
     log_files
         .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
 
@@ -498,19 +537,53 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the single staged commit that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), 3);
 }
 
-// Any path past the version-named region stops the listing, not just `_staged_commits/`:
-// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
-// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
-// is ever consumed.
+#[test]
+fn list_delta_log_from_storage_tolerates_recursive_results() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let mut files: Vec<_> = [
+        "00000000000000000000.json",
+        "00000000000000000001.json",
+        "00000000000000000002.json",
+        "_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet",
+        "_staged_commits/00000000000000000003.uuid.json",
+    ]
+    .into_iter()
+    .map(|path| FileMeta::new(log_root.join(path).unwrap(), 0, 1))
+    .collect();
+    files.sort_unstable();
+
+    let items_pulled = Arc::new(AtomicU32::new(0));
+    let storage = RecursiveListingHandler {
+        files,
+        items_pulled: items_pulled.clone(),
+    };
+
+    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert_eq!(
+        listed.iter().map(|path| path.version).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    // The first nested path terminates the listing without pulling later recursive descendants.
+    assert_eq!(items_pulled.load(Ordering::Relaxed), 4);
+}
+
+// Nested paths are excluded by `StorageHandler`; direct paths past the version-named region stop
+// the listing.
 #[rstest]
-#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
-#[case::non_underscore_sentinel("_delta_log/Zsentinel")]
+#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet", 3)]
+#[case::non_underscore_sentinel("_delta_log/Zsentinel", 4)]
 #[tokio::test]
-async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_path: &str) {
+async fn test_listing_excludes_nested_and_stops_at_direct_non_version_path(
+    #[case] sentinel_path: &str,
+    #[case] expected_items_listed: u32,
+) {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -527,8 +600,7 @@ async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_pat
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the sentinel that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), expected_items_listed);
 }
 
 #[tokio::test]
