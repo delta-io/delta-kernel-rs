@@ -16,10 +16,10 @@ pub(crate) struct ScanMetrics {
     num_add_files_seen: AtomicU64,
     /// Add actions in delta-file replay input before predicate filtering and deduplication.
     num_add_files_seen_from_delta_files: AtomicU64,
-    /// Add files that survived log replay (files to read). includes files that survived
-    /// dataskipping, partition pruning, and add/remove deduplication.
+    /// Candidate data files that survived data skipping, partition pruning, and add/remove
+    /// deduplication. This is recorded before any execute-time file filter.
     num_selected_add_files: AtomicU64,
-    /// Number of bytes in the active add files as reported by the add action size field
+    /// Bytes in candidate data files as reported by Add actions, before execute-time filtering.
     selected_add_files_bytes: AtomicU64,
     /// Remove actions in delta-file replay input before deduplication.
     num_remove_files_seen_from_delta_files: AtomicU64,
