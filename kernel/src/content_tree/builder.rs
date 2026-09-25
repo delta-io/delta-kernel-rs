@@ -23,22 +23,20 @@ use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
     ToSchema as _,
 };
-use crate::transaction::{with_row_tracking_cols, BASE_ADD_FILES_SCHEMA};
+use crate::transaction::augmented_write_metadata_schema;
 use crate::{DeltaResult, Engine, Error};
 
-/// The AMT/Iceberg adaptive-metadata format version stamped onto each written entry: Iceberg
-/// format version 4 (the "V4 adaptive metadata tree").
+/// The Iceberg format version stamped onto each written entry: 4 (the V4 adaptive metadata tree).
 const AMT_FORMAT_VERSION: i32 = 4;
 
 /// Dotted path of the `stats.numRecords` leaf column, used for column selection and error messages.
 const STATS_NUM_RECORDS: &str = "stats.numRecords";
 
 /// The write-metadata input schema consumed by [`convert_append_metadata_to_entry_batch`]: the
-/// canonical row-tracking-augmented add-file write-metadata schema (`BASE_ADD_FILES_SCHEMA`
-/// extended with the row-tracking columns), projected to the columns this path reads and with
-/// `stats` narrowed to `numRecords`. Derived from that single source of truth so it cannot drift.
+/// [`augmented_write_metadata_schema`] projected to the columns this path reads and with `stats`
+/// narrowed to `numRecords`. Derived from that single source so it cannot drift.
 fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
-    let augmented = with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?;
+    let augmented = augmented_write_metadata_schema()?;
     let projected = augmented.project(&[
         PATH_NAME,
         SIZE_NAME,
@@ -64,16 +62,10 @@ fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
 }
 
 /// The write-metadata leaf columns this path requires to be non-null on every row, in leaf order:
-/// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. See
-/// [`RequiredFieldsNonNullVisitor`]. Nullability here is only used to name the selected leaves; the
-/// non-null contract is enforced by the visitor, not this schema.
-///
-/// These columns must be non-null because they populate root-manifest entry fields that a root
-/// manifest requires (`recordCount` and the tracking `firstRowId`/`sequenceNumber`/
-/// `fileSequenceNumber`) -- note the tracking fields are themselves `Option` on the output entry,
-/// so their non-nullability is a root-manifest requirement, not an output-schema one. `path`/`size`
-/// are omitted deliberately: the upstream add-file writer always populates them (they are mandatory
-/// add-file fields), so they cannot be null in practice.
+/// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. The non-null contract is enforced by
+/// [`RequiredFieldsNonNullVisitor`], not this schema: these populate root-manifest entry fields
+/// that are themselves `Option` on the output entry, so the output schema can't enforce it.
+/// `path`/`size` are exempt because the upstream add-file writer always populates them.
 static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     StructType::new_unchecked([
         StructField::not_null(
@@ -89,37 +81,43 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// Translates a Delta file write-metadata batch into a content-tree entry [`EngineData`] batch
 /// (one `Data` entry per input row), suitable for serializing as an AMT root manifest.
 ///
-/// Each input row is a newly added file: the produced entry has content type `Data`, `fileFormat`
-/// `parquet`, `specId` 0 (this path assumes an unpartitioned table), `formatVersion` 4, and
-/// tracking status [`TrackingStatus::Added`]. `location`, `fileSizeInBytes`, `recordCount`, and
-/// `firstRowId` come from the input `path`, `size`, `stats.numRecords`, and `baseRowId` columns
-/// respectively. Both `sequenceNumber` and `fileSequenceNumber` come from the input
-/// `defaultRowCommitVersion` column (the AMT data/file sequence number). `snapshotId` is set to
-/// `snapshot_id`. All entry fields other than these are left null; statistics and partition values
-/// are omitted from the output schema.
+/// Each input row is a newly added file, producing an [`TrackingStatus::Added`] `Data` entry
+/// (`fileFormat` parquet, `formatVersion` 4, `specId` 0 -- unpartitioned tables only). Both
+/// `sequenceNumber` and `fileSequenceNumber` take the input `defaultRowCommitVersion`; remaining
+/// entry fields are null, and statistics and partition values are omitted from the output schema.
 ///
 /// This path is only valid for AMT tables, which always have row tracking enabled, so every input
 /// row carries an assigned `baseRowId` and `defaultRowCommitVersion`.
 ///
 /// # Parameters
 /// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transform.
-/// - `write_metadata`: input batch with the schema `{path: string, size: long, stats: {numRecords:
-///   long}, baseRowId: long, defaultRowCommitVersion: long}` -- a projection of the row-tracking-
-///   augmented add-file write-metadata schema.
+/// - `write_metadata`: input batch matching [`write_metadata_input_schema`].
 /// - `snapshot_id`: the AMT snapshot id the files are added in; stored in each entry's tracking.
+/// - `partition_columns`: the table's partition columns; must be empty (partitioned tables are
+///   rejected).
 ///
 /// # Returns
 /// An [`EngineData`] batch matching [`ContentTreeNodeEntry::to_schema`].
 ///
 /// # Errors
-/// Returns an error if a row's required `stats.numRecords`, `baseRowId`, or
-/// `defaultRowCommitVersion` is null, or if the evaluator cannot be constructed or fails to
-/// evaluate.
+/// Returns an error if `partition_columns` is non-empty, if a row's required `stats.numRecords`,
+/// `baseRowId`, or `defaultRowCommitVersion` is null, or if the evaluator cannot be constructed or
+/// fails to evaluate.
 pub(crate) fn convert_append_metadata_to_entry_batch(
     engine: &dyn Engine,
     write_metadata: &dyn EngineData,
     snapshot_id: i64,
+    partition_columns: &[String],
 ) -> DeltaResult<Box<dyn EngineData>> {
+    // `specId` 0 below is only correct for an unpartitioned table (a partitioned table's spec 0 is
+    // its real partition spec), so reject partitioned tables until this path supports them.
+    if !partition_columns.is_empty() {
+        return Err(Error::unsupported(format!(
+            "AMT root writes do not yet support partitioned tables; partition columns: \
+             {partition_columns:?}"
+        )));
+    }
+
     // Row tracking guarantees these are assigned, but the evaluator does not enforce the input
     // schema's non-nullability, so a missing assignment would otherwise emit a root entry with a
     // null sequence/firstRowId (invalid for a root manifest). Reject it up front.
@@ -210,9 +208,8 @@ fn build_content_tree_entry_expression(
         LOCATION => Some(projections.location.clone()),
         FILE_FORMAT => Some(lit(DataFileFormat::Parquet)),
         TRACKING => Some(tracking.clone()),
-        // TODO(#3320): `specId` 0 is only correct for unpartitioned tables. A partitioned table's
-        // spec 0 is its real (non-empty) partition spec, so this must carry the table's actual
-        // spec id once the write path supports partitioned AMT tables.
+        // `specId` 0 is safe here because the caller rejects partitioned tables. TODO(#3320): carry
+        // the table's actual spec id once the write path supports partitioned AMT tables.
         PARTITION_SPEC_ID => Some(lit(0i32)),
         RECORD_COUNT => Some(projections.record_count.clone()),
         FILE_SIZE_IN_BYTES => Some(projections.file_size_in_bytes.clone()),
@@ -429,6 +426,7 @@ mod tests {
             &engine,
             write_metadata_input(&engine, &files).as_ref(),
             snapshot_id,
+            &[],
         )
         .unwrap();
         let expected = expected_entries(&engine, &files, snapshot_id);
@@ -450,6 +448,7 @@ mod tests {
             &engine,
             write_metadata_input(&engine, &files).as_ref(),
             0,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -488,7 +487,7 @@ mod tests {
     ) {
         let engine = SyncEngine::new();
         let input = write_metadata_input_nullable(&engine, &rows);
-        let err = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0)
+        let err = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0, &[])
             .err()
             .expect("null required field should be rejected");
         assert!(
@@ -498,10 +497,25 @@ mod tests {
     }
 
     #[test]
+    fn convert_append_metadata_to_entry_batch_rejects_partitioned_table() {
+        let engine = SyncEngine::new();
+        let input = write_metadata_input(&engine, &[("a.parquet", 1, 1, 0, 0)]);
+        let partition_columns = ["part_col".to_string()];
+        let err =
+            convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0, &partition_columns)
+                .err()
+                .expect("a partitioned table should be rejected");
+        assert!(
+            err.to_string().contains("part_col"),
+            "expected error to name the partition column, got: {err}"
+        );
+    }
+
+    #[test]
     fn write_metadata_output_schema_matches_entry_schema() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[("a.parquet", 1, 1, 0, 0)]);
-        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0)
+        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0, &[])
             .unwrap()
             .try_into_record_batch()
             .unwrap();
@@ -516,7 +530,7 @@ mod tests {
     fn convert_append_metadata_to_entry_batch_empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[]);
-        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0).unwrap();
+        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0, &[]).unwrap();
         assert_eq!(out.len(), 0);
     }
 

@@ -149,7 +149,7 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-pub(crate) fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
+fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
     let patch = SchemaStructPatchBuilder::new()
         .append(StructField::nullable("baseRowId", DataType::LONG))
         .append(StructField::nullable(
@@ -157,6 +157,12 @@ pub(crate) fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRe
             DataType::LONG,
         ));
     Ok(Arc::new(patch.build(schema)?))
+}
+
+/// The row-tracking-augmented add-file write-metadata schema: [`BASE_ADD_FILES_SCHEMA`] extended
+/// with the row-tracking columns.
+pub(crate) fn augmented_write_metadata_schema() -> DeltaResult<SchemaRef> {
+    with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)
 }
 
 /// Marker type for transactions on existing tables.
@@ -1377,7 +1383,7 @@ impl<S> Transaction<S> {
         let add_actions = build_add_actions(
             engine,
             extended_add_files,
-            with_row_tracking_cols(self.add_files_schema())?,
+            augmented_write_metadata_schema()?,
             self.data_change,
         )?;
 
