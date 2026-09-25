@@ -16,12 +16,11 @@ use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{ADD_NAME, SIDECAR_NAME};
+use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
@@ -244,23 +243,20 @@ impl CheckpointShape {
             .then_some(stats_schema)
     }
 
-    /// Returns `partition_schema` when the checkpoint has compatible parsed partition values for
-    /// every requested partition column.
+    /// Returns `partition_schema` when the checkpoint has compatible parsed partition values.
     pub(crate) fn compatible_partition_values_parsed_schema<'a>(
         &self,
         partition_schema: &'a SchemaRef,
     ) -> Option<&'a SchemaRef> {
-        let checkpoint_schema = self.leaf_checkpoint_schema.as_ref()?;
-        // Missing stats only weaken pruning; missing partition values change scan output.
-        let contains_all_partition_columns = partition_schema.fields().all(|field| {
-            checkpoint_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME, field.name()])
-        });
-        (contains_all_partition_columns
-            && LogSegment::schema_has_compatible_partition_values_parsed(
-                checkpoint_schema,
-                partition_schema,
-            ))
-        .then_some(partition_schema)
+        self.leaf_checkpoint_schema
+            .as_ref()
+            .is_some_and(|checkpoint_schema| {
+                LogSegment::schema_has_compatible_partition_values_parsed(
+                    checkpoint_schema,
+                    partition_schema,
+                )
+            })
+            .then_some(partition_schema)
     }
 }
 
@@ -497,8 +493,17 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn parsed_partition_values_require_all_requested_columns() {
+    #[rstest]
+    #[case::matching(probe_partition_schema(), true)]
+    #[case::missing_column(schema_ref! {
+        nullable "part": INTEGER,
+        nullable "missing": STRING,
+    }, true)]
+    #[case::incompatible_type(schema_ref! { nullable "part": STRING }, false)]
+    fn parsed_partition_values_schema_compatibility(
+        #[case] partition_schema: SchemaRef,
+        #[case] expected_compatible: bool,
+    ) {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
         let shape = CheckpointShape::try_new_with_leaf_schema(
@@ -507,24 +512,10 @@ mod tests {
         )
         .unwrap();
 
-        let compatible = probe_partition_schema();
         assert_eq!(
-            shape.compatible_partition_values_parsed_schema(&compatible),
-            Some(&compatible)
+            shape.compatible_partition_values_parsed_schema(&partition_schema),
+            expected_compatible.then_some(&partition_schema)
         );
-
-        let incomplete = schema_ref! {
-            nullable "part": INTEGER,
-            nullable "missing": STRING,
-        };
-        assert!(shape
-            .compatible_partition_values_parsed_schema(&incomplete)
-            .is_none());
-
-        let incompatible = schema_ref! { nullable "part": STRING };
-        assert!(shape
-            .compatible_partition_values_parsed_schema(&incompatible)
-            .is_none());
     }
 
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards
