@@ -1,9 +1,10 @@
 # Time travel and snapshot management
 
-To read a Delta table at a specific version or refresh an existing snapshot to
-pick up new commits, you use Kernel's `SnapshotBuilder` API. The builder
-supports both full construction from a table URL and incremental updates from an
-existing `Snapshot`.
+To load or refresh a point-in-time view of a table, build a `Snapshot` for the version you need.
+The [`Snapshot` rustdoc] defines the exact API contract; this page compares the available
+workflows.
+
+[`Snapshot` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.Snapshot.html
 
 Before reading this page, make sure you understand
 [Building a Scan](./building_a_scan.md).
