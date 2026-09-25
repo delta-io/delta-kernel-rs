@@ -242,6 +242,22 @@ impl CheckpointShape {
             })
             .then_some(stats_schema)
     }
+
+    /// Returns `partition_schema` when the checkpoint has compatible parsed partition values.
+    pub(crate) fn compatible_partition_values_parsed_schema<'a>(
+        &self,
+        partition_schema: &'a SchemaRef,
+    ) -> Option<&'a SchemaRef> {
+        self.leaf_checkpoint_schema
+            .as_ref()
+            .is_some_and(|checkpoint_schema| {
+                LogSegment::schema_has_compatible_partition_values_parsed(
+                    checkpoint_schema,
+                    partition_schema,
+                )
+            })
+            .then_some(partition_schema)
+    }
 }
 
 #[tracing::instrument(
@@ -451,6 +467,10 @@ mod tests {
         }
     }
 
+    fn probe_partition_schema() -> SchemaRef {
+        schema_ref! { nullable "part": INTEGER }
+    }
+
     #[test]
     fn incompatible_parsed_stats_schema_is_rejected() {
         let (_engine, snapshot, _tempdir) =
@@ -471,6 +491,31 @@ mod tests {
         assert!(shape
             .compatible_stats_parsed_schema(&incompatible)
             .is_none());
+    }
+
+    #[rstest]
+    #[case::matching(probe_partition_schema(), true)]
+    #[case::missing_column(schema_ref! {
+        nullable "part": INTEGER,
+        nullable "missing": STRING,
+    }, true)]
+    #[case::incompatible_type(schema_ref! { nullable "part": STRING }, false)]
+    fn parsed_partition_values_schema_compatibility(
+        #[case] partition_schema: SchemaRef,
+        #[case] expected_compatible: bool,
+    ) {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &SyncPlanExecutor::default(),
+            snapshot.as_ref(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            shape.compatible_partition_values_parsed_schema(&partition_schema),
+            expected_compatible.then_some(&partition_schema)
+        );
     }
 
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards
