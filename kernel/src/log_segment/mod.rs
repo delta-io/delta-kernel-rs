@@ -13,6 +13,8 @@ use crate::actions::{
     action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -876,6 +878,27 @@ impl LogSegment {
             None,
         )?;
         Ok(result.actions)
+    }
+
+    /// The last (newest) `checkpoint` action (the adaptiveMetadata content root) in this log
+    /// segment, or `None` if it has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log segment cannot be read or a checkpoint action fails to parse.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn find_last_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
+        for batch in self.read_actions(engine, schema)? {
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
+            {
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
     }
 
     /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
