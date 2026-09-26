@@ -19,7 +19,7 @@ use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef,
+    FileSize, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 #[derive(Constructor)]
@@ -88,7 +88,7 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         location: Url,
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         let first_batch = data.next().ok_or_else(|| {
             crate::Error::generic("Cannot write parquet file with empty data iterator")
         })??;
@@ -108,9 +108,11 @@ impl ParquetHandler for SyncParquetHandler {
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
             writer.write(&batch)?;
         }
-        writer.close()?;
+        writer.close()?; // writer must be closed to write the footer
+        let size_in_bytes = buf.len() as u64;
 
-        put_bytes(self.store.as_ref(), &location, buf.into(), true)
+        put_bytes(self.store.as_ref(), &location, buf.into(), true)?;
+        Ok(size_in_bytes)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
@@ -166,7 +168,7 @@ mod tests {
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
 
-        handler
+        let write_size = handler
             .write_parquet_file(url.clone(), test_data_iter())
             .unwrap();
         assert!(file_path.exists());
@@ -178,6 +180,9 @@ mod tests {
                 .unwrap();
         let schema = reader.schema().clone();
         let file_size = std::fs::metadata(&file_path).unwrap().len();
+        // The reported size must be non-zero and match the on-disk file length.
+        assert_ne!(write_size, 0);
+        assert_eq!(write_size, file_size);
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,

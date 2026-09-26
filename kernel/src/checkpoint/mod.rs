@@ -621,7 +621,7 @@ impl CheckpointWriter {
         let checkpoint_path = self.checkpoint_path()?;
         let main_data: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
-        engine
+        let main_size = engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), main_data)?;
 
@@ -635,6 +635,7 @@ impl CheckpointWriter {
             engine,
             &checkpoint_path,
             iter_state,
+            main_size,
             sidecar_sizes_sum,
             sidecar_count,
         )
@@ -650,7 +651,7 @@ impl CheckpointWriter {
         let data_iter = self.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine
+        let main_size = engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
 
@@ -658,6 +659,7 @@ impl CheckpointWriter {
             engine,
             &checkpoint_path,
             state,
+            main_size,
             0, /* sidecar_sizes_sum */
             0, /* sidecar_count */
         )
@@ -809,21 +811,37 @@ fn write_single_sidecar(
         return Ok(None);
     }
     let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
-    engine
+    let written_size = engine
         .parquet_handler()
         .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
     let meta = engine.storage_handler().head(&sidecar_url)?;
+    verify_written_size(&sidecar_url, written_size, meta.size)?;
     Ok(Some((filename, meta)))
+}
+
+/// Verifies that the size the parquet writer reported matches the size the storage layer reports
+/// via `head`, guarding against a truncated or partially-written file. `path` names the file in
+/// the error message.
+fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> DeltaResult<()> {
+    if written_size != observed_size {
+        return Err(Error::generic(format!(
+            "parquet file size mismatch at {path}: writer reported {written_size} bytes, \
+             storage reports {observed_size} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn build_written_checkpoint_info(
     engine: &dyn Engine,
     checkpoint_path: &Url,
     state: Arc<ActionReconciliationIteratorState>,
+    written_size: u64,
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
 ) -> DeltaResult<WrittenCheckpointInfo> {
     let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    verify_written_size(checkpoint_path, written_size, file_meta.size)?;
     let total_size_in_bytes = file_meta
         .size
         .checked_add(sidecar_sizes_sum)

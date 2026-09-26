@@ -202,7 +202,7 @@ use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_colu
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
-    DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, FileSize,
     FilteredEngineData, JsonHandler, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
     Snapshot,
 };
@@ -1855,7 +1855,7 @@ impl ParquetHandler for CapturingParquetHandler {
         &self,
         location: Url,
         data: FileDataReadResultIterator,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 

@@ -22,8 +22,8 @@ use delta_kernel::transaction::Transaction;
 use delta_kernel::LogPath;
 use delta_kernel::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
-    FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
-    PredicateRef, StorageHandler, Version,
+    FileDataReadResultIterator, FileMeta, FileSize, FileStats, JsonHandler, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -2521,7 +2521,7 @@ impl ParquetHandler for NoParquetReadsHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
