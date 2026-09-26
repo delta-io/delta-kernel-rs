@@ -2001,6 +2001,7 @@ pub fn read_actions_from_commit(
 }
 
 /// Row tracking fields extracted from a single add action in a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddActionRowTracking {
     /// The base row ID assigned to the first row in the file.
     pub base_row_id: Option<i64>,
