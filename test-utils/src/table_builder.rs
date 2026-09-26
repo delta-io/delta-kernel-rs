@@ -53,6 +53,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(feature = "nanosecond-timestamps")]
+use delta_kernel::arrow::array::TimestampNanosecondArray;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -68,7 +70,9 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
-use delta_kernel::schema::{schema_ref, DataType, PrimitiveType, SchemaRef, StructType};
+use delta_kernel::schema::{
+    schema_ref, DataType, PrimitiveType, SchemaRef, StructField, StructType,
+};
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -1568,6 +1572,19 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
                 None => Arc::new(array),
             }
         }
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            // Needs a sub-millisecond component like the microsecond case to test truncation.
+            // Also includes a sub-microsecond component.
+            let values: Vec<i64> = (0..rows)
+                .map(|i| (18 + base + i as i32) as i64 * 86_400_000_000_000 + 298_677_123)
+                .collect();
+            let array = TimestampNanosecondArray::from(values);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
         ArrowDataType::Decimal128(precision, scale) => {
             let scale_factor = 10i128.pow(*scale as u32);
             let values: Vec<i128> = (0..rows)
@@ -1836,6 +1853,16 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                     // Microseconds since epoch (no timezone)
                     Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
                 }
+                #[cfg(feature = "nanosecond-timestamps")]
+                PrimitiveType::TimestampNanos => {
+                    // Nanoseconds since epoch (UTC)
+                    Scalar::TimestampNanos((18000 + seed as i64) * 86_400_000_000_000)
+                }
+                #[cfg(feature = "nanosecond-timestamps")]
+                PrimitiveType::TimestampNanosNtz => {
+                    // Nanoseconds since epoch (no timezone)
+                    Scalar::TimestampNanosNtz((18000 + seed as i64) * 86_400_000_000_000)
+                }
                 PrimitiveType::Decimal(dt) => {
                     let scale_factor = 10i128.pow(dt.scale() as u32);
                     let bits = seed as i128 * scale_factor;
@@ -1860,6 +1887,19 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
 /// Default schema with all Delta primitive types including TimestampNtz
 /// and a nested column type.
 pub(crate) fn default_schema() -> SchemaRef {
+    #[cfg(feature = "nanosecond-timestamps")]
+    fn nanos_timestamp_fields() -> Vec<StructField> {
+        vec![
+            StructField::nullable("ts_nanos_col", DataType::TIMESTAMP_NANOS),
+            StructField::nullable("ts_nanos_ntz_col", DataType::TIMESTAMP_NANOS_NTZ),
+        ]
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    fn nanos_timestamp_fields() -> Vec<StructField> {
+        vec![]
+    }
+
     schema_ref! {
         nullable "bool_col": BOOLEAN,
         nullable "byte_col": BYTE,
@@ -1873,6 +1913,7 @@ pub(crate) fn default_schema() -> SchemaRef {
         nullable "date_col": DATE,
         nullable "ts_col": TIMESTAMP,
         nullable "ts_ntz_col": TIMESTAMP_NTZ,
+        ..(nanos_timestamp_fields()),
         nullable "decimal_col": (DataType::decimal(10, 2).unwrap()),
         nullable "nested_col": {
             nullable "a": LONG,

@@ -28,6 +28,8 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::table_features::validate_timestamp_nanos_feature_support;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
@@ -255,6 +257,9 @@ impl TableConfiguration {
             &V3_VALIDATOR,
             IcebergCompatValidationContext::TableConfiguration,
         )?;
+
+        #[cfg(feature = "nanosecond-timestamps")]
+        validate_timestamp_nanos_feature_support(&table_config)?;
 
         Ok(table_config)
     }
@@ -1356,6 +1361,32 @@ mod test {
             table_config.column_mapping_mode()
         );
         assert_eq!(new_table_config.table_root(), table_config.table_root());
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest::rstest]
+    #[case::nanos(DataType::TIMESTAMP_NANOS)]
+    #[case::nanos_ntz(DataType::TIMESTAMP_NANOS_NTZ)]
+    fn test_timestamp_nanos_validation_integration(#[case] ts_type: DataType) {
+        let schema = schema_ref! { nullable "ts": (ts_type) };
+        let config = |features: &[TableFeature]| {
+            MockTableConfigurationBuilder::new()
+                .with_schema(schema.clone())
+                .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+                .try_build()
+        };
+
+        let result = config(&[]);
+        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features");
+
+        let result = config(&[
+            TableFeature::TimestampNanos,
+            TableFeature::TimestampWithoutTimezone,
+        ]);
+        assert!(
+            result.is_ok(),
+            "Should succeed when nanosecond timestamps are used with required features"
+        );
     }
 
     #[test]

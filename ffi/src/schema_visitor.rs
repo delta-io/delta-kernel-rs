@@ -502,6 +502,108 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     .into_extern_result(&allocate_error)
 }
 
+/// Visit a timestamp_nanos field. Similar to timestamp but nanosecond resolution.
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_timestamp_nanos(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_timestamp_nanos_impl(state, name_str, nullable, metadata)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_field_timestamp_nanos_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+) -> DeltaResult<usize> {
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::TimestampNanos,
+        nullable,
+        metadata,
+    )
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_field_timestamp_nanos_impl(
+    _state: &mut KernelSchemaVisitorState,
+    _name: DeltaResult<&str>,
+    _nullable: bool,
+    _metadata: *const EngineMetadata,
+) -> DeltaResult<usize> {
+    Err(Error::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
+/// Visit a timestamp_nanos_ntz field. Similar to timestamp_ntz but nanosecond resolution.
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// descriptor and callback.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_timestamp_nanos_ntz(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_timestamp_nanos_ntz_impl(state, name_str, nullable, metadata)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_field_timestamp_nanos_ntz_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+) -> DeltaResult<usize> {
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::TimestampNanosNtz,
+        nullable,
+        metadata,
+    )
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_field_timestamp_nanos_ntz_impl(
+    _state: &mut KernelSchemaVisitorState,
+    _name: DeltaResult<&str>,
+    _nullable: bool,
+    _metadata: *const EngineMetadata,
+) -> DeltaResult<usize> {
+    Err(Error::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
 /// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
 ///
 /// # Safety
@@ -1592,6 +1694,8 @@ mod tests {
         //   col_date: date,
         //   col_timestamp: timestamp,
         //   col_timestamp_ntz: timestamp_ntz,
+        //   col_timestamp_nanos: timestamp_nanos,
+        //   col_timestamp_nanos_ntz: timestamp_nanos_ntz,
         //   col_interval_year_month: interval year to month,
         //   col_interval_day_time: interval day to second,
         //   col_void: void,
@@ -1618,6 +1722,17 @@ mod tests {
         let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false, null());
         let col_timestamp_ntz =
             visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false, null());
+        #[cfg(feature = "nanosecond-timestamps")]
+        let col_timestamp_nanos =
+            visit_field!(timestamp_nanos, state, "col_timestamp_nanos", false, null());
+        #[cfg(feature = "nanosecond-timestamps")]
+        let col_timestamp_nanos_ntz = visit_field!(
+            timestamp_nanos_ntz,
+            state,
+            "col_timestamp_nanos_ntz",
+            false,
+            null()
+        );
         let col_interval_year_month = visit_field!(
             interval_year_month,
             state,
@@ -1680,6 +1795,10 @@ mod tests {
             col_date,
             col_timestamp,
             col_timestamp_ntz,
+            #[cfg(feature = "nanosecond-timestamps")]
+            col_timestamp_nanos,
+            #[cfg(feature = "nanosecond-timestamps")]
+            col_timestamp_nanos_ntz,
             col_interval_year_month,
             col_interval_day_time,
             col_void,
@@ -1704,7 +1823,7 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 20);
+        assert_eq!(fields.len(), all_columns.len());
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -1720,6 +1839,10 @@ mod tests {
             ("col_date", PrimitiveType::Date),
             ("col_timestamp", PrimitiveType::Timestamp),
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            ("col_timestamp_nanos", PrimitiveType::TimestampNanos),
+            #[cfg(feature = "nanosecond-timestamps")]
+            ("col_timestamp_nanos_ntz", PrimitiveType::TimestampNanosNtz),
             ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
             ("col_interval_day_time", PrimitiveType::IntervalDayTime),
             ("col_void", PrimitiveType::Void),
@@ -1736,25 +1859,32 @@ mod tests {
             assert!(!fields[index].is_nullable());
         }
 
-        assert_eq!(fields[15].name(), "col_decimal");
-        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[15].data_type()
+        let num_primitive = primitive_field_expectations.len();
+        assert_eq!(fields[num_primitive].name(), "col_decimal");
+        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) =
+            fields[num_primitive].data_type()
         else {
             panic!("Field col_decimal is not a decimal type");
         };
         assert_eq!(decimal_type.precision(), 10);
         assert_eq!(decimal_type.scale(), 2);
 
-        assert_eq!(fields[16].name(), "col_array");
-        assert_array(fields[16], DataType::STRING, false);
+        assert_eq!(fields[num_primitive + 1].name(), "col_array");
+        assert_array(fields[num_primitive + 1], DataType::STRING, false);
 
-        assert_eq!(fields[17].name(), "col_map");
-        assert_map(fields[17], DataType::STRING, DataType::LONG, false);
+        assert_eq!(fields[num_primitive + 2].name(), "col_map");
+        assert_map(
+            fields[num_primitive + 2],
+            DataType::STRING,
+            DataType::LONG,
+            false,
+        );
 
-        assert_eq!(fields[18].name(), "col_struct");
-        assert_struct(fields[18], DataType::STRING, false);
+        assert_eq!(fields[num_primitive + 3].name(), "col_struct");
+        assert_struct(fields[num_primitive + 3], DataType::STRING, false);
 
-        assert_eq!(fields[19].name(), "col_variant");
-        let DataType::Variant(variant_type) = fields[19].data_type() else {
+        assert_eq!(fields[num_primitive + 4].name(), "col_variant");
+        let DataType::Variant(variant_type) = fields[num_primitive + 4].data_type() else {
             panic!("Expected variant type for col_variant");
         };
         let variant_fields: Vec<_> = variant_type.fields().collect();
