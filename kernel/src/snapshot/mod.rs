@@ -31,8 +31,8 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
-use crate::scan::ScanBuilder;
-use crate::schema::SchemaRef;
+use crate::scan::{ScanBuilder, StatsOptions};
+use crate::schema::{schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
@@ -889,6 +889,33 @@ impl Snapshot {
     pub fn get_file_stats_if_present(&self) -> Option<FileStats> {
         self.crc_at_version()
             .and_then(|crc| crc.file_stats().cloned())
+    }
+
+    /// Validates `numFiles` and `tableSizeBytes` against a complete, predicate-free log replay.
+    /// Uses `engine` to read log files, not table data. Other CRC fields are not compared.
+    /// Returns `Ok(())` without replay when no CRC with complete file totals is cached at this
+    /// snapshot's version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ChecksumMismatch`] if either total differs, or an error if the metadata
+    /// scan cannot be built or consumed.
+    pub fn validate_crc(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<()> {
+        if self
+            .crc_at_version()
+            .and_then(|crc| crc.file_stats())
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.clone()
+            .scan_builder()
+            .with_schema(schema_ref! {})
+            .with_stats(StatsOptions::none())
+            .without_row_transforms()
+            .build()?
+            .scan_metadata(engine)?
+            .try_for_each(|batch| batch.map(|_| ()))
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.

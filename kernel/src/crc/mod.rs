@@ -29,6 +29,7 @@ mod writer;
 pub(crate) use delta::{merge_domain_metadata, CrcDelta};
 use delta_kernel_derive::internal_api;
 pub use file_size_histogram::FileSizeHistogram;
+pub(crate) use file_stats::validate_file_stats;
 pub use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::{is_incremental_safe_operation, size_to_u64, FileStatsDelta};
