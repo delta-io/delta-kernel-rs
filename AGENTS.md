@@ -299,6 +299,14 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Common Gotchas
 
+- **Bound resource use at trust boundaries:** Treat protocol, JSON, checkpoint, FFI, and
+  connector inputs as potentially faulty or adversarial. Audit collection cardinality, string and
+  payload lengths, nesting, allocation multiplication, copies, and the stack footprint of inline
+  state in frequently instantiated objects. Parsing a field that was ignored is a resource-use
+  change, and checking its length after materialization does not bound peak memory. Prefer
+  streaming or bounded decoding, limits enforced before allocation when possible, explicit
+  rejection or fallback, and boxing uncommon large inline state. Test at-limit and over-limit
+  inputs and guard important stack or heap footprint regressions where practical.
 - **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
   in production code (ok in tests). NEVER assume one batch per file: ALWAYS iterate.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use
