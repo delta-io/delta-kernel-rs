@@ -258,7 +258,7 @@ struct DataLayoutResult {
 /// 4. Of a supported primitive type (Struct, Array, and Map are rejected because the Delta protocol
 ///    does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
-fn validate_partition_columns(
+pub(super) fn validate_partition_columns(
     schema: &StructType,
     partition_columns: &[ColumnName],
 ) -> DeltaResult<()> {

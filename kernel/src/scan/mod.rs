@@ -425,11 +425,9 @@ impl ScanBuilder {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
-        // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
-        // a transient state, but a scan over zero columns has no way to derive row
-        // counts downstream and panics in the arrow layer. Users must populate the
-        // schema with ALTER TABLE ADD COLUMN before scanning.
-        if table_schema.num_fields() == 0 {
+        // Row scans over an empty schema cannot derive row counts downstream and panic in
+        // the Arrow layer. Metadata-only scans still need to enumerate files for overwrite.
+        if table_schema.num_fields() == 0 && !self.without_row_transforms {
             return Err(Error::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
