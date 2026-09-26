@@ -39,7 +39,7 @@ use test_utils::{
     create_default_engine, create_default_engine_mt_executor,
     create_table_with_column_mapping_mode, engine_store_setup, insert_data, into_record_batch,
     load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_table_p37,
-    setup_test_tables, test_table_setup,
+    setup_test_tables, test_table_setup, AddActionRowTracking,
 };
 use url::Url;
 
@@ -2232,7 +2232,6 @@ fn row_tracking_metadata_cases(
     #[case] expected_error: Option<&str>,
     #[values(None, Some(-1))] value: Option<i64>,
     #[values("baseRowId", "defaultRowCommitVersion")] field: &'static str,
-    #[values(0, 1)] batch_index: usize,
     #[values("none", "name", "id")] cm_mode: &str,
 ) {
 }
@@ -2245,12 +2244,11 @@ async fn commit_validates_remove_row_tracking_metadata(
     expected_error: Option<&str>,
     value: Option<i64>,
     field: &'static str,
-    batch_index: usize,
     cm_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // === Given a table with row tracking in the requested state ===
     let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
-    let (original, _, batches) = modified_row_tracking_batches(
+    let (original, corrupted) = batch_with_invalid_row_tracking_meta(
         snapshot.clone(),
         engine.as_ref(),
         ScanFileModification {
@@ -2258,8 +2256,6 @@ async fn commit_validates_remove_row_tracking_metadata(
             value: Arc::new(Int64Array::from(vec![value])),
             row_id: 1,
         },
-        selection_vector,
-        batch_index,
     )?;
     let selected_paths = selected_file_paths(&original, selection_vector);
     let mut expected = row_tracking_file_metadata(&original);
@@ -2268,11 +2264,13 @@ async fn commit_validates_remove_row_tracking_metadata(
     }
 
     // === When committing removals of the selected files ===
+    let corrupted = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     txn.ack_row_tracking_preservation();
-    for batch in batches {
-        txn.remove_files(batch);
-    }
+    txn.remove_files(corrupted);
     let result = txn.commit(engine.as_ref());
 
     // === Expect a validation error or the exact surviving file metadata ===
@@ -2296,12 +2294,11 @@ async fn commit_validates_dv_row_tracking_metadata(
     expected_error: Option<&str>,
     value: Option<i64>,
     field: &'static str,
-    batch_index: usize,
     cm_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // === Given a table with row tracking in the requested state ===
     let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
-    let (original, modified, batches) = modified_row_tracking_batches(
+    let (original, corrupted) = batch_with_invalid_row_tracking_meta(
         snapshot.clone(),
         engine.as_ref(),
         ScanFileModification {
@@ -2309,24 +2306,24 @@ async fn commit_validates_dv_row_tracking_metadata(
             value: Arc::new(Int64Array::from(vec![value])),
             row_id: 1,
         },
-        selection_vector,
-        batch_index,
     )?;
     let selected_paths = selected_file_paths(&original, selection_vector);
     let mut expected = row_tracking_file_metadata(&original);
-    let modified_metadata = row_tracking_file_metadata(&modified);
+    let corrupted_metadata = row_tracking_file_metadata(&corrupted);
     for path in &selected_paths {
-        let mut metadata = modified_metadata[path];
-        metadata.has_deletion_vector = true;
-        expected.insert(path.clone(), metadata);
+        expected.insert(path.clone(), corrupted_metadata[path]);
     }
 
     // === When committing DV updates for the selected files ===
+    let corrupted = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     txn.ack_row_tracking_preservation();
     txn.update_deletion_vectors(
         sequential_dv_descriptors(&selected_paths),
-        batches.into_iter().map(Ok),
+        std::iter::once(Ok(corrupted)),
     )?;
     let result = txn.commit(engine.as_ref());
 
@@ -2349,13 +2346,6 @@ enum RowTrackingState {
     Supported,
     Suspended,
     Unsupported,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileRowTrackingMetadata {
-    base_row_id: Option<i64>,
-    default_row_commit_version: Option<i64>,
-    has_deletion_vector: bool,
 }
 
 type RowTrackingTableSetup = (tempfile::TempDir, Arc<dyn Engine>, Arc<Snapshot>);
@@ -2411,34 +2401,19 @@ fn create_row_tracking_table(
     Ok((temp_dir, engine, snapshot))
 }
 
-fn modified_row_tracking_batches(
+fn batch_with_invalid_row_tracking_meta(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
     modification: ScanFileModification,
-    selection_vector: &[bool],
-    batch_index: usize,
-) -> DeltaResult<(RecordBatch, RecordBatch, Vec<FilteredEngineData>)> {
+) -> DeltaResult<(RecordBatch, RecordBatch)> {
     let scan_file = selected_scan_file_batch(snapshot, engine)?;
     assert_eq!(scan_file.data().len(), 3);
     let original = into_record_batch(scan_file.apply_selection_vector()?);
     let scan_file = FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(
         original.clone(),
     )));
-    let (data, _) = modify_scan_file(scan_file, &modification).into_parts();
-    let modified = into_record_batch(data);
-    let batches = (0..2)
-        .map(|index| {
-            FilteredEngineData::try_new(
-                Box::new(ArrowEngineData::new(modified.clone())),
-                if index == batch_index {
-                    selection_vector.to_vec()
-                } else {
-                    vec![false; modified.num_rows()]
-                },
-            )
-        })
-        .collect::<DeltaResult<Vec<_>>>()?;
-    Ok((original, modified, batches))
+    let (corrupted, _) = modify_scan_file(scan_file, &modification).into_parts();
+    Ok((original, into_record_batch(corrupted)))
 }
 
 fn selected_file_paths(batch: &RecordBatch, selection_vector: &[bool]) -> Vec<String> {
@@ -2453,7 +2428,7 @@ fn selected_file_paths(batch: &RecordBatch, selection_vector: &[bool]) -> Vec<St
         .collect()
 }
 
-fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, FileRowTrackingMetadata> {
+fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, AddActionRowTracking> {
     let constants = batch
         .column_by_name("fileConstantValues")
         .unwrap()
@@ -2466,7 +2441,6 @@ fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, FileRowTra
         .column_by_name("defaultRowCommitVersion")
         .unwrap()
         .as_primitive::<Int64Type>();
-    let dvs = batch.column_by_name("deletionVector").unwrap();
     batch
         .column_by_name("path")
         .unwrap()
@@ -2474,14 +2448,12 @@ fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, FileRowTra
         .iter()
         .zip(base_row_ids.iter())
         .zip(versions.iter())
-        .enumerate()
-        .map(|(row, ((path, base_row_id), default_row_commit_version))| {
+        .map(|((path, base_row_id), default_row_commit_version)| {
             (
                 path.unwrap().to_owned(),
-                FileRowTrackingMetadata {
+                AddActionRowTracking {
                     base_row_id,
                     default_row_commit_version,
-                    has_deletion_vector: dvs.is_valid(row),
                 },
             )
         })
@@ -2491,7 +2463,7 @@ fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, FileRowTra
 fn assert_row_tracking_files(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-    expected: &HashMap<String, FileRowTrackingMetadata>,
+    expected: &HashMap<String, AddActionRowTracking>,
 ) -> DeltaResult<()> {
     let mut actual = HashMap::new();
     for scan_files in get_scan_files(snapshot, engine)? {
