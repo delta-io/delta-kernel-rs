@@ -444,17 +444,17 @@ impl<S> Transaction<S> {
         )
         .validate(&self.add_files_metadata)?;
 
-        let row_tracking_enabled = self
+        let row_tracking_required = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::RowTracking);
         write_validation::StagedDataValidator::staged_dv_matched_file(
             self.effective_table_config.physical_partition_columns(),
-            row_tracking_enabled,
+            row_tracking_required,
         )?
         .validate_filtered(&self.dv_matched_files)?;
 
         // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file(row_tracking_enabled)
+        write_validation::StagedDataValidator::staged_remove_file(row_tracking_required)
             .validate_filtered(&self.remove_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions

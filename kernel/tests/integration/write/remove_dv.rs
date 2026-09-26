@@ -12,7 +12,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::committer::FileSystemCommitter;
@@ -31,6 +31,7 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
+use rstest_reuse::template;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
@@ -46,6 +47,9 @@ use crate::common::write_utils::{
     create_dv_table_with_files, get_scan_files, get_simple_int_schema, sequential_dv_descriptors,
     set_table_properties, write_data_and_check_result_and_stats,
 };
+
+mod dv;
+mod remove;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppendOnlyWrite {
@@ -990,156 +994,6 @@ struct ScanFileModification {
     field_name: &'static str,
     value: ArrayRef,
     row_id: usize,
-}
-
-#[rstest]
-#[case::missing_selected(true, &[true, true, true], Some("missing required row-tracking field"))]
-#[case::missing_implicitly_selected(true, &[false], Some("missing required row-tracking field"))]
-#[case::missing_unselected(true, &[true, false, true], None)]
-#[case::none_selected(true, &[false, false, false], None)]
-#[case::supported_only(false, &[true, true, true], None)]
-#[tokio::test]
-async fn commit_validates_remove_and_dv_row_tracking_metadata(
-    #[case] row_tracking_enabled: bool,
-    #[case] selection_vector: &[bool],
-    #[case] expected_error: Option<&str>,
-    #[values("baseRowId", "defaultRowCommitVersion")] field: &'static str,
-    #[values(false, true)] dv_update: bool,
-    #[values(0, 1)] batch_index: usize,
-    #[values("none", "name", "id")] cm_mode: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_table(
-        &table_path,
-        schema_ref! { nullable "id": INTEGER },
-        "Test/1.0",
-    )
-    .with_table_properties([
-        ("delta.enableDeletionVectors", "true"),
-        ("delta.feature.rowTracking", "supported"),
-        (
-            "delta.enableRowTracking",
-            if row_tracking_enabled {
-                "true"
-            } else {
-                "false"
-            },
-        ),
-        ("delta.columnMapping.mode", cm_mode),
-    ])
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-    .commit(engine.as_ref())?
-    .unwrap_post_commit_snapshot();
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
-    txn.add_files(create_add_files_metadata(
-        txn.add_files_schema(),
-        vec![
-            ("file0.parquet", 10, 1, Some(3)),
-            ("file1.parquet", 10, 1, Some(3)),
-            ("file2.parquet", 10, 1, Some(3)),
-        ],
-    )?);
-    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-    let scan_file = selected_scan_file_batch(snapshot.clone(), engine.as_ref())?;
-    assert_eq!(scan_file.data().len(), 3);
-    let original_batch = into_record_batch(scan_file.apply_selection_vector()?);
-    let scan_file = FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(
-        original_batch.clone(),
-    )));
-    let scan_file = modify_scan_file(
-        scan_file,
-        &ScanFileModification {
-            field_name: field,
-            value: new_null_array(&ArrowDataType::Int64, 1),
-            row_id: 1,
-        },
-    );
-    let (data, _) = scan_file.into_parts();
-    let batch = into_record_batch(data);
-    let paths = batch.column_by_name("path").unwrap().as_string::<i32>();
-    let selected_paths = (0..batch.num_rows())
-        .filter(|&row| selection_vector.get(row).copied().unwrap_or(true))
-        .map(|row| paths.value(row).to_owned())
-        .collect::<Vec<_>>();
-    let mut expected_paths = paths
-        .iter()
-        .flatten()
-        .filter(|path| dv_update || !selected_paths.iter().any(|selected| selected == path))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    expected_paths.sort();
-    let staged_batches = (0..2)
-        .map(|index| {
-            FilteredEngineData::try_new(
-                Box::new(ArrowEngineData::new(batch.clone())),
-                if index == batch_index {
-                    selection_vector.to_vec()
-                } else {
-                    vec![false; batch.num_rows()]
-                },
-            )
-        })
-        .collect::<DeltaResult<Vec<_>>>()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
-    txn.ack_row_tracking_preservation();
-    if dv_update {
-        txn.update_deletion_vectors(
-            sequential_dv_descriptors(&selected_paths),
-            staged_batches.into_iter().map(Ok),
-        )?;
-    } else {
-        for staged in staged_batches {
-            txn.remove_files(staged);
-        }
-    }
-
-    let result = txn.commit(engine.as_ref());
-    if let Some(expected_error) = expected_error {
-        assert_result_error_with_message(result, &format!("{expected_error} '{field}'"));
-    } else {
-        let snapshot = result?.unwrap_post_commit_snapshot();
-        let mut actual_paths = Vec::new();
-        for scan_file in get_scan_files(snapshot, engine.as_ref())? {
-            let actual = into_record_batch(scan_file.apply_selection_vector()?);
-            let actual_dvs = actual.column_by_name("deletionVector").unwrap();
-            let actual_constants = actual
-                .column_by_name("fileConstantValues")
-                .unwrap()
-                .as_struct();
-            for (row, path) in actual
-                .column_by_name("path")
-                .unwrap()
-                .as_string::<i32>()
-                .iter()
-                .enumerate()
-            {
-                let path = path.unwrap();
-                actual_paths.push(path.to_owned());
-                let selected = selected_paths.iter().any(|selected| selected == path);
-                assert_eq!(actual_dvs.is_valid(row), dv_update && selected);
-                let source_row = paths
-                    .iter()
-                    .position(|source| source == Some(path))
-                    .unwrap();
-                let source = if selected { &batch } else { &original_batch };
-                let constants = source
-                    .column_by_name("fileConstantValues")
-                    .unwrap()
-                    .as_struct();
-                for name in ["baseRowId", "defaultRowCommitVersion"] {
-                    let expected = constants.column_by_name(name).unwrap();
-                    let value = actual_constants.column_by_name(name).unwrap();
-                    assert_eq!(
-                        value.slice(row, 1).to_data(),
-                        expected.slice(source_row, 1).to_data()
-                    );
-                }
-            }
-        }
-        actual_paths.sort();
-        assert_eq!(actual_paths, expected_paths);
-    }
-    Ok(())
 }
 
 #[rstest::rstest]
@@ -2321,4 +2175,226 @@ async fn create_number_table(
     .await?
     .unwrap_post_commit_snapshot();
     Ok((temp_dir, table_url, engine, snapshot))
+}
+
+#[template]
+#[rstest]
+#[case::enabled_selected(
+    RowTrackingState::Enabled,
+    &[true, true, true] /* selection_vector */,
+    Some("row-tracking field") /* expected_error */,
+)]
+#[case::supported_selected(
+    RowTrackingState::Supported,
+    &[true, true, true] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::suspended_selected(
+    RowTrackingState::Suspended,
+    &[true, true, true] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::unsupported_selected(
+    RowTrackingState::Unsupported,
+    &[true, true, true] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::enabled_implicitly_selected(
+    RowTrackingState::Enabled,
+    &[false] /* selection_vector */,
+    Some("row-tracking field") /* expected_error */,
+)]
+#[case::supported_implicitly_selected(
+    RowTrackingState::Supported,
+    &[false] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::enabled_unselected(
+    RowTrackingState::Enabled,
+    &[true, false, true] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::supported_unselected(
+    RowTrackingState::Supported,
+    &[true, false, true] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::enabled_none_selected(
+    RowTrackingState::Enabled,
+    &[false, false, false] /* selection_vector */,
+    None /* expected_error */,
+)]
+#[case::supported_none_selected(
+    RowTrackingState::Supported,
+    &[false, false, false] /* selection_vector */,
+    None /* expected_error */,
+)]
+fn row_tracking_metadata_cases(
+    #[case] row_tracking_state: RowTrackingState,
+    #[case] selection_vector: &[bool],
+    #[case] expected_error: Option<&str>,
+    #[values(None, Some(-1))] value: Option<i64>,
+    #[values("baseRowId", "defaultRowCommitVersion")] field: &'static str,
+    #[values(0, 1)] batch_index: usize,
+    #[values("none", "name", "id")] cm_mode: &str,
+) {
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowTrackingState {
+    Enabled,
+    Supported,
+    Suspended,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileRowTrackingMetadata {
+    base_row_id: Option<i64>,
+    default_row_commit_version: Option<i64>,
+    has_deletion_vector: bool,
+}
+
+type RowTrackingTableSetup = (tempfile::TempDir, Arc<dyn Engine>, Arc<Snapshot>);
+
+fn create_row_tracking_table(
+    row_tracking_state: RowTrackingState,
+    cm_mode: &str,
+) -> Result<RowTrackingTableSetup, Box<dyn std::error::Error>> {
+    let (temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = vec![
+        ("delta.enableDeletionVectors", "true"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    match row_tracking_state {
+        RowTrackingState::Enabled => properties.push(("delta.enableRowTracking", "true")),
+        RowTrackingState::Supported | RowTrackingState::Suspended => {
+            properties.push(("delta.feature.rowTracking", "supported"));
+        }
+        RowTrackingState::Unsupported => {}
+    }
+    let snapshot = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "Test/1.0",
+    )
+    .with_table_properties(properties)
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![
+            ("file0.parquet", 10, 1, Some(3)),
+            ("file1.parquet", 10, 1, Some(3)),
+            ("file2.parquet", 10, 1, Some(3)),
+        ],
+    )?);
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    // Create-table does not support suspension; suspend after assigning the original metadata.
+    let snapshot = if row_tracking_state == RowTrackingState::Suspended {
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        set_table_properties(
+            &table_path,
+            &table_url,
+            engine.as_ref(),
+            snapshot.version(),
+            &[("delta.rowTrackingSuspended", "true")],
+        )?
+    } else {
+        snapshot
+    };
+    Ok((temp_dir, engine, snapshot))
+}
+
+fn modified_row_tracking_batches(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    modification: ScanFileModification,
+    selection_vector: &[bool],
+    batch_index: usize,
+) -> DeltaResult<(RecordBatch, RecordBatch, Vec<FilteredEngineData>)> {
+    let scan_file = selected_scan_file_batch(snapshot, engine)?;
+    assert_eq!(scan_file.data().len(), 3);
+    let original = into_record_batch(scan_file.apply_selection_vector()?);
+    let scan_file = FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(
+        original.clone(),
+    )));
+    let (data, _) = modify_scan_file(scan_file, &modification).into_parts();
+    let modified = into_record_batch(data);
+    let batches = (0..2)
+        .map(|index| {
+            FilteredEngineData::try_new(
+                Box::new(ArrowEngineData::new(modified.clone())),
+                if index == batch_index {
+                    selection_vector.to_vec()
+                } else {
+                    vec![false; modified.num_rows()]
+                },
+            )
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok((original, modified, batches))
+}
+
+fn selected_file_paths(batch: &RecordBatch, selection_vector: &[bool]) -> Vec<String> {
+    batch
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| selection_vector.get(*row).copied().unwrap_or(true))
+        .map(|(_, path)| path.unwrap().to_owned())
+        .collect()
+}
+
+fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, FileRowTrackingMetadata> {
+    let constants = batch
+        .column_by_name("fileConstantValues")
+        .unwrap()
+        .as_struct();
+    let base_row_ids = constants
+        .column_by_name("baseRowId")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let versions = constants
+        .column_by_name("defaultRowCommitVersion")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let dvs = batch.column_by_name("deletionVector").unwrap();
+    batch
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .zip(base_row_ids.iter())
+        .zip(versions.iter())
+        .enumerate()
+        .map(|(row, ((path, base_row_id), default_row_commit_version))| {
+            (
+                path.unwrap().to_owned(),
+                FileRowTrackingMetadata {
+                    base_row_id,
+                    default_row_commit_version,
+                    has_deletion_vector: dvs.is_valid(row),
+                },
+            )
+        })
+        .collect()
+}
+
+fn assert_row_tracking_files(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    expected: &HashMap<String, FileRowTrackingMetadata>,
+) -> DeltaResult<()> {
+    let mut actual = HashMap::new();
+    for scan_files in get_scan_files(snapshot, engine)? {
+        let batch = into_record_batch(scan_files.apply_selection_vector()?);
+        actual.extend(row_tracking_file_metadata(&batch));
+    }
+    assert_eq!(&actual, expected);
+    Ok(())
 }
