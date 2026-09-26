@@ -31,11 +31,11 @@ static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| MANDATORY_REMOVE_FILE_SCHEMA.leaves(None));
 
 impl StagedDataValidator {
-    pub(crate) fn staged_remove_file(row_tracking_required: bool) -> Self {
+    pub(crate) fn staged_remove_file(row_tracking_enabled: bool) -> Self {
         StagedDataValidator::new(
             &MANDATORY_REMOVE_FILE_COLUMNS,
             vec![Box::new(RemoveFileRequiredFields {
-                row_tracking_required,
+                row_tracking_enabled,
             })],
         )
     }
@@ -47,7 +47,7 @@ impl StagedDataValidator {
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
 struct RemoveFileRequiredFields {
-    row_tracking_required: bool,
+    row_tracking_enabled: bool,
 }
 
 impl Validation for RemoveFileRequiredFields {
@@ -70,7 +70,7 @@ impl Validation for RemoveFileRequiredFields {
                 "RemoveFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );
-        if self.row_tracking_required {
+        if self.row_tracking_enabled {
             require_row_tracking_metadata(
                 path,
                 getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
@@ -241,6 +241,6 @@ mod tests {
     }
 
     fn remove_validator() -> StagedDataValidator {
-        StagedDataValidator::staged_remove_file(false /* row_tracking_required */)
+        StagedDataValidator::staged_remove_file(false /* row_tracking_enabled */)
     }
 }

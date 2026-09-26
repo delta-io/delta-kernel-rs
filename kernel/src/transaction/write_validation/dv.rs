@@ -50,7 +50,7 @@ static DV_MATCHED_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> = Laz
 
 struct DvMatchedFileRequiredFields {
     physical_partition_columns: HashSet<String>,
-    row_tracking_required: bool,
+    row_tracking_enabled: bool,
 }
 
 impl Validation for DvMatchedFileRequiredFields {
@@ -86,7 +86,7 @@ impl Validation for DvMatchedFileRequiredFields {
             path,
             MODIFICATION_TIME_NAME,
         )?;
-        if self.row_tracking_required {
+        if self.row_tracking_enabled {
             require_row_tracking_metadata(
                 path,
                 getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
@@ -104,7 +104,7 @@ impl StagedDataValidator {
     /// Errors if the required columns are absent from the scan-row schema.
     pub(crate) fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        row_tracking_required: bool,
+        row_tracking_enabled: bool,
     ) -> DeltaResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS.as_ref().map_err(|error| {
             Error::internal_error(format!(
@@ -115,7 +115,7 @@ impl StagedDataValidator {
             columns,
             vec![Box::new(DvMatchedFileRequiredFields {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
-                row_tracking_required,
+                row_tracking_enabled,
             })],
         ))
     }
@@ -224,7 +224,7 @@ mod tests {
         let batches = [make_staged_dv_from_addfile(batch, vec![true])];
         StagedDataValidator::staged_dv_matched_file(
             std::iter::empty(),
-            false, /* row_tracking_required */
+            false, /* row_tracking_enabled */
         )
         .expect("DV validator should use the scan-row schema")
         .validate_filtered(&batches)
@@ -256,7 +256,7 @@ mod tests {
         assert_result_error_with_message(
             StagedDataValidator::staged_dv_matched_file(
                 std::iter::empty(),
-                false, /* row_tracking_required */
+                false, /* row_tracking_enabled */
             )
             .expect("DV validator should use the scan-row schema")
             .validate_filtered(&batches),
@@ -282,7 +282,7 @@ mod tests {
         )];
         let result = StagedDataValidator::staged_dv_matched_file(
             ["p1".to_string(), "p2".to_string()],
-            false, /* row_tracking_required */
+            false, /* row_tracking_enabled */
         )
         .expect("DV validator should use the scan-row schema")
         .validate_filtered(&batches);
