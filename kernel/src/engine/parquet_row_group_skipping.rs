@@ -2,7 +2,6 @@
 //! stats.
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
 use tracing::debug;
 
@@ -11,9 +10,10 @@ use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
-use crate::parquet::file::metadata::RowGroupMetaData;
+use crate::parquet::basic::{ConvertedType, LogicalType, TimeUnit, Type as PhysicalType};
+use crate::parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use crate::parquet::file::statistics::Statistics;
-use crate::parquet::schema::types::ColumnDescPtr;
+use crate::parquet::schema::types::{ColumnDescPtr, ColumnDescriptor};
 use crate::schema::{DataType, DecimalType, PrimitiveType};
 
 #[cfg(test)]
@@ -122,28 +122,30 @@ impl<'a> RowGroupFilter<'a> {
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 
-    /// Returns `None` if the column doesn't exist and `Some(None)` if the column has no stats.
-    fn get_stats(&self, col: &ColumnName) -> Option<Option<&Statistics>> {
+    /// Returns the physical column and its footer metadata, or `None` if it does not exist.
+    fn get_column(&self, col: &ColumnName) -> Option<&ColumnChunkMetaData> {
         self.field_indices
             .get(col)
-            .map(|&i| self.row_group.column(i).statistics())
+            .map(|&i| self.row_group.column(i))
     }
 }
 
 impl ParquetStatsProvider for RowGroupFilter<'_> {
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        extract_min_scalar(data_type, self.get_stats(col)??)
+        let column = self.get_column(col)?;
+        extract_min_scalar(data_type, column.statistics()?, column.column_descr())
     }
 
     fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        extract_max_scalar(data_type, self.get_stats(col)??)
+        let column = self.get_column(col)?;
+        extract_max_scalar(data_type, column.statistics()?, column.column_descr())
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
         // NOTE: Stats for any given column are optional, which may produce a NULL nullcount. But if
         // the column itself is missing, then we know all values are implied to be NULL.
         //
-        let Some(stats) = self.get_stats(col) else {
+        let Some(column) = self.get_column(col) else {
             // WARNING: This optimization is only sound if the caller has verified that the column
             // actually exists in the table's logical schema, and that any necessary logical to
             // physical name mapping has been performed. Because we currently lack both the
@@ -152,7 +154,7 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             return self.get_parquet_rowcount_stat().filter(|_| false);
         };
 
-        extract_nullcount(stats)
+        extract_nullcount(column.statistics())
     }
 
     fn get_parquet_rowcount_stat(&self) -> Option<i64> {
@@ -162,7 +164,11 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 
 /// Extracts the minimum stat value from parquet footer statistics, converting from the physical
 /// parquet type to the requested logical Delta type.
-fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar> {
+fn extract_min_scalar(
+    data_type: &DataType,
+    stats: &Statistics,
+    column: &ColumnDescriptor,
+) -> Option<Scalar> {
     use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, stats) {
         (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
@@ -189,16 +195,25 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
         (Date, _) => return None,
-        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.min_opt()?),
+        (Timestamp, Statistics::Int64(s)) => {
+            Scalar::Timestamp(timestamp_micros(*s.min_opt()?, column)?)
+        }
         (Timestamp, _) => return None, // TODO: Int96 timestamps
-        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
-        (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
+        (TimestampNtz, Statistics::Int64(s)) => {
+            Scalar::TimestampNtz(timestamp_micros(*s.min_opt()?, column)?)
+        }
+        (TimestampNtz, Statistics::Int32(s)) if column.converted_type() == ConvertedType::DATE => {
+            timestamp_from_date(s.min_opt())?
+        }
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth | IntervalDayTime, _) => return None,
-        (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
-        (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
+        (Decimal(d), Statistics::Int32(i)) => decimal_stat(i128::from(*i.min_opt()?), *d, column)?,
+        (Decimal(d), Statistics::Int64(i)) => decimal_stat(i128::from(*i.min_opt()?), *d, column)?,
         (Decimal(d), Statistics::FixedLenByteArray(b)) => {
-            decimal_from_bytes(b.min_bytes_opt(), *d)?
+            decimal_stat(decimal_from_bytes(b.min_bytes_opt())?, *d, column)?
+        }
+        (Decimal(d), Statistics::ByteArray(b)) => {
+            decimal_stat(decimal_from_bytes(b.min_bytes_opt())?, *d, column)?
         }
         (Decimal(..), _) => return None,
         // Void columns have no Parquet representation, so no stats exist
@@ -211,7 +226,11 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
 
 /// Extracts the maximum stat value from parquet footer statistics, converting from the physical
 /// parquet type to the requested logical Delta type.
-fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar> {
+fn extract_max_scalar(
+    data_type: &DataType,
+    stats: &Statistics,
+    column: &ColumnDescriptor,
+) -> Option<Scalar> {
     use PrimitiveType::*;
     let value = match (data_type.as_primitive_opt()?, stats) {
         (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
@@ -238,16 +257,25 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
         (Date, _) => return None,
-        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.max_opt()?),
+        (Timestamp, Statistics::Int64(s)) => {
+            Scalar::Timestamp(timestamp_micros(*s.max_opt()?, column)?)
+        }
         (Timestamp, _) => return None, // TODO: Int96 timestamps
-        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
-        (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
+        (TimestampNtz, Statistics::Int64(s)) => {
+            Scalar::TimestampNtz(timestamp_micros(*s.max_opt()?, column)?)
+        }
+        (TimestampNtz, Statistics::Int32(s)) if column.converted_type() == ConvertedType::DATE => {
+            timestamp_from_date(s.max_opt())?
+        }
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth | IntervalDayTime, _) => return None,
-        (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
-        (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
+        (Decimal(d), Statistics::Int32(i)) => decimal_stat(i128::from(*i.max_opt()?), *d, column)?,
+        (Decimal(d), Statistics::Int64(i)) => decimal_stat(i128::from(*i.max_opt()?), *d, column)?,
         (Decimal(d), Statistics::FixedLenByteArray(b)) => {
-            decimal_from_bytes(b.max_bytes_opt(), *d)?
+            decimal_stat(decimal_from_bytes(b.max_bytes_opt())?, *d, column)?
+        }
+        (Decimal(d), Statistics::ByteArray(b)) => {
+            decimal_stat(decimal_from_bytes(b.max_bytes_opt())?, *d, column)?
         }
         (Decimal(..), _) => return None,
         // Void columns have no Parquet representation, so no stats exist
@@ -265,7 +293,7 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
     Some(stats?.null_count_opt()? as i64)
 }
 
-fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
+fn decimal_from_bytes(bytes: Option<&[u8]>) -> Option<i128> {
     // Statistics are a minimal-width big-endian two's-complement integer. Sign-extend to
     // 16 bytes on the stack (no heap alloc) and copy in as little-endian: fill with 0xFF
     // when the sign bit of the most-significant (first, big-endian) byte is set, else 0x00.
@@ -277,15 +305,62 @@ fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar
     for (dst, &src) in le.iter_mut().zip(bytes.iter().rev()) {
         *dst = src;
     }
-    let value = DecimalData::try_new(i128::from_le_bytes(le), dtype).ok()?;
-    Some(value.into())
+    Some(i128::from_le_bytes(le))
 }
 
 fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
-    let days = u64::try_from(*days?).ok()?;
-    let timestamp = DateTime::UNIX_EPOCH.checked_add_days(Days::new(days))?;
-    let timestamp = timestamp.signed_duration_since(DateTime::UNIX_EPOCH);
-    Some(Scalar::TimestampNtz(timestamp.num_microseconds()?))
+    Some(Scalar::TimestampNtz(
+        i64::from(*days?).checked_mul(86_400_000_000)?,
+    ))
+}
+
+fn decimal_stat(value: i128, target: DecimalType, column: &ColumnDescriptor) -> Option<Scalar> {
+    let source_scale = match column.converted_type() {
+        ConvertedType::DECIMAL => column.type_scale(),
+        ConvertedType::NONE
+        | ConvertedType::INT_8
+        | ConvertedType::INT_16
+        | ConvertedType::INT_32
+        | ConvertedType::INT_64
+            if matches!(
+                column.physical_type(),
+                PhysicalType::INT32 | PhysicalType::INT64
+            ) =>
+        {
+            0
+        }
+        _ => return None,
+    };
+    // A lossy scale reduction cannot provide a bound in the predicate's decimal type.
+    let increase = u32::try_from(i32::from(target.scale()).checked_sub(source_scale)?).ok()?;
+    let value = value.checked_mul(10i128.checked_pow(increase)?)?;
+    Some(DecimalData::try_new(value, target).ok()?.into())
+}
+
+fn timestamp_micros(value: i64, column: &ColumnDescriptor) -> Option<i64> {
+    #[cfg(feature = "arrow-59")]
+    let unit = match column.logical_type_ref() {
+        Some(LogicalType::Timestamp(timestamp)) => Some(timestamp.unit),
+        _ => None,
+    };
+    #[cfg(not(feature = "arrow-59"))]
+    let unit = match column.logical_type_ref() {
+        Some(LogicalType::Timestamp { unit, .. }) => Some(*unit),
+        _ => None,
+    };
+    let unit = unit.or_else(|| match column.converted_type() {
+        ConvertedType::TIMESTAMP_MILLIS => Some(TimeUnit::MILLIS),
+        ConvertedType::TIMESTAMP_MICROS => Some(TimeUnit::MICROS),
+        // Checkpoint stats may omit the timestamp annotation; their INT64 values are microseconds.
+        ConvertedType::NONE if column.logical_type_ref().is_none() => Some(TimeUnit::MICROS),
+        _ => None,
+    })?;
+    match unit {
+        TimeUnit::MILLIS => value.checked_mul(1_000),
+        TimeUnit::MICROS => Some(value),
+        // Match Arrow's truncation toward zero, including timestamps before the epoch.
+        TimeUnit::NANOS => Some(value / 1_000),
+    }
 }
 
 /// Checks whether a parquet column has any null values in a row group, based on its footer stats.
@@ -396,7 +471,7 @@ impl<'a> CheckpointRowGroupFilter<'a> {
         col: &ColumnName,
         data_type: &DataType,
         get_index: impl FnOnce(&StatsColumnIndices) -> Option<usize>,
-        extract: impl FnOnce(&DataType, &Statistics) -> Option<Scalar>,
+        extract: impl FnOnce(&DataType, &Statistics, &ColumnDescriptor) -> Option<Scalar>,
     ) -> Option<Scalar> {
         let indices = self.stats_column_indices.get(col)?;
         let stat_index = get_index(indices)?;
@@ -405,7 +480,11 @@ impl<'a> CheckpointRowGroupFilter<'a> {
         if column_has_nulls(self.row_group, stat_index) {
             return None;
         }
-        extract(data_type, self.get_stats_at(stat_index)?)
+        extract(
+            data_type,
+            self.get_stats_at(stat_index)?,
+            self.row_group.column(stat_index).column_descr(),
+        )
     }
 }
 
@@ -413,7 +492,11 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
-            return extract_min_scalar(data_type, self.get_stats_at(idx)?);
+            return extract_min_scalar(
+                data_type,
+                self.get_stats_at(idx)?,
+                self.row_group.column(idx).column_descr(),
+            );
         }
         self.get_guarded_stat(col, data_type, |i| i.min_index, extract_min_scalar)
     }
@@ -421,7 +504,11 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
-            return extract_max_scalar(data_type, self.get_stats_at(idx)?);
+            return extract_max_scalar(
+                data_type,
+                self.get_stats_at(idx)?,
+                self.row_group.column(idx).column_descr(),
+            );
         }
         let max = self.get_guarded_stat(col, data_type, |i| i.max_index, extract_max_scalar)?;
         Some(adjust_stats_for_truncation(max))

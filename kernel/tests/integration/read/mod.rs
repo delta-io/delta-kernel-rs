@@ -1,5 +1,7 @@
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
+mod parquet_pushdown;
+mod parquet_pushdown_regressions;
 mod scan_cancellation;
 
 use std::path::PathBuf;
@@ -2540,7 +2542,7 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
-    let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {
+    let row_counts = |predicate_us: i64| -> Result<(usize, usize), Box<dyn std::error::Error>> {
         let predicate = Arc::new(Pred::gt(
             col!("ts_col"),
             lit(Scalar::Timestamp(predicate_us)),
@@ -2550,43 +2552,58 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
             .scan_builder()
             .with_predicate(predicate)
             .build()?;
+        let mut metadata_rows = 0;
+        for metadata in scan.scan_metadata(engine.as_ref())? {
+            metadata_rows = metadata?.visit_scan_files(metadata_rows, |rows, file| {
+                *rows += file.stats.unwrap().num_records as usize;
+            })?;
+        }
         let batches = read_scan(&scan, engine.clone())?;
-        Ok(batches.iter().map(|b| b.num_rows()).sum())
+        Ok((metadata_rows, batches.iter().map(|b| b.num_rows()).sum()))
     };
 
     // Mid-ms value (4.000400s): adjusted to 3_999_401
     //   file1 max=2s < 3_999_401 -> pruned; file2+3 kept (4 rows)
-    assert_eq!(row_count(4_000_400)?, 4, "mid-ms: file2+file3 kept");
+    assert_eq!(row_counts(4_000_400)?, (4, 4), "mid-ms: file2+file3 kept");
 
     // Exact ms boundary (4.000000s = truncated max of file2): adjusted to 3_999_001
     //   file1 max=2s < 3_999_001 -> pruned; file2 max=4s > 3_999_001 -> kept (4 rows)
     assert_eq!(
-        row_count(4_000_000)?,
-        4,
+        row_counts(4_000_000)?,
+        (4, 4),
         "exact ms boundary: file2+file3 kept"
     );
 
     // 1us above ms boundary (4.000001s): adjusted to 3_999_002
     //   file1 pruned; file2 max=4s > 3_999_002 -> kept (4 rows)
-    assert_eq!(row_count(4_000_001)?, 4, "1us above ms: file2+file3 kept");
+    assert_eq!(
+        row_counts(4_000_001)?,
+        (4, 4),
+        "1us above ms: file2+file3 kept"
+    );
 
     // 998us above ms boundary (4.000998s): adjusted to 3_999_999
-    //   file2 max=4s > 3_999_999 -> kept (just not prunable)
+    //   Delta file2 max=4s > 3_999_999 -> kept (just not prunable from Delta stats).
+    //   Parquet's precise max=4_000_500 < 4_000_998 -> pruned during execute.
     assert_eq!(
-        row_count(4_000_998)?,
-        4,
-        "just not prunable: file2+file3 kept"
+        row_counts(4_000_998)?,
+        (4, 2),
+        "Delta retains file2+file3; Parquet prunes file2"
     );
 
     // 999us above ms boundary (4.000999s): adjusted to 4_000_000
     //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (just prunable)
-    assert_eq!(row_count(4_000_999)?, 2, "just prunable: only file3 kept");
+    assert_eq!(
+        row_counts(4_000_999)?,
+        (2, 2),
+        "just prunable: only file3 kept"
+    );
 
     // Next ms boundary (4.001000s): adjusted to 4_000_001
     //   file2 max=4s < 4_000_001 -> pruned (2 rows)
     assert_eq!(
-        row_count(4_001_000)?,
-        2,
+        row_counts(4_001_000)?,
+        (2, 2),
         "next ms boundary: only file3 kept"
     );
 

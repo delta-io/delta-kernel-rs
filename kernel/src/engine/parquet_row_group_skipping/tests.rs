@@ -20,6 +20,8 @@ use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
+use crate::parquet::schema::parser::parse_message_type;
+use crate::parquet::schema::types::SchemaDescriptor;
 use crate::{DeltaResult, Predicate};
 
 /// Empty partition column set for tests that don't need partition columns.
@@ -505,8 +507,9 @@ fn test_interval_skipping_unsupported_for_any_footer_stats() {
     for dt in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
         for stats in &variants {
             // Call the extractor directly: the fixture has no interval column for get_min_stat
-            assert_eq!(extract_min_scalar(&dt, stats), None);
-            assert_eq!(extract_max_scalar(&dt, stats), None);
+            let column = source_column("message schema { OPTIONAL INT64 value; }");
+            assert_eq!(extract_min_scalar(&dt, stats, &column), None);
+            assert_eq!(extract_max_scalar(&dt, stats, &column), None);
         }
     }
 }
@@ -851,8 +854,6 @@ fn checkpoint_filter_is_not_null_never_prunes() {
 
 #[test]
 fn checkpoint_filter_timestamp_max_widened() {
-    // Timestamp max stats are widened by 999us to account for millisecond truncation
-    // in JSON-serialized stats (which stats_parsed inherits).
     let tmp = write_checkpoint_parquet(
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
@@ -866,7 +867,6 @@ fn checkpoint_filter_timestamp_max_widened() {
     let predicate = column_pred!("x");
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
-    // max(maxValues.x) = 200, widened to 200 + 999 = 1199
     assert_eq!(
         filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP),
         Some(Scalar::Timestamp(1199))
@@ -1202,35 +1202,131 @@ fn test_decimal_from_bytes_sign_extends_negative_stats() {
     // arrays, so a negative value occupies fewer than 16 bytes. Decoding must sign-extend the
     // high bytes; zero-padding turns a negative stat into a large positive one, which makes
     // row-group skipping prune groups that actually contain matching rows.
-    let dtype = DecimalType::try_new(38, 3).unwrap();
 
     // -1 unscaled, one byte: 0xFF.
-    assert_eq!(
-        decimal_from_bytes(Some(&[0xFF]), dtype),
-        Some(Scalar::decimal(-1, 38, 3).unwrap())
-    );
+    assert_eq!(decimal_from_bytes(Some(&[0xFF])), Some(-1));
 
     // -256 unscaled, two bytes: 0xFF00.
-    assert_eq!(
-        decimal_from_bytes(Some(&[0xFF, 0x00]), dtype),
-        Some(Scalar::decimal(-256, 38, 3).unwrap())
-    );
+    assert_eq!(decimal_from_bytes(Some(&[0xFF, 0x00])), Some(-256));
 
     // Positive minimal-width values must stay correct.
-    assert_eq!(
-        decimal_from_bytes(Some(&[0x01]), dtype),
-        Some(Scalar::decimal(1, 38, 3).unwrap())
-    );
+    assert_eq!(decimal_from_bytes(Some(&[0x01])), Some(1));
 
     // Empty slice: no most-significant byte, treated as non-negative, decodes to 0.
-    assert_eq!(
-        decimal_from_bytes(Some(&[]), dtype),
-        Some(Scalar::decimal(0, 38, 3).unwrap())
-    );
+    assert_eq!(decimal_from_bytes(Some(&[])), Some(0));
 
     // Full 16-byte negative value: resize is a no-op, sign already present.
+    assert_eq!(decimal_from_bytes(Some(&(-1i128).to_be_bytes())), Some(-1));
+}
+
+#[rstest::rstest]
+#[case::millis("TIMESTAMP(MILLIS,true)", 1_000, Some(1_000_000))]
+#[case::micros("TIMESTAMP(MICROS,true)", 1_000, Some(1_000))]
+#[case::nanos("TIMESTAMP(NANOS,false)", 1_999, Some(1))]
+#[case::negative_nanos("TIMESTAMP(NANOS,false)", -1_999, Some(-1))]
+#[case::negative_submicro("TIMESTAMP(NANOS,false)", -1, Some(0))]
+#[case::overflow("TIMESTAMP(MILLIS,true)", i64::MAX, None)]
+#[case::underflow("TIMESTAMP(MILLIS,true)", i64::MIN, None)]
+#[case::legacy_millis("TIMESTAMP_MILLIS", 1_000, Some(1_000_000))]
+#[case::legacy_micros("TIMESTAMP_MICROS", 1_000, Some(1_000))]
+#[case::unannotated("", 1_000, Some(1_000))]
+#[case::unsupported_time("TIME(MICROS,true)", 1_000, None)]
+fn timestamp_bounds_use_source_units(
+    #[case] annotation: &str,
+    #[case] value: i64,
+    #[case] expected: Option<i64>,
+) {
+    let annotation = if annotation.is_empty() {
+        String::new()
+    } else {
+        format!("({annotation})")
+    };
+    let column = source_column(&format!(
+        "message schema {{ OPTIONAL INT64 value {annotation}; }}"
+    ));
+    assert_eq!(timestamp_micros(value, &column), expected);
+}
+
+#[rstest::rstest]
+#[case::increase(2, 6, 3, 1234, Some(12340))]
+#[case::negative(2, 6, 3, -1234, Some(-12340))]
+#[case::same_scale(2, 6, 2, 1234, Some(1234))]
+#[case::scale_reduction(3, 6, 2, 1234, None)]
+#[case::precision_overflow(2, 3, 3, 1234, None)]
+#[case::multiplication_overflow(0, 38, 1, 9 * 10i128.pow(37), None)]
+fn decimal_bounds_use_source_scale(
+    #[case] source_scale: u8,
+    #[case] precision: u8,
+    #[case] scale: u8,
+    #[case] value: i128,
+    #[case] expected: Option<i128>,
+) {
+    let column = source_column(&format!(
+        "message schema {{ OPTIONAL FIXED_LEN_BYTE_ARRAY(16) value (DECIMAL(38,{source_scale})); }}"
+    ));
+    let target = DecimalType::try_new(precision, scale).unwrap();
     assert_eq!(
-        decimal_from_bytes(Some(&(-1i128).to_be_bytes()), dtype),
-        Some(Scalar::decimal(-1, 38, 3).unwrap())
+        decimal_stat(value, target, &column),
+        expected.map(|value| Scalar::decimal(value, precision, scale).unwrap())
     );
+}
+
+#[rstest::rstest]
+#[case::integer("INT32", 1234)]
+#[case::long("INT64", -1234)]
+fn integer_bounds_widen_to_decimal(#[case] physical_type: &str, #[case] value: i128) {
+    let column = source_column(&format!(
+        "message schema {{ OPTIONAL {physical_type} value; }}"
+    ));
+    assert_eq!(
+        decimal_stat(value, DecimalType::try_new(22, 2).unwrap(), &column),
+        Some(Scalar::decimal(value * 100, 22, 2).unwrap())
+    );
+}
+
+#[rstest::rstest]
+#[case::int32("INT32", Statistics::int32(Some(-1234), Some(1234), None, Some(0), false))]
+#[case::int64("INT64", Statistics::int64(Some(-1234), Some(1234), None, Some(0), false))]
+#[case::byte_array("BYTE_ARRAY", Statistics::byte_array(
+    Some(ByteArray::from((-1234i128).to_be_bytes().to_vec())),
+    Some(ByteArray::from(1234i128.to_be_bytes().to_vec())), None, Some(0), false,
+))]
+#[case::fixed_bytes("FIXED_LEN_BYTE_ARRAY(16)", Statistics::fixed_len_byte_array(
+    Some(FixedLenByteArray::from(ByteArray::from((-1234i128).to_be_bytes().to_vec()))),
+    Some(FixedLenByteArray::from(ByteArray::from(1234i128.to_be_bytes().to_vec()))),
+    None, Some(0), false,
+))]
+fn decimal_min_and_max_rescale_all_encodings(
+    #[case] physical_type: &str,
+    #[case] stats: Statistics,
+) {
+    let column = source_column(&format!(
+        "message schema {{ OPTIONAL {physical_type} value (DECIMAL(5,2)); }}"
+    ));
+    let target = DataType::decimal(6, 3).unwrap();
+    assert_eq!(
+        extract_min_scalar(&target, &stats, &column),
+        Some(Scalar::decimal(-12340, 6, 3).unwrap())
+    );
+    assert_eq!(
+        extract_max_scalar(&target, &stats, &column),
+        Some(Scalar::decimal(12340, 6, 3).unwrap())
+    );
+}
+
+#[rstest::rstest]
+#[case::before_epoch(-1, Some(-86_400_000_000))]
+#[case::epoch(0, Some(0))]
+#[case::after_epoch(1, Some(86_400_000_000))]
+#[case::overflow(i32::MAX, None)]
+#[case::underflow(i32::MIN, None)]
+fn date_bounds_convert_to_timestamp_ntz(#[case] days: i32, #[case] expected: Option<i64>) {
+    assert_eq!(
+        timestamp_from_date(Some(&days)),
+        expected.map(Scalar::TimestampNtz)
+    );
+}
+
+fn source_column(schema: &str) -> ColumnDescPtr {
+    SchemaDescriptor::new(Arc::new(parse_message_type(schema).unwrap())).column(0)
 }
