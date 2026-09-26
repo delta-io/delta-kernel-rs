@@ -9,9 +9,9 @@ use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
 };
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{transform_output_type, DeltaResult, Error};
+use crate::{DeltaResult, Error};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
 /// These characters have special meaning in Parquet schema syntax.
