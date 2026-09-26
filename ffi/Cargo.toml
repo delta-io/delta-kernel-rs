@@ -20,7 +20,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 bytes = "1.10"
 derive_more = { version = "~2.1", default-features = false, features = ["constructor", "from"] }
-prost = { version = "0.13", optional = true }
+prost = "0.13"
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -29,6 +29,8 @@ serde_json = "1.0.142"
 peak_alloc = { version = "0.3.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
+  "state-proto",
+  "vendored-protoc",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.28.0" }
@@ -68,7 +70,7 @@ default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_def
 # Requires `arrow` because iterators returned from plan execution use Arrow to pass along data
 # batches, and requires `default-engine-base` because the `PlanBasedEngine` FFI constructor pairs
 # the plan executor with `ArrowEvaluationHandler`
-declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
+declarative-plans = ["delta_kernel/declarative-plans", "arrow", "default-engine-base"]
 
 vendored-protoc = ["delta_kernel/vendored-protoc"]
 

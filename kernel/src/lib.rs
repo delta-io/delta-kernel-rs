@@ -109,6 +109,8 @@ pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+#[cfg(feature = "state-proto")]
+pub mod state_proto;
 pub mod struct_patch;
 pub mod table_changes;
 pub mod table_configuration;
