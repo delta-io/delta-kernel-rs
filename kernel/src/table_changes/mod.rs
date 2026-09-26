@@ -722,11 +722,15 @@ mod tests {
             nullable "value": STRING,
         };
         let rt_config = row_tracking_properties();
+        let metadata = Metadata::try_new(None, None, start_schema, vec![], 0, rt_config).unwrap();
 
         // v0: start schema + row tracking. v1: a data commit (no metadata) using the start schema.
         // v2: a metadata commit that drops `extra` -- never re-declaring the start schema in range.
         mock_table
-            .commit(row_tracking_setup_actions(start_schema))
+            .commit([
+                Action::Protocol(row_tracking_protocol()),
+                Action::Metadata(metadata.clone()),
+            ])
             .await;
         mock_table
             .commit([Action::Add(Add {
@@ -739,9 +743,7 @@ mod tests {
             })])
             .await;
         mock_table
-            .commit([Action::Metadata(
-                Metadata::try_new(None, None, end_schema, vec![], 0, rt_config).unwrap(),
-            )])
+            .commit([Action::Metadata(metadata.with_schema(end_schema).unwrap())])
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
