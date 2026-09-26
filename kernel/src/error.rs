@@ -138,6 +138,14 @@ pub enum SnapshotHintError {
     /// The supplied log files contain log compaction files, which snapshot hints do not support.
     #[error("Invalid snapshot hint: log compaction files are not supported")]
     LogCompaction,
+    /// A supplied log file is not beneath the table's `_delta_log` root.
+    #[error("Invalid snapshot hint: log path '{path}' is not beneath log root '{log_root}'")]
+    LogPathOutsideRoot {
+        /// The supplied log file path.
+        path: String,
+        /// The expected table log root.
+        log_root: String,
+    },
     /// The supplied log files cannot form a valid log segment.
     #[error("Invalid snapshot hint: supplied log files do not form a valid log segment")]
     LogSegment {
