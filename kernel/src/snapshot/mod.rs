@@ -153,22 +153,6 @@ impl Snapshot {
     // Internal constructors
     // ============================================================================
 
-    /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn new(
-        log_segment: LogSegment,
-        table_configuration: TableConfiguration,
-    ) -> DeltaResult<Self> {
-        Self::new_with_crc(
-            log_segment,
-            table_configuration,
-            None,  /* crc */
-            false, /* built_as_latest */
-            false, /* skipped_new_checkpoints */
-        )
-    }
-
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
@@ -2807,6 +2791,13 @@ mod tests {
     {
         let mut new_log_segment = baseline.log_segment().clone();
         mutate(&mut new_log_segment.listed, &new_log_segment.log_root);
-        Snapshot::new(new_log_segment, baseline.table_configuration().clone()).unwrap()
+        Snapshot::new_with_crc(
+            new_log_segment,
+            baseline.table_configuration().clone(),
+            None,  /* crc */
+            false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
+        )
+        .unwrap()
     }
 }

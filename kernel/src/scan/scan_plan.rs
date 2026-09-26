@@ -604,7 +604,13 @@ mod tests {
             .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .with_table_root("memory:///")
             .try_build()?;
-        Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))
+        Ok(Arc::new(Snapshot::new_with_crc(
+            log_segment,
+            table_configuration,
+            None,  /* crc */
+            false, /* built_as_latest */
+            false, /* skipped_new_checkpoints */
+        )?))
     }
 
     fn partitioned_schema() -> SchemaRef {
