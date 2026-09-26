@@ -42,15 +42,71 @@ use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 
-/// Expected schema for file statistics, using physical column names.
-///
-/// Wrapped in a struct so it can be extended with a logical-name variant if needed.
-#[allow(unused)]
-#[derive(Debug, Clone)]
+/// Builds the expected schema for file statistics. See
+/// [`TableConfiguration::stats_schema_builder`].
 #[internal_api]
-pub(crate) struct ExpectedStatsSchemas {
-    /// Stats schema using physical column names (for storage).
-    pub physical: SchemaRef,
+pub(crate) struct StatsSchemaBuilder<'a> {
+    table_configuration: &'a TableConfiguration,
+    required_physical_columns: Option<&'a [ColumnName]>,
+    requested_physical_columns: Option<&'a [ColumnName]>,
+    variant_min_max: bool,
+}
+
+impl<'a> StatsSchemaBuilder<'a> {
+    /// Sets the columns that always get statistics, regardless of `delta.dataSkippingStatsColumns`
+    /// and `delta.dataSkippingNumIndexedCols` (e.g. clustering columns, which the Delta protocol
+    /// requires). `None`, the default, adds no columns.
+    #[internal_api]
+    pub(crate) fn with_required_physical_columns(
+        mut self,
+        columns: Option<&'a [ColumnName]>,
+    ) -> Self {
+        self.required_physical_columns = columns;
+        self
+    }
+
+    /// Sets an output filter that limits which columns appear in the schema without affecting
+    /// column counting. `None`, the default, keeps every column.
+    #[internal_api]
+    pub(crate) fn with_requested_physical_columns(
+        mut self,
+        columns: Option<&'a [ColumnName]>,
+    ) -> Self {
+        self.requested_physical_columns = columns;
+        self
+    }
+
+    /// Sets whether each VARIANT column's min/max statistic appears in `minValues`/`maxValues`,
+    /// typed as the variant's physical struct. Off by default.
+    #[internal_api]
+    pub(crate) fn with_variant_min_max(mut self, include: bool) -> Self {
+        self.variant_min_max = include;
+        self
+    }
+
+    /// Builds the stats schema, using physical column names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the derived stats schema is invalid (see [`StructType::try_new`]).
+    #[internal_api]
+    pub(crate) fn build(self) -> DeltaResult<SchemaRef> {
+        let tc = self.table_configuration;
+        let physical_data_schema = tc.physical_data_schema_without_partition_columns();
+        let required_physical_stats_columns = tc.required_physical_stats_columns();
+        let config = StatsConfig {
+            data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: tc.table_properties().data_skipping_num_indexed_cols,
+            variant_min_max: self.variant_min_max,
+        };
+        let physical_stats_schema = Arc::new(expected_stats_schema(
+            &physical_data_schema,
+            &config,
+            self.required_physical_columns,
+            self.requested_physical_columns,
+        )?);
+        Ok(strip_metadata(physical_stats_schema))
+    }
 }
 
 /// Information about in-commit timestamp enablement state.
@@ -308,11 +364,11 @@ impl TableConfiguration {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
-    /// Generates the expected schema for file statistics.
+    /// Returns a builder for the expected schema for file statistics.
     ///
     /// Engines can provide statistics for files written to the delta table, enabling
-    /// data skipping and other optimizations. Returns the physical stats schema wrapped in
-    /// an `ExpectedStatsSchemas`.
+    /// data skipping and other optimizations. [`StatsSchemaBuilder::build`] returns the physical
+    /// stats schema.
     ///
     /// The schema is structured as:
     /// ```text
@@ -330,37 +386,19 @@ impl TableConfiguration {
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
-    /// - **Required columns** (e.g. clustering columns): Per the Delta protocol, always included in
-    ///   statistics, regardless of the above settings.
-    /// - **Requested columns**: Optional output filter that limits which columns appear in the
-    ///   schema without affecting column counting.
+    /// - **Builder options**: required and requested columns, and type-specific statistics. See
+    ///   [`StatsSchemaBuilder`].
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
-    #[allow(unused)]
     #[internal_api]
-    pub(crate) fn build_expected_stats_schemas(
-        &self,
-        required_physical_columns: Option<&[ColumnName]>,
-        requested_physical_columns: Option<&[ColumnName]>,
-    ) -> DeltaResult<ExpectedStatsSchemas> {
-        let physical_data_schema = self.physical_data_schema_without_partition_columns();
-        let required_physical_stats_columns = self.required_physical_stats_columns();
-        let config = StatsConfig {
-            data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
-        };
-        let physical_stats_schema = Arc::new(expected_stats_schema(
-            &physical_data_schema,
-            &config,
-            required_physical_columns,
-            requested_physical_columns,
-        )?);
-        let physical_stats_schema = strip_metadata(physical_stats_schema);
-
-        Ok(ExpectedStatsSchemas {
-            physical: physical_stats_schema,
-        })
+    pub(crate) fn stats_schema_builder(&self) -> StatsSchemaBuilder<'_> {
+        StatsSchemaBuilder {
+            table_configuration: self,
+            required_physical_columns: None,
+            requested_physical_columns: None,
+            variant_min_max: false,
+        }
     }
 
     /// Returns the list of physical column names that should have statistics collected.
@@ -377,6 +415,8 @@ impl TableConfiguration {
         let config = StatsConfig {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
+            // Column names are collected from the base schema; min/max never enters into it.
+            variant_min_max: false,
         };
         stats_column_names(
             &self.physical_data_schema_without_partition_columns(),
@@ -2014,7 +2054,7 @@ mod test {
     }
 
     #[test]
-    fn test_build_expected_stats_schemas_no_column_mapping() {
+    fn test_stats_schema_builder_no_column_mapping() {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema! {
                 nullable "col_a": LONG,
@@ -2025,14 +2065,10 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.stats_schema_builder().build().unwrap();
 
         // Verify field names are logical names
-        let min_values = stats_schemas
-            .physical
-            .field(MIN_VALUES)
-            .unwrap()
-            .data_type();
+        let min_values = stats_schema.field(MIN_VALUES).unwrap().data_type();
         if let DataType::Struct(inner) = min_values {
             assert!(inner.field("col_a").is_some());
             assert!(inner.field("col_b").is_some());
@@ -2042,7 +2078,7 @@ mod test {
     }
 
     #[test]
-    fn test_build_expected_stats_schemas_with_column_mapping() {
+    fn test_stats_schema_builder_with_column_mapping() {
         // With column mapping, physical schema should have physical names
         let schema = schema_with_column_mapping();
         let config = MockTableConfigurationBuilder::new()
@@ -2053,14 +2089,10 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.stats_schema_builder().build().unwrap();
 
         // Verify physical schema has physical names
-        let physical_min_values = stats_schemas
-            .physical
-            .field(MIN_VALUES)
-            .unwrap()
-            .data_type();
+        let physical_min_values = stats_schema.field(MIN_VALUES).unwrap().data_type();
         if let DataType::Struct(inner) = physical_min_values {
             assert!(
                 inner.field("phys_col_a").is_some(),
@@ -2077,7 +2109,7 @@ mod test {
     }
 
     #[test]
-    fn test_build_expected_stats_schemas_id_mode_has_no_parquet_field_ids() {
+    fn test_stats_schema_builder_id_mode_has_no_parquet_field_ids() {
         // With column mapping mode `id`, make_physical() injects ParquetFieldId metadata for
         // data file reading. But the physical stats schema must NOT contain these field IDs
         // because stats are read from JSON commit files or checkpoint Parquet files, neither of
@@ -2093,14 +2125,10 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.stats_schema_builder().build().unwrap();
 
         // Verify physical schema has physical names
-        let physical_min_values = stats_schemas
-            .physical
-            .field(MIN_VALUES)
-            .unwrap()
-            .data_type();
+        let physical_min_values = stats_schema.field(MIN_VALUES).unwrap().data_type();
         let DataType::Struct(inner) = physical_min_values else {
             panic!("Expected minValues to be a struct");
         };
@@ -2186,7 +2214,7 @@ mod test {
     }
 
     #[test]
-    fn test_build_expected_stats_schemas_excludes_partition_columns() {
+    fn test_stats_schema_builder_excludes_partition_columns() {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema_with_column_mapping())
             .with_column_mapping(ColumnMappingMode::Name)
@@ -2194,14 +2222,9 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .build();
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.stats_schema_builder().build().unwrap();
 
-        let DataType::Struct(inner) = stats_schemas
-            .physical
-            .field(MIN_VALUES)
-            .unwrap()
-            .data_type()
-        else {
+        let DataType::Struct(inner) = stats_schema.field(MIN_VALUES).unwrap().data_type() else {
             panic!("Expected minValues to be a struct");
         };
         assert!(

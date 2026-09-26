@@ -8,8 +8,10 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
-use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
+use crate::actions::{
+    get_commit_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS,
+};
+use crate::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
@@ -28,11 +30,11 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, schema, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField,
-    StructType,
+    self, schema, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec,
+    SchemaStructPatchBuilder, StructField, StructType,
 };
 use crate::transaction::create_table::create_table;
-use crate::unit_test_utils::TestCancellationToken;
+use crate::unit_test_utils::{string_array_to_engine_data, TestCancellationToken};
 use crate::{
     CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
@@ -2108,6 +2110,7 @@ fn test_default_stats_options_no_struct_output() {
         struct_stats: StructStats::Columns {
             requested: vec![column_name!("id")],
         },
+        variant_stats: false,
     },
     &["id"],
     None,
@@ -2276,6 +2279,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             struct_stats: StructStats::Columns {
                 requested: vec![column_name!("nonexistent_column")],
             },
+            variant_stats: false,
         })
         .build();
 
@@ -2300,6 +2304,200 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
         result.is_ok(),
         "unresolvable extra_indexed column should be dropped, not error: {:?}",
         result.err()
+    );
+}
+
+#[rstest]
+#[case::json_only(StatsOptions::json_only(), Some("requires struct stats output"))]
+#[case::none(StatsOptions::none(), Some("requires struct stats output"))]
+#[case::all(
+    StatsOptions::all(),
+    Some("cannot be combined with JSON stats synthesis")
+)]
+#[case::all_struct(StatsOptions::all_struct(), None)]
+#[case::struct_columns(StatsOptions::struct_columns(vec![column_name!("id")]), None)]
+fn scan_builder_accepts_variant_stats_only_with_struct_stats_without_json_synthesis(
+    #[case] stats: StatsOptions,
+    #[case] expected_error: Option<&str>,
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_stats(stats.with_variant_stats(true))
+        .build();
+
+    match expected_error {
+        Some(message) => assert_result_error_with_message(result, message),
+        None => {
+            result.unwrap();
+        }
+    }
+}
+
+/// With `with_variant_stats`, a VARIANT column's min/max statistic reaches `stats_parsed` from
+/// both sources: a commit's stats JSON through `ParseJson`, and a checkpoint's `stats_parsed`,
+/// whose footer reports the statistic as a plain struct of binaries. The default engine's
+/// `ParseJson` decodes a hex-encoded `{metadata, value}` object, standing in for a connector's own
+/// decoding of the statistic.
+#[test]
+fn scan_metadata_variant_stats_from_commit_json_and_checkpoint_stats_parsed() {
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let table_root = Url::parse("memory:///test_table/").unwrap();
+    let log_file = |name: &str| table_root.join(&format!("_delta_log/{name}")).unwrap();
+    let put_commit = |name: &str, actions: &[serde_json::Value]| {
+        let lines: Vec<String> = actions.iter().map(ToString::to_string).collect();
+        engine
+            .storage_handler()
+            .put(&log_file(name), lines.join("\n").into(), false)
+            .unwrap();
+    };
+
+    let table_schema = schema! {
+        nullable "id": LONG,
+        nullable "v": (DataType::unshredded_variant()),
+    };
+    let protocol = serde_json::json!({"protocol": {
+        "minReaderVersion": 3,
+        "minWriterVersion": 7,
+        "readerFeatures": ["variantType"],
+        "writerFeatures": ["variantType"],
+    }});
+    let metadata = serde_json::json!({"metaData": {
+        "id": "variant-stats",
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": serde_json::to_string(&table_schema).unwrap(),
+        "partitionColumns": [],
+        "configuration": {},
+        "createdTime": 1,
+    }});
+    // Each bound of `v` is the variant int8 equal to the `id` bound, with an empty dictionary.
+    let stats = |min: u8, max: u8| {
+        let variant =
+            |n: u8| serde_json::json!({"metadata": "010000", "value": format!("0c{n:02x}")});
+        serde_json::json!({
+            "numRecords": 3,
+            "nullCount": {"id": 0, "v": 0},
+            "minValues": {"id": min, "v": variant(min)},
+            "maxValues": {"id": max, "v": variant(max)},
+            "tightBounds": true,
+        })
+    };
+    let add = |path: &str, stats_field: &str, stats: serde_json::Value| {
+        serde_json::json!({"add": {
+            "path": path,
+            "partitionValues": {},
+            "size": 1,
+            "modificationTime": 1,
+            "dataChange": true,
+            stats_field: stats,
+        }})
+    };
+
+    put_commit(
+        "00000000000000000000.json",
+        &[protocol.clone(), metadata.clone()],
+    );
+    put_commit(
+        "00000000000000000001.json",
+        &[add("a.parquet", "stats", stats(1, 3).to_string().into())],
+    );
+    // The checkpoint carries `a.parquet`'s stats only as `stats_parsed`, so they cannot come from
+    // JSON.
+    let bounds = schema! {
+        nullable "id": LONG,
+        nullable "v": {
+            not_null "metadata": BINARY,
+            not_null "value": BINARY,
+        },
+    };
+    let stats_parsed = StructField::nullable(
+        STATS_PARSED,
+        schema! {
+            nullable NUM_RECORDS: LONG,
+            nullable NULL_COUNT: { nullable "id": LONG, nullable "v": LONG },
+            nullable MIN_VALUES: (bounds.clone()),
+            nullable MAX_VALUES: (bounds),
+            nullable TIGHT_BOUNDS: BOOLEAN,
+        },
+    );
+    let checkpoint_schema = Arc::new(
+        SchemaStructPatchBuilder::new()
+            .append_at(["add"], stats_parsed)
+            .build(get_commit_schema().as_ref())
+            .unwrap(),
+    );
+    let checkpoint_rows = [
+        protocol,
+        metadata,
+        add("a.parquet", STATS_PARSED, stats(1, 3)),
+    ];
+    let checkpoint = engine
+        .json_handler()
+        .parse_json(
+            string_array_to_engine_data(StringArray::from_iter_values(
+                checkpoint_rows.iter().map(ToString::to_string),
+            )),
+            checkpoint_schema,
+        )
+        .unwrap();
+    engine
+        .parquet_handler()
+        .write_parquet_file(
+            log_file("00000000000000000001.checkpoint.parquet"),
+            Box::new(std::iter::once(Ok(checkpoint))),
+        )
+        .unwrap();
+    put_commit(
+        "00000000000000000002.json",
+        &[add("b.parquet", "stats", stats(4, 6).to_string().into())],
+    );
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(1));
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct().with_variant_stats(true))
+        .build()
+        .unwrap();
+
+    let mut actual = Vec::new();
+    for scan_metadata in scan.scan_metadata(&engine).unwrap() {
+        let (data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+        let paths = get_column!(batch, "path", StringArray);
+        let stats_parsed = get_column!(batch, STATS_PARSED, StructArray);
+        for bound in [MIN_VALUES, MAX_VALUES] {
+            let bounds = get_column!(stats_parsed, bound, StructArray);
+            let variant = get_column!(bounds, "v", StructArray);
+            let metadata = get_column!(variant, "metadata", BinaryArray);
+            let value = get_column!(variant, "value", BinaryArray);
+            for row in 0..batch.num_rows() {
+                actual.push((
+                    paths.value(row).to_string(),
+                    bound,
+                    metadata.value(row).to_vec(),
+                    value.value(row).to_vec(),
+                ));
+            }
+        }
+    }
+    actual.sort();
+
+    let expected =
+        |path: &str, bound, n: u8| (path.to_string(), bound, vec![1, 0, 0], vec![0x0c, n]);
+    assert_eq!(
+        actual,
+        vec![
+            expected("a.parquet", MAX_VALUES, 3),
+            expected("a.parquet", MIN_VALUES, 1),
+            expected("b.parquet", MAX_VALUES, 6),
+            expected("b.parquet", MIN_VALUES, 4),
+        ]
     );
 }
 

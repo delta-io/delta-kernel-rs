@@ -226,7 +226,7 @@ impl DataSkippingFilter {
     /// unlike the scan path which reads pre-parsed `stats_parsed` from transformed batches.
     ///
     /// The stats schema is derived from the predicate's column references via
-    /// [`TableConfiguration::build_expected_stats_schemas`], matching the write side exactly;
+    /// [`TableConfiguration::stats_schema_builder`], matching the write side exactly;
     /// references outside the table's stats columns fold to NULL (keeping the file). Partition
     /// values are parsed from the raw `add.partitionValues` string map with
     /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
@@ -261,9 +261,10 @@ impl DataSkippingFilter {
             .collect();
         let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
         let physical_stats_schema = table_configuration
-            .build_expected_stats_schemas(None, Some(&predicate_refs))
-            .ok()?
-            .physical;
+            .stats_schema_builder()
+            .with_requested_physical_columns(Some(&predicate_refs))
+            .build()
+            .ok()?;
         let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
 
         // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
@@ -520,10 +521,11 @@ fn is_partition_value_reference(expr: &Expr) -> bool {
 }
 
 /// A column carries min/max stats iff it's a primitive whose type supports min/max skipping.
-/// Boolean / Binary, Array, Map, and Variant leaves carry nullCount only. Struct columns
-/// have no per-struct stats; only their primitive leaves do, recursively.
-/// Must match `MinMaxStatsTransform`'s acceptance rule. Otherwise the predicate creator
-/// emits refs to min/max fields the stats schema doesn't contain.
+/// Boolean / Binary, Array, and Map leaves carry nullCount only. Struct columns have no per-struct
+/// stats; only their primitive leaves do, recursively.
+/// Must accept no more than `MinMaxStatsTransform` does. Otherwise the predicate creator emits refs
+/// to min/max fields the stats schema doesn't contain. Accepting less is fine: a caller may admit
+/// a VARIANT leaf to the schema, but no kernel predicate can reference it.
 fn has_min_max_stats(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
 }

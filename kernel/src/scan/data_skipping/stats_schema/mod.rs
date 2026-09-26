@@ -27,11 +27,12 @@ use crate::DeltaResult;
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
 ///
-/// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful
-/// for these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping).
-/// They count as leaf columns against the indexed column limit. The `nullCount` schema also
-/// includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null
-/// counts are still meaningful for those types.
+/// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful for
+/// these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping). A
+/// Variant is the one exception: a caller can opt in via [`StatsConfig::variant_min_max`] to admit
+/// its min/max statistic. All of them count as leaf columns against the indexed column limit. The
+/// `nullCount` schema also includes primitive types that aren't eligible for min/max
+/// (e.g., Boolean, Binary) since null counts are still meaningful for those types.
 ///
 /// The `minValues`/`maxValues` struct fields are also nested structures mirroring the table's
 /// column hierarchy. They additionally filter out leaf fields with non-eligible data types
@@ -156,7 +157,9 @@ pub(crate) fn expected_stats_schema(
         ));
 
         // include only min/max skipping eligible fields (data types)
-        let mut min_max_transform = MinMaxStatsTransform;
+        let mut min_max_transform = MinMaxStatsTransform {
+            variant_min_max: config.variant_min_max,
+        };
         if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
             let min_max_schema = min_max_schema.into_owned();
             fields.push(StructField::nullable(MIN_VALUES, min_max_schema.clone()));
@@ -344,22 +347,26 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
 // removes all fields with non eligible data types
 //
 // should only be applied to schema processed via `BaseStatsTransform`.
-#[allow(unused)]
-struct MinMaxStatsTransform;
+struct MinMaxStatsTransform {
+    variant_min_max: bool,
+}
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    // Array, Map, and Variant fields pass through BaseStatsTransform (for nullCount) but must
-    // be excluded from min/max stats.
+    // Array and Map fields pass through BaseStatsTransform (for nullCount) but must be excluded
+    // from min/max stats.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
     }
     fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
         None
     }
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        None
+
+    /// Not recursed into: the `metadata` and `value` binaries are the statistic's own encoding, not
+    /// columns that carry statistics of their own.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        self.variant_min_max.then_some(Cow::Borrowed(stype))
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
@@ -423,6 +430,7 @@ mod tests {
         StatsConfig {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
+            variant_min_max: false,
         }
     }
 
@@ -855,6 +863,43 @@ mod tests {
         assert_eq!(&expected, &stats_schema);
     }
 
+    /// A VARIANT's min/max statistic is admitted only when the caller asks for it. `nullCount` is a
+    /// scalar LONG either way, so opting in changes nothing else about the schema.
+    #[test]
+    fn test_stats_schema_variant_min_max_is_opt_in() {
+        let properties: TableProperties = [("key", "value")].into();
+        let file_schema = schema! {
+            nullable "id": LONG,
+            nullable "v": unshredded_variant(),
+        };
+        let stats_schema = |variant_min_max| {
+            let config = StatsConfig {
+                variant_min_max,
+                ..stats_config_from_table_properties(&properties)
+            };
+            expected_stats_schema(&file_schema, &config, None, None).unwrap()
+        };
+        let expected_null_count = schema! {
+            nullable "id": LONG,
+            nullable "v": LONG,
+        };
+
+        assert_eq!(
+            stats_schema(false),
+            expected_stats(expected_null_count.clone(), schema! { nullable "id": LONG },),
+        );
+        assert_eq!(
+            stats_schema(true),
+            expected_stats(
+                expected_null_count,
+                schema! {
+                    nullable "id": LONG,
+                    nullable "v": unshredded_variant(),
+                },
+            ),
+        );
+    }
+
     #[test]
     fn test_stats_schema_complex_type_consumes_slot_before_primitive() {
         // Validates that a complex type consuming a slot causes a subsequent primitive to
@@ -908,10 +953,7 @@ mod tests {
             },
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // With default settings, all leaf columns should be included
@@ -940,10 +982,7 @@ mod tests {
             nullable "d": DOUBLE,
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only first 2 columns should be included
@@ -967,10 +1006,7 @@ mod tests {
             nullable "extra": STRING,
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Only specified columns should be included (user.name and extra excluded)
@@ -989,10 +1025,7 @@ mod tests {
             nullable "name": STRING,
         };
 
-        let config = StatsConfig {
-            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
-        };
+        let config = stats_config_from_table_properties(&properties);
         let columns = stats_column_names(&file_schema, &config, None);
 
         // Array, Map, and Variant are leaf columns and included in the stats column list

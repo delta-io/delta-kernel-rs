@@ -443,9 +443,10 @@ impl<'a> CategoryScopes<'a> {
         Ok(CategoryScopes { categories })
     }
 
-    /// Which categories a leaf named `leaf_name` appears in. Every leaf -- variants included -- is
-    /// a scalar in each category (a variant appears in `nullCount` as a scalar `LONG` and is
-    /// absent from `minValues`/`maxValues`), so presence is a same-name field lookup.
+    /// Which categories a leaf named `leaf_name` appears in. Presence is a same-name field lookup:
+    /// every leaf occupies one field per category it appears in, whatever that field's type (a
+    /// variant is a scalar `LONG` in `nullCount`, and its own struct in the bound categories when
+    /// the caller admitted it there).
     fn leaf_categories(&self, leaf_name: &str) -> StatCategories {
         let [null_count, min_values, max_values] = self
             .categories
@@ -1558,6 +1559,7 @@ mod tests {
         let config = StatsConfig {
             data_skipping_stats_columns: None,
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
+            variant_min_max: false,
         };
         let delta = expected_stats_schema(&table, &config, None, None).expect("stats schema");
 
