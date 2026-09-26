@@ -4150,8 +4150,8 @@ mod tests {
                         "entries",
                         ArrowDataType::Struct(
                             vec![
-                                ArrowField::new("keys", ArrowDataType::Utf8, false),
-                                ArrowField::new("values", ArrowDataType::Utf8, true),
+                                ArrowField::new("key", ArrowDataType::Utf8, false),
+                                ArrowField::new("value", ArrowDataType::Utf8, true),
                             ]
                             .into(),
                         ),
@@ -4166,7 +4166,13 @@ mod tests {
 
         let string_builder = StringBuilder::new();
         let string_builder2 = StringBuilder::new();
-        let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
+        let map_field_names = MapFieldNames {
+            entry: "entries".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        };
+        let mut map_builder =
+            MapBuilder::new(Some(map_field_names), string_builder, string_builder2);
 
         // Preserve a null value inside a non-null map as `"b": null`.
         map_builder.keys().append_value("a");

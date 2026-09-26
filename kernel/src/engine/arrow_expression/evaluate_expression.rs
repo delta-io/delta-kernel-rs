@@ -487,7 +487,7 @@ fn evaluate_array_expression(
     let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, total_len);
     for row in 0..num_rows {
         for col in 0..n {
-            mutable.extend(col, row, row + 1);
+            mutable.try_extend(col, row, row + 1)?;
         }
     }
     let values = make_array(mutable.freeze());
@@ -926,9 +926,9 @@ fn coalesce_arrays(
     for row in 0..first.len() {
         // Find first non-null value for this row
         match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
-            Some((array_idx, _)) => mutable.extend(array_idx, row, row + 1),
-            None => mutable.extend_nulls(1),
-        }
+            Some((array_idx, _)) => mutable.try_extend(array_idx, row, row + 1)?,
+            None => mutable.try_extend_nulls(1)?,
+        };
     }
 
     Ok(make_array(mutable.freeze()))

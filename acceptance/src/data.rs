@@ -8,6 +8,7 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
+#[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -19,6 +20,7 @@ use itertools::Itertools;
 
 use crate::{TestCaseInfo, TestResult};
 
+#[allow(deprecated)]
 pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);

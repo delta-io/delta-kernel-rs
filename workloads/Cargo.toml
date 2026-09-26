@@ -14,9 +14,9 @@ release = false
 
 [features]
 default = ["arrow"]
-arrow = ["arrow-59"]
+arrow = ["arrow-60"]
+arrow-60 = ["delta_kernel/arrow-60"]
 arrow-59 = ["delta_kernel/arrow-59"]
-arrow-58 = ["delta_kernel/arrow-58"]
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["internal-api"] }

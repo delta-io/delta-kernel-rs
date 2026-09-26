@@ -87,7 +87,7 @@ fn test_get_stat_values() {
         Some(3i64.into())
     );
 
-    // No nulls -> exact zero count (parquet 58.1+, arrow-rs#9451).
+    // No nulls -> exact zero count (arrow-rs#9451).
     assert_eq!(
         filter.get_nullcount_stat(&column_name!("varlen.utf8")),
         Some(0i64.into())
@@ -459,7 +459,7 @@ fn test_get_stat_values() {
 }
 
 // A missing footer null count decodes to `None`; an exact zero is preserved as `Some(0)`. Parquet
-// 58.1+ distinguishes the two (arrow-rs#9451).
+// Supported parquet versions distinguish the two (arrow-rs#9451).
 #[test]
 fn test_extract_nullcount_distinguishes_missing_from_zero() {
     let stats = |null_count| Statistics::int64(Some(1), Some(2), None, null_count, false);
@@ -1132,9 +1132,8 @@ fn checkpoint_filter_multi_row_group_skipping() {
     // RG1: x in [400, 600] -> kept by "x > 500"
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    #[allow(deprecated)] // renamed to set_max_row_group_row_count in newer parquet versions
     let props = WriterProperties::builder()
-        .set_max_row_group_size(2)
+        .set_max_row_group_row_count(Some(2))
         .build();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
     writer

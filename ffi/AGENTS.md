@@ -256,8 +256,8 @@ cargo build -p delta_kernel_ffi --release
 Feature flags:
 - `default-engine-rustls` (default)
 - `default-engine-native-tls`
-- `arrow` (default; currently maps to `arrow-59`)
-- `arrow-59`, `arrow-58`
+- `arrow` (default; currently maps to `arrow-60`)
+- `arrow-60`, `arrow-59`
 - `delta-kernel-unity-catalog`
 - `tracing`
 - `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful

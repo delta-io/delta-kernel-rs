@@ -382,7 +382,7 @@ mod tests {
         //   next path in order
         // - if no, register the waker and wait
         async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            // object_store 0.13 implements `head()` via `get_opts(..., head = true)`.
+            // object_store implements `head()` via `get_opts(..., head = true)`.
             // The ordering queue is only meant to serialize content reads for the test, so
             // skip queue accounting for HEAD probes used while constructing FileMeta.
             if options.head {

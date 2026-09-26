@@ -48,13 +48,21 @@ mod tests {
         let _client = reqwest::Client::new();
     }
 
-    // `default-engine-rustls` has an inherent dual-provider conflict: reqwest's `rustls`
-    // feature brings aws-lc-rs while object_store brings ring. This is an upstream limitation.
-    // If this test stops panicking, the upstream issue is fixed and the annotation can go.
+    // Arrow 59's object_store selects ring while reqwest selects aws-lc-rs, so rustls cannot
+    // determine the process-level provider. This also applies when both Arrow versions are
+    // enabled because Cargo unifies the rustls feature set.
     #[test]
-    #[cfg(feature = "default-engine-rustls")]
+    #[cfg(all(feature = "default-engine-rustls", feature = "arrow-59"))]
     #[should_panic(expected = "Could not automatically determine the process-level CryptoProvider")]
-    fn test_rustls_rustls_builder_has_dual_provider_panic() {
+    fn test_arrow_59_rustls_builder_has_dual_provider_panic() {
+        let _config = rustls::ClientConfig::builder();
+    }
+
+    // Arrow 60's object_store and reqwest dependencies both select aws-lc-rs, so rustls can
+    // determine the process-level provider when Arrow 59 is absent.
+    #[test]
+    #[cfg(all(feature = "default-engine-rustls", not(feature = "arrow-59")))]
+    fn test_arrow_60_rustls_builder_no_dual_provider_panic() {
         let _config = rustls::ClientConfig::builder();
     }
 

@@ -839,7 +839,10 @@ fn build_arrow_input_with_stale_element_id() -> StructArray {
     let stale_element = outer_element
         .as_ref()
         .clone()
-        .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "999".to_string())].into());
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "999".to_string(),
+        )]));
     let new_outer_key = Field::new(
         outer_key.name(),
         DataType::List(Arc::new(stale_element)),

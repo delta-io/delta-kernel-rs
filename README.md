@@ -83,8 +83,8 @@ delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
 | ------------- | ------------- |
 | `rustls`      | Use the rustls TLS backend for HTTPS object stores  |
 | `native-tls`  | Use the native-tls TLS backend for HTTPS object stores  |
-| `arrow-58`    | Build against arrow 58 (see Arrow versioning below) |
 | `arrow-59`    | Build against arrow 59 (see Arrow versioning below) |
+| `arrow-60`    | Build against arrow 60 (see Arrow versioning below) |
 
 The `delta_kernel` crate itself exposes a few additional flags:
 
@@ -110,12 +110,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-58`: Use arrow version 58
 - `arrow-59`: Use arrow version 59
+- `arrow-60`: Use arrow version 60
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-58`.
+  specify it directly with `arrow-N`, e.g. `arrow-59`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of

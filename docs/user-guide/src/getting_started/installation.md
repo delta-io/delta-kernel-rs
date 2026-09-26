@@ -44,7 +44,7 @@ You only pay for what you enable.
 |---------|-------------|
 | `rustls` | Default engine with `rustls` for TLS. **Recommended for most users.** |
 | `native-tls` | Default engine using your platform's native TLS (OpenSSL on Linux, Schannel on Windows, Secure Transport on macOS). Use this if `rustls` doesn't work in your environment. |
-| `arrow` | Use the latest Arrow version Kernel supports. Currently maps to Arrow 59. |
+| `arrow` | Use the latest Arrow version Kernel supports. Currently maps to Arrow 60. |
 
 You need exactly one of `rustls` or `native-tls`. See
 [Building a Connector](../connector/overview.md) for when a custom engine makes sense instead.
@@ -56,8 +56,8 @@ explicitly on both crates:
 
 | Feature | Arrow version |
 |---------|---------------|
-| `arrow-59` | Arrow 59 (current default) |
-| `arrow-58` | Arrow 58 |
+| `arrow-60` | Arrow 60 (current default) |
+| `arrow-59` | Arrow 59 |
 
 For more details on managing Arrow version compatibility, see
 [Feature Flags](../concepts/feature_flags.md).

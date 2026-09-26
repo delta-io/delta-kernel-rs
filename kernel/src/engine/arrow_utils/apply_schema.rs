@@ -592,8 +592,9 @@ mod apply_schema_validation_tests {
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())].into());
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())]),
+        );
         let input_array = StructArray::try_new(
             vec![arrow_field].into(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -615,8 +616,9 @@ mod apply_schema_validation_tests {
                 .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])),
         };
 
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "99".to_string())].into());
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "99".to_string())]),
+        );
         let input_array = StructArray::try_new(
             vec![arrow_field].into(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],

@@ -10,9 +10,9 @@ rust-version.workspace = true
 
 [features]
 default = ["arrow"]
-arrow = ["arrow-59"]
+arrow = ["arrow-60"]
+arrow-60 = ["delta_kernel/arrow-60", "delta_kernel_workloads/arrow-60"]
 arrow-59 = ["delta_kernel/arrow-59", "delta_kernel_workloads/arrow-59"]
-arrow-58 = ["delta_kernel/arrow-58", "delta_kernel_workloads/arrow-58"]
 
 [build-dependencies]
 flate2 = "1.1"

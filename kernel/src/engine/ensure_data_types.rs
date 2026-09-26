@@ -326,23 +326,22 @@ impl PartialEq<String> for MetadataValue {
     }
 }
 
-// allow for comparing our metadata maps to arrow ones. We can't implement PartialEq because both
-// are HashMaps which aren't defined in this crate
-fn metadata_eq(
+// Compare kernel metadata with Arrow's version-specific metadata container.
+fn metadata_eq<'a>(
     kernel_metadata: &HashMap<String, MetadataValue>,
-    arrow_metadata: &HashMap<String, String>,
+    arrow_metadata: impl IntoIterator<Item = (&'a String, &'a String)>,
 ) -> bool {
-    let kernel_len = kernel_metadata.len();
-    if kernel_len != arrow_metadata.len() {
-        return false;
+    let mut arrow_len = 0;
+    for (key, value) in arrow_metadata {
+        arrow_len += 1;
+        if !kernel_metadata
+            .get(key)
+            .is_some_and(|kernel_value| *kernel_value == *value)
+        {
+            return false;
+        }
     }
-    if kernel_len == 0 {
-        // lens are equal, so two empty maps are equal
-        return true;
-    }
-    kernel_metadata
-        .iter()
-        .all(|(key, value)| arrow_metadata.get(key).is_some_and(|v| *value == *v))
+    kernel_metadata.len() == arrow_len
 }
 
 #[cfg(test)]

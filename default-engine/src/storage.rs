@@ -114,7 +114,10 @@ mod tests {
 
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{self, ObjectStore};
-    use hdfs_native_object_store::HdfsObjectStoreBuilder;
+    #[cfg(all(feature = "arrow-59", not(feature = "arrow-60")))]
+    use hdfs_native_object_store_13::HdfsObjectStoreBuilder;
+    #[cfg(feature = "arrow-60")]
+    use hdfs_native_object_store_14::HdfsObjectStoreBuilder;
 
     use super::{insert_url_handler, store_from_url_opts, URL_REGISTRY};
     use crate::*;

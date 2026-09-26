@@ -259,7 +259,7 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
 }
 
 /// Extracts the null count from parquet footer statistics for a column. Returns `None` for a
-/// missing count (parquet 58.1+ no longer forces it to zero, see arrow-rs#9451).
+/// missing count (supported parquet versions do not force it to zero, see arrow-rs#9451).
 fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
     // Cast u64 to i64 is safe: nullcount can never exceed the i64 rowcount.
     Some(stats?.null_count_opt()? as i64)
