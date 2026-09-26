@@ -17,7 +17,7 @@ use tracing::instrument;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::root_manifest_file::RootManifestFile;
-use super::Transaction;
+use super::{Operation as TransactionOperation, Transaction};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
@@ -113,6 +113,8 @@ impl Transaction {
             should_emit_metadata: false,
             committer,
             operation: None,
+            operation_parameters: HashMap::new(),
+            operation_metrics: HashMap::new(),
             engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
@@ -123,6 +125,7 @@ impl Transaction {
             provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
+            infer_data_change: false,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
@@ -149,10 +152,17 @@ impl Transaction {
         self
     }
 
-    /// Set the operation that this transaction is performing. This string will be persisted in the
-    /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
+    /// Sets the operation persisted in the commit and visible in table history.
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(TransactionOperation::from(operation.into()));
+        self
+    }
+
+    pub(super) fn with_update_table_operation(
+        mut self,
+        operation: super::UpdateTableOperation,
+    ) -> Self {
+        self.operation = Some(operation.into());
         self
     }
 
@@ -169,13 +179,14 @@ impl Transaction {
         mut self,
         changes: Vec<SchemaOperation>,
     ) -> DeltaResult<Self> {
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::IcebergCompatV3)
-        {
-            return Err(Error::unsupported(
-                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
-            ));
+        let unsupported_iceberg_compat =
+            [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
+                .into_iter()
+                .find(|feature| self.effective_table_config.is_feature_enabled(feature));
+        if let Some(feature) = unsupported_iceberg_compat {
+            return Err(Error::unsupported(format!(
+                "Schema changes are not yet supported on tables with {feature} enabled"
+            )));
         }
         if self
             .effective_table_config

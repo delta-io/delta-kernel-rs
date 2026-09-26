@@ -26,9 +26,9 @@ use crate::DeltaResult;
 /// Operations are validated and applied in order during
 /// `apply_schema_operations`. Each operation sees the schema state after all prior operations
 /// have been applied.
+#[internal_api]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[internal_api]
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
     AddColumn {
@@ -43,6 +43,7 @@ pub(crate) enum SchemaOperation {
 
 impl SchemaOperation {
     /// Creates an add-column operation under `parent`; `None` selects the root schema.
+    #[internal_api]
     pub(crate) fn add_column(parent: impl Into<Option<ColumnName>>, field: StructField) -> Self {
         Self::AddColumn {
             parent: parent.into(),

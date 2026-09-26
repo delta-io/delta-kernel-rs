@@ -36,8 +36,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
-use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, UpdateTableTransactionBuilder};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
@@ -1022,15 +1021,12 @@ impl Snapshot {
         Transaction::try_new_existing_table(self, committer, engine)
     }
 
-    /// Creates a builder for altering this table's metadata. Currently supports schema change
-    /// operations.
+    /// Creates a builder for a transaction against this snapshot.
     ///
-    /// The returned builder allows chaining operations before building an
-    /// [`AlterTableTransaction`] that can be committed.
-    ///
-    /// [`AlterTableTransaction`]: crate::transaction::AlterTableTransaction
-    pub fn alter_table(self: Arc<Self>) -> AlterTableTransactionBuilder {
-        AlterTableTransactionBuilder::new(self)
+    /// The builder supports both data-changing transactions and schema changes. Configuration is
+    /// validated when [`UpdateTableTransactionBuilder::build`] is called.
+    pub fn transaction_builder(self: Arc<Self>) -> UpdateTableTransactionBuilder {
+        UpdateTableTransactionBuilder::new(self)
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

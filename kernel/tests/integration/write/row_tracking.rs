@@ -8,7 +8,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
-use delta_kernel::transaction::RowTrackingMetadataColumns;
+use delta_kernel::transaction::{RowTrackingMetadataColumns, UpdateTableOperation};
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use test_utils::{
     assert_result_error_with_message, insert_data, into_record_batch, read_scan, test_table_setup,
@@ -152,7 +152,8 @@ mod row_tracking_preservation {
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
         let commit_version = snapshot
-            .alter_table()
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::AlterTable)
             .add_column(StructField::nullable("added", DataType::INTEGER))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?

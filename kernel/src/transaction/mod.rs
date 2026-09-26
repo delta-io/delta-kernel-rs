@@ -69,22 +69,24 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
-pub(crate) mod alter_table;
-pub use alter_table::AlterTableTransaction;
+pub use builder::update_table::UpdateTableTransactionBuilder;
 mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
+mod operation;
+pub(crate) use operation::Operation;
+pub use operation::UpdateTableOperation;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
-#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 #[internal_api]
+#[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
 pub(crate) use schema_evolution::SchemaOperation;
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
 mod stats_verifier;
-mod update;
+mod update_table;
 mod write_state;
 mod write_validation;
 
@@ -92,7 +94,7 @@ pub use bound_write_context::BoundWriteContext;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use root_manifest_file::RootManifestFile;
 use stats_verifier::StatsColumnVerifier;
-use update::{intermediate_dv_schema, new_dv_column_schema};
+use update_table::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -171,21 +173,225 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-/// Marker type for alter-table (schema evolution) transactions.
-///
-/// Transactions in this state perform metadata-only commits. Data file operations are not
-/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
-#[derive(Debug)]
-pub struct AlterTable;
-
 /// Marker trait for transaction states that support data file operations.
 ///
-/// Only transaction types that implement this trait can access methods for adding, removing, or
-/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
-/// only perform metadata-only commits.
+/// Only transaction types that implement this trait can access data-file methods.
 pub trait SupportsDataFiles {}
 impl SupportsDataFiles for ExistingTable {}
 impl SupportsDataFiles for CreateTable {}
+
+/// Options shared by create-table and existing-table transaction builders.
+///
+/// These options describe connector-provided provenance and commit metadata. Repeated calls to a
+/// builder's `with_options` method replace the complete options value.
+#[derive(Default)]
+pub struct TransactionOptions {
+    correlation_id: Option<Arc<str>>,
+    operation_parameters: Option<HashMap<String, String>>,
+    operation_metrics: Option<HashMap<String, String>>,
+    engine_info: Option<String>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    transaction_ids: Vec<(String, i64)>,
+    domain_metadata_additions: Vec<DomainMetadata>,
+}
+
+impl std::fmt::Debug for TransactionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionOptions")
+            .field("correlation_id", &self.correlation_id)
+            .field("operation_parameters", &self.operation_parameters)
+            .field("operation_metrics", &self.operation_metrics)
+            .field("engine_info", &self.engine_info)
+            .field("engine_commit_info", &self.engine_commit_info.is_some())
+            .field("transaction_ids", &self.transaction_ids)
+            .field("domain_metadata_additions", &self.domain_metadata_additions)
+            .finish()
+    }
+}
+
+impl TransactionOptions {
+    /// Creates empty transaction options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the engine information recorded in `commitInfo`.
+    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
+        self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Attaches an opaque identifier to the transaction's metric events.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Sets operation parameters recorded in `commitInfo`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = Some(collect_operation_metadata("parameter", parameters)?);
+        Ok(self)
+    }
+
+    /// Sets operation metrics recorded in `commitInfo`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_operation_metadata("metric", metrics)?);
+        Ok(self)
+    }
+
+    /// Supplies one arbitrary connector-provided `commitInfo` row.
+    pub fn with_commit_info(
+        mut self,
+        commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((commit_info, commit_info_schema));
+        self
+    }
+
+    /// Adds an application transaction identifier.
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.transaction_ids.push((app_id.into(), version));
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.domain_metadata_additions
+            .push(DomainMetadata::new(domain.into(), configuration.into()));
+        self
+    }
+
+    fn validate(&self) -> DeltaResult<()> {
+        let mut app_ids = HashSet::with_capacity(self.transaction_ids.len());
+        if let Some((app_id, _)) = self
+            .transaction_ids
+            .iter()
+            .find(|(app_id, _)| !app_ids.insert(app_id.as_str()))
+        {
+            return Err(Error::invalid_transaction_state(format!(
+                "app_id {app_id} already exists in transaction options"
+            )));
+        }
+
+        let mut domains = HashSet::with_capacity(self.domain_metadata_additions.len());
+        if let Some(domain) = self
+            .domain_metadata_additions
+            .iter()
+            .map(DomainMetadata::domain)
+            .find(|domain| !domains.insert(*domain))
+        {
+            return Err(Error::invalid_transaction_state(format!(
+                "domain metadata '{domain}' appears more than once in transaction options"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// Configuration shared by transaction builders before transaction-kind-specific construction.
+pub(super) struct TransactionConfig {
+    options: TransactionOptions,
+    default_engine_info: Option<String>,
+    default_correlation_id: Option<Arc<str>>,
+    data_change: Option<bool>,
+    column_defaults_acknowledged: bool,
+    row_tracking_preservation_acknowledged: bool,
+}
+
+impl TransactionConfig {
+    pub(super) fn new() -> Self {
+        Self {
+            options: TransactionOptions::new(),
+            default_engine_info: None,
+            default_correlation_id: None,
+            data_change: None,
+            column_defaults_acknowledged: false,
+            row_tracking_preservation_acknowledged: false,
+        }
+    }
+
+    pub(super) fn for_create_table(engine_info: String) -> Self {
+        Self {
+            default_engine_info: Some(engine_info),
+            data_change: Some(true),
+            ..Self::new()
+        }
+    }
+
+    pub(super) fn set_options(&mut self, options: TransactionOptions) {
+        self.options = options;
+    }
+
+    pub(super) fn set_default_correlation_id(&mut self, correlation_id: Option<Arc<str>>) {
+        self.default_correlation_id = correlation_id;
+    }
+
+    pub(super) fn set_correlation_id(&mut self, correlation_id: impl Into<Arc<str>>) {
+        self.options = std::mem::take(&mut self.options).with_correlation_id(correlation_id);
+    }
+
+    pub(super) fn set_data_change(&mut self, data_change: bool) {
+        self.data_change = Some(data_change);
+    }
+
+    pub(super) fn acknowledge_column_defaults(&mut self) {
+        self.column_defaults_acknowledged = true;
+    }
+
+    pub(super) fn acknowledge_row_tracking_preservation(&mut self) {
+        self.row_tracking_preservation_acknowledged = true;
+    }
+}
+
+fn collect_operation_metadata<I, K, V>(
+    kind: &str,
+    entries: I,
+) -> DeltaResult<HashMap<String, String>>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    let mut values = HashMap::new();
+    for (key, value) in entries {
+        let key = key.into();
+        require!(
+            !key.is_empty(),
+            Error::invalid_transaction_state(format!("operation {kind} key cannot be empty"))
+        );
+        require!(
+            values.insert(key.clone(), value.into()).is_none(),
+            Error::invalid_transaction_state(format!(
+                "operation {kind} key '{key}' appears more than once"
+            ))
+        );
+    }
+    Ok(values)
+}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -220,12 +426,15 @@ pub struct Transaction<S = ExistingTable> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
+    // schema changes, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
-    operation: Option<String>,
+    operation: Option<Operation>,
+    operation_parameters: HashMap<String, String>,
+    operation_metrics: HashMap<String, String>,
     engine_info: Option<String>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -250,6 +459,8 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // Whether data_change must be resolved after all file actions have been staged.
+    infer_data_change: bool,
     // TODO(#2499): Replace this state when Conntector responsibilities encode column-default
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
@@ -369,8 +580,11 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(mut self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
+
+        self.resolve_data_change();
+        self.validate_operation_compatibility()?;
 
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
@@ -465,10 +679,24 @@ impl<S> Transaction<S> {
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
-            self.operation.clone(),
+            self.operation.as_ref().map(ToString::to_string),
             self.engine_info.clone(),
             self.is_blind_append,
         );
+        // Delta writers conventionally emit operationParameters even when the map is empty, while
+        // operationMetrics is optional and omitted when no metrics were supplied.
+        kernel_commit_info.operation_parameters = Some(
+            self.operation_parameters
+                .iter()
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect(),
+        );
+        kernel_commit_info.operation_metrics = (!self.operation_metrics.is_empty()).then(|| {
+            self.operation_metrics
+                .iter()
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect()
+        });
 
         // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
         // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
@@ -617,8 +845,8 @@ impl<S> Transaction<S> {
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
         span.record("data_change", self.data_change);
-        if let Some(operation) = self.operation.as_deref() {
-            span.record("operation", operation);
+        if let Some(operation) = &self.operation {
+            span.record("operation", operation.metric_label());
         }
         span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
         span.record(
@@ -639,6 +867,7 @@ impl<S> Transaction<S> {
     ///    optimizaton).
     pub fn with_data_change(mut self, data_change: bool) -> Self {
         self.data_change = data_change;
+        self.infer_data_change = false;
         self
     }
 
@@ -648,6 +877,25 @@ impl<S> Transaction<S> {
     #[allow(dead_code)] // used in FFI
     pub(crate) fn set_data_change(&mut self, data_change: bool) {
         self.data_change = data_change;
+        self.infer_data_change = false;
+    }
+
+    pub(super) fn with_transaction_config(
+        mut self,
+        mut config: TransactionConfig,
+    ) -> DeltaResult<Self> {
+        if config.options.engine_info.is_none() {
+            config.options.engine_info = config.default_engine_info;
+        }
+        if config.options.correlation_id.is_none() {
+            config.options.correlation_id = config.default_correlation_id;
+        }
+        self = self.with_transaction_options(config.options)?;
+        self.infer_data_change = config.data_change.is_none();
+        self.data_change = config.data_change.unwrap_or(true);
+        self.column_defaults_acknowledged = config.column_defaults_acknowledged;
+        self.row_tracking_preservation_acknowledged = config.row_tracking_preservation_acknowledged;
+        Ok(self)
     }
 
     /// Set the engine info field of this transaction's commit info action. This field is optional.
@@ -713,6 +961,36 @@ impl<S> Transaction<S> {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
         self
+    }
+
+    pub(crate) fn with_transaction_options(
+        mut self,
+        options: TransactionOptions,
+    ) -> DeltaResult<Self> {
+        options.validate()?;
+        let TransactionOptions {
+            correlation_id,
+            operation_parameters,
+            operation_metrics,
+            engine_info,
+            engine_commit_info,
+            transaction_ids,
+            domain_metadata_additions,
+        } = options;
+
+        self.correlation_id = correlation_id;
+        self.operation_parameters = operation_parameters.unwrap_or_default();
+        self.operation_metrics = operation_metrics.unwrap_or_default();
+        self.engine_info = engine_info;
+        self.engine_commit_info = engine_commit_info;
+        self.set_transactions = transaction_ids
+            .into_iter()
+            .map(|(app_id, version)| {
+                SetTransaction::new(app_id, version, Some(self.commit_timestamp))
+            })
+            .collect();
+        self.user_domain_metadata_additions = domain_metadata_additions;
+        Ok(self)
     }
 
     /// Determines the commit type based on whether this is a create-table operation and whether
@@ -925,8 +1203,8 @@ impl<S> Transaction<S> {
         if self.effective_table_config.logical_schema().num_fields() == 0 {
             return Err(Error::generic(
                 "Cannot write data files to a Delta table with empty schema; \
-                 use `snapshot.alter_table().add_column(...)` to add at least one \
-                 column before writing data",
+                 use `snapshot.transaction_builder()` with `UpdateTableOperation::AlterTable` and \
+                 `add_column(...)` to add at least one column before writing data",
             ));
         }
         Ok(())
@@ -970,11 +1248,44 @@ impl<S> Transaction<S> {
     /// Returns true if this is a create-table transaction.
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
-        debug_assert!(
-            self.operation.as_deref() != Some("CREATE TABLE") || self.read_snapshot_opt.is_none(),
-            "CREATE TABLE operation should not have a read snapshot"
-        );
         self.read_snapshot_opt.is_none()
+    }
+
+    pub(super) fn resolve_data_change(&mut self) {
+        if self.infer_data_change {
+            self.data_change = match self.operation.as_ref() {
+                Some(Operation::UpdateTable(UpdateTableOperation::AlterTable)) => {
+                    self.has_data_file_actions()
+                }
+                _ => true,
+            };
+        }
+    }
+
+    fn validate_operation_compatibility(&self) -> DeltaResult<()> {
+        if let Some(operation) = &self.operation {
+            operation
+                .validate()
+                .map_err(Error::invalid_transaction_state)?;
+        }
+        match (self.is_create_table(), self.operation.as_ref()) {
+            (true, Some(Operation::CreateTable)) => Ok(()),
+            (false, Some(Operation::UpdateTable(UpdateTableOperation::AlterTable)))
+                if !self.should_emit_metadata =>
+            {
+                Err(Error::invalid_transaction_state(
+                    "ALTER TABLE requires at least one schema change",
+                ))
+            }
+            (false, Some(Operation::UpdateTable(_))) => Ok(()),
+            (true, _) => Err(Error::invalid_transaction_state(
+                "create-table transactions must use the CREATE TABLE operation",
+            )),
+            (false, Some(Operation::CreateTable)) => Err(Error::invalid_transaction_state(
+                "CREATE TABLE cannot use an update-table transaction",
+            )),
+            (false, _) => Ok(()),
+        }
     }
 
     /// True iff this transaction stages any data-file action (add, remove, or DV update).
@@ -1466,8 +1777,8 @@ impl<S> Transaction<S> {
         // present, and only operation classification can flip `is_incremental_safe`.
         let is_incremental_safe = self
             .operation
-            .as_deref()
-            .is_some_and(is_incremental_safe_operation);
+            .as_ref()
+            .is_some_and(|operation| is_incremental_safe_operation(operation.as_str()));
         Ok(CrcDelta {
             file_stats,
             protocol: self

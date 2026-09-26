@@ -117,7 +117,8 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Writers call
+**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
+Writers configure transaction intent before `build()`, then call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
 Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a

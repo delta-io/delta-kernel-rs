@@ -44,7 +44,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionConfig, TransactionOptions};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -798,10 +798,9 @@ fn validate_extract_table_features_and_properties(
 pub struct CreateTableTransactionBuilder {
     path: String,
     schema: SchemaRef,
-    engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
-    correlation_id: Option<Arc<str>>,
+    config: TransactionConfig,
 }
 
 impl CreateTableTransactionBuilder {
@@ -813,10 +812,9 @@ impl CreateTableTransactionBuilder {
         Self {
             path: path.as_ref().to_string(),
             schema,
-            engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
-            correlation_id: None,
+            config: TransactionConfig::for_create_table(engine_info.into()),
         }
     }
 
@@ -907,7 +905,17 @@ impl CreateTableTransactionBuilder {
     /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
-        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        let correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self.config.set_default_correlation_id(correlation_id);
+        self
+    }
+
+    /// Replaces options shared by create-table and existing-table transactions.
+    ///
+    /// If the options omit engine information or a correlation identifier, the corresponding
+    /// values supplied through the existing create-table APIs are retained.
+    pub fn with_options(mut self, options: TransactionOptions) -> Self {
+        self.config.set_options(options);
         self
     }
 
@@ -1052,11 +1060,10 @@ impl CreateTableTransactionBuilder {
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
             table_configuration,
-            self.engine_info,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
-            self.correlation_id,
+            self.config,
         )
     }
 }
@@ -1068,6 +1075,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::committer::FileSystemCommitter;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_name, ColumnName};
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
@@ -1094,8 +1103,53 @@ mod tests {
             CreateTableTransactionBuilder::new("/path/to/table", schema.clone(), "TestApp/1.0");
 
         assert_eq!(builder.path, "/path/to/table");
-        assert_eq!(builder.engine_info, "TestApp/1.0");
+        assert_eq!(
+            builder.config.default_engine_info.as_deref(),
+            Some("TestApp/1.0")
+        );
         assert!(builder.table_properties.is_empty());
+    }
+
+    #[rstest]
+    #[case::legacy_values_are_backfilled(None, None, "legacy-engine", "legacy-correlation")]
+    #[case::options_take_precedence(
+        Some("options-engine"),
+        Some("options-correlation"),
+        "options-engine",
+        "options-correlation"
+    )]
+    fn test_transaction_options_precedence(
+        #[case] options_engine: Option<&str>,
+        #[case] options_correlation: Option<&str>,
+        #[case] expected_engine: &str,
+        #[case] expected_correlation: &str,
+    ) -> DeltaResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let mut options = TransactionOptions::new();
+        if let Some(engine) = options_engine {
+            options = options.with_engine_info(engine);
+        }
+        if let Some(correlation) = options_correlation {
+            options = options.with_correlation_id(correlation);
+        }
+
+        let transaction = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "legacy-engine",
+        )
+        .with_correlation_id("legacy-correlation")
+        .with_options(options)
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
+
+        assert_eq!(transaction.engine_info.as_deref(), Some(expected_engine));
+        assert_eq!(
+            transaction.correlation_id.as_deref(),
+            Some(expected_correlation)
+        );
+        Ok(())
     }
 
     #[test]
