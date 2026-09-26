@@ -321,6 +321,21 @@ pub enum KernelError {
     #[error("Table version {0} is missing or unavailable for this log operation.")]
     MissingVersion(Version),
 
+    /// The requested start version is unavailable from the queried log segment, though later
+    /// versions remain.
+    #[error(
+        "Start version {requested} is not available; earliest available version is {earliest}."
+    )]
+    StartVersionNotFound {
+        /// The start version the caller requested.
+        requested: Version,
+        /// The earliest version servable from the queried log segment (always > `requested`).
+        /// This is the lowest version this producer can serve, not a promise about the lowest
+        /// version readable on disk: a checkpoint may have trimmed the segment past commits a
+        /// path-based read could still serve.
+        earliest: Version,
+    },
+
     /// A table version required by an operation has not been published to the Delta log.
     ///
     /// The payload is the first unpublished version.

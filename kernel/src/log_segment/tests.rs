@@ -1128,7 +1128,10 @@ async fn test_non_contiguous_log() {
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::MissingVersion(1))
+        Err(KernelError::StartVersionNotFound {
+            requested: 1,
+            earliest: 2
+        })
     ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
