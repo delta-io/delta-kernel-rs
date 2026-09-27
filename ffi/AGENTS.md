@@ -790,6 +790,8 @@ The setter consumes the builder on both success and error, returning its replace
 - `src/snapshot_hint/` -- typed snapshot-hint input and callback export
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
+- `src/concurrent_identity_column.rs` -- Concurrent Identity Column (`concurrentIdentityColumns`)
+  report + write-path ack (`concurrent-identity-columns-in-dev`)
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
@@ -980,6 +982,19 @@ new_update_table_txn_builder(snapshot, operation, engine_info, data_change, engi
   -> update_table_txn_commit(txn, engine)
 ```
 
+Concurrent Identity Columns (`concurrent-identity-columns-in-dev`) live in
+`ffi/src/concurrent_identity_column.rs`. `visit_field_cic(state, name, sequence_id, start, step,
+allow_explicit_insert, alloc)` builds a non-nullable `LONG` CIC field for a create-table schema.
+The kernel reports CICs but never generates their values, so the connector fills them itself:
+
+```
+update_table_txn_builder_build()
+  -> update_table_txn_visit_concurrent_identity_columns(txn, engine, ctx, visitor)
+  -> update_table_txn_ack_concurrent_identity_columns(txn)   // REQUIRED for a CIC table, else the
+                                                            // write context errors
+  -> update_table_txn_get_unpartitioned_write_context(txn, engine) ... add_files ... commit
+```
+
 Deletion vector update flow:
 
 ```
@@ -1061,6 +1076,7 @@ Feature flags:
 - `arrow-60`, `arrow-59`
 - `delta-kernel-unity-catalog`
 - `tracing`
+- `concurrent-identity-columns-in-dev` -- experimental Concurrent Identity Column bindings
 - `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
   `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
   another `#[global_allocator]` if linked as an rlib)
