@@ -112,6 +112,9 @@ pub(crate) enum TableFeature {
     GeneratedColumns,
     /// ID Columns
     IdentityColumns,
+    /// Concurrent Identity Columns. Identity values are allocated from a catalog-hosted sequence
+    /// instead of the Delta-log high-water mark, allowing concurrent writers.
+    ConcurrentIdentityColumns,
     /// Monotonically increasing timestamps in the CommitInfo
     InCommitTimestamp,
     /// Row tracking on tables
@@ -355,7 +358,31 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
-    kernel_support: KernelSupport::NotSupported,
+    // If the table has the `concurrentIdentityColumns` feature, kernel supports writing an
+    // `identityColumns` table.
+    kernel_support: KernelSupport::Custom(|protocol, _properties, operation| match operation {
+        Operation::Write
+            if protocol.has_table_feature(&TableFeature::ConcurrentIdentityColumns) =>
+        {
+            Ok(())
+        }
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'identityColumns' (classic high-water-mark identity) is not supported for \
+             writes",
+        )),
+        Operation::Scan | Operation::Cdf => Ok(()),
+    }),
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+static CONCURRENT_IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Supported(TableFeature::IdentityColumns),
+        FeatureRequirement::Supported(TableFeature::CatalogManaged),
+    ],
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -720,6 +747,7 @@ impl TableFeature {
             | TableFeature::ChangeDataFeed
             | TableFeature::GeneratedColumns
             | TableFeature::IdentityColumns
+            | TableFeature::ConcurrentIdentityColumns
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
@@ -754,6 +782,7 @@ impl TableFeature {
             TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
             TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
             TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
+            TableFeature::ConcurrentIdentityColumns => &CONCURRENT_IDENTITY_COLUMNS_INFO,
             TableFeature::InCommitTimestamp => &IN_COMMIT_TIMESTAMP_INFO,
             TableFeature::RowTracking => &ROW_TRACKING_INFO,
             TableFeature::DomainMetadata => &DOMAIN_METADATA_INFO,
@@ -1105,6 +1134,7 @@ mod tests {
                 TableFeature::ChangeDataFeed => "changeDataFeed",
                 TableFeature::GeneratedColumns => "generatedColumns",
                 TableFeature::IdentityColumns => "identityColumns",
+                TableFeature::ConcurrentIdentityColumns => "concurrentIdentityColumns",
                 TableFeature::InCommitTimestamp => "inCommitTimestamp",
                 TableFeature::RowTracking => "rowTracking",
                 TableFeature::DomainMetadata => "domainMetadata",

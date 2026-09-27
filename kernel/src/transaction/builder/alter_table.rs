@@ -215,6 +215,18 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema
         };
 
+        // Reject introducing a CIC on a table that does not already have the feature.
+        let has_cic = crate::identity_columns::validate_concurrent_identity_columns(
+            &evolved_schema,
+            table_config.metadata().partition_columns(),
+        )?;
+        if has_cic && !table_config.is_feature_enabled(&TableFeature::ConcurrentIdentityColumns) {
+            return Err(Error::unsupported(
+                "ALTER TABLE cannot add a Concurrent Identity Column: enabling the \
+                 concurrentIdentityColumns feature via ALTER is not yet supported",
+            ));
+        }
+
         let evolved_metadata = table_config
             .metadata()
             .clone()

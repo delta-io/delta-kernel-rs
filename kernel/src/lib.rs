@@ -98,6 +98,7 @@ pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod identity_columns;
 pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
