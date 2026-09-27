@@ -191,7 +191,9 @@ pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, KernelError};
+pub use error::{
+    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, KernelError, KernelResult,
+};
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};

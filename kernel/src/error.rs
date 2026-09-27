@@ -86,6 +86,9 @@ pub(crate) fn add_scalar_path_context(
 /// A [`std::result::Result`] that has the kernel [`KernelError`] as the error variant
 pub type DeltaResult<T, E = KernelError> = std::result::Result<T, E>;
 
+/// A result whose error is a [`KernelError`].
+pub type KernelResult<T> = std::result::Result<T, KernelError>;
+
 /// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
 ///
 /// Convenience alias for the common pattern of returning a streaming, fallible iterator from
