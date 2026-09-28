@@ -6,105 +6,108 @@
 
 ### 🏗️ Breaking changes
 1. Introduce writectx builder ([#3226])
-  - Replace `WriteState::unpartitioned_write_context()` with `write_context_builder().build()`, and
-    `partitioned_write_context(values)` with
+    - Replace `WriteState::unpartitioned_write_context()` with `write_context_builder().build()`,
+    and `partitioned_write_context(values)` with
     `write_context_builder().with_partition_values(values).build()`.
 2. Let scans request stats for columns beyond dataSkippingNumIndexedCols ([#3230])
-  - This changes `StructStats`: 
-    - `StructStats::All` becomes `All { extra_indexed: Vec<ColumnName> }1.
-    - `StructStats::Columns(Vec<ColumnName>)` becomes `Columns { requested: Vec<ColumnName> }`.
+    - This changes `StructStats`:
+      - `StructStats::All` becomes `All { extra_indexed: Vec<ColumnName> }`.
+      - `StructStats::Columns(Vec<ColumnName>)` becomes `Columns { requested: Vec<ColumnName> }`.
 3. Add row tracking metadata cols into writecontext ([#3229])
-  - Rename `WriteContextBuilder` to `BoundWriteContextBuilder`, and replace
+    - Rename `WriteContextBuilder` to `BoundWriteContextBuilder`, and replace
     `BoundWriteContext::logical_schema()` / `physical_schema()` with `logical_data_schema()` /
     `physical_data_schema()`. To preserve materialized row-tracking columns, configure them through
     `with_row_tracking_columns(RowTrackingMetadataColumns { ... })`.
 4. Add row tracking metadata ackowledgement ([#3252])
-  - Before committing removals or deletion-vector updates on Row Tracking-enabled tables, call
+    - Before committing removals or deletion-vector updates on Row Tracking-enabled tables, call
     `txn.ack_row_tracking_preservation()`, acknowledging preservation of stable row IDs for
     copied/updated rows and stable row commit versions for copied rows. This requirement was
     initially gated by `row-tracking-preservation-in-dev`.
-6. Emit row tracking preservation tag in commitInfo ([#3268])
-  - Remove `row-tracking-preservation-in-dev` from your Cargo feature list; the acknowledgment
+5. Emit row tracking preservation tag in commitInfo ([#3268])
+    - Remove `row-tracking-preservation-in-dev` from your Cargo feature list; the acknowledgment
     requirement introduced in #3252 now applies regardless of feature flags. Kernel automatically
     emits the row-tracking preservation tag and merges it with custom commit-info tags, with
     Kernel-owned values taking precedence.
-9. Validate default evaluator input schemas at top level ([#3274])
-  - `SequentialPhase::try_new` now needs to have the checkpoint read schema passed to it
-10. Add reader timezone to map-to-struct ([#3118])
-  - `Expression::map_to_struct` now requires `MapToStructOptions`, and `MapToStructExpression`
+6. Validate default evaluator input schemas at top level ([#3274])
+    - `SequentialPhase::try_new` now needs to have the checkpoint read schema passed to it
+7. Add reader timezone to map-to-struct ([#3118])
+    - `Expression::map_to_struct` now requires `MapToStructOptions`, and `MapToStructExpression`
     stores the options.
-12. Support map-to-struct options in engine adapters ([#3296])
-  - The existing `MapToStruct` FFI visitor callback and constructor now accept a borrowed
+8. Support map-to-struct options in engine adapters ([#3296])
+    - The existing `MapToStruct` FFI visitor callback and constructor now accept a borrowed
     `FfiMapToStructOptions` pointer.
-13. Add schema field metadata visitor for projected scan FFI ([#3332])
-  - every visit_field_* function now requires a mutable `EngineMetadata *`, which allows engines to
-    pass metadata for schema fields. See the PR for code details.
-14. Add validation for snapshot load ([#3336])
-  - Handle unsupported reader protocol/features and unmet reader-feature requirements as errors
+9. Add schema field metadata visitor for projected scan FFI ([#3332])
+    - every visit_field_* function now requires a mutable `EngineMetadata *`, which allows engines
+    to pass metadata for schema fields. See the PR for code details.
+10. Add validation for snapshot load ([#3336])
+    - Handle unsupported reader protocol/features and unmet reader-feature requirements as errors
     during snapshot construction, rather than deferring them to subsequent operations. Unsupported
     writer-only features alone do not prevent snapshot construction.
-15. Report cumulative scan action-transform time ([#3396])
-  - Rust `ScanMetadataCompleted` adds `action_transform_time: Duration1.
-  - FFI `ScanMetadataCompleted` adds `action_transform_time_ns: u64`. This changes its C layout, so
-    consumers must recompile against the matching generated header.
-17. Migrate engine builder to handle system ([#3369])
-  - This is breaking for the FFI ABI:
-  - `get_engine_builder` returns `ExternResultHandleMutableFfiEngineBuilder`.
-  - Builder setters accept `HandleMutableFfiEngineBuilder *`.
-  - `builder_build` and `free_engine_builder` consume `HandleMutableFfiEngineBuilder`.
-  - Null engine-builder handles are invalid, consistent with other FFI handles.
-18. Reclassify generic log segment errors ([#3195])
-  - Adds new error variants: `MissingVersion`, `UnpublishedVersion`, `EmptyLog`, and `InvalidLogSegment`
-19. Overhaul EvaluationHandler::create_xxx methods ([#3285])
-  - `EvaluationHandler::create_many` now requires owned `Vec<Vec<Scalar>>`.
-  - Removed `EvaluationHandler::create_null` method. Use `create_many` instead.
-  - The `EvaluationHandlerExtension` trait was removed. Use the new `create_row` helper instead.
-  - The `IntoEngineData` trait was removed, along with its companion derive macro. Derive `IntoStructData` instead.
-  - The `Error::LiteralExpressionTransformError` variant was removed and FFI error updated to match.
-20. Clean up Engine cancellation contract ([#3239])
-  - The cancellation-aware handler contract now puts more responsibility on engines. Kernel no
+11. Report cumulative scan action-transform time ([#3396])
+    - Rust `ScanMetadataCompleted` adds `action_transform_time: Duration`.
+    - FFI `ScanMetadataCompleted` adds `action_transform_time_ns: u64`. This changes its C layout,
+    so consumers must recompile against the matching generated header.
+12. Migrate engine builder to handle system ([#3369])
+    - This is breaking for the FFI ABI:
+    - `get_engine_builder` returns `ExternResultHandleMutableFfiEngineBuilder`.
+    - Builder setters accept `HandleMutableFfiEngineBuilder *`.
+    - `builder_build` and `free_engine_builder` consume `HandleMutableFfiEngineBuilder`.
+    - Null engine-builder handles are invalid, consistent with other FFI handles.
+13. Reclassify generic log segment errors ([#3195])
+    - Adds new error variants: `MissingVersion`, `UnpublishedVersion`, `EmptyLog`, and
+      `InvalidLogSegment`
+14. Overhaul EvaluationHandler::create_xxx methods ([#3285])
+    - `EvaluationHandler::create_many` now requires owned `Vec<Vec<Scalar>>`.
+    - Removed `EvaluationHandler::create_null` method. Use `create_many` instead.
+    - The `EvaluationHandlerExtension` trait was removed. Use the new `create_row` helper instead.
+    - The `IntoEngineData` trait was removed, along with its companion derive macro. Derive
+      `IntoStructData` instead.
+    - The `Error::LiteralExpressionTransformError` variant was removed and FFI error updated to
+      match.
+15. Clean up Engine cancellation contract ([#3239])
+    - The cancellation-aware handler contract now puts more responsibility on engines. Kernel no
     longer attempts to compensate for engines that fail to honor cancellation when kernel correctly
     invoked cancellation-aware engine handler methods.
-21. Generalize borrowed ffi slices ([#3325])
-  - Changes borrowed array structs, including `KernelI64Slice`, into descriptive type aliases.
-22. Use DeltaResultIterator[Static] type alias ([#3241])
-  - `StorageHandler::list_from` and `StorageHandler::read_files` now return Send iterators where
+16. Generalize borrowed ffi slices ([#3325])
+    - Changes borrowed array structs, including `KernelI64Slice`, into descriptive type aliases.
+17. Use DeltaResultIterator[Static] type alias ([#3241])
+    - `StorageHandler::list_from` and `StorageHandler::read_files` now return Send iterators where
     previously they did not.
-23. Demote arrow expression helper visibility ([#3328])
-  - Direct callers of `coalesce_arrays` must use expression evaluation or their own implementation
+18. Demote arrow expression helper visibility ([#3328])
+    - Direct callers of `coalesce_arrays` must use expression evaluation or their own implementation
     because the helper is now private. Direct callers of `to_json` must enable the unstable
     `internal-api` feature or use expression evaluation; `evaluate_predicate` remains public.
-25. Strip gratuitous Transaction suffix from CommitResult variants ([#3384])
-  - `CommitResult` enum variant names are now shorter.
+19. Strip gratuitous Transaction suffix from CommitResult variants ([#3384])
+    - `CommitResult` enum variant names are now shorter.
 
 ### 🚀 Features / new APIs
 
 1. Optimize checkpoint shape resolution using sidecarSchema tag ([#3209])
 2. Support reading stable row commit version ([#3224])
 3. *(ffi)* Add create-table domain metadata setter ([#3267])
-5. Schema evolution API and nested add-column paths ([#3103])
-4. Add void schema field visitor ([#3275])
-5. Add option to skip checkpoints during incremental snapshot updates ([#3249])
-6. Add frame reporting support to metrics layers ([#3306])
-7. Annotate call sites with frame graph tracing events ([#3327])
-8. Support for committing externally produced root manifests ([#3216])
-9. Allow null variant scalar ([#3287])
-10. Support metadata.format.options in FFI visitor ([#3323])
-11. Add `BackReference` and add it to `Add` and `Remove` ([#3302])
-12. Correctly set fields on Remove action when AMT is enabled ([#3318])
-13. Reject tables with row tracking enabled + suspended ([#3348])
-14. Ensure `v2Checkpoint` and `adaptiveMetadata` are exclusive ([#3356])
-15. Expose CRC allFiles via a public accessor ([#3353])
-16. Support iceberg_compat_v2 feature ([#3225])
-17. Support catalog-managed commit ranges ([#3326])
-18. Expose distributed write state through ffi ([#3387])
-19. Reject cdf reserved cols on create and alter ([#3347])
-20. Accept physical column names for partition values ([#3408])
-21. Add ability to project AMT schema ([#3171)]
-7. Add SnapshotHint builder support ([#3222])
-8. Expose SnapshotHint through FFI ([#3284])
-16. Add `LastManifestCommit` to `Crc` and `CommitInfo` ([#3390])
-11. Expose snapshot row tracking high-water mark ([#3330])
+4. Schema evolution API and nested add-column paths ([#3103])
+5. Add void schema field visitor ([#3275])
+6. Add option to skip checkpoints during incremental snapshot updates ([#3249])
+7. Add frame reporting support to metrics layers ([#3306])
+8. Annotate call sites with frame graph tracing events ([#3327])
+9. Support for committing externally produced root manifests ([#3216])
+10. Allow null variant scalar ([#3287])
+11. Support metadata.format.options in FFI visitor ([#3323])
+12. Add `BackReference` and add it to `Add` and `Remove` ([#3302])
+13. Correctly set fields on Remove action when AMT is enabled ([#3318])
+14. Reject tables with row tracking enabled + suspended ([#3348])
+15. Ensure `v2Checkpoint` and `adaptiveMetadata` are exclusive ([#3356])
+16. Expose CRC allFiles via a public accessor ([#3353])
+17. Support iceberg_compat_v2 feature ([#3225])
+18. Support catalog-managed commit ranges ([#3326])
+19. Expose distributed write state through ffi ([#3387])
+20. Reject cdf reserved cols on create and alter ([#3347])
+21. Accept physical column names for partition values ([#3408])
+22. Add ability to project AMT schema ([#3171])
+23. Add SnapshotHint builder support ([#3222])
+24. Expose SnapshotHint through FFI ([#3284])
+25. Add `LastManifestCommit` to `Crc` and `CommitInfo` ([#3390])
+26. Expose snapshot row tracking high-water mark ([#3330])
 
 ### 🐛 Bug Fixes
 
@@ -173,8 +176,8 @@
 15. PhantomType cleanup ([#3391])
 16. Include license and notice files in default_engine crate ([#3370])
 17. Introduce fixture in `remove_dv.rs` ([#3364])
-24. Move location helpers out of `actions/mod.rs` ([#3365])
-18. Add feedback reactions to ai inline reviews ([#3415])
+18. Move location helpers out of `actions/mod.rs` ([#3365])
+19. Add feedback reactions to ai inline reviews ([#3415])
 
 
 [#3205]: https://github.com/delta-io/delta-kernel-rs/pull/3205
