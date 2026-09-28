@@ -771,14 +771,18 @@ impl TableConfiguration {
 
         // While concurrent identity columns are supported, classic high-water-mark identity
         // columns do not exist.
-        if self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns)
-            && crate::identity_columns::schema_has_high_water_mark(self.logical_schema.as_ref())
-        {
-            return Err(Error::unsupported(
-                "Table supports 'concurrentIdentityColumns' but a column carries \
-                 'delta.identity.highWaterMark'; classic high-water-mark identity generation is \
-                 not supported (every identity column must be concurrent)",
-            ));
+        if self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns) {
+            if crate::schema::schema_has_high_water_mark(self.logical_schema.as_ref()) {
+                return Err(Error::unsupported(
+                    "Table supports 'concurrentIdentityColumns' but a column carries \
+                     'delta.identity.highWaterMark'; classic high-water-mark identity generation \
+                     is not supported (every identity column must be concurrent)",
+                ));
+            }
+            crate::schema::validate_concurrent_identity_columns(
+                &self.logical_schema,
+                self.metadata.partition_columns(),
+            )?;
         }
 
         Ok(())
@@ -961,7 +965,7 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::identity_columns::concurrent_identity_column;
+    use crate::schema::concurrent_identity_column::concurrent_identity_column;
     use crate::schema::{
         column_name, schema, schema_ref, ColumnMetadataKey, ColumnName, DataType, MetadataValue,
         SchemaRef, StructField, StructType,

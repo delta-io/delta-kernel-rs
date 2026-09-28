@@ -878,7 +878,7 @@ impl<S> Transaction<S> {
     fn ensure_concurrent_identity_columns_acknowledged(&self) -> DeltaResult<()> {
         require!(
             self.concurrent_identity_columns_acknowledged
-                || crate::identity_columns::try_collect_concurrent_identity_columns(
+                || crate::schema::try_collect_concurrent_identity_columns(
                     self.effective_table_config.logical_schema_ref()
                 )?
                 .is_empty(),
@@ -1128,13 +1128,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     /// Returns the list of Concurrent Identity Columns (CICs) in this table's logical schema.
     ///
-    /// A CIC column's values are issued by a UC Identity Sequence Service, not stored in the Delta
-    /// log, so the connector must fill them before writing. Use this to discover which columns to
-    /// fill and their sequence parameters, reserve ranges from your sequence client, generate the
-    /// values (a reserved range enumerates as `range_start + step * i`), fill each column into your
-    /// batch, and then call
+    /// A CIC column's values are issued by a catalog-hosted sequence, not stored in the Delta log,
+    /// so the connector must fill them and then call
     /// [`ack_concurrent_identity_columns`](Self::ack_concurrent_identity_columns) before requesting
-    /// write state. Kernel neither reserves, generates, nor inserts values.
+    /// write state. See [`ConcurrentIdentityColumn`](crate::schema::ConcurrentIdentityColumn) for
+    /// the full connector write-flow.
     ///
     /// # Errors
     ///
@@ -1142,8 +1140,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// `delta.identity.*` key or carrying a malformed value).
     pub fn concurrent_identity_columns(
         &self,
-    ) -> DeltaResult<Vec<crate::identity_columns::ConcurrentIdentityColumn<'_>>> {
-        crate::identity_columns::try_collect_concurrent_identity_columns(
+    ) -> DeltaResult<Vec<crate::schema::ConcurrentIdentityColumn<'_>>> {
+        crate::schema::try_collect_concurrent_identity_columns(
             self.effective_table_config.logical_schema_ref(),
         )
     }
@@ -1173,7 +1171,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged.
+    /// column defaults or Concurrent Identity Columns that the connector has not acknowledged.
     pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;

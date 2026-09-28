@@ -358,11 +358,12 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
-    // If the table has the `concurrentIdentityColumns` feature, kernel supports writing an
-    // `identityColumns` table.
-    kernel_support: KernelSupport::Custom(|protocol, _properties, operation| match operation {
+    // Classic high-water-mark identity is unsupported for writes; kernel only supports writing an
+    // `identityColumns` table when it also has the `concurrentIdentityColumns` feature.
+    kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
         Operation::Write
-            if protocol.has_table_feature(&TableFeature::ConcurrentIdentityColumns) =>
+            if _protocol.has_table_feature(&TableFeature::ConcurrentIdentityColumns) =>
         {
             Ok(())
         }
@@ -382,7 +383,10 @@ static CONCURRENT_IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::Supported(TableFeature::IdentityColumns),
         FeatureRequirement::Supported(TableFeature::CatalogManaged),
     ],
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "concurrent-identity-columns-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

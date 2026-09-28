@@ -216,7 +216,7 @@ impl AlterTableTransactionBuilder<Modifying> {
         };
 
         // Reject introducing a CIC on a table that does not already have the feature.
-        let has_cic = crate::identity_columns::validate_concurrent_identity_columns(
+        let has_cic = crate::schema::validate_concurrent_identity_columns(
             &evolved_schema,
             table_config.metadata().partition_columns(),
         )?;

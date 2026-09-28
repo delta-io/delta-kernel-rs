@@ -8,6 +8,8 @@ mod column_mapping;
 mod commit_info;
 mod domain_metadata;
 mod ict;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+mod identity_columns;
 mod interval;
 mod nested_field_ids;
 mod partitioned;
