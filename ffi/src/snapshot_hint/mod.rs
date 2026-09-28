@@ -1,7 +1,8 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
 use delta_kernel::snapshot::{
-    SnapshotHint, SnapshotHintError, SnapshotHintFreshness, SnapshotState,
+    SnapshotHint, SnapshotHintError, SnapshotHintFreshness, SnapshotLogState, SnapshotScanState,
+    SnapshotState,
 };
 use delta_kernel::{KernelError, KernelResult, Version};
 
@@ -12,7 +13,7 @@ use crate::log_path::LogPathArray;
 use crate::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
 
 mod state;
-use state::{BorrowedSnapshotLogState, BorrowedSnapshotState};
+use state::BorrowedSnapshotState;
 mod core;
 pub use core::*;
 
@@ -50,18 +51,22 @@ pub struct FfiSnapshotHint {
     pub crc: *const FfiCrc,
 }
 
-/// Borrowed snapshot components needed to resolve a transaction-log segment.
+/// Borrowed snapshot components needed to validate and plan a default scan.
 ///
-/// Unlike [`FfiSnapshotHint`], this omits protocol, metadata, schema, and CRC state. Every pointer
-/// is borrowed only for the FFI call receiving this value.
+/// This omits CRC state because scan planning never reads it. Every pointer is borrowed only for
+/// the FFI call receiving this value.
 #[repr(C)]
-pub struct FfiSnapshotLogState {
-    /// Target table version described by the log state.
+pub struct FfiSnapshotScanState {
+    /// Target table version described by the scan state.
     pub version: Version,
     /// Connector-provided freshness claim for `version`.
     pub freshness: FfiSnapshotHintFreshness,
     /// Complete set of log paths needed to construct the log segment.
     pub log_paths: LogPathArray,
+    /// Protocol action at `version`.
+    pub protocol: FfiProtocol,
+    /// Metadata action at `version`.
+    pub metadata: FfiMetadata,
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
 }

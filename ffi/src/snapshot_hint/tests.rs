@@ -6,7 +6,7 @@ use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastChe
 use delta_kernel::object_store::memory::InMemory;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::plans::proto::operation as proto_op;
-use delta_kernel::snapshot::SnapshotState;
+use delta_kernel::snapshot::{SnapshotLogState, SnapshotScanState, SnapshotState};
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(feature = "declarative-plans")]
 use prost::Message as _;
@@ -92,6 +92,12 @@ fn copy_protocol(value: &FfiProtocol) -> FfiProtocol {
         reader_features: copy_features(&value.reader_features),
         writer_features: copy_features(&value.writer_features),
     }
+}
+
+fn copy_metadata(value: &FfiMetadata) -> FfiMetadata {
+    // FFI metadata contains borrowed pointer/length descriptors and has no destructor. This test
+    // keeps the backing values alive while both descriptors are used.
+    unsafe { std::ptr::read(value) }
 }
 
 fn test_metadata() -> FfiMetadata {
@@ -194,14 +200,16 @@ fn test_snapshot_hint(
     }
 }
 
-fn test_snapshot_log_state(hint: &FfiSnapshotHint) -> FfiSnapshotLogState {
-    FfiSnapshotLogState {
+fn test_snapshot_scan_state(hint: &FfiSnapshotHint) -> FfiSnapshotScanState {
+    FfiSnapshotScanState {
         version: hint.version,
         freshness: hint.freshness,
         log_paths: LogPathArray {
             ptr: hint.log_paths.ptr,
             len: hint.log_paths.len,
         },
+        protocol: copy_protocol(&hint.protocol),
+        metadata: copy_metadata(&hint.metadata),
         last_checkpoint: hint.last_checkpoint,
     }
 }
@@ -224,21 +232,23 @@ fn externalized_core_borrows_validated_connector_state() {
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let owned = unsafe { snapshot.as_ref() };
     assert_eq!(
-        SnapshotState::table_root(owned).as_str(),
+        SnapshotLogState::table_root(owned).as_str(),
         "memory:///hinted-table/"
     );
-    assert_eq!(SnapshotState::version(owned), 0);
-    assert!(!SnapshotState::is_latest(owned));
+    assert_eq!(SnapshotLogState::version(owned), 0);
+    assert!(!SnapshotLogState::is_latest(owned));
     assert_eq!(
-        SnapshotState::protocol(owned).unwrap().min_reader_version(),
+        SnapshotScanState::protocol(owned)
+            .unwrap()
+            .min_reader_version(),
         1
     );
-    assert_eq!(SnapshotState::metadata(owned).unwrap().id(), "table-id");
-    assert!(SnapshotState::logical_schema(owned).is_ok());
-    assert!(SnapshotState::last_checkpoint(owned).unwrap().is_none());
+    assert_eq!(SnapshotScanState::metadata(owned).unwrap().id(), "table-id");
+    assert!(SnapshotScanState::logical_schema(owned).is_ok());
+    assert!(SnapshotLogState::last_checkpoint(owned).unwrap().is_none());
     assert!(SnapshotState::crc(owned).unwrap().is_none());
     let mut path_count = 0;
-    SnapshotState::visit_log_paths(owned, &mut |batch| {
+    SnapshotLogState::visit_log_paths(owned, &mut |batch| {
         path_count += batch.len();
         Ok(())
     })
@@ -355,12 +365,12 @@ fn externalized_core_borrows_validated_connector_state() {
     // Empty schemas can still be externalized and read through getters, but not scanned.
     #[cfg(feature = "declarative-plans")]
     {
-        assert!(!unsafe { snapshot_core_has_validated_metadata_plan(core.shallow_copy()) });
         let plan_engine = unsafe { plan_based_engine(&engine) };
+        let scan_state = test_snapshot_scan_state(&hint);
         let rejected = unsafe {
             snapshot_core_declarative_metadata_plan(
                 core.shallow_copy(),
-                &hint,
+                &scan_state,
                 42,
                 plan_engine.shallow_copy(),
             )
@@ -416,7 +426,6 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         ))
     };
     let plan_engine = unsafe { plan_based_engine(&engine) };
-    assert!(unsafe { snapshot_core_has_validated_metadata_plan(core.shallow_copy()) });
     let inner_engine = unsafe { plan_engine.as_ref() }.engine();
     let native_snapshot = unsafe { snapshot.into_inner() };
     let native_plan = native_snapshot
@@ -428,26 +437,12 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         .unwrap()
         .expect("expected a native plan for a hinted commit");
     let native_bytes = delta_kernel::Operation::QueryPlan(native_plan).to_proto_bytes();
+    let scan_state = test_snapshot_scan_state(&hint);
 
-    // Fail immediately if the narrow planner asks for schema, metadata, protocol, or CRC.
-    let validation = delta_kernel::scan::ValidatedMetadataScan::try_new(&native_snapshot).unwrap();
-    let log_state = test_snapshot_log_state(&hint);
-    let host_state = BorrowedSnapshotLogState {
-        value: &log_state,
-        table_root: native_snapshot.table_root(),
-    };
-    let narrow_plan = validation
-        .plan(&host_state, inner_engine.as_ref())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        delta_kernel::Operation::QueryPlan(narrow_plan).to_proto_bytes(),
-        native_bytes
-    );
     let rejected = unsafe {
-        snapshot_core_declarative_metadata_plan_from_log_state(
+        snapshot_core_declarative_metadata_plan(
             core.shallow_copy(),
-            &log_state,
+            &scan_state,
             43,
             plan_engine.shallow_copy(),
         )
@@ -455,9 +450,9 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
 
     let result = unsafe {
-        snapshot_core_declarative_metadata_plan_from_log_state(
+        snapshot_core_declarative_metadata_plan(
             core.shallow_copy(),
-            &log_state,
+            &scan_state,
             42,
             plan_engine.shallow_copy(),
         )

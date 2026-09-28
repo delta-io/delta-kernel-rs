@@ -43,7 +43,7 @@ use crate::schema::{
     StructField, StructType, ToSchema as _,
 };
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
-use crate::snapshot::{log_segment_from_state, SnapshotLogState, SnapshotState};
+use crate::snapshot::{log_segment_from_state, SnapshotScanState};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
@@ -63,81 +63,6 @@ pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
 
-/// Validation of a default metadata scan against an immutable snapshot.
-///
-/// This retains only identity. JSON stats and string partition values need no table schema.
-/// Connectors must bind this validation to the generation of the immutable state they supply.
-#[cfg(feature = "declarative-plans")]
-#[derive(Debug)]
-#[internal_api]
-pub(crate) struct ValidatedMetadataScan {
-    table_root: Url,
-    version: Version,
-    latest: bool,
-}
-
-#[cfg(feature = "declarative-plans")]
-impl ValidatedMetadataScan {
-    /// Validate against an already loaded snapshot without retaining its schemas.
-    #[internal_api]
-    pub(crate) fn try_new(snapshot: &SnapshotRef) -> KernelResult<Self> {
-        let schema = snapshot.schema();
-        if schema.num_fields() == 0 {
-            return Err(KernelError::generic(
-                "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
-                 to add at least one column before scanning",
-            ));
-        }
-        snapshot
-            .table_configuration()
-            .ensure_operation_supported(Operation::Scan)?;
-        // Ordinary table fields already passed TableConfiguration validation at load. Explicit
-        // metadata columns have extra scan rules; use the existing validator for this rare case.
-        if schema.metadata_columns().next().is_some() {
-            snapshot.clone().scan_builder().build()?;
-        }
-        Ok(Self {
-            table_root: snapshot.table_root().clone(),
-            version: snapshot.version(),
-            latest: snapshot.is_built_as_latest(),
-        })
-    }
-
-    /// Plan the validated default scan, decoding only log paths from the supplied state.
-    ///
-    /// The connector must supply the same immutable state validated at handoff. Identity checks
-    /// detect version/freshness changes; they cannot detect mutation under an unchanged generation.
-    #[internal_api]
-    pub(crate) fn plan(
-        &self,
-        state: &dyn SnapshotLogState,
-        engine: &dyn Engine,
-    ) -> KernelResult<Option<Plan>> {
-        if state.table_root() != &self.table_root
-            || state.version() != self.version
-            || state.is_latest() != self.latest
-        {
-            return Err(KernelError::generic(
-                "validated metadata scan identity changed",
-            ));
-        }
-        let log_segment = log_segment_from_state(state)?;
-        let executor = engine.require_plan_executor()?;
-        let shape = CheckpointShape::try_new_for_segment(executor.as_ref(), &log_segment, true)?;
-        scan_plan::MetadataScanPlan {
-            log_segment: &log_segment,
-            skip_all: false,
-            pruning_predicate: None,
-            physical_stats_schema: None,
-            physical_partition_schema: None,
-            stats: &StatsOptions::default(),
-            physical_stats_output_schema: &None,
-            partition_values: &PartitionValuesOptions::default(),
-        }
-        .build_metadata_scan_plan(&shape)
-    }
-}
-
 /// Plan a default full-table scan from connector-owned snapshot components for one call.
 ///
 /// The table configuration and scan state live only until plan construction finishes. The
@@ -145,7 +70,7 @@ impl ValidatedMetadataScan {
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
 #[internal_api]
 pub(crate) fn declarative_metadata_scan_plan_from_state(
-    state: &dyn SnapshotState,
+    state: &dyn SnapshotScanState,
     engine: &dyn Engine,
 ) -> KernelResult<Option<Plan>> {
     let log_segment = log_segment_from_state(state)?;
@@ -163,6 +88,29 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
              to add at least one column before scanning",
         ));
     }
+
+    // A default metadata plan has no projection, predicate, requested statistics, or parsed
+    // partition output. For ordinary table fields, TableConfiguration construction has already
+    // performed the schema and protocol validation this operation needs. Avoid StateInfo because
+    // its physical projection and statistics schemas cannot affect this plan. Metadata columns
+    // have additional scan rules, so they continue through the complete scan validation below.
+    if table_schema.metadata_columns().next().is_none() {
+        drop(table_configuration);
+        let executor = engine.require_plan_executor()?;
+        let shape = CheckpointShape::try_new_for_segment(executor.as_ref(), &log_segment, false)?;
+        return scan_plan::MetadataScanPlan {
+            log_segment: &log_segment,
+            skip_all: false,
+            pruning_predicate: None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+            stats: &StatsOptions::default(),
+            physical_stats_output_schema: &None,
+            partition_values: &PartitionValuesOptions::default(),
+        }
+        .build_metadata_scan_plan(&shape);
+    }
+
     let stats = StatsOptions::default();
     let partition_values = PartitionValuesOptions::default();
     let state_info = StateInfo::try_new(
