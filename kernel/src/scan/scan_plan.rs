@@ -804,13 +804,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::with_parsed_stats(Some(struct_stats_schema()), true)]
-    #[case::without_parsed_stats(None, false)]
+    #[case::without_parsed_partitions(None, false)]
+    #[case::compatible_partitions(Some(schema_ref! { nullable "p": STRING }), true)]
+    #[case::incompatible_partitions(Some(schema_ref! { nullable "p": LONG }), false)]
     fn metadata_plan_checkpoint_metadata_columns(
-        #[case] parsed_stats: Option<SchemaRef>,
-        #[case] expect_parsed_columns: bool,
+        #[case] parsed_partitions: Option<SchemaRef>,
+        #[case] expect_native_partitions: bool,
+        #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
-        #[values(false, true)] native_parsed_partitions: bool,
     ) -> DeltaResult<()> {
         let stats = StatsOptions::all();
         let partition_values = PartitionValuesOptions::with_struct();
@@ -820,13 +821,11 @@ mod tests {
             .with_stats(stats)
             .with_partition_values(partition_values)
             .build()?;
-        let parsed_partitions = native_parsed_partitions
-            .then(|| scan.state_info.physical_partition_schema.as_ref().unwrap());
         let shape = CheckpointShape {
             checkpoint_type,
             leaf_checkpoint_schema: Some(parquet_read_schema(
                 parsed_stats.as_ref(),
-                parsed_partitions,
+                parsed_partitions.as_ref(),
             )?),
         };
         let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
@@ -847,13 +846,13 @@ mod tests {
             .expect("checkpoint leaf scan");
         assert_eq!(
             add_struct(checkpoint_schema).field(STATS_PARSED).is_some(),
-            expect_parsed_columns,
+            parsed_stats.is_some(),
         );
         assert_eq!(
             add_struct(checkpoint_schema)
                 .field(PARTITION_VALUES_PARSED)
                 .is_some(),
-            native_parsed_partitions,
+            expect_native_partitions,
         );
 
         let normalization = plan
@@ -869,7 +868,7 @@ mod tests {
             .expect("checkpoint normalization project");
         assert_eq!(
             normalization.contains("MAP_TO_STRUCT"),
-            !native_parsed_partitions
+            !expect_native_partitions
         );
         assert!(!normalization.contains("COALESCE"));
         Ok(())
