@@ -19,8 +19,8 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -146,6 +146,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::ScanParquet(n) => Op::ScanParquet(n.into()),
             Operator::ScanJson(n) => Op::ScanJson(n.into()),
             Operator::Values(n) => Op::Values(n.into()),
+            Operator::RelationSource(n) => Op::RelationSource(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
@@ -198,6 +199,15 @@ impl From<&Values> for proto_plan::ValuesNode {
         proto_plan::ValuesNode {
             schema: Some(node.schema.as_ref().into()),
             rows,
+        }
+    }
+}
+
+impl From<&RelationRef> for proto_plan::RelationSourceNode {
+    fn from(relation_ref: &RelationRef) -> Self {
+        proto_plan::RelationSourceNode {
+            id: relation_ref.id().to_owned(),
+            schema: Some(relation_ref.schema().as_ref().into()),
         }
     }
 }
@@ -998,8 +1008,8 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-        ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
+        ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1305,6 +1315,10 @@ mod tests {
     )]
     #[case(Operator::Values(Values { schema: sample_schema(), rows: vec![] }), "values")]
     #[case(
+        Operator::RelationSource(RelationRef::new("relation-7", sample_schema())),
+        "relation_source"
+    )]
+    #[case(
         Operator::Project(Project {
             expr: Arc::new(Expression::struct_from([lit(1)])),
             schema: sample_schema(),
@@ -1344,6 +1358,7 @@ mod tests {
             Op::ScanParquet(_) => "scan_parquet",
             Op::ScanJson(_) => "scan_json",
             Op::Values(_) => "values",
+            Op::RelationSource(_) => "relation_source",
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
             Op::DynamicScan(_) => "dynamic_scan",
@@ -1401,6 +1416,14 @@ mod tests {
         assert!(proto.schema.is_some());
         assert_eq!(proto.rows.len(), 2);
         assert_eq!(proto.rows[0].values.len(), 1);
+    }
+
+    #[test]
+    fn from_relation_source() {
+        let node = RelationRef::new("scope/a:relation", sample_schema());
+        let proto = proto_plan::RelationSourceNode::from(&node);
+        assert_eq!(proto.id, "scope/a:relation");
+        assert!(proto.schema.is_some());
     }
 
     #[test]

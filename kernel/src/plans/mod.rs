@@ -8,7 +8,7 @@
 //!
 //! # What a plan is
 //!
-//! A [`Plan`](ir::plan::Plan) is a DAG of relational operators ([`Operator`](ir::nodes::Operator)):
+//! A [`Plan`] is a DAG of relational operators ([`Operator`](ir::nodes::Operator)):
 //! sources, transforms, and set combinators. Most map one-to-one onto a SQL operator, so a plan
 //! reads like a query. The live-add metadata plan built in `scan::scan_plan`, for example, is
 //! roughly:
@@ -31,9 +31,9 @@
 //!
 //! - [`Operation::IoOperation`] is a single I/O request; each [`IoOperation`] variant documents the
 //!   [`PlanResult`] it must return.
-//! - [`Operation::QueryPlan`] is a [`Plan`](ir::plan::Plan), returning [`PlanResult::Data`]. Either
-//!   evaluate [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted
-//!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
+//! - [`Operation::QueryPlan`] is a [`Plan`], returning [`PlanResult::Data`]. Either evaluate
+//!   [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted so a
+//!   node's inputs are already evaluated, or compile the DAG into the engine's own plan.
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
 //! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
@@ -44,7 +44,7 @@
 //! [`PlanExecutor::execute_op`] and [`PlanResult::Data`] provide the generic result contract for
 //! operations whose output is consumed by kernel.
 //!
-//! Some kernel APIs instead return a [`Plan`](ir::plan::Plan) whose terminal rows belong to the
+//! Some kernel APIs instead return a [`Plan`] whose terminal rows belong to the
 //! connector. The connector may execute the plan through its ordinary query engine and keep the
 //! result in the engine's native representation instead of adapting it through [`EngineData`] only
 //! to pass it back to itself. [`Scan::declarative_metadata_scan_plan`] is one example: the
@@ -75,6 +75,8 @@ pub mod proto;
 
 pub use builder::PlanBuilder;
 use bytes::Bytes;
+pub use ir::nodes::{RelationId, RelationRef};
+pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
 
 use crate::{
@@ -89,12 +91,43 @@ pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
 
+    /// Returns an executor that retains relations within its own scope.
+    ///
+    /// Unlike [`execute_op`](Self::execute_op), which materializes a plan's result and streams it
+    /// to kernel, [`ScopedPlanExecutor::execute_and_retain`] keeps the result on the engine side.
+    /// A [`RelationSource`](ir::nodes::Operator::RelationSource) node can then read it in another
+    /// plan executed by the scoped executor. The scoped executor should release every relation it
+    /// retained when it is dropped.
+    fn get_scoped(&self) -> DeltaResult<Box<dyn ScopedPlanExecutor>> {
+        Err(KernelError::unsupported(
+            "scoped execution is not supported by this PlanExecutor",
+        ))
+    }
+
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
     /// [`IoOperation::ParquetFooter`] op.
     fn read_parquet_footer(&self, file: FileMeta) -> DeltaResult<ParquetFooter> {
         self.execute_op(Operation::IoOperation(IoOperation::parquet_footer(file)))?
             .into_parquet_footer()
     }
+}
+
+/// A [`PlanExecutor`] that can retain relations within its own lifetime.
+///
+/// Implementations should release every relation retained through
+/// [`execute_and_retain`](Self::execute_and_retain) when this executor is dropped. A
+/// [`RelationRef`] may outlive the executor, but reading it after the executor is dropped must
+/// return an error. Reading a ref through a scoped executor other than the one that produced it
+/// is also an error.
+pub trait ScopedPlanExecutor: PlanExecutor {
+    /// Executes `plan` and retains its terminal relation in the engine, returning a handle that
+    /// can be used as a [`RelationSource`](ir::nodes::Operator::RelationSource) in another plan.
+    /// The handle is valid until this scoped executor is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan cannot be executed or its result cannot be retained.
+    fn execute_and_retain(&self, plan: Plan) -> DeltaResult<RelationRef>;
 }
 
 /// The result of executing an [`Operation`].

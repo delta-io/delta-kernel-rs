@@ -35,6 +35,9 @@ pub enum Operator {
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
     Values(Values),
+    /// Reads all rows of a relation previously retained by the engine. The [`RelationRef`]'s
+    /// schema is this node's output schema.
+    RelationSource(RelationRef),
 
     // === Unary operators (1 input) ===========================================
     Project(Project),
@@ -47,6 +50,43 @@ pub enum Operator {
 
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
+}
+
+/// An engine-assigned identifier for a relation retained by a
+/// [`PlanExecutor`](crate::plans::PlanExecutor). Opaque to kernel.
+pub type RelationId = String;
+
+/// An opaque handle to a relation retained by the engine's
+/// [`PlanExecutor`](crate::plans::PlanExecutor). See [`Operator::RelationSource`].
+///
+/// Kernel holds only the [`RelationId`] and the relation's output schema; the rows themselves are
+/// never materialized into kernel. A handle is produced by
+/// [`ScopedPlanExecutor::execute_and_retain`](crate::plans::ScopedPlanExecutor::execute_and_retain)
+/// and read back by an [`Operator::RelationSource`] node while the scoped executor lives.
+#[derive(Debug, Clone)]
+pub struct RelationRef {
+    id: RelationId,
+    schema: SchemaRef,
+}
+
+impl RelationRef {
+    /// A handle to the relation identified by `id`, producing rows matching `schema`.
+    pub fn new(id: impl Into<RelationId>, schema: impl Into<SchemaRef>) -> Self {
+        Self {
+            id: id.into(),
+            schema: schema.into(),
+        }
+    }
+
+    /// The engine-assigned identifier of the retained relation.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The output schema of the retained relation.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
 }
 
 /// One file to scan plus literal values broadcast to every row read from that file.

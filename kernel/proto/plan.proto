@@ -50,6 +50,13 @@ message ValuesNode {
   repeated ValuesRow rows = 2;
 }
 
+// Reads all rows of a relation retained by a plan executor.
+// `id` is engine-assigned and opaque to kernel; `schema` is the relation's output schema.
+message RelationSourceNode {
+  string id = 1;
+  delta.kernel.schema.StructType schema = 2;
+}
+
 // ============================================================================
 // Transform payloads (1+ inputs)
 // ============================================================================
@@ -143,6 +150,7 @@ message Operator {
     ScanParquetNode scan_parquet = 1;
     ScanJsonNode scan_json = 2;
     ValuesNode values = 3;
+    RelationSourceNode relation_source = 10;
     // Transforms (1+ inputs)
     ProjectNode project = 4;
     FilterNode filter = 5;
