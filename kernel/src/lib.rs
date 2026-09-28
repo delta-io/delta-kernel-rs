@@ -104,6 +104,7 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+pub(crate) mod partition_values;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;
