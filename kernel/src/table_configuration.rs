@@ -186,24 +186,28 @@ impl TableConfiguration {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        let physical_data_schema_without_partition_columns = {
-            let fields = logical_schema
+        let (
+            physical_data_schema_without_partition_columns,
+            logical_schema_without_partition_columns,
+        ) = if partition_columns.is_empty() {
+            (physical_schema.clone(), logical_schema.clone())
+        } else {
+            let physical_fields = logical_schema
                 .fields()
                 .zip(physical_schema.fields())
                 .filter(|(logical_field, _)| {
                     !partition_columns.contains(logical_field.name().as_str())
                 })
                 .map(|(_, physical_field)| physical_field.clone());
-            // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
-        };
-        let logical_schema_without_partition_columns = {
-            let fields = logical_schema
+            let logical_fields = logical_schema
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name().as_str()))
                 .cloned();
-            // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
+            // Both are subsets of already-valid schemas.
+            (
+                Arc::new(StructType::new_unchecked(physical_fields)),
+                Arc::new(StructType::new_unchecked(logical_fields)),
+            )
         };
 
         let mut table_config = Self {
@@ -954,6 +958,7 @@ impl TableConfiguration {
 mod test {
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use rstest::rstest;
 
@@ -979,6 +984,49 @@ mod test {
         MockTableConfigurationBuilder,
     };
     use crate::Error;
+
+    #[test]
+    fn unpartitioned_schema_views_share_backing() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "part": STRING,
+            })
+            .build();
+
+        assert!(Arc::ptr_eq(
+            &table_config.logical_schema,
+            &table_config.logical_schema_without_partition_columns
+        ));
+        assert!(Arc::ptr_eq(
+            &table_config.physical_schema,
+            &table_config.physical_data_schema_without_partition_columns
+        ));
+    }
+
+    #[test]
+    fn partitioned_schema_views_remain_filtered() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "part": STRING,
+            })
+            .with_partition_columns(["part"])
+            .build();
+
+        assert_eq!(
+            table_config
+                .logical_schema_without_partition_columns
+                .num_fields(),
+            1
+        );
+        assert_eq!(
+            table_config
+                .physical_data_schema_without_partition_columns
+                .num_fields(),
+            1
+        );
+    }
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
