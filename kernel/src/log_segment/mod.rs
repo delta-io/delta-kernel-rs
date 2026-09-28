@@ -44,6 +44,8 @@ mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) use protocol_metadata_replay::CheckpointActionResolution;
 
 #[cfg(test)]
 mod crc_tests;
@@ -869,16 +871,18 @@ impl LogSegment {
         Ok(result.actions)
     }
 
-    /// The newest `checkpoint` action (the adaptiveMetadata content root) in this log
-    /// segment, or `None` if it has none.
+    /// Scan this segment's log newest-first for the latest AMT `checkpoint` action, returning
+    /// `None` for a classic (non-AMT) table whose checkpoints lack the action. The first action
+    /// found is the latest, since the files are read in descending version order.
+    ///
+    /// This opens log files until an action is found. TODO: once commitInfo carries a pointer to
+    /// the latest checkpoint action (delta-io/delta#7533), resolve this by opening at most two log
+    /// files instead of scanning.
     ///
     /// # Errors
-    ///
-    /// Returns an error if the log segment cannot be read or a checkpoint action fails to parse.
-    // TODO(#3426): cache the last checkpoint action on the Snapshot (resolved at construction),
-    // which would let us remove this method.
+    /// Returns an error if the log cannot be read or a checkpoint action fails to parse.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn find_last_checkpoint_action(
+    pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<CheckpointAction>> {

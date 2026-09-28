@@ -50,7 +50,7 @@ impl ManifestCommitState {
         // path lands.
         if let Some(checkpoint) = read_snapshot
             .log_segment()
-            .find_last_checkpoint_action(engine)?
+            .latest_checkpoint_action(engine)?
         {
             let snapshot_version = version_as_i64(read_snapshot.version())?;
             require!(

@@ -114,7 +114,7 @@ impl RootManifestFile {
             Some(SetTransactionState::Complete(_))
         );
 
-        let checkpoint_action = snapshot.log_segment().find_last_checkpoint_action(engine)?;
+        let checkpoint_action = snapshot.latest_checkpoint_action(engine)?;
 
         // Reject a checkpoint that spilled txns/domain metadata to sidecars, since sidecars aren't
         // read yet and that state would be lost.
