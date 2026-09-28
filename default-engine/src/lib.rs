@@ -248,8 +248,29 @@ pub struct DefaultTaskExecutor;
 impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// Create a new [`DefaultEngineBuilder`] with the default executor.
     ///
-    /// Existing object-store handles remain supported. For a manually constructed cloud store,
-    /// pass [`EngineStore::with_paginated`] to retain non-recursive paginated listing.
+    /// `store` supplies the engine's object operations and optional paginated listing support.
+    /// Use [`EngineStore::from_url_opts`] or [`EngineStore::from_paginated`] for cloud stores.
+    ///
+    /// # Listing performance
+    ///
+    /// Passing an `Arc<S>` directly selects [`EngineStore::plain`], even when `S` is a concrete
+    /// cloud store that implements paginated listing. The results still exclude nested files,
+    /// but listing may fetch their metadata before filtering it client-side.
+    /// [`EngineStore::from_paginated`] avoids listing descendants but collects and sorts all pages.
+    /// Use [`EngineStore::from_ordered_paginated`] for a store that guarantees global listing order
+    /// to retain streaming and offset pushdown. [`EngineStore::from_url_opts`] selects this for
+    /// ordered built-in cloud backends automatically.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::object_store::aws::AmazonS3Builder;
+    /// # use delta_kernel_default_engine::{storage::EngineStore, DefaultEngineBuilder};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = Arc::new(AmazonS3Builder::from_env().with_bucket_name("bucket").build()?);
+    /// let engine = DefaultEngineBuilder::new(EngineStore::from_ordered_paginated(store)).build();
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(store: impl Into<EngineStore>) -> Self {
         Self {
             store: store.into(),

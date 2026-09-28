@@ -134,12 +134,24 @@ pub fn get_engine(
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
+        let bucket = if url.scheme() == "https"
+            && url.host_str().is_some_and(|host| host.starts_with("s3."))
+        {
+            url.path_segments().and_then(|mut segments| segments.next())
+        } else {
+            url.host_str()
+        };
+        let ordered = scheme != AmazonS3
+            || !bucket.is_some_and(|bucket| bucket.contains("--x-s3") || bucket.contains("-xa-s3"));
         macro_rules! engine_store {
-            ($builder:ty) => {
-                EngineStore::with_paginated(Arc::new(
-                    <$builder>::from_env().with_url(url_str).build()?,
-                ))
-            };
+            ($builder:ty) => {{
+                let store = Arc::new(<$builder>::from_env().with_url(url_str).build()?);
+                if ordered {
+                    EngineStore::from_ordered_paginated(store)
+                } else {
+                    EngineStore::from_paginated(store)
+                }
+            }};
         }
         let store = match scheme {
             AmazonS3 => engine_store!(AmazonS3Builder),

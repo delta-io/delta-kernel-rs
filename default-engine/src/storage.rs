@@ -14,12 +14,12 @@ use url::Url;
 
 /// Object-store handles used by a [`DefaultEngine`](crate::DefaultEngine).
 ///
-/// The optional paginated handle lets cloud backends apply both the directory delimiter and the
-/// starting offset in the storage request. Without it, listing uses
-/// [`ObjectStore::list_with_offset`] and removes nested descendants client-side.
+/// The optional paginated handle lets cloud backends apply the directory delimiter in storage
+/// requests. Globally ordered stores can also push down the starting offset. Without it, listing
+/// uses [`ObjectStore::list_with_offset`] and removes nested descendants client-side.
 pub struct EngineStore {
     pub(crate) object_store: Arc<DynObjectStore>,
-    pub(crate) paginated: Option<Arc<dyn PaginatedListStore>>,
+    pub(crate) paginated: Option<PaginatedListing>,
 }
 
 impl std::fmt::Debug for EngineStore {
@@ -36,6 +36,17 @@ impl EngineStore {
     ///
     /// Offset pushdown remains available through [`ObjectStore::list_with_offset`], but stores
     /// whose offset listing is recursive may still retrieve nested descendants.
+    ///
+    /// # Performance
+    ///
+    /// Listing uses a recursive stream and filters out nested files locally. Finding the next
+    /// direct child or reaching the end can consume a large nested subtree, even though none of
+    /// its files appear in the returned results. On cloud storage, this can require additional
+    /// listing requests.
+    ///
+    /// This also applies to cloud stores passed to the engine as ordinary `Arc` handles. Use
+    /// [`Self::from_paginated`] or [`Self::from_url_opts`] to retain provider-side shallow listing
+    /// where supported.
     pub fn plain(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
@@ -46,11 +57,40 @@ impl EngineStore {
     /// Create a store that supports provider-specific paginated listing.
     ///
     /// The same store handles ordinary object operations and paginated listing, preventing the two
-    /// handles from referring to different backends.
-    pub fn with_paginated<S: ObjectStore + PaginatedListStore + 'static>(store: Arc<S>) -> Self {
+    /// handles from referring to different backends. `store` must honor the requested delimiter:
+    /// objects must be direct children and subdirectories must be returned as common prefixes.
+    ///
+    /// Results are collected across all pages and sorted before being returned. No starting
+    /// offset is sent to the provider. Use [`Self::from_ordered_paginated`] only when `store`
+    /// guarantees globally ordered listing, including across page boundaries.
+    pub fn from_paginated<S: ObjectStore + PaginatedListStore + 'static>(store: Arc<S>) -> Self {
         Self {
             object_store: store.clone(),
-            paginated: Some(store),
+            paginated: Some(PaginatedListing {
+                store,
+                ordered: false,
+            }),
+        }
+    }
+
+    /// Create a store whose paginated listings are globally lexicographically ordered by path.
+    ///
+    /// `store` must honor delimiters as in [`Self::from_paginated`] and support starting offsets.
+    /// Every object's path must sort after all paths on preceding pages; ordering within each
+    /// individual page is not sufficient. Violating this contract can cause log discovery to
+    /// miss commits. Do not use this constructor for S3 Express directory buckets.
+    ///
+    /// Listings stream without collecting all pages, and the starting offset is sent with the
+    /// first request. Use [`Self::from_paginated`] when ordering is unknown.
+    pub fn from_ordered_paginated<S: ObjectStore + PaginatedListStore + 'static>(
+        store: Arc<S>,
+    ) -> Self {
+        Self {
+            object_store: store.clone(),
+            paginated: Some(PaginatedListing {
+                store,
+                ordered: true,
+            }),
         }
     }
 
@@ -58,6 +98,7 @@ impl EngineStore {
     ///
     /// Built-in S3, GCS, and Azure stores retain paginated listing support. Registered custom URL
     /// handlers and other built-in stores use [`Self::plain`].
+    /// Ordered cloud backends stream results; S3 Express listings are collected and sorted.
     ///
     /// # Errors
     ///
@@ -81,14 +122,24 @@ impl EngineStore {
             .into_iter()
             .map(|(key, value)| (key.as_ref().to_string(), value.into()));
         macro_rules! paginated {
-            ($builder:expr) => {
-                Self::with_paginated(Arc::new(build_cloud_store($builder, url, options)?))
-            };
+            ($builder:expr, $ordered:expr) => {{
+                let store = Arc::new(build_cloud_store($builder, url, options)?);
+                if $ordered {
+                    Self::from_ordered_paginated(store)
+                } else {
+                    Self::from_paginated(store)
+                }
+            }};
         }
         Ok(match scheme {
-            ObjectStoreScheme::AmazonS3 => paginated!(AmazonS3Builder::new()),
-            ObjectStoreScheme::GoogleCloudStorage => paginated!(GoogleCloudStorageBuilder::new()),
-            ObjectStoreScheme::MicrosoftAzure => paginated!(MicrosoftAzureBuilder::new()),
+            ObjectStoreScheme::AmazonS3 => paginated!(
+                AmazonS3Builder::new(),
+                crate::filesystem::supports_ordered_listing(url)
+            ),
+            ObjectStoreScheme::GoogleCloudStorage => {
+                paginated!(GoogleCloudStorageBuilder::new(), true)
+            }
+            ObjectStoreScheme::MicrosoftAzure => paginated!(MicrosoftAzureBuilder::new(), true),
             _ => Self::plain(store_from_url_opts(url, options)?),
         })
     }
@@ -104,6 +155,13 @@ impl<S: ObjectStore + 'static> From<Arc<S>> for EngineStore {
     fn from(object_store: Arc<S>) -> Self {
         Self::plain(object_store)
     }
+}
+
+/// Paginated listing capability, including whether results are globally ordered across pages.
+#[derive(Clone)]
+pub(crate) struct PaginatedListing {
+    pub(crate) store: Arc<dyn PaginatedListStore>,
+    pub(crate) ordered: bool,
 }
 
 /// Alias for convenience
@@ -271,6 +329,7 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{self, ObjectStore};
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
+    use rstest::rstest;
 
     use super::{insert_url_handler, store_from_url_opts, EngineStore, URL_REGISTRY};
     use crate::*;
@@ -332,16 +391,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cloud_url_factory_preserves_paginated_listing() {
-        for url in [
-            "s3://bucket/table",
-            "gs://bucket/table",
-            "abfss://container@account.dfs.core.windows.net/table",
-        ] {
-            let url = Url::parse(url).unwrap();
-            let store = EngineStore::from_url_opts(&url, HashMap::<String, String>::new()).unwrap();
-            assert!(store.paginated.is_some(), "missing pagination for {url}");
-        }
+    #[rstest]
+    #[case("s3://bucket/table", true)]
+    #[case("s3://bucket/table--x-s3", true)]
+    #[case("s3://bucket--usw2-az1--x-s3/table", false)]
+    #[case("s3://access-point-usw2-az1-xa-s3/table", false)]
+    #[case("https://s3.us-west-2.amazonaws.com/bucket/table", true)]
+    #[case("https://bucket.s3.us-west-2.amazonaws.com/table--x-s3", true)]
+    #[case(
+        "https://s3.us-west-2.amazonaws.com/bucket--usw2-az1--x-s3/table",
+        false
+    )]
+    #[case(
+        "https://bucket--usw2-az1--x-s3.s3.us-west-2.amazonaws.com/table",
+        false
+    )]
+    #[case("gs://bucket/table", true)]
+    #[case("abfss://container@account.dfs.core.windows.net/table", true)]
+    fn cloud_url_factory_preserves_listing_capabilities(#[case] url: &str, #[case] ordered: bool) {
+        let url = Url::parse(url).unwrap();
+        let store = EngineStore::from_url_opts(&url, HashMap::<String, String>::new()).unwrap();
+        assert_eq!(store.paginated.unwrap().ordered, ordered, "{url}");
     }
 }

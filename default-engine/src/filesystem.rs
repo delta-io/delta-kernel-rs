@@ -13,11 +13,12 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::executor::TaskExecutor;
+use crate::storage::PaginatedListing;
 use crate::UrlExt;
 
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
-    paginated: Option<Arc<dyn PaginatedListStore>>,
+    paginated: Option<PaginatedListing>,
     task_executor: Arc<E>,
     readahead: usize,
 }
@@ -35,7 +36,7 @@ impl<E: TaskExecutor> std::fmt::Debug for ObjectStoreStorageHandler<E> {
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     pub(crate) fn new(
         store: Arc<DynObjectStore>,
-        paginated: Option<Arc<dyn PaginatedListStore>>,
+        paginated: Option<PaginatedListing>,
         task_executor: Arc<E>,
     ) -> Self {
         Self {
@@ -62,7 +63,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
-    paginated: Option<Arc<dyn PaginatedListStore>>,
+    paginated: Option<PaginatedListing>,
     path: Url,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
@@ -82,16 +83,20 @@ async fn list_from_impl(
         Path::from_iter(parts)
     };
 
-    let has_ordered_listing = supports_ordered_listing(&path);
-
     if let Some(paginated) = paginated {
-        return list_paginated(paginated, path, prefix, offset, has_ordered_listing).await;
+        return list_paginated(paginated.store, path, prefix, offset, paginated.ordered).await;
     }
+
+    let has_ordered_listing = supports_ordered_listing(&path);
 
     // `list_with_offset` lets capable stores push down the offset but recursively lists
     // descendants.
     let stream = store
         .list_with_offset(Some(&prefix), &offset)
+        // Filtering descendants hides them from Kernel's lexical stopping rule. Without an
+        // earlier direct entry such as _last_checkpoint, reaching the end can consume the entire
+        // _staged_commits or _sidecars tail. Sorted paths can interleave direct children and
+        // descendants: a, b/x, c. Encountering b/x does not mean all direct children were listed.
         .try_filter(move |meta| {
             futures::future::ready(
                 meta.location
@@ -122,7 +127,7 @@ async fn list_from_impl(
     }
 }
 
-/// Lists one directory level while pushing both the delimiter and offset into cloud requests.
+/// Lists one directory level, pushing the offset only for globally ordered stores.
 async fn list_paginated(
     store: Arc<dyn PaginatedListStore>,
     base_url: Url,
@@ -147,12 +152,12 @@ async fn list_paginated(
                     return Ok::<_, object_store::Error>(None);
                 };
                 let result = store
-                    .list_paginated(request_prefix.as_deref(), options)
+                    .list_paginated(request_prefix.as_deref(), options.clone())
                     .await?;
                 let next_options = result.page_token.map(|page_token| PaginatedListOptions {
-                    delimiter: Some("/".into()),
                     page_token: Some(page_token),
-                    ..Default::default()
+                    offset: None,
+                    ..options
                 });
                 Ok(Some((result.result.objects, next_options)))
             }
@@ -161,15 +166,11 @@ async fn list_paginated(
 
     let filtered_pages = pages.map_ok(move |objects| {
         let base_url = base_url.clone();
-        let prefix = prefix.clone();
         let offset = offset.clone();
         stream::iter(
             objects
                 .into_iter()
-                .filter(move |meta| {
-                    meta.location.as_ref() > offset.as_ref()
-                        && is_direct_child(&meta.location, &prefix)
-                })
+                .filter(move |meta| meta.location.as_ref() > offset.as_ref())
                 .map(move |meta| Ok::<_, object_store::Error>(file_meta(&base_url, meta))),
         )
     });
@@ -184,12 +185,6 @@ async fn list_paginated(
         items.sort_unstable();
         Ok(stream::iter(items.into_iter().map(Ok)).boxed())
     }
-}
-
-fn is_direct_child(location: &Path, prefix: &Path) -> bool {
-    location
-        .prefix_match(prefix)
-        .is_some_and(|parts| parts.count() == 1)
 }
 
 fn file_meta(base_url: &Url, meta: ObjectMeta) -> FileMeta {
@@ -387,20 +382,30 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 ///   "This page shows you how to list the [objects](https://cloud.google.com/storage/docs/objects)
 ///   stored in your Cloud Storage buckets, which are ordered in the list lexicographically by
 ///   name."
-fn supports_ordered_listing(url: &Url) -> bool {
+pub(crate) fn supports_ordered_listing(url: &Url) -> bool {
+    let path_style_bucket =
+        if url.scheme() == "https" && url.host_str().is_some_and(|host| host.starts_with("s3.")) {
+            url.path_segments().and_then(|mut segments| segments.next())
+        } else {
+            None
+        };
     !((url.scheme() == "file")
         // S3 Directory Buckets
         || url.domain().map(|d| d.contains("--x-s3")).unwrap_or(false)
         // S3 Directory Bucket Access Points
-        || url.domain().map(|d| d.contains("-xa-s3")).unwrap_or(false))
+        || url.domain().map(|d| d.contains("-xa-s3")).unwrap_or(false)
+        || path_style_bucket.is_some_and(|bucket| bucket.contains("--x-s3") || bucket.contains("-xa-s3")))
 }
 
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use delta_kernel::log_segment_files::list_delta_log_from_storage;
+    use delta_kernel::object_store::list::PaginatedListResult;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -410,6 +415,7 @@ mod tests {
     use delta_kernel::Engine as _;
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
+    use rstest::rstest;
     use test_utils::delta_path_for_version;
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -423,6 +429,9 @@ mod tests {
     struct RecordingOffsetStore {
         inner: InMemory,
         list_requests: Mutex<Vec<(Option<Path>, Path)>>,
+        upstream_pulls: Arc<AtomicUsize>,
+        pages: Vec<Vec<&'static str>>,
+        page_requests: AtomicUsize,
     }
 
     impl RecordingOffsetStore {
@@ -430,13 +439,104 @@ mod tests {
             Self {
                 inner: InMemory::new(),
                 list_requests: Mutex::new(Vec::new()),
+                upstream_pulls: Arc::new(AtomicUsize::new(0)),
+                pages: Vec::new(),
+                page_requests: AtomicUsize::new(0),
             }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PaginatedRequest {
+        prefix: Option<String>,
+        offset: Option<String>,
+        delimiter: Option<String>,
+        page_token: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct UnorderedPaginatedStore {
+        requests: Mutex<Vec<PaginatedRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PaginatedListStore for UnorderedPaginatedStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: PaginatedListOptions,
+        ) -> object_store::Result<PaginatedListResult> {
+            self.requests.lock().unwrap().push(PaginatedRequest {
+                prefix: prefix.map(ToOwned::to_owned),
+                offset: options.offset.clone(),
+                delimiter: options.delimiter.as_deref().map(ToOwned::to_owned),
+                page_token: options.page_token.clone(),
+            });
+            let (locations, page_token) = match options.page_token.as_deref() {
+                None => (
+                    vec![
+                        "table/_delta_log/00000000000000000012.json",
+                        "table/_delta_log/00000000000000000010.json",
+                        "table/_delta_log/00000000000000000009.json",
+                    ],
+                    Some("second-page".to_string()),
+                ),
+                Some("second-page") => (vec!["table/_delta_log/00000000000000000011.json"], None),
+                Some(token) => panic!("Unexpected page token: {token}"),
+            };
+            let objects = locations
+                .into_iter()
+                .map(|location| ObjectMeta {
+                    location: Path::from(location),
+                    last_modified: chrono::Utc::now(),
+                    size: 1,
+                    e_tag: None,
+                    version: None,
+                })
+                .collect();
+            Ok(PaginatedListResult {
+                result: ListResult {
+                    common_prefixes: vec![Path::from("table/_delta_log/_sidecars")],
+                    objects,
+                },
+                page_token,
+            })
         }
     }
 
     impl std::fmt::Display for RecordingOffsetStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "RecordingOffsetStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PaginatedListStore for RecordingOffsetStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: PaginatedListOptions,
+        ) -> object_store::Result<PaginatedListResult> {
+            assert_eq!(prefix, Some("_delta_log/"));
+            assert_eq!(options.delimiter.as_deref(), Some("/"));
+            assert!(options.offset.is_none());
+            self.page_requests.fetch_add(1, Ordering::Relaxed);
+            let index = options
+                .page_token
+                .as_deref()
+                .map(|token| token.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            let mut objects = Vec::new();
+            for key in &self.pages[index] {
+                objects.push(self.inner.head(&Path::from(*key)).await?);
+            }
+            Ok(PaginatedListResult {
+                result: ListResult {
+                    common_prefixes: Vec::new(),
+                    objects,
+                },
+                page_token: (index + 1 < self.pages.len()).then(|| (index + 1).to_string()),
+            })
         }
     }
 
@@ -483,7 +583,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((prefix.cloned(), offset.clone()));
-            self.inner.list_with_offset(prefix, offset)
+            let upstream_pulls = self.upstream_pulls.clone();
+            self.inner
+                .list_with_offset(prefix, offset)
+                .inspect(move |_| {
+                    upstream_pulls.fetch_add(1, Ordering::Relaxed);
+                })
+                .boxed()
         }
 
         async fn list_with_delimiter(
@@ -677,8 +783,10 @@ mod tests {
         for key in [
             "_delta_log/00000000000000000000.json",
             "_delta_log/00000000000000000001.json",
+            "_delta_log/00000000000000000001.json/child",
             "_delta_log/00000000000000000002.json",
             "_delta_log/_staged_commits/00000000000000000003.uuid.json",
+            "_delta_log/z.txt",
         ] {
             store
                 .put(&Path::from(key), Bytes::from_static(b"x").into())
@@ -696,7 +804,10 @@ mod tests {
             .map(|result| result.unwrap().location.path().to_string())
             .collect();
 
-        assert_eq!(locations, vec!["/_delta_log/00000000000000000002.json"]);
+        assert_eq!(
+            locations,
+            vec!["/_delta_log/00000000000000000002.json", "/_delta_log/z.txt"]
+        );
         assert_eq!(
             *store.list_requests.lock().unwrap(),
             vec![(
@@ -706,8 +817,131 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::without_hint(false, 1003)]
+    #[case::with_hint(true, 4)]
+    #[tokio::test]
+    async fn fallback_log_discovery_consumption_depends_on_direct_stopping_entry(
+        #[case] include_hint: bool,
+        #[case] expected_pulls: usize,
+    ) {
+        let store = Arc::new(RecordingOffsetStore::new());
+        let mut keys: Vec<_> = (0..3)
+            .map(|version| format!("_delta_log/{version:020}.json"))
+            .collect();
+        keys.extend(
+            (0..1000).map(|version| format!("_delta_log/_staged_commits/{version:020}.uuid.json")),
+        );
+        if include_hint {
+            keys.push("_delta_log/_last_checkpoint".into());
+        }
+        for key in keys {
+            store
+                .put(&Path::from(key), Bytes::from_static(b"x").into())
+                .await
+                .unwrap();
+        }
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let storage = engine.storage_handler();
+        let log_root = Url::parse("s3://bucket/_delta_log/").unwrap();
+        let versions: Vec<_> =
+            list_delta_log_from_storage(storage.as_ref(), &log_root, 0, u64::MAX, None)
+                .unwrap()
+                .map(|result| result.unwrap().version)
+                .collect();
+        assert_eq!(versions, vec![0, 1, 2]);
+        assert_eq!(store.upstream_pulls.load(Ordering::Relaxed), expected_pulls);
+        assert_eq!(store.page_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_paginated_store_sorts_across_pages_before_kernel_stops_listing() {
+        let store = Arc::new(RecordingOffsetStore {
+            pages: vec![
+                vec![
+                    "_delta_log/00000000000000000000.json",
+                    "_delta_log/_last_checkpoint",
+                ],
+                vec!["_delta_log/00000000000000000001.json"],
+            ],
+            ..RecordingOffsetStore::new()
+        });
+        for key in store.pages.iter().flatten() {
+            store
+                .put(&Path::from(*key), Bytes::from_static(b"x").into())
+                .await
+                .unwrap();
+        }
+        let engine = DefaultEngineBuilder::new(EngineStore::from_paginated(store.clone())).build();
+        let storage = engine.storage_handler();
+        let log_root = Url::parse("s3://bucket/_delta_log/").unwrap();
+        let versions: Vec<_> =
+            list_delta_log_from_storage(storage.as_ref(), &log_root, 0, u64::MAX, None)
+                .unwrap()
+                .map(|result| result.unwrap().version)
+                .collect();
+        assert_eq!(versions, vec![0, 1]);
+        assert_eq!(store.page_requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[rstest]
+    #[case::ordinary_bucket("bucket")]
+    #[case::directory_bucket("bucket--usw2-az1--x-s3")]
+    #[case::directory_bucket_access_point("access-point-usw2-az1-xa-s3")]
+    #[tokio::test]
+    async fn unordered_paginated_listing_filters_offset_and_sorts_all_pages(#[case] bucket: &str) {
+        let paginated = Arc::new(UnorderedPaginatedStore::default());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(
+            Arc::new(InMemory::new()),
+            Some(PaginatedListing {
+                store: paginated.clone(),
+                ordered: false,
+            }),
+            executor,
+        );
+        let start = Url::parse(&format!(
+            "s3://{bucket}/table/_delta_log/00000000000000000010.json"
+        ))
+        .unwrap();
+
+        let locations: Vec<_> = handler
+            .list_from(&start)
+            .unwrap()
+            .map(|result| result.unwrap().location.path().to_string())
+            .collect();
+
+        assert_eq!(
+            locations,
+            vec![
+                "/table/_delta_log/00000000000000000011.json",
+                "/table/_delta_log/00000000000000000012.json",
+            ]
+        );
+        assert_eq!(
+            *paginated.requests.lock().unwrap(),
+            vec![
+                PaginatedRequest {
+                    prefix: Some("table/_delta_log/".to_string()),
+                    offset: None,
+                    delimiter: Some("/".to_string()),
+                    page_token: None,
+                },
+                PaginatedRequest {
+                    prefix: Some("table/_delta_log/".to_string()),
+                    offset: None,
+                    delimiter: Some("/".to_string()),
+                    page_token: Some("second-page".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[rstest]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn azure_listing_pushes_directory_and_offset_and_remains_lazy() {
+    async fn azure_listing_pushes_directory_and_offset_and_remains_lazy(
+        #[values(true, false)] use_url_factory: bool,
+    ) {
         const OFFSET: &str = "table/_delta_log/00000000000000000010.json";
         const NEXT: &str = "table/_delta_log/00000000000000000011.json";
         const NEXT_PAGE: &str = "table/_delta_log/00000000000000000012.json";
@@ -727,10 +961,7 @@ mod tests {
              <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
              <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
              </Properties></Blob>\
-             <Blob><Name>table/_delta_log/_staged_commits/nested.json</Name><Properties>\
-             <Last-Modified>Thu, 01 Jul 2021 10:44:59 GMT</Last-Modified>\
-             <Content-Length>1</Content-Length><Content-Type>application/json</Content-Type>\
-             </Properties></Blob>\
+             <BlobPrefix><Name>table/_delta_log/_staged_commits/</Name></BlobPrefix>\
              </Blobs><NextMarker>page-2</NextMarker></EnumerationResults>"
         );
         Mock::given(method("GET"))
@@ -766,12 +997,24 @@ mod tests {
 
         let table_url =
             Url::parse("abfss://container@account.dfs.core.windows.net/table/").unwrap();
-        let options = vec![
-            ("endpoint", server.uri()),
-            ("allow_http", "true".to_string()),
-            ("skip_signature", "true".to_string()),
-        ];
-        let store = EngineStore::from_url_opts(&table_url, options).unwrap();
+        let store = if use_url_factory {
+            let options = vec![
+                ("endpoint", server.uri()),
+                ("allow_http", "true".to_string()),
+                ("skip_signature", "true".to_string()),
+            ];
+            EngineStore::from_url_opts(&table_url, options).unwrap()
+        } else {
+            EngineStore::from_ordered_paginated(Arc::new(
+                object_store::azure::MicrosoftAzureBuilder::new()
+                    .with_url(table_url.as_str())
+                    .with_endpoint(server.uri())
+                    .with_allow_http(true)
+                    .with_skip_signature(true)
+                    .build()
+                    .unwrap(),
+            ))
+        };
         let engine = DefaultEngineBuilder::new(store).build();
         let start = table_url
             .join("_delta_log/00000000000000000010.json")
