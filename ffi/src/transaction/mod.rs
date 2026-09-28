@@ -2292,7 +2292,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel_ffi::{
-            get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
+            get_snapshot_builder, snapshot_builder_build, snapshot_builder_with_max_catalog_version,
         };
 
         use crate::delta_kernel_unity_catalog::tests::{
@@ -2348,11 +2348,11 @@ mod tests {
             let engine = engine_handle_for_store(Arc::clone(&store));
 
             let snapshot = unsafe {
-                let mut ptr = ok_or_panic(get_snapshot_builder(
+                let ptr = ok_or_panic(get_snapshot_builder(
                     kernel_string_slice!(table_path_str),
                     engine.shallow_copy(),
                 ));
-                snapshot_builder_set_max_catalog_version(&mut ptr, 0);
+                let ptr = snapshot_builder_with_max_catalog_version(ptr, 0);
                 ok_or_panic(snapshot_builder_build(ptr))
             };
 
