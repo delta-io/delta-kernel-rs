@@ -38,7 +38,7 @@ write commit and checkpoint files.
 
 | Method | Purpose |
 |--------|---------|
-| `list_from(path)` | List files lexicographically after `path` in the same directory |
+| `list_from(path)` | List files lexicographically after `path` in the same directory, non-recursively |
 | `read_files(files)` | Read byte ranges from one or more files |
 | `copy_atomic(src, dst)` | Atomically copy a file (used for publishing commits) |
 | `put(path, data, overwrite)` | Write raw bytes to a path (fails if `overwrite` is false and file exists) |
