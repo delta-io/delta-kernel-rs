@@ -806,6 +806,7 @@ mod tests {
     #[rstest::rstest]
     #[case::without_parsed_partitions(None, false)]
     #[case::compatible_partitions(Some(schema_ref! { nullable "p": STRING }), true)]
+    // The table's partition column p is STRING, so native LONG values are incompatible.
     #[case::incompatible_partitions(Some(schema_ref! { nullable "p": LONG }), false)]
     fn metadata_plan_checkpoint_metadata_columns(
         #[case] parsed_partitions: Option<SchemaRef>,
