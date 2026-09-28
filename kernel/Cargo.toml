@@ -21,6 +21,9 @@ all-features = true
 pre-release-replacements = [
   { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
   { file = "../README.md", search = "version = \"[a-z0-9\\.-]+\"", replace = "version = \"{{version}}\"" },
+  # Keep the separate DataFusion workspace's lockfile in sync with cargo-release version bumps.
+  { file = "../datafusion-executor/Cargo.lock", search = "(name = \"delta_kernel\"\\r?\\nversion = \")[a-z0-9\\.+-]+\"", replace = "${1}{{version}}\"", exactly = 1 },
+  { file = "../datafusion-executor/Cargo.lock", search = "(name = \"delta_kernel_derive\"\\r?\\nversion = \")[a-z0-9\\.+-]+\"", replace = "${1}{{version}}\"", exactly = 1 },
 ]
 pre-release-hook = [
   "../release.sh",
