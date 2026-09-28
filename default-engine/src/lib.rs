@@ -255,7 +255,8 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     ///
     /// Passing an `Arc<S>` directly selects [`EngineStore::plain`], even when `S` is a concrete
     /// cloud store that implements paginated listing. The results still exclude nested files,
-    /// but listing may fetch their metadata before filtering it client-side.
+    /// but listing collects and sorts the recursive results. Use [`EngineStore::from_ordered`]
+    /// for a globally ordered recursive source to allow streaming and bounded early stopping.
     /// [`EngineStore::from_paginated`] avoids listing descendants but collects and sorts all pages.
     /// Use [`EngineStore::from_ordered_paginated`] for a store that guarantees global listing order
     /// to retain streaming and offset pushdown. [`EngineStore::from_url_opts`] selects this for
@@ -346,10 +347,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let EngineStore {
             object_store,
             paginated,
+            ordered,
         } = store;
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
             paginated,
+            ordered,
             task_executor.clone(),
         ));
 

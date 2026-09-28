@@ -1,9 +1,11 @@
 //! Utilities to make working with directory and file paths easier
 
+use std::cmp::Ordering;
 use std::slice;
 use std::str::FromStr;
 
 use delta_kernel_derive::internal_api;
+use percent_encoding::percent_decode_str;
 use url::Url;
 use uuid::Uuid;
 
@@ -162,6 +164,34 @@ impl AsUrl for Url {
     fn as_url(&self) -> &Url {
         self
     }
+}
+
+/// Compare `left` and `right` by their percent-decoded path bytes, ignoring other URL components.
+///
+/// Returns their lexicographic ordering without allocating decoded strings.
+#[internal_api]
+pub(crate) fn compare_listing_paths(left: &Url, right: &Url) -> Ordering {
+    percent_decode_str(left.path()).cmp(percent_decode_str(right.path()))
+}
+
+/// Validate that `end` belongs to the directory listed from `start`.
+///
+/// Query strings and fragments do not affect directory identity. Returns an error when the
+/// bounds select different directories or their parent URLs cannot be resolved.
+#[internal_api]
+pub(crate) fn validate_list_range(start: &Url, end: &Url) -> DeltaResult<()> {
+    let mut start_directory = start.join(".")?;
+    let mut end_directory = end.join(".")?;
+    start_directory.set_query(None);
+    start_directory.set_fragment(None);
+    end_directory.set_query(None);
+    end_directory.set_fragment(None);
+    if start_directory != end_directory {
+        return Err(Error::generic(
+            "Listing bounds must belong to the same directory",
+        ));
+    }
+    Ok(())
 }
 
 fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> bool {

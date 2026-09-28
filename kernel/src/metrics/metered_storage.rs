@@ -72,6 +72,21 @@ impl StorageHandler for MeteredStorageHandler {
         )))
     }
 
+    fn list_range(
+        &self,
+        start: &Url,
+        end: &Url,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        let begun = Instant::now();
+        let inner = self.inner.list_range(start, end, cancellation_token)?;
+        Ok(Box::new(MetricsIterator::<_, FileMeta>::new(
+            inner,
+            StorageListCompleted::NAME,
+            begun,
+        )))
+    }
+
     fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
         let start = Instant::now();
         let inner = self.inner.read_files(files)?;
@@ -168,6 +183,41 @@ mod tests {
         Url::parse("memory:///_delta_log/").unwrap()
     }
 
+    #[rstest::rstest]
+    #[case("0", "%5B", vec!["1"])]
+    #[case("%5B", "%5B", vec![])]
+    #[case("%5B", "0", vec![])]
+    fn default_list_range_compares_decoded_paths(
+        #[case] start: &str,
+        #[case] end: &str,
+        #[case] expected: Vec<&str>,
+    ) {
+        let storage = StubStorageHandler {
+            list_results: vec![
+                fake_file_meta("1"),
+                fake_file_meta("%5B"),
+                fake_file_meta("z"),
+            ],
+            read_results: vec![],
+        };
+        let listed: Vec<_> = storage
+            .list_range(
+                &fake_url().join(start).unwrap(),
+                &fake_url().join(end).unwrap(),
+                None,
+            )
+            .unwrap()
+            .map(|result| result.unwrap().location)
+            .collect();
+        assert_eq!(
+            listed,
+            expected
+                .into_iter()
+                .map(|name| fake_file_meta(name).location)
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn fake_file_meta(name: &str) -> FileMeta {
         FileMeta {
             location: Url::parse(&format!("memory:///_delta_log/{name}")).unwrap(),
@@ -182,8 +232,8 @@ mod tests {
         (reporter, guard)
     }
 
-    #[test]
-    fn list_from_emits_storage_list_completed() {
+    #[rstest::rstest]
+    fn listing_emits_one_storage_list_completed(#[values(false, true)] bounded: bool) {
         let (reporter, _guard) = install_capture();
         let inner: Arc<dyn StorageHandler> = Arc::new(StubStorageHandler {
             list_results: vec![
@@ -194,10 +244,26 @@ mod tests {
         });
         let storage = MeteredStorageHandler::new(inner);
 
-        let iter = storage.list_from(&fake_url()).unwrap();
+        let iter = if bounded {
+            storage.list_range(
+                &fake_url(),
+                &fake_url().join("00000000000000000001.json").unwrap(),
+                None,
+            )
+        } else {
+            storage.list_from(&fake_url())
+        }
+        .unwrap();
         let _: Vec<_> = iter.collect();
 
         let events = reporter.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, MetricEvent::StorageListCompleted(_)))
+                .count(),
+            1
+        );
         let listed = events
             .iter()
             .find(|e| matches!(e, MetricEvent::StorageListCompleted(_)))
@@ -205,7 +271,7 @@ mod tests {
         let MetricEvent::StorageListCompleted(e) = listed else {
             unreachable!();
         };
-        assert_eq!(e.num_files, 2);
+        assert_eq!(e.num_files, if bounded { 1 } else { 2 });
     }
 
     #[test]
@@ -264,9 +330,21 @@ mod tests {
     #[derive(Default)]
     struct TokenCapturingStorageHandler {
         seen: std::sync::Mutex<Option<CancellationTokenRef>>,
+        range: std::sync::Mutex<Option<(Url, Url)>>,
     }
 
     impl StorageHandler for TokenCapturingStorageHandler {
+        fn list_range(
+            &self,
+            start: &Url,
+            end: &Url,
+            cancellation_token: Option<CancellationTokenRef>,
+        ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+            *self.seen.lock().unwrap() = cancellation_token;
+            *self.range.lock().unwrap() = Some((start.clone(), end.clone()));
+            Ok(Box::new(std::iter::empty()))
+        }
+
         fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
             Ok(Box::new(std::iter::empty()))
         }
@@ -316,15 +394,23 @@ mod tests {
     // The wrapper forwards to the inner cancellation-aware methods and passes the token through by
     // identity, so a caller can still downcast it to recover what it supplied.
     #[rstest::rstest]
-    #[case::list(true)]
-    #[case::read(false)]
-    fn forwards_cancellation_token_by_identity(#[case] list: bool) {
+    #[case::list("list")]
+    #[case::range("range")]
+    #[case::read("read")]
+    fn forwards_cancellation_token_by_identity(#[case] operation: &str) {
         let stub = Arc::new(TokenCapturingStorageHandler::default());
         let storage = MeteredStorageHandler::new(stub.clone());
         let token: CancellationTokenRef =
             Arc::new(crate::unit_test_utils::TestCancellationToken::default());
 
-        if list {
+        if operation == "range" {
+            let end = fake_url().join("z").unwrap();
+            let iter = storage
+                .list_range(&fake_url(), &end, Some(token.clone()))
+                .unwrap();
+            let _: Vec<_> = iter.collect();
+            assert_eq!(*stub.range.lock().unwrap(), Some((fake_url(), end)));
+        } else if operation == "list" {
             let iter = storage
                 .list_from_with_cancellation(&fake_url(), Some(token.clone()))
                 .unwrap();

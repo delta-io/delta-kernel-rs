@@ -19,7 +19,8 @@ use url::Url;
 /// uses [`ObjectStore::list_with_offset`] and removes nested descendants client-side.
 pub struct EngineStore {
     pub(crate) object_store: Arc<DynObjectStore>,
-    pub(crate) paginated: Option<PaginatedListing>,
+    pub(crate) paginated: Option<Arc<dyn PaginatedListStore>>,
+    pub(crate) ordered: bool,
 }
 
 impl std::fmt::Debug for EngineStore {
@@ -27,6 +28,7 @@ impl std::fmt::Debug for EngineStore {
         f.debug_struct("EngineStore")
             .field("object_store", &self.object_store)
             .field("paginated", &self.paginated.is_some())
+            .field("ordered", &self.ordered)
             .finish()
     }
 }
@@ -35,7 +37,9 @@ impl EngineStore {
     /// Create a store without provider-specific paginated listing support.
     ///
     /// Offset pushdown remains available through [`ObjectStore::list_with_offset`], but stores
-    /// whose offset listing is recursive may still retrieve nested descendants.
+    /// whose offset listing is recursive may still retrieve nested descendants. Results are
+    /// collected and sorted because ordering is unknown. Use [`Self::from_ordered`] when the
+    /// source guarantees globally ordered listings.
     ///
     /// # Performance
     ///
@@ -51,6 +55,22 @@ impl EngineStore {
         Self {
             object_store,
             paginated: None,
+            ordered: false,
+        }
+    }
+
+    /// Create a recursive store whose offset listing is globally ordered by full UTF-8 path.
+    ///
+    /// `object_store.list_with_offset` must preserve this order across all pages. The result
+    /// streams direct children and can stop at a caller-supplied upper bound before filtering
+    /// descendants. Violating the ordering guarantee can silently omit files. Use
+    /// [`Self::plain`] when ordering is unknown, including S3 Express directory buckets.
+    /// Unbounded listings can still consume entire descendant subtrees.
+    pub fn from_ordered(object_store: Arc<DynObjectStore>) -> Self {
+        Self {
+            object_store,
+            paginated: None,
+            ordered: true,
         }
     }
 
@@ -66,10 +86,8 @@ impl EngineStore {
     pub fn from_paginated<S: ObjectStore + PaginatedListStore + 'static>(store: Arc<S>) -> Self {
         Self {
             object_store: store.clone(),
-            paginated: Some(PaginatedListing {
-                store,
-                ordered: false,
-            }),
+            paginated: Some(store),
+            ordered: false,
         }
     }
 
@@ -87,10 +105,8 @@ impl EngineStore {
     ) -> Self {
         Self {
             object_store: store.clone(),
-            paginated: Some(PaginatedListing {
-                store,
-                ordered: true,
-            }),
+            paginated: Some(store),
+            ordered: true,
         }
     }
 
@@ -155,13 +171,6 @@ impl<S: ObjectStore + 'static> From<Arc<S>> for EngineStore {
     fn from(object_store: Arc<S>) -> Self {
         Self::plain(object_store)
     }
-}
-
-/// Paginated listing capability, including whether results are globally ordered across pages.
-#[derive(Clone)]
-pub(crate) struct PaginatedListing {
-    pub(crate) store: Arc<dyn PaginatedListStore>,
-    pub(crate) ordered: bool,
 }
 
 /// Alias for convenience
@@ -411,6 +420,7 @@ mod tests {
     fn cloud_url_factory_preserves_listing_capabilities(#[case] url: &str, #[case] ordered: bool) {
         let url = Url::parse(url).unwrap();
         let store = EngineStore::from_url_opts(&url, HashMap::<String, String>::new()).unwrap();
-        assert_eq!(store.paginated.unwrap().ordered, ordered, "{url}");
+        assert!(store.paginated.is_some());
+        assert_eq!(store.ordered, ordered, "{url}");
     }
 }

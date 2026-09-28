@@ -58,13 +58,13 @@ pub(crate) struct LogSegmentFiles {
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
 /// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
-/// underlying listing at the first path past the version-named region, so directories like
-/// `_staged_commits/` and `_sidecars/` are never paged through.
+/// files (e.g. dot-prefixed files), and stopping at `end_version`. The upper bound lets ordered
+/// engines stop before filtering descendants past the version-named region. Engines that do not
+/// push down the bound may still page through `_staged_commits/` and `_sidecars/` internally.
 /// This also defensively tolerates a recursive storage listing by treating its first nested path
 /// past the version-named region as the end of the relevant listing.
 ///
-/// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
+/// This is a thin wrapper around [`StorageHandler::list_range`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
 ///
@@ -80,14 +80,17 @@ pub(crate) fn list_delta_log_from_storage(
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let end_before = match end_version.checked_add(1) {
+        Some(version) => log_root.join(&format!("{version:020}"))?,
+        None => log_root.join("./:")?,
+    };
     let log_root_str = log_root.to_string();
     let files = storage
-        .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
+        .list_range(&start_from, &end_before, cancellation_token.cloned())?
         // The listing is sorted by full path, so nothing relevant follows the first relative path
         // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
         // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
         // A path that doesn't strip the log_root prefix is kept; parsing discards it.
-        // TODO(#2740): push the bound into the listing request itself.
         .take_while(move |meta_res| match meta_res {
             Ok(meta) => meta
                 .location

@@ -587,6 +587,42 @@ pub trait StorageHandler: AsAny {
         self.list_from(path)
     }
 
+    /// List direct children with full paths strictly between `start` and `end`, in UTF-8 order.
+    ///
+    /// Both bounds are exclusive. `start` determines the directory as in [`Self::list_from`];
+    /// `end` must name a path in that same directory. An empty or reversed interval returns no
+    /// files. Comparisons use percent-decoded path bytes, not URL serialization. Cancellation
+    /// follows [`Self::list_from_with_cancellation`].
+    ///
+    /// The default implementation bounds an already shallow, sorted listing. Engines backed by
+    /// ordered recursive listings should apply `end` before removing descendants, so hidden
+    /// subtrees beyond the bound do not need to be exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for bounds in different directories, cancellation, or listing failures.
+    fn list_range(
+        &self,
+        start: &Url,
+        end: &Url,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        check_cancelled(cancellation_token.as_ref())?;
+        path::validate_list_range(start, end)?;
+        if path::compare_listing_paths(end, start).is_le() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let end = end.clone();
+        Ok(Box::new(
+            self.list_from_with_cancellation(start, cancellation_token)?
+                .take_while(move |result| {
+                    result.as_ref().map_or(true, |meta| {
+                        path::compare_listing_paths(&meta.location, &end).is_lt()
+                    })
+                }),
+        ))
+    }
+
     /// Read data specified by the start and end offset from the file.
     fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>>;
 
