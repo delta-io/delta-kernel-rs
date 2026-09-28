@@ -1,0 +1,43 @@
+digraph lifecycle {
+  graph [bgcolor="white", pad="0.3", nodesep="0.55", ranksep="0.55",
+         label="Native Rust memory lifecycle: baseline and final candidate\nSchematic ownership with matched p100 medians",
+         labelloc="t", fontsize="22", fontname="DejaVu Sans"];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize="14",
+        width="3.8", margin="0.18"];
+  edge [color="#52606d", penwidth="1.4", arrowsize="0.8"];
+
+  subgraph cluster_baseline {
+    label="BASELINE"; color="#9fb3c8"; style="rounded";
+    b_load [fillcolor="#eaf2fb",
+      label="Construct snapshots\nPeak 4,272.95 MB"];
+    b_idle [fillcolor="#eaf2fb",
+      label="Between calls\nRetain snapshots + engines\n4,272.76 MB"];
+    b_plan [fillcolor="#eaf2fb",
+      label="Plan 1,107 scans\n+1,865.34 MB incremental\n6,138.10 MB overall peak"];
+    b_close [fillcolor="#eaf2fb",
+      label="Close\nRust delta returns to zero"];
+    b_load -> b_idle -> b_plan -> b_close;
+  }
+
+  subgraph cluster_candidate {
+    label="FINAL CANDIDATE"; color="#88b7a4"; style="rounded";
+    c_load [fillcolor="#e5f3ec",
+      label="Construct and validate sequential snapshots\nRelease construction engine\nPeak 65.09 MB"];
+    c_idle [fillcolor="#e5f3ec",
+      label="Between calls\nJava hint + Rust SnapshotCore\n0.741 MB Rust; 0 JNR scope bytes"];
+    c_plan [fillcolor="#e5f3ec",
+      label="Plan with scoped log state + engine\n+4.30 MB incremental\nOverall peak remains 65.09 MB"];
+    c_close [fillcolor="#e5f3ec",
+      label="Close\nRust and JNR deltas return to zero"];
+    c_load -> c_idle -> c_plan -> c_close;
+  }
+
+  note [shape=note, fillcolor="#fff3d8", width="7.7",
+    label="1,107 snapshots; 475,621 fields; 16 workers; three isolated repeats.\nRust values are allocator tracked. JNR buffers are measured separately.\nThe candidate moves the fleet peak to snapshot construction."];
+  {rank=same; b_load; c_load}
+  {rank=same; b_idle; c_idle}
+  {rank=same; b_plan; c_plan}
+  {rank=same; b_close; c_close}
+  b_close -> note [style=invis];
+  c_close -> note [style=invis];
+}

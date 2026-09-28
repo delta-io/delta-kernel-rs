@@ -194,6 +194,18 @@ fn test_snapshot_hint(
     }
 }
 
+fn test_snapshot_log_state(hint: &FfiSnapshotHint) -> FfiSnapshotLogState {
+    FfiSnapshotLogState {
+        version: hint.version,
+        freshness: hint.freshness,
+        log_paths: LogPathArray {
+            ptr: hint.log_paths.ptr,
+            len: hint.log_paths.len,
+        },
+        last_checkpoint: hint.last_checkpoint,
+    }
+}
+
 #[test]
 fn externalized_core_borrows_validated_connector_state() {
     let engine = test_engine();
@@ -281,6 +293,26 @@ fn externalized_core_borrows_validated_connector_state() {
     };
     assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "differs");
     assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+
+    let validated_core =
+        unsafe { snapshot_externalize_validated_core(snapshot.shallow_copy(), 41) };
+    assert_eq!(
+        unsafe { snapshot_core_version(validated_core.shallow_copy()) },
+        0
+    );
+    let validated_schema = unsafe {
+        ok_or_panic(snapshot_core_logical_schema(
+            validated_core.shallow_copy(),
+            &hint,
+            41,
+            allocate_err,
+        ))
+    };
+    unsafe {
+        crate::free_schema(validated_schema);
+        free_snapshot_core(validated_core);
+    }
+
     let core = unsafe {
         ok_or_panic(snapshot_externalize_core(
             snapshot.shallow_copy(),
@@ -297,7 +329,7 @@ fn externalized_core_borrows_validated_connector_state() {
             core.shallow_copy(),
             &hint,
             42,
-            engine.shallow_copy(),
+            allocate_err,
         ))
     };
     unsafe { crate::free_schema(schema) };
@@ -306,7 +338,7 @@ fn externalized_core_borrows_validated_connector_state() {
             core.shallow_copy(),
             &hint,
             42,
-            engine.shallow_copy(),
+            allocate_err,
         ))
     };
     unsafe { crate::free_protocol(protocol) };
@@ -315,7 +347,7 @@ fn externalized_core_borrows_validated_connector_state() {
             core.shallow_copy(),
             &hint,
             42,
-            engine.shallow_copy(),
+            allocate_err,
         ))
     };
     unsafe { crate::free_metadata(metadata) };
@@ -323,6 +355,7 @@ fn externalized_core_borrows_validated_connector_state() {
     // Empty schemas can still be externalized and read through getters, but not scanned.
     #[cfg(feature = "declarative-plans")]
     {
+        assert!(!unsafe { snapshot_core_has_validated_metadata_plan(core.shallow_copy()) });
         let plan_engine = unsafe { plan_based_engine(&engine) };
         let rejected = unsafe {
             snapshot_core_declarative_metadata_plan(
@@ -336,9 +369,8 @@ fn externalized_core_borrows_validated_connector_state() {
         unsafe { free_engine(plan_engine) };
     }
 
-    let wrong_generation = unsafe {
-        snapshot_core_logical_schema(core.shallow_copy(), &hint, 43, engine.shallow_copy())
-    };
+    let wrong_generation =
+        unsafe { snapshot_core_logical_schema(core.shallow_copy(), &hint, 43, allocate_err) };
     assert_extern_result_error_contains(
         wrong_generation,
         KernelError::InvalidSnapshotHint,
@@ -384,6 +416,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         ))
     };
     let plan_engine = unsafe { plan_based_engine(&engine) };
+    assert!(unsafe { snapshot_core_has_validated_metadata_plan(core.shallow_copy()) });
     let inner_engine = unsafe { plan_engine.as_ref() }.engine();
     let native_snapshot = unsafe { snapshot.into_inner() };
     let native_plan = native_snapshot
@@ -398,12 +431,13 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
 
     // Fail immediately if the narrow planner asks for schema, metadata, protocol, or CRC.
     let validation = delta_kernel::scan::ValidatedMetadataScan::try_new(&native_snapshot).unwrap();
-    let host_state = BorrowedSnapshotState {
-        hint: &hint,
+    let log_state = test_snapshot_log_state(&hint);
+    let host_state = BorrowedSnapshotLogState {
+        value: &log_state,
         table_root: native_snapshot.table_root(),
     };
     let narrow_plan = validation
-        .plan(&LogOnlyState(&host_state), inner_engine.as_ref())
+        .plan(&host_state, inner_engine.as_ref())
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -411,9 +445,9 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         native_bytes
     );
     let rejected = unsafe {
-        snapshot_core_declarative_metadata_plan(
+        snapshot_core_declarative_metadata_plan_from_log_state(
             core.shallow_copy(),
-            &hint,
+            &log_state,
             43,
             plan_engine.shallow_copy(),
         )
@@ -421,9 +455,9 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
 
     let result = unsafe {
-        snapshot_core_declarative_metadata_plan(
+        snapshot_core_declarative_metadata_plan_from_log_state(
             core.shallow_copy(),
-            &hint,
+            &log_state,
             42,
             plan_engine.shallow_copy(),
         )

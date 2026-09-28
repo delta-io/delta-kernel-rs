@@ -12,7 +12,7 @@ use crate::log_path::LogPathArray;
 use crate::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
 
 mod state;
-use state::BorrowedSnapshotState;
+use state::{BorrowedSnapshotLogState, BorrowedSnapshotState};
 mod core;
 pub use core::*;
 
@@ -48,6 +48,22 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     /// Optional CRC state. Null means absent.
     pub crc: *const FfiCrc,
+}
+
+/// Borrowed snapshot components needed to resolve a transaction-log segment.
+///
+/// Unlike [`FfiSnapshotHint`], this omits protocol, metadata, schema, and CRC state. Every pointer
+/// is borrowed only for the FFI call receiving this value.
+#[repr(C)]
+pub struct FfiSnapshotLogState {
+    /// Target table version described by the log state.
+    pub version: Version,
+    /// Connector-provided freshness claim for `version`.
+    pub freshness: FfiSnapshotHintFreshness,
+    /// Complete set of log paths needed to construct the log segment.
+    pub log_paths: LogPathArray,
+    /// Optional `_last_checkpoint` state. Null means absent.
+    pub last_checkpoint: *const FfiLastCheckpoint,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
