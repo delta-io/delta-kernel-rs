@@ -880,7 +880,7 @@ impl LogSegment {
         Ok(result.actions)
     }
 
-    /// The last (newest) `checkpoint` action (the adaptiveMetadata content root) in this log
+    /// The newest `checkpoint` action (the adaptiveMetadata content root) in this log
     /// segment, or `None` if it has none.
     ///
     /// # Errors
