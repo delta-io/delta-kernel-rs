@@ -7,22 +7,25 @@ fn main() {
         println!("cargo:rustc-cfg=NIGHTLY_CHANNEL");
     }
 
-    // Generate prost bindings for the declarative-plans proto schema only when the feature is
-    // enabled. Off-by-default consumers don't pay the protoc / codegen cost and don't pull in
-    // prost-build.
-    #[cfg(feature = "declarative-plans")]
+    // Generate prost bindings only when a protobuf feature is enabled. Off-by-default consumers
+    // don't pay the protoc / codegen cost and don't pull in prost-build.
+    #[cfg(feature = "state-proto")]
     compile_proto_definitions();
 }
 
-#[cfg(feature = "declarative-plans")]
+#[cfg(feature = "state-proto")]
 fn compile_proto_definitions() {
     let proto_dir = "proto";
-    let proto_files = [
+    #[cfg(feature = "declarative-plans")]
+    let proto_files = vec![
         "schema.proto",
+        "state.proto",
         "expressions.proto",
         "plan.proto",
         "operation.proto",
     ];
+    #[cfg(not(feature = "declarative-plans"))]
+    let proto_files = vec!["schema.proto", "state.proto"];
 
     for file in &proto_files {
         println!("cargo:rerun-if-changed={proto_dir}/{file}");
@@ -45,7 +48,7 @@ fn compile_proto_definitions() {
         .expect("failed to compile .proto files");
 }
 
-#[cfg(all(feature = "declarative-plans", feature = "vendored-protoc"))]
+#[cfg(all(feature = "state-proto", feature = "vendored-protoc"))]
 fn set_vendored_protoc() {
     // Leave a caller-supplied `protoc` alone, so a pinned toolchain wins over the vendored binary.
     if std::env::var_os("PROTOC").is_none() {

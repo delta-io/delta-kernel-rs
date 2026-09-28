@@ -9,9 +9,11 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
+use delta_kernel::state_proto::{schema as proto_schema, state as proto_state};
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
+use prost::Message;
 use tracing::debug;
 use url::Url;
 
@@ -23,9 +25,9 @@ use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
-    TryFromStringSlice,
+    ExternResult, IntoExternResult, KernelBoolSlice, KernelOwnedBytes, KernelRowIndexArray,
+    KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema,
+    SharedSnapshot, TryFromStringSlice,
 };
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
@@ -414,6 +416,23 @@ pub unsafe extern "C" fn scan_table_root(
     allocate_fn(kernel_string_slice!(table_root))
 }
 
+/// Serialize a borrowed scan's table root as protobuf. The caller owns the returned buffer and
+/// must free it exactly once with [`crate::free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid scan handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_scan_table_root_as_proto(
+    scan: Handle<SharedScan>,
+) -> KernelOwnedBytes {
+    let scan = unsafe { scan.as_ref() };
+    proto_state::TableRoot {
+        uri: scan.table_root().to_string(),
+    }
+    .encode_to_vec()
+    .into()
+}
+
 /// Get the logical (i.e. output) schema of a scan.
 ///
 /// # Safety
@@ -422,6 +441,21 @@ pub unsafe extern "C" fn scan_table_root(
 pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.logical_schema().clone().into()
+}
+
+/// Serialize a borrowed scan's logical schema as protobuf. The caller owns the returned buffer and
+/// must free it exactly once with [`crate::free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid scan handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_scan_logical_schema_as_proto(
+    scan: Handle<SharedScan>,
+) -> KernelOwnedBytes {
+    let scan = unsafe { scan.as_ref() };
+    proto_schema::StructType::from(scan.logical_schema().as_ref())
+        .encode_to_vec()
+        .into()
 }
 
 /// Get the kernel view of the physical read schema that an engine should read from parquet file in
@@ -435,13 +469,51 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
     scan.physical_schema().clone().into()
 }
 
+/// Serialize a borrowed scan's physical schema as protobuf. The caller owns the returned buffer
+/// and must free it exactly once with [`crate::free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid scan handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_scan_physical_schema_as_proto(
+    scan: Handle<SharedScan>,
+) -> KernelOwnedBytes {
+    let scan = unsafe { scan.as_ref() };
+    proto_schema::StructType::from(scan.physical_schema().as_ref())
+        .encode_to_vec()
+        .into()
+}
+
+/// Serialize a borrowed scan's complete control-plane state as protobuf. The caller owns the
+/// returned buffer and must free it exactly once with [`crate::free_kernel_bytes`].
+///
+/// # Safety
+/// Caller is responsible for passing a valid scan handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_scan_state_as_proto(scan: Handle<SharedScan>) -> KernelOwnedBytes {
+    let scan = unsafe { scan.as_ref() };
+    proto_state::ScanState {
+        table_root: Some(proto_state::TableRoot {
+            uri: scan.table_root().to_string(),
+        }),
+        logical_schema: Some(proto_schema::StructType::from(
+            scan.logical_schema().as_ref(),
+        )),
+        physical_schema: Some(proto_schema::StructType::from(
+            scan.physical_schema().as_ref(),
+        )),
+    }
+    .encode_to_vec()
+    .into()
+}
+
 /// Build the declarative metadata-scan [`Plan`](delta_kernel::plans::ir::plan::Plan) for a scan and
 /// return it as proto-serialized [`Operation`](delta_kernel::Operation) bytes.
 ///
 /// On success, returns an [`OptionalValue`]:
-/// - [`OptionalValue::Some`] wraps a [`KernelOwnedBytes`](crate::KernelOwnedBytes) buffer holding
-///   the proto-serialized `delta.kernel.operation.Operation` message (a `QueryPlan`). The engine
-///   owns the buffer and must free it with [`free_kernel_bytes`](crate::free_kernel_bytes).
+/// - [`OptionalValue::Some`] wraps a [`KernelOwnedBytes`] buffer holding the proto-serialized
+///   `delta.kernel.operation.Operation` message (a `QueryPlan`). The engine owns the buffer and
+///   must free it with [`free_kernel_bytes`](crate::free_kernel_bytes).
 /// - [`OptionalValue::None`] means there is no plan to execute because the scan's predicate
 ///   statically skips all files.
 ///
@@ -1093,12 +1165,15 @@ mod scan_builder_tests {
 
     use std::ffi::c_void;
 
+    use delta_kernel::state_proto::{schema as proto_schema, state as proto_state};
+    use prost::Message;
     use test_utils::{actions_to_string, TestAction};
 
     use super::{
-        free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
-        EnginePredicate, EngineSchema,
+        free_scan, free_scan_builder, get_scan_logical_schema_as_proto,
+        get_scan_physical_schema_as_proto, get_scan_state_as_proto, get_scan_table_root_as_proto,
+        scan_builder, scan_builder_build, scan_builder_with_predicate, scan_builder_with_schema,
+        scan_logical_schema, EnginePredicate, EngineSchema,
     };
     use crate::error::KernelError;
     use crate::expressions::kernel_visitor::{
@@ -1173,6 +1248,33 @@ mod scan_builder_tests {
         let schema_ref = unsafe { schema.as_ref() };
         assert_eq!(schema_ref.fields().count(), 2);
         unsafe { free_schema(schema) };
+
+        let logical = unsafe { get_scan_logical_schema_as_proto(scan.shallow_copy()).into_vec() };
+        assert_eq!(
+            proto_schema::StructType::decode(logical.as_slice())
+                .unwrap()
+                .fields
+                .len(),
+            2
+        );
+        let physical = unsafe { get_scan_physical_schema_as_proto(scan.shallow_copy()).into_vec() };
+        assert_eq!(
+            proto_schema::StructType::decode(physical.as_slice())
+                .unwrap()
+                .fields
+                .len(),
+            2
+        );
+        let root = unsafe { get_scan_table_root_as_proto(scan.shallow_copy()).into_vec() };
+        assert!(!proto_state::TableRoot::decode(root.as_slice())
+            .unwrap()
+            .uri
+            .is_empty());
+        let state = unsafe { get_scan_state_as_proto(scan.shallow_copy()).into_vec() };
+        let state = proto_state::ScanState::decode(state.as_slice()).unwrap();
+        assert!(state.table_root.is_some());
+        assert!(state.logical_schema.is_some());
+        assert!(state.physical_schema.is_some());
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };

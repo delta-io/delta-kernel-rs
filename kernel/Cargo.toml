@@ -106,8 +106,12 @@ arrow-expression = ["need-arrow", "dep:chrono-tz"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# Protobuf transport for kernel-owned control-plane state. This is independent of declarative
+# plans so imperative connectors can use the wire format without enabling plan execution.
+state-proto = ["dep:prost", "dep:prost-build"]
+
 # Declarative plan IR (experimental).
-declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
+declarative-plans = ["internal-api", "state-proto"]
 
 # Sources a prebuilt `protoc` for the codegen `declarative-plans` runs, so the build needs no
 # system protobuf install. Leave it off to pass `protoc` through the `PROTOC` env var instead;
@@ -136,7 +140,7 @@ default-engine-base = [
 
 [build-dependencies]
 rustc_version = "0.4.1"
-# Proto codegen, only pulled in / run under the `declarative-plans` feature.
+# Proto codegen, only pulled in / run under a protobuf feature.
 prost-build = { version = "0.13", optional = true }
 # Prebuilt `protoc` for that codegen, only pulled in under the `vendored-protoc` feature.
 protoc-bin-vendored = { version = "3.2", optional = true }
