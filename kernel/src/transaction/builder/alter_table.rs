@@ -36,7 +36,7 @@ use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::PhantomType;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, KernelError};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -194,13 +194,13 @@ impl AlterTableTransactionBuilder<Modifying> {
                 .into_iter()
                 .find(|feature| table_config.is_feature_enabled(feature));
         if let Some(feature) = unsupported_iceberg_compat {
-            return Err(Error::unsupported(format!(
+            return Err(KernelError::unsupported(format!(
                 "ALTER TABLE is not yet supported on tables with {feature} enabled"
             )));
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
             ));
         }

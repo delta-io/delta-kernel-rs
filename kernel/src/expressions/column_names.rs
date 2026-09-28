@@ -7,7 +7,7 @@ use delta_kernel_derive::pub_macro;
 use derive_more::Deref;
 
 use crate::utils::CollectInto;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// A (possibly nested) column name.
 ///
@@ -268,11 +268,13 @@ fn drop_leading_whitespace(iter: &mut Peekable<impl Iterator<Item = char>>) {
 /// assert_eq!(parsed.to_string(), "a.`b.``c``.d`.e");
 /// ```
 impl std::str::FromStr for ColumnName {
-    type Err = Error;
+    type Err = KernelError;
 
     fn from_str(s: &str) -> DeltaResult<Self> {
         match parse_column_name(&mut s.chars().peekable())? {
-            (_, FieldEnding::NextColumn) => Err(Error::generic("Trailing comma in column name")),
+            (_, FieldEnding::NextColumn) => {
+                Err(KernelError::generic("Trailing comma in column name"))
+            }
             (col, _) => Ok(col),
         }
     }
@@ -322,7 +324,7 @@ fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnd
             Some(FIELD_SEPARATOR) => FieldEnding::NextField,
             Some(COLUMN_SEPARATOR) => FieldEnding::NextColumn,
             Some(other) => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Invalid character {other:?} after field {field_name:?}",
                 )))
             }
@@ -338,7 +340,7 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     let mut first = true;
     while let Some(c) = chars.next_if(|c| is_simple_char(*c)) {
         if first && c.is_ascii_digit() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Unescaped field name cannot start with a digit {c:?}"
             )));
         }
@@ -360,7 +362,7 @@ pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<Str
             Some(FIELD_ESCAPE_CHAR) if chars.next_if_eq(&FIELD_ESCAPE_CHAR).is_none() => break,
             Some(c) => name.push(c),
             None => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "No closing {FIELD_ESCAPE_CHAR:?} after field {name:?}"
                 )));
             }

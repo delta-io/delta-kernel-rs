@@ -16,7 +16,7 @@ use delta_kernel_derive::internal_api;
 
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// The state of file statistics for a CRC.
 ///
@@ -125,7 +125,7 @@ fn domain_metadata_map(
     for value in values {
         let domain = value.domain().to_string();
         if reject_tombstones && value.is_removed() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "complete CRC state contains domain-metadata tombstone for {domain}"
             )));
         }
@@ -134,7 +134,7 @@ fn domain_metadata_map(
                 entry.insert(value);
             }
             Entry::Occupied(entry) => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC state contains duplicate domain {}",
                     entry.key()
                 )));
@@ -220,7 +220,7 @@ fn transaction_map(
                 entry.insert(value);
             }
             Entry::Occupied(entry) => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC state contains duplicate transaction application id {}",
                     entry.key()
                 )));

@@ -1,7 +1,7 @@
 //! Error helpers for UC operations. Centralizes error message construction to keep validation
 //! logic concise.
 
-use delta_kernel::Error as DeltaError;
+use delta_kernel::KernelError as DeltaError;
 
 pub(crate) fn missing_feature(feature: &str) -> DeltaError {
     DeltaError::generic(format!(

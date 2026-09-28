@@ -8,7 +8,7 @@ use delta_kernel_default_engine::DefaultEngineBuilder;
 
 use super::*;
 use crate::delta_types::*;
-use crate::error::KernelError;
+use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
     allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
     ok_or_panic,
@@ -176,8 +176,8 @@ unsafe fn set_minimal_hint(builder: &mut Handle<MutableFfiSnapshotBuilder>) {
 
 #[test]
 fn invalid_crc_preserves_source() {
-    let error = invalid_crc(Error::internal_error("invalid CRC state"));
-    let Error::SnapshotHint(source) = error else {
+    let error = invalid_crc(KernelError::internal_error("invalid CRC state"));
+    let KernelError::SnapshotHint(source) = error else {
         panic!("expected SnapshotHint")
     };
     assert!(source
@@ -253,7 +253,7 @@ fn aggregate_setter_wraps_invalid_top_level_state(#[case] component: InvalidHint
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_contains(
         result,
-        KernelError::InvalidSnapshotHint,
+        FFIKernelError::InvalidSnapshotHint,
         component.expected_token(),
     );
 
@@ -292,7 +292,11 @@ fn aggregate_setter_late_failure_preserves_existing_hint() {
     );
     replacement.crc = &invalid_crc_state;
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &replacement) };
-    assert_extern_result_error_contains(result, KernelError::InvalidSnapshotHint, "supplied CRC");
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::InvalidSnapshotHint,
+        "supplied CRC",
+    );
 
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     assert!(!unsafe { snapshot.as_ref() }.is_built_as_latest());
@@ -348,7 +352,7 @@ fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_contains(
         result,
-        KernelError::InvalidSnapshotHint,
+        FFIKernelError::InvalidSnapshotHint,
         "supplied log paths",
     );
 
@@ -377,7 +381,7 @@ fn aggregate_setter_rejects_null_nonempty_log_path_array() {
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_contains(
         result,
-        KernelError::InvalidSnapshotHint,
+        FFIKernelError::InvalidSnapshotHint,
         "supplied log paths are invalid",
     );
 
@@ -405,7 +409,11 @@ fn aggregate_setter_rejects_log_compaction_paths() {
         FfiSnapshotHintFreshness::Unverified,
     );
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
-    assert_extern_result_error_contains(result, KernelError::InvalidSnapshotHint, "log compaction");
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::InvalidSnapshotHint,
+        "log compaction",
+    );
 
     unsafe {
         free_snapshot_builder(builder);
@@ -455,7 +463,7 @@ fn aggregate_setter_rejects_single_bin_histogram() {
     );
     hint.crc = &crc;
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
-    assert_extern_result_error_with_message(result, KernelError::InvalidSnapshotHint, None);
+    assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
 
     unsafe {
         free_snapshot_builder(builder);
@@ -664,7 +672,7 @@ fn aggregate_setter_validates_explicit_builder_version_at_build(
         assert_eq!(unsafe { snapshot.as_ref() }.version(), requested_version);
         unsafe { free_snapshot(snapshot) };
     } else {
-        assert_extern_result_error_with_message(result, KernelError::InvalidSnapshotHint, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
     }
     unsafe { free_engine(engine) };
 }
@@ -871,7 +879,7 @@ fn aggregate_setter_reports_unsupported_for_existing_snapshot_builder() {
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut update_builder, &hint) };
     assert_extern_result_error_contains(
         result,
-        KernelError::UnsupportedError,
+        FFIKernelError::UnsupportedError,
         "builders created by get_snapshot_builder_from",
     );
 
@@ -897,7 +905,7 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     let result = unsafe { snapshot_builder_build(update_builder) };
     assert_extern_result_error_contains(
         result,
-        KernelError::InvalidSnapshotHint,
+        FFIKernelError::InvalidSnapshotHint,
         "cannot be used with Snapshot::builder_from",
     );
 

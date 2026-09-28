@@ -12,7 +12,7 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, Error};
+use delta_kernel::{DeltaResult, Engine, KernelError};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -48,7 +48,7 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> DeltaResult<(
     let schema_stripped = strip_metadata(schema);
     let golden_stripped = strip_metadata(golden);
     if schema_stripped.fields() != golden_stripped.fields() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Schema mismatch:\nActual: {:?}\nExpected: {:?}",
             schema_stripped.fields(),
             golden_stripped.fields()
@@ -94,10 +94,10 @@ pub fn assert_data_matches(
 
     // Format both batches as strings for order-independent comparison
     let actual_str = pretty_format_batches(std::slice::from_ref(&all_data))
-        .map_err(|e| Error::generic(format!("Failed to format actual: {}", e)))?
+        .map_err(|e| KernelError::generic(format!("Failed to format actual: {}", e)))?
         .to_string();
     let expected_str = pretty_format_batches(std::slice::from_ref(&expected))
-        .map_err(|e| Error::generic(format!("Failed to format expected: {}", e)))?
+        .map_err(|e| KernelError::generic(format!("Failed to format expected: {}", e)))?
         .to_string();
 
     let mut actual_lines: Vec<&str> = actual_str.trim().lines().collect();
@@ -115,7 +115,7 @@ pub fn assert_data_matches(
 
     // Compare sorted lines
     if actual_lines != expected_lines {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Data mismatch:\nExpected:\n{}\nActual:\n{}",
             expected_lines.join("\n"),
             actual_lines.join("\n")

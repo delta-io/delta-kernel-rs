@@ -14,7 +14,7 @@ use delta_kernel::expressions::{
     UnaryPredicateOp as KernelUnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, StructType};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 
 use crate::expression::to_df_expr;
 use crate::scalar::to_df_scalar;
@@ -23,10 +23,10 @@ use crate::scalar::to_df_scalar;
 /// [`Expr`](DFExpr), checking column references against `input_schema`.
 ///
 /// # Errors
-/// Returns [`Error::unsupported`] for engine-defined (`Opaque`) or `Unknown` predicates, and for an
-/// `IN` whose right side is neither a literal array nor an array-typed column. Also propagates
-/// errors from child expressions, such as an unresolved column or an interval literal (which has
-/// no Arrow equivalent).
+/// Returns [`KernelError::unsupported`] for engine-defined (`Opaque`) or `Unknown` predicates, and
+/// for an `IN` whose right side is neither a literal array nor an array-typed column. Also
+/// propagates errors from child expressions, such as an unresolved column or an interval literal
+/// (which has no Arrow equivalent).
 pub fn to_df_predicate_expr(
     pred: &KernelPredicate,
     input_schema: &StructType,
@@ -42,10 +42,10 @@ pub fn to_df_predicate_expr(
         KernelPredicate::Junction(junction) => {
             junction_to_df_predicate_expr(junction, input_schema)
         }
-        KernelPredicate::Opaque(_) => Err(Error::unsupported(
+        KernelPredicate::Opaque(_) => Err(KernelError::unsupported(
             "cannot convert an engine-defined Opaque predicate",
         )),
-        KernelPredicate::Unknown(name) => Err(Error::unsupported(format!(
+        KernelPredicate::Unknown(name) => Err(KernelError::unsupported(format!(
             "cannot convert Unknown predicate {name:?}"
         ))),
     }
@@ -104,8 +104,8 @@ fn binary_to_df_predicate_expr(
 /// and drops the row.
 ///
 /// # Errors
-/// Returns [`Error::unsupported`] if the left operand is not a literal, or the right operand is
-/// neither a literal array nor an array-typed column.
+/// Returns [`KernelError::unsupported`] if the left operand is not a literal, or the right operand
+/// is neither a literal array nor an array-typed column.
 fn in_to_df_predicate_expr(
     value: &KernelExpression,
     list: &KernelExpression,
@@ -114,7 +114,7 @@ fn in_to_df_predicate_expr(
     // Kernel's Arrow evaluator accepts `IN` only with a literal left operand (a column left
     // operand errors), so reject anything else to match it exactly.
     let KernelExpression::Literal(_) = value else {
-        return Err(Error::unsupported(
+        return Err(KernelError::unsupported(
             "converting an IN predicate requires a literal left-hand side",
         ));
     };
@@ -123,7 +123,7 @@ fn in_to_df_predicate_expr(
         match list {
             KernelExpression::Literal(KernelScalar::Array(array)) => in_list_expr(value, array)?,
             KernelExpression::Column(name) => array_has_expr(value, list, name, input_schema)?,
-            _ => return Err(Error::unsupported(
+            _ => return Err(KernelError::unsupported(
                 "converting an IN predicate requires a literal array or an array-typed column on \
                  the right-hand side",
             )),
@@ -149,7 +149,7 @@ fn in_list_expr(value: DFExpr, array: &KernelArrayData) -> DeltaResult<DFExpr> {
 /// flipped argument order: haystack first, needle second.
 ///
 /// # Errors
-/// Returns [`Error::unsupported`] if `name` does not resolve to an array-typed column.
+/// Returns [`KernelError::unsupported`] if `name` does not resolve to an array-typed column.
 fn array_has_expr(
     value: DFExpr,
     column: &KernelExpression,
@@ -157,7 +157,7 @@ fn array_has_expr(
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
     let DataType::Array(_) = input_schema.field_at(name)?.data_type else {
-        return Err(Error::unsupported(
+        return Err(KernelError::unsupported(
             "converting an IN predicate against a column requires an array-typed column",
         ));
     };

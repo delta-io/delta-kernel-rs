@@ -12,7 +12,7 @@ use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
 use test_utils::add_commit;
 
-use crate::error::{EngineError, ExternResult, KernelError};
+use crate::error::{EngineError, ExternResult, FFIKernelError};
 #[cfg(test)]
 use crate::{
     engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
@@ -24,13 +24,13 @@ use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSli
 #[cfg(test)]
 #[repr(C)]
 pub(crate) struct EngineErrorWithMessage {
-    pub(crate) etype: KernelError,
+    pub(crate) etype: FFIKernelError,
     pub(crate) message: String,
 }
 
 #[no_mangle]
 pub(crate) extern "C" fn allocate_err(
-    etype: KernelError,
+    etype: FFIKernelError,
     message: KernelStringSlice,
 ) -> *mut EngineError {
     let message = unsafe { String::try_from_slice(&message).unwrap() };
@@ -128,7 +128,7 @@ pub(crate) async fn setup_snapshot(
 /// Check error type and message while also recovering the error to prevent leaks
 pub(crate) fn assert_extern_result_error_with_message<T>(
     res: ExternResult<T>,
-    expected_etype: KernelError,
+    expected_etype: FFIKernelError,
     opt_message: Option<&str>,
 ) {
     let error = expect_extern_result_error(res, expected_etype);
@@ -141,7 +141,7 @@ pub(crate) fn assert_extern_result_error_with_message<T>(
 /// leaks.
 pub(crate) fn assert_extern_result_error_contains<T>(
     res: ExternResult<T>,
-    expected_etype: KernelError,
+    expected_etype: FFIKernelError,
     expected_message: &str,
 ) {
     let error = expect_extern_result_error(res, expected_etype);
@@ -154,7 +154,7 @@ pub(crate) fn assert_extern_result_error_contains<T>(
 
 fn expect_extern_result_error<T>(
     res: ExternResult<T>,
-    expected_etype: KernelError,
+    expected_etype: FFIKernelError,
 ) -> EngineErrorWithMessage {
     match res {
         ExternResult::Err(e) => {
@@ -190,7 +190,7 @@ mod tests {
     fn test_ok_or_panic_with_error() {
         // Create a test error
         let message = "Test error message";
-        let error_ptr = allocate_err(KernelError::GenericError, kernel_string_slice!(message));
+        let error_ptr = allocate_err(FFIKernelError::GenericError, kernel_string_slice!(message));
         let result = ExternResult::<i32>::Err(error_ptr);
 
         // Test that ok_or_panic panics with the expected message

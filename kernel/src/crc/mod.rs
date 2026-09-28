@@ -41,9 +41,11 @@ pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
-use crate::{DeltaResult, Error, Version};
+use crate::{DeltaResult, KernelError, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -107,6 +109,10 @@ pub struct Crc {
     pub(crate) num_deletion_vectors_opt: Option<i64>,
     /// Distribution of deleted record counts across files.
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+    /// The latest manifest commit up to this version (adaptiveMetadata). Absent until the table's
+    /// first manifest commit.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit_opt: Option<LastManifestCommit>,
 }
 
 impl Crc {
@@ -130,6 +136,9 @@ impl Crc {
         num_deleted_records_opt: Option<i64>,
         num_deletion_vectors_opt: Option<i64>,
         deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+        #[cfg(feature = "adaptive-metadata-in-dev")] last_manifest_commit_opt: Option<
+            LastManifestCommit,
+        >,
     ) -> DeltaResult<Self> {
         let crc = Self {
             version,
@@ -144,6 +153,8 @@ impl Crc {
             num_deleted_records_opt,
             num_deletion_vectors_opt,
             deleted_record_counts_histogram_opt,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit_opt,
         };
         crc.validate()?;
         Ok(crc)
@@ -219,6 +230,9 @@ struct CrcRaw {
     num_deletion_vectors_opt: Option<i64>,
     #[serde(default, skip_serializing)]
     deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogramRaw>,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_manifest_commit: Option<LastManifestCommit>,
     /// The Delta protocol spec names this field `fileSizeHistogram`, but Delta-Spark writers
     /// historically emit it as `histogramOpt`. To remain compatible with CRC files written by
     /// those tools, deserialization accepts either name, but not both. If both are present
@@ -255,7 +269,7 @@ impl Crc {
             ("numProtocol", raw.num_protocol),
         ] {
             if value != 1 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
                 )));
             }
@@ -265,7 +279,7 @@ impl Crc {
             ("tableSizeBytes", raw.table_size_bytes),
         ] {
             if value < 0 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected a non-negative value, got {value}"
                 )));
             }
@@ -296,17 +310,19 @@ impl Crc {
             raw.deleted_record_counts_histogram_opt
                 .map(TryInto::try_into)
                 .transpose()?,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            raw.last_manifest_commit,
         )
     }
 }
 
 /// Fails for non-`Complete` file stats: a degraded CRC has no well-defined on-disk shape.
 impl TryFrom<&Crc> for CrcRaw {
-    type Error = Error;
+    type Error = KernelError;
     fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
         crc.validate()?;
         let FileStatsState::Complete(stats) = &crc.file_stats_state else {
-            return Err(Error::ChecksumWriteUnsupported(format!(
+            return Err(KernelError::ChecksumWriteUnsupported(format!(
                 "Cannot serialize CRC with {:?} file stats",
                 crc.file_stats_state
             )));
@@ -335,6 +351,8 @@ impl TryFrom<&Crc> for CrcRaw {
             num_deletion_vectors_opt: None,
             deleted_record_counts_histogram_opt: None,
             file_size_histogram: stats.file_size_histogram.clone(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: crc.last_manifest_commit_opt.clone(),
         })
     }
 }
@@ -382,7 +400,7 @@ impl Crc {
             ("numDeletionVectorsOpt", self.num_deletion_vectors_opt),
         ] {
             if value.is_some_and(|value| value < 0) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected a non-negative value"
                 )));
             }
@@ -394,7 +412,7 @@ impl Crc {
             .is_some_and(|value| value == "true")
             && self.in_commit_timestamp_opt.is_none()
         {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "CRC file is missing inCommitTimestampOpt for an ICT-enabled table",
             ));
         }
@@ -402,13 +420,13 @@ impl Crc {
         if let Some(files) = &self.all_files {
             let mut paths = HashSet::with_capacity(files.len());
             if let Some(add) = files.iter().find(|add| !paths.insert(add.path.as_str())) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "allFiles contains duplicate path {}",
                     add.path
                 )));
             }
             if let Some(add) = files.iter().find(|add| add.size < 0) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "allFiles contains negative file size {} for {}",
                     add.size, add.path
                 )));
@@ -430,9 +448,9 @@ impl Crc {
             }
             if let Some(files) = &self.all_files {
                 let file_count = i64::try_from(files.len())
-                    .map_err(|_| Error::generic("allFiles length exceeds i64"))?;
+                    .map_err(|_| KernelError::generic("allFiles length exceeds i64"))?;
                 if file_count != stats.num_files {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "allFiles/numFiles mismatch: {file_count} != {}",
                         stats.num_files
                     )));
@@ -440,7 +458,7 @@ impl Crc {
                 let table_size =
                     checked_sum("allFiles table size", files.iter().map(|add| add.size))?;
                 if table_size != stats.table_size_bytes {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "allFiles/tableSizeBytes mismatch: {table_size} != {}",
                         stats.table_size_bytes
                     )));
@@ -453,7 +471,7 @@ impl Crc {
                         derived.insert(add.size)?;
                     }
                     if &derived != histogram {
-                        return Err(Error::generic(
+                        return Err(KernelError::generic(
                             "allFiles/fileSizeHistogram bins do not match",
                         ));
                     }
@@ -490,7 +508,7 @@ impl Crc {
                 ),
             ] {
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "allFiles/{name} mismatch: derived {actual}"
                     )));
                 }
@@ -500,10 +518,15 @@ impl Crc {
                 .as_ref()
                 .is_some_and(|histogram| histogram != &derived.histogram)
             {
-                return Err(Error::generic(
+                return Err(KernelError::generic(
                     "allFiles/deletedRecordCountsHistogramOpt bins do not match",
                 ));
             }
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(last_manifest_commit) = &self.last_manifest_commit_opt {
+            last_manifest_commit.validate()?;
         }
         Ok(())
     }
@@ -516,7 +539,7 @@ struct DerivedDeletionStats {
 }
 
 impl TryFrom<&[Add]> for DerivedDeletionStats {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(files: &[Add]) -> DeltaResult<Self> {
         let cardinalities = || {
@@ -534,7 +557,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
                 .filter(|add| add.deletion_vector.is_some())
                 .count(),
         )
-        .map_err(|_| Error::generic("allFiles deletion-vector count exceeds i64"))?;
+        .map_err(|_| KernelError::generic("allFiles deletion-vector count exceeds i64"))?;
         Ok(Self {
             deleted_records,
             deletion_vectors,
@@ -546,7 +569,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
 fn validate_sum(name: &str, values: &[i64], expected: i64) -> DeltaResult<()> {
     let actual = checked_sum(name, values.iter().copied())?;
     if actual != expected {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "CRC {name} mismatch: expected {expected}, got {actual}"
         )));
     }
@@ -556,7 +579,7 @@ fn validate_sum(name: &str, values: &[i64], expected: i64) -> DeltaResult<()> {
 fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> DeltaResult<i64> {
     values.try_fold(0_i64, |sum, value| {
         sum.checked_add(value)
-            .ok_or_else(|| Error::generic(format!("CRC {name} overflow")))
+            .ok_or_else(|| KernelError::generic(format!("CRC {name} overflow")))
     })
 }
 
@@ -591,7 +614,7 @@ struct DeletedRecordCountsHistogramRaw {
 }
 
 impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(value: DeletedRecordCountsHistogramRaw) -> DeltaResult<Self> {
         Self::try_new(value.deleted_record_counts.into())
@@ -615,7 +638,7 @@ impl DeletedRecordCountsHistogram {
         let mut bins = vec![0; 10];
         for cardinality in cardinalities {
             if cardinality < 0 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "allFiles contains negative deletion-vector cardinality {cardinality}"
                 )));
             }
@@ -638,7 +661,7 @@ impl DeletedRecordCountsHistogram {
 
     fn validate(deleted_record_counts: &[i64]) -> DeltaResult<()> {
         if deleted_record_counts.len() != 10 {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "deleted-record-count histogram must contain exactly 10 bins, got {}",
                 deleted_record_counts.len()
             )));
@@ -649,7 +672,7 @@ impl DeletedRecordCountsHistogram {
             .enumerate()
             .find(|(_, count)| *count < 0)
         {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "deleted-record-count histogram has negative file count {count} at bin {bin}"
             )));
         }
@@ -667,6 +690,8 @@ mod tests {
         Crc, CrcRaw, DeletedRecordCountsHistogram, DomainMetadataState, FileStats, FileStatsState,
         SetTransactionState, ENABLE_IN_COMMIT_TIMESTAMPS,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::LastManifestCommit;
     use crate::actions::{Add, DomainMetadata, Protocol, SetTransaction};
     use crate::table_features::TableFeature;
 
@@ -1010,6 +1035,55 @@ mod tests {
         assert_eq!(crc, deserialized);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn round_trip_last_manifest_commit() {
+        let crc = Crc {
+            protocol: valid_protocol(),
+            file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+            last_manifest_commit_opt: Some(LastManifestCommit::new(5, 3).unwrap()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&crc).unwrap();
+        assert_eq!(json["lastManifestCommit"]["version"], 5);
+        assert_eq!(json["lastManifestCommit"]["contentRootVersion"], 3);
+
+        let deserialized = Crc::try_from_json_bytes(json.to_string().as_bytes(), 0).unwrap();
+        assert_eq!(crc, deserialized);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn de_missing_last_manifest_commit_is_none() {
+        let crc = Crc::try_from_json_bytes(crc_json_with_counts(0, 0, 1, 1).as_bytes(), 0).unwrap();
+        assert_eq!(crc.last_manifest_commit_opt, None);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn de_last_manifest_commit_content_root_newer_than_version_is_rejected() {
+        // LastManifestCommit derives Deserialize, so an invalid pair bypasses `new`'s check.
+        // Crc::validate must catch it on the deserialization path.
+        let crc = Crc {
+            protocol: valid_protocol(),
+            file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&crc).unwrap();
+        json["lastManifestCommit"] = serde_json::json!({
+            "version": 3,
+            "contentRootVersion": 5,
+        });
+
+        let err = Crc::try_from_json_bytes(json.to_string().as_bytes(), 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contentRootVersion 5 exceeds version 3"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ===== numMetadata / numProtocol rejection =====
 
     /// Minimal CRC JSON with the supplied numMetadata / numProtocol values; used to construct
@@ -1301,6 +1375,8 @@ mod tests {
             Some(all_files),
             None,
             None,
+            None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
             None,
         )
         .unwrap_err();
@@ -1612,7 +1688,7 @@ mod tests {
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();
         assert!(
-            matches!(err, crate::Error::ChecksumWriteUnsupported(_)),
+            matches!(err, crate::KernelError::ChecksumWriteUnsupported(_)),
             "expected ChecksumWriteUnsupported, got: {err:?}"
         );
     }
