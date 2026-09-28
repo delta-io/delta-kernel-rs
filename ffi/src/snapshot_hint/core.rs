@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use delta_kernel::snapshot::SnapshotState;
-use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel::snapshot::SnapshotScanState;
+use delta_kernel::{DeltaResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
+use super::state::BorrowedSnapshotScanState;
 use super::{
-    invalid, validate_handoff, BorrowedSnapshotLogState, BorrowedSnapshotState, FfiSnapshotHint,
-    FfiSnapshotLogState,
+    invalid, validate_handoff, BorrowedSnapshotState, FfiSnapshotHint, FfiSnapshotScanState,
 };
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -22,8 +22,6 @@ pub struct SnapshotCore {
     version: Version,
     latest: bool,
     generation: u64,
-    #[cfg(feature = "declarative-plans")]
-    metadata_scan: Option<delta_kernel::scan::ValidatedMetadataScan>,
 }
 
 /// Shared handle for a snapshot whose component state is held by its connector.
@@ -40,13 +38,6 @@ unsafe fn core_from_snapshot(
         version: owned.version(),
         latest: owned.is_built_as_latest(),
         generation,
-        // A snapshot can be readable through getters but unscannable (e.g. empty schema).
-        // Preserve that behavior: unsuccessful validation uses the existing fallible path.
-        #[cfg(feature = "declarative-plans")]
-        metadata_scan: delta_kernel::scan::ValidatedMetadataScan::try_new(&unsafe {
-            snapshot.clone_as_arc()
-        })
-        .ok(),
     })
 }
 
@@ -116,19 +107,6 @@ pub unsafe extern "C" fn snapshot_core_version(core: Handle<SharedSnapshotCore>)
     unsafe { core.as_ref() }.version
 }
 
-/// Whether this core can plan a metadata scan from [`FfiSnapshotLogState`].
-///
-/// # Safety
-///
-/// `core` must be a valid borrowed handle.
-#[cfg(feature = "declarative-plans")]
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_core_has_validated_metadata_plan(
-    core: Handle<SharedSnapshotCore>,
-) -> bool {
-    unsafe { core.as_ref() }.metadata_scan.is_some()
-}
-
 fn borrowed_state<'a>(
     core: &'a SnapshotCore,
     value: &'a FfiSnapshotHint,
@@ -144,25 +122,6 @@ fn borrowed_state<'a>(
     }
     Ok(BorrowedSnapshotState {
         hint: value,
-        table_root: &core.table_root,
-    })
-}
-
-fn borrowed_log_state<'a>(
-    core: &'a SnapshotCore,
-    value: &'a FfiSnapshotLogState,
-    generation: u64,
-) -> DeltaResult<BorrowedSnapshotLogState<'a>> {
-    if generation != core.generation
-        || value.version != core.version
-        || matches!(value.freshness, super::FfiSnapshotHintFreshness::Latest) != core.latest
-    {
-        return Err(invalid(
-            "host snapshot generation, version, or freshness changed",
-        ));
-    }
-    Ok(BorrowedSnapshotLogState {
-        value,
         table_root: &core.table_root,
     })
 }
@@ -239,21 +198,30 @@ pub unsafe extern "C" fn snapshot_core_get_metadata(
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan(
     core: Handle<SharedSnapshotCore>,
-    value: &FfiSnapshotHint,
+    value: &FfiSnapshotScanState,
     generation: u64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
     let core = unsafe { core.as_ref() };
     let extern_engine = unsafe { engine.as_ref() };
     let inner_engine = extern_engine.engine();
-    let result = borrowed_state(core, value, generation).and_then(|state| {
-        let plan = match &core.metadata_scan {
-            Some(validated) => validated.plan(&state, inner_engine.as_ref())?,
-            None => delta_kernel::scan::declarative_metadata_scan_plan_from_state(
-                &state,
-                inner_engine.as_ref(),
-            )?,
+    let result = (|| {
+        if generation != core.generation
+            || value.version != core.version
+            || matches!(value.freshness, super::FfiSnapshotHintFreshness::Latest) != core.latest
+        {
+            return Err(invalid(
+                "host snapshot generation, version, or freshness changed",
+            ));
+        }
+        let state = BorrowedSnapshotScanState {
+            value,
+            table_root: &core.table_root,
         };
+        let plan = delta_kernel::scan::declarative_metadata_scan_plan_from_state(
+            &state,
+            inner_engine.as_ref(),
+        )?;
         Ok(plan
             .map(|plan| {
                 delta_kernel::Operation::QueryPlan(plan)
@@ -261,42 +229,6 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan(
                     .into()
             })
             .into())
-    });
-    result.into_extern_result(&extern_engine)
-}
-
-/// Build a validated declarative scan plan from borrowed transaction-log state.
-///
-/// Callers must first check [`snapshot_core_has_validated_metadata_plan`]. The scoped value omits
-/// protocol, metadata, table schema, and CRC state because validated metadata planning cannot use
-/// them.
-///
-/// # Safety
-///
-/// Handles are borrowed. `value` and all nested storage must be valid for this call.
-#[cfg(feature = "declarative-plans")]
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_from_log_state(
-    core: Handle<SharedSnapshotCore>,
-    value: &FfiSnapshotLogState,
-    generation: u64,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
-    let core = unsafe { core.as_ref() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let inner_engine = extern_engine.engine();
-    let result = borrowed_log_state(core, value, generation).and_then(|state| {
-        let validated = core.metadata_scan.as_ref().ok_or_else(|| {
-            Error::internal_error("snapshot core does not contain a validated metadata scan")
-        })?;
-        Ok(validated
-            .plan(&state, inner_engine.as_ref())?
-            .map(|plan| {
-                delta_kernel::Operation::QueryPlan(plan)
-                    .to_proto_bytes()
-                    .into()
-            })
-            .into())
-    });
+    })();
     result.into_extern_result(&extern_engine)
 }

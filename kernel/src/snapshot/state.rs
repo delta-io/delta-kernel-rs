@@ -21,30 +21,7 @@ use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, Snapshot, Version};
 
-/// Immutable components of a snapshot, independently backed by Rust or a connector.
-///
-/// Implementations must return the same state for every call. In particular, the version,
-/// protocol, metadata, schema, and log paths must describe one validated snapshot generation.
-pub trait SnapshotState {
-    fn table_root(&self) -> &Url;
-    fn version(&self) -> Version;
-    fn is_latest(&self) -> bool;
-    fn protocol(&self) -> DeltaResult<Protocol>;
-    fn metadata(&self) -> DeltaResult<Metadata>;
-    fn logical_schema(&self) -> DeltaResult<SchemaRef>;
-    fn last_checkpoint(&self) -> DeltaResult<Option<LastCheckpointHint>>;
-    fn crc(&self) -> DeltaResult<Option<Arc<Crc>>>;
-    fn visit_log_paths(
-        &self,
-        visitor: &mut dyn FnMut(&[LogPath]) -> DeltaResult<()>,
-    ) -> DeltaResult<()>;
-}
-
-/// Immutable snapshot inputs needed to resolve its transaction-log segment.
-///
-/// This narrower capability lets connectors supply planning state without materializing protocol,
-/// metadata, CRC, or table schemas. Implementations must describe the same immutable generation
-/// for every call.
+/// Immutable transaction-log identity and paths needed to reconstruct a log segment.
 pub trait SnapshotLogState {
     fn table_root(&self) -> &Url;
     fn version(&self) -> Version;
@@ -56,32 +33,22 @@ pub trait SnapshotLogState {
     ) -> DeltaResult<()>;
 }
 
-impl<T: SnapshotState + ?Sized> SnapshotLogState for T {
-    fn table_root(&self) -> &Url {
-        SnapshotState::table_root(self)
-    }
-
-    fn version(&self) -> Version {
-        SnapshotState::version(self)
-    }
-
-    fn is_latest(&self) -> bool {
-        SnapshotState::is_latest(self)
-    }
-
-    fn last_checkpoint(&self) -> DeltaResult<Option<LastCheckpointHint>> {
-        SnapshotState::last_checkpoint(self)
-    }
-
-    fn visit_log_paths(
-        &self,
-        visitor: &mut dyn FnMut(&[LogPath]) -> DeltaResult<()>,
-    ) -> DeltaResult<()> {
-        SnapshotState::visit_log_paths(self, visitor)
-    }
+/// Snapshot components needed to validate and plan a scan.
+pub trait SnapshotScanState: SnapshotLogState {
+    fn protocol(&self) -> DeltaResult<Protocol>;
+    fn metadata(&self) -> DeltaResult<Metadata>;
+    fn logical_schema(&self) -> DeltaResult<SchemaRef>;
 }
 
-impl SnapshotState for Snapshot {
+/// Complete immutable snapshot state, including state not read by scan planning.
+///
+/// Implementations must return the same state for every call. In particular, the version,
+/// protocol, metadata, schema, CRC, and log paths must describe one validated generation.
+pub trait SnapshotState: SnapshotScanState {
+    fn crc(&self) -> DeltaResult<Option<Arc<Crc>>>;
+}
+
+impl SnapshotLogState for Snapshot {
     fn table_root(&self) -> &Url {
         self.table_root()
     }
@@ -94,24 +61,8 @@ impl SnapshotState for Snapshot {
         self.is_built_as_latest()
     }
 
-    fn protocol(&self) -> DeltaResult<Protocol> {
-        Ok(self.table_configuration().protocol().clone())
-    }
-
-    fn metadata(&self) -> DeltaResult<Metadata> {
-        Ok(self.table_configuration().metadata().clone())
-    }
-
-    fn logical_schema(&self) -> DeltaResult<SchemaRef> {
-        Ok(self.schema())
-    }
-
     fn last_checkpoint(&self) -> DeltaResult<Option<LastCheckpointHint>> {
         Ok(self.log_segment().last_checkpoint_metadata.clone())
-    }
-
-    fn crc(&self) -> DeltaResult<Option<Arc<Crc>>> {
-        Ok(self.base_crc().cloned())
     }
 
     fn visit_log_paths(
@@ -130,6 +81,26 @@ impl SnapshotState for Snapshot {
             visitor(&batch)?;
         }
         Ok(())
+    }
+}
+
+impl SnapshotScanState for Snapshot {
+    fn protocol(&self) -> DeltaResult<Protocol> {
+        Ok(self.table_configuration().protocol().clone())
+    }
+
+    fn metadata(&self) -> DeltaResult<Metadata> {
+        Ok(self.table_configuration().metadata().clone())
+    }
+
+    fn logical_schema(&self) -> DeltaResult<SchemaRef> {
+        Ok(self.schema())
+    }
+}
+
+impl SnapshotState for Snapshot {
+    fn crc(&self) -> DeltaResult<Option<Arc<Crc>>> {
+        Ok(self.base_crc().cloned())
     }
 }
 
@@ -159,8 +130,8 @@ impl Snapshot {
 }
 
 /// Resolve borrowed log paths into the segment needed by scan planning and handoff validation.
-pub(crate) fn log_segment_from_state<S: SnapshotLogState + ?Sized>(
-    state: &S,
+pub(crate) fn log_segment_from_state(
+    state: &(impl SnapshotLogState + ?Sized),
 ) -> DeltaResult<LogSegment> {
     let mut paths: Vec<ParsedLogPath> = Vec::new();
     state.visit_log_paths(&mut |batch| {
