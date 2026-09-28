@@ -332,6 +332,9 @@ impl ScanBuilder {
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should
     /// have been filtered out but were kept).
     ///
+    /// String predicates use binary UTF-8 semantics. Predicates that require collation semantics
+    /// must be evaluated outside Kernel.
+    ///
     /// NOTE: Predicates referencing metadata columns the caller added to the projection via
     /// [`StructType::add_metadata_column`] (row indexes, row ids, row commit versions, file paths)
     /// are not supported and will error at build time.

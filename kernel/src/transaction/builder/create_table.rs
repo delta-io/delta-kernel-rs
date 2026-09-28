@@ -20,8 +20,8 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
-    StructType,
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields,
+    schema_has_collations, DataType, SchemaRef, StructType,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -87,6 +87,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // create time is the explicit feature signal
     // `delta.feature.materializePartitionColumns=supported`.
     TableFeature::MaterializePartitionColumns,
+    TableFeature::Collations,
+    TableFeature::CollationsPreview,
     // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
     // Dependent features (ColumnMapping) are auto-added during create table.
     TableFeature::IcebergCompatV2,
@@ -391,6 +393,32 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
             &mut validated.writer_features,
         );
     }
+}
+
+/// Adds the stable collation feature when a schema carries collation metadata.
+fn maybe_enable_collations(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if !schema_has_collations(schema) {
+        return;
+    }
+
+    let has_collations = validated
+        .writer_features
+        .contains(&TableFeature::Collations)
+        || validated
+            .writer_features
+            .contains(&TableFeature::CollationsPreview);
+    if !has_collations {
+        add_feature_to_lists(
+            TableFeature::Collations,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+    add_feature_to_lists(
+        TableFeature::DomainMetadata,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
 }
 
 /// Conditionally adds the `invariants` writer feature to the protocol when the schema contains
@@ -750,8 +778,11 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // RowTracking requires DomainMetadata as a dependency
-        if feature == TableFeature::RowTracking {
+        // These writer features require DomainMetadata as a dependency.
+        if matches!(
+            feature,
+            TableFeature::RowTracking | TableFeature::Collations | TableFeature::CollationsPreview
+        ) {
             add_feature_to_lists(
                 TableFeature::DomainMetadata,
                 &mut reader_features,
@@ -1011,6 +1042,7 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_collations(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties

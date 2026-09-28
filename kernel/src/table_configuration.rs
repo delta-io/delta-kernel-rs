@@ -24,7 +24,8 @@ use crate::scan::data_skipping::stats_schema::{
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    schema_has_collations, schema_has_invariants, validate_column_defaults_metadata, SchemaRef,
+    StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -237,6 +238,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_collations_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column) and retain whether the validated schema declares any column
         // defaults.
@@ -950,6 +952,22 @@ impl TableConfiguration {
     }
 }
 
+fn validate_collations_feature_support(table_config: &TableConfiguration) -> DeltaResult<()> {
+    let protocol = table_config.protocol();
+    if !protocol.has_table_feature(&TableFeature::Collations)
+        && !protocol.has_table_feature(&TableFeature::CollationsPreview)
+    {
+        require!(
+            !schema_has_collations(table_config.logical_schema.as_ref()),
+            Error::unsupported(
+                "Table contains collation metadata but requires the 'collations' or \
+                 'collations-preview' table feature"
+            )
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
 
@@ -979,6 +997,27 @@ mod test {
         MockTableConfigurationBuilder,
     };
     use crate::Error;
+
+    #[rstest]
+    #[case::stable(TableFeature::Collations)]
+    #[case::preview(TableFeature::CollationsPreview)]
+    fn collations_require_domain_metadata_for_writes(#[case] feature: TableFeature) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([feature])
+                    .build(),
+            )
+            .build();
+
+        assert_result_error_with_message(
+            table_config.ensure_operation_supported(Operation::Write),
+            "domainMetadata",
+        );
+        table_config
+            .ensure_operation_supported(Operation::Scan)
+            .unwrap();
+    }
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
