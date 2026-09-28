@@ -9,7 +9,7 @@
 //! 1. In-memory transaction data via [`FileStatsDelta::try_compute_for_txn`]
 //! 2. A parsed .json commit file
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use delta_kernel_derive::internal_api;
 
@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, RowVisitor};
+use crate::{DeltaResult, EngineData, Error, RowVisitor, Version};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -88,6 +88,69 @@ impl FileStats {
     pub fn file_size_histogram(&self) -> Option<&FileSizeHistogram> {
         self.file_size_histogram.as_ref()
     }
+
+    /// Adds a live file to the scalar totals without computing a histogram.
+    pub(crate) fn add_file(&mut self, size: i64) -> DeltaResult<()> {
+        require!(
+            size >= 0,
+            Error::generic("Negative Add size during log replay")
+        );
+        self.num_files = self
+            .num_files
+            .checked_add(1)
+            .ok_or_else(|| Error::generic("File count exceeds i64"))?;
+        self.table_size_bytes = self
+            .table_size_bytes
+            .checked_add(size)
+            .ok_or_else(|| Error::generic("Table size exceeds i64"))?;
+        Ok(())
+    }
+}
+
+/// Compares scalar totals only after successful exhaustion. Input errors and early drops do not
+/// validate partial totals.
+pub(crate) fn validate_file_stats<T>(
+    input: impl Iterator<Item = DeltaResult<T>>,
+    mut expected: Option<FileStats>,
+    actual: Arc<Mutex<FileStats>>,
+    version: Version,
+) -> impl Iterator<Item = DeltaResult<T>> {
+    let mut input = input.fuse();
+    std::iter::from_fn(move || match input.next() {
+        Some(Err(error)) => {
+            expected = None;
+            Some(Err(error))
+        }
+        Some(batch) => Some(batch),
+        None => {
+            let expected = expected.take()?;
+            let compare = || -> DeltaResult<()> {
+                let actual = actual.lock().map_err(|e| {
+                    Error::internal_error(format!("File statistics lock poisoned: {e}"))
+                })?;
+                for (field, expected, actual) in [
+                    ("numFiles", expected.num_files, actual.num_files),
+                    (
+                        "tableSizeBytes",
+                        expected.table_size_bytes,
+                        actual.table_size_bytes,
+                    ),
+                ] {
+                    require!(
+                        expected == actual,
+                        Error::ChecksumMismatch {
+                            version,
+                            field,
+                            expected,
+                            actual,
+                        }
+                    );
+                }
+                Ok(())
+            };
+            compare().err().map(Err)
+        }
+    })
 }
 
 /// Gross file-change totals from a single commit, plus an optional net file-size histogram.
@@ -285,10 +348,82 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::{generate_batch, IntoArray};
+    use test_utils::{assert_result_error_with_message, generate_batch, IntoArray};
 
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
+
+    #[rstest]
+    #[case::negative(0, 0, -1, "Negative Add size")]
+    #[case::file_overflow(i64::MAX, 0, 0, "File count exceeds")]
+    #[case::size_overflow(1, i64::MAX, 1, "Table size exceeds")]
+    fn replay_totals_reject_invalid_sizes_and_overflow(
+        #[case] num_files: i64,
+        #[case] table_size_bytes: i64,
+        #[case] size: i64,
+        #[case] error: &str,
+    ) {
+        let mut stats = FileStats {
+            num_files,
+            table_size_bytes,
+            ..Default::default()
+        };
+        assert_result_error_with_message(stats.add_file(size), error);
+    }
+
+    #[test]
+    fn replay_validation_waits_for_exhaustion_and_compares_once() {
+        let actual = Arc::new(Mutex::new(FileStats::default()));
+        let expected = FileStats {
+            num_files: 1,
+            table_size_bytes: 10,
+            ..Default::default()
+        };
+        let mut iter = validate_file_stats(
+            [Ok(()), Ok(())].into_iter(),
+            Some(expected),
+            actual.clone(),
+            7,
+        );
+        assert!(iter.next().unwrap().is_ok());
+        actual.lock().unwrap().add_file(9).unwrap();
+        assert!(iter.next().unwrap().is_ok());
+        assert!(matches!(
+            iter.next().unwrap(),
+            Err(Error::ChecksumMismatch {
+                version: 7,
+                field: "tableSizeBytes",
+                expected: 10,
+                actual: 9,
+            })
+        ));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn replay_validation_does_not_compare_on_input_error_or_drop() {
+        let actual = Arc::new(Mutex::new(FileStats::default()));
+        let expected = FileStats {
+            num_files: 1,
+            ..Default::default()
+        };
+        let mut iter = validate_file_stats(
+            [Ok(())].into_iter(),
+            Some(expected.clone()),
+            actual.clone(),
+            0,
+        );
+        assert!(iter.next().unwrap().is_ok());
+        drop(iter);
+        let mut iter = validate_file_stats(
+            [Err::<(), _>(Error::generic("read failed"))].into_iter(),
+            Some(expected),
+            actual,
+            0,
+        );
+        assert_result_error_with_message(iter.next().unwrap(), "read failed");
+        assert!(iter.next().is_none());
+    }
 
     fn size_batch(sizes: Vec<i64>) -> Box<dyn EngineData> {
         let batch = generate_batch(vec![("size", sizes.into_arrow_array())]).unwrap();

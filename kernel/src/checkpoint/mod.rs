@@ -114,6 +114,7 @@ use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
     REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
+use crate::crc::validate_file_stats;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar, StructData};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -439,6 +440,10 @@ impl CheckpointWriter {
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
     /// shared state for building a [`LastCheckpointHintStats`] after the iterator is exhausted.
     ///
+    /// Compares the file count and table size with the snapshot's cached CRC, if available, after
+    /// reconciliation finishes. A mismatch yields [`Error::ChecksumMismatch`]. The writer must
+    /// abort on iterator errors and must not finalize the checkpoint.
+    ///
     /// # Engine Usage
     ///
     /// ```ignore
@@ -472,11 +477,17 @@ impl CheckpointWriter {
             .read_actions(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
-        let checkpoint_data = ActionReconciliationProcessor::new(
+        let processor = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
-        )
-        .process_actions_iter(actions);
+        );
+        let file_stats = processor.file_stats();
+        let checkpoint_data = validate_file_stats(
+            processor.process_actions_iter(actions),
+            self.snapshot.get_file_stats_if_present(),
+            file_stats,
+            self.snapshot.version(),
+        );
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).

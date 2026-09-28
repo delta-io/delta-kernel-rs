@@ -1,6 +1,6 @@
 use std::clone::Clone;
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::crc::{size_to_u64, FileStats};
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
@@ -158,6 +159,7 @@ pub struct SerializableScanState {
 /// to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
+    file_stats: Arc<Mutex<FileStats>>,
     data_skipping_filter: Option<DataSkippingFilter>,
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
@@ -312,6 +314,7 @@ impl ScanLogReplayProcessor {
         };
 
         Ok(Self {
+            file_stats: Arc::default(),
             data_skipping_filter,
             // Commit transform: parse JSON for stats, MapToStruct for partition values
             commit_transform: engine.evaluation_handler().new_expression_evaluator(
@@ -563,9 +566,17 @@ impl ScanLogReplayProcessor {
                 active_add_file_sizes.len()
             ))
         );
+        let mut file_stats = self
+            .file_stats
+            .lock()
+            .map_err(|e| Error::internal_error(format!("File statistics lock poisoned: {e}")))?;
         for (selected, size) in selection_vector.iter().zip(active_add_file_sizes) {
             if *selected {
                 self.metrics.record_selected_add_file(*size);
+                file_stats.add_file(
+                    i64::try_from(*size)
+                        .map_err(|e| Error::generic(format!("Add size exceeds i64: {e}")))?,
+                )?;
             }
         }
         Ok(())
@@ -702,6 +713,11 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                 self.row_transform_exprs.resize_with(row, Default::default);
                 self.row_transform_exprs.push(patch_expr);
             }
+        }
+        // The deduplicator substitutes zero for invalid sizes; CRC totals must not use that
+        // fallback.
+        if size == 0 {
+            size_to_u64(getters[ScanLogReplayProcessor::ADD_SIZE_INDEX].get(row, "add.size")?)?;
         }
         self.active_add_file_sizes[row] = size;
         Ok(true)
@@ -1156,6 +1172,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 ///
 /// Each row that is selected in the returned `engine_data` _must_ be processed to complete the
 /// scan. Non-selected rows _must_ be ignored.
+/// `file_stats` collects live-file totals, complete only after successful exhaustion.
 ///
 /// When `stats_options.skip_stats` is true, file statistics are not read from checkpoint parquet
 /// files and columnar data skipping is disabled (no stats-based or partition-value-based
@@ -1170,11 +1187,12 @@ pub(crate) fn scan_action_iter(
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
+    file_stats: Arc<Mutex<FileStats>>,
 ) -> DeltaResult<(
     impl Iterator<Item = DeltaResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor = ScanLogReplayProcessor::new(
+    let mut processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
         checkpoint_info,
@@ -1182,6 +1200,7 @@ pub(crate) fn scan_action_iter(
         partition_values_options,
     )?;
     let metrics = processor.metrics.clone();
+    processor.file_stats = file_stats;
     Ok((processor.process_actions_iter(action_iter), metrics))
 }
 
@@ -1396,6 +1415,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            Arc::default(),
         )
         .unwrap();
         for res in iter {
@@ -1425,6 +1445,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            Arc::default(),
         )
         .unwrap();
 
@@ -1508,6 +1529,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            Arc::default(),
         )
         .unwrap();
 
@@ -1571,6 +1593,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            Arc::default(),
         )?;
 
         let mut iter = iter.peekable();
@@ -2027,6 +2050,7 @@ mod tests {
                 ..Default::default()
             },
             ScanPartitionValuesOptions::default(),
+            Arc::default(),
         )
         .unwrap();
 
@@ -2110,6 +2134,7 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
+            Arc::default(),
         )
         .unwrap();
 

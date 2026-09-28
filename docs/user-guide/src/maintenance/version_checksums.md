@@ -59,6 +59,23 @@ publishing) so that downstream code sees the CRC file.
 > `write_checksum()` on the snapshot returned by
 > `CommittedTransaction::post_commit_snapshot()`.
 
+## Validating file totals
+
+Call `snapshot.validate_crc(&engine)?` to compare `numFiles` and `tableSizeBytes`
+with a complete metadata scan. It doesn't read table data or compare other CRC
+fields, including histograms. It returns `Ok(())` without replay if the snapshot
+has no cached CRC with complete file totals at its version.
+
+Predicate-free `scan_metadata()` and checkpoint writing also compare these
+totals after replay finishes. Column projection doesn't disable validation.
+A mismatch returns `Error::ChecksumMismatch`. You must consume the full
+iterator to complete validation; early drops and input errors don't validate
+partial totals. A checkpoint writer must abort on any iterator error without
+finalizing the checkpoint. Failed V2 writes can leave unreferenced sidecars.
+
+CRC deserialization checks internal consistency separately. Parallel and declarative
+metadata scans don't perform this comparison automatically.
+
 ## Recommended post-commit pattern
 
 After every commit, write the checksum first, then decide whether to

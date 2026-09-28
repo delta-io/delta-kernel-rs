@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
@@ -19,6 +19,7 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::crc::{validate_file_stats, FileStats};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -445,6 +446,7 @@ impl ScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
+        let validate_crc = self.predicate.is_none();
         let mut state_info = StateInfo::try_new(
             logical_read_schema,
             table_schema,
@@ -478,6 +480,7 @@ impl ScanBuilder {
 
         Ok(Scan {
             snapshot: self.snapshot,
+            validate_crc,
             state_info: Arc::new(state_info),
             stats: self.stats,
             physical_stats_output_schema,
@@ -733,6 +736,7 @@ impl HasSelectionVector for ScanMetadata {
 /// scanning the table.
 pub struct Scan {
     snapshot: SnapshotRef,
+    validate_crc: bool,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     #[allow(dead_code)] // Only used when `declarative-plans` is enabled
@@ -889,6 +893,10 @@ impl Scan {
     ///
     /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
     /// fully exhausted.
+    ///
+    /// When no predicate was supplied, compares `numFiles` and `tableSizeBytes` with the cached
+    /// CRC at this snapshot's version, if available. A mismatch yields [`Error::ChecksumMismatch`]
+    /// after replay is exhausted. Dropping the iterator early does not complete validation.
     ///
     /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
     ///
@@ -1088,6 +1096,7 @@ impl Scan {
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
         let correlation_id = self.correlation_id.clone();
 
+        let file_stats = Arc::new(Mutex::new(FileStats::default()));
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
                 info!("Predicate statically evaluated to false; skipping all files");
@@ -1101,6 +1110,7 @@ impl Scan {
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
                     self.partition_values_options(),
+                    file_stats.clone(),
                 )?;
                 (Some(it), m)
             }
@@ -1117,7 +1127,17 @@ impl Scan {
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
-        Ok(iter.into_iter().flatten().on_complete(on_complete))
+        let expected = self
+            .validate_crc
+            .then(|| self.snapshot.get_file_stats_if_present())
+            .flatten();
+        Ok(validate_file_stats(
+            iter.into_iter().flatten(),
+            expected,
+            file_stats,
+            self.snapshot.version(),
+        )
+        .on_complete(on_complete))
     }
 
     #[cfg(feature = "declarative-plans")]

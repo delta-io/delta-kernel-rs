@@ -50,6 +50,11 @@ protocol/metadata provenance, `max_published_version`, and freshness.
 From a snapshot you can: read the schema and table properties, build a `Scan` to read data,
 start a `Transaction` to write data, or create a checkpoint.
 
+`Snapshot::validate_crc` exhausts a predicate-free metadata scan to check `numFiles` and
+`tableSizeBytes`. Predicate-free scans and checkpoint writes compare these totals at replay
+exhaustion. Both replay processors collect the totals in `Arc<Mutex<FileStats>>`; comparison
+logic lives in `kernel/src/crc/file_stats.rs`.
+
 ## Read Path
 
 `Snapshot` -> `ScanBuilder` -> `Scan` -> data
