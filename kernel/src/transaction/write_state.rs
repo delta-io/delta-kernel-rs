@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -100,7 +101,8 @@ impl BoundWriteContextBuilder {
     ///
     /// Values are validated and serialized according to the Delta protocol when
     /// [`build`](Self::build) is called, then keyed by physical column name in the returned
-    /// context. Null-equivalent values require nullable partition columns.
+    /// context. A null scalar, empty string, or empty binary value requires a nullable partition
+    /// column.
     ///
     /// Names are matched case-insensitively and normalized to schema case. The map must contain
     /// every partition column and no other keys.
@@ -113,8 +115,11 @@ impl BoundWriteContextBuilder {
     ///
     /// Names must exactly match the physical names of every partition column, with no other keys.
     /// Physical names are case-sensitive. Values are validated against the logical schema when
-    /// [`build`](Self::build) is called. Null-equivalent values require nullable partition columns.
-    pub fn with_physical_partition_values(
+    /// [`build`](Self::build) is called. A null scalar, empty string, or empty binary value
+    /// requires a nullable partition column.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn with_physical_partition_values(
         mut self,
         partition_values: HashMap<String, Scalar>,
     ) -> Self {
