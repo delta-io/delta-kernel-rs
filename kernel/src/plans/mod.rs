@@ -111,12 +111,14 @@ pub trait PlanExecutor: AsAny {
 pub trait ScopedPlanExecutor: PlanExecutor {
     /// Executes `plan` and retains its terminal relation in the engine, returning a handle that
     /// can be used as a [`RelationSource`](ir::nodes::Operator::RelationSource) in another plan.
-    /// The handle is valid until this scoped executor is dropped.
+    /// `name` is a debug-only identifier that an executor may embed in the resulting
+    /// [`RelationId`] to identify its source. The handle is valid until this scoped executor is
+    /// dropped.
     ///
     /// # Errors
     ///
     /// Returns an error if the plan cannot be executed or its result cannot be retained.
-    fn execute_and_retain(&self, plan: Plan) -> Result<RelationRef>;
+    fn execute_and_retain(&self, name: &str, plan: Plan) -> Result<RelationRef>;
 }
 
 /// The result of executing an [`Operation`].

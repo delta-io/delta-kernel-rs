@@ -60,9 +60,10 @@ pub type RelationId = String;
 /// [`PlanExecutor`](crate::plans::PlanExecutor). See [`Operator::RelationSource`].
 ///
 /// Kernel holds only the [`RelationId`] and the relation's output schema; the rows themselves are
-/// never materialized into kernel. A handle is produced by
-/// [`ScopedPlanExecutor::execute_and_retain`](crate::plans::ScopedPlanExecutor::execute_and_retain)
-/// and read back by an [`Operator::RelationSource`] node while the scoped executor lives.
+/// never materialized into kernel. An executor can produce a handle when it retains a relation,
+/// including through
+/// [`ScopedPlanExecutor::execute_and_retain`](crate::plans::ScopedPlanExecutor::execute_and_retain).
+/// An [`Operator::RelationSource`] node reads it while the executor retains it.
 #[derive(Debug, Clone)]
 pub struct RelationRef {
     id: RelationId,

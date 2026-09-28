@@ -262,7 +262,7 @@ impl PlanBuilder {
     ///     StructField::not_null("id", DataType::INTEGER),
     /// ])?);
     /// let source = PlanBuilder::values(schema, vec![vec![1i32.into()]])?.build()?;
-    /// let relation_ref = scoped.execute_and_retain(source)?;
+    /// let relation_ref = scoped.execute_and_retain("example", source)?;
     /// let plan = PlanBuilder::relation_source(relation_ref)
     ///     .filter(col!("id").is_not_null())?
     ///     .build()?;
@@ -586,6 +586,7 @@ impl PlanBuilder {
         Ok(match &self.0 {
             PlanBuilderRoot::Present(root) => Self::build_plan(root),
             PlanBuilderRoot::Absent(schema) => Plan {
+                schema: Arc::clone(schema),
                 nodes: vec![PlanNode::new(
                     Values::new(Arc::clone(schema), vec![]),
                     vec![],
@@ -626,7 +627,10 @@ impl PlanBuilder {
         }
         let mut nodes = Vec::new();
         emit(root, &mut nodes, &mut HashMap::new());
-        Plan { nodes }
+        Plan {
+            schema: Arc::clone(&root.schema),
+            nodes,
+        }
     }
 }
 
@@ -743,6 +747,7 @@ mod tests {
     /// inspection.
     fn assert_plan(builder: PlanBuilder, expected: &[(&[usize], &str)]) -> Plan {
         let plan = builder.build().unwrap();
+        assert_eq!(&plan.schema, builder.schema(), "output schema");
         assert_eq!(plan.nodes.len(), expected.len(), "node count");
         for (i, (node, &(inputs, op))) in plan.nodes.iter().zip(expected).enumerate() {
             assert_eq!(node.inputs.as_slice(), inputs, "node {i} inputs");

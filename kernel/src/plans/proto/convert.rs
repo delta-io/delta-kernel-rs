@@ -124,6 +124,8 @@ impl From<&FileMeta> for proto_plan::FileMeta {
 
 impl From<&Plan> for proto_plan::Plan {
     fn from(plan: &Plan) -> Self {
+        // The plan's output schema is lost when converting to proto. It can be
+        // reconstructed by traversing the nodes.
         proto_plan::Plan {
             nodes: convert_vec(&plan.nodes),
         }
@@ -1126,7 +1128,7 @@ mod tests {
         Operation::IoOperation(IoOperation::head_file(Url::parse("memory:///h").unwrap())),
         "io"
     )]
-    #[case(Operation::QueryPlan(Plan { nodes: vec![] }), "query_plan")]
+    #[case(Operation::QueryPlan(Plan { schema: sample_schema(), nodes: vec![] }), "query_plan")]
     fn from_operation(#[case] op: Operation, #[case] expected: &str) {
         use proto_op::operation::Op;
         let kind = match decode(&op).op.unwrap() {
@@ -1243,6 +1245,7 @@ mod tests {
             not_null "name": STRING,
         };
         let plan = Plan {
+            schema: schema.clone(),
             nodes: vec![
                 PlanNode {
                     op: Operator::ScanParquet(ScanParquet {
