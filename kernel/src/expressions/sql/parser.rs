@@ -14,7 +14,7 @@ use std::vec;
 
 use super::token::Token;
 use crate::expressions::ColumnName;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// An operand of a comparison: a column reference (its as-written path) or a literal (raw source
 /// text, e.g. `42`, `'foo'`, `NULL`).
@@ -54,7 +54,7 @@ pub(super) fn parse(tokens: Vec<Token>) -> DeltaResult<Comparison> {
     };
     let comparison = parser.parse_comparison()?;
     if parser.advance().is_some() {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "unexpected trailing input: only a single comparison is supported",
         ));
     }
@@ -134,8 +134,8 @@ impl Parser {
 
 /// Build the `expected {what}, found {found:?}` error shared by the parser's operand and operator
 /// sites.
-fn expected(what: &str, found: Option<Token>) -> Error {
-    Error::generic(format!("expected {what}, found {found:?}"))
+fn expected(what: &str, found: Option<Token>) -> KernelError {
+    KernelError::generic(format!("expected {what}, found {found:?}"))
 }
 
 #[cfg(test)]

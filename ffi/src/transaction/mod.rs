@@ -136,10 +136,10 @@ fn commit_result_to_committed_handle<S>(
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
-        CommitResult::Retryable(_) => Err(delta_kernel::Error::unsupported(
+        CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
-        CommitResult::Conflicted(conflicted) => Err(delta_kernel::Error::Generic(format!(
+        CommitResult::Conflicted(conflicted) => Err(delta_kernel::KernelError::Generic(format!(
             "commit conflict at version {}",
             conflicted.conflict_version()
         ))),
@@ -334,7 +334,7 @@ fn with_root_manifest_file_impl(
     let size = file
         .size
         .try_into()
-        .map_err(|_| delta_kernel::Error::generic("manifest size does not fit a FileSize"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("manifest size does not fit a FileSize"))?;
     let delta_file = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
@@ -897,7 +897,7 @@ mod tests {
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::delta_types::FfiColumnNameArray;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
-    use delta_kernel_ffi::error::KernelError;
+    use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, engine_handle_for_store,
@@ -1347,7 +1347,7 @@ mod tests {
                 unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
             assert_extern_result_error_contains(
                 invalid_partition_build,
-                KernelError::UnknownError,
+                FFIKernelError::UnknownError,
                 if partitioned {
                     "unknown partition column 'unknown'"
                 } else {
@@ -1364,7 +1364,7 @@ mod tests {
                     unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
                 assert_extern_result_error_contains(
                     missing_partition_build,
-                    KernelError::UnknownError,
+                    FFIKernelError::UnknownError,
                     "missing partition column 'part'",
                 );
             }
@@ -1387,7 +1387,7 @@ mod tests {
             };
             assert_extern_result_error_with_message(
                 invalid_row_tracking,
-                KernelError::Utf8Error,
+                FFIKernelError::Utf8Error,
                 None,
             );
 
@@ -1425,7 +1425,7 @@ mod tests {
                 unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
             assert_extern_result_error_with_message(
                 unsupported_row_tracking_build,
-                KernelError::UnsupportedError,
+                FFIKernelError::UnsupportedError,
                 None,
             );
 
@@ -1495,7 +1495,7 @@ mod tests {
                 };
                 assert_extern_result_error_with_message(
                     result,
-                    KernelError::MalformedJsonError,
+                    FFIKernelError::MalformedJsonError,
                     None,
                 );
                 let snapshot = unsafe {
@@ -2014,7 +2014,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
         );
 
@@ -2037,7 +2037,7 @@ mod tests {
 
         assert_extern_result_error_contains(
             unsafe { commit(txn, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "requires the 'rowTracking' feature",
         );
 
@@ -2060,7 +2060,7 @@ mod tests {
 
         assert_extern_result_error_contains(
             unsafe { with_row_tracking_high_water_mark(txn, 8, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "already specified in this transaction",
         );
 
@@ -2120,7 +2120,7 @@ mod tests {
         });
         assert_extern_result_error_contains(
             unsafe { commit(txn, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "cannot be less than the calculated value 7",
         );
 
@@ -2186,7 +2186,7 @@ mod tests {
         });
         assert_extern_result_error_contains(
             unsafe { commit(txn, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "cannot be less than the calculated value 1",
         );
 
@@ -2229,7 +2229,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
         );
 
@@ -2280,7 +2280,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::UnsupportedError,
+            FFIKernelError::UnsupportedError,
             Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
         );
 
@@ -2837,7 +2837,7 @@ mod tests {
         } else {
             assert_extern_result_error_with_message(
                 unsafe { commit(txn, engine.shallow_copy()) },
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 Some(
                     "Generic delta kernel error: root manifest file commit requires the \
                      adaptiveMetadata-preview feature",
@@ -2971,7 +2971,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             missing_partition_value,
-            KernelError::UnknownError,
+            FFIKernelError::UnknownError,
             Some("Invalid partition values: missing partition column 'date'. Provided: []"),
         );
 
@@ -3099,7 +3099,7 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
-        let layout: DeltaResult<DataLayout> = Err(delta_kernel::Error::generic("bad column"));
+        let layout: DeltaResult<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
         let result = create_table_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };
@@ -3829,7 +3829,7 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::Error>(r?.len()))
+            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
             .sum::<Result<_, _>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 
@@ -3931,7 +3931,7 @@ mod tests {
                 unsafe {
                     get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
                 },
-                KernelError::InvalidTransactionStateError,
+                FFIKernelError::InvalidTransactionStateError,
                 Some(
                     "Invalid transaction state: Writing data to a table with column defaults \
                      requires calling Transaction::ack_column_defaults() first",

@@ -5,7 +5,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::transaction::{
     BoundWriteContext, BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState,
 };
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::partition_value::{ExclusivePartitionValueMap, PartitionValueMap};
@@ -558,7 +558,7 @@ fn resolve_file_path_impl(
     file_url: DeltaResult<&str>,
 ) -> DeltaResult<String> {
     let url = Url::parse(file_url?).map_err(|e| {
-        Error::generic(format!("invalid file URL passed to resolve_file_path: {e}"))
+        KernelError::generic(format!("invalid file URL passed to resolve_file_path: {e}"))
     })?;
     write_context.resolve_file_path(&url)
 }

@@ -29,7 +29,7 @@ use crate::schema::{
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{DeltaResult, Error, PlanBuilder};
+use crate::{DeltaResult, KernelError, PlanBuilder};
 
 // === Internal column names ===
 
@@ -288,7 +288,7 @@ impl Scan {
         let projection = match (self.stats.synthesize_json, has_json_stats) {
             (true, true) | (false, false) => projection,
             (true, false) => {
-                return Err(Error::internal_error(
+                return Err(KernelError::internal_error(
                     "JSON stats were requested, but add.stats is missing from the metadata schema",
                 ));
             }
@@ -321,7 +321,7 @@ impl Scan {
                 project_nested_struct_to_schema([ADD_NAME, PARTITION_VALUES_PARSED_NAME], schema),
             ),
             (Some(_), false) => {
-                return Err(Error::internal_error(
+                return Err(KernelError::internal_error(
                     "parsed partition values were requested, but add.partitionValues_parsed is \
                      missing",
                 ));
@@ -1006,7 +1006,7 @@ mod tests {
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?;
         let actual_rows = batches.try_fold(0, |rows, batch| {
-            Ok::<_, crate::Error>(rows + batch?.try_into_record_batch()?.num_rows())
+            Ok::<_, crate::KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
         })?;
         assert_eq!(actual_rows, expected_rows);
         Ok(())

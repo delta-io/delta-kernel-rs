@@ -8,8 +8,8 @@ use url::Url;
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
+    KernelError, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -56,7 +56,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         let Some(fallback) = &self.fallback else {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "PlanBasedParquetHandler does not support write_parquet_file yet, and no fallback \
                  handler is configured",
             ));

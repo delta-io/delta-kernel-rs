@@ -45,7 +45,9 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
+use crate::{
+    DeltaResult, Engine, EngineData, FileMeta, KernelError, Snapshot, SnapshotRef, Version,
+};
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -1194,7 +1196,7 @@ fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<Tem
                 .join("tests/data")
                 .join(table_name);
             let path = std::fs::canonicalize(path)
-                .map_err(|e| Error::generic(format!("Failed to canonicalize path: {e}")))?;
+                .map_err(|e| KernelError::generic(format!("Failed to canonicalize path: {e}")))?;
             Ok((path, None))
         }
     }
@@ -1206,9 +1208,9 @@ pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
     let tempdir = tempfile::tempdir()?;
     let table_path = tempdir.path().join(table_name);
     copy_directory(&source, &table_path)
-        .map_err(|e| Error::generic(format!("Failed to copy test table: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("Failed to copy test table: {e}")))?;
     let url = Url::from_directory_path(&table_path)
-        .map_err(|_| Error::generic("Failed to create URL from path"))?;
+        .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
     Ok((url, tempdir))
 }
 
@@ -1222,7 +1224,7 @@ pub(crate) fn load_test_table(
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)
-        .map_err(|_| Error::generic("Failed to create URL from path"))?;
+        .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
 
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;

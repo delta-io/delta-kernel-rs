@@ -45,7 +45,7 @@ pub(crate) use writer::try_write_crc_file;
 use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
-use crate::{DeltaResult, Error, Version};
+use crate::{DeltaResult, KernelError, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -269,7 +269,7 @@ impl Crc {
             ("numProtocol", raw.num_protocol),
         ] {
             if value != 1 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
                 )));
             }
@@ -279,7 +279,7 @@ impl Crc {
             ("tableSizeBytes", raw.table_size_bytes),
         ] {
             if value < 0 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected a non-negative value, got {value}"
                 )));
             }
@@ -318,11 +318,11 @@ impl Crc {
 
 /// Fails for non-`Complete` file stats: a degraded CRC has no well-defined on-disk shape.
 impl TryFrom<&Crc> for CrcRaw {
-    type Error = Error;
+    type Error = KernelError;
     fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
         crc.validate()?;
         let FileStatsState::Complete(stats) = &crc.file_stats_state else {
-            return Err(Error::ChecksumWriteUnsupported(format!(
+            return Err(KernelError::ChecksumWriteUnsupported(format!(
                 "Cannot serialize CRC with {:?} file stats",
                 crc.file_stats_state
             )));
@@ -400,7 +400,7 @@ impl Crc {
             ("numDeletionVectorsOpt", self.num_deletion_vectors_opt),
         ] {
             if value.is_some_and(|value| value < 0) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected a non-negative value"
                 )));
             }
@@ -412,7 +412,7 @@ impl Crc {
             .is_some_and(|value| value == "true")
             && self.in_commit_timestamp_opt.is_none()
         {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "CRC file is missing inCommitTimestampOpt for an ICT-enabled table",
             ));
         }
@@ -420,13 +420,13 @@ impl Crc {
         if let Some(files) = &self.all_files {
             let mut paths = HashSet::with_capacity(files.len());
             if let Some(add) = files.iter().find(|add| !paths.insert(add.path.as_str())) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "allFiles contains duplicate path {}",
                     add.path
                 )));
             }
             if let Some(add) = files.iter().find(|add| add.size < 0) {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "allFiles contains negative file size {} for {}",
                     add.size, add.path
                 )));
@@ -448,9 +448,9 @@ impl Crc {
             }
             if let Some(files) = &self.all_files {
                 let file_count = i64::try_from(files.len())
-                    .map_err(|_| Error::generic("allFiles length exceeds i64"))?;
+                    .map_err(|_| KernelError::generic("allFiles length exceeds i64"))?;
                 if file_count != stats.num_files {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "allFiles/numFiles mismatch: {file_count} != {}",
                         stats.num_files
                     )));
@@ -458,7 +458,7 @@ impl Crc {
                 let table_size =
                     checked_sum("allFiles table size", files.iter().map(|add| add.size))?;
                 if table_size != stats.table_size_bytes {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "allFiles/tableSizeBytes mismatch: {table_size} != {}",
                         stats.table_size_bytes
                     )));
@@ -471,7 +471,7 @@ impl Crc {
                         derived.insert(add.size)?;
                     }
                     if &derived != histogram {
-                        return Err(Error::generic(
+                        return Err(KernelError::generic(
                             "allFiles/fileSizeHistogram bins do not match",
                         ));
                     }
@@ -508,7 +508,7 @@ impl Crc {
                 ),
             ] {
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "allFiles/{name} mismatch: derived {actual}"
                     )));
                 }
@@ -518,7 +518,7 @@ impl Crc {
                 .as_ref()
                 .is_some_and(|histogram| histogram != &derived.histogram)
             {
-                return Err(Error::generic(
+                return Err(KernelError::generic(
                     "allFiles/deletedRecordCountsHistogramOpt bins do not match",
                 ));
             }
@@ -539,7 +539,7 @@ struct DerivedDeletionStats {
 }
 
 impl TryFrom<&[Add]> for DerivedDeletionStats {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(files: &[Add]) -> DeltaResult<Self> {
         let cardinalities = || {
@@ -557,7 +557,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
                 .filter(|add| add.deletion_vector.is_some())
                 .count(),
         )
-        .map_err(|_| Error::generic("allFiles deletion-vector count exceeds i64"))?;
+        .map_err(|_| KernelError::generic("allFiles deletion-vector count exceeds i64"))?;
         Ok(Self {
             deleted_records,
             deletion_vectors,
@@ -569,7 +569,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
 fn validate_sum(name: &str, values: &[i64], expected: i64) -> DeltaResult<()> {
     let actual = checked_sum(name, values.iter().copied())?;
     if actual != expected {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "CRC {name} mismatch: expected {expected}, got {actual}"
         )));
     }
@@ -579,7 +579,7 @@ fn validate_sum(name: &str, values: &[i64], expected: i64) -> DeltaResult<()> {
 fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> DeltaResult<i64> {
     values.try_fold(0_i64, |sum, value| {
         sum.checked_add(value)
-            .ok_or_else(|| Error::generic(format!("CRC {name} overflow")))
+            .ok_or_else(|| KernelError::generic(format!("CRC {name} overflow")))
     })
 }
 
@@ -614,7 +614,7 @@ struct DeletedRecordCountsHistogramRaw {
 }
 
 impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(value: DeletedRecordCountsHistogramRaw) -> DeltaResult<Self> {
         Self::try_new(value.deleted_record_counts.into())
@@ -638,7 +638,7 @@ impl DeletedRecordCountsHistogram {
         let mut bins = vec![0; 10];
         for cardinality in cardinalities {
             if cardinality < 0 {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "allFiles contains negative deletion-vector cardinality {cardinality}"
                 )));
             }
@@ -661,7 +661,7 @@ impl DeletedRecordCountsHistogram {
 
     fn validate(deleted_record_counts: &[i64]) -> DeltaResult<()> {
         if deleted_record_counts.len() != 10 {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "deleted-record-count histogram must contain exactly 10 bins, got {}",
                 deleted_record_counts.len()
             )));
@@ -672,7 +672,7 @@ impl DeletedRecordCountsHistogram {
             .enumerate()
             .find(|(_, count)| *count < 0)
         {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "deleted-record-count histogram has negative file count {count} at bin {bin}"
             )));
         }
@@ -1688,7 +1688,7 @@ mod tests {
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();
         assert!(
-            matches!(err, crate::Error::ChecksumWriteUnsupported(_)),
+            matches!(err, crate::KernelError::ChecksumWriteUnsupported(_)),
             "expected ChecksumWriteUnsupported, got: {err:?}"
         );
     }

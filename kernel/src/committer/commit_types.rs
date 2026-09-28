@@ -72,17 +72,17 @@ impl CommitProtocolMetadata {
         new_metadata: Option<Metadata>,
     ) -> DeltaResult<Self> {
         if read_protocol.is_some() != read_metadata.is_some() {
-            return Err(crate::Error::generic(
+            return Err(crate::KernelError::generic(
                 "read_protocol and read_metadata must both be present or both be absent",
             ));
         }
         if read_protocol.is_none() && new_protocol.is_none() {
-            return Err(crate::Error::generic(
+            return Err(crate::KernelError::generic(
                 "CommitProtocolMetadata requires at least one protocol (read or new)",
             ));
         }
         if read_metadata.is_none() && new_metadata.is_none() {
-            return Err(crate::Error::generic(
+            return Err(crate::KernelError::generic(
                 "CommitProtocolMetadata requires at least one metadata (read or new)",
             ));
         }
@@ -221,7 +221,7 @@ impl CommitMetadata {
             .as_ref()
             .or(pm.read_protocol.as_ref())
             .ok_or_else(|| {
-                crate::Error::internal_error(
+                crate::KernelError::internal_error(
                     "CommitProtocolMetadata should have at least one protocol",
                 )
             })
@@ -235,7 +235,7 @@ impl CommitMetadata {
             .as_ref()
             .or(pm.read_metadata.as_ref())
             .ok_or_else(|| {
-                crate::Error::internal_error(
+                crate::KernelError::internal_error(
                     "CommitProtocolMetadata should have at least one metadata",
                 )
             })

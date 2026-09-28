@@ -8,7 +8,7 @@ use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
-use crate::{create_row, DataType, Engine, EngineData, Error, Expression, ExpressionRef};
+use crate::{create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -16,7 +16,7 @@ use crate::{create_row, DataType, Engine, EngineData, Error, Expression, Express
 /// inserting kernel-only fields after the last engine field.
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
-) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
+) -> Result<Vec<(&'static str, ExpressionRef)>, KernelError> {
     let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
     let mut literal_exprs = vec![
@@ -50,7 +50,7 @@ fn commit_info_literal_exprs(
     ));
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
-        return Err(Error::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
+        return Err(KernelError::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
             If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())));
     }
     Ok(literal_exprs)
@@ -59,7 +59,7 @@ fn commit_info_literal_exprs(
 fn string_map_literal_expr(
     map: Option<HashMap<String, Option<String>>>,
     map_type: &MapType,
-) -> Result<ExpressionRef, Error> {
+) -> Result<ExpressionRef, KernelError> {
     let expression = match map {
         Some(map) => lit(MapData::try_new(
             map_type.clone(),
@@ -76,7 +76,7 @@ impl<S> Transaction<S> {
         &self,
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
-    ) -> Result<Box<dyn EngineData>, Error> {
+    ) -> Result<Box<dyn EngineData>, KernelError> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
@@ -96,7 +96,7 @@ impl<S> Transaction<S> {
                 let mut patch = ProjectionStructPatchBuilder::new(engine_commit_info_schema);
                 for (field_name, expr_ref) in &literal_exprs {
                     let field = kernel_schema.field(*field_name).ok_or_else(|| {
-                        Error::internal_error(format!(
+                        KernelError::internal_error(format!(
                             "CommitInfo schema is missing field '{field_name}'"
                         ))
                     })?;
@@ -106,7 +106,7 @@ impl<S> Transaction<S> {
                 }
                 for (field_name, expr_ref) in &literal_exprs {
                     let field = kernel_schema.field(*field_name).ok_or_else(|| {
-                        Error::internal_error(format!(
+                        KernelError::internal_error(format!(
                             "CommitInfo schema is missing field '{field_name}'"
                         ))
                     })?;
@@ -155,13 +155,13 @@ impl RowVisitor for CommitInfoTagsVisitor {
         &mut self,
         row_count: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<(), Error> {
+    ) -> Result<(), KernelError> {
         require!(
             row_count == 1,
-            Error::generic("Connector commit info must contain exactly one row")
+            KernelError::generic("Connector commit info must contain exactly one row")
         );
         let [tags_getter] = getters else {
-            return Err(Error::internal_error(format!(
+            return Err(KernelError::internal_error(format!(
                 "CommitInfoTagsVisitor received {} getters instead of one",
                 getters.len()
             )));

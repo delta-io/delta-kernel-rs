@@ -47,7 +47,7 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta, SnapshotRef,
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
     Version,
 };
 
@@ -405,7 +405,7 @@ impl ScanBuilder {
     /// is not cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     pub fn with_cancellation_token(
         mut self,
         token: impl Into<Option<CancellationTokenRef>>,
@@ -430,7 +430,7 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
             ));
@@ -538,7 +538,7 @@ impl PhysicalPredicate {
             // clause has invalid column references. Data skipping is best-effort and the predicate
             // anyway needs to be evaluated against every row of data -- which is impossible if the
             // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
-            return Err(Error::missing_column(format!(
+            return Err(KernelError::missing_column(format!(
                 "Predicate references unknown column: {unresolved}"
             )));
         }
@@ -971,7 +971,7 @@ impl Scan {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
@@ -1303,7 +1303,7 @@ impl Scan {
         // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
         // not thread cancellation, so honoring a set token would require dropping it on the floor.
         if self.cancellation_token.is_some() {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \
                  use scan_metadata for a cancellable scan",
             ));
@@ -1355,7 +1355,7 @@ impl Scan {
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Scan::execute is not supported when the scan was built with \
                  without_row_transforms; use scan_metadata for listing and read data with your \
                  own reader",
@@ -1395,7 +1395,7 @@ impl Scan {
                 let meta = FileMeta {
                     last_modified: scan_file.modification_time,
                     size: scan_file.size.try_into().map_err(|_| {
-                        Error::generic("Unable to convert scan file size into FileSize")
+                        KernelError::generic("Unable to convert scan file size into FileSize")
                     })?,
                     location: file_path,
                 };
@@ -1419,7 +1419,7 @@ impl Scan {
                 // 0-row file from a buggy connector, so we conservatively allow it.
                 let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {
-                    return Err(Error::internal_error(format!(
+                    return Err(KernelError::internal_error(format!(
                         "ParquetHandler returned no data for file '{}'. This is likely a connector \
                          bug -- the handler's read_parquet_files must return at least one batch for \
                          each requested file that contains rows.",

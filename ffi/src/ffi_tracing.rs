@@ -21,7 +21,7 @@ use delta_kernel::metrics::{
     FrameReporter, FrameReporterLayer, MetricEvent as KernelMetricEvent, MetricsReporter,
     ReportGeneratorLayer,
 };
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use tracing::field::{Field as TracingField, Visit};
 use tracing::{error, Event as TracingEvent, Subscriber};
 use tracing_core::Dispatch;
@@ -249,7 +249,9 @@ pub unsafe extern "C" fn enable_formatted_log_line_tracing(
 
 fn set_global_default(dispatch: tracing_core::Dispatch) -> DeltaResult<()> {
     tracing_core::dispatcher::set_global_default(dispatch).map_err(|_| {
-        Error::generic("Unable to set global default subscriber. Trying to set more than once?")
+        KernelError::generic(
+            "Unable to set global default subscriber. Trying to set more than once?",
+        )
     })
 }
 
@@ -563,15 +565,16 @@ impl GlobalTracingState {
 
     /// Make `layer` the active logging layer and set its level filter.
     fn reload_logging(&self, layer: BoxedLayer, max_level: Level) -> DeltaResult<()> {
-        let reload_err = |e| Error::generic(format!("Unable to reload logging subscriber: {e}"));
+        let reload_err =
+            |e| KernelError::generic(format!("Unable to reload logging subscriber: {e}"));
         self.logging_layer
             .as_ref()
-            .ok_or_else(|| Error::generic("logging slot not installed"))?
+            .ok_or_else(|| KernelError::generic("logging slot not installed"))?
             .reload(layer)
             .map_err(reload_err)?;
         self.logging_filter
             .as_ref()
-            .ok_or_else(|| Error::generic("logging filter not installed"))?
+            .ok_or_else(|| KernelError::generic("logging filter not installed"))?
             .reload(LevelFilter::from(max_level))
             .map_err(reload_err)
     }
@@ -582,7 +585,7 @@ impl GlobalTracingState {
         max_level: Level,
     ) -> DeltaResult<()> {
         if !max_level.is_valid() {
-            return Err(Error::generic("max_level out of range"));
+            return Err(KernelError::generic("max_level out of range"));
         }
         self.ensure_installed()?;
         self.reload_logging(build_event_layer(callback), max_level)
@@ -600,7 +603,7 @@ impl GlobalTracingState {
         with_target: bool,
     ) -> DeltaResult<()> {
         if !max_level.is_valid() {
-            return Err(Error::generic("max_level out of range"));
+            return Err(KernelError::generic("max_level out of range"));
         }
         self.ensure_installed()?;
         let layer =
@@ -612,16 +615,14 @@ impl GlobalTracingState {
     /// `INFO`.
     fn register_metrics_callback(&mut self, callback: MetricsEventFn) -> DeltaResult<()> {
         self.ensure_installed()?;
-        *self
-            .metrics_callback
-            .lock()
-            .map_err(|_| Error::generic("Failed to lock metrics callback (mutex poisoned)."))? =
-            Some(callback);
+        *self.metrics_callback.lock().map_err(|_| {
+            KernelError::generic("Failed to lock metrics callback (mutex poisoned).")
+        })? = Some(callback);
         self.metrics_filter
             .as_ref()
-            .ok_or_else(|| Error::generic("metrics filter not installed"))?
+            .ok_or_else(|| KernelError::generic("metrics filter not installed"))?
             .reload(LevelFilter::INFO)
-            .map_err(|e| Error::generic(format!("Unable to reload metrics subscriber: {e}")))
+            .map_err(|e| KernelError::generic(format!("Unable to reload metrics subscriber: {e}")))
     }
 
     /// Registers the frame callback and enables spans containing the `enable_call_frame` field.
@@ -629,12 +630,12 @@ impl GlobalTracingState {
         self.ensure_installed()?;
         self.frame_callback
             .set(callback)
-            .map_err(|_| Error::generic("frame callback already registered"))?;
+            .map_err(|_| KernelError::generic("frame callback already registered"))?;
         self.frame_filter
             .as_ref()
-            .ok_or_else(|| Error::generic("frame filter not installed"))?
+            .ok_or_else(|| KernelError::generic("frame filter not installed"))?
             .reload(LevelFilter::TRACE)
-            .map_err(|e| Error::generic(format!("Unable to reload frame subscriber: {e}")))
+            .map_err(|e| KernelError::generic(format!("Unable to reload frame subscriber: {e}")))
     }
 }
 
@@ -644,7 +645,7 @@ static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
     let mut state = TRACING_STATE
         .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up event subscriber"))?;
+        .map_err(|_e| KernelError::generic("Poisoned mutex while setting up event subscriber"))?;
     state.register_event_callback(callback, max_level)
 }
 
@@ -657,9 +658,9 @@ fn setup_log_line_subscriber(
     with_level: bool,
     with_target: bool,
 ) -> DeltaResult<()> {
-    let mut state = TRACING_STATE
-        .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up log_line_subscriber"))?;
+    let mut state = TRACING_STATE.lock().map_err(|_e| {
+        KernelError::generic("Poisoned mutex while setting up log_line_subscriber")
+    })?;
     state.register_log_line_callback(
         callback,
         max_level,
@@ -688,7 +689,7 @@ pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> b
 fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
     let mut state = TRACING_STATE
         .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up metrics reporter"))?;
+        .map_err(|_e| KernelError::generic("Poisoned mutex while setting up metrics reporter"))?;
     state.register_metrics_callback(callback)
 }
 
@@ -713,7 +714,7 @@ fn setup_metrics_reporter(callback: MetricsEventFn) -> DeltaResult<()> {
 pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool {
     TRACING_STATE
         .lock()
-        .map_err(|_e| Error::generic("Poisoned mutex while setting up frame reporter"))
+        .map_err(|_e| KernelError::generic("Poisoned mutex while setting up frame reporter"))
         .and_then(|mut state| state.register_frame_callback(callback))
         .is_ok()
 }

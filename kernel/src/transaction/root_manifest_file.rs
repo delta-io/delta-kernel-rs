@@ -6,7 +6,7 @@ use crate::actions::{
     CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, CHECKPOINT_ACTION_FIELD,
 };
 use crate::crc::{merge_domain_metadata, DomainMetadataState, SetTransactionState};
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::schema::StructType;
 use crate::snapshot::SnapshotRef;
@@ -72,7 +72,7 @@ impl RootManifestFile {
         if let Some(existing) = &existing_checkpoint {
             require!(
                 existing.version() >= read_snapshot_version,
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "root manifest file commit requires no delta log commits pending replay since \
                      the last checkpoint; existing checkpoint covers version {} but snapshot is \
                      at {read_snapshot_version}",
@@ -83,7 +83,7 @@ impl RootManifestFile {
 
         let version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
-            .map_err(|_| Error::generic("root manifest file size exceeds i64::MAX"))?;
+            .map_err(|_| KernelError::generic("root manifest file size exceeds i64::MAX"))?;
         let content_root = ContentRoot::new(self.file.location.to_string(), size, version);
 
         Ok(CheckpointAction::new(
@@ -133,7 +133,7 @@ impl RootManifestFile {
             require!(
                 checkpoint.txn_sidecars.is_empty()
                     && checkpoint.domain_metadata_sidecars.is_empty(),
-                Error::generic(
+                KernelError::generic(
                     "root manifest file commit cannot yet replace a checkpoint that spills txns \
                      or domain metadata to sidecars"
                 )

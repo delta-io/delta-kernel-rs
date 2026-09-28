@@ -40,7 +40,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{DeltaResult, Error, Version};
+use crate::{DeltaResult, KernelError, Version};
 
 /// Expected schema for file statistics, using physical column names.
 ///
@@ -80,13 +80,13 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Duplicate partition column: '{col}'"
             )));
         }
         require!(
             logical_schema.field(col).is_some(),
-            Error::generic(format!("Partition column '{col}' not found in schema"))
+            KernelError::generic(format!("Partition column '{col}' not found in schema"))
         );
     }
     Ok(())
@@ -229,7 +229,7 @@ impl TableConfiguration {
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
                 && table_config.is_row_tracking_suspended()),
-            Error::invalid_protocol(
+            KernelError::invalid_protocol(
                 "Row tracking cannot be enabled and suspended at the same time"
             )
         );
@@ -632,7 +632,7 @@ impl TableConfiguration {
                 FeatureRequirement::Supported(dep) => {
                     require!(
                         self.is_feature_supported(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be supported"
                         ))
                     );
@@ -640,7 +640,7 @@ impl TableConfiguration {
                 FeatureRequirement::Enabled(dep) => {
                     require!(
                         self.is_feature_enabled(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be enabled"
                         ))
                     );
@@ -648,7 +648,7 @@ impl TableConfiguration {
                 FeatureRequirement::NotSupported(dep) => {
                     require!(
                         !self.is_feature_supported(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be supported"
                         ))
                     );
@@ -656,7 +656,7 @@ impl TableConfiguration {
                 FeatureRequirement::NotEnabled(dep) => {
                     require!(
                         !self.is_feature_enabled(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be enabled"
                         ))
                     );
@@ -680,7 +680,7 @@ impl TableConfiguration {
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(Error::unsupported(format!(
+                return Err(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
                 )))
             }
@@ -761,14 +761,14 @@ impl TableConfiguration {
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
+            KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_writer_version()
             ))
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(Error::unsupported(format!(
+            return Err(KernelError::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
             )));
@@ -784,7 +784,7 @@ impl TableConfiguration {
         if self.is_feature_supported(&TableFeature::Invariants)
             && schema_has_invariants(self.logical_schema.as_ref())
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Column invariants are not yet supported",
             ));
         }
@@ -815,10 +815,10 @@ impl TableConfiguration {
             (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled {
                 enablement: Some((version, timestamp)),
             }),
-            (Some(_), None) => Err(Error::generic(
+            (Some(_), None) => Err(KernelError::generic(
                 "In-commit timestamp enabled, but enablement timestamp is missing",
             )),
-            (None, Some(_)) => Err(Error::generic(
+            (None, Some(_)) => Err(KernelError::generic(
                 "In-commit timestamp enabled, but enablement version is missing",
             )),
             // If InCommitTimestamps was enabled at the beginning of the table's history,
@@ -942,7 +942,7 @@ impl TableConfiguration {
 
     pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
         if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
@@ -978,7 +978,7 @@ mod test {
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
     };
-    use crate::Error;
+    use crate::KernelError;
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
@@ -1111,7 +1111,9 @@ mod test {
                     .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_protocol(MockProtocolBuilder::new().with_versions(1, 8).build())
                     .build(),
-                Err(Error::unsupported("Unsupported minimum writer version 8")),
+                Err(KernelError::unsupported(
+                    "Unsupported minimum writer version 8",
+                )),
             ),
             // Column mapping is now supported for writes.
             (
@@ -1240,7 +1242,7 @@ mod test {
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(matches!(
             table_config.in_commit_timestamp_enablement(),
-            Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
+            Err(KernelError::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
         ));
     }
     #[test]

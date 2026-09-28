@@ -1,7 +1,7 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
-use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel::{DeltaResult, KernelError, Version};
 
 use crate::delta_types::{FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol};
 use crate::error::{ExternResult, IntoExternResult};
@@ -43,7 +43,7 @@ pub struct FfiSnapshotHint {
     pub crc: *const FfiCrc,
 }
 
-fn invalid_with_source(message: impl Into<String>, source: Error) -> Error {
+fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
     SnapshotHintError::Connector {
         message: message.into(),
         source: Some(Box::new(source)),
@@ -51,7 +51,7 @@ fn invalid_with_source(message: impl Into<String>, source: Error) -> Error {
     .into()
 }
 
-pub(crate) fn invalid(message: impl Into<String>) -> Error {
+pub(crate) fn invalid(message: impl Into<String>) -> KernelError {
     SnapshotHintError::Connector {
         message: message.into(),
         source: None,
@@ -59,7 +59,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     .into()
 }
 
-fn invalid_crc(source: Error) -> Error {
+fn invalid_crc(source: KernelError) -> KernelError {
     invalid_with_source("supplied CRC is invalid", source)
 }
 
@@ -84,7 +84,7 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
         &builder.source,
         FfiSnapshotBuilderSource::ExistingSnapshot(_)
     ) {
-        return Err(Error::unsupported(
+        return Err(KernelError::unsupported(
             "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
         ));
     }

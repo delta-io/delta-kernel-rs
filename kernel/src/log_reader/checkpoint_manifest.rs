@@ -10,7 +10,7 @@ use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FileMeta, KernelError, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
@@ -54,7 +54,7 @@ impl CheckpointManifestReader {
                 None,
             )?,
             extension => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Unsupported checkpoint extension: {extension}",
                 )));
             }
@@ -76,7 +76,7 @@ impl CheckpointManifestReader {
     pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Cannot extract sidecars from in-progress ManifestReader for file: {}",
                 self.manifest_file.location
             ))

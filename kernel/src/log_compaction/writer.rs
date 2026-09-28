@@ -10,7 +10,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
+use crate::{DeltaResult, Engine, KernelError, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -58,11 +58,11 @@ impl LogCompactionWriter {
         _start_version: Version,
         _end_version: Version,
     ) -> DeltaResult<Self> {
-        Err(Error::unsupported(
+        Err(KernelError::unsupported(
             "Log compaction is not currently supported",
         ))
         // if start_version >= end_version {
-        //     return Err(Error::generic(format!(
+        //     return Err(KernelError::generic(format!(
         //         "Invalid version range: end_version {end_version} must be greater than \
         //          start_version {start_version}"
         //     )));
@@ -102,7 +102,7 @@ impl LogCompactionWriter {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "End version {} exceeds snapshot version {}",
                 self.end_version, snapshot_end_version
             )));

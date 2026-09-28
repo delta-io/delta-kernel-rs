@@ -15,7 +15,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{DecimalData, Scalar};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
 /// `NaiveDate::from_num_days_from_ce_opt`, which counts from 0001-01-01.
@@ -97,10 +97,12 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
         Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
-        Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => Err(Error::generic(format!(
-            "cannot serialize partition value: type {:?} is not a valid partition column type",
-            value.data_type()
-        ))),
+        Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => {
+            Err(KernelError::generic(format!(
+                "cannot serialize partition value: type {:?} is not a valid partition column type",
+                value.data_type()
+            )))
+        }
     }
 }
 
@@ -162,11 +164,13 @@ fn format_f64(v: f64) -> String {
 /// Formats a date value (days since UNIX epoch) as "YYYY-MM-DD".
 fn format_date(days: i32) -> DeltaResult<String> {
     let ce_days = UNIX_EPOCH_CE_DAYS.checked_add(days).ok_or_else(|| {
-        Error::generic(format!("date value {days} days from epoch is out of range"))
+        KernelError::generic(format!("date value {days} days from epoch is out of range"))
     })?;
     NaiveDate::from_num_days_from_ce_opt(ce_days)
         .map(|d| d.format("%Y-%m-%d").to_string())
-        .ok_or_else(|| Error::generic(format!("date value {days} days from epoch is out of range")))
+        .ok_or_else(|| {
+            KernelError::generic(format!("date value {days} days from epoch is out of range"))
+        })
 }
 
 /// Converts microseconds since epoch to a [`DateTime`], returning an error if out of range.
@@ -174,7 +178,7 @@ fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
     DateTime::from_timestamp(secs, subsec_nanos).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "{label} value {micros} microseconds from epoch is out of range"
         ))
     })
@@ -239,7 +243,9 @@ fn format_decimal(d: &DecimalData) -> String {
 fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
-        .map_err(|e| Error::generic(format!("binary partition value is not valid UTF-8: {e}")))
+        .map_err(|e| {
+            KernelError::generic(format!("binary partition value is not valid UTF-8: {e}"))
+        })
 }
 
 #[cfg(test)]

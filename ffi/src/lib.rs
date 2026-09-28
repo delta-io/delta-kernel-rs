@@ -190,7 +190,7 @@ impl<T> FfiSlice<T> {
             return Ok(&[]);
         }
         if self.ptr.is_null() {
-            return Err(delta_kernel::Error::generic(format!(
+            return Err(delta_kernel::KernelError::generic(format!(
                 "slice pointer is null with length {}",
                 self.len
             )));
@@ -271,7 +271,7 @@ impl KernelStringSlice {
             return Ok(String::new());
         }
         if self.ptr.is_null() {
-            return Err(delta_kernel::Error::generic(format!(
+            return Err(delta_kernel::KernelError::generic(format!(
                 "string pointer is null with length {}",
                 self.len
             )));
@@ -326,7 +326,7 @@ impl KernelBytesSlice {
             return Ok(&[]);
         }
         if self.ptr.is_null() {
-            return Err(delta_kernel::Error::generic(format!(
+            return Err(delta_kernel::KernelError::generic(format!(
                 "byte pointer is null with length {}",
                 self.len
             )));
@@ -1027,7 +1027,7 @@ fn set_builder_rest_object_store_impl(
 ) -> DeltaResult<bool> {
     // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
     let endpoint_config = unsafe { endpoint_config.as_ref() }
-        .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+        .ok_or_else(|| delta_kernel::KernelError::generic("null CRestEndpointConfig pointer"))?;
     builder.object_store_backend =
         ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
             endpoint_config,
@@ -2252,7 +2252,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
+    use crate::error::{EngineError, FFIKernelError};
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
@@ -2260,7 +2260,7 @@ mod tests {
     };
 
     #[no_mangle]
-    extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
+    extern "C" fn allocate_null_err(_: FFIKernelError, _: KernelStringSlice) -> *mut EngineError {
         std::ptr::null_mut()
     }
 
@@ -2334,7 +2334,7 @@ mod tests {
         assert!(unsafe { null_empty.try_as_slice() }.unwrap().is_empty());
         assert!(matches!(
             unsafe { null_nonempty.try_as_slice() },
-            Err(delta_kernel::Error::Generic(_))
+            Err(delta_kernel::KernelError::Generic(_))
         ));
     }
 
@@ -2366,7 +2366,7 @@ mod tests {
         unsafe {
             assert_extern_result_error_with_message(
                 snapshot_builder_set_log_tail(&mut builder, log_tail),
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 Some("Generic delta kernel error: slice pointer is null with length 1"),
             );
             free_snapshot_builder(builder);
@@ -2512,7 +2512,7 @@ mod tests {
             let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
             assert_extern_result_error_contains(
                 builder_build(builder),
-                KernelError::ObjectStoreError,
+                FFIKernelError::ObjectStoreError,
                 "unsupported-scheme",
             );
         }
@@ -2526,7 +2526,7 @@ mod tests {
                 ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
             assert_extern_result_error_contains(
                 set_builder_rest_object_store(&mut builder, std::ptr::null(), None, None),
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 "null CRestEndpointConfig pointer",
             );
             free_engine_builder(builder);
@@ -2565,7 +2565,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             snapshot_at_non_existent_version,
-            KernelError::MissingVersionError,
+            FFIKernelError::MissingVersionError,
             Some("Table version 1 is missing or unavailable for this log operation."),
         );
 
@@ -2586,7 +2586,7 @@ mod tests {
         // The crc-full fixture has a CRC at version 0 with complete file stats.
         let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
         let table_root = Url::from_directory_path(&table_path)
-            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
             .to_string();
 
         let engine = get_default_engine(&table_root);
@@ -2631,7 +2631,7 @@ mod tests {
     {
         let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
         let table_root = Url::from_directory_path(&table_path)
-            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
             .to_string();
 
         let engine = get_default_engine(&table_root);
@@ -2784,13 +2784,13 @@ mod tests {
         EarliestCommitTableSetupScenario::NoCommits,
         OptionalValue::Some(0),
         FfiHistoryCommitType::Published,
-        Err(KernelError::GenericError)
+        Err(FFIKernelError::GenericError)
     )]
     #[case::empty_log_errors(
         EarliestCommitTableSetupScenario::NoCommits,
         OptionalValue::None,
         FfiHistoryCommitType::Published,
-        Err(KernelError::LogHistoryError)
+        Err(FFIKernelError::LogHistoryError)
     )]
     #[case::checkpoint_published(
         EarliestCommitTableSetupScenario::FilesystemV4CheckpointWithEarliestCommitAtV2,
@@ -2809,7 +2809,7 @@ mod tests {
         #[case] setup: EarliestCommitTableSetupScenario,
         #[case] earliest_ratified: OptionalValue<Version>,
         #[case] commit_type: FfiHistoryCommitType,
-        #[case] expected: Result<Version, KernelError>,
+        #[case] expected: Result<Version, FFIKernelError>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///earliest_commit/";
         let log_root = "memory:///earliest_commit/_delta_log/";
@@ -2924,13 +2924,13 @@ mod tests {
     #[rstest]
     #[case::latest_version_query_at_ict(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
     #[case::first_version_after_query_at_ict(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP, Ok((0, TEST_ICT_ENABLEMENT_TIMESTAMP)))]
-    #[case::latest_version_query_out_of_range(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP - 1, Err(KernelError::LogHistoryError))]
-    #[case::first_version_after_query_out_of_range(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP + 1, Err(KernelError::LogHistoryError))]
+    #[case::latest_version_query_out_of_range(latest_version_as_of, TEST_ICT_ENABLEMENT_TIMESTAMP - 1, Err(FFIKernelError::LogHistoryError))]
+    #[case::first_version_after_query_out_of_range(first_version_after, TEST_ICT_ENABLEMENT_TIMESTAMP + 1, Err(FFIKernelError::LogHistoryError))]
     #[tokio::test]
     async fn test_snapshot_version_at_timestamp_cases(
         #[case] query: HistoryQueryFn,
         #[case] timestamp: i64,
-        #[case] expected: Result<(Version, i64), KernelError>,
+        #[case] expected: Result<(Version, i64), FFIKernelError>,
         #[values(FfiHistoryCommitType::Published, FfiHistoryCommitType::Recreatable)]
         commit_type: FfiHistoryCommitType,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3267,7 +3267,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             extern_result,
-            KernelError::CheckpointWriteError,
+            FFIKernelError::CheckpointWriteError,
             Some("Error writing checkpoint: file_actions_per_sidecar_hint must be greater than 0"),
         );
 
@@ -3276,7 +3276,7 @@ mod tests {
         Ok(())
     }
 
-    // Checkpoint on V1 table with V2 spec => `KernelError::CheckpointWriteError`.
+    // Checkpoint on V1 table with V2 spec => `FFIKernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3288,7 +3288,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             extern_result,
-            KernelError::CheckpointWriteError,
+            FFIKernelError::CheckpointWriteError,
             Some("Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported"),
         );
 
@@ -3437,7 +3437,7 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
-            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+            .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
         // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
@@ -3500,7 +3500,7 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
-            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+            .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
         let protocol_and_metadata = METADATA
@@ -3664,7 +3664,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             invalid_snapshot,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some(concat!(
                 "Max catalog version error: Max catalog version is required when providing ",
                 "staged commits. ",
@@ -3782,7 +3782,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
         );
 
@@ -4115,7 +4115,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidTableLocationError,
+            FFIKernelError::InvalidTableLocationError,
             None,
         );
 
@@ -4140,7 +4140,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::MissingVersionError,
+            FFIKernelError::MissingVersionError,
             Some("Table version 1 is missing or unavailable for this log operation."),
         );
 

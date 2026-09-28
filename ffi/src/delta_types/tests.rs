@@ -1074,7 +1074,7 @@ fn typed_actions_validate_tags_and_convert_each_payload() {
     for action in &null_actions {
         assert!(matches!(
             unsafe { action.try_to_kernel() },
-            Err(Error::Generic(_))
+            Err(KernelError::Generic(_))
         ));
     }
 }

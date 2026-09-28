@@ -12,7 +12,7 @@ ownership semantics:
 
 A handle is needed when a value might outlive the function call that passes it across the
 FFI boundary, or when the type is not representable in C/C++ (dyn trait references, slices,
-options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelError`,
+options, etc.). Short-lived "plain old data" types like `ExternResult`, `FFIKernelError`,
 `KernelStringSlice`, and `EngineIterator` do not need handles.
 
 Borrowed record arrays use `FfiSlice<T>`: empty slices accept null or non-null pointers, while
@@ -177,7 +177,7 @@ defaults but never materializes them, so the connector fills every omitted colum
 transaction()
   -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
-                                            // KernelError::InvalidTransactionStateError
+                                            // FFIKernelError::InvalidTransactionStateError
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
