@@ -978,7 +978,8 @@ mod test {
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
+        column_name, schema, schema_ref, ColumnMetadataKey, ColumnName, DataType, MetadataValue,
+        SchemaRef, StructField,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -990,8 +991,9 @@ mod test {
         ENABLE_ROW_TRACKING,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        assert_result_error_with_message, assert_schema_feature_validation, test_schema_flat,
+        test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
@@ -1017,6 +1019,32 @@ mod test {
         table_config
             .ensure_operation_supported(Operation::Scan)
             .unwrap();
+    }
+
+    #[rstest]
+    #[case::stable(TableFeature::Collations)]
+    #[case::preview(TableFeature::CollationsPreview)]
+    fn collation_metadata_requires_feature(#[case] feature: TableFeature) {
+        let schema_with = schema! {
+            (StructField::nullable("value", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::Collations.as_ref(),
+                MetadataValue::Other(serde_json::json!({ "value": "spark.UTF8_LCASE" })),
+            )])),
+        };
+        let schema_without = schema! { nullable "value": STRING };
+        let protocol_with = MockProtocolBuilder::new()
+            .with_writer_features([feature])
+            .build();
+        let protocol_without = MockProtocolBuilder::new().build();
+
+        assert_schema_feature_validation(
+            &schema_with,
+            &schema_without,
+            &protocol_with,
+            &protocol_without,
+            &[],
+            "requires the 'collations' or 'collations-preview' table feature",
+        );
     }
 
     #[test]

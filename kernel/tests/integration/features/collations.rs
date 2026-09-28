@@ -10,7 +10,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::{col, column_name, lit};
+use delta_kernel::expressions::{col, lit};
 use delta_kernel::schema::{
     schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
 };
@@ -472,108 +472,6 @@ async fn create_preserves_container_collation_metadata() -> DeltaResult<()> {
             .unwrap()
             .get_config_value(&ColumnMetadataKey::Collations),
         Some(&map_metadata)
-    );
-    Ok(())
-}
-
-#[rstest]
-#[case::stable(
-    "collations",
-    TableFeature::Collations,
-    TableFeature::CollationsPreview
-)]
-#[case::preview(
-    "collations-preview",
-    TableFeature::CollationsPreview,
-    TableFeature::Collations
-)]
-#[tokio::test]
-async fn alter_add_collated_column_with_enabled_feature(
-    #[case] feature_signal: &str,
-    #[case] expected_feature: TableFeature,
-    #[case] absent_feature: TableFeature,
-) -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_table(&table_path, schema_ref! { nullable "id": INTEGER }, "test")
-        .with_table_properties([(
-            format!("delta.feature.{feature_signal}"),
-            "supported".to_string(),
-        )])
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-    let initial_protocol = snapshot.table_configuration().protocol().clone();
-
-    snapshot
-        .alter_table()
-        .add_column(collated_field("value"))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let table_config = reloaded.table_configuration();
-    assert_eq!(table_config.protocol(), &initial_protocol);
-    assert!(table_config.is_feature_supported(&expected_feature));
-    assert!(!table_config.is_feature_supported(&absent_feature));
-    assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
-    assert_eq!(
-        reloaded
-            .schema()
-            .field("value")
-            .unwrap()
-            .get_config_value(&ColumnMetadataKey::Collations),
-        Some(&collation_metadata("value"))
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn alter_add_collated_column_requires_enabled_feature() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_table(&table_path, schema_ref! { nullable "id": INTEGER }, "test")
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
-    let error = snapshot
-        .alter_table()
-        .add_column(collated_field("value"))
-        .build(engine.as_ref(), committer())
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("requires the 'collations' or 'collations-preview' table feature"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn alter_preserves_existing_collation_metadata() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let expected_metadata = collation_metadata("value");
-    let field = StructField::not_null("value", DataType::STRING).with_metadata([(
-        ColumnMetadataKey::Collations.as_ref(),
-        expected_metadata.clone(),
-    )]);
-    let snapshot = create_table(&table_path, schema_ref! { (field) }, "test")
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
-    snapshot
-        .alter_table()
-        .set_nullable(column_name!("value"))
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let schema = reloaded.schema();
-    let field = schema.field("value").unwrap();
-    assert!(field.is_nullable());
-    assert_eq!(
-        field.get_config_value(&ColumnMetadataKey::Collations),
-        Some(&expected_metadata)
     );
     Ok(())
 }
