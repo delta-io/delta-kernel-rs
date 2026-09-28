@@ -78,6 +78,7 @@ pub enum FFIKernelError {
     EmptyLogError = 49,
     InvalidSnapshotHint = 50,
     StartVersionNotFound = 51,
+    InvalidGeoParamsError = 52,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -128,6 +129,7 @@ impl From<KernelError> for FFIKernelError {
             }
             KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
+            KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
             KernelError::Backtraced {
@@ -328,6 +330,7 @@ impl From<EngineExecError> for KernelError {
             }
             FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
+            FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
             FFIKernelError::InvalidLogPath => KernelError::InvalidLogPath(message),
@@ -486,6 +489,18 @@ mod error_code_tests {
             FFIKernelError::InvalidSnapshotHint
         );
         assert_eq!(FFIKernelError::InvalidSnapshotHint as i32, 50);
+    }
+
+    #[test]
+    fn invalid_geo_params_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidGeoParams("invalid".to_string())),
+            FFIKernelError::InvalidGeoParamsError
+        );
+        assert_eq!(FFIKernelError::InvalidGeoParamsError as i32, 52);
+
+        let err: KernelError = exec_error(FFIKernelError::InvalidGeoParamsError, "invalid").into();
+        assert!(matches!(err, KernelError::InvalidGeoParams(message) if message == "invalid"));
     }
 }
 

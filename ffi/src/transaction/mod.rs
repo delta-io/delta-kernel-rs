@@ -924,6 +924,8 @@ mod tests {
     use super::*;
     use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
     use crate::expressions::free_kernel_expression;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema_visitor::visit_field_geometry;
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
@@ -2726,6 +2728,74 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    /// Schema visitor callback for tests: builds a one-field `{geom: geometry(OGC:CRS84)}` schema.
+    #[cfg(feature = "geo-type-in-dev")]
+    extern "C" fn visit_single_geometry_field_schema(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let name = "geom";
+        let crs = "OGC:CRS84";
+        let field_id = unsafe {
+            ok_or_panic(visit_field_geometry(
+                state,
+                kernel_string_slice!(name),
+                kernel_string_slice!(crs),
+                true,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        };
+        let field_ids = [field_id];
+        let root = "schema";
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                kernel_string_slice!(root),
+                field_ids.as_ptr(),
+                field_ids.len(),
+                false,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        }
+    }
+
+    /// A visitor-built geo schema handed to the create-table path must be rejected: `create_table`
+    /// does not declare the `geospatial` reader/writer feature for the tables it builds, so a
+    /// schema containing a geometry/geography column always fails table-configuration validation
+    /// before any data write is attempted.
+    #[cfg(feature = "geo-type-in-dev")]
+    #[tokio::test]
+    async fn test_create_table_rejects_geospatial_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table_rejects_geospatial_schema", None);
+        let table_path = table_url.to_string();
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_single_geometry_field_schema,
+        };
+        let builder = ok_or_panic(unsafe {
+            get_create_table_builder(
+                kernel_string_slice!(table_path),
+                &schema_arg,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+        let build_res = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
+        assert_extern_result_error_contains(
+            build_res,
+            FFIKernelError::UnsupportedError,
+            "does not have the required 'geospatial' feature",
+        );
         unsafe { free_engine(engine) };
         Ok(())
     }

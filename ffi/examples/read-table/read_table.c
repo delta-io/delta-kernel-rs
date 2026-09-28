@@ -383,8 +383,9 @@ int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
+  bool print_scan_schema = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:")) != -1) {
+  while ((c = getopt (argc, argv, "ac:s")) != -1) {
     switch (c) {
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
@@ -396,6 +397,12 @@ int main(int argc, char* argv[])
       break;
     case 'c':
       requested_cols = optarg;
+      break;
+    case 's':
+      // Print the scan's resulting logical schema (scan_logical_schema), separately from the
+      // table's own schema printed above. Useful to verify that a projected/custom requested
+      // schema (-c) was actually honored by the scan.
+      print_scan_schema = true;
       break;
     case '?':
       if (optopt == 'c') {
@@ -416,7 +423,7 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] table/path\n", argv[0]);
     return -1;
   }
 
@@ -552,6 +559,12 @@ int main(int argc, char* argv[])
 
   SharedSchema* logical_schema = scan_logical_schema(scan);
   SharedSchema* physical_schema = scan_physical_schema(scan);
+
+  if (print_scan_schema) {
+    CSchema* scan_cschema = build_cschema(logical_schema, engine);
+    print_cschema_as("Scan schema", scan_cschema);
+    free_cschema(scan_cschema);
+  }
   struct EngineContext context = {
     logical_schema,
     physical_schema,

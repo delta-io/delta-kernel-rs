@@ -79,6 +79,32 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     visit_res = visit_field_interval_year_month(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "interval day to second") == 0) {
     visit_res = visit_field_interval_day_time(state, name, item->is_nullable, &metadata, allocate_error);
+#ifdef DEFINE_GEO_TYPE_IN_DEV
+  } else if (strncmp(item->type, "geometry(", 9) == 0) {
+    char crs_buf[256];
+    int end_pos = -1;
+    int matched = sscanf(item->type, "geometry( %255[^ )] )%n", crs_buf, &end_pos);
+    if (matched != 1 || end_pos < 0 || item->type[end_pos] != '\0') {
+      printf("[ERROR] Invalid geometry type: %s\n", item->type);
+      return 0;
+    }
+    KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
+    visit_res = visit_field_geometry(state, name, crs, item->is_nullable, &metadata, allocate_error);
+  } else if (strncmp(item->type, "geography(", 10) == 0) {
+    char crs_buf[256];
+    char algorithm_buf[64];
+    int end_pos = -1;
+    int matched = sscanf(
+      item->type, "geography( %255[^ ,)] , %63[^ ,)] )%n", crs_buf, algorithm_buf, &end_pos);
+    if (matched != 2 || end_pos < 0 || item->type[end_pos] != '\0') {
+      printf("[ERROR] Invalid geography type: %s\n", item->type);
+      return 0;
+    }
+    KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
+    KernelStringSlice algorithm = { algorithm_buf, strlen(algorithm_buf) };
+    visit_res = visit_field_geography(
+      state, name, crs, algorithm, item->is_nullable, &metadata, allocate_error);
+#endif
   } else if (strncmp(item->type, "decimal", 7) == 0) {
     unsigned int precision;
     int scale;
