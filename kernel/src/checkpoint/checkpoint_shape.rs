@@ -18,6 +18,7 @@ use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
+use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
@@ -274,6 +275,7 @@ fn collect_single_sidecar(
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
     }?
+    .filter(col!(SIDECAR_NAME).is_not_null())?
     .build()?;
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
 
@@ -305,14 +307,14 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
 
-    /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
-    /// performs.
+    /// Counts I/O operations and verifies that sidecar discovery queries filter out null actions.
     struct CountingExecutor {
         inner: SyncPlanExecutor,
         query_scans: AtomicUsize,
@@ -332,7 +334,14 @@ mod tests {
     impl PlanExecutor for CountingExecutor {
         fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
             match &op {
-                Operation::QueryPlan(_) => _ = self.query_scans.fetch_add(1, Ordering::Relaxed),
+                Operation::QueryPlan(plan) => {
+                    let predicate = plan.nodes.iter().find_map(|node| match &node.op {
+                        Operator::Filter(filter) => Some(filter.predicate.as_ref()),
+                        _ => None,
+                    });
+                    assert_eq!(predicate, Some(&col!(SIDECAR_NAME).is_not_null()));
+                    _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
+                }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {
                     _ = self.footer_reads.fetch_add(1, Ordering::Relaxed)
                 }
@@ -391,7 +400,7 @@ mod tests {
         #[case] expect_parsed: Option<bool>,
     ) {
         let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
-        let exec = SyncPlanExecutor::default();
+        let exec = CountingExecutor::new();
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
         let shape = if stats_schema.is_some() {
