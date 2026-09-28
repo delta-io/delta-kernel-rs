@@ -192,7 +192,7 @@ pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{
-    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, KernelError, KernelResult,
+    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error, KernelError, KernelResult,
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};

@@ -13,6 +13,16 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+/// An error returned by a Delta Kernel operation.
+#[derive(Debug, thiserror::Error)]
+// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+#[non_exhaustive]
+pub enum Error {
+    /// A failure represented by a kernel implementation error.
+    #[error(transparent)]
+    Kernel(KernelError),
+}
+
 /// Details of a failed conversion from a scalar into a Rust value.
 ///
 /// Conversion code adds path elements as an error unwinds, producing a path from the outermost
