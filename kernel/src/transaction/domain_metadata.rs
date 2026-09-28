@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
-use super::{EngineDataResultIterator, Transaction};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
+use super::Transaction;
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::KernelError;
 use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{create_row, Engine, KernelResult};
+use crate::{Engine, KernelResult};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -191,33 +191,22 @@ impl<S> Transaction<S> {
             .collect())
     }
 
-    /// Generate domain metadata actions with validation. Handle both user and system domains.
+    /// Generates domain metadata actions (assumes domain metadata operations have already
+    /// been validated)
     ///
-    /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
-    /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
-    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
-    ///   powers CRC file writes.
+    /// Incorporates the calculated row-tracking high-water mark and returns the domain changes
+    /// for action encoding, commit metadata, and the post-commit
+    /// [`CrcDelta`](crate::crc::CrcDelta). Returns an error if a provided high-water mark is
+    /// below the calculated value or if domain state cannot be read.
     ///
     /// This function may perform an expensive log replay operation if there are any domain
     /// removals. The log replay is required to fetch the previous configuration value for the
     /// domain to preserve in removal tombstones as mandated by the Delta spec.
-    pub(super) fn generate_domain_metadata_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    pub(super) fn generate_domain_metadata_actions(
+        &self,
+        engine: &dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> KernelResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
-        let is_create = self.is_create_table();
-
-        // Validate domain operations (includes feature validation)
-        self.validate_domain_metadata_operations()?;
-
-        if is_create {
-            // user_domain_removals already validated above, but be explicit
-            debug_assert!(self.user_domain_removals.is_empty());
-        }
-
-        // Generate removal actions (empty for create-table due to validation above)
+    ) -> KernelResult<Vec<DomainMetadata>> {
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
         let row_tracking_high_watermark =
@@ -256,14 +245,6 @@ impl<S> Transaction<S> {
             .chain(removal_actions)
             .collect();
 
-        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
-
-        let dm_actions_iter: Vec<_> = dm_actions_vec
-            .iter()
-            .cloned()
-            .map(|dm| create_row(engine, schema.clone(), dm))
-            .collect();
-
-        Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))
+        Ok(dm_actions_vec)
     }
 }
