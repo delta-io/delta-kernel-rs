@@ -40,6 +40,47 @@ pub trait SnapshotState {
     ) -> DeltaResult<()>;
 }
 
+/// Immutable snapshot inputs needed to resolve its transaction-log segment.
+///
+/// This narrower capability lets connectors supply planning state without materializing protocol,
+/// metadata, CRC, or table schemas. Implementations must describe the same immutable generation
+/// for every call.
+pub trait SnapshotLogState {
+    fn table_root(&self) -> &Url;
+    fn version(&self) -> Version;
+    fn is_latest(&self) -> bool;
+    fn last_checkpoint(&self) -> DeltaResult<Option<LastCheckpointHint>>;
+    fn visit_log_paths(
+        &self,
+        visitor: &mut dyn FnMut(&[LogPath]) -> DeltaResult<()>,
+    ) -> DeltaResult<()>;
+}
+
+impl<T: SnapshotState + ?Sized> SnapshotLogState for T {
+    fn table_root(&self) -> &Url {
+        SnapshotState::table_root(self)
+    }
+
+    fn version(&self) -> Version {
+        SnapshotState::version(self)
+    }
+
+    fn is_latest(&self) -> bool {
+        SnapshotState::is_latest(self)
+    }
+
+    fn last_checkpoint(&self) -> DeltaResult<Option<LastCheckpointHint>> {
+        SnapshotState::last_checkpoint(self)
+    }
+
+    fn visit_log_paths(
+        &self,
+        visitor: &mut dyn FnMut(&[LogPath]) -> DeltaResult<()>,
+    ) -> DeltaResult<()> {
+        SnapshotState::visit_log_paths(self, visitor)
+    }
+}
+
 impl SnapshotState for Snapshot {
     fn table_root(&self) -> &Url {
         self.table_root()
@@ -118,7 +159,9 @@ impl Snapshot {
 }
 
 /// Resolve borrowed log paths into the segment needed by scan planning and handoff validation.
-pub(crate) fn log_segment_from_state(state: &dyn SnapshotState) -> DeltaResult<LogSegment> {
+pub(crate) fn log_segment_from_state<S: SnapshotLogState + ?Sized>(
+    state: &S,
+) -> DeltaResult<LogSegment> {
     let mut paths: Vec<ParsedLogPath> = Vec::new();
     state.visit_log_paths(&mut |batch| {
         paths.extend(batch.iter().cloned().map(Into::into));

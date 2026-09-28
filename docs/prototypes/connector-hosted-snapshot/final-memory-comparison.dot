@@ -1,0 +1,25 @@
+digraph memory {
+  graph [bgcolor="white", pad="0.25", rankdir="LR",
+         label="Matched p100 Rust memory medians (MB)", labelloc="t",
+         fontsize="22", fontname="DejaVu Sans"];
+  node [shape=plain, fontname="DejaVu Sans"];
+  chart [label=<
+    <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="10" CELLPADDING="5">
+      <TR><TD ALIGN="RIGHT">Construction peak</TD>
+        <TD BGCOLOR="#7aa6c2" WIDTH="430" ALIGN="RIGHT">Baseline 4,272.95</TD>
+        <TD BGCOLOR="#78b79f" WIDTH="65" ALIGN="LEFT">Candidate 65.09</TD></TR>
+      <TR><TD ALIGN="RIGHT">Retained between calls</TD>
+        <TD BGCOLOR="#7aa6c2" WIDTH="430" ALIGN="RIGHT">Baseline 4,272.76</TD>
+        <TD BGCOLOR="#78b79f" WIDTH="30" ALIGN="LEFT">Candidate 0.741</TD></TR>
+      <TR><TD ALIGN="RIGHT">Incremental scan peak</TD>
+        <TD BGCOLOR="#7aa6c2" WIDTH="188" ALIGN="RIGHT">Baseline 1,865.34</TD>
+        <TD BGCOLOR="#78b79f" WIDTH="38" ALIGN="LEFT">Candidate 4.30</TD></TR>
+      <TR><TD ALIGN="RIGHT">Overall peak</TD>
+        <TD BGCOLOR="#7aa6c2" WIDTH="620" ALIGN="RIGHT">Baseline 6,138.10</TD>
+        <TD BGCOLOR="#78b79f" WIDTH="65" ALIGN="LEFT">Candidate 65.09</TD></TR>
+      <TR><TD COLSPAN="3" ALIGN="LEFT"><FONT POINT-SIZE="11">
+        Bars use a common linear scale with minimum label width; values are authoritative.
+      </FONT></TD></TR>
+    </TABLE>
+  >];
+}

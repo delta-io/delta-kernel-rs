@@ -1,0 +1,19 @@
+digraph latency {
+  graph [bgcolor="white", pad="0.25", rankdir="LR",
+         label="Matched p100 median latency (ms)", labelloc="t",
+         fontsize="22", fontname="DejaVu Sans"];
+  node [shape=plain, fontname="DejaVu Sans"];
+  chart [label=<
+    <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="10" CELLPADDING="5">
+      <TR><TD ALIGN="RIGHT">Snapshot load</TD>
+        <TD BGCOLOR="#7aa6c2" WIDTH="385" ALIGN="RIGHT">Baseline 21,354</TD>
+        <TD BGCOLOR="#78b79f" WIDTH="623" ALIGN="RIGHT">Candidate 34,592 (+62%)</TD></TR>
+      <TR><TD ALIGN="RIGHT">Plan 1,107 scans</TD>
+        <TD BGCOLOR="#7aa6c2" WIDTH="232" ALIGN="RIGHT">Baseline 2,319</TD>
+        <TD BGCOLOR="#78b79f" WIDTH="94" ALIGN="RIGHT">Candidate 937 (-59.6%)</TD></TR>
+      <TR><TD COLSPAN="3" ALIGN="LEFT"><FONT POINT-SIZE="11">
+        Load and plan rows use separate linear scales. Three isolated repeats per mode.
+      </FONT></TD></TR>
+    </TABLE>
+  >];
+}

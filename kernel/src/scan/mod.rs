@@ -43,7 +43,7 @@ use crate::schema::{
     StructField, StructType, ToSchema as _,
 };
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
-use crate::snapshot::{log_segment_from_state, SnapshotState};
+use crate::snapshot::{log_segment_from_state, SnapshotLogState, SnapshotState};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
@@ -110,7 +110,7 @@ impl ValidatedMetadataScan {
     #[internal_api]
     pub(crate) fn plan(
         &self,
-        state: &dyn SnapshotState,
+        state: &dyn SnapshotLogState,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Plan>> {
         if state.table_root() != &self.table_root

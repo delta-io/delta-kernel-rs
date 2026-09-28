@@ -58,7 +58,7 @@ use snapshot_crc::SnapshotCrc;
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
 pub(crate) use state::log_segment_from_state;
 #[cfg(feature = "internal-api")]
-pub use state::SnapshotState;
+pub use state::{SnapshotLogState, SnapshotState};
 
 pub use crate::error::SnapshotHintError;
 
