@@ -96,10 +96,16 @@ commit actions, and delegates the atomic commit to a `Committer`.
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
   updates, table creation (including clustered tables via `DataLayout`), and limited schema
-  evolution
+  evolution and full-table schema overwrite
 - **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` for
   filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
   for catalog-managed tables (staging, ratifying, publishing).
+
+`Snapshot::overwrite(schema, partition_columns).build(engine, committer)` stages all active files
+for removal and supplies write state for the replacement schema. Retained logical field paths keep
+their column-mapping IDs and physical names. It preserves the protocol and table properties;
+CDF and append-only must be disabled. Catalog committers must accept metadata updates. A version
+conflict is returned without rebasing the overwrite onto a newer snapshot.
 
 ## Engine Trait System
 

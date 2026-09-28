@@ -37,7 +37,7 @@ use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
-use crate::transaction::Transaction;
+use crate::transaction::{OverwriteTableTransactionBuilder, Transaction};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
@@ -1031,6 +1031,21 @@ impl Snapshot {
     /// [`AlterTableTransaction`]: crate::transaction::AlterTableTransaction
     pub fn alter_table(self: Arc<Self>) -> AlterTableTransactionBuilder {
         AlterTableTransactionBuilder::new(self)
+    }
+
+    /// Creates a builder to atomically replace this table's schema, partitioning, and all data.
+    ///
+    /// `schema` is the complete replacement schema. `partition_columns` is the complete list of
+    /// top-level logical partition column names; an empty list makes the table unpartitioned.
+    /// Retained fields keep their column-mapping identities. The table's protocol and mapping
+    /// mode do not change. Validation and enumeration of the old files happen during
+    /// [`build`](OverwriteTableTransactionBuilder::build), before replacement data is written.
+    pub fn overwrite(
+        self: Arc<Self>,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+    ) -> OverwriteTableTransactionBuilder {
+        OverwriteTableTransactionBuilder::new(self, schema, partition_columns)
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

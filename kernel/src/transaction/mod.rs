@@ -71,9 +71,12 @@ pub(crate) mod data_layout;
 
 pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
+pub use builder::overwrite_table::OverwriteTableTransactionBuilder;
 mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
+mod overwrite;
+pub use overwrite::OverwriteTableTransaction;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
@@ -178,6 +181,12 @@ pub struct CreateTable;
 #[derive(Debug)]
 pub struct AlterTable;
 
+/// Marker type for full-table schema overwrite transactions.
+///
+/// Kernel stages all removals; callers can only add replacement files.
+#[derive(Debug)]
+pub struct OverwriteTable;
+
 /// Marker trait for transaction states that support data file operations.
 ///
 /// Only transaction types that implement this trait can access methods for adding, removing, or
@@ -186,6 +195,7 @@ pub struct AlterTable;
 pub trait SupportsDataFiles {}
 impl SupportsDataFiles for ExistingTable {}
 impl SupportsDataFiles for CreateTable {}
+impl SupportsDataFiles for OverwriteTable {}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -195,6 +205,7 @@ impl SupportsDataFiles for CreateTable {}
 /// - [`ExistingTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
+/// - [`OverwriteTable`]: Full replacement of schema and data (see [`OverwriteTableTransaction`]).
 ///
 /// # Examples
 ///
@@ -220,9 +231,9 @@ pub struct Transaction<S = ExistingTable> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether this commit creates or changes the protocol.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether this commit creates or changes table metadata.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: Option<String>,
@@ -250,6 +261,7 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    full_overwrite: bool,
     // TODO(#2499): Replace this state when Conntector responsibilities encode column-default
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
@@ -371,6 +383,11 @@ impl<S> Transaction<S> {
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
+
+        require!(
+            !self.full_overwrite || self.data_change,
+            Error::invalid_transaction_state("Full-table overwrite requires dataChange = true")
+        );
 
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.

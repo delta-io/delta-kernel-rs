@@ -10,6 +10,7 @@ mod domain_metadata;
 mod ict;
 mod interval;
 mod nested_field_ids;
+mod overwrite;
 mod partitioned;
 mod post_commit;
 mod relative_paths;
