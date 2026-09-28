@@ -3,13 +3,17 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Array, BinaryArray, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, AsArray as _, BinaryArray, BooleanArray, Datum, RecordBatch, StringArray,
+    StructArray,
 };
-use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::compute::kernels::zip::zip;
+use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::PartitionValuesOptions;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
@@ -19,7 +23,8 @@ use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{partitioned, version_latest, FeatureSet, LogState, TableConfig};
 use test_utils::{
     add_commit, create_default_engine_mt_executor, get_column,
-    install_thread_local_metrics_reporter, test_context, CountingReporter,
+    install_thread_local_metrics_reporter, record_batch_to_bytes_with_props, test_context,
+    CountingReporter,
 };
 use url::Url;
 
@@ -152,8 +157,7 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
 //
 // The kernel never persists a literal "" partition value (it serializes its own empty and null
 // partition values to JSON null on write), so these tests stand in a raw-JSON foreign writer that
-// did, then assert the kernel reconstructs `partitionValues_parsed` with the empty-string cast: ""
-// stays "" for string, becomes empty bytes for binary, and becomes null for every other type.
+// did, then assert the kernel reads "" as null for every type, as the Delta protocol requires.
 
 /// Writes a foreign-writer table under `table_path`: protocol + metadata declaring string, binary,
 /// and integer partition columns (with `writeStatsAsStruct` enabled so a checkpoint writes its own
@@ -220,18 +224,93 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
     .to_string()
 }
 
+/// Where a scan of a foreign-writer table reads its partition values from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LogSource {
+    Commits,
+    /// A kernel-written checkpoint, whose native `partitionValues_parsed` holds null for "".
+    KernelCheckpoint,
+    /// A checkpoint whose native STRING and BINARY partition values hold a foreign writer's
+    /// literal "", with one action per row group so checkpoint row-group skipping sees each value.
+    ForeignCheckpoint,
+}
+
+/// Checkpoints the table at `table_path` according to `source`.
+fn checkpoint_table(table_path: &std::path::Path, url: &Url, source: LogSource) {
+    if source == LogSource::Commits {
+        return;
+    }
+    let engine = create_default_engine_mt_executor(url).unwrap();
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    if source == LogSource::KernelCheckpoint {
+        return;
+    }
+
+    let log_dir = table_path.join("_delta_log");
+    let checkpoint_path = log_dir.join(format!("{:020}.checkpoint.parquet", snapshot.version()));
+    let file = std::fs::File::open(&checkpoint_path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
+    let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+    // Replace every null native STRING and BINARY value of an Add with "".
+    let actions = StructArray::from(batch);
+    let add = actions.column_by_name("add").unwrap().as_struct();
+    let parsed = add
+        .column_by_name("partitionValues_parsed")
+        .unwrap()
+        .as_struct();
+    let fill = |name: &str, empty: &dyn Datum| {
+        let values = parsed.column_by_name(name).unwrap();
+        let is_empty = BooleanArray::from_iter(
+            (0..add.len()).map(|row| Some(add.is_valid(row) && values.is_null(row))),
+        );
+        zip(&is_empty, empty, values).unwrap()
+    };
+    let parsed = with_field(parsed, "p_str", fill("p_str", &StringArray::new_scalar("")));
+    let parsed = with_field(
+        &parsed,
+        "p_bin",
+        fill("p_bin", &BinaryArray::new_scalar(b"")),
+    );
+    let add = with_field(add, "partitionValues_parsed", Arc::new(parsed));
+    let batch = RecordBatch::from(with_field(&actions, "add", Arc::new(add)));
+
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    std::fs::write(
+        &checkpoint_path,
+        record_batch_to_bytes_with_props(&batch, props),
+    )
+    .unwrap();
+    std::fs::remove_file(log_dir.join("_last_checkpoint")).unwrap();
+}
+
+/// Returns `array` with its `name` child replaced by `value`.
+fn with_field(array: &StructArray, name: &str, value: ArrayRef) -> StructArray {
+    let (fields, mut columns, nulls) = array.clone().into_parts();
+    columns[fields.find(name).unwrap().0] = value;
+    StructArray::new(fields, columns, nulls)
+}
+
 /// A foreign writer can persist a literal "" in the `partitionValues` map. On read, kernel
-/// reconstructs `partitionValues_parsed` with the empty-string cast: "" stays "" for string,
-/// becomes empty bytes for binary, and becomes null for every other type.
-///
-/// The result is identical whether the value is reconstructed from the `partitionValues` map (JSON
-/// commit) or read from a kernel-written checkpoint's native `partitionValues_parsed` column: the
-/// checkpoint reconstructs that column with the same cast, so a checkpoint never changes the value
-/// a scan surfaces. The `native_checkpoint` axis exercises both sources.
+/// reconstructs every such `partitionValues_parsed` field as null from every [`LogSource`].
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_partition_values_read_foreign_empty_string(
-    #[values(false, true)] native_checkpoint: bool,
+    #[values(
+        LogSource::Commits,
+        LogSource::KernelCheckpoint,
+        LogSource::ForeignCheckpoint
+    )]
+    source: LogSource,
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("foreign-empty-string");
@@ -245,14 +324,8 @@ async fn parsed_partition_values_read_foreign_empty_string(
         )],
     )
     .await;
+    checkpoint_table(&table_path, &url, source);
     let engine = create_default_engine_mt_executor(&url).unwrap();
-
-    if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
-    }
 
     // Confirm the scan reads from the intended source: the checkpoint axis must actually place a
     // checkpoint in the snapshot's log segment (and the non-checkpoint axis must not), otherwise a
@@ -264,8 +337,8 @@ async fn parsed_partition_values_read_foreign_empty_string(
         .unwrap();
     assert_eq!(
         reporter.checkpoint_files.get(),
-        u64::from(native_checkpoint),
-        "log segment checkpoint parts must match native_checkpoint={native_checkpoint}"
+        u64::from(source != LogSource::Commits),
+        "log segment checkpoint parts must match {source:?}"
     );
     let scan = snapshot
         .scan_builder()
@@ -279,45 +352,35 @@ async fn parsed_partition_values_read_foreign_empty_string(
         let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
         let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
         let pv = get_column!(batch, "partitionValues_parsed", StructArray);
-
-        let p_str = pv.column_by_name("p_str").unwrap();
-        let p_str = p_str.as_any().downcast_ref::<StringArray>().unwrap();
-        let p_bin = pv.column_by_name("p_bin").unwrap();
-        let p_bin = p_bin.as_any().downcast_ref::<BinaryArray>().unwrap();
-        let p_int = pv.column_by_name("p_int").unwrap();
-        let p_int = p_int.as_any().downcast_ref::<Int32Array>().unwrap();
-
-        // Identical whether read from the map (JSON commit) or the checkpoint's native column.
-        assert!(!p_str.is_null(0), "string \"\" reconstructs as \"\"");
-        assert_eq!(p_str.value(0), "");
-        assert!(!p_bin.is_null(0), "binary \"\" reconstructs as empty bytes");
-        assert_eq!(p_bin.value(0), b"");
-        assert!(p_int.is_null(0), "non-string \"\" must be null");
+        for name in ["p_str", "p_bin", "p_int"] {
+            assert!(
+                pv.column_by_name(name).unwrap().is_null(0),
+                "{name} \"\" must be null"
+            );
+        }
 
         asserted_rows += batch.num_rows();
     }
-    assert_eq!(
-        asserted_rows, 1,
-        "expected exactly one file (native_checkpoint={native_checkpoint})"
-    );
+    assert_eq!(asserted_rows, 1, "expected exactly one file ({source:?})");
 }
 
 fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
     paths.push(scan_file.path);
 }
 
-/// A file whose partition value is a foreign literal "" is a real empty value, not null, so
-/// partition skipping treats it accordingly:
-/// - `p_str = ''` keeps it and `p_str = 'other'` prunes it.
-/// - `p_str IS NULL` prunes it and `p_str IS NOT NULL` keeps it (the value is "", not null).
-/// - the same holds for the binary column (`p_bin`), whose "" reconstructs as empty bytes.
-///
-/// The `native_checkpoint` axis exercises that pruning is identical before and after a kernel
-/// checkpoint: the checkpoint reconstructs the same "" into its native `partitionValues_parsed`
-/// column, so skipping keeps and prunes the same files a scan of the JSON commit would.
+/// A file whose partition value is a foreign literal "" has a null partition value, so partition
+/// skipping prunes it under an equality with any literal (including `''`) and under `IS NOT NULL`,
+/// and keeps it under `IS NULL`, from every [`LogSource`].
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint: bool) {
+async fn empty_string_partition_pruning(
+    #[values(
+        LogSource::Commits,
+        LogSource::KernelCheckpoint,
+        LogSource::ForeignCheckpoint
+    )]
+    source: LogSource,
+) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("empty-string-pruning");
     let url = write_foreign_partition_table(
@@ -328,14 +391,8 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         ],
     )
     .await;
+    checkpoint_table(&table_path, &url, source);
     let engine = create_default_engine_mt_executor(&url).unwrap();
-
-    if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
-    }
 
     let surviving = |predicate: Predicate| -> Vec<String> {
         let snapshot = Snapshot::builder_for(url.clone())
@@ -357,37 +414,31 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         paths
     };
 
-    let empty = "p_str=/empty.parquet".to_string();
-    let other = "p_str=other/other.parquet".to_string();
-    let both = vec![empty.clone(), other.clone()];
+    let empty = vec!["p_str=/empty.parquet".to_string()];
+    let other = vec!["p_str=other/other.parquet".to_string()];
 
-    // The empty-string value is a real "", so equality and null predicates treat it as such.
-    assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit(""))),
-        vec![empty.clone()],
-        "empty-string file must be kept under p_str = ''"
+    assert!(
+        surviving(Predicate::eq(col!("p_str"), lit(""))).is_empty(),
+        "null partition file must be pruned under p_str = ''"
     );
     assert_eq!(
         surviving(Predicate::eq(col!("p_str"), lit("other"))),
-        vec![other.clone()],
-        "empty-string file must be pruned under p_str = 'other'"
+        other,
+        "null partition file must be pruned under p_str = 'other'"
     );
-    // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
-    // keeps both.
-    assert!(
-        surviving(Predicate::is_null(col!("p_str"))).is_empty(),
-        "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"
+    assert_eq!(
+        surviving(Predicate::is_null(col!("p_str"))),
+        empty,
+        "null partition file must be kept under p_str IS NULL"
     );
     assert_eq!(
         surviving(Predicate::is_not_null(col!("p_str"))),
-        both,
-        "both files must be kept under p_str IS NOT NULL"
+        other,
+        "null partition file must be pruned under p_str IS NOT NULL"
     );
-
-    // The binary column reconstructs "" as empty bytes, pruned the same way.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
-        vec![other.clone()],
-        "empty-bytes file must be pruned under p_bin = X'6f74686572'"
+        surviving(Predicate::is_null(col!("p_bin"))),
+        empty,
+        "null partition file must be kept under p_bin IS NULL"
     );
 }

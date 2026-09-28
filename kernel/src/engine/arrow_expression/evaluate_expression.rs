@@ -936,16 +936,15 @@ fn coalesce_arrays(
 
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
-/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` applies only to `TIMESTAMP` values without an embedded offset or named
-/// timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
+/// An empty string is null for every type. `timestamp_timezone` applies only to `TIMESTAMP` values
+/// without an embedded offset or named timezone; it does not affect `DATE` or `TIMESTAMP_NTZ`.
 fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
     timestamp_timezone: TimestampTimezone,
 ) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
-        return Ok(prim.empty_string_partition_cast());
+        return Ok(None);
     }
     match prim {
         PrimitiveType::Date => {
@@ -973,9 +972,9 @@ fn parse_partition_scalar(
 }
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
-/// and parses each value into its target type, producing a `StructArray`. An empty-string value
-/// casts via [`PrimitiveType::empty_string_partition_cast`].
-/// `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset or named timezone.
+/// and parses each value into its target type, producing a `StructArray`. An empty-string value is
+/// null for every type. `timestamp_timezone` controls `TIMESTAMP` values without an embedded offset
+/// or named timezone.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -3146,10 +3145,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// An empty-string map value casts via `empty_string_partition_cast`: `""` for string, empty
-    /// bytes for binary, and null for every other type.
     #[test]
-    fn test_map_to_struct_empty_string_cast_semantics() {
+    fn test_map_to_struct_empty_strings_are_null() {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("region");
         builder.values().append_value("");
@@ -3176,29 +3173,9 @@ mod tests {
         let expr = Expr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
-
-        let regions = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!(!regions.is_null(0));
-        assert_eq!(regions.value(0), "");
-
-        let blobs = structs
-            .column(1)
-            .as_any()
-            .downcast_ref::<crate::arrow::array::BinaryArray>()
-            .unwrap();
-        assert!(!blobs.is_null(0));
-        assert_eq!(blobs.value(0), b"");
-
-        let counts = structs
-            .column(2)
-            .as_any()
-            .downcast_ref::<crate::arrow::array::Int32Array>()
-            .unwrap();
-        assert!(counts.is_null(0));
+        for column in structs.columns() {
+            assert!(column.is_null(0), "{column:?}");
+        }
     }
 
     #[test]
