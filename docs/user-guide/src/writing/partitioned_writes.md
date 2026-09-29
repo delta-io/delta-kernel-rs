@@ -6,7 +6,7 @@ commit. Kernel validates partition values, serializes them per the Delta protoco
 and constructs the correct directory paths.
 
 Before reading this page, make sure you understand
-[Appending Data](./append.md) and
+[Appending Data](./DML/append.md) and
 [Creating a Table](./create_table.md#partitioned-tables).
 
 ## How partitioned writes differ
@@ -180,7 +180,7 @@ prefixes to prevent S3 hotspots.
 
 ## What's next
 
-- [Appending Data](./append.md) covers the general write flow, commit handling, and
+- [Appending Data](./DML/append.md) covers the general write flow, commit handling, and
   blind appends.
 - [Creating a Table](./create_table.md#partitioned-tables) covers creating partitioned
   tables.

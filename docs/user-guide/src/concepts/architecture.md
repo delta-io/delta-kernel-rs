@@ -172,7 +172,7 @@ match txn.commit(&engine)? {
 
 The `file_metadata` argument is an `EngineData` batch that matches
 `txn.add_files_schema()`, not raw file paths. See
-[Appending data](../writing/append.md) for the full pattern, including how to
+[Appending data](../writing/DML/append.md) for the full pattern, including how to
 build that batch from Parquet write results.
 
 > [!NOTE]
@@ -287,4 +287,4 @@ The project is organized into several crates:
 ## See also
 
 - [Schema and Types](./schema_and_types.md) for Kernel's type system.
-- [Appending Data](../writing/append.md) for a complete write example.
+- [Appending Data](../writing/DML/append.md) for a complete write example.

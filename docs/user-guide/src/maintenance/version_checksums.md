@@ -151,4 +151,4 @@ file on the next commit so subsequent snapshots have stats available.
 
 - [Checkpointing](./checkpointing.md) for compacting the transaction log into
   Parquet
-- [Appending Data](../writing/append.md) for the full write and commit flow
+- [Appending Data](../writing/DML/append.md) for the full write and commit flow

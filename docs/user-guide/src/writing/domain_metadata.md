@@ -10,7 +10,7 @@ flags, or custom configuration that should travel with the table and survive
 across sessions.
 
 Before reading this page, make sure you understand
-[Appending Data](./append.md) and how transactions work.
+[Appending Data](./DML/append.md) and how transactions work.
 
 ## Writing domain metadata
 
@@ -171,7 +171,7 @@ apply:
 
 - [Idempotent Writes](./idempotent_writes.md) covers `SetTransaction` actions
   for at-most-once write guarantees
-- [Appending Data](./append.md) explains the full write flow for adding data
+- [Appending Data](./DML/append.md) explains the full write flow for adding data
   files to a table
 - [Creating a Table](./create_table.md) shows how to set domain metadata during
   table creation

@@ -1,9 +1,9 @@
 # Appending Data
 
 To append data to an existing Delta table, you create a `Transaction` from a
-[Snapshot](../concepts/architecture.md#snapshot), write Parquet files through the engine, register them,
+[Snapshot](../../concepts/architecture.md#snapshot), write Parquet files through the engine, register them,
 and commit. For a quick end-to-end example that creates a table and writes data, see
-[Quick Start: Writing a Table](../getting_started/quick_start_write.md).
+[Quick Start: Writing a Table](../../getting_started/quick_start_write.md).
 
 ## The write flow
 
@@ -143,7 +143,7 @@ Kernel maps each provided logical row-tracking metadata column to the correspond
 column configured on the table. Row Tracking must be enabled when these options are provided.
 
 For partitioned tables, see
-[Writing to Partitioned Tables](./partitioned_writes.md).
+[Writing to Partitioned Tables](../partitioned_writes.md).
 
 `BoundWriteContext` provides:
 
@@ -369,11 +369,11 @@ overwrite existing checksum files.
 > CRC) returns a `ChecksumWriteUnsupported` error.
 
 The post-commit snapshot is the entry point for maintenance operations that should happen
-after a successful write. See [Checkpointing](../maintenance/checkpointing.md) and
-[Catalog-Managed Tables](../catalog_managed/overview.md) for details.
+after a successful write. See [Checkpointing](../../maintenance/checkpointing.md) and
+[Catalog-Managed Tables](../../catalog_managed/overview.md) for details.
 
 ## What's next
 
-- [Writing to Partitioned Tables](./partitioned_writes.md) covers writing data with partition values.
-- [Creating a Table](./create_table.md) covers creating a new table from scratch.
-- [Checkpointing](../maintenance/checkpointing.md) explains when and how to write checkpoints.
+- [Writing to Partitioned Tables](../partitioned_writes.md) covers writing data with partition values.
+- [Creating a Table](../create_table.md) covers creating a new table from scratch.
+- [Checkpointing](../../maintenance/checkpointing.md) explains when and how to write checkpoints.

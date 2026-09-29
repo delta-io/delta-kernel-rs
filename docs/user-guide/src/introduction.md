@@ -64,7 +64,7 @@ column projection. See [Building a Scan](./reading/building_a_scan.md).
 
 **Transaction** writes data to a table. It supports creating tables, blind appends, and
 committing changes atomically. See [Creating a Table](./writing/create_table.md) and
-[Appending Data](./writing/append.md).
+[Appending Data](./writing/DML/append.md).
 
 **CheckpointWriter** compacts the transaction log into a checkpoint for faster reads.
 See [Checkpointing](./maintenance/checkpointing.md).

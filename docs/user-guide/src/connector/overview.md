@@ -157,7 +157,7 @@ Building a connector typically involves these steps:
    - Write Parquet files and register them with the transaction
    - Commit atomically, handling conflicts and retries
    - See [Creating a table](../writing/create_table.md) and
-     [Appending data](../writing/append.md)
+     [Appending data](../writing/DML/append.md)
 
 4. **Handle distribution** (if your engine is distributed):
    - Serialize scan metadata and transaction state to ship to workers
@@ -169,4 +169,4 @@ Building a connector typically involves these steps:
 - [Implementing the Engine trait](./implementing_engine.md): when and how to customize the
   Engine
 - [Building a scan](../reading/building_a_scan.md): the Kernel read API
-- [Appending data](../writing/append.md): the Kernel write API
+- [Appending data](../writing/DML/append.md): the Kernel write API

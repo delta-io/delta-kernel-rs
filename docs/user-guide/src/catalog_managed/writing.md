@@ -66,7 +66,7 @@ let mut txn = snapshot
 
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the
-// [Appending data](../writing/append.md) how-to for the full Parquet-writing flow.
+// [Appending data](../writing/DML/append.md) how-to for the full Parquet-writing flow.
 // This example writes to an unpartitioned table. For a partitioned table, call
 // with_partition_values(...) before build().
 let write_state = txn.write_state()?;
@@ -193,4 +193,4 @@ For a complete Unity Catalog example, see
   your catalog.
 - [Reading catalog-managed tables](./reading.md): how to provide catalog commits for
   snapshot construction.
-- [Appending data](../writing/append.md): the basics of writing data with Kernel.
+- [Appending data](../writing/DML/append.md): the basics of writing data with Kernel.

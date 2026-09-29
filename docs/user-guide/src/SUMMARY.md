@@ -29,10 +29,11 @@
 # Writing Tables
 
 - [Creating a Table](./writing/create_table.md)
-- [Appending Data](./writing/append.md)
-- [Writing to Partitioned Tables](./writing/partitioned_writes.md)
-- [Removing Data](./writing/removing_files.md)
 - [Data Manipulation (DML)](./writing/DML.md)
+  - [Appending Data](./writing/DML/append.md)
+  - [Removing Data](./writing/DML/remove.md)
+  - [OPTIMIZE](./writing/DML/optimize.md)
+- [Writing to Partitioned Tables](./writing/partitioned_writes.md)
 - [Domain Metadata](./writing/domain_metadata.md)
 - [Idempotent Writes](./writing/idempotent_writes.md)
 - [Altering a Table](./writing/alter_table.md)

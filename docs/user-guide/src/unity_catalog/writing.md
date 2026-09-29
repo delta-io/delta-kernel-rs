@@ -111,7 +111,7 @@ let write_context = write_state.write_context_builder().build()?;
 txn.add_files(file_metadata);
 ```
 
-See [Appending Data](../writing/append.md) for the full details on writing
+See [Appending Data](../writing/DML/append.md) for the full details on writing
 Parquet files and registering file metadata.
 
 ## Commit and handle the result
@@ -325,6 +325,6 @@ match txn.commit(&engine)? {
   UC-managed table before you can write to it
 - [Catalog-managed write lifecycle](../catalog_managed/writing.md) for the
   generic commit and publish flow
-- [Appending Data](../writing/append.md) for the details of writing Parquet
+- [Appending Data](../writing/DML/append.md) for the details of writing Parquet
   files and collecting file metadata
 - [Reading UC Tables](./reading.md) for resolving tables and loading snapshots

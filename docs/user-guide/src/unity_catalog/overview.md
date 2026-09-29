@@ -268,7 +268,7 @@ retry model.
 If your tables are not registered in Unity Catalog, you don't need these crates.
 Standard filesystem-managed Delta tables work with Kernel directly. See
 [Building a Scan](../reading/building_a_scan.md) and
-[Appending Data](../writing/append.md) for the non-catalog path.
+[Appending Data](../writing/DML/append.md) for the non-catalog path.
 
 If you use a different catalog (Hive Metastore, AWS Glue, Polaris), you need a
 different catalog client-side component. The generic

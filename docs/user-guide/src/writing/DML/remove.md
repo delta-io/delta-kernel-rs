@@ -2,13 +2,13 @@
 
 To remove data files from an existing Delta table, you scan the table's file
 metadata, select which files to remove, and commit those removals as a
-[Transaction](../concepts/architecture.md#transaction). Kernel tracks removes at
+[Transaction](../../concepts/architecture.md#transaction). Kernel tracks removes at
 file-level granularity. Each removed file produces a **remove action** in the
 Delta **transaction log**.
 
 Before reading this page, make sure you understand
 [Appending Data](./append.md) and
-[Advanced Reads with scan_metadata()](../reading/scan_metadata.md).
+[Advanced Reads with scan_metadata()](../../reading/scan_metadata.md).
 
 ## The remove flow
 
@@ -69,7 +69,7 @@ The underlying data conforms to the schema returned by `scan_row_schema()`:
 
 You don't need to construct this data yourself. The scan produces it for you.
 For full details on working with `scan_metadata()`, see
-[Advanced Reads with scan_metadata()](../reading/scan_metadata.md).
+[Advanced Reads with scan_metadata()](../../reading/scan_metadata.md).
 
 > [!NOTE]
 > If your scan was built with a partition predicate (`Scan::with_predicate`), the
@@ -213,9 +213,9 @@ commit time. If your transaction removes files, do not call
 
 ## What's next
 
-- [Idempotent Writes](./idempotent_writes.md) covers how to make writes
+- [Idempotent Writes](../idempotent_writes.md) covers how to make writes
   safely repeatable.
-- [Domain Metadata](./domain_metadata.md) explains how to attach custom
+- [Domain Metadata](../domain_metadata.md) explains how to attach custom
   metadata to a commit.
-- [Advanced Reads with scan_metadata()](../reading/scan_metadata.md) covers
+- [Advanced Reads with scan_metadata()](../../reading/scan_metadata.md) covers
   the full `scan_metadata()` API used to obtain `FilteredEngineData`.

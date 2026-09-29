@@ -381,6 +381,6 @@ properties.
 
 ## What's next
 
-- [Appending Data](./append.md) to write rows to an existing table
+- [Appending Data](./DML/append.md) to write rows to an existing table
 - [Writing to Partitioned Tables](./partitioned_writes.md) to write data with partition values
 - [Quick Start: Writing a Table](../getting_started/quick_start_write.md) for a complete end-to-end example

@@ -226,4 +226,4 @@ Committed version 1
 ## What's next
 
 - [Creating a Table](../writing/create_table.md) covers table properties, partition columns, and more.
-- [Appending Data](../writing/append.md) covers writing to existing tables and retry logic.
+- [Appending Data](../writing/DML/append.md) covers writing to existing tables and retry logic.

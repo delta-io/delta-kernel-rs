@@ -186,6 +186,6 @@ retrieve the compaction path and data, then write the data to storage.
 ## What's next
 
 - [Version Checksums](./version_checksums.md) for writing CRC files after every commit
-- [Appending Data](../writing/append.md) to learn about writing data and committing
+- [Appending Data](../writing/DML/append.md) to learn about writing data and committing
 - [Catalog-Managed Tables](../catalog_managed/overview.md) to understand publishing
   commits for catalog-managed tables

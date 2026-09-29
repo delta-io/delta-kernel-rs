@@ -92,5 +92,5 @@ the retention window are filtered out by `get_app_id_version()`.
 
 ## What's next
 
-- [Appending data](./append.md) covers the basics of writing data with Kernel
+- [Appending data](./DML/append.md) covers the basics of writing data with Kernel
 - [Checkpointing](../maintenance/checkpointing.md) explains how to write checkpoints after commits

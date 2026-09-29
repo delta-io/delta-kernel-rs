@@ -7,7 +7,7 @@ data files.
 
 Before reading this page, make sure you understand
 [Creating a Table](./create_table.md) and
-[Appending Data](./append.md).
+[Appending Data](./DML/append.md).
 
 ## When to use alter table
 
@@ -128,11 +128,11 @@ time. In particular, the following are not callable on an `AlterTableTransaction
 
 If you need to add data and evolve the schema, run two transactions: an
 alter-table transaction first, then a write transaction against the post-commit
-snapshot. See [Appending Data](./append.md) for the write flow.
+snapshot. See [Appending Data](./DML/append.md) for the write flow.
 
 ## What's next
 
-- [Appending Data](./append.md) walks through writing data to the evolved
+- [Appending Data](./DML/append.md) walks through writing data to the evolved
   table.
 - [Creating a Table](./create_table.md) covers creating a new table with the
   schema you want from the start.
