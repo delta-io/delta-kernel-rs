@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <sys/time.h>
 
 /*
@@ -41,6 +42,18 @@ bool visit_schema_item_metadata(void* metadata, CMetadataMap* state)
   return true;
 }
 
+#ifdef DEFINE_GEO_TYPE_IN_DEV
+// The geo `sscanf` formats in `visit_schema_item` capture everything up to a delimiter, so trim the
+// trailing whitespace they keep and leave the remaining validation to kernel.
+void trim_trailing_whitespace(char* s)
+{
+  size_t len = strlen(s);
+  while (len > 0 && isspace((unsigned char)s[len - 1])) {
+    s[--len] = '\0';
+  }
+}
+#endif
+
 // This function looks at tahe type field in the schema to figure out which visitor to call. It's a
 // bit gross as the schema code is string based, a real implementation would have a more robust way
 // to represent a schema.
@@ -83,11 +96,12 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
   } else if (strncmp(item->type, "geometry(", 9) == 0) {
     char crs_buf[256];
     int end_pos = -1;
-    int matched = sscanf(item->type, "geometry( %255[^ )] )%n", crs_buf, &end_pos);
+    int matched = sscanf(item->type, "geometry( %255[^)])%n", crs_buf, &end_pos);
     if (matched != 1 || end_pos < 0 || item->type[end_pos] != '\0') {
       printf("[ERROR] Invalid geometry type: %s\n", item->type);
       return 0;
     }
+    trim_trailing_whitespace(crs_buf);
     KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
     visit_res = visit_field_geometry(state, name, crs, item->is_nullable, &metadata, allocate_error);
   } else if (strncmp(item->type, "geography(", 10) == 0) {
@@ -95,11 +109,13 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     char algorithm_buf[64];
     int end_pos = -1;
     int matched = sscanf(
-      item->type, "geography( %255[^ ,)] , %63[^ ,)] )%n", crs_buf, algorithm_buf, &end_pos);
+      item->type, "geography( %255[^,)], %63[^)])%n", crs_buf, algorithm_buf, &end_pos);
     if (matched != 2 || end_pos < 0 || item->type[end_pos] != '\0') {
       printf("[ERROR] Invalid geography type: %s\n", item->type);
       return 0;
     }
+    trim_trailing_whitespace(crs_buf);
+    trim_trailing_whitespace(algorithm_buf);
     KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
     KernelStringSlice algorithm = { algorithm_buf, strlen(algorithm_buf) };
     visit_res = visit_field_geography(
