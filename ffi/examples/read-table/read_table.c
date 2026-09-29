@@ -399,9 +399,8 @@ int main(int argc, char* argv[])
       requested_cols = optarg;
       break;
     case 's':
-      // Also print the scan's logical schema (scan_logical_schema) as "Scan schema", after the
-      // table schema that is always printed as "Schema". Useful to check that a schema requested
-      // with -c was honored.
+      // Print the scan's logical schema (scan_logical_schema) as "Scan schema". Useful to check
+      // that a schema requested with -c was honored.
       print_scan_schema = true;
       break;
     case '?':
