@@ -72,7 +72,11 @@ pub(crate) struct LastCheckpointHint {
     ///
     /// Absent and `Unknown` are thus distinct: absence is a known (legacy) checkpoint, whereas an
     /// unrecognized value invalidates the hint.
+    ///
+    /// Skipped on serialize when `None` so a classic hint's wire form is identical whether or not
+    /// the `adaptive-metadata-in-dev` feature is compiled in.
     #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) checkpoint_type: Option<CheckpointType>,
 
     /// For an adaptive-metadata (AMT) checkpoint, the embedded AMT checkpoint info: the manifest
@@ -83,7 +87,11 @@ pub(crate) struct LastCheckpointHint {
     /// either constraint on read: it parses whatever the file contains, so a malformed hint (an
     /// `AdaptiveMetadataTree` type with no `amtCheckpoint`, or both this and `v2_checkpoint`) is
     /// retained as-is rather than rejected.
+    ///
+    /// Skipped on serialize when `None` so a classic hint's wire form is identical whether or not
+    /// the `adaptive-metadata-in-dev` feature is compiled in.
     #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) amt_checkpoint: Option<AmtCheckpoint>,
 }
 
@@ -573,6 +581,29 @@ mod tests {
         assert!(hint.amt_checkpoint.is_none());
     }
 
+    /// A classic hint (no `checkpoint_type` / `amt_checkpoint`) omits both AMT keys on serialize
+    /// rather than emitting `"checkpointType": null` / `"amtCheckpoint": null`, so the wire form is
+    /// identical whether or not the `adaptive-metadata-in-dev` feature is compiled in.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn classic_hint_omits_amt_keys_on_serialize() {
+        let hint = LastCheckpointHint {
+            version: 5,
+            size: 10,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&hint).unwrap();
+        let obj = json.as_object().expect("hint serializes to an object");
+        assert!(
+            !obj.contains_key("checkpointType"),
+            "classic hint must omit checkpointType, got: {json}"
+        );
+        assert!(
+            !obj.contains_key("amtCheckpoint"),
+            "classic hint must omit amtCheckpoint, got: {json}"
+        );
+    }
+
     /// A `checkpointType` value kernel does not recognize parses to `Unknown` rather than failing
     /// the whole-hint parse.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -735,6 +766,10 @@ mod tests {
     /// action, and the JSON serde writes parses back through the log path -- so a rename or
     /// element-shape change on either side is caught. Compared at the typed level (not raw JSON) so
     /// it is robust to the intended null-`tags` emission difference between the two writers.
+    ///
+    /// This exercises only the known element kinds; the two paths intentionally diverge on unknown
+    /// elements (the serde path fails closed, the visitor skips them), which this test does not
+    /// cover.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn checkpoint_action_cross_serializes_between_log_and_hint() -> DeltaResult<()> {

@@ -1387,7 +1387,12 @@ impl LastManifestCommit {
 // Serde is hand-written (see below), not derived: the wire form is the RFC array of tagged element
 // objects (`[{"checkpointMetadata":..}, {"contentRoot":..}, ..]`), not a struct. This is the same
 // shape the EngineData path uses, so the `_last_checkpoint` hint (which serdes this action) and log
-// replay agree. Used by the hint's `AmtCheckpoint.checkpoint` field.
+// replay share the wire form and the enumerated invariants (required singletons, no duplicates,
+// known sidecar `type`, `contentRoot.version <= checkpointMetadata.version`). They intentionally
+// differ on unknown elements: log replay skips a future element kind for forward compatibility (see
+// `visitors::CheckpointElementVisitor::visit`), whereas the serde path fails closed on it (an
+// externally-tagged enum with no catch-all), so a hint carrying one is dropped and the reader falls
+// back to log replay. Used by the hint's `AmtCheckpoint.checkpoint` field.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -1417,7 +1422,10 @@ pub(crate) struct CheckpointAction {
 /// One element of a [`CheckpointAction`]'s serialized array (adaptiveMetadata RFC "Checkpoint
 /// Action"). A checkpoint action serializes as a JSON array of single-key tagged objects, so this
 /// is an externally-tagged enum keyed by the action name, reusing kernel's action structs to yield
-/// the same types as log replay. An unrecognized action key fails the parse.
+/// the same types as log replay. Having no catch-all variant, it fails the parse on an unrecognized
+/// action key -- deliberately fail-closed, unlike the forward-compatible EngineData
+/// [`visitors::CheckpointElementVisitor`], which skips unknown elements. A hint carrying a future
+/// element kind is thus dropped and the reader falls back to log replay.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1500,9 +1508,12 @@ impl Serialize for CheckpointAction {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl<'de> Deserialize<'de> for CheckpointAction {
-    /// Folds the RFC array of tagged elements into a typed action, applying the same checks as the
-    /// EngineData [`visitors::CheckpointVisitor`]: required singletons, no duplicates, known
-    /// sidecar `type`, and the `contentRoot.version <= checkpointMetadata.version` invariant.
+    /// Folds the RFC array of tagged elements into a typed action, applying the same enumerated
+    /// checks as the EngineData [`visitors::CheckpointVisitor`]: required singletons, no
+    /// duplicates, known sidecar `type`, and the `contentRoot.version <=
+    /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
+    /// this path fails closed on an unrecognized element key (see [`CheckpointActionElement`]),
+    /// whereas the visitor skips it for forward compatibility.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let elements = Vec::<CheckpointActionElement>::deserialize(deserializer)?;
         Self::from_elements(elements).map_err(serde::de::Error::custom)
@@ -3381,9 +3392,12 @@ mod tests {
         pub(super) const METADATA: &str = r#"{"metaData":{"id":"id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
     }
 
-    /// The serde fold applies the same checks as the EngineData `CheckpointVisitor`, with identical
-    /// error messages (compare `test_parse_checkpoint_action_errors` in `visitors.rs`): required
-    /// singletons, no duplicates, known sidecar `type`, and the `contentRoot.version` invariant.
+    /// The serde fold applies the same enumerated checks as the EngineData `CheckpointVisitor`,
+    /// with identical error messages (compare `test_parse_checkpoint_action_errors` in
+    /// `visitors.rs`): required singletons, no duplicates, known sidecar `type`, and the
+    /// `contentRoot.version` invariant. Unknown elements are the intended exception -- the
+    /// serde path fails closed on them while the visitor skips them -- and are not covered
+    /// here.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::duplicate_metadata(&[
@@ -3429,6 +3443,29 @@ mod tests {
         assert!(
             err.to_string().contains(expected_msg),
             "expected error containing {expected_msg:?}, got: {err}"
+        );
+    }
+
+    /// The serde path deliberately fails closed on an unrecognized element key, unlike the
+    /// forward-compatible EngineData `CheckpointElementVisitor`, which skips unknown elements. Pins
+    /// that intended asymmetry: an otherwise-valid array carrying a future element kind fails the
+    /// whole-hint parse (so the reader falls back to log replay).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_fails_closed_on_unknown_element() {
+        let array = format!(
+            "[{},{},{},{},{}]",
+            checkpoint_serde_elements::CHECKPOINT_METADATA,
+            checkpoint_serde_elements::CONTENT_ROOT,
+            checkpoint_serde_elements::PROTOCOL,
+            checkpoint_serde_elements::METADATA,
+            r#"{"someNewAction":{"foo":1}}"#,
+        );
+        let err = serde_json::from_str::<CheckpointAction>(&array)
+            .expect_err("unknown element must fail the parse");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected an unknown-variant error, got: {err}"
         );
     }
 }
