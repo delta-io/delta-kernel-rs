@@ -1384,9 +1384,12 @@ impl LastManifestCommit {
 ///   ]
 /// }
 /// ```
+// Serde is hand-written (see below), not derived: the wire form is the RFC array of tagged element
+// objects (`[{"checkpointMetadata":..}, {"contentRoot":..}, ..]`), not a struct. This is the same
+// shape the EngineData path uses, so the `_last_checkpoint` hint (which serdes this action) and log
+// replay agree. Used by the hint's `AmtCheckpoint.checkpoint` field.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct CheckpointAction {
     /// The table version up to which the checkpoint is complete, sourced from the wire
@@ -1400,17 +1403,110 @@ pub(crate) struct CheckpointAction {
     /// The table metadata at the checkpoint version.
     pub(crate) metadata: Metadata,
     /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) transactions: Vec<SetTransaction>,
     /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) domain_metadata: Vec<DomainMetadata>,
     /// `sidecar` entries of type `txn`, referencing spilled [`SetTransaction`] actions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) txn_sidecars: Vec<Sidecar>,
     /// `sidecar` entries of type `domainMetadata`, referencing spilled [`DomainMetadata`] actions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
+}
+
+// === CheckpointAction <-> JSON (RFC array of tagged elements) ===
+
+/// One element of a [`CheckpointAction`]'s serialized array (adaptiveMetadata RFC "Checkpoint
+/// Action"). A checkpoint action serializes as a JSON array of single-key tagged objects, so this
+/// is an externally-tagged enum keyed by the action name, reusing kernel's action structs to yield
+/// the same types as log replay. An unrecognized action key fails the parse.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) enum CheckpointActionElement {
+    CheckpointMetadata(CheckpointMetadata),
+    ContentRoot(ContentRoot),
+    Protocol(Protocol),
+    #[serde(rename = "metaData")]
+    Metadata(Metadata),
+    DomainMetadata(DomainMetadata),
+    Txn(SetTransaction),
+    Sidecar(CheckpointSidecar),
+}
+
+/// A `sidecar` element inside a checkpoint action array. The RFC prefixes the [`Sidecar`] fields
+/// with a `type` discriminator (`"txn"` or `"domainMetadata"`) identifying which action kind the
+/// sidecar spills; [`Sidecar`] itself carries no type, so it is flattened in alongside it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct CheckpointSidecar {
+    /// The action kind this sidecar spills: `"txn"` or `"domainMetadata"`.
+    #[serde(rename = "type")]
+    pub(crate) sidecar_type: String,
+    #[serde(flatten)]
+    pub(crate) sidecar: Sidecar,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Serialize for CheckpointAction {
+    /// Emits the RFC array of tagged elements in the same canonical order as
+    /// `try_into_scalar` (`checkpointMetadata`, `contentRoot`, `protocol`, `metaData`,
+    /// then `txn`, `domainMetadata`, and the `txn`/`domainMetadata` sidecars). Validates first,
+    /// so an invalid action can never be written through serde either.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let checkpoint_metadata = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        };
+        let mut elements = vec![
+            CheckpointActionElement::CheckpointMetadata(checkpoint_metadata),
+            CheckpointActionElement::ContentRoot(self.content_root.clone()),
+            CheckpointActionElement::Protocol(self.protocol.clone()),
+            CheckpointActionElement::Metadata(self.metadata.clone()),
+        ];
+        elements.extend(
+            self.transactions
+                .iter()
+                .cloned()
+                .map(CheckpointActionElement::Txn),
+        );
+        elements.extend(
+            self.domain_metadata
+                .iter()
+                .cloned()
+                .map(CheckpointActionElement::DomainMetadata),
+        );
+        let sidecar_element = |type_str: &str, sidecar: &Sidecar| {
+            CheckpointActionElement::Sidecar(CheckpointSidecar {
+                sidecar_type: type_str.to_string(),
+                sidecar: sidecar.clone(),
+            })
+        };
+        elements.extend(
+            self.txn_sidecars
+                .iter()
+                .map(|s| sidecar_element(SET_TRANSACTION_NAME, s)),
+        );
+        elements.extend(
+            self.domain_metadata_sidecars
+                .iter()
+                .map(|s| sidecar_element(DOMAIN_METADATA_NAME, s)),
+        );
+        elements.serialize(serializer)
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl<'de> Deserialize<'de> for CheckpointAction {
+    /// Folds the RFC array of tagged elements into a typed action, applying the same checks as the
+    /// EngineData [`visitors::CheckpointVisitor`]: required singletons, no duplicates, known
+    /// sidecar `type`, and the `contentRoot.version <= checkpointMetadata.version` invariant.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let elements = Vec::<CheckpointActionElement>::deserialize(deserializer)?;
+        Self::from_elements(elements).map_err(serde::de::Error::custom)
+    }
 }
 
 // === CheckpointAction -> EngineData ===
@@ -1569,6 +1665,70 @@ impl CheckpointAction {
         let mut visitor = visitors::CheckpointVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
+    }
+
+    /// Folds a deserialized RFC array of tagged [`CheckpointActionElement`]s into a checkpoint
+    /// action, mirroring [`visitors::CheckpointVisitor`]: the four required elements are singletons
+    /// (missing or repeated is an error), `txn`/`domainMetadata` are collected, `sidecar` entries
+    /// are split by their `type` (unknown types error), and the assembled action is validated.
+    fn from_elements(elements: Vec<CheckpointActionElement>) -> DeltaResult<Self> {
+        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
+            require!(
+                slot.replace(value).is_none(),
+                KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
+            );
+            Ok(())
+        }
+
+        let mut version = None;
+        let mut content_root = None;
+        let mut protocol = None;
+        let mut metadata = None;
+        let mut transactions = Vec::new();
+        let mut domain_metadata = Vec::new();
+        let mut txn_sidecars = Vec::new();
+        let mut domain_metadata_sidecars = Vec::new();
+        for element in elements {
+            match element {
+                CheckpointActionElement::CheckpointMetadata(cm) => {
+                    set_once(&mut version, cm.version, CHECKPOINT_METADATA_NAME)?
+                }
+                CheckpointActionElement::ContentRoot(cr) => {
+                    set_once(&mut content_root, cr, CONTENT_ROOT_NAME)?
+                }
+                CheckpointActionElement::Protocol(p) => set_once(&mut protocol, p, PROTOCOL_NAME)?,
+                CheckpointActionElement::Metadata(m) => set_once(&mut metadata, m, METADATA_NAME)?,
+                CheckpointActionElement::Txn(t) => transactions.push(t),
+                CheckpointActionElement::DomainMetadata(dm) => domain_metadata.push(dm),
+                CheckpointActionElement::Sidecar(cs) => match cs.sidecar_type.as_str() {
+                    SET_TRANSACTION_NAME => txn_sidecars.push(cs.sidecar),
+                    DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(cs.sidecar),
+                    other => {
+                        return Err(KernelError::generic(format!(
+                            "checkpoint sidecar has unsupported type `{other}`"
+                        )))
+                    }
+                },
+            }
+        }
+
+        let missing = |field: &str| {
+            KernelError::generic(format!(
+                "checkpoint action is missing required `{field}` element"
+            ))
+        };
+        let action = CheckpointAction {
+            version: version.ok_or_else(|| missing(CHECKPOINT_METADATA_NAME))?,
+            content_root: content_root.ok_or_else(|| missing(CONTENT_ROOT_NAME))?,
+            protocol: protocol.ok_or_else(|| missing(PROTOCOL_NAME))?,
+            metadata: metadata.ok_or_else(|| missing(METADATA_NAME))?,
+            transactions,
+            domain_metadata,
+            txn_sidecars,
+            domain_metadata_sidecars,
+        };
+        action.validate()?;
+        Ok(action)
     }
 
     /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
@@ -3152,5 +3312,81 @@ mod tests {
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
         Ok(())
+    }
+
+    /// The hand-written serde folds/expands the RFC array losslessly: an action expands to the
+    /// tagged-element array and folds back to the identical action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_round_trip() {
+        let action = sample_checkpoint_action();
+        let json = serde_json::to_value(&action).unwrap();
+        assert!(json.is_array(), "checkpoint action serializes to an array");
+        let back: CheckpointAction = serde_json::from_value(json).unwrap();
+        assert_eq!(back, action);
+    }
+
+    /// Fully-populated array elements, used to build valid and malformed variants for the serde
+    /// fold-error cases below. Mirrors `checkpoint_elements` in `visitors.rs` so the serde path and
+    /// the EngineData path are checked against the same inputs.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod checkpoint_serde_elements {
+        pub(super) const CHECKPOINT_METADATA: &str = r#"{"checkpointMetadata":{"version":42}}"#;
+        pub(super) const CONTENT_ROOT: &str =
+            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40}}"#;
+        pub(super) const PROTOCOL: &str =
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        pub(super) const METADATA: &str = r#"{"metaData":{"id":"id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
+    }
+
+    /// The serde fold applies the same checks as the EngineData `CheckpointVisitor`, with identical
+    /// error messages (compare `test_parse_checkpoint_action_errors` in `visitors.rs`): required
+    /// singletons, no duplicates, known sidecar `type`, and the `contentRoot.version` invariant.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::duplicate_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+        checkpoint_serde_elements::METADATA,
+    ], "duplicate `metaData` element in checkpoint action")]
+    #[case::duplicate_checkpoint_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CHECKPOINT_METADATA,
+        checkpoint_serde_elements::CONTENT_ROOT, checkpoint_serde_elements::PROTOCOL,
+        checkpoint_serde_elements::METADATA,
+    ], "duplicate `checkpointMetadata` element in checkpoint action")]
+    #[case::missing_protocol(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::METADATA,
+    ], "checkpoint action is missing required `protocol` element")]
+    #[case::missing_content_root(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::PROTOCOL,
+        checkpoint_serde_elements::METADATA,
+    ], "checkpoint action is missing required `contentRoot` element")]
+    #[case::missing_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL,
+    ], "checkpoint action is missing required `metaData` element")]
+    #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
+    #[case::bad_sidecar_type(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+        r#"{"sidecar":{"type":"bogus","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
+    ], "checkpoint sidecar has unsupported type `bogus`")]
+    #[case::content_root_version_too_high(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA,
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+    ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    fn test_checkpoint_action_serde_fold_errors(
+        #[case] elements: &[&str],
+        #[case] expected_msg: &str,
+    ) {
+        let array = format!("[{}]", elements.join(","));
+        let err = serde_json::from_str::<CheckpointAction>(&array)
+            .expect_err("checkpoint action should fail to fold");
+        assert!(
+            err.to_string().contains(expected_msg),
+            "expected error containing {expected_msg:?}, got: {err}"
+        );
     }
 }

@@ -10,7 +10,7 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::ContentRoot;
+use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
@@ -134,13 +134,13 @@ pub(crate) struct AmtCheckpoint {
     /// checkpoint action even when `checkpoint`/`leaves` are omitted.
     pub(crate) manifest_commit_version: Version,
 
-    /// The embedded `checkpoint` action, prefetched alongside the hint, as the RFC's array of
-    /// tagged action entries (see [`CheckpointHintAction`]). `None` when the writer omitted it
-    /// (e.g. to bound write latency); the reader then reads it from the manifest commit. Stored
-    /// as-parsed: this prefetch is an optimization, so it carries no singleton/invariant checks
-    /// (a bad hint is dropped and the reader falls back to log replay).
+    /// The embedded `checkpoint` action, prefetched alongside the hint. Serialized as the RFC's
+    /// array of tagged action entries and folded into a typed [`CheckpointAction`] on parse (see
+    /// its hand-written serde). `None` when the writer omitted it (e.g. to bound write
+    /// latency); the reader then reads it from the manifest commit. A malformed array fails
+    /// the whole-hint parse, which `try_read` drops so the reader falls back to log replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) checkpoint: Option<Vec<CheckpointHintAction>>,
+    pub(crate) checkpoint: Option<CheckpointAction>,
 
     /// The checkpoint's embedded content entries, prefetched alongside the hint. Retained as
     /// untyped [`serde_json::Value`] because a content entry's schema depends on the table's
@@ -151,42 +151,6 @@ pub(crate) struct AmtCheckpoint {
     // follow-up PR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) leaves: Option<Vec<serde_json::Value>>,
-}
-
-/// One element of an [`AmtCheckpoint`]'s `checkpoint` array (adaptiveMetadata RFC "Checkpoint
-/// Action"). A checkpoint action is a JSON array of single-key tagged objects, so this is an
-/// externally-tagged enum keyed by the action name, reusing kernel's action structs to yield the
-/// same types as log replay. Mirrors [`HintAction`] but adds the checkpoint-only `contentRoot` and
-/// `sidecar` element kinds. An unrecognized action key fails the whole-hint parse; `try_read`
-/// swallows that, so the reader falls back to reading the checkpoint.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[internal_api]
-pub(crate) enum CheckpointHintAction {
-    CheckpointMetadata(CheckpointMetadata),
-    ContentRoot(ContentRoot),
-    Protocol(Protocol),
-    #[serde(rename = "metaData")]
-    Metadata(Metadata),
-    DomainMetadata(DomainMetadata),
-    Txn(SetTransaction),
-    Sidecar(CheckpointSidecar),
-}
-
-/// A `sidecar` element inside a checkpoint action array. The RFC prefixes the [`Sidecar`] fields
-/// with a `type` discriminator (`"txn"` or `"domainMetadata"`) identifying which action kind the
-/// sidecar spills; [`Sidecar`] itself carries no type, so it is flattened in alongside it.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[internal_api]
-pub(crate) struct CheckpointSidecar {
-    /// The action kind this sidecar spills: `"txn"` or `"domainMetadata"`.
-    #[serde(rename = "type")]
-    pub(crate) sidecar_type: String,
-    #[serde(flatten)]
-    pub(crate) sidecar: Sidecar,
 }
 
 /// The `v2Checkpoint` object embedded in a `_last_checkpoint` hint for a V2 checkpoint.
@@ -587,20 +551,9 @@ mod tests {
         let amt = hint.amt_checkpoint.expect("amtCheckpoint present");
         assert_eq!(amt.manifest_commit_version, 6);
         let checkpoint = amt.checkpoint.expect("checkpoint present");
-        assert_eq!(checkpoint.len(), 4);
-        assert!(matches!(
-            &checkpoint[0],
-            CheckpointHintAction::CheckpointMetadata(c) if c.version == 7
-        ));
-        assert!(matches!(
-            &checkpoint[1],
-            CheckpointHintAction::ContentRoot(cr) if cr.path == "metadata/root-v7.parquet"
-        ));
-        assert!(matches!(&checkpoint[2], CheckpointHintAction::Protocol(_)));
-        assert!(matches!(
-            &checkpoint[3],
-            CheckpointHintAction::Metadata(m) if m.id() == "tid"
-        ));
+        assert_eq!(checkpoint.version(), 7);
+        assert_eq!(checkpoint.path(), "metadata/root-v7.parquet");
+        assert_eq!(checkpoint.metadata().id(), "tid");
         assert_eq!(amt.leaves.expect("leaves present").len(), 1);
     }
 
@@ -726,8 +679,8 @@ mod tests {
     }
 
     /// A checkpoint action array carrying every element kind -- including repeatable `txn` /
-    /// `domainMetadata` entries and a `sidecar` with its `type` discriminator -- parses each entry
-    /// to its [`CheckpointHintAction`] variant and round-trips unchanged.
+    /// `domainMetadata` entries and a `sidecar` with its `type` discriminator -- folds into a typed
+    /// [`CheckpointAction`] with each entry in the right field, and round-trips unchanged.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn amt_checkpoint_full_action_array_parses_and_round_trips() {
@@ -758,36 +711,29 @@ mod tests {
             .checkpoint
             .as_ref()
             .expect("checkpoint present");
-        assert_eq!(checkpoint.len(), 7);
-        assert!(matches!(
-            &checkpoint[4],
-            CheckpointHintAction::Txn(t) if t.app_id == "app"
-        ));
-        assert!(matches!(
-            &checkpoint[5],
-            CheckpointHintAction::DomainMetadata(dm) if dm.domain() == "d"
-        ));
-        assert!(matches!(
-            &checkpoint[6],
-            CheckpointHintAction::Sidecar(s)
-                if s.sidecar_type == "txn"
-                    && s.sidecar.path == "txn-v7.parquet"
-                    && s.sidecar.size_in_bytes == 42
-        ));
+        assert_eq!(checkpoint.version(), 7);
+        assert_eq!(checkpoint.transactions.len(), 1);
+        assert_eq!(checkpoint.transactions[0].app_id, "app");
+        assert_eq!(checkpoint.domain_metadata.len(), 1);
+        assert_eq!(checkpoint.domain_metadata[0].domain(), "d");
+        assert_eq!(checkpoint.txn_sidecars.len(), 1);
+        assert_eq!(checkpoint.txn_sidecars[0].path, "txn-v7.parquet");
+        assert_eq!(checkpoint.txn_sidecars[0].size_in_bytes, 42);
+        assert!(checkpoint.domain_metadata_sidecars.is_empty());
         let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
         assert_eq!(hint, reparsed);
     }
 
-    /// Cross-check that the Delta-log `CheckpointAction` (de)serializer and the `_last_checkpoint`
-    /// hint's `CheckpointHintAction` serde agree on the RFC checkpoint-action array wire form. A
-    /// `CheckpointAction` serialized by the log path parses through the hint serde, and the hint
-    /// serde's output parses back through the log path to the identical action -- so a rename or
+    /// Cross-check that the Delta-log `CheckpointAction` EngineData (de)serializer and its
+    /// serde (used by the `_last_checkpoint` hint) agree on the RFC checkpoint-action array wire
+    /// form. The action the log path writes as JSON parses back through serde to the identical
+    /// action, and the JSON serde writes parses back through the log path -- so a rename or
     /// element-shape change on either side is caught. Compared at the typed level (not raw JSON) so
     /// it is robust to the intended null-`tags` emission difference between the two writers.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn checkpoint_action_cross_serializes_between_log_and_hint() -> DeltaResult<()> {
-        use crate::actions::CheckpointAction;
+        use crate::actions::ContentRoot;
         use crate::engine::sync::SyncEngine;
         use crate::engine::to_json_bytes;
         use crate::engine_data::FilteredEngineData;
@@ -809,7 +755,7 @@ mod tests {
             domain_metadata_sidecars: vec![Sidecar::new("dm.parquet".to_string(), 3, 4, None)],
         };
 
-        // Log path -> JSON, then extract the `checkpoint` array.
+        // Log path -> JSON array -> serde: folds back to the identical typed action.
         let engine = SyncEngine::new();
         let data = action.clone().into_engine_data(&engine)?;
         let bytes = to_json_bytes(std::iter::once(Ok(
@@ -820,52 +766,15 @@ mod tests {
             .get("checkpoint")
             .expect("checkpoint field present")
             .clone();
+        let from_log: CheckpointAction = serde_json::from_value(array).unwrap();
+        assert_eq!(from_log, action);
 
-        // Log JSON -> hint serde: parses, with each element in the canonical order emitted by the
-        // log path.
-        let hint_actions: Vec<CheckpointHintAction> = serde_json::from_value(array).unwrap();
-        assert_eq!(hint_actions.len(), 8);
-        assert!(matches!(
-            &hint_actions[0],
-            CheckpointHintAction::CheckpointMetadata(c) if c.version == 7
-        ));
-        assert!(matches!(
-            &hint_actions[1],
-            CheckpointHintAction::ContentRoot(cr) if cr.path == "s3://bucket/manifest"
-        ));
-        assert!(matches!(
-            &hint_actions[2],
-            CheckpointHintAction::Protocol(_)
-        ));
-        assert!(matches!(
-            &hint_actions[3],
-            CheckpointHintAction::Metadata(_)
-        ));
-        assert!(matches!(
-            &hint_actions[4],
-            CheckpointHintAction::Txn(t) if t.app_id == "app"
-        ));
-        assert!(matches!(
-            &hint_actions[5],
-            CheckpointHintAction::DomainMetadata(dm) if dm.domain() == "d"
-        ));
-        assert!(matches!(
-            &hint_actions[6],
-            CheckpointHintAction::Sidecar(s)
-                if s.sidecar_type == "txn" && s.sidecar.path == "txn.parquet"
-        ));
-        assert!(matches!(
-            &hint_actions[7],
-            CheckpointHintAction::Sidecar(s)
-                if s.sidecar_type == "domainMetadata" && s.sidecar.path == "dm.parquet"
-        ));
-
-        // Hint serde -> JSON -> log path: reparses to the identical typed action.
-        let array = serde_json::to_value(&hint_actions).unwrap();
+        // serde -> JSON array -> log path: reparses to the identical typed action.
+        let array = serde_json::to_value(&action).unwrap();
         let commit = serde_json::json!({ "checkpoint": array }).to_string();
         let data = parse_json_batch(crate::arrow::array::StringArray::from(vec![commit]));
         let parsed = CheckpointAction::try_new_from_data(data.as_ref())?
-            .expect("checkpoint action should round-trip through the hint serde");
+            .expect("checkpoint action should round-trip through serde");
         assert_eq!(parsed, action);
         Ok(())
     }
