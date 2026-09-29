@@ -43,8 +43,6 @@ bool visit_schema_item_metadata(void* metadata, CMetadataMap* state)
 }
 
 #ifdef DEFINE_GEO_TYPE_IN_DEV
-// The geo `sscanf` formats in `visit_schema_item` capture everything up to a delimiter, so trim the
-// trailing whitespace they keep and leave the remaining validation to kernel.
 void trim_trailing_whitespace(char* s)
 {
   size_t len = strlen(s);
