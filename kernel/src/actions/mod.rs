@@ -1424,7 +1424,7 @@ pub(crate) struct CheckpointAction {
 /// is an externally-tagged enum keyed by the action name, reusing kernel's action structs to yield
 /// the same types as log replay. Having no catch-all variant, it fails the parse on an unrecognized
 /// action key -- deliberately fail-closed, unlike the forward-compatible EngineData
-/// [`visitors::CheckpointElementVisitor`], which skips unknown elements. A hint carrying a future
+/// `CheckpointElementVisitor`, which skips unknown elements. A hint carrying a future
 /// element kind is thus dropped and the reader falls back to log replay.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
