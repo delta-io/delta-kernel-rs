@@ -58,12 +58,12 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
         Ok((names, types).into())
     });
 
-struct DvMatchedFileRequiredFields<'a> {
+struct RequiredDvMatchedFileVal<'a> {
     physical_partition_columns: HashSet<String>,
     existing_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for DvMatchedFileRequiredFields<'_> {
+impl Validation for RequiredDvMatchedFileVal<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, PATH_NAME)?
@@ -128,7 +128,7 @@ impl<'a> StagedDataValidator<'a> {
             })?;
         Ok(StagedDataValidator::new(
             columns,
-            vec![Box::new(DvMatchedFileRequiredFields {
+            vec![Box::new(RequiredDvMatchedFileVal {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
                 existing_file_actions,
             })],
