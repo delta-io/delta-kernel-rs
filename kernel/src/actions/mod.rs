@@ -2044,6 +2044,10 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine::to_json_bytes;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -3271,8 +3275,6 @@ mod tests {
             match self {
                 Codec::Serde => Ok(serde_json::to_value(action)?),
                 Codec::EngineData => {
-                    use crate::engine::to_json_bytes;
-                    use crate::engine_data::FilteredEngineData;
                     let scalar = action.clone().try_into_scalar()?;
                     let data =
                         create_row(&ExprEngine::new(), LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
@@ -3507,9 +3509,6 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_wire_format() -> DeltaResult<()> {
-        use crate::engine::to_json_bytes;
-        use crate::engine_data::FilteredEngineData;
-
         // Build the action's engine data, then write it out through the engine JSON writer and
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the

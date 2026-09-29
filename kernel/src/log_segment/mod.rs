@@ -413,16 +413,6 @@ impl LogSegment {
             .flatten()
     }
 
-    /// The manifest commit version from the AMT `_last_checkpoint` hint (see
-    /// [`Self::amt_checkpoint_hint`]): the commit that emitted the latest checkpoint action,
-    /// letting a reader locate it without full log replay. `None` when there is no applicable
-    /// AMT hint.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[allow(unused)] // consumed by the AMT read path
-    pub(crate) fn checkpoint_hint_manifest_commit_version(&self) -> Option<Version> {
-        Some(self.amt_checkpoint_hint()?.manifest_commit_version)
-    }
-
     /// Succinct summary string for logging purposes.
     fn summary(&self) -> String {
         format!(

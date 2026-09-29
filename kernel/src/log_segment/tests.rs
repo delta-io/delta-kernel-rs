@@ -5476,18 +5476,16 @@ fn amt_checkpoint_hint_accessor_gates_on_checkpoint_type() {
         ..Default::default()
     };
 
-    // AMT-typed hint carrying an amtCheckpoint: exposed, and manifestCommitVersion surfaces.
+    // AMT-typed hint carrying an amtCheckpoint: exposed with its manifestCommitVersion intact.
     let seg = segment(Some(hint(
         Some(CheckpointType::AdaptiveMetadataTree),
         Some(amt()),
     )));
     assert_eq!(seg.amt_checkpoint_hint(), Some(&amt()));
-    assert_eq!(seg.checkpoint_hint_manifest_commit_version(), Some(6));
 
     // A non-AMT checkpoint type suppresses the accessor even though amtCheckpoint is present.
     let seg = segment(Some(hint(Some(CheckpointType::Unknown), Some(amt()))));
     assert_eq!(seg.amt_checkpoint_hint(), None);
-    assert_eq!(seg.checkpoint_hint_manifest_commit_version(), None);
 
     // AMT type but no amtCheckpoint object, and no hint at all, both yield None.
     let seg = segment(Some(hint(Some(CheckpointType::AdaptiveMetadataTree), None)));
