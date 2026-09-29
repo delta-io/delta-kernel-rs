@@ -17,8 +17,8 @@ Most connectors should start with the default engine:
 
 ```toml
 [dependencies]
-delta_kernel = "0.28.0"
-delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
+delta_kernel = "0.29.0"
+delta_kernel_default_engine = { version = "0.29.0", features = ["rustls"] }
 ```
 
 The default engine supplies Arrow data, Tokio execution, expression evaluation, Parquet and JSON
@@ -30,7 +30,7 @@ without Arrow features:
 
 ```toml
 [dependencies]
-delta_kernel = "0.28.0"
+delta_kernel = "0.29.0"
 ```
 
 For a custom Engine that still uses Kernel's Arrow conversion and expression modules, enable those
@@ -38,7 +38,7 @@ capabilities directly:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.28.0", features = ["arrow-conversion", "arrow-expression"] }
+delta_kernel = { version = "0.29.0", features = ["arrow-conversion", "arrow-expression"] }
 ```
 
 ## Choose a TLS backend
