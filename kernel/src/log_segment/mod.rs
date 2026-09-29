@@ -37,6 +37,9 @@ use crate::{
     Version,
 };
 
+#[cfg(feature = "declarative-plans")]
+mod streamed;
+
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;

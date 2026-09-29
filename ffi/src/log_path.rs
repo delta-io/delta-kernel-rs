@@ -74,3 +74,22 @@ impl FfiLogPath {
         LogPath::try_new(file_meta)
     }
 }
+
+/// Connector-owned source of ordered log paths. No callback or context is retained after planning.
+#[repr(C)]
+pub struct FfiLogPathSource {
+    /// Opaque connector state, borrowed for the planning call.
+    pub context: *mut std::ffi::c_void,
+    /// Read a batch beginning at `offset`. Empty means end of input; false reports connector
+    /// failure. Return at most `max_entries` entries and target `max_bytes` encoded bytes. A
+    /// single oversized path is allowed so batching does not change which valid paths are
+    /// accepted. The batch and nested strings remain valid until the next read or the end of
+    /// planning.
+    pub read_batch: unsafe extern "C" fn(
+        context: *mut std::ffi::c_void,
+        offset: usize,
+        max_entries: usize,
+        max_bytes: usize,
+        output: *mut LogPathArray,
+    ) -> bool,
+}

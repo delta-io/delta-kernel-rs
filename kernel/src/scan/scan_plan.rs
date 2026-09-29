@@ -93,6 +93,15 @@ impl<'a> MetadataScanPlan<'a> {
         &self,
         shape: &CheckpointShape,
     ) -> DeltaResult<Option<Plan>> {
+        self.build_metadata_scan_plan_with_commits(shape, None)
+    }
+
+    /// Consume already validated commit files without reconstructing a native log segment.
+    pub(super) fn build_metadata_scan_plan_with_commits(
+        &self,
+        shape: &CheckpointShape,
+        commit_files: Option<Vec<crate::plans::ir::nodes::ScanFile>>,
+    ) -> DeltaResult<Option<Plan>> {
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if self.skip_all {
             return Ok(None);
@@ -106,23 +115,26 @@ impl<'a> MetadataScanPlan<'a> {
         let add_field = self.normalized_add_field()?;
         let (output_expr, output_schema) = self.metadata_output_projection(&add_field)?;
 
-        let commit_actions = self.commit_arm()?.try_fold_with(prune, |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        })?;
+        let commit_actions = self
+            .commit_arm(commit_files)?
+            .try_fold_with(prune, |p, prune| {
+                // We filter so that:
+                // * All remove actions are kept
+                // * Add actions that do not match the partition pruning or stats predicate are
+                //   removed.
+                //
+                // NOTE: It is important that add actions are filtered by the partition predicate
+                // because partition filtering may not be applied on data rows. On the other
+                // hand, failing to skip based on data columns is safe because the data
+                // predicate will also be evaluated on data rows. Thus it is crucial that we
+                // partition prune adds here.
+                //
+                // NOTE: It is not safe to prune remove actions using the partition filter. This is
+                // because a NULL result for `remove.partitionValues.partCol` may be due to
+                // `remove.partitionValues` being NULL, or it may be from `partCol` being
+                // NULL. Thus, we simply do not prune removes.
+                p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+            })?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -235,9 +247,14 @@ impl<'a> MetadataScanPlan<'a> {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(&self) -> DeltaResult<PlanBuilder> {
-        let log_segment = self.log_segment;
-        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+    fn commit_arm(
+        &self,
+        files: Option<Vec<crate::plans::ir::nodes::ScanFile>>,
+    ) -> DeltaResult<PlanBuilder> {
+        let commit_files = match files {
+            Some(files) => files,
+            None => self.log_segment.commit_cover_version_tagged_scan_files()?,
+        };
         PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
             .filter(Predicate::or(
                 col!("add.path").is_not_null(),
