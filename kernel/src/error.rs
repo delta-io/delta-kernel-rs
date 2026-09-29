@@ -13,6 +13,16 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+/// An error returned by a Delta Kernel operation.
+#[derive(Debug, thiserror::Error)]
+// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+#[non_exhaustive]
+pub enum Error {
+    /// A failure represented by a kernel implementation error.
+    #[error(transparent)]
+    Kernel(KernelError),
+}
+
 /// Details of a failed conversion from a scalar into a Rust value.
 ///
 /// Conversion code adds path elements as an error unwinds, producing a path from the outermost
@@ -320,6 +330,21 @@ pub enum KernelError {
     /// The payload is the lowest version that the operation requires but cannot obtain.
     #[error("Table version {0} is missing or unavailable for this log operation.")]
     MissingVersion(Version),
+
+    /// The requested start version is unavailable from the queried log segment, though later
+    /// versions remain.
+    #[error(
+        "Start version {requested} is not available; earliest available version is {earliest}."
+    )]
+    StartVersionNotFound {
+        /// The start version the caller requested.
+        requested: Version,
+        /// The earliest version servable from the queried log segment (always > `requested`).
+        /// This is the lowest version this producer can serve, not a promise about the lowest
+        /// version readable on disk: a checkpoint may have trimmed the segment past commits a
+        /// path-based read could still serve.
+        earliest: Version,
+    },
 
     /// A table version required by an operation has not been published to the Delta log.
     ///

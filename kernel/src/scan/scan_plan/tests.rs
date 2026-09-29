@@ -656,8 +656,13 @@ fn declarative_metadata_output_options_across_log_shapes(
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
     #[case] stats: StatsOptions,
+    #[values(
+        PartitionValuesOptions::default(),
+        PartitionValuesOptions::with_struct()
+    )]
+    partitions: PartitionValuesOptions,
 ) -> DeltaResult<()> {
-    assert_metadata_output_options(log_state, features, table_config, stats)
+    assert_metadata_output_options(log_state, features, table_config, stats, partitions)
 }
 
 #[rstest]
@@ -678,7 +683,14 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] features: FeatureSet,
     #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
 ) {
-    assert_metadata_output_options(log_state, features, checkpoint_struct_stats(), stats).unwrap();
+    assert_metadata_output_options(
+        log_state,
+        features,
+        checkpoint_struct_stats(),
+        stats,
+        PartitionValuesOptions::with_struct(),
+    )
+    .unwrap();
 }
 
 fn assert_metadata_output_options(
@@ -686,8 +698,10 @@ fn assert_metadata_output_options(
     features: FeatureSet,
     table_config: TableConfig,
     stats: StatsOptions,
+    partitions: PartitionValuesOptions,
 ) -> DeltaResult<()> {
     let json_requested = stats.synthesize_json;
+    let parsed_partitions_requested = partitions.parsed_struct;
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
@@ -702,16 +716,34 @@ fn assert_metadata_output_options(
             .clone()
             .scan_builder()
             .with_stats(stats.clone())
-            .with_partition_values(PartitionValuesOptions::with_struct())
+            .with_partition_values(partitions.clone())
             .build()?,
         &engine,
     )?;
     let scan = snapshot
         .scan_builder()
         .with_stats(stats)
-        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_partition_values(partitions)
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
+
+    for batches in [&actual, &expected] {
+        assert!(
+            !batches.is_empty(),
+            "partitioned metadata must be populated"
+        );
+        for batch in batches {
+            let parsed = batch.column_by_name(PARTITION_VALUES_PARSED);
+            assert_eq!(parsed.is_some(), parsed_partitions_requested);
+            if let Some(parsed) = parsed {
+                let parsed = parsed.as_any().downcast_ref::<StructArray>().unwrap();
+                assert_eq!(parsed.null_count(), 0, "requested parsed partitions");
+                for (field, values) in parsed.fields().iter().zip(parsed.columns()) {
+                    assert_eq!(values.null_count(), 0, "partition {}", field.name());
+                }
+            }
+        }
+    }
 
     if json_requested {
         for batch in &actual {
@@ -792,7 +824,7 @@ fn declarative_metadata_data_skipping(
 #[case::part_zero(col!("part").eq(lit(0i32)), 1)]
 #[case::part_one(col!("part").eq(lit(1i32)), 2)]
 #[case::missing_part(col!("part").eq(lit(4i32)), 0)]
-fn declarative_metadata_reconstructs_partition_values_for_pruning(
+fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
 ) -> DeltaResult<()> {
@@ -804,7 +836,6 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
@@ -814,16 +845,12 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
+    assert!(scan.state_info.physical_stats_schema.is_none());
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_metadata_eq(
-        &without_columns(&actual, &[STATS])?,
-        &without_columns(&expected, &[STATS])?,
-        "partition pruning",
-    )
+    assert_metadata_eq(&actual, &expected, "partition pruning")
 }
 
 #[test]

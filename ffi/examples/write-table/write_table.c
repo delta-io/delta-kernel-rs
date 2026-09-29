@@ -50,9 +50,9 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
   // === Build engine ===
-  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
+  ExternResultHandleExclusiveEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return 1;
@@ -154,9 +154,9 @@ int main(int argc, char* argv[]) {
     free_snapshot(snap);
   } else {
     printf("No post-commit snapshot available; loading via snapshot builder.\n");
-    ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
+    ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res =
         get_snapshot_builder(table_path_slice, engine);
-    if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+    if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
       print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
       free_error((Error*)snapshot_builder_res.err);
       free_committed_transaction(committed);

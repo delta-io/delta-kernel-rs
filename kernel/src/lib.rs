@@ -192,7 +192,7 @@ pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{
-    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, KernelError, KernelResult,
+    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error, KernelError, KernelResult,
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
@@ -976,7 +976,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// The exact number of bytes written to the parquet file.
     ///
     /// [`StructField`]: crate::schema::StructField
     /// [`ColumnMetadataKey::ColumnMappingId`]: crate::schema::ColumnMetadataKey::ColumnMappingId
@@ -988,7 +988,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///

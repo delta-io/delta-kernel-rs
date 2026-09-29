@@ -41,13 +41,19 @@ use crate::scan::{
 use crate::schema::{
     schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::{
+    minimal_checkpoint_action, setup_table, write_commit,
+};
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, load_test_table, string_array_to_engine_data, Action,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Snapshot;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    FileSize, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
     StorageHandler,
 };
 
@@ -240,7 +246,7 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.0.write_parquet_file(location, data)
     }
 
@@ -1122,7 +1128,10 @@ async fn test_non_contiguous_log() {
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::MissingVersion(1))
+        Err(KernelError::StartVersionNotFound {
+            requested: 1,
+            earliest: 2
+        })
     ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
@@ -5404,5 +5413,46 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
         "read_commit_actions should find exactly the expected files"
     );
 
+    Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn find_last_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<()> {
+    let (engine, table_root) = setup_table()?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert!(snapshot
+        .log_segment()
+        .find_last_checkpoint_action(&engine)?
+        .is_none());
+    Ok(())
+}
+
+// The log is replayed newest-first, so the most recent `checkpoint` action wins.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> DeltaResult<()> {
+    let (engine, table_root) = setup_table()?;
+    write_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+    )?;
+    write_commit(
+        &engine,
+        &table_root,
+        2,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert_eq!(snapshot.version(), 2);
+    let checkpoint = snapshot
+        .log_segment()
+        .find_last_checkpoint_action(&engine)?
+        .expect("checkpoint present");
+    assert_eq!(checkpoint.version(), 2);
+    assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
     Ok(())
 }

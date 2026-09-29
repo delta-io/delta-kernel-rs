@@ -40,7 +40,7 @@ cargo build -p delta_kernel_ffi --release
 Objects that cross the FFI boundary are wrapped in **handles**. These are opaque pointers
 that carry ownership semantics. There are two kinds:
 
-- **Mutable handles** (`Box`-like) represent exclusive ownership. Dropping the handle
+- **Exclusive handles** (`Box`-like) represent exclusive ownership. Dropping the handle
   drops the underlying object. These are neither `Copy` nor `Clone`.
 - **Shared handles** (`Arc`-like) represent shared ownership. Dropping the handle only
   drops the underlying object if it was the last reference.
@@ -60,7 +60,7 @@ is needed for reads):
 ```text
 get_default_engine()        ->  Handle<SharedExternEngine>
         |
-get_snapshot_builder()      ->  Handle<MutableFfiSnapshotBuilder>
+get_snapshot_builder()      ->  Handle<ExclusiveSnapshotBuilder>
         |
 snapshot_builder_build()    ->  Handle<SharedSnapshot>
         |
@@ -115,10 +115,14 @@ authoritative list and signatures, consult the generated
 | Function | Purpose |
 |----------|---------|
 | `get_default_engine` | Create an engine from a table path with default options |
-| `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
-| `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
-| `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
+| `get_engine_builder` / `builder_with_option` / `builder_build` | Create an engine with custom storage options |
+| `builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
+
+Builder `with_*` functions consume their input handle and return the updated handle on success.
+Replace the input handle with the result; on error, the builder has been dropped. `build` and
+`free` also consume the builder.
 
 **Snapshots**
 
@@ -126,9 +130,9 @@ authoritative list and signatures, consult the generated
 |----------|---------|
 | `get_snapshot_builder` | Create a snapshot builder from a table path |
 | `get_snapshot_builder_from` | Create a snapshot builder incrementally from an existing snapshot |
-| `snapshot_builder_set_version` | Pin the snapshot to a specific table version |
-| `snapshot_builder_set_log_tail` | Provide a log tail for catalog-managed tables |
-| `snapshot_builder_set_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
+| `snapshot_builder_with_version` | Pin the snapshot to a specific table version |
+| `snapshot_builder_with_log_tail` | Provide a log tail for catalog-managed tables |
+| `snapshot_builder_with_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
 | `snapshot_builder_build` | Consume the builder and produce the snapshot |
 | `free_snapshot_builder` / `free_snapshot` | Release snapshot-related handles |
 
@@ -439,7 +443,7 @@ ExternResultHandleSharedExternEngine engine_res =
     get_default_engine(table_path, allocate_error);
 
 // 2. Build a snapshot
-ExternResultHandleMutableFfiSnapshotBuilder builder_res =
+ExternResultHandleExclusiveSnapshotBuilder builder_res =
     get_snapshot_builder(table_path, engine);
 ExternResultHandleSharedSnapshot snap_res =
     snapshot_builder_build(builder);

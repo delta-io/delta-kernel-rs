@@ -132,7 +132,7 @@ pub trait ParquetHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
 }

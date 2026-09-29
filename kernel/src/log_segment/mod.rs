@@ -13,6 +13,8 @@ use crate::actions::{
     action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -578,13 +580,10 @@ impl LogSegment {
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
-        require!(
-            listed_files
-                .ascending_commit_files()
-                .first()
-                .is_some_and(|first_commit| first_commit.version == start_version),
-            KernelError::MissingVersion(start_version)
-        );
+        validate_start_version_available(
+            start_version,
+            listed_files.ascending_commit_files().first(),
+        )?;
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
@@ -876,6 +875,27 @@ impl LogSegment {
             None,
         )?;
         Ok(result.actions)
+    }
+
+    /// The newest `checkpoint` action (the adaptiveMetadata content root) in this log
+    /// segment, or `None` if it has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log segment cannot be read or a checkpoint action fails to parse.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn find_last_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
+        for batch in self.read_actions(engine, schema)? {
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
+            {
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
     }
 
     /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
@@ -1752,6 +1772,29 @@ fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> DeltaResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Classifies a requested commit-range/table-changes start against the first available commit.
+///
+/// - no commit at or after the start -> [`KernelError::EmptyLog`];
+/// - the first available commit is not the requested start ->
+///   [`KernelError::StartVersionNotFound`], carrying that commit as `earliest`;
+/// - the first available commit is the requested start -> `Ok`.
+///
+/// A gap *after* a present start is not handled here -- it surfaces as
+/// [`KernelError::MissingVersion`] during contiguity validation in [`LogSegment::try_new`].
+pub(crate) fn validate_start_version_available(
+    start_version: Version,
+    first_commit: Option<&ParsedLogPath>,
+) -> DeltaResult<()> {
+    match first_commit {
+        None => Err(KernelError::EmptyLog),
+        Some(commit) if commit.version == start_version => Ok(()),
+        Some(commit) => Err(KernelError::StartVersionNotFound {
+            requested: start_version,
+            earliest: commit.version,
+        }),
+    }
 }
 
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {

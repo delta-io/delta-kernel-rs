@@ -267,28 +267,12 @@ fn transaction_update_deletion_vectors_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use delta_kernel::Engine;
-
     use super::*;
-    use crate::error::{AllocateError, AllocateErrorFn, FFIKernelError};
-    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_with_message};
-    use crate::{free_engine, ExternEngine};
-
-    struct ErrorOnlyExternEngine {
-        allocate_error: AllocateErrorFn,
-    }
-
-    impl ExternEngine for ErrorOnlyExternEngine {
-        fn engine(&self) -> Arc<dyn Engine> {
-            panic!("error-only test engine does not expose a kernel engine")
-        }
-
-        fn error_allocator(&self) -> &dyn AllocateError {
-            &self.allocate_error
-        }
-    }
+    use crate::error::FFIKernelError;
+    use crate::ffi_test_utils::{
+        assert_extern_result_error_with_message, error_only_engine_handle,
+    };
+    use crate::free_engine;
 
     #[test]
     fn kernel_dv_storage_type_maps_to_kernel_storage_type() {
@@ -375,10 +359,7 @@ mod tests {
 
     #[test]
     fn dv_descriptor_map_insert_invalid_utf8_consumes_descriptor() {
-        let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
-            allocate_error: allocate_err,
-        });
-        let engine: Handle<SharedExternEngine> = engine.into();
+        let engine = error_only_engine_handle();
         let map = dv_descriptor_map_new();
         let descriptor =
             dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, 1)
