@@ -36,6 +36,8 @@ const WINDOWS_SKIP_WORKLOADS: &[&str] = &[
 ];
 
 fn main() {
+    // The FFI example tests still use these generated table fixtures even though the legacy DAT
+    // acceptance runner has been removed.
     if !Path::new(DAT_EXISTS_FILE_CHECK).exists() {
         let tarball_url = format!(
             "https://github.com/delta-incubator/dat/releases/download/v{DAT_VERSION}/deltalake-dat-v{DAT_VERSION}.tar.gz"
@@ -43,9 +45,9 @@ fn main() {
         let tarball_data = download_tarball(&tarball_url, DAT_CHECKSUM);
         extract_dat_tarball(&tarball_data);
         let mut done_file = BufWriter::new(
-            File::create(DAT_EXISTS_FILE_CHECK).expect("Failed to create legacy DAT marker"),
+            File::create(DAT_EXISTS_FILE_CHECK).expect("Failed to create DAT fixture marker"),
         );
-        write!(done_file, "done").expect("Failed to write legacy DAT marker");
+        write!(done_file, "done").expect("Failed to write DAT fixture marker");
     }
     extract_acceptance_workloads();
 }
@@ -53,10 +55,10 @@ fn main() {
 fn extract_dat_tarball(tarball_data: &[u8]) {
     let tarball = GzDecoder::new(BufReader::new(tarball_data));
     let mut archive = Archive::new(tarball);
-    std::fs::create_dir_all(DAT_OUTPUT_FOLDER).expect("Failed to create legacy DAT directory");
+    std::fs::create_dir_all(DAT_OUTPUT_FOLDER).expect("Failed to create DAT fixture directory");
     archive
         .unpack(DAT_OUTPUT_FOLDER)
-        .expect("Failed to unpack legacy DAT archive");
+        .expect("Failed to unpack DAT fixtures");
 }
 
 fn download_tarball(url: &str, expected_checksum: &str) -> Vec<u8> {
