@@ -278,12 +278,10 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
-    // Caller-supplied root manifest file to commit, set via with_root_manifest_file().
+    // The manifest this transaction will write, if any. The two ways of writing it are mutually
+    // exclusive, so a single field makes staging both unrepresentable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    root_manifest_file: Option<RootManifestFile>,
-    // In-progress manifest (content-tree) commit state, set via with_manifest_commit().
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    manifest_commit_state: Option<ManifestCommitState>,
+    manifest_write: Option<ManifestWrite>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -291,6 +289,19 @@ pub struct Transaction<S = ExistingTable> {
     // PhantomType marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomType<S>,
+}
+
+/// The manifest a transaction will write. Root-file and content-tree commits are mutually
+/// exclusive ways of writing the manifest, so representing them as one enum makes staging both
+/// unrepresentable.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+enum ManifestWrite {
+    /// Caller-supplied root manifest file, staged via
+    /// [`with_root_manifest_file`](Transaction::with_root_manifest_file).
+    RootFile(RootManifestFile),
+    /// In-progress manifest (content-tree) commit, staged via
+    /// [`with_manifest_commit`](Transaction::with_manifest_commit).
+    Commit(ManifestCommitState),
 }
 
 impl<S> std::fmt::Debug for Transaction<S> {
@@ -418,11 +429,7 @@ impl<S> Transaction<S> {
         self.validate_append_only_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.validate_manifest_commit_root_mutual_exclusion()?;
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.validate_root_manifest_file_semantics()?;
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.validate_manifest_commit_semantics()?;
+        self.validate_manifest_write_semantics()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
@@ -858,48 +865,26 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Reject a transaction that stages both an explicit root manifest file and a manifest
-    /// (content-tree) commit: the two are mutually exclusive ways of writing the manifest.
+    /// Validate the staged manifest write, if any. A root-manifest-file commit must carry no data
+    /// file actions; a manifest (content-tree) commit cannot be committed yet (its write path is
+    /// not built). The `adaptiveMetadata-preview` feature and root/commit mutual exclusion are
+    /// enforced when staging, so they need no check here.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn validate_manifest_commit_root_mutual_exclusion(&self) -> DeltaResult<()> {
-        require!(
-            self.root_manifest_file.is_none() || self.manifest_commit_state.is_none(),
-            KernelError::invalid_transaction_state(
-                "explicit root manifest and manifest commit are mutually exclusive"
-            )
-        );
-        Ok(())
-    }
-
-    /// Validate that a root manifest file commit targets an `adaptiveMetadata-preview` table and
-    /// carries no file actions.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn validate_root_manifest_file_semantics(&self) -> DeltaResult<()> {
-        if self.root_manifest_file.is_none() {
-            return Ok(());
+    fn validate_manifest_write_semantics(&self) -> DeltaResult<()> {
+        match &self.manifest_write {
+            Some(ManifestWrite::RootFile(_)) => {
+                require!(
+                    !self.has_data_file_actions(),
+                    KernelError::generic("root manifest file commit cannot include file actions")
+                );
+            }
+            Some(ManifestWrite::Commit(_)) => {
+                return Err(KernelError::unsupported(
+                    "committing a manifest commit is not yet supported",
+                ));
+            }
+            None => {}
         }
-        require!(
-            self.effective_table_config
-                .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
-            KernelError::generic(
-                "root manifest file commit requires the adaptiveMetadata-preview feature"
-            )
-        );
-        require!(
-            !self.has_data_file_actions(),
-            KernelError::generic("root manifest file commit cannot include file actions")
-        );
-        Ok(())
-    }
-
-    /// Reject committing a manifest (content-tree) commit: the write path is not yet built, so a
-    /// staged [`ManifestCommitState`] cannot be turned into commit actions.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn validate_manifest_commit_semantics(&self) -> DeltaResult<()> {
-        require!(
-            self.manifest_commit_state.is_none(),
-            KernelError::unsupported("committing a manifest commit is not yet supported")
-        );
         Ok(())
     }
 
@@ -912,8 +897,11 @@ impl<S> Transaction<S> {
         commit_version: Version,
         dm_changes: &[DomainMetadata],
     ) -> DeltaResult<Option<Box<dyn EngineData>>> {
-        self.root_manifest_file
-            .as_ref()
+        let root_manifest_file = match &self.manifest_write {
+            Some(ManifestWrite::RootFile(root_manifest_file)) => Some(root_manifest_file),
+            _ => None,
+        };
+        root_manifest_file
             .map(|root_manifest_file| {
                 let action = root_manifest_file.compute_checkpoint_action(
                     engine,

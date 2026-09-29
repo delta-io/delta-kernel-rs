@@ -16,6 +16,8 @@ use crate::{version_as_i64, DeltaResult, Engine, Version};
 #[internal_api]
 pub(crate) struct ManifestCommitState {
     /// Version this commit will write.
+    // TODO(#3352): read this once the manifest-commit write path lands.
+    #[allow(dead_code)]
     version_to_write: Version,
     /// Snapshot the commit updates.
     read_snapshot: SnapshotRef,
@@ -44,8 +46,6 @@ impl ManifestCommitState {
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.
-        // TODO: the last checkpoint action should ultimately be cached on the Snapshot (resolved at
-        // construction), which would let us remove LogSegment::find_last_checkpoint_action.
         if let Some(checkpoint) = read_snapshot
             .log_segment()
             .find_last_checkpoint_action(engine)?
@@ -69,14 +69,16 @@ impl ManifestCommitState {
 
     /// Creates a [`LeafNodeWriter`] for writing a new leaf manifest in this commit.
     ///
+    /// The `finish -> LeafNodeWriterResult -> add_leaf` handshake and the `engine` argument are
+    /// deliberate (rather than folding a leaf in when its writer drops): they keep the door open to
+    /// writing leaf manifests on executors for large appends/CTAS, so a finished leaf's result is
+    /// handed back explicitly and `engine` is reserved for that write I/O.
+    ///
     /// # Errors
     ///
     /// Returns an error if the table's physical schema cannot be derived.
     #[internal_api]
-    pub(crate) fn new_leaf_node_writer(
-        &mut self,
-        _engine: &dyn Engine,
-    ) -> DeltaResult<LeafNodeWriter> {
+    pub(crate) fn new_leaf_node_writer(&self, _engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
         let column_mapping_mode = self
             .read_snapshot
             .table_configuration()
@@ -86,13 +88,13 @@ impl ManifestCommitState {
                 .schema()
                 .make_physical(column_mapping_mode)?,
         );
-        Ok(LeafNodeWriter::new(self.version_to_write, physical_schema))
+        Ok(LeafNodeWriter::new(physical_schema))
     }
 
     /// Folds a finished leaf's [`LeafNodeWriterResult`] into this commit.
     #[internal_api]
     pub(crate) fn add_leaf(&mut self, _result: LeafNodeWriterResult) -> DeltaResult<()> {
-        // TODO(#2866): fold the finished leaf's result into the commit.
+        // TODO(#3352): fold the finished leaf's result into the commit.
         Err(KernelError::unsupported(
             "manifest commit add_leaf is not yet supported",
         ))

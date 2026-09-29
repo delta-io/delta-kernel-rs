@@ -886,6 +886,8 @@ impl LogSegment {
     /// # Errors
     ///
     /// Returns an error if the log segment cannot be read or a checkpoint action fails to parse.
+    // TODO(#3426): cache the last checkpoint action on the Snapshot (resolved at construction),
+    // which would let us remove this method.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn find_last_checkpoint_action(
         &self,

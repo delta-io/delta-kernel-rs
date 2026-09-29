@@ -4,7 +4,7 @@ use delta_kernel_derive::internal_api;
 
 use crate::error::KernelError;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, Version};
+use crate::{DeltaResult, Engine, EngineData};
 
 /// Writes a single leaf manifest for a manifest (content-tree) commit.
 ///
@@ -12,12 +12,8 @@ use crate::{DeltaResult, Engine, EngineData, Version};
 #[internal_api]
 #[derive(Debug)]
 pub(crate) struct LeafNodeWriter {
-    // TODO(#2866): these are the state the write path needs; read them once appends are
-    // implemented in add_files/finish.
-    /// Table version this leaf is written for.
-    #[allow(dead_code)]
-    version: Version,
     /// Physical (column-mapped) schema of the table's data.
+    // TODO(#3352): read this once appends are implemented in add_files/finish.
     #[allow(dead_code)]
     physical_schema: SchemaRef,
 }
@@ -29,14 +25,12 @@ pub(crate) struct LeafNodeWriter {
 /// is built out.
 #[internal_api]
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct LeafNodeWriterResult {}
 
 impl LeafNodeWriter {
-    pub(super) fn new(version: Version, physical_schema: SchemaRef) -> Self {
-        LeafNodeWriter {
-            version,
-            physical_schema,
-        }
+    pub(super) fn new(physical_schema: SchemaRef) -> Self {
+        LeafNodeWriter { physical_schema }
     }
 
     /// Buffers new data files described by `add_metadata` for writing into this leaf manifest.
@@ -49,7 +43,7 @@ impl LeafNodeWriter {
         _engine: &dyn Engine,
         _add_metadata: Box<dyn EngineData>,
     ) -> DeltaResult<()> {
-        // TODO(#2866): implement buffering appends, and add the other update kinds a leaf must
+        // TODO(#3352): implement buffering appends, and add the other update kinds a leaf must
         // accept (existing-file moves/removals and deletion-vector updates).
         Err(KernelError::unsupported(
             "manifest commit leaf writer add_files is not yet supported",
@@ -59,7 +53,7 @@ impl LeafNodeWriter {
     /// Writes the buffered changes as a leaf manifest and returns its [`LeafNodeWriterResult`].
     #[internal_api]
     pub(crate) fn finish(self, _engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
-        // TODO(#2866): write the buffered changes as a leaf manifest.
+        // TODO(#3352): write the buffered changes as a leaf manifest.
         Err(KernelError::unsupported(
             "manifest commit leaf writer finish is not yet supported",
         ))
