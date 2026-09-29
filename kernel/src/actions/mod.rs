@@ -1402,9 +1402,9 @@ pub(crate) struct CheckpointAction {
     pub(crate) protocol: Protocol,
     /// The table metadata at the checkpoint version.
     pub(crate) metadata: Metadata,
-    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint.
+    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint array.
     pub(crate) transactions: Vec<SetTransaction>,
-    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint.
+    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint array.
     pub(crate) domain_metadata: Vec<DomainMetadata>,
     /// `sidecar` entries of type `txn`, referencing spilled [`SetTransaction`] actions.
     pub(crate) txn_sidecars: Vec<Sidecar>,
