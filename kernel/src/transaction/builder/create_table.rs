@@ -43,11 +43,12 @@ use crate::table_properties::{
     MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
     SET_TRANSACTION_RETENTION_DURATION,
 };
+use crate::transaction::builder::TransactionBuilderState;
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{Transaction, TransactionConfig, TransactionOptions};
+use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
+use crate::{Engine, EngineData, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -808,7 +809,7 @@ pub struct CreateTableTransactionBuilder {
     schema: SchemaRef,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
-    config: TransactionConfig,
+    state: TransactionBuilderState,
 }
 
 impl CreateTableTransactionBuilder {
@@ -822,7 +823,7 @@ impl CreateTableTransactionBuilder {
             schema,
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
-            config: TransactionConfig::for_create_table(engine_info.into()),
+            state: TransactionBuilderState::for_create_table(engine_info.into()),
         }
     }
 
@@ -913,17 +914,70 @@ impl CreateTableTransactionBuilder {
     /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
-        let correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
-        self.config.set_default_correlation_id(correlation_id);
+        self.state = self.state.with_correlation_id(correlation_id);
         self
     }
 
-    /// Replaces options shared by create-table and existing-table transactions.
+    /// Replaces the operation parameters recorded in `commitInfo`.
     ///
-    /// If the options omit engine information or a correlation identifier, the corresponding
-    /// values supplied through the existing create-table APIs are retained.
-    pub fn with_options(mut self, options: TransactionOptions) -> Self {
-        self.config.set_options(options);
+    /// This map replaces rather than merges with an earlier map. Dedicated parameters take
+    /// precedence over a same-named nested field supplied by
+    /// [`with_commit_info`](Self::with_commit_info).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.state = self.state.with_operation_parameters(parameters)?;
+        Ok(self)
+    }
+
+    /// Replaces the operation metrics recorded in `commitInfo`.
+    ///
+    /// This map replaces rather than merges with an earlier map. Metrics supplied to the built
+    /// transaction replace these values. Dedicated metrics take precedence over a same-named
+    /// nested field supplied by [`with_commit_info`](Self::with_commit_info).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.state = self.state.with_operation_metrics(metrics)?;
+        Ok(self)
+    }
+
+    /// Supplies one arbitrary connector-provided `commitInfo` row.
+    ///
+    /// Consecutive calls replace the previous row. Kernel-owned fields and dedicated operation
+    /// parameter or metric maps take precedence over same-named fields in this row.
+    pub fn with_commit_info(
+        mut self,
+        commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.state = self.state.with_commit_info(commit_info, commit_info_schema);
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    ///
+    /// Each domain may occur only once; duplicates are rejected by [`build`](Self::build).
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.state = self.state.with_domain_metadata(domain, configuration);
         self
     }
 
@@ -1066,13 +1120,15 @@ impl CreateTableTransactionBuilder {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        Transaction::try_new_create_table(
+        let transaction = Transaction::try_new_create_table(
             table_configuration,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
-            self.config,
-        )
+            self.state,
+        )?;
+        transaction.validate_domain_metadata_operations()?;
+        Ok(transaction)
     }
 }
 
@@ -1111,52 +1167,83 @@ mod tests {
             CreateTableTransactionBuilder::new("/path/to/table", schema.clone(), "TestApp/1.0");
 
         assert_eq!(builder.path, "/path/to/table");
-        assert_eq!(
-            builder.config.default_engine_info.as_deref(),
-            Some("TestApp/1.0")
-        );
+        assert_eq!(builder.state.engine_info.as_deref(), Some("TestApp/1.0"));
         assert!(builder.table_properties.is_empty());
     }
 
-    #[rstest]
-    #[case::legacy_values_are_backfilled(None, None, "legacy-engine", "legacy-correlation")]
-    #[case::options_take_precedence(
-        Some("options-engine"),
-        Some("options-correlation"),
-        "options-engine",
-        "options-correlation"
-    )]
-    fn test_transaction_options_precedence(
-        #[case] options_engine: Option<&str>,
-        #[case] options_correlation: Option<&str>,
-        #[case] expected_engine: &str,
-        #[case] expected_correlation: &str,
-    ) -> DeltaResult<()> {
+    #[test]
+    fn test_common_builder_state_is_applied() -> Result<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
         std::fs::create_dir(&table_path)?;
-        let mut options = TransactionOptions::new();
-        if let Some(engine) = options_engine {
-            options = options.with_engine_info(engine);
-        }
-        if let Some(correlation) = options_correlation {
-            options = options.with_correlation_id(correlation);
-        }
 
         let transaction = CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             test_schema(),
-            "legacy-engine",
+            "test-engine",
         )
-        .with_correlation_id("legacy-correlation")
-        .with_options(options)
+        .with_correlation_id("test-correlation")
+        .with_operation_parameters([("mode", "Create")])?
         .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(transaction.engine_info.as_deref(), Some(expected_engine));
+        assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
         assert_eq!(
             transaction.correlation_id.as_deref(),
-            Some(expected_correlation)
+            Some("test-correlation")
         );
+        assert_eq!(transaction.operation_parameters["mode"], "Create");
+        assert!(transaction.data_change);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::missing_feature("app.config", None, "domainMetadata")]
+    #[case::reserved_domain(
+        "delta.custom",
+        Some(("delta.feature.domainMetadata", "supported")),
+        "system controlled"
+    )]
+    fn invalid_domain_metadata_is_rejected_during_build(
+        #[case] domain: &str,
+        #[case] property: Option<(&str, &str)>,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let mut builder = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_domain_metadata(domain, "{}");
+        if let Some(property) = property {
+            builder = builder.with_table_properties([property]);
+        }
+
+        let error = builder
+            .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn user_domain_cannot_conflict_with_generated_clustering_domain() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let error = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_data_layout(DataLayout::clustered(["id"]))
+        .with_domain_metadata("delta.clustering", "{}")
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("system controlled"), "{error}");
         Ok(())
     }
 

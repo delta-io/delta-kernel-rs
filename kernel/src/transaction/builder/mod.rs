@@ -6,4 +6,7 @@
 #![allow(unreachable_pub, dead_code)]
 
 pub mod create_table;
+pub(super) mod state;
 pub mod update_table;
+
+pub(super) use state::{collect_operation_metadata, TransactionBuilderState};

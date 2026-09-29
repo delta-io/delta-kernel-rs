@@ -1589,8 +1589,8 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark
-/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
-/// checkpoint.
+/// used by subsequent catalog commits -- use it for the next
+/// `update_table_txn_builder_build_with_committer` call or checkpoint.
 ///
 /// # Safety
 ///

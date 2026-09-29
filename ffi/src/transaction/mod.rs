@@ -1,24 +1,35 @@
 //! This module holds functionality for managing transactions.
-use delta_kernel::KernelResult;
+mod committed;
+mod create_table;
 mod deletion_vector;
 mod partition_value;
 mod transaction_id;
+mod update_table;
 mod write_context;
 
 use std::sync::Arc;
 
+pub use committed::{
+    committed_transaction_post_commit_snapshot, committed_transaction_version,
+    free_committed_transaction,
+};
+pub use create_table::*;
 pub use deletion_vector::{
     dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor,
-    free_dv_descriptor_map, transaction_update_deletion_vectors, ExclusiveDvDescriptor,
+    free_dv_descriptor_map, update_table_txn_update_deletion_vectors, ExclusiveDvDescriptor,
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
+use delta_kernel::transaction::{
+    CommitResult, CommittedTransaction, Transaction, UpdateTableOperation,
+    UpdateTableTransactionBuilder,
+};
+use delta_kernel::KernelResult;
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
@@ -30,7 +41,11 @@ pub use partition_value::{
     partition_value_map_insert_timestamp, partition_value_map_insert_timestamp_ntz,
     partition_value_map_new, ExclusivePartitionValueMap,
 };
+pub use update_table::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use url::Url;
 
+use crate::delta_types::{FfiColumnName, FfiStringMap};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
@@ -38,29 +53,14 @@ use crate::handle::Handle;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
-    unwrap_and_parse_path_as_url, ExclusiveEngineData, ExternEngine, KernelStringSlice,
-    OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot, TryFromStringSlice, Url,
+    Result, ExclusiveEngineData, ExternEngine, KernelStringSlice, SharedExternEngine,
+    SharedSnapshot, TryFromStringSlice,
 };
-
-/// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
-///
-/// Returned by [`transaction`] and [`transaction_with_committer`]. Supports all transaction
-/// operations including existing-table-only operations like blind append and file removal.
-#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
-pub struct ExclusiveTransaction;
-
-/// A handle for a create-table transaction (`Transaction<CreateTable>`).
-///
-/// Returned by [`create_table_builder_build`]. Only supports operations valid during table
-/// creation: adding files, setting data change, engine info, and committing. Operations like
-/// file removal, blind append, and deletion vector updates are not available.
-#[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
-pub struct ExclusiveCreateTransaction;
 
 /// A handle for a [`CommittedTransaction`].
 ///
-/// Returned by [`commit`] and [`create_table_commit`]. Carries the committed version and,
-/// when available, the post-commit snapshot. Use [`committed_transaction_version`] and
+/// Returned by [`update_table_txn_commit`] and [`create_table_txn_commit`]. Carries the committed
+/// version and, when available, the post-commit snapshot. Use [`committed_transaction_version`] and
 /// [`committed_transaction_post_commit_snapshot`] to read the contents, then release with
 /// [`free_committed_transaction`].
 #[handle_descriptor(target=CommittedTransaction, mutable=true, sized=true)]
@@ -70,810 +70,16 @@ pub struct ExclusiveCommittedTransaction;
 #[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
 pub struct MutableCommitter;
 
-/// Start a transaction on the latest snapshot of the table.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
-pub unsafe extern "C" fn transaction(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    transaction_impl(url, engine).into_extern_result(&engine)
-}
-
-fn transaction_impl(
-    url: KernelResult<Url>,
-    extern_engine: &dyn ExternEngine,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let engine = extern_engine.engine();
-    let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
-}
-
-/// Start a transaction with a custom committer
-/// NOTE: This consumes the committer handle
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles
-#[no_mangle]
-pub unsafe extern "C" fn transaction_with_committer(
-    snapshot: Handle<SharedSnapshot>,
-    engine: Handle<SharedExternEngine>,
-    committer: Handle<MutableCommitter>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    let engine = unsafe { engine.as_ref() };
-    let committer = unsafe { committer.into_inner() };
-    transaction_with_committer_impl(snapshot, engine, committer).into_extern_result(&engine)
-}
-
-fn transaction_with_committer_impl(
-    snapshot: Arc<Snapshot>,
-    extern_engine: &dyn ExternEngine,
-    committer: Box<dyn Committer>,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let engine = extern_engine.engine();
-    let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
-}
-
-/// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
-/// was not successful.
-///
-/// The returned handle owns the [`CommittedTransaction`] and must be freed with
-/// [`free_committed_transaction`].
-///
-/// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
-fn commit_result_to_committed_handle<S>(
-    result: KernelResult<CommitResult<S>>,
-) -> KernelResult<Handle<ExclusiveCommittedTransaction>> {
-    match result? {
-        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
-        CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
-            "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
-        CommitResult::Conflicted(conflicted) => Err(delta_kernel::KernelError::Generic(format!(
-            "commit conflict at version {}",
-            conflicted.conflict_version()
-        ))),
-    }
-}
-
-// ============================================================================
-// Existing-table transaction FFI functions
-// ============================================================================
-
-/// Free an existing-table transaction handle without committing.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
-    txn.drop_handle();
-}
-
-/// Attaches engine info to an existing-table transaction.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. CONSUMES the transaction handle.
-#[no_mangle]
-pub unsafe extern "C" fn with_engine_info(
-    txn: Handle<ExclusiveTransaction>,
-    engine_info: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
-}
-
-fn with_engine_info_impl(
-    txn: Transaction,
-    engine_info: KernelStringSlice,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
-    Ok(Box::new(txn.with_engine_info(info)).into())
-}
-
-/// Set the operation that this transaction is performing. This string will be persisted in the
-/// commit and visible to anyone who describes the table history. This CONSUMES the transaction
-/// handle and returns a new handle for the updated transaction.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. CONSUMES the transaction handle.
-#[no_mangle]
-pub unsafe extern "C" fn with_operation(
-    txn: Handle<ExclusiveTransaction>,
-    operation: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_operation_impl(*txn, operation).into_extern_result(&engine)
-}
-
-fn with_operation_impl(
-    txn: Transaction,
-    operation: KernelStringSlice,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }?;
-    Ok(Box::new(txn.with_operation(operation)).into())
-}
-
-/// Add domain metadata to the transaction. The domain metadata will be written to the Delta log
-/// as a `domainMetadata` action when the transaction is committed.
-///
-/// `domain` identifies the metadata domain (e.g. `"myApp"`). `configuration` is an arbitrary
-/// string value associated with the domain (typically JSON).
-///
-/// Each domain can only appear once per transaction. Setting metadata for multiple distinct
-/// domains is allowed. Duplicate domains or setting and removing the same domain in a single
-/// transaction will cause the commit to fail.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
-/// a new one.
-#[no_mangle]
-pub unsafe extern "C" fn with_domain_metadata(
-    txn: Handle<ExclusiveTransaction>,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
-}
-
-fn with_domain_metadata_impl(
-    txn: Transaction,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
-}
-
-/// Remove domain metadata from the table in this transaction. A tombstone action with
-/// `removed: true` will be written to the Delta log when the transaction is committed.
-///
-/// The caller does not need to provide a configuration value -- the existing value is
-/// automatically preserved in the tombstone.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
-/// a new one.
-#[no_mangle]
-pub unsafe extern "C" fn with_domain_metadata_removed(
-    txn: Handle<ExclusiveTransaction>,
-    domain: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_domain_metadata_removed_impl(*txn, domain).into_extern_result(&engine)
-}
-
-fn with_domain_metadata_removed_impl(
-    txn: Transaction,
-    domain: KernelStringSlice,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
-}
-
-/// Set an explicit row-tracking high-water mark for this transaction.
-///
-/// Use this when row IDs must also be coordinated with another system. Kernel still assigns
-/// row-tracking fields to files passed to [`add_files`] and rejects `high_water_mark` if it is less
-/// than the value calculated from those files. The generic [`with_domain_metadata`] API cannot
-/// modify `delta.rowTracking` or other system-controlled domains.
-///
-/// Returns the updated transaction handle, or an error if the transaction already has an explicit
-/// high-water mark. Table-feature and current-table-state validation occurs during commit.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
-/// a new one.
-#[no_mangle]
-pub unsafe extern "C" fn with_row_tracking_high_water_mark(
-    txn: Handle<ExclusiveTransaction>,
-    high_water_mark: i64,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_row_tracking_high_water_mark_impl(*txn, high_water_mark).into_extern_result(&engine)
-}
-
-fn with_row_tracking_high_water_mark_impl(
-    txn: Transaction,
-    high_water_mark: i64,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
-}
-
-/// Stages `file` to be committed as this transaction's root manifest.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. CONSUMES the transaction handle.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-#[no_mangle]
-pub unsafe extern "C" fn with_root_manifest_file(
-    txn: Handle<ExclusiveTransaction>,
-    file: &FileMeta,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    with_root_manifest_file_impl(*txn, file).into_extern_result(&engine)
-}
-
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn with_root_manifest_file_impl(
-    txn: Transaction,
-    file: &FileMeta,
-) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
-    let location = Url::parse(path)?;
-    let size = file
-        .size
-        .try_into()
-        .map_err(|_| delta_kernel::KernelError::generic("manifest size does not fit a FileSize"))?;
-    let delta_file = delta_kernel::FileMeta {
-        location,
-        last_modified: file.last_modified,
-        size,
-    };
-    Ok(Box::new(txn.with_root_manifest_file(delta_file)?).into())
-}
-
-/// Add file metadata to the transaction for files that have been written. The metadata contains
-/// information about files written during the transaction that will be added to the Delta log
-/// during commit.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. Consumes write_metadata.
-#[no_mangle]
-pub unsafe extern "C" fn add_files(
-    mut txn: Handle<ExclusiveTransaction>,
-    write_metadata: Handle<ExclusiveEngineData>,
-) {
-    let txn = unsafe { txn.as_mut() };
-    let write_metadata = unsafe { write_metadata.into_inner() };
-    txn.add_files(write_metadata);
-}
-
-/// Mark the transaction as having data changes or not (these are recorded at the file level).
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, data_change: bool) {
-    let underlying_txn = unsafe { txn.as_mut() };
-    underlying_txn.set_data_change(data_change);
-}
-
-/// Attempt to commit a transaction to the table. On success, returns a handle to the
-/// [`CommittedTransaction`] from which the caller can read the version and the optional
-/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
-///
-/// Returns an error if the commit fails. The FFI surfaces conflicted and retryable
-/// `CommitResult` variants as errors today (see TODO on `commit_result_to_committed_handle`).
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
-/// method is called.
-#[no_mangle]
-pub unsafe extern "C" fn commit(
-    txn: Handle<ExclusiveTransaction>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
-}
-
-// ============================================================================
-// Create-table transaction FFI functions
-// ============================================================================
-
-/// Free a create-table transaction handle without committing.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_free_transaction(txn: Handle<ExclusiveCreateTransaction>) {
-    txn.drop_handle();
-}
-
-/// Attaches engine info to a create-table transaction.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. CONSUMES the transaction handle.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_with_engine_info(
-    txn: Handle<ExclusiveCreateTransaction>,
-    engine_info: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    create_table_with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
-}
-
-fn create_table_with_engine_info_impl(
-    txn: CreateTableTransaction,
-    engine_info: KernelStringSlice,
-) -> KernelResult<Handle<ExclusiveCreateTransaction>> {
-    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
-    Ok(Box::new(txn.with_engine_info(info)).into())
-}
-
-/// Add domain metadata to a create-table transaction.
-///
-/// `domain` identifies the user-controlled metadata domain, and `configuration` is its arbitrary
-/// string value. Returns the updated transaction handle. Invalid strings are returned as errors;
-/// domain and table-feature validation occurs when the transaction is committed.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
-/// a new one.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_with_domain_metadata(
-    txn: Handle<ExclusiveCreateTransaction>,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    create_table_with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
-}
-
-fn create_table_with_domain_metadata_impl(
-    txn: CreateTableTransaction,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-) -> KernelResult<Handle<ExclusiveCreateTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
-}
-
-/// Add file metadata to a create-table transaction for files that have been written. The metadata
-/// contains information about files written during the transaction that will be added to the
-/// Delta log during commit.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. Consumes write_metadata.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_add_files(
-    mut txn: Handle<ExclusiveCreateTransaction>,
-    write_metadata: Handle<ExclusiveEngineData>,
-) {
-    let txn = unsafe { txn.as_mut() };
-    let write_metadata = unsafe { write_metadata.into_inner() };
-    txn.add_files(write_metadata);
-}
-
-/// Mark the create-table transaction as having data changes or not (these are recorded at the
-/// file level).
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_set_data_change(
-    mut txn: Handle<ExclusiveCreateTransaction>,
-    data_change: bool,
-) {
-    let underlying_txn = unsafe { txn.as_mut() };
-    underlying_txn.set_data_change(data_change);
-}
-
-/// Attempt to commit a create-table transaction. On success, returns a handle to the
-/// [`CommittedTransaction`] from which the caller can read the version and the optional
-/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
-///
-/// Returns an error if the commit fails.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
-/// method is called.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_commit(
-    txn: Handle<ExclusiveCreateTransaction>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
-    let txn = unsafe { txn.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
-}
-
-// ============================================================================
-// Committed transaction accessors
-// ============================================================================
-
-// TODO: expose CommittedTransaction::post_commit_stats through FFI.
-
-/// Free a [`CommittedTransaction`] handle.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle and must not use it after this call.
-#[no_mangle]
-pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommittedTransaction>) {
-    txn.drop_handle();
-}
-
-/// Read the committed version from a [`CommittedTransaction`] handle.
-///
-/// Does not consume the handle; the caller still owns it and must eventually pass it to
-/// [`free_committed_transaction`].
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn committed_transaction_version(
-    txn: &Handle<ExclusiveCommittedTransaction>,
-) -> u64 {
-    unsafe { txn.as_ref() }.commit_version()
-}
-
-/// Reads the post-commit snapshot, if available.
-///
-/// Returns `Some` with a fresh [`SharedSnapshot`] handle if the committed transaction has an
-/// associated post-commit snapshot. Returns `None` otherwise.
-///
-/// Not every commit path produces a post-commit snapshot (see
-/// [`CommittedTransaction::post_commit_snapshot`] for the kernel-side rationale); callers
-/// can fall back to building a snapshot via [`get_snapshot_builder`](crate::get_snapshot_builder)
-/// in that case.
-///
-/// Each `Some` result contains an independent handle that the caller must eventually free with
-/// [`free_snapshot`](crate::free_snapshot). Does not consume the input handle; the caller must
-/// eventually pass it to [`free_committed_transaction`].
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
-    txn: &Handle<ExclusiveCommittedTransaction>,
-) -> OptionalValue<Handle<SharedSnapshot>> {
-    unsafe { txn.as_ref() }
-        .post_commit_snapshot()
-        .map(|snap| Arc::clone(snap).into())
-        .into()
-}
-
-// ============================================================================
-// Create Table DDL
-// ============================================================================
-
-/// A handle representing an exclusive [`CreateTableTransactionBuilder`].
-///
-/// The caller must eventually either call [`create_table_builder_build`] (which consumes the
-/// handle and returns a transaction) or [`free_create_table_builder`] (which drops it without
-/// creating anything).
-#[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
-pub struct ExclusiveCreateTableBuilder;
-
-/// Collect `num_columns` column-name string slices into owned `String`s.
-///
-/// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
-/// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
-///
-/// # Safety
-///
-/// When `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid
-/// [`KernelStringSlice`] values whose backing bytes are readable for the duration of the call.
-unsafe fn collect_create_table_columns(
-    columns: *const KernelStringSlice,
-    num_columns: usize,
-) -> KernelResult<Vec<String>> {
-    if num_columns == 0 {
-        return Ok(Vec::new());
-    }
-    let slices = unsafe { std::slice::from_raw_parts(columns, num_columns) };
-    slices
-        .iter()
-        .map(|slice| {
-            unsafe { TryFromStringSlice::try_from_slice(slice) }.map(|s: &str| s.to_string())
-        })
-        .collect()
-}
-
-/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
-/// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
-/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
-/// happens later at [`create_table_builder_build`].
-///
-/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
-/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
-/// do not free or reuse it. There is no new handle to free either.
-///
-/// Only top-level columns are supported through this entry point (each slice is one column name);
-/// nested clustering columns must be set on the Rust builder directly.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
-/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
-/// values whose backing bytes are readable for the duration of the call; `columns` may be null
-/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
-#[no_mangle]
-pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    columns: *const KernelStringSlice,
-    num_columns: usize,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let builder = unsafe { *builder.into_inner() };
-    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
-    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
-        .into_extern_result(&engine)
-}
-
-/// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
-/// partition column names (in order). Clustering and partitioning are mutually exclusive; the last
-/// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
-/// later at [`create_table_builder_build`].
-///
-/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
-/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
-/// do not free or reuse it. There is no new handle to free either.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
-/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
-/// values whose backing bytes are readable for the duration of the call; `columns` may be null
-/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
-#[no_mangle]
-pub unsafe extern "C" fn create_table_builder_with_partition_columns(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    columns: *const KernelStringSlice,
-    num_columns: usize,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let builder = unsafe { *builder.into_inner() };
-    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
-    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::partitioned))
-        .into_extern_result(&engine)
-}
-
-/// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
-/// wrappers so it can be unit-tested. `layout` is a `Result` so a column-parse failure
-/// short-circuits here, dropping the already-consumed builder rather than producing a layout.
-fn create_table_builder_with_data_layout_impl(
-    builder: CreateTableTransactionBuilder,
-    layout: KernelResult<DataLayout>,
-) -> KernelResult<Handle<ExclusiveCreateTableBuilder>> {
-    Ok(Box::new(builder.with_data_layout(layout?)).into())
-}
-
-/// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
-///
-/// The schema is provided via the engine's visitor callback pattern ([`EngineSchema`]): the
-/// kernel allocates a [`KernelSchemaVisitorState`], calls the engine's visitor function to
-/// populate it via `visit_field_*` downcalls, then extracts the final schema.
-///
-/// The returned builder can be configured with [`create_table_builder_with_table_property`]
-/// before building with [`create_table_builder_build`]. The engine is only used for error
-/// reporting at this stage.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
-#[no_mangle]
-pub unsafe extern "C" fn get_create_table_builder(
-    path: KernelStringSlice,
-    schema: &EngineSchema,
-    engine_info: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
-    let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    get_create_table_builder_impl(path, schema, info).into_extern_result(&engine)
-}
-
-fn get_create_table_builder_impl(
-    path: KernelResult<&str>,
-    schema: &EngineSchema,
-    engine_info: KernelResult<&str>,
-) -> KernelResult<Handle<ExclusiveCreateTableBuilder>> {
-    let mut visitor_state = KernelSchemaVisitorState::default();
-    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
-    let builder = delta_kernel::transaction::create_table::create_table(
-        path?,
-        Arc::new(schema),
-        engine_info?.to_string(),
-    );
-    Ok(Box::new(builder).into())
-}
-
-/// Add a single table property to a [`CreateTableTransactionBuilder`].
-///
-/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
-/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
-/// do not free or reuse it. There is no new handle to free either.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid builder handle, `key`, `value`, and `engine`.
-/// CONSUMES the builder handle unconditionally (even on error).
-#[no_mangle]
-pub unsafe extern "C" fn create_table_builder_with_table_property(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    key: KernelStringSlice,
-    value: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let builder = unsafe { *builder.into_inner() };
-    let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
-    create_table_builder_with_table_property_impl(builder, key, value).into_extern_result(&engine)
-}
-
-fn create_table_builder_with_table_property_impl(
-    builder: CreateTableTransactionBuilder,
-    key: KernelResult<String>,
-    value: KernelResult<String>,
-) -> KernelResult<Handle<ExclusiveCreateTableBuilder>> {
-    let builder = builder.with_table_properties([(key?, value?)]);
-    Ok(Box::new(builder).into())
-}
-
-/// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
-/// create-table transaction handle that can be used with [`create_table_add_files`],
-/// [`create_table_set_data_change`], [`create_table_with_engine_info`], and
-/// [`create_table_commit`] to optionally stage initial data before committing.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid builder and engine handles.
-/// CONSUMES the builder handle -- caller must not use it after this call.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_builder_build(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let builder = unsafe { *builder.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    let committer = Box::new(FileSystemCommitter::new());
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
-}
-
-/// Build a create-table transaction with a custom committer. Same as
-/// [`create_table_builder_build`] but uses the provided committer instead of the default.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles.
-/// CONSUMES both the builder and committer handles -- caller must not use them after this call.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_builder_build_with_committer(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    committer: Handle<MutableCommitter>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
-    let builder = unsafe { *builder.into_inner() };
-    let committer = unsafe { committer.into_inner() };
-    let extern_engine = unsafe { engine.as_ref() };
-    create_table_builder_build_impl(builder, committer, extern_engine)
-        .into_extern_result(&extern_engine)
-}
-
-fn create_table_builder_build_impl(
-    builder: CreateTableTransactionBuilder,
-    committer: Box<dyn Committer>,
-    extern_engine: &dyn ExternEngine,
-) -> KernelResult<Handle<ExclusiveCreateTransaction>> {
-    let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
-    Ok(Box::new(create_txn).into())
-}
-
-/// Free a [`CreateTableTransactionBuilder`] without building.
-///
-/// Use this on failure paths when the builder will not be built.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid handle.
-#[no_mangle]
-pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCreateTableBuilder>) {
-    builder.drop_handle();
-}
-
-// ============================================================================
-// Remove Files DML
-// ============================================================================
-
-/// Remove files from a transaction using engine data and a selection vector.
-///
-/// The `data` handle is consumed. The selection vector indicates which rows in `data` represent
-/// files to remove: nonzero means the row is selected for removal, `0` means it is skipped.
-/// If `selection_vector` is null or `selection_vector_len` is 0, all rows are selected. When
-/// `selection_vector_len` is 0, the `selection_vector` pointer is not accessed and may be null
-/// or any arbitrary value.
-///
-/// The `data` and `selection_vector` should be derived from
-/// [`scan_metadata_next`](crate::scan::scan_metadata_next): `data` is the engine data batch and
-/// `selection_vector` is the scan's selection vector, modified to select only the rows (files) to
-/// remove. Selecting rows that were not active in the original scan selection vector produces
-/// invalid Remove actions in the commit log.
-///
-/// Note: Unlike [`add_files`], this function takes an `engine` handle and returns
-/// [`ExternResult`] because the selection vector validation can fail. Returns `true` on
-/// success (the value itself is not meaningful).
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. The `selection_vector` pointer must be valid
-/// for `selection_vector_len` bytes, or null. Consumes the `data` handle. Does NOT consume
-/// the `txn` handle.
-#[no_mangle]
-pub unsafe extern "C" fn remove_files(
-    mut txn: Handle<ExclusiveTransaction>,
-    data: Handle<ExclusiveEngineData>,
-    selection_vector: *const u8,
-    selection_vector_len: usize,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<bool> {
-    let engine = unsafe { engine.as_ref() };
-    let data = unsafe { data.into_inner() };
-    let txn = unsafe { txn.as_mut() };
-    // empty sv = all rows selected (per FilteredEngineData contract)
-    let sv = if selection_vector.is_null() || selection_vector_len == 0 {
-        vec![]
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) };
-        raw.iter().map(|&b| b != 0).collect()
-    };
-    let result: KernelResult<bool> = (|| {
-        let filtered = FilteredEngineData::try_new(data, sv)?;
-        txn.remove_files(filtered);
-        Ok(true)
-    })();
-    result.into_extern_result(&engine)
-}
+#[cfg(test)]
+use create_table::{collect_create_table_columns, create_table_txn_builder_with_data_layout_impl};
+#[cfg(test)]
+pub(crate) use update_table::transaction;
+#[cfg(all(test, feature = "delta-kernel-unity-catalog"))]
+use update_table::transaction_with_committer;
+#[cfg(test)]
+use update_table::{
+    set_data_change, with_domain_metadata_removed, with_engine_info, with_operation,
+};
 
 #[cfg(test)]
 mod tests {
@@ -887,16 +93,17 @@ mod tests {
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::engine_data::FilteredEngineData;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::Result;
-    use delta_kernel_ffi::delta_types::FfiColumnNameArray;
+    use delta_kernel_ffi::delta_types::{FfiColumnNameArray, FfiStringMapEntry};
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
@@ -913,11 +120,12 @@ mod tests {
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
-        create_table_get_partitioned_write_context, create_table_get_unpartitioned_write_context,
-        free_write_context, get_logical_to_physical, get_partitioned_write_context,
-        get_physical_write_schema, get_unpartitioned_write_context, get_write_dir, get_write_path,
-        get_write_schema, resolve_file_path, visit_partition_values, write_context_builder_build,
-        write_context_builder_with_partition_values,
+        create_table_txn_get_partitioned_write_context,
+        create_table_txn_get_unpartitioned_write_context, free_write_context,
+        get_logical_to_physical, get_physical_write_schema, get_write_dir, get_write_path,
+        get_write_schema, resolve_file_path, update_table_txn_get_partitioned_write_context,
+        update_table_txn_get_unpartitioned_write_context, visit_partition_values,
+        write_context_builder_build, write_context_builder_with_partition_values,
         write_context_builder_with_physical_partition_values, FfiRowTrackingMetadataColumns,
         SharedWriteContext,
     };
@@ -932,7 +140,7 @@ mod tests {
     };
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_bytes_slice, kernel_string_slice,
-        logical_schema, version, KernelStringSlice, NullableCvoid, OptionalValue,
+        logical_schema, version, KernelStringSlice, NullableCvoid, OptionalValue, Url,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -972,8 +180,8 @@ mod tests {
     ///
     /// # Safety
     ///
-    /// Caller asserts the handle is valid (i.e. produced by [`commit`] /
-    /// [`create_table_commit`] and not previously freed).
+    /// Caller asserts the handle is valid (i.e. produced by [`update_table_txn_commit`] /
+    /// [`create_table_txn_commit`] and not previously freed).
     unsafe fn version_and_free(committed: Handle<ExclusiveCommittedTransaction>) -> u64 {
         let version = unsafe { committed_transaction_version(&committed) };
         unsafe { free_committed_transaction(committed) };
@@ -1002,6 +210,25 @@ mod tests {
             array: out_array,
             schema: out_schema,
         })
+    }
+
+    fn commit_info_engine_data(value: &str) -> Handle<ExclusiveEngineData> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            delta_kernel::arrow::datatypes::Field::new(
+                "connectorField",
+                delta_kernel::arrow::datatypes::DataType::Utf8,
+                true,
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![Some(value)]))])
+                .unwrap();
+        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::new(batch));
+        data.into()
+    }
+
+    fn ffi_str(value: &str) -> KernelStringSlice {
+        unsafe { KernelStringSlice::new_unsafe(value) }
     }
 
     fn create_file_metadata(
@@ -1126,7 +353,10 @@ mod tests {
             };
 
             let write_context = ok_or_panic(unsafe {
-                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+                update_table_txn_get_unpartitioned_write_context(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                )
             });
 
             // Ensure we get the correct schema
@@ -1180,9 +410,10 @@ mod tests {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
-            unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+            unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let committed =
+                ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
             unsafe { free_committed_transaction(committed) };
 
             // Confirm that our commit is what we expect
@@ -1297,9 +528,12 @@ mod tests {
                 transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
             let state = ok_or_panic(unsafe {
-                write_context::transaction_write_state(txn.shallow_copy(), engine.shallow_copy())
+                write_context::update_table_txn_write_state(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                )
             });
-            unsafe { free_transaction(txn) };
+            unsafe { free_update_table_txn(txn) };
             let state = if roundtrip {
                 let encoded = recover_bytes(
                     ok_or_panic(unsafe {
@@ -1578,7 +812,7 @@ mod tests {
             assert!(inserted);
 
             let write_context = ok_or_panic(unsafe {
-                get_partitioned_write_context(
+                update_table_txn_get_partitioned_write_context(
                     txn.shallow_copy(),
                     partition_values,
                     engine.shallow_copy(),
@@ -1669,9 +903,10 @@ mod tests {
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
-            unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+            unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let committed =
+                ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
             unsafe { free_committed_transaction(committed) };
 
             // The commit's add action records the partition values and Hive-style path.
@@ -1743,7 +978,7 @@ mod tests {
                 )
             });
             let result = unsafe {
-                get_partitioned_write_context(
+                update_table_txn_get_partitioned_write_context(
                     txn.shallow_copy(),
                     partition_values,
                     engine.shallow_copy(),
@@ -1758,7 +993,7 @@ mod tests {
                 "unexpected error: {}",
                 err.message
             );
-            unsafe { free_transaction(txn) };
+            unsafe { free_update_table_txn(txn) };
             unsafe { free_engine(engine) };
         }
 
@@ -1796,7 +1031,7 @@ mod tests {
                 )
             });
             let write_context = ok_or_panic(unsafe {
-                get_partitioned_write_context(
+                update_table_txn_get_partitioned_write_context(
                     txn.shallow_copy(),
                     partition_values,
                     engine.shallow_copy(),
@@ -1813,7 +1048,7 @@ mod tests {
             assert_eq!(collected, vec![("part".to_string(), String::new(), true)]);
 
             unsafe { free_write_context(write_context) };
-            unsafe { free_transaction(txn) };
+            unsafe { free_update_table_txn(txn) };
             unsafe { free_engine(engine) };
         }
 
@@ -1862,7 +1097,7 @@ mod tests {
                 )
             });
             let write_context = ok_or_panic(unsafe {
-                get_partitioned_write_context(
+                update_table_txn_get_partitioned_write_context(
                     txn.shallow_copy(),
                     partition_values,
                     engine.shallow_copy(),
@@ -1880,7 +1115,7 @@ mod tests {
             assert_eq!(keys, vec!["region", "year"]);
 
             unsafe { free_write_context(write_context) };
-            unsafe { free_transaction(txn) };
+            unsafe { free_update_table_txn(txn) };
             unsafe { free_engine(engine) };
         }
 
@@ -1908,6 +1143,24 @@ mod tests {
             .into_iter()
             .find(|a| a.get("domainMetadata").is_some())
             .expect("commit should contain a domainMetadata action")
+    }
+
+    async fn read_commit_info_action(
+        store: &DynObjectStore,
+        table_url: &Url,
+        version: u64,
+    ) -> serde_json::Value {
+        let path = format!("_delta_log/{version:020}.json");
+        let commit_url = table_url.join(&path).unwrap();
+        let data = store
+            .get(&Path::from_url_path(commit_url.path()).unwrap())
+            .await
+            .unwrap();
+        Deserializer::from_slice(&data.bytes().await.unwrap())
+            .into_iter::<serde_json::Value>()
+            .map(Result::unwrap)
+            .find(|action| action.get("commitInfo").is_some())
+            .expect("commit should contain a commitInfo action")
     }
 
     /// Create a table with the requested domain-metadata features.
@@ -1951,7 +1204,7 @@ mod tests {
         let domain = "testDomain";
         let configuration = r#"{"key": "value"}"#;
         let txn = ok_or_panic(unsafe {
-            with_domain_metadata(
+            update_table_txn_with_domain_metadata(
                 txn,
                 kernel_string_slice!(domain),
                 kernel_string_slice!(configuration),
@@ -1959,7 +1212,7 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 1);
 
@@ -1978,7 +1231,7 @@ mod tests {
             with_domain_metadata_removed(txn, kernel_string_slice!(domain), engine.shallow_copy())
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 2);
 
@@ -1997,7 +1250,8 @@ mod tests {
         let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys", false).await?;
         let table_path_str = table_url.as_str();
 
-        // with_domain_metadata succeeds (validation is lazy), but commit should fail
+        // update_table_txn_with_domain_metadata succeeds (validation is lazy), but commit should
+        // fail
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
@@ -2006,7 +1260,7 @@ mod tests {
         let sys_domain = "delta.system";
         let config = "config";
         let txn = ok_or_panic(unsafe {
-            with_domain_metadata(
+            update_table_txn_with_domain_metadata(
                 txn,
                 kernel_string_slice!(sys_domain),
                 kernel_string_slice!(config),
@@ -2014,7 +1268,7 @@ mod tests {
             )
         });
 
-        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        let result = unsafe { update_table_txn_commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
@@ -2035,11 +1289,11 @@ mod tests {
             transaction(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
         });
 
         assert_extern_result_error_contains(
-            unsafe { commit(txn, engine.shallow_copy()) },
+            unsafe { update_table_txn_commit(txn, engine.shallow_copy()) },
             FFIKernelError::GenericError,
             "requires the 'rowTracking' feature",
         );
@@ -2058,11 +1312,13 @@ mod tests {
             transaction(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
         });
 
         assert_extern_result_error_contains(
-            unsafe { with_row_tracking_high_water_mark(txn, 8, engine.shallow_copy()) },
+            unsafe {
+                update_table_txn_with_row_tracking_high_water_mark(txn, 8, engine.shallow_copy())
+            },
             FFIKernelError::GenericError,
             "already specified in this transaction",
         );
@@ -2080,10 +1336,10 @@ mod tests {
             transaction(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         assert_eq!(unsafe { version_and_free(committed) }, 1);
         let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
         assert_eq!(
@@ -2110,19 +1366,19 @@ mod tests {
             transaction(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
         });
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         assert_eq!(unsafe { version_and_free(committed) }, 1);
 
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 6, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 6, engine.shallow_copy())
         });
         assert_extern_result_error_contains(
-            unsafe { commit(txn, engine.shallow_copy()) },
+            unsafe { update_table_txn_commit(txn, engine.shallow_copy()) },
             FFIKernelError::GenericError,
             "cannot be less than the calculated value 7",
         );
@@ -2148,12 +1404,12 @@ mod tests {
         let file_info_engine_data = ok_or_panic(unsafe {
             get_engine_data(file_info.array, &file_info.schema, allocate_err)
         });
-        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+        unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
         });
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         assert_eq!(unsafe { version_and_free(committed) }, 1);
         let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
         assert_eq!(
@@ -2182,13 +1438,13 @@ mod tests {
         let file_info_engine_data = ok_or_panic(unsafe {
             get_engine_data(file_info.array, &file_info.schema, allocate_err)
         });
-        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+        unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
         let txn = ok_or_panic(unsafe {
-            with_row_tracking_high_water_mark(txn, 0, engine.shallow_copy())
+            update_table_txn_with_row_tracking_high_water_mark(txn, 0, engine.shallow_copy())
         });
         assert_extern_result_error_contains(
-            unsafe { commit(txn, engine.shallow_copy()) },
+            unsafe { update_table_txn_commit(txn, engine.shallow_copy()) },
             FFIKernelError::GenericError,
             "cannot be less than the calculated value 1",
         );
@@ -2213,7 +1469,7 @@ mod tests {
         let config_a = "a";
         let config_b = "b";
         let txn = ok_or_panic(unsafe {
-            with_domain_metadata(
+            update_table_txn_with_domain_metadata(
                 txn,
                 kernel_string_slice!(dup_domain),
                 kernel_string_slice!(config_a),
@@ -2221,7 +1477,7 @@ mod tests {
             )
         });
         let txn = ok_or_panic(unsafe {
-            with_domain_metadata(
+            update_table_txn_with_domain_metadata(
                 txn,
                 kernel_string_slice!(dup_domain),
                 kernel_string_slice!(config_b),
@@ -2229,7 +1485,7 @@ mod tests {
             )
         });
 
-        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        let result = unsafe { update_table_txn_commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
@@ -2272,7 +1528,7 @@ mod tests {
         let domain = "myDomain";
         let config = "config";
         let txn = ok_or_panic(unsafe {
-            with_domain_metadata(
+            update_table_txn_with_domain_metadata(
                 txn,
                 kernel_string_slice!(domain),
                 kernel_string_slice!(config),
@@ -2280,7 +1536,7 @@ mod tests {
             )
         });
 
-        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        let result = unsafe { update_table_txn_commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::UnsupportedError,
@@ -2397,7 +1653,7 @@ mod tests {
             };
 
             let write_context = ok_or_panic(unsafe {
-                get_unpartitioned_write_context(
+                update_table_txn_get_unpartitioned_write_context(
                     txn_with_engine_info.shallow_copy(),
                     engine.shallow_copy(),
                 )
@@ -2434,9 +1690,15 @@ mod tests {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
-            unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
+            unsafe {
+                update_table_txn_add_files(
+                    txn_with_engine_info.shallow_copy(),
+                    file_info_engine_data,
+                )
+            };
 
-            let commit_result = unsafe { commit(txn_with_engine_info, engine.shallow_copy()) };
+            let commit_result =
+                unsafe { update_table_txn_commit(txn_with_engine_info, engine.shallow_copy()) };
 
             // UC committer returns success from our mock callback
             let committed = ok_or_panic(commit_result);
@@ -2657,14 +1919,14 @@ mod tests {
     /// Create a [`CreateTableTransactionBuilder`] handle via the FFI, using the given schema
     /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
     /// for freeing/consuming the engine and builder handles.
-    fn create_table_builder(
+    fn create_table_txn_builder(
         store: &Arc<DynObjectStore>,
         table_url: &Url,
         fields: Vec<StructField>,
     ) -> (
         String,
         Handle<SharedExternEngine>,
-        Handle<ExclusiveCreateTableBuilder>,
+        Handle<ExclusiveCreateTableTransactionBuilder>,
     ) {
         let table_path = table_url.to_string();
         let engine = engine_handle_for_store(Arc::clone(store));
@@ -2674,7 +1936,7 @@ mod tests {
             visitor: visit_test_schema,
         };
         let builder = ok_or_panic(unsafe {
-            get_create_table_builder(
+            get_create_table_txn_builder(
                 kernel_string_slice!(table_path),
                 &schema_arg,
                 kernel_string_slice!(engine_info),
@@ -2687,12 +1949,12 @@ mod tests {
     /// Build and commit a create-table builder with default (null) committer, asserting that
     /// the committed version is 0.
     fn build_and_commit(
-        builder: Handle<ExclusiveCreateTableBuilder>,
+        builder: Handle<ExclusiveCreateTableTransactionBuilder>,
         engine: &Handle<SharedExternEngine>,
     ) -> u64 {
         let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 0);
         version
@@ -2702,7 +1964,7 @@ mod tests {
     async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (table_path, engine, builder) = create_table_builder(
+        let (table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![
@@ -2802,10 +2064,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_create_table_txn_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>>
+    {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table_domain_metadata", None);
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
@@ -2813,7 +2076,7 @@ mod tests {
         let domain_feature = "delta.feature.domainMetadata";
         let supported = "supported";
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_table_property(
+            create_table_txn_builder_with_table_property(
                 builder,
                 kernel_string_slice!(domain_feature),
                 kernel_string_slice!(supported),
@@ -2821,11 +2084,11 @@ mod tests {
             )
         });
         let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
         let domain = "test.domain";
         let configuration = r#"{"key":"value"}"#;
         let txn = ok_or_panic(unsafe {
-            create_table_with_domain_metadata(
+            create_table_txn_with_domain_metadata(
                 txn,
                 kernel_string_slice!(domain),
                 kernel_string_slice!(configuration),
@@ -2833,7 +2096,7 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
         assert_eq!(unsafe { version_and_free(committed) }, 0);
         let domain_metadata = read_domain_metadata_action(&store, &table_url, 0).await;
         assert_eq!(domain_metadata["domainMetadata"]["domain"], domain);
@@ -2843,6 +2106,360 @@ mod tests {
         );
 
         unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_builder_commit_info_setters() {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_builder_setters", None);
+        let (_table_path, engine, builder) = create_table_txn_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_table_property(
+                builder,
+                ffi_str("delta.feature.domainMetadata"),
+                ffi_str("supported"),
+                engine.shallow_copy(),
+            )
+        });
+
+        let parameter_entries = [FfiStringMapEntry {
+            key: ffi_str("key"),
+            value: ffi_str("parameter"),
+        }];
+        let parameters = unsafe { FfiStringMap::new_unsafe(&parameter_entries) };
+        let builder_metric_entries = [FfiStringMapEntry {
+            key: ffi_str("key"),
+            value: ffi_str("builder"),
+        }];
+        let builder_metrics = unsafe { FfiStringMap::new_unsafe(&builder_metric_entries) };
+        let transaction_metric_entries = [FfiStringMapEntry {
+            key: ffi_str("key"),
+            value: ffi_str("transaction"),
+        }];
+        let transaction_metrics = unsafe { FfiStringMap::new_unsafe(&transaction_metric_entries) };
+        let commit_info_fields = vec![StructField::nullable("connectorField", DataType::STRING)];
+        let commit_info_schema = EngineSchema {
+            schema: &commit_info_fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_correlation_id(
+                builder,
+                ffi_str("create-correlation"),
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_operation_parameters(
+                builder,
+                &parameters,
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_operation_metrics(
+                builder,
+                &builder_metrics,
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_commit_info(
+                builder,
+                commit_info_engine_data("builder"),
+                &commit_info_schema,
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_domain_metadata(
+                builder,
+                ffi_str("connector.domain"),
+                ffi_str("{}"),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let txn = ok_or_panic(unsafe {
+            create_table_txn_with_operation_metrics(
+                txn,
+                &transaction_metrics,
+                engine.shallow_copy(),
+            )
+        });
+        let txn = ok_or_panic(unsafe {
+            create_table_txn_with_commit_info(
+                txn,
+                commit_info_engine_data("transaction"),
+                &commit_info_schema,
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 0);
+        let commit_info = read_commit_info_action(&store, &table_url, 0).await;
+        assert_eq!(
+            commit_info["commitInfo"]["operationParameters"]["key"],
+            "parameter"
+        );
+        assert_eq!(
+            commit_info["commitInfo"]["operationMetrics"]["key"],
+            "transaction"
+        );
+        assert_eq!(commit_info["commitInfo"]["connectorField"], "transaction");
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_update_table_builder_commit_info_setters(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, store, engine) =
+            setup_domain_metadata_table("test_update_builder_setters", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+
+        let parameter_entries = [FfiStringMapEntry {
+            key: ffi_str("key"),
+            value: ffi_str("parameter"),
+        }];
+        let parameters = unsafe { FfiStringMap::new_unsafe(&parameter_entries) };
+        let builder_metric_entries = [FfiStringMapEntry {
+            key: ffi_str("key"),
+            value: ffi_str("builder"),
+        }];
+        let builder_metrics = unsafe { FfiStringMap::new_unsafe(&builder_metric_entries) };
+        let transaction_metric_entries = [FfiStringMapEntry {
+            key: ffi_str("key"),
+            value: ffi_str("transaction"),
+        }];
+        let transaction_metrics = unsafe { FfiStringMap::new_unsafe(&transaction_metric_entries) };
+        let commit_info_fields = vec![StructField::nullable("connectorField", DataType::STRING)];
+        let commit_info_schema = EngineSchema {
+            schema: &commit_info_fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_correlation_id(
+                builder,
+                ffi_str("update-correlation"),
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_operation_parameters(
+                builder,
+                &parameters,
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_operation_metrics(
+                builder,
+                &builder_metrics,
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_commit_info(
+                builder,
+                commit_info_engine_data("builder"),
+                &commit_info_schema,
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_domain_metadata(
+                builder,
+                ffi_str("connector.domain"),
+                ffi_str("{}"),
+                engine.shallow_copy(),
+            )
+        });
+        let added_fields = vec![StructField::nullable("added", DataType::LONG)];
+        let added_field = EngineSchema {
+            schema: &added_fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_add_column(builder, &added_field, engine.shallow_copy())
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_engine_info(
+                builder,
+                ffi_str("test-engine/1.0"),
+                engine.shallow_copy(),
+            )
+        });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_custom_operation(
+                builder,
+                ffi_str("CUSTOM"),
+                engine.shallow_copy(),
+            )
+        });
+        let builder = unsafe { update_table_txn_builder_with_data_change(builder, true) };
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let txn = ok_or_panic(unsafe {
+            update_table_txn_with_operation_metrics(
+                txn,
+                &transaction_metrics,
+                engine.shallow_copy(),
+            )
+        });
+        let txn = ok_or_panic(unsafe {
+            update_table_txn_with_commit_info(
+                txn,
+                commit_info_engine_data("transaction"),
+                &commit_info_schema,
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let commit_info = read_commit_info_action(&store, &table_url, 1).await;
+        assert_eq!(commit_info["commitInfo"]["operation"], "CUSTOM");
+        assert_eq!(
+            commit_info["commitInfo"]["operationParameters"]["key"],
+            "parameter"
+        );
+        assert_eq!(
+            commit_info["commitInfo"]["operationMetrics"]["key"],
+            "transaction"
+        );
+        assert_eq!(commit_info["commitInfo"]["connectorField"], "transaction");
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn create_table_builder_rejects_duplicate_operation_parameter_keys() {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_builder_duplicate_parameters", None);
+        let (_table_path, engine, builder) = create_table_txn_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let entries = [
+            FfiStringMapEntry {
+                key: ffi_str("duplicate"),
+                value: ffi_str("first"),
+            },
+            FfiStringMapEntry {
+                key: ffi_str("duplicate"),
+                value: ffi_str("second"),
+            },
+        ];
+        let values = unsafe { FfiStringMap::new_unsafe(&entries) };
+
+        assert_extern_result_error_contains(
+            unsafe {
+                create_table_txn_builder_with_operation_parameters(
+                    builder,
+                    &values,
+                    engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::GenericError,
+            "duplicate map key: duplicate",
+        );
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn update_table_builder_rejects_empty_operation_parameter_key(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_empty_parameter", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let entries = [FfiStringMapEntry {
+            key: ffi_str(""),
+            value: ffi_str("value"),
+        }];
+        let values = unsafe { FfiStringMap::new_unsafe(&entries) };
+
+        assert_extern_result_error_contains(
+            unsafe {
+                update_table_txn_builder_with_operation_parameters(
+                    builder,
+                    &values,
+                    engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::InvalidTransactionStateError,
+            "operation parameter key cannot be empty",
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_table_builder_lifecycle_and_operation_variants(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_lifecycle", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+
+        for operation in [
+            KernelUpdateTableOperation::StreamingUpdate,
+            KernelUpdateTableOperation::AlterTable,
+            KernelUpdateTableOperation::Delete,
+            KernelUpdateTableOperation::Update,
+            KernelUpdateTableOperation::Merge,
+            KernelUpdateTableOperation::Optimize,
+        ] {
+            let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+            let builder = unsafe { update_table_txn_builder_with_operation(builder, operation) };
+            unsafe { free_update_table_txn_builder(builder) };
+        }
+
+        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_domain_metadata_removed(
+                builder,
+                ffi_str("missing.domain"),
+                engine.shallow_copy(),
+            )
+        });
+        unsafe { free_update_table_txn_builder(builder) };
+
+        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { update_table_txn_builder_with_data_change(builder, true) };
+        let builder = unsafe { update_table_txn_builder_with_blind_append(builder) };
+        let committer: Box<dyn Committer> = Box::new(FileSystemCommitter::new());
+        let txn = ok_or_panic(unsafe {
+            update_table_txn_builder_build_with_committer(
+                builder,
+                engine.shallow_copy(),
+                committer.into(),
+            )
+        });
+        unsafe {
+            free_update_table_txn(txn);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
         Ok(())
     }
 
@@ -2899,11 +2516,14 @@ mod tests {
 
         let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
         let file = root_manifest_file_meta(&manifest_path);
-        let staged = unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) };
+        let staged = unsafe {
+            update_table_txn_with_root_manifest_file(txn, &file, engine.shallow_copy())
+        };
 
         if feature_enabled {
             let txn = ok_or_panic(staged);
-            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let committed =
+                ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
             assert_eq!(unsafe { version_and_free(committed) }, 1);
         } else {
             assert_extern_result_error_with_message(
@@ -2940,7 +2560,7 @@ mod tests {
     async fn test_create_table_with_clustering_columns() -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![
@@ -2952,7 +2572,7 @@ mod tests {
         let col = "id";
         let columns = [kernel_string_slice!(col)];
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_clustering_columns(
+            create_table_txn_builder_with_clustering_columns(
                 builder,
                 columns.as_ptr(),
                 columns.len(),
@@ -2988,7 +2608,7 @@ mod tests {
             test_utils::engine_store_setup("test_create_table", None);
         // Partitioning requires at least one non-partition column, so partition on `date`
         // while keeping `id` as data.
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![
@@ -3000,7 +2620,7 @@ mod tests {
         let col = "date";
         let columns = [kernel_string_slice!(col)];
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_partition_columns(
+            create_table_txn_builder_with_partition_columns(
                 builder,
                 columns.as_ptr(),
                 columns.len(),
@@ -3008,7 +2628,7 @@ mod tests {
             )
         });
         let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
 
         let partition_values = partition_value_map_new();
         let value = "2024-01-01";
@@ -3021,7 +2641,7 @@ mod tests {
             )
         }));
         let write_context = ok_or_panic(unsafe {
-            create_table_get_partitioned_write_context(
+            create_table_txn_get_partitioned_write_context(
                 txn.shallow_copy(),
                 partition_values,
                 engine.shallow_copy(),
@@ -3034,7 +2654,7 @@ mod tests {
         unsafe { free_write_context(write_context) };
 
         let missing_partition_value = unsafe {
-            create_table_get_partitioned_write_context(
+            create_table_txn_get_partitioned_write_context(
                 txn.shallow_copy(),
                 partition_value_map_new(),
                 engine.shallow_copy(),
@@ -3046,7 +2666,7 @@ mod tests {
             Some("Invalid partition values: missing partition column 'date'. Provided: []"),
         );
 
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 0);
 
@@ -3066,7 +2686,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![
@@ -3080,7 +2700,7 @@ mod tests {
         let c1 = "name";
         let columns = [kernel_string_slice!(c0), kernel_string_slice!(c1)];
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_clustering_columns(
+            create_table_txn_builder_with_clustering_columns(
                 builder,
                 columns.as_ptr(),
                 columns.len(),
@@ -3104,7 +2724,7 @@ mod tests {
     {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![
@@ -3118,7 +2738,7 @@ mod tests {
         let c_col = "id";
         let c_cols = [kernel_string_slice!(c_col)];
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_clustering_columns(
+            create_table_txn_builder_with_clustering_columns(
                 builder,
                 c_cols.as_ptr(),
                 c_cols.len(),
@@ -3128,7 +2748,7 @@ mod tests {
         let p_col = "date";
         let p_cols = [kernel_string_slice!(p_col)];
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_partition_columns(
+            create_table_txn_builder_with_partition_columns(
                 builder,
                 p_cols.as_ptr(),
                 p_cols.len(),
@@ -3164,14 +2784,14 @@ mod tests {
         // builder, never producing a layout or a dangling handle.
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (_table_path, engine, builder_handle) = create_table_builder(
+        let (_table_path, engine, builder_handle) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
         let layout: Result<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
-        let result = create_table_builder_with_data_layout_impl(builder, layout);
+        let result = create_table_txn_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };
     }
@@ -3182,15 +2802,15 @@ mod tests {
     async fn test_post_commit_snapshot_create_table() -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
 
         let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
 
         assert_eq!(unsafe { committed_transaction_version(&committed) }, 0);
 
@@ -3232,7 +2852,7 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let v = unsafe { committed_transaction_version(&committed) };
         assert_eq!(v, 2);
 
@@ -3269,7 +2889,7 @@ mod tests {
     fn test_create_table_with_properties() {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (table_path, engine, builder) = create_table_builder(
+        let (table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
@@ -3279,7 +2899,7 @@ mod tests {
         let prop_key1 = "delta.appendOnly";
         let prop_val1 = "true";
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_table_property(
+            create_table_txn_builder_with_table_property(
                 builder,
                 kernel_string_slice!(prop_key1),
                 kernel_string_slice!(prop_val1),
@@ -3289,7 +2909,7 @@ mod tests {
         let prop_key2 = "custom.key";
         let prop_val2 = "custom_value";
         let builder = ok_or_panic(unsafe {
-            create_table_builder_with_table_property(
+            create_table_txn_builder_with_table_property(
                 builder,
                 kernel_string_slice!(prop_key2),
                 kernel_string_slice!(prop_val2),
@@ -3332,10 +2952,10 @@ mod tests {
         cm_mode: Option<&str>,
     ) -> (
         Handle<SharedExternEngine>,
-        Handle<ExclusiveCreateTransaction>,
+        Handle<ExclusiveCreateTableTransaction>,
         Handle<SharedWriteContext>,
     ) {
-        let (_table_path, engine, mut builder) = create_table_builder(
+        let (_table_path, engine, mut builder) = create_table_txn_builder(
             store,
             table_url,
             vec![
@@ -3346,7 +2966,7 @@ mod tests {
         if let Some(mode) = cm_mode {
             let cm_key = "delta.columnMapping.mode";
             builder = ok_or_panic(unsafe {
-                create_table_builder_with_table_property(
+                create_table_txn_builder_with_table_property(
                     builder,
                     kernel_string_slice!(cm_key),
                     kernel_string_slice!(mode),
@@ -3355,9 +2975,12 @@ mod tests {
             });
         }
         let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
         let write_context = ok_or_panic(unsafe {
-            create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+            create_table_txn_get_unpartitioned_write_context(
+                txn.shallow_copy(),
+                engine.shallow_copy(),
+            )
         });
         (engine, txn, write_context)
     }
@@ -3428,7 +3051,7 @@ mod tests {
             free_schema(physical);
             free_schema(logical);
             free_write_context(write_context);
-            create_table_free_transaction(txn);
+            free_create_table_txn(txn);
             free_engine(engine);
         }
     }
@@ -3439,7 +3062,7 @@ mod tests {
             test_utils::engine_store_setup("test_create_table", None);
 
         // Create the table first time -- should succeed
-        let (_table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
@@ -3447,12 +3070,12 @@ mod tests {
         build_and_commit(builder, &engine);
 
         // Try to create the same table again -- build should error (table already exists)
-        let (_, engine2, builder2) = create_table_builder(
+        let (_, engine2, builder2) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let result = unsafe { create_table_builder_build(builder2, engine2.shallow_copy()) };
+        let result = unsafe { create_table_txn_builder_build(builder2, engine2.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 // Clean up the error to prevent leaks
@@ -3464,7 +3087,7 @@ mod tests {
                 );
             }
             ExternResult::Ok(txn) => {
-                unsafe { create_table_free_transaction(txn) };
+                unsafe { free_create_table_txn(txn) };
                 panic!("Expected error for table that already exists");
             }
         }
@@ -3475,13 +3098,13 @@ mod tests {
     }
 
     #[test]
-    fn test_free_create_table_builder() {
+    fn test_free_create_table_txn_builder() {
         let schema = schema_ref! { nullable "id": INTEGER };
         let builder =
             delta_kernel::transaction::create_table::create_table("memory:///test", schema, "test");
-        let handle: Handle<ExclusiveCreateTableBuilder> = Box::new(builder).into();
+        let handle: Handle<ExclusiveCreateTableTransactionBuilder> = Box::new(builder).into();
         // Should not panic or leak
-        unsafe { free_create_table_builder(handle) };
+        unsafe { free_create_table_txn_builder(handle) };
     }
 
     #[tokio::test]
@@ -3491,13 +3114,92 @@ mod tests {
             test_utils::engine_store_setup("test_create_table", None);
         // CREATE TABLE with no columns is permitted by the Delta protocol; users may
         // populate the schema later via ALTER TABLE ADD COLUMN.
-        let (_table_path, engine, builder) = create_table_builder(&store, &table_url, vec![]);
+        let (_table_path, engine, builder) = create_table_txn_builder(&store, &table_url, vec![]);
 
         let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        unsafe { create_table_free_transaction(txn) };
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
+        unsafe { free_create_table_txn(txn) };
 
         unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_table_txn_builder_applies_nested_schema_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, kernel_engine, table_url) =
+            test_utils::engine_store_setup("test_nested_schema_changes", None);
+        let nested =
+            StructType::try_new(vec![StructField::not_null("required", DataType::STRING)])?;
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "profile", nested,
+        )])?);
+        delta_kernel::transaction::create_table::create_table(
+            table_url.as_str(),
+            schema,
+            "test-engine/1.0",
+        )
+        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&kernel_engine)?
+        .unwrap_committed();
+        let engine = engine_handle_for_store(store);
+
+        let snapshot =
+            delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
+        let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+        let mut builder = unsafe { get_update_table_txn_builder(snapshot_handle.shallow_copy()) };
+        builder = unsafe {
+            update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::AlterTable)
+        };
+
+        let profile_name = "profile";
+        let required_name = "required";
+        let parent_parts = [kernel_string_slice!(profile_name)];
+        let parent = FfiColumnName {
+            path: unsafe { crate::delta_types::FfiStringArray::new_unsafe(&parent_parts) },
+        };
+        let added_fields = vec![StructField::nullable("added", DataType::LONG)];
+        let added_field = EngineSchema {
+            schema: &added_fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+        builder = ok_or_panic(unsafe {
+            update_table_txn_builder_add_column_at(
+                builder,
+                &parent,
+                &added_field,
+                engine.shallow_copy(),
+            )
+        });
+
+        let nullable_parts = [
+            kernel_string_slice!(profile_name),
+            kernel_string_slice!(required_name),
+        ];
+        let nullable_column = FfiColumnName {
+            path: unsafe { crate::delta_types::FfiStringArray::new_unsafe(&nullable_parts) },
+        };
+        builder = ok_or_panic(unsafe {
+            update_table_txn_builder_set_nullable(builder, &nullable_column, engine.shallow_copy())
+        });
+
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        unsafe {
+            free_committed_transaction(committed);
+            free_snapshot(snapshot_handle);
+            free_engine(engine);
+        }
+
+        let snapshot = delta_kernel::Snapshot::builder_for(table_url).build(&kernel_engine)?;
+        let schema = snapshot.schema();
+        let profile = schema.field("profile").expect("profile field");
+        let DataType::Struct(profile) = &profile.data_type else {
+            panic!("profile must remain a struct");
+        };
+        assert!(profile.field("added").is_some());
+        assert!(profile.field("required").expect("required field").nullable);
         Ok(())
     }
 
@@ -3505,7 +3207,7 @@ mod tests {
     async fn test_create_table_with_custom_committer() -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (table_path, engine, builder) = create_table_builder(
+        let (table_path, engine, builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
@@ -3518,13 +3220,13 @@ mod tests {
         let committer_handle: Handle<MutableCommitter> = committer.into();
 
         let txn = ok_or_panic(unsafe {
-            create_table_builder_build_with_committer(
+            create_table_txn_builder_build_with_committer(
                 builder,
-                committer_handle,
                 engine.shallow_copy(),
+                committer_handle,
             )
         });
-        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
         let committed_version = unsafe { version_and_free(committed) };
         assert_eq!(committed_version, 0);
 
@@ -3559,7 +3261,7 @@ mod tests {
             visitor: visit_test_schema,
         };
         let builder = ok_or_panic(unsafe {
-            get_create_table_builder(
+            get_create_table_txn_builder(
                 kernel_string_slice!(table_path),
                 &schema_arg,
                 kernel_string_slice!(engine_info),
@@ -3608,8 +3310,8 @@ mod tests {
                 crate::ffi_test_utils::allocate_err,
             )
         });
-        unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         unsafe { free_committed_transaction(committed) };
 
         Ok((table_path.to_string(), engine))
@@ -3653,7 +3355,7 @@ mod tests {
         (
             Box<dyn delta_kernel::EngineData>,
             Vec<bool>,
-            Handle<ExclusiveTransaction>,
+            Handle<ExclusiveUpdateTableTransaction>,
             Handle<SharedExternEngine>,
             Arc<dyn delta_kernel::Engine>,
             String,
@@ -3710,7 +3412,7 @@ mod tests {
             sv_u8.as_ptr()
         };
         ok_or_panic(unsafe {
-            remove_files(
+            update_table_txn_remove_files(
                 txn.shallow_copy(),
                 data_handle,
                 sv_ptr,
@@ -3719,7 +3421,7 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         unsafe { free_committed_transaction(committed) };
         assert_no_active_files(&kernel_engine, table_path.as_str())?;
 
@@ -3754,7 +3456,7 @@ mod tests {
         use delta_kernel_ffi::scan::{free_scan, scan, scan_metadata_iter_init};
         use delta_kernel_ffi::transaction::{
             dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
-            transaction_update_deletion_vectors, KernelDvStorageType,
+            update_table_txn_update_deletion_vectors, KernelDvStorageType,
         };
         use test_utils::record_batch_to_bytes;
 
@@ -3800,9 +3502,10 @@ mod tests {
             .build(kernel_engine.as_ref())?;
         let mut add_txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .transaction_builder()
             .with_engine_info("test-engine/1.0")
-            .with_operation("WRITE".to_string());
+            .with_operation(UpdateTableOperation::Write)
+            .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,
@@ -3882,7 +3585,7 @@ mod tests {
         });
 
         ok_or_panic(unsafe {
-            transaction_update_deletion_vectors(
+            update_table_txn_update_deletion_vectors(
                 txn.shallow_copy(),
                 map,
                 scan_iter,
@@ -3890,7 +3593,7 @@ mod tests {
             )
         });
 
-        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let committed_version = unsafe { version_and_free(committed) };
         assert_eq!(committed_version, 2);
 
@@ -3932,7 +3635,7 @@ mod tests {
         // the FFI signature (nonzero = selected).
         let sv: Vec<u8> = vec![1; num_rows];
         ok_or_panic(unsafe {
-            remove_files(
+            update_table_txn_remove_files(
                 txn.shallow_copy(),
                 data_handle,
                 sv.as_ptr(),
@@ -3944,17 +3647,17 @@ mod tests {
         // Don't commit -- the from_raw_parts path has been exercised. Committing with
         // a non-empty SV triggers a different code path in generate_remove_actions that
         // requires additional scan row fields not present in this test setup.
-        unsafe { free_transaction(txn) };
+        unsafe { free_update_table_txn(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
 
     /// The kernel's column-default acknowledgement gate, observed through the FFI: a write context
-    /// is only obtainable after [`transaction_ack_column_defaults`]. The column-default accessors
-    /// themselves are tested in [`crate::column_default`].
+    /// is only obtainable after [`update_table_txn_ack_column_defaults`]. The column-default
+    /// accessors themselves are tested in [`crate::column_default`].
     mod column_default_ack_gate {
         use delta_kernel_ffi::column_default::{
-            transaction_ack_column_defaults, transaction_visit_top_level_column_defaults,
+            update_table_txn_ack_column_defaults, update_table_txn_visit_top_level_column_defaults,
         };
 
         use super::*;
@@ -3974,7 +3677,10 @@ mod tests {
         /// Open a transaction on the fixture at `table_path`, returning `(engine, txn)`.
         fn transaction_on(
             table_path: &str,
-        ) -> (Handle<SharedExternEngine>, Handle<ExclusiveTransaction>) {
+        ) -> (
+            Handle<SharedExternEngine>,
+            Handle<ExclusiveUpdateTableTransaction>,
+        ) {
             let table_root = delta_kernel::try_parse_uri(table_path).unwrap().to_string();
             let engine = get_default_engine(&table_root);
             let txn = ok_or_panic(unsafe {
@@ -3989,7 +3695,7 @@ mod tests {
 
             // Visiting the defaults must not implicitly acknowledge them.
             let visited = ok_or_panic(unsafe {
-                transaction_visit_top_level_column_defaults(
+                update_table_txn_visit_top_level_column_defaults(
                     txn.shallow_copy(),
                     engine.shallow_copy(),
                     None,
@@ -4000,7 +3706,10 @@ mod tests {
 
             assert_extern_result_error_with_message(
                 unsafe {
-                    get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+                    update_table_txn_get_unpartitioned_write_context(
+                        txn.shallow_copy(),
+                        engine.shallow_copy(),
+                    )
                 },
                 FFIKernelError::InvalidTransactionStateError,
                 Some(
@@ -4009,13 +3718,16 @@ mod tests {
                 ),
             );
 
-            unsafe { transaction_ack_column_defaults(txn.shallow_copy()) };
+            unsafe { update_table_txn_ack_column_defaults(txn.shallow_copy()) };
             let write_context = ok_or_panic(unsafe {
-                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+                update_table_txn_get_unpartitioned_write_context(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                )
             });
 
             unsafe { free_write_context(write_context) };
-            unsafe { free_transaction(txn) };
+            unsafe { free_update_table_txn(txn) };
             unsafe { free_engine(engine) };
         }
 
@@ -4024,11 +3736,14 @@ mod tests {
             let (engine, txn) = transaction_on(FIXTURE_WITHOUT_DEFAULTS);
 
             let write_context = ok_or_panic(unsafe {
-                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+                update_table_txn_get_unpartitioned_write_context(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                )
             });
 
             unsafe { free_write_context(write_context) };
-            unsafe { free_transaction(txn) };
+            unsafe { free_update_table_txn(txn) };
             unsafe { free_engine(engine) };
         }
     }

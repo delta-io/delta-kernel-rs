@@ -7,6 +7,7 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::schema::{
     schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
@@ -35,6 +36,56 @@ fn simple_schema() -> SchemaRef {
 
 fn committer() -> Box<FileSystemCommitter> {
     Box::new(FileSystemCommitter::new())
+}
+
+#[tokio::test]
+async fn schema_evolution_while_writing_round_trips_new_column() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let mut transaction = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .add_column(StructField::nullable("country", DataType::STRING))
+        .build(engine.as_ref(), committer())?;
+
+    let write_context = transaction.write_state()?.write_context_builder().build()?;
+    assert!(write_context.logical_data_schema().contains("country"));
+    let batch = RecordBatch::try_new(
+        Arc::new(
+            write_context
+                .logical_data_schema()
+                .as_ref()
+                .try_into_arrow()?,
+        ),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(StringArray::from(vec!["US", "CA"])),
+        ],
+    )?;
+    let add_metadata = engine
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
+        .await?;
+    transaction.add_files(add_metadata);
+
+    let committed = transaction.commit(engine.as_ref())?.unwrap_committed();
+    let snapshot = committed
+        .post_commit_snapshot()
+        .expect("post-commit snapshot");
+    assert!(snapshot.schema().contains("country"));
+    let scan = snapshot.clone().scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine)?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let countries = batches[0]
+        .column_by_name("country")
+        .expect("country column")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("country must be a string array");
+    assert_eq!(countries.value(0), "US");
+    assert_eq!(countries.value(1), "CA");
+    Ok(())
 }
 
 /// Reads `delta.columnMapping.maxColumnId` from the snapshot's metadata. Returns
@@ -893,8 +944,9 @@ async fn empty_create_then_add_column(
     );
     let write_state_err = v0
         .clone()
-        .transaction(committer(), engine.as_ref())?
+        .transaction_builder()
         .with_engine_info("EmptySchemaApp/0.1.0")
+        .build(engine.as_ref(), committer())?
         .write_state()
         .expect_err("write_state() must reject empty-schema snapshots");
     assert!(
@@ -1403,7 +1455,9 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> Result<()> {
         .expect("CURRENT_DEFAULT metadata must survive ALTER");
     assert_eq!(default.raw_sql(), "42");
 
-    let txn = reloaded.transaction(committer(), engine.as_ref())?;
+    let txn = reloaded
+        .transaction_builder()
+        .build(engine.as_ref(), committer())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
         "default metadata must remain inert without allowColumnDefaults",

@@ -293,8 +293,9 @@ mod tests {
     ) -> KernelResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string())
+            .transaction_builder()
+            .with_operation(crate::transaction::UpdateTableOperation::Write)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)
             });
@@ -430,9 +431,23 @@ mod tests {
             ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
+        let mut kernel_commit_info = make_kernel_commit_info();
+        kernel_commit_info.operation_parameters = Some(
+            [(
+                "current_parameter".to_string(),
+                Some("current_value".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        kernel_commit_info.operation_metrics = Some(
+            [("current_metric".to_string(), Some("1".to_string()))]
+                .into_iter()
+                .collect(),
+        );
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info(engine.as_ref(), kernel_commit_info)?,
         )?;
         let commit_info = commit_info_struct(&result);
 
@@ -444,8 +459,14 @@ mod tests {
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
-        assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
-        assert!(get_map(commit_info, "operationMetrics").is_empty());
+        let parameters = get_map(commit_info, "operationParameters");
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(get_str(&parameters, "key"), "current_parameter");
+        assert_eq!(get_str(&parameters, "value"), "current_value");
+        let metrics = get_map(commit_info, "operationMetrics");
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(get_str(&metrics, "key"), "current_metric");
+        assert_eq!(get_str(&metrics, "value"), "1");
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);

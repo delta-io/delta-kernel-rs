@@ -17,8 +17,9 @@ use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, create_add_files_metadata, create_table,
-    engine_store_setup, into_record_batch, load_and_begin_transaction,
+    assert_result_error_with_message, begin_transaction, begin_transaction_with,
+    create_add_files_metadata, create_table, engine_store_setup, into_record_batch,
+    load_and_begin_transaction_with,
 };
 use url::Url;
 
@@ -56,8 +57,9 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_engine_info("test");
+    let mut txn = load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
+        builder.with_engine_info("test")
+    })?;
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
@@ -120,9 +122,11 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 
     // Now remove the files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf remove test")
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_engine_info("cdf remove test")
+            .with_data_change(true)
+    })?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
@@ -158,9 +162,11 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
     // Now create a transaction with both add AND remove files, but dataChange=false
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf mixed test")
-        .with_data_change(false); // dataChange=false is key here
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_engine_info("cdf mixed test")
+            .with_data_change(false)
+    })?; // dataChange=false is key here
 
     // Add new files
     add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
@@ -199,9 +205,11 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     // Now create a transaction with both add AND remove files with dataChange=true
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf mixed fail test")
-        .with_data_change(true); // dataChange=true - this should fail
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_engine_info("cdf mixed fail test")
+            .with_data_change(true)
+    })?; // dataChange=true - this should fail
 
     // Add new files
     add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
@@ -283,7 +291,9 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
     setup_txn.add_files(existing_file);
     let snapshot = setup_txn.commit(&engine)?.unwrap_post_commit_snapshot();
 
-    let mut txn = begin_transaction(snapshot.clone(), &engine)?.with_data_change(data_change);
+    let mut txn = begin_transaction_with(snapshot.clone(), &engine, |builder| {
+        builder.with_data_change(data_change)
+    })?;
     let new_file = create_add_files_metadata(
         txn.add_files_schema(),
         vec![(

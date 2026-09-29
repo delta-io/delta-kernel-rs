@@ -5,6 +5,7 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -122,8 +123,9 @@ fn commit(
 ) -> Result<Arc<Snapshot>, TestError> {
     Ok(snapshot
         .clone()
-        .transaction(Box::new(uc_committer(update_table_client)), engine)?
-        .with_operation("WRITE".to_string())
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine, Box::new(uc_committer(update_table_client)))?
         .commit(engine)?
         .unwrap_post_commit_snapshot())
 }
@@ -190,7 +192,8 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let committer = Box::new(uc_committer(&update_table_client));
     let err = snapshot
         .clone()
-        .transaction(committer, &engine)?
+        .transaction_builder()
+        .build(&engine, committer)?
         .commit(&engine)
         .unwrap_err();
     assert!(
