@@ -42,6 +42,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 use delta_kernel::{DeltaResult, EngineData, Error};
+use derive_more::Constructor;
 use url::Url;
 
 use crate::error::EngineExecResult;
@@ -134,16 +135,13 @@ fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<DeltaResul
 ///
 /// Embedding this in every `Ffi*Iter` adapter provides a single shared mechanism for ensuring the
 /// iterator is dropped correctly.
+#[derive(Constructor)]
 pub(crate) struct IterCleanup {
     state: NullableCvoid,
     free: CIterFreeFn,
 }
 
 impl IterCleanup {
-    fn new(state: NullableCvoid, free: CIterFreeFn) -> Self {
-        Self { state, free }
-    }
-
     /// The opaque engine state pointer, forwarded to each `next` call.
     fn state(&self) -> NullableCvoid {
         self.state

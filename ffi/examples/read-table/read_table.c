@@ -444,9 +444,9 @@ int main(int argc, char* argv[])
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
-  ExternResultEngineBuilder engine_builder_res =
+  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
     get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return -1;
@@ -456,13 +456,14 @@ int main(int argc, char* argv[])
   // keys accepted here come from object_store's configuration vocabulary (e.g. "aws_region",
   // "aws_access_key_id"). They are object-store-specific and only meaningful when the table URL
   // points at that backend -- for a local file:// table the setters have no effect.
-  EngineBuilder* engine_builder = engine_builder_res.ok;
-  if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
+  HandleMutableFfiEngineBuilder engine_builder = engine_builder_res.ok;
+  if (!set_builder_opt(&engine_builder, "aws_region", "us-west-2")) {
+    free_engine_builder(engine_builder);
     return -1;
   }
   // potentially set credentials here
-  // set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
-  // set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
+  // set_builder_opt(&engine_builder, "aws_access_key_id" , "[redacted]");
+  // set_builder_opt(&engine_builder, "aws_secret_access_key", "[redacted]");
   ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
 
   // alternately if we don't care to set any options on the builder:

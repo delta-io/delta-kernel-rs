@@ -178,7 +178,7 @@ for metadata in scan.scan_metadata(&engine)? {
 
 // 6. Commit the transaction
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),

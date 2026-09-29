@@ -109,13 +109,13 @@ async fn try_main() -> DeltaResult<()> {
             ));
         }
         txn = match txn.commit(&engine)? {
-            CommitResult::CommittedTransaction(committed) => break committed,
-            CommitResult::ConflictedTransaction(conflicted) => {
+            CommitResult::Committed(committed) => break committed,
+            CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
                 return Err(Error::generic("Commit failed"));
             }
-            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+            CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
                 transaction
             }

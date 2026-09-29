@@ -114,9 +114,9 @@ int main(int argc, char* argv[]) {
   HandleExclusiveCommittedTransaction committed = NULL;
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
+  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
     err = (Error*)engine_builder_res.err;
     print_error("Could not get engine builder.", err);
     goto cleanup;

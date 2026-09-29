@@ -76,7 +76,7 @@ txn.add_files(file_metadata);
 
 // 6. Commit
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),
@@ -107,6 +107,10 @@ The builder methods:
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## WriteState and BoundWriteContext
+
+If the table declares column defaults, resolve any defaults your input needs and acknowledge them
+before requesting write state. See [Column defaults](./column_defaults.md) for both Kernel-parsed
+and connector-evaluated defaults.
 
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
@@ -220,7 +224,7 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => {
@@ -230,10 +234,10 @@ match txn.commit(&engine)? {
 ```
 
 > [!NOTE]
-> `commit()` returns a `CommitResult` with three variants: `CommittedTransaction` on success,
-> `ConflictedTransaction` if another writer committed first, and `RetryableTransaction` for
-> transient IO errors. Automatic conflict resolution is not yet supported. A blind append to
-> a table with no concurrent writers always succeeds.
+> `commit()` returns a `CommitResult` with three variants: `Committed` on success, `Conflicted` if
+> another writer committed first, and `Retryable` for transient IO errors. Automatic conflict
+> resolution is not yet supported. A blind append to a table with no concurrent writers always
+> succeeds.
 
 ## Blind appends
 
@@ -309,7 +313,7 @@ snapshot and post-commit statistics:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 

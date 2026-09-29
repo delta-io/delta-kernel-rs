@@ -26,6 +26,8 @@ const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 /// This format is reserved for future use and not currently supported.
 const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
+const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum DeletionVectorStorageType {
@@ -347,7 +349,16 @@ impl DeletionVectorDescriptor {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
-                let magic = slice_to_u32(&byte_slice[0..4], Endian::Little)?;
+                require!(
+                    byte_slice.len() >= INLINE_DELETION_VECTOR_MAGIC_SIZE,
+                    Error::deletion_vector(
+                        "Inline deletion vector payload must contain at least 4 bytes"
+                    )
+                );
+                let magic = slice_to_u32(
+                    &byte_slice[..INLINE_DELETION_VECTOR_MAGIC_SIZE],
+                    Endian::Little,
+                )?;
                 match magic {
                     ROARING_BITMAP_PORTABLE_MAGIC => {
                         RoaringTreemap::deserialize_from(&byte_slice[4..])
@@ -784,6 +795,37 @@ mod tests {
         for i in [1, 2, 8, 17, 55, 200] {
             assert!(!tree_map.contains(i));
         }
+    }
+
+    #[rstest::rstest]
+    #[case::empty(vec![], "at least 4 bytes")]
+    #[case::one_byte(vec![0], "at least 4 bytes")]
+    #[case::two_bytes(vec![0, 1], "at least 4 bytes")]
+    #[case::three_bytes(vec![0, 1, 2], "at least 4 bytes")]
+    #[case::invalid_magic(vec![0, 0, 0, 0], "Invalid magic")]
+    fn test_inline_read_rejects_malformed_payload(
+        #[case] bytes: Vec<u8>,
+        #[case] expected_error: &str,
+    ) {
+        let encoded = z85::encode(&bytes);
+        let inline = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            encoded,
+            None,
+            bytes.len() as i32,
+            0,
+        )
+        .unwrap();
+        let sync_engine = SyncEngine::new();
+        let storage = sync_engine.storage_handler();
+        let parent = Url::parse("http://not.used").unwrap();
+
+        let error = inline.read(storage, &parent).unwrap_err();
+        assert!(matches!(&error, Error::DeletionVector(_)));
+        assert!(
+            error.to_string().contains(expected_error),
+            "expected error containing {expected_error:?}, got {error}"
+        );
     }
 
     #[test]

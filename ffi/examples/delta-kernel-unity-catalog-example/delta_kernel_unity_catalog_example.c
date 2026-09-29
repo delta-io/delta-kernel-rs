@@ -171,10 +171,10 @@ int main(int argc, char* argv[])
 
     // Get the default engine
     KernelStringSlice table_path_slice = { .ptr = table_path, .len = strlen(table_path) };
-    ExternResultEngineBuilder engine_builder_res =
+    ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
         get_engine_builder(table_path_slice, allocate_error);
 
-    if (engine_builder_res.tag != OkEngineBuilder) {
+    if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);
         free_error((Error*)engine_builder_res.err);
         free_uc_committer(uc_committer);
@@ -182,7 +182,7 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    EngineBuilder* engine_builder = engine_builder_res.ok;
+    HandleMutableFfiEngineBuilder engine_builder = engine_builder_res.ok;
     ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
 
     if (engine_res.tag != OkHandleSharedExternEngine) {

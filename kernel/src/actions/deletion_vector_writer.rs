@@ -371,6 +371,8 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 mod tests {
     use std::io::Cursor;
 
+    use derive_more::Constructor;
+
     use super::*;
 
     #[test]
@@ -580,14 +582,9 @@ mod tests {
         use crate::Engine;
 
         // Custom DeletionVector implementation that wraps an array of u64
+        #[derive(Constructor)]
         struct ArrayDeletionVector {
             deleted_rows: Vec<u64>,
-        }
-
-        impl ArrayDeletionVector {
-            fn new(deleted_rows: Vec<u64>) -> Self {
-                Self { deleted_rows }
-            }
         }
 
         impl DeletionVector for ArrayDeletionVector {

@@ -702,20 +702,20 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Commit the first transaction - this should succeed
     let result1 = txn1.commit(engine1.as_ref())?;
     match result1 {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(
                 committed.commit_version(),
                 1,
                 "First transaction should commit at version 1"
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             panic!(
                 "First transaction should not conflict, got conflict at version {}",
                 conflicted.conflict_version()
             );
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("First transaction should not be retryable error");
         }
     }
@@ -723,13 +723,13 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Commit the second transaction - this should result in a conflict
     let result2 = txn2.commit(engine2.as_ref())?;
     match result2 {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             panic!(
                 "Second transaction should conflict, but got committed at version {}",
                 committed.commit_version()
             );
         }
-        CommitResult::ConflictedTransaction(conflicted) => {
+        CommitResult::Conflicted(conflicted) => {
             assert_eq!(
                 conflicted.conflict_version(),
                 1,
@@ -739,7 +739,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             // TODO: In the future, we need to resolve conflicts and retry the commit
             // For now, we just verify that we got the conflict as expected
         }
-        CommitResult::RetryableTransaction(_) => {
+        CommitResult::Retryable(_) => {
             panic!("Second transaction should not be retryable error");
         }
     }

@@ -63,7 +63,7 @@ async fn write_data_to_table(
 
     let result = txn.commit(engine.as_ref())?;
     match result {
-        CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
+        CommitResult::Committed(committed) => Ok(committed.commit_version()),
         _ => panic!("Transaction should be committed"),
     }
 }
@@ -132,7 +132,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     // This should succeed - remove-only transactions are allowed with CDF
     let result = txn.commit(engine.as_ref())?;
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), 2);
         }
         _ => panic!("Transaction should be committed"),
@@ -174,7 +174,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
     // This should succeed - mixed operations are allowed when dataChange=false
     let result = txn.commit(engine.as_ref())?;
     match result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), 2);
         }
         _ => panic!("Transaction should be committed"),

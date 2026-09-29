@@ -92,7 +92,7 @@ commit actions, and delegates the atomic commit to a `Committer`.
    values.
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)` and stage any removals or deletion-vector updates
-5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
+5. Commit: returns `CommitResult::Committed`, `Conflicted`, or `Retryable`
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
   updates, table creation (including clustered tables via `DataLayout`), and limited schema

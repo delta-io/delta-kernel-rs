@@ -167,9 +167,10 @@ impl BoundWriteContext {
 
     /// Returns the column names that should have statistics collected during writes.
     ///
-    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
+    /// The list includes columns selected by the table's data-skipping configuration and any
+    /// clustering columns.
     pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.write_state.stats_columns
+        self.write_state.stats_columns()
     }
 
     /// Returns the serialized partition values for this write context. Keys are physical

@@ -256,13 +256,12 @@ let config = ClientConfig::build(&endpoint, &token)
     .build()?;
 ```
 
-The REST client automatically retries requests that fail with server errors
-(HTTP 5xx) or transient network errors, using linear backoff bounded by
-`retry_base_delay` and `retry_max_delay`. Successful 2xx and client errors
-(HTTP 4xx) are not retried. These retries apply to transport-level failures
-only. Transaction-level conflicts (another writer won the version) must be
-handled by the connector through the `CommitResult::ConflictedTransaction`
-branch. See [Writing to UC Tables](./writing.md) for the full retry model.
+The REST client automatically retries requests that fail with server errors (HTTP 5xx) or transient
+network errors, using linear backoff bounded by `retry_base_delay` and `retry_max_delay`. Successful
+2xx and client errors (HTTP 4xx) are not retried. These retries apply to transport-level failures
+only. Transaction-level conflicts (another writer won the version) must be handled by the connector
+through the `CommitResult::Conflicted` branch. See [Writing to UC Tables](./writing.md) for the full
+retry model.
 
 ## When not to use this
 

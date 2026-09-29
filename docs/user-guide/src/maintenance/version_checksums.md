@@ -21,7 +21,7 @@ written or already existed.
 use delta_kernel::snapshot::ChecksumWriteResult;
 
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 
@@ -66,7 +66,7 @@ checkpoint:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 

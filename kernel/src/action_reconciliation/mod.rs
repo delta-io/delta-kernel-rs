@@ -133,6 +133,8 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
 mod tests {
     use std::time::Duration;
 
+    use derive_more::Constructor;
+
     use super::*;
 
     #[test]
@@ -229,14 +231,9 @@ mod tests {
     }
 
     // Mock implementation of RetentionCalculator for testing trait methods
+    #[derive(Constructor)]
     struct MockRetentionCalculator {
         properties: TableProperties,
-    }
-
-    impl MockRetentionCalculator {
-        fn new(properties: TableProperties) -> Self {
-            Self { properties }
-        }
     }
 
     impl RetentionCalculator for MockRetentionCalculator {

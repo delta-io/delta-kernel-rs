@@ -94,9 +94,9 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
   // === Build engine ===
-  ExternResultEngineBuilder engine_builder_res =
+  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return 1;
@@ -107,10 +107,11 @@ int main(int argc, char* argv[]) {
   // thread is parked on the outer `block_on`, so the inner task can never be scheduled. Use a
   // small multithreaded executor (2 workers, default blocking threads) so the nested `block_on`
   // can make progress.
-  set_builder_with_multithreaded_executor(engine_builder_res.ok,
+  HandleMutableFfiEngineBuilder engine_builder = engine_builder_res.ok;
+  set_builder_with_multithreaded_executor(&engine_builder,
                                           /*worker_threads*/ 2,
                                           /*max_blocking_threads*/ 0);
-  ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder_res.ok);
+  ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
   if (engine_res.tag != OkHandleSharedExternEngine) {
     print_error("Failed to build engine.", (Error*)engine_res.err);
     free_error((Error*)engine_res.err);

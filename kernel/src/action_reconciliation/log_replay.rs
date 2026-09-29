@@ -1211,22 +1211,18 @@ mod tests {
 
     // Test-only mock utilities module to avoid coverage noise
     mod test_mocks {
+        use derive_more::Constructor;
+
         use super::*;
 
         /// Mock GetData implementation that can simulate type errors for testing error paths
+        #[derive(Constructor)]
         pub(super) struct MockErrorGetData {
             error_on_field: &'static str,
             error_type: &'static str,
         }
 
         impl MockErrorGetData {
-            pub(super) fn new(error_on_field: &'static str, error_type: &'static str) -> Self {
-                Self {
-                    error_on_field,
-                    error_type,
-                }
-            }
-
             pub(super) fn default() -> Self {
                 Self::new("", "")
             }

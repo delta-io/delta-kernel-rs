@@ -165,13 +165,11 @@ shape:
 }
 ```
 
-Map your catalog's "another writer won this version" error to
-`CommitResponse::Conflict { version: commit_metadata.version() }` rather than
-propagating it as an `Err`. Return other errors as `Err(...)`. Kernel classifies
-only `Error::IOError` as retryable (surfaced as
-`CommitResult::RetryableTransaction`); return `IOError` for transient storage
-failures and other variants for everything else. Do not disguise non-I/O errors
-as `IOError` to opt into retry semantics.
+Map your catalog's "another writer won this version" error to `CommitResponse::Conflict { version:
+commit_metadata.version() }` rather than propagating it as an `Err`. Return other errors as
+`Err(...)`. Kernel classifies only `Error::IOError` as retryable (surfaced as
+`CommitResult::Retryable`); return `IOError` for transient storage failures and other variants for
+everything else. Do not disguise non-I/O errors as `IOError` to opt into retry semantics.
 
 ### Step 3: Mark as catalog committer
 

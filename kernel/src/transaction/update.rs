@@ -10,7 +10,6 @@
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -41,10 +40,10 @@ use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V3_VALIDATOR,
+    V2_VALIDATOR, V3_VALIDATOR,
 };
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
-use crate::utils::{current_time_ms, require};
+use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
 use crate::{DataType, DeltaResult, Engine, Expression};
@@ -94,6 +93,12 @@ impl Transaction {
 
         validate_iceberg_compat_if_needed(
             &effective_table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::Write,
+        )?;
+
+        validate_iceberg_compat_if_needed(
+            &effective_table_config,
             &V3_VALIDATOR,
             IcebergCompatValidationContext::Write,
         )?;
@@ -127,7 +132,7 @@ impl Transaction {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             root_manifest_file: None,
             physical_clustering_columns: clustering_columns,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         })
     }
 

@@ -2,6 +2,7 @@ use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use url::Url;
 
 use super::{put_bytes, read_files_arrow};
@@ -19,14 +20,9 @@ use crate::{
     FileSize, JsonHandler, PredicateRef,
 };
 
+#[derive(Constructor)]
 pub(crate) struct SyncJsonHandler {
     store: Option<Arc<DynObjectStore>>,
-}
-
-impl SyncJsonHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
-    }
 }
 
 pub(super) fn try_create_from_json(

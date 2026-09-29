@@ -2,7 +2,8 @@ use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
-use std::ops::Deref;
+
+use derive_more::Deref;
 
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
@@ -20,8 +21,9 @@ use crate::{DeltaResult, Error};
 /// {id: INT, my_map: MAP<STRING, STRUCT<first_name: STRING, last_name: STRING>>}
 /// The field named first_name would be represented as ["my_map", "value", "first_name"].
 /// The map key would be represented as ["my_map", "key"].
-#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deref, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct ColumnName {
+    #[deref(forward)]
     path: Vec<String>,
 }
 
@@ -152,14 +154,6 @@ impl IntoIterator for ColumnName {
 
     fn into_iter(self) -> Self::IntoIter {
         self.path.into_iter()
-    }
-}
-
-impl Deref for ColumnName {
-    type Target = [String];
-
-    fn deref(&self) -> &[String] {
-        &self.path
     }
 }
 

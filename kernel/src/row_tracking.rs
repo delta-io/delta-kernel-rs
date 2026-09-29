@@ -133,19 +133,16 @@ impl RowVisitor for RowTrackingVisitor {
 
 #[cfg(test)]
 mod tests {
+    use derive_more::Constructor;
+
     use super::*;
     use crate::engine_data::GetData;
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Mock GetData implementation for testing
+    #[derive(Constructor)]
     struct MockGetData {
         num_records_values: Vec<Option<i64>>,
-    }
-
-    impl MockGetData {
-        fn new(num_records_values: Vec<Option<i64>>) -> Self {
-            Self { num_records_values }
-        }
     }
 
     impl<'a> GetData<'a> for MockGetData {

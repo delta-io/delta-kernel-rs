@@ -253,7 +253,7 @@ async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
     let result = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))]).await?;
 
     // THEN the second commit conflicts and emits exactly one conflict metric.
-    assert!(matches!(result, CommitResult::ConflictedTransaction(_)));
+    assert!(matches!(result, CommitResult::Conflicted(_)));
     assert_eq!(reporter.transaction_commits.get(), 1);
     assert_eq!(reporter.commit_conflicts.get(), 1);
     assert_eq!(reporter.commit_errors.get(), 0);
