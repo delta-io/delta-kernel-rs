@@ -36,7 +36,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
-use crate::transaction::{Transaction, UpdateTableTransactionBuilder};
+use crate::transaction::UpdateTableTransactionBuilder;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, KernelError, LogCompactionWriter, Version};
 
@@ -1007,18 +1007,6 @@ impl Snapshot {
         base_version: Version,
     ) -> IncrementalScanBuilder {
         IncrementalScanBuilder::new(self, base_version)
-    }
-
-    /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
-    ///
-    /// Note: For tables with clustering enabled, this performs log replay to read clustering
-    /// columns from domain metadata, which may have a performance cost.
-    pub fn transaction(
-        self: Arc<Self>,
-        committer: Box<dyn Committer>,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer, engine)
     }
 
     /// Creates a builder for a transaction against this snapshot.

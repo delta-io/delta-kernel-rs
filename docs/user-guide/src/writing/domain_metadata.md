@@ -26,6 +26,7 @@ transactions.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -33,12 +34,15 @@ transactions.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_builder()
     .with_domain_metadata(
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
-    .with_operation("UPDATE METADATA".to_string());
+    .with_operation(UpdateTableOperation::Custom(
+        "UPDATE METADATA".to_string(),
+    ))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 txn.commit(&engine)?;
 # Ok(())
@@ -73,6 +77,7 @@ exist yet.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -80,9 +85,12 @@ exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_builder()
     .with_domain_metadata_removed("myConnector.settings".to_string())
-    .with_operation("REMOVE METADATA".to_string());
+    .with_operation(UpdateTableOperation::Custom(
+        "REMOVE METADATA".to_string(),
+    ))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 txn.commit(&engine)?;
 # Ok(())

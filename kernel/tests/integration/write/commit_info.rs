@@ -9,11 +9,11 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::{TransactionOptions, UpdateTableOperation};
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
+use test_utils::{load_and_begin_transaction_with, set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{
     get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID,
@@ -31,8 +31,11 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_engine_info("default engine")
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         // commit!
         let _ = txn.commit(&engine)?;
@@ -78,11 +81,8 @@ async fn transaction_builder_writes_operation_parameters_and_metrics(
         let transaction = snapshot
             .transaction_builder()
             .with_operation(UpdateTableOperation::Write)
-            .with_options(
-                TransactionOptions::new()
-                    .with_operation_parameters([("mode", "Append")])?
-                    .with_operation_metrics([("numFiles", "3")])?,
-            )
+            .with_operation_parameters([("mode", "Append")])?
+            .with_operation_metrics([("numFiles", "3")])?
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         transaction.commit(&engine)?.unwrap_committed();
@@ -116,8 +116,11 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_engine_info("default engine");
+        let txn = Snapshot::builder_for(table_url.clone())
+            .build(&engine)?
+            .transaction_builder()
+            .with_engine_info("default engine")
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         let _ = txn.commit(&engine)?;
 
@@ -206,9 +209,10 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
             nullable "operationMetrics": { STRING => nullable STRING },
         };
 
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_operation("WRITE".to_string())
-            .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
+        let txn = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+            builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+        })?
+        .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
 
         let _ = txn.commit(&engine)?;
 

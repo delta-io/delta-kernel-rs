@@ -31,7 +31,7 @@ may differ.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::{CommitResult, UpdateTableOperation, TransactionOptions};
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -44,7 +44,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
     .transaction_builder()
     .with_operation(UpdateTableOperation::Write)
-    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_engine_info("my-app/1.0")
     .with_data_change(true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
@@ -95,7 +95,7 @@ writing against:
 let mut txn = snapshot
     .transaction_builder()
     .with_operation(UpdateTableOperation::Write)
-    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_engine_info("my-app/1.0")
     .with_data_change(true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
@@ -105,7 +105,7 @@ The builder methods:
 | Method | Purpose |
 |--------|---------|
 | `with_operation(UpdateTableOperation)` | Typed operation stored in the commit log; use `UpdateTableOperation::Custom` for connector-specific names |
-| `with_options(TransactionOptions)` | Supplies engine information, operation metadata, transaction IDs, and domain metadata |
+| `with_engine_info(impl Into<String>)` | Supplies the connector name and version recorded in commit information |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## WriteState and BoundWriteContext
@@ -216,9 +216,8 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Transaction methods that prepare or register data files (`write_state`, `add_files`, and
-> `stats_schema`) are gated by the `SupportsDataFiles` trait bound. They're available on standard
-> write transactions but not on metadata-only transaction states such as `AlterTable`.
+> Existing-table transactions, including `ALTER TABLE`, can stage file actions. Kernel infers
+> `dataChange` from staged file actions unless the connector supplies an explicit override.
 
 ## Committing
 
@@ -249,9 +248,10 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_blind_append();
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .with_blind_append()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
@@ -281,8 +281,9 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 

@@ -16,9 +16,9 @@
 // The target table must already exist (e.g. created by the `create-table` example).
 //
 // Demonstrates the write-path FFI surface:
-//   - transaction(path, engine) to start an existing-table transaction
-//   - with_engine_info(txn, "...", engine) to set commitInfo.engineInfo
-//   - get_unpartitioned_write_context(txn, engine) plus the four
+//   - get_update_table_txn_builder(snapshot) to start an update builder
+//   - update_table_txn_builder_with_engine_info to set commitInfo.engineInfo
+//   - update_table_txn_get_unpartitioned_write_context(txn, engine) plus the four
 //     write-context accessors an engine needs when writing parquet files itself:
 //       - get_write_schema           -- logical (user-facing) schema
 //       - get_physical_write_schema  -- on-disk parquet schema (carries
@@ -26,19 +26,19 @@
 //       - get_logical_to_physical    -- transform to apply per batch
 //       - get_write_path             -- table root URL (partitioned write
 //                                       directory support tracked by #2355)
-//   - set_data_change(txn, false) because this empty commit does not add data
-//   - commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
+//   - update_table_txn_builder_with_data_change(builder, false) because this empty commit does not add data
+//   - update_table_txn_commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
 //   - committed_transaction_version + committed_transaction_post_commit_snapshot to read the
 //     version and the post-commit snapshot directly from the result, avoiding a fresh
 //     snapshot load
 //   - free_committed_transaction to release the result handle
 //
-// NOTE: This example does NOT call add_files. Staging new files requires building an Arrow
+// NOTE: This example does NOT call update_table_txn_add_files. Staging new files requires building an Arrow
 // RecordBatch that matches Transaction::add_files_schema (path, partitionValues, size,
 // modificationTime, stats), which needs arrow-glib (or equivalent) on the C side to
 // construct. That flow is tracked as a follow-up; once the shared arrow-glib writer helper
 // lands in ffi/examples/common/, this example should be extended to stage a real parquet
-// file and exercise the full add_files -> commit path.
+// file and exercise the full update_table_txn_add_files -> update_table_txn_commit path.
 
 int main(int argc, char* argv[]) {
   if (argc != 2) {
@@ -65,44 +65,63 @@ int main(int argc, char* argv[]) {
   }
   SharedExternEngine* engine = engine_res.ok;
 
-  // === Start a transaction on the latest snapshot ===
-  ExternResultHandleExclusiveTransaction txn_res = transaction(table_path_slice, engine);
-  if (txn_res.tag != OkHandleExclusiveTransaction) {
-    print_error("Failed to start transaction.", (Error*)txn_res.err);
-    free_error((Error*)txn_res.err);
+  // === Build transaction intent on the latest snapshot ===
+  ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res =
+      get_snapshot_builder(table_path_slice, engine);
+  if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
+    print_error("Failed to create snapshot builder.", (Error*)snapshot_builder_res.err);
+    free_error((Error*)snapshot_builder_res.err);
     free_engine(engine);
     return 1;
   }
-  ExclusiveTransaction* txn = txn_res.ok;
+  ExternResultHandleSharedSnapshot snapshot_res =
+      snapshot_builder_build(snapshot_builder_res.ok);
+  if (snapshot_res.tag != OkHandleSharedSnapshot) {
+    print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
+    free_error((Error*)snapshot_res.err);
+    free_engine(engine);
+    return 1;
+  }
+  SharedSnapshot* snapshot = snapshot_res.ok;
+  ExclusiveUpdateTableTransactionBuilder* txn_builder = get_update_table_txn_builder(snapshot);
 
-  // set_data_change does not consume the handle. This commit has no data, so dataChange=false.
-  // Setting it here (before with_engine_info) is fine: the consume-and-return chain below
-  // preserves staged transaction state across handle handoffs.
-  set_data_change(txn, false);
+  // This empty commit does not add data.
+  txn_builder = update_table_txn_builder_with_data_change(txn_builder, false);
 
-  // Attach engine_info. CONSUMES and returns the transaction handle.
   const char* engine_info = "write_table_example";
   KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
-  ExternResultHandleExclusiveTransaction with_info_res =
-      with_engine_info(txn, engine_info_slice, engine);
-  if (with_info_res.tag != OkHandleExclusiveTransaction) {
-    print_error("with_engine_info failed.", (Error*)with_info_res.err);
+  ExternResultHandleExclusiveUpdateTableTransactionBuilder with_info_res =
+      update_table_txn_builder_with_engine_info(txn_builder, engine_info_slice, engine);
+  if (with_info_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
+    print_error("setting builder engine info failed.", (Error*)with_info_res.err);
     free_error((Error*)with_info_res.err);
+    free_snapshot(snapshot);
     free_engine(engine);
     return 1;
   }
-  txn = with_info_res.ok;
+  txn_builder = with_info_res.ok;
+  ExternResultHandleExclusiveUpdateTableTransaction txn_res =
+      update_table_txn_builder_build(txn_builder, engine);
+  if (txn_res.tag != OkHandleExclusiveUpdateTableTransaction) {
+    print_error("Failed to build transaction.", (Error*)txn_res.err);
+    free_error((Error*)txn_res.err);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    return 1;
+  }
+  ExclusiveUpdateTableTransaction* txn = txn_res.ok;
+  free_snapshot(snapshot);
 
   // === Inspect the unpartitioned write context ===
   //
   // The WriteContext carries the schema an engine's parquet writer should use plus the table
   // root URL it should write under. This example does not actually write any files, but we
   // print these so users see the shape of the information they'd consume in a real engine.
-  ExternResultHandleSharedWriteContext wc_res = get_unpartitioned_write_context(txn, engine);
+  ExternResultHandleSharedWriteContext wc_res = update_table_txn_get_unpartitioned_write_context(txn, engine);
   if (wc_res.tag != OkHandleSharedWriteContext) {
-    print_error("get_unpartitioned_write_context failed.", (Error*)wc_res.err);
+    print_error("update_table_txn_get_unpartitioned_write_context failed.", (Error*)wc_res.err);
     free_error((Error*)wc_res.err);
-    free_transaction(txn);
+    free_update_table_txn(txn);
     free_engine(engine);
     return 1;
   }
@@ -133,7 +152,7 @@ int main(int argc, char* argv[]) {
   free_write_context(write_context);
 
   // === Commit ===
-  ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
+  ExternResultHandleExclusiveCommittedTransaction commit_res = update_table_txn_commit(txn, engine);
   if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
     print_error("commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);

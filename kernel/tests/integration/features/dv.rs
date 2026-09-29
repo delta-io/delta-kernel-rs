@@ -13,14 +13,14 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
     add_commit, create_add_files_metadata, create_default_engine_mt_executor, create_table,
-    engine_store_setup, generate_batch, into_record_batch, load_and_begin_transaction,
-    read_actions_from_commit, record_batch_to_bytes, IntoArray,
+    engine_store_setup, generate_batch, into_record_batch, read_actions_from_commit,
+    record_batch_to_bytes, IntoArray,
 };
 
 use crate::common::write_utils::{
@@ -192,9 +192,15 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         write_parquet_file(&store, &table_url, "2", &data_batch_2).await?;
 
     // Step 2: Add both files to the table via a transaction
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
+    let mut txn = Snapshot::builder_for(table_url.clone())
+        .build(engine.as_ref())?
+        .transaction_builder()
         .with_engine_info("test engine")
-        .with_operation("WRITE".to_string());
+        .with_operation(UpdateTableOperation::Write)
+        .build(
+            engine.as_ref(),
+            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
+        )?;
 
     // Create add file metadata for both files
     let add_files_schema = txn.add_files_schema();

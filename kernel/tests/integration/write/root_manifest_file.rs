@@ -9,8 +9,8 @@ use delta_kernel::{Engine, FileMeta};
 use serde_json::json;
 use tempfile::TempDir;
 use test_utils::{
-    begin_transaction, create_table, create_table_with_column_mapping_mode, engine_store_setup,
-    read_actions_from_commit,
+    begin_transaction, begin_transaction_with, create_table, create_table_with_column_mapping_mode,
+    engine_store_setup, read_actions_from_commit,
 };
 use url::Url;
 
@@ -111,9 +111,10 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_merge").await?;
 
-    let txn = begin_transaction(snapshot, &engine)?
-        .with_domain_metadata("my.domain".to_string(), "v1".to_string())
-        .with_transaction_id("app-1".to_string(), 5);
+    let txn = begin_transaction_with(snapshot, &engine, |builder| {
+        builder.with_transaction_id("app-1", 5)
+    })?
+    .with_domain_metadata("my.domain".to_string(), "v1".to_string());
     let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
 
     let file = FileMeta {
@@ -121,10 +122,11 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
         last_modified: 0,
         size: 1024,
     };
-    let txn = begin_transaction(snapshot, &engine)?
-        .with_root_manifest_file(file)?
-        .with_domain_metadata("my.domain".to_string(), "v2".to_string())
-        .with_transaction_id("app-2".to_string(), 7);
+    let txn = begin_transaction_with(snapshot, &engine, |builder| {
+        builder.with_transaction_id("app-2", 7)
+    })?
+    .with_root_manifest_file(file)?
+    .with_domain_metadata("my.domain".to_string(), "v2".to_string());
     txn.commit(&engine)?.unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;

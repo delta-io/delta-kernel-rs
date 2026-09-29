@@ -44,7 +44,7 @@ column. The flow is:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
-# use delta_kernel::transaction::{CommitResult, UpdateTableOperation, TransactionOptions};
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -57,7 +57,7 @@ let result = snapshot
     .transaction_builder()
     .with_operation(UpdateTableOperation::AlterTable)
     .add_column(StructField::nullable("country", DataType::STRING))
-    .with_options(TransactionOptions::new().with_engine_info("my-app/1.0"))
+    .with_engine_info("my-app/1.0")
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 
@@ -91,7 +91,7 @@ column by including it in the `RecordBatch` they pass to
 
 > [!NOTE]
 > `ALTER TABLE` is still rejected on tables with unsupported writer features, and
-> currently on tables with `icebergCompatV3` or `allowColumnDefaults` enabled.
+> currently on tables with `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults` enabled.
 
 ## Chaining multiple operations
 

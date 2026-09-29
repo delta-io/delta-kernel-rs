@@ -23,8 +23,9 @@ use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
-    load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
+    begin_transaction, begin_transaction_with, create_add_files_metadata,
+    create_table_and_load_snapshot, insert_data, load_test_data, read_add_infos, read_scan,
+    test_table_setup_mt, write_batch_to_table,
 };
 
 use crate::common::read_utils::read_parquet_file;
@@ -930,17 +931,20 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
-        snapshot = begin_transaction(snapshot, engine.as_ref())?
-            .with_transaction_id(app_id.to_string(), version)
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot();
+        snapshot = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+            builder.with_transaction_id(app_id, version)
+        })?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
     }
 
     // Remove all 8 files -> 8 remove tombstones
     let scan = snapshot.clone().scan_builder().build()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?
-        .with_operation("DELETE".to_string())
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Delete)
+            .with_data_change(true)
+    })?;
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
@@ -1449,7 +1453,9 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .scan_metadata(engine.as_ref())?
         .map_ok(|sm| sm.scan_files)
         .try_collect()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let mut txn = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder.with_data_change(true)
+    })?;
     txn.update_deletion_vectors(
         HashMap::from([(path, dv.clone())]),
         scan_files.into_iter().map(Ok),
@@ -1517,7 +1523,9 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     for c in 0..COMMITS {
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+        let mut txn = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+            builder.with_data_change(true)
+        })?;
         let add_files_schema = txn.add_files_schema().clone();
         let paths: Vec<String> = (0..PER_COMMIT)
             .map(|i| format!("part-{c:03}-{i:04}.parquet"))

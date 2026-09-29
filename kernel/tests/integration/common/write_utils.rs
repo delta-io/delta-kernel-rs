@@ -27,15 +27,16 @@ use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
+use delta_kernel::transaction::{
+    BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
+};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
-    into_record_batch, load_and_begin_transaction, modify_add_file_partition_keys,
-    AddFilePartitionKeyModify,
+    create_add_files_metadata, create_table, engine_store_setup, into_record_batch,
+    modify_add_file_partition_keys, AddFilePartitionKeyModify,
 };
 use url::Url;
 use uuid::Uuid;
@@ -212,8 +213,11 @@ pub async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_data_change(true);
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        table_url.clone(),
+        engine.as_ref(),
+        |builder| builder.with_data_change(true),
+    )?;
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -397,10 +401,15 @@ pub async fn create_dv_table_with_files(
 
     // Write files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
+    let mut txn = snapshot
+        .transaction_builder()
         .with_engine_info("test engine")
-        .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_operation(UpdateTableOperation::Write)
+        .with_data_change(true)
+        .build(
+            engine.as_ref(),
+            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
+        )?;
 
     let add_files_schema = txn.add_files_schema();
 
@@ -499,7 +508,13 @@ pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
 ) -> Result<Transaction, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?
+    Ok(Snapshot::builder_for(table_url.clone())
+        .build(engine)?
+        .transaction_builder()
         .with_engine_info("test engine")
-        .with_operation("DELETE".to_string()))
+        .with_operation(UpdateTableOperation::Delete)
+        .build(
+            engine,
+            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
+        )?)
 }

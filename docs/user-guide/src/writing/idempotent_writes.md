@@ -32,7 +32,7 @@ committing:
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{DeltaResult, Snapshot};
 # #[tokio::main]
 # async fn main() -> DeltaResult<()> {
@@ -52,9 +52,10 @@ if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
 
 // Not yet committed. Proceed with the write.
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_builder()
     .with_transaction_id(app_id.to_string(), batch_version)
-    .with_operation("STREAMING UPDATE".to_string());
+    .with_operation(UpdateTableOperation::StreamingUpdate)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // ... write data, add files, commit ...
 # Ok(())

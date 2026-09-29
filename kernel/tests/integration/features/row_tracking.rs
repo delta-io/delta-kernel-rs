@@ -23,11 +23,11 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 use test_utils::{
-    add_commit, assert_result_error_with_message, begin_transaction, collect_row_ids,
+    add_commit, assert_result_error_with_message, begin_transaction_with, collect_row_ids,
     create_default_engine_mt_executor, create_table, create_table_and_load_snapshot,
     engine_store_setup, get_materialized_row_tracking_column_names, load_and_begin_transaction,
-    read_actions_from_commit, read_add_infos, read_scan, record_batch_to_bytes, test_read,
-    test_table_setup,
+    load_and_begin_transaction_with, read_actions_from_commit, read_add_infos, read_scan,
+    record_batch_to_bytes, test_read, test_table_setup,
 };
 use url::Url;
 
@@ -92,8 +92,9 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
+    let mut txn = load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
+        builder.with_data_change(true)
+    })?;
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.write_state()?.write_context_builder().build()?);
@@ -667,12 +668,16 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
-    let mut txn1 = begin_transaction(snapshot1, engine1.as_ref())?
-        .with_engine_info("transaction 1")
-        .with_data_change(true);
-    let mut txn2 = begin_transaction(snapshot2, engine2.as_ref())?
-        .with_engine_info("transaction 2")
-        .with_data_change(true);
+    let mut txn1 = begin_transaction_with(snapshot1, engine1.as_ref(), |builder| {
+        builder
+            .with_engine_info("transaction 1")
+            .with_data_change(true)
+    })?;
+    let mut txn2 = begin_transaction_with(snapshot2, engine2.as_ref(), |builder| {
+        builder
+            .with_engine_info("transaction 2")
+            .with_data_change(true)
+    })?;
 
     // Prepare data for both transactions
     let data1 = RecordBatch::try_new(

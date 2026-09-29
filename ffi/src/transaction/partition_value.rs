@@ -1,10 +1,11 @@
 //! FFI surface for building the partition values of a partitioned write.
 //!
 //! Engines build a [`PartitionValueMap`] by inserting one typed value per partition column
-//! (keyed by the column's logical name), then pass it to `get_partitioned_write_context`. The
-//! typed inserts mirror the `visit_expression_literal_*` family: one entry point per scalar type.
-//! The kernel validates the supplied values against the table's partition schema and serializes
-//! them per the Delta protocol when the write context is built.
+//! (keyed by the column's logical name), then pass it to
+//! `update_table_txn_get_partitioned_write_context`. The typed inserts mirror the
+//! `visit_expression_literal_*` family: one entry point per scalar type. The kernel validates the
+//! supplied values against the table's partition schema and serializes them per the Delta protocol
+//! when the write context is built.
 
 use std::collections::HashMap;
 
@@ -19,7 +20,8 @@ use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 
 /// Owns a map from a partition column's logical name to its [`Scalar`] value. Engines build the
 /// map with the `partition_value_map_insert_*` functions and pass it to
-/// `get_partitioned_write_context` (or its create-table counterpart), which consumes it.
+/// `update_table_txn_get_partitioned_write_context` (or its create-table counterpart), which
+/// consumes it.
 pub struct PartitionValueMap {
     pub(crate) inner: HashMap<String, Scalar>,
 }
@@ -29,7 +31,8 @@ pub struct PartitionValueMap {
 pub struct ExclusivePartitionValueMap;
 
 /// Allocate an empty partition value map. The returned handle must be released either by
-/// [`free_partition_value_map`] or by `get_partitioned_write_context` (which consumes the map).
+/// [`free_partition_value_map`] or by `update_table_txn_get_partitioned_write_context` (which
+/// consumes the map).
 #[no_mangle]
 pub extern "C" fn partition_value_map_new() -> Handle<ExclusivePartitionValueMap> {
     Box::new(PartitionValueMap {

@@ -1,0 +1,503 @@
+//! Create-table transaction FFI lifecycle.
+
+use super::update_table::{commit_result_to_committed_handle, decode_engine_schema};
+use super::*;
+
+/// A handle for a create-table transaction (`Transaction<CreateTable>`).
+///
+/// Returned by [`create_table_txn_builder_build`]. Only supports operations valid during table
+/// creation: adding files, late-bound commit information, domain metadata, and committing.
+/// Operations like
+/// file removal, blind append, and deletion vector updates are not available.
+#[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
+pub struct ExclusiveCreateTableTransaction;
+
+// ============================================================================
+// Create-table transaction FFI functions
+// ============================================================================
+
+/// Replaces create-table operation metrics after writing and before commit.
+///
+/// # Safety
+///
+/// All handles and nested map pointers must be valid. This unconditionally consumes `txn`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_with_operation_metrics(
+    txn: Handle<ExclusiveCreateTableTransaction>,
+    metrics: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
+    let txn = unsafe { *txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    unsafe { metrics.try_to_hash_map() }
+        .and_then(|metrics| txn.with_operation_metrics(metrics))
+        .map(|txn| Box::new(txn).into())
+        .into_extern_result(&engine)
+}
+
+/// Replaces the connector-defined create-table `commitInfo` row before commit.
+///
+/// # Safety
+///
+/// All handles and `schema` must be valid. This consumes both `txn` and `commit_info`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_with_commit_info(
+    txn: Handle<ExclusiveCreateTableTransaction>,
+    commit_info: Handle<ExclusiveEngineData>,
+    schema: &EngineSchema,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
+    let txn = unsafe { *txn.into_inner() };
+    let commit_info = unsafe { commit_info.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    decode_engine_schema(schema)
+        .map(|schema| txn.with_commit_info(commit_info, Arc::new(schema)))
+        .map(|txn| Box::new(txn).into())
+        .into_extern_result(&engine)
+}
+
+/// Free a create-table transaction handle without committing.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_create_table_txn(txn: Handle<ExclusiveCreateTableTransaction>) {
+    txn.drop_handle();
+}
+
+/// Add domain metadata to a create-table transaction.
+///
+/// `domain` identifies the user-controlled metadata domain, and `configuration` is its arbitrary
+/// string value. Returns the updated transaction handle. Invalid strings are returned as errors;
+/// domain and table-feature validation occurs when the transaction is committed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_with_domain_metadata(
+    txn: Handle<ExclusiveCreateTableTransaction>,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    create_table_txn_with_domain_metadata_impl(*txn, domain, configuration)
+        .into_extern_result(&engine)
+}
+
+fn create_table_txn_with_domain_metadata_impl(
+    txn: CreateTableTransaction,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTableTransaction>> {
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
+}
+
+/// Add file metadata to a create-table transaction for files that have been written. The metadata
+/// contains information about files written during the transaction that will be added to the
+/// Delta log during commit.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. Consumes write_metadata.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_add_files(
+    mut txn: Handle<ExclusiveCreateTableTransaction>,
+    write_metadata: Handle<ExclusiveEngineData>,
+) {
+    let txn = unsafe { txn.as_mut() };
+    let write_metadata = unsafe { write_metadata.into_inner() };
+    txn.add_files(write_metadata);
+}
+
+/// Attempt to commit a create-table transaction. On success, returns a handle to the
+/// [`CommittedTransaction`] from which the caller can read the version and the optional
+/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
+///
+/// Returns an error if the commit fails.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
+/// method is called.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_commit(
+    txn: Handle<ExclusiveCreateTableTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
+        .into_extern_result(&extern_engine)
+}
+
+// ============================================================================
+// Create Table DDL
+// ============================================================================
+
+/// A handle representing an exclusive [`CreateTableTransactionBuilder`].
+///
+/// The caller must eventually either call [`create_table_txn_builder_build`] (which consumes the
+/// handle and returns a transaction) or [`free_create_table_txn_builder`] (which drops it without
+/// creating anything).
+#[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
+pub struct ExclusiveCreateTableTransactionBuilder;
+
+/// Attaches a correlation identifier to create transaction metric events.
+///
+/// Repeated calls replace the previous value; an empty value clears it.
+///
+/// # Safety
+///
+/// All handles and the string must be valid. This unconditionally consumes `builder`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_correlation_id(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    correlation_id: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let correlation_id: DeltaResult<String> =
+        unsafe { TryFromStringSlice::try_from_slice(&correlation_id) };
+    correlation_id
+        .map(|id| Box::new(builder.with_correlation_id(id)).into())
+        .into_extern_result(&engine)
+}
+
+/// Replaces create-table operation parameters recorded in `commitInfo`.
+///
+/// Empty or duplicate keys are rejected; consecutive calls replace rather than merge.
+///
+/// # Safety
+///
+/// All handles and nested map pointers must be valid. This unconditionally consumes `builder`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_operation_parameters(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    parameters: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    unsafe { parameters.try_to_hash_map() }
+        .and_then(|parameters| builder.with_operation_parameters(parameters))
+        .map(|builder| Box::new(builder).into())
+        .into_extern_result(&engine)
+}
+
+/// Replaces create-table operation metrics recorded in `commitInfo` before writes begin.
+///
+/// Metrics supplied to the built transaction replace these metrics. Dedicated metrics override
+/// the nested `operationMetrics` field in connector commit information.
+///
+/// # Safety
+///
+/// All handles and nested map pointers must be valid. This unconditionally consumes `builder`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_operation_metrics(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    metrics: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    unsafe { metrics.try_to_hash_map() }
+        .and_then(|metrics| builder.with_operation_metrics(metrics))
+        .map(|builder| Box::new(builder).into())
+        .into_extern_result(&engine)
+}
+
+/// Supplies one connector-defined `commitInfo` row to the create-table builder.
+///
+/// Repeated calls replace the prior row. Kernel-owned fields and dedicated parameter or metric
+/// maps take precedence over same-named nested fields.
+///
+/// # Safety
+///
+/// All handles and `schema` must be valid. This consumes both `builder` and `commit_info`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_commit_info(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    commit_info: Handle<ExclusiveEngineData>,
+    schema: &EngineSchema,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let commit_info = unsafe { commit_info.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    decode_engine_schema(schema)
+        .map(|schema| builder.with_commit_info(commit_info, Arc::new(schema)))
+        .map(|builder| Box::new(builder).into())
+        .into_extern_result(&engine)
+}
+
+/// Adds user-controlled domain metadata to the create-table builder.
+///
+/// Duplicate domains are rejected when the builder is built.
+///
+/// # Safety
+///
+/// All handles and strings must be valid. This unconditionally consumes `builder`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_domain_metadata(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let domain: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
+    let configuration: DeltaResult<String> =
+        unsafe { TryFromStringSlice::try_from_slice(&configuration) };
+    domain
+        .and_then(|domain| configuration.map(|configuration| (domain, configuration)))
+        .map(|(domain, configuration)| {
+            Box::new(builder.with_domain_metadata(domain, configuration)).into()
+        })
+        .into_extern_result(&engine)
+}
+
+/// Collect `num_columns` column-name string slices into owned `String`s.
+///
+/// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
+/// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
+///
+/// # Safety
+///
+/// When `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid
+/// [`KernelStringSlice`] values whose backing bytes are readable for the duration of the call.
+pub(super) unsafe fn collect_create_table_columns(
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+) -> DeltaResult<Vec<String>> {
+    if num_columns == 0 {
+        return Ok(Vec::new());
+    }
+    let slices = unsafe { std::slice::from_raw_parts(columns, num_columns) };
+    slices
+        .iter()
+        .map(|slice| {
+            unsafe { TryFromStringSlice::try_from_slice(slice) }.map(|s: &str| s.to_string())
+        })
+        .collect()
+}
+
+/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
+/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
+/// happens later at [`create_table_txn_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// Only top-level columns are supported through this entry point (each slice is one column name);
+/// nested clustering columns must be set on the Rust builder directly.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_txn_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
+        .into_extern_result(&engine)
+}
+
+/// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// partition column names (in order). Clustering and partitioning are mutually exclusive; the last
+/// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
+/// later at [`create_table_txn_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_partition_columns(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_txn_builder_with_data_layout_impl(builder, columns.map(DataLayout::partitioned))
+        .into_extern_result(&engine)
+}
+
+/// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
+/// wrappers so it can be unit-tested. `layout` is a `DeltaResult` so a column-parse failure
+/// short-circuits here, dropping the already-consumed builder rather than producing a layout.
+pub(super) fn create_table_txn_builder_with_data_layout_impl(
+    builder: CreateTableTransactionBuilder,
+    layout: DeltaResult<DataLayout>,
+) -> DeltaResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    Ok(Box::new(builder.with_data_layout(layout?)).into())
+}
+
+/// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
+///
+/// The schema is provided via the engine's visitor callback pattern ([`EngineSchema`]): the
+/// kernel allocates a [`KernelSchemaVisitorState`], calls the engine's visitor function to
+/// populate it via `visit_field_*` downcalls, then extracts the final schema.
+///
+/// The returned builder can be configured with [`create_table_txn_builder_with_table_property`]
+/// before building with [`create_table_txn_builder_build`]. The engine is only used for error
+/// reporting at this stage.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
+#[no_mangle]
+pub unsafe extern "C" fn get_create_table_txn_builder(
+    path: KernelStringSlice,
+    schema: &EngineSchema,
+    engine_info: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
+    let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
+    get_create_table_txn_builder_impl(path, schema, info).into_extern_result(&engine)
+}
+
+fn get_create_table_txn_builder_impl(
+    path: DeltaResult<&str>,
+    schema: &EngineSchema,
+    engine_info: DeltaResult<&str>,
+) -> DeltaResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+    let builder = delta_kernel::transaction::create_table::create_table(
+        path?,
+        Arc::new(schema),
+        engine_info?.to_string(),
+    );
+    Ok(Box::new(builder).into())
+}
+
+/// Add a single table property to a [`CreateTableTransactionBuilder`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle, `key`, `value`, and `engine`.
+/// CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_table_property(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
+    let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
+    create_table_txn_builder_with_table_property_impl(builder, key, value)
+        .into_extern_result(&engine)
+}
+
+fn create_table_txn_builder_with_table_property_impl(
+    builder: CreateTableTransactionBuilder,
+    key: DeltaResult<String>,
+    value: DeltaResult<String>,
+) -> DeltaResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = builder.with_table_properties([(key?, value?)]);
+    Ok(Box::new(builder).into())
+}
+
+/// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
+/// create-table transaction handle that can be used with [`create_table_txn_add_files`] and
+/// [`create_table_txn_commit`] to optionally stage initial data before committing.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid builder and engine handles.
+/// CONSUMES the builder handle -- caller must not use it after this call.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_build(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
+    let builder = unsafe { *builder.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let committer = Box::new(FileSystemCommitter::new());
+    create_table_txn_builder_build_impl(builder, committer, extern_engine)
+        .into_extern_result(&extern_engine)
+}
+
+/// Build a create-table transaction with a custom committer. Same as
+/// [`create_table_txn_builder_build`] but uses the provided committer instead of the default.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles.
+/// CONSUMES both the builder and committer handles -- caller must not use them after this call.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_build_with_committer(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    engine: Handle<SharedExternEngine>,
+    committer: Handle<MutableCommitter>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
+    let builder = unsafe { *builder.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let committer = unsafe { committer.into_inner() };
+    create_table_txn_builder_build_impl(builder, committer, extern_engine)
+        .into_extern_result(&extern_engine)
+}
+
+fn create_table_txn_builder_build_impl(
+    builder: CreateTableTransactionBuilder,
+    committer: Box<dyn Committer>,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<Handle<ExclusiveCreateTableTransaction>> {
+    let engine = extern_engine.engine();
+    let create_txn = builder.build(engine.as_ref(), committer)?;
+    Ok(Box::new(create_txn).into())
+}
+
+/// Free a [`CreateTableTransactionBuilder`] without building.
+///
+/// Use this on failure paths when the builder will not be built.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_create_table_txn_builder(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+) {
+    builder.drop_handle();
+}
