@@ -341,9 +341,9 @@ impl From<EngineExecError> for KernelError {
             .into(),
             FFIKernelError::FileAlreadyExists => KernelError::FileAlreadyExists(message),
             FFIKernelError::UnsupportedError => KernelError::Unsupported(message),
-            FFIKernelError::UnsupportedProtocolVersionError => {
-                KernelError::Unsupported(message)
-            }
+            // EngineExecError does not retain the version fields needed to reconstruct the
+            // structured error, so this intentionally collapses to Unsupported.
+            FFIKernelError::UnsupportedProtocolVersionError => KernelError::Unsupported(message),
             FFIKernelError::InvalidCheckpoint => KernelError::InvalidCheckpoint(message),
             FFIKernelError::SchemaError => KernelError::Schema(message),
             FFIKernelError::InvalidTransactionStateError => {
