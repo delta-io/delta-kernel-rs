@@ -52,7 +52,7 @@ To begin a write, create a transaction with your catalog's `Committer`, add file
 call `commit()`:
 
 ```rust,ignore
-// transaction() moves the Box<dyn Committer> into the Transaction, and commit()
+// build() moves the Box<dyn Committer> into the Transaction, and commit()
 // consumes the Transaction, so the boxed committer is gone by the time you need
 // to publish. Construct a second committer for publish() in Phase 3 and clone
 // any catalog-client state you need to keep in scope across both calls.
@@ -61,8 +61,9 @@ let committer = Box::new(MyCatalogCommitter::new(
     table_id.clone(),
 ));
 let mut txn = snapshot
-    .transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .build(&engine, committer)?;
 
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the

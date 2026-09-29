@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use delta_kernel::transaction::Transaction;
 use delta_kernel::{Result, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
-use crate::transaction::ExclusiveTransaction;
+use crate::transaction::ExclusiveUpdateTableTransactionBuilder;
 use crate::{
     ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
@@ -21,24 +20,18 @@ use crate::{
 /// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice
 /// must be valid. CONSUMES TRANSACTION
 #[no_mangle]
-pub unsafe extern "C" fn with_transaction_id(
-    txn: Handle<ExclusiveTransaction>,
+pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     app_id: KernelStringSlice,
     version: i64,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let txn = unsafe { txn.into_inner() };
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let app_id_res: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    with_transaction_id_impl(*txn, app_id_res, version).into_extern_result(&engine)
-}
-
-fn with_transaction_id_impl(
-    txn: Transaction,
-    app_id_res: Result<String>,
-    version: i64,
-) -> Result<Handle<ExclusiveTransaction>> {
-    Ok(Box::new(txn.with_transaction_id(app_id_res?, version)).into())
+    app_id_res
+        .map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into())
+        .into_extern_result(&engine)
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.
@@ -82,7 +75,10 @@ mod tests {
 
     use super::*;
     use crate::ffi_test_utils::{engine_handle_for_store, ok_or_panic};
-    use crate::transaction::{commit, free_committed_transaction, transaction};
+    use crate::transaction::{
+        free_committed_transaction, get_update_table_txn_builder, update_table_txn_builder_build,
+        update_table_txn_commit,
+    };
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 
     #[cfg(feature = "default-engine-base")]
@@ -94,40 +90,40 @@ mod tests {
         for (table_url, engine, store, _table_name) in
             setup_test_tables(schema, &[], None, "test_table").await?
         {
-            let table_url_str = table_url.as_str();
             let default_engine_handle = engine_handle_for_store(store);
 
-            // Start the transaction
-            let txn = ok_or_panic(unsafe {
-                transaction(
-                    kernel_string_slice!(table_url_str),
-                    default_engine_handle.shallow_copy(),
-                )
-            });
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
+            let builder = unsafe { get_update_table_txn_builder(snapshot_handle.shallow_copy()) };
 
             // Add app ids
             let app_id1 = "app_id1";
             let app_id2 = "app_id2";
-            let txn = ok_or_panic(unsafe {
-                with_transaction_id(
-                    txn,
+            let builder = ok_or_panic(unsafe {
+                update_table_txn_builder_with_transaction_id(
+                    builder,
                     kernel_string_slice!(app_id1),
                     1,
                     default_engine_handle.shallow_copy(),
                 )
             });
-            let txn = ok_or_panic(unsafe {
-                with_transaction_id(
-                    txn,
+            let builder = ok_or_panic(unsafe {
+                update_table_txn_builder_with_transaction_id(
+                    builder,
                     kernel_string_slice!(app_id2),
                     2,
                     default_engine_handle.shallow_copy(),
                 )
             });
+            let txn = ok_or_panic(unsafe {
+                update_table_txn_builder_build(builder, default_engine_handle.shallow_copy())
+            });
+            unsafe { free_snapshot(snapshot_handle) };
 
             // commit!
-            let committed =
-                ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            let committed = ok_or_panic(unsafe {
+                update_table_txn_commit(txn, default_engine_handle.shallow_copy())
+            });
             unsafe { free_committed_transaction(committed) };
 
             let snapshot: Arc<Snapshot> = Snapshot::builder_for(table_url.clone())

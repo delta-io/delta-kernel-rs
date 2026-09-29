@@ -42,7 +42,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, V2_VALIDATOR,
 };
-use crate::transaction::{CreateTable, Operation, Transaction, TransactionConfig};
+use crate::transaction::builder::TransactionBuilderState;
+use crate::transaction::{CommitOperation, CreateTable, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
 use crate::Result;
 
@@ -143,7 +144,7 @@ impl CreateTableTransaction {
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
-        config: TransactionConfig,
+        state: TransactionBuilderState,
     ) -> Result<Self> {
         validate_iceberg_compat_if_needed(
             &effective_table_config,
@@ -165,7 +166,7 @@ impl CreateTableTransaction {
             should_emit_protocol: true,
             should_emit_metadata: true,
             committer,
-            operation: Some(Operation::CreateTable),
+            operation: Some(CommitOperation::CreateTable),
             operation_parameters: std::collections::HashMap::new(),
             operation_metrics: std::collections::HashMap::new(),
             engine_info: None,
@@ -190,6 +191,6 @@ impl CreateTableTransaction {
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
         }
-        .with_transaction_config(config)
+        .with_builder_state(state)
     }
 }

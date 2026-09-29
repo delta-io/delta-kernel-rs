@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
-use delta_kernel::transaction::{CommitResult, RetryableTransaction};
+use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, Result, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -88,10 +88,11 @@ async fn try_main() -> Result<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
-        .with_operation("INSERT".to_string())
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
         .with_engine_info("default_engine/write-table-example")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(&engine, committer)?;
 
     // This example assumes the table is unpartitioned.
     let write_context = txn.write_state()?.write_context_builder().build()?;

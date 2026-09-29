@@ -21,9 +21,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{
-    begin_transaction, get_column, read_scan, test_table_setup_mt, write_batch_to_table,
-};
+use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
 
 use crate::common::read_utils::read_parquet_file;
@@ -1001,8 +999,10 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let mut txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
-        .with_engine_info("default engine");
+    let mut txn =
+        test_utils::load_and_begin_transaction_with(&table_path, engine.as_ref(), |builder| {
+            builder.with_engine_info("default engine")
+        })?;
 
     // Data batch must not contain the partition column.
     let data_schema = schema_ref! { nullable "number": INTEGER };
@@ -1109,9 +1109,10 @@ async fn test_materialize_partition_columns_e2e(
 
     // A single commit writing two distinct partitions.
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction_builder()
         .with_engine_info("default engine")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;
     for (d1, d2, p1, p2) in [
         (vec![1, 2, 3], vec![10, 20, 30], "x", 5),
@@ -1257,8 +1258,10 @@ async fn test_input_data_with_partition_column_errors(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let txn = test_utils::load_and_begin_transaction(&table_path, engine.as_ref())?
-        .with_engine_info("default engine");
+    let txn =
+        test_utils::load_and_begin_transaction_with(&table_path, engine.as_ref(), |builder| {
+            builder.with_engine_info("default engine")
+        })?;
 
     // Contract violation: the batch includes the `partition` column.
     let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
@@ -1359,7 +1362,9 @@ async fn test_partition_null_validation(
         .commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let txn = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder.with_engine_info("default engine")
+    })?;
     let write_state = txn.write_state()?;
     let result = write_state
         .write_context_builder()
@@ -1416,7 +1421,9 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let txn = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder.with_engine_info("default engine")
+    })?;
     let write_state = txn.write_state()?;
 
     write_state

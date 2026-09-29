@@ -188,7 +188,8 @@ mod row_tracking_preservation {
         let (connector_commit_info, connector_commit_info_schema) =
             test_case.connector_commit_info()?;
         let commit_version = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction_builder()
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .with_commit_info(
                 Box::new(ArrowEngineData::new(connector_commit_info)),
                 connector_commit_info_schema,
@@ -381,8 +382,9 @@ mod row_tracking_preservation {
             .unwrap()?
             .scan_files;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+            .transaction_builder()
+            .with_data_change(true)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         txn.remove_files(scan_files);
         if test_case.acknowledges_preservation() {
             txn.ack_row_tracking_preservation();
@@ -596,8 +598,9 @@ mod row_tracking_preservation {
         // === Delete rows 20 and 40 with a deletion vector ===
         let mut txn = source_snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("DELETE".to_string());
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Delete)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let write_context = txn.write_state()?.write_context_builder().build()?;
         let mut deletion_vector = KernelDeletionVector::new();
         deletion_vector.add_deleted_row_indexes([1, 3]);
@@ -671,9 +674,10 @@ mod row_tracking_preservation {
     ) -> Result<Arc<Snapshot>> {
         let source_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("OPTIMIZE".to_string())
-            .with_data_change(false);
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Optimize)
+            .with_data_change(false)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let write_context = txn
             .write_state()?
             .write_context_builder()
@@ -756,7 +760,9 @@ fn write_context_row_tracking_columns_respect_iceberg_compat_v3(
     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
     .commit(engine.as_ref())?
     .unwrap_post_commit_snapshot();
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction_builder()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let result = txn
         .write_state()?
         .write_context_builder()
@@ -833,7 +839,8 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
     // === Build the write context ===
     let txn = source_snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        .transaction_builder()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_context = txn
         .write_state()?
         .write_context_builder()

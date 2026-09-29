@@ -21,7 +21,7 @@ use super::manifest_commit_state::ManifestCommitState;
 use super::root_manifest_file::RootManifestFile;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::ManifestWrite;
-use super::{Operation as TransactionOperation, Transaction};
+use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
@@ -56,6 +56,19 @@ use crate::{DataType, Engine, Expression, Result};
 // Update table transactions only
 // =============================================================================
 impl Transaction {
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_operation_for_test(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(super::CommitOperation::from(operation.into()));
+        self
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_domain_metadata_removed_for_test(mut self, domain: impl Into<String>) -> Self {
+        self.user_domain_removals.push(domain.into());
+        self
+    }
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -151,14 +164,8 @@ impl Transaction {
     ///
     /// Blind append transactions should only add new files and avoid write operations that
     /// depend on existing table state.
-    pub fn with_blind_append(mut self) -> Self {
+    pub(super) fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
-        self
-    }
-
-    /// Sets the operation persisted in the commit and visible in table history.
-    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
-        self.operation = Some(TransactionOperation::from(operation.into()));
         self
     }
 
@@ -232,7 +239,7 @@ impl Transaction {
     /// the same domain in a single transaction. If a duplicate domain is included, the `commit`
     /// will fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
-    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+    pub(super) fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
     }
@@ -388,7 +395,10 @@ impl Transaction {
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let mut txn = snapshot
+    ///     .clone()
+    ///     .transaction_builder()
+    ///     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -473,8 +483,11 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
-    ///     .with_operation("UPDATE".to_string());
+    /// let mut txn = snapshot
+    ///     .clone()
+    ///     .transaction_builder()
+    ///     .with_operation(UpdateTableOperation::Update)
+    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?

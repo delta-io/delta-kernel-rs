@@ -121,9 +121,8 @@ You can call `remove_files()` multiple times to remove files from different
 pending removals.
 
 > [!NOTE]
-> `remove_files()` is available on transaction states that produce data files (gated by
-> the `SupportsDataFiles` trait bound). Metadata-only transaction states cannot register
-> file removals.
+> Existing-table transactions, including `ALTER TABLE`, can register file removals. Kernel infers
+> `dataChange` from staged file actions unless the connector supplies an explicit override.
 
 ## Full example
 
@@ -138,7 +137,7 @@ This example removes the first file from a filesystem-backed table:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::engine_data::FilteredEngineData;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -150,8 +149,9 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Create a transaction
 let mut txn = snapshot
     .clone()
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("DELETE".to_string());
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("DELETE".to_string()))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Build a scan and get file metadata
 let scan = snapshot.scan_builder().build()?;

@@ -49,6 +49,19 @@ impl UpdateTableOperation {
         };
         validate_custom_name(name)
     }
+
+    fn from_name(operation: String) -> Self {
+        match operation.as_str() {
+            "WRITE" => Self::Write,
+            "STREAMING UPDATE" => Self::StreamingUpdate,
+            "ALTER TABLE" => Self::AlterTable,
+            "DELETE" => Self::Delete,
+            "UPDATE" => Self::Update,
+            "MERGE" => Self::Merge,
+            "OPTIMIZE" => Self::Optimize,
+            _ => Self::Custom(operation),
+        }
+    }
 }
 
 impl fmt::Display for UpdateTableOperation {
@@ -58,12 +71,12 @@ impl fmt::Display for UpdateTableOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Operation {
+pub(crate) enum CommitOperation {
     CreateTable,
     UpdateTable(UpdateTableOperation),
 }
 
-impl Operation {
+impl CommitOperation {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::CreateTable => "CREATE TABLE",
@@ -72,6 +85,8 @@ impl Operation {
     }
 
     pub(crate) fn metric_label(&self) -> &str {
+        // Connector-defined names collapse to one bounded-cardinality metric label while the
+        // exact operation name remains available in commitInfo.
         match self {
             Self::UpdateTable(UpdateTableOperation::Custom(_)) => "CUSTOM",
             operation => operation.as_str(),
@@ -86,35 +101,29 @@ impl Operation {
     }
 }
 
-impl fmt::Display for Operation {
+impl fmt::Display for CommitOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl From<UpdateTableOperation> for Operation {
+impl From<UpdateTableOperation> for CommitOperation {
     fn from(operation: UpdateTableOperation) -> Self {
         Self::UpdateTable(operation)
     }
 }
 
-impl From<String> for Operation {
+impl From<String> for CommitOperation {
     fn from(operation: String) -> Self {
-        match operation.as_str() {
-            "CREATE TABLE" => Self::CreateTable,
-            "WRITE" => UpdateTableOperation::Write.into(),
-            "STREAMING UPDATE" => UpdateTableOperation::StreamingUpdate.into(),
-            "ALTER TABLE" => UpdateTableOperation::AlterTable.into(),
-            "DELETE" => UpdateTableOperation::Delete.into(),
-            "UPDATE" => UpdateTableOperation::Update.into(),
-            "MERGE" => UpdateTableOperation::Merge.into(),
-            "OPTIMIZE" => UpdateTableOperation::Optimize.into(),
-            _ => UpdateTableOperation::Custom(operation).into(),
+        if operation == "CREATE TABLE" {
+            Self::CreateTable
+        } else {
+            Self::UpdateTable(UpdateTableOperation::from_name(operation))
         }
     }
 }
 
-impl From<&str> for Operation {
+impl From<&str> for CommitOperation {
     fn from(operation: &str) -> Self {
         operation.to_string().into()
     }
@@ -145,7 +154,7 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, UpdateTableOperation};
+    use super::{CommitOperation, UpdateTableOperation};
 
     #[test]
     fn update_table_operations_have_stable_names() {
@@ -161,7 +170,7 @@ mod tests {
         for (name, operation) in cases {
             assert_eq!(operation.as_str(), name);
             assert_eq!(operation.to_string(), name);
-            assert_eq!(Operation::from(operation).as_str(), name);
+            assert_eq!(CommitOperation::from(operation).as_str(), name);
         }
     }
 
@@ -169,10 +178,11 @@ mod tests {
     fn custom_operations_round_trip_exactly() {
         let value = "vendor.custom/write-v2";
         let operation = UpdateTableOperation::Custom(value.to_string());
+        assert_eq!(operation, UpdateTableOperation::Custom(value.to_string()));
         assert_eq!(operation.as_str(), value);
-        let operation = Operation::from(operation);
+        let operation = CommitOperation::from(operation);
         assert_eq!(operation.metric_label(), "CUSTOM");
-        assert_eq!(Operation::from(value), operation);
+        assert_eq!(CommitOperation::from(value), operation);
     }
 
     #[test]

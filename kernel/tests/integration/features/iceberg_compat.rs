@@ -224,7 +224,8 @@ async fn v3_invalid_type_change_blocks_writes_but_not_snapshot_loading() {
         .build(engine.as_ref())
         .unwrap();
     let err = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction_builder()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap_err()
         .to_string();
     assert!(
@@ -289,7 +290,8 @@ async fn v2_and_deletion_vectors_active_blocks_writes() {
         .build(engine.as_ref())
         .unwrap();
     let err = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction_builder()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap_err()
         .to_string();
     assert!(
@@ -317,10 +319,11 @@ async fn iceberg_compat_commit_validates_num_records(
         .unwrap();
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
-        .unwrap()
+        .transaction_builder()
         .with_engine_info("Test/1.0")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap();
     let add_files = create_add_files_metadata(
         txn.add_files_schema(),
         vec![("part-fake.parquet", 1024, 1_000_000, num_records)],

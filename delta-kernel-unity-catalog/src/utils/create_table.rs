@@ -427,7 +427,8 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(TestCatalogCommitter), &engine)
+            .transaction_builder()
+            .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();

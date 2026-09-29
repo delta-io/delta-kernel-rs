@@ -6,15 +6,12 @@ use delta_kernel_derive::internal_api;
 
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::StructField;
+use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
+use crate::transaction::builder::TransactionBuilderState;
 use crate::transaction::schema_evolution::SchemaOperation;
-use crate::transaction::{
-    Transaction, TransactionConfig, TransactionOptions, UpdateTableOperation,
-};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::FileMeta;
-use crate::{DeltaResult, Engine, Error};
+use crate::transaction::{Transaction, UpdateTableOperation};
+use crate::{DeltaResult, Engine, EngineData, KernelError};
 
 /// Configures a transaction against an existing table.
 ///
@@ -22,14 +19,12 @@ use crate::{DeltaResult, Engine, Error};
 /// [`build`](Self::build) validates the accumulated intent and constructs the transaction.
 pub struct UpdateTableTransactionBuilder {
     snapshot: SnapshotRef,
-    config: TransactionConfig,
+    state: TransactionBuilderState,
     operation: Option<UpdateTableOperation>,
+    transaction_ids: Vec<(String, i64)>,
     schema_changes: Vec<SchemaOperation>,
     domain_metadata_removals: Vec<String>,
-    row_tracking_high_water_mark: Option<i64>,
     is_blind_append: bool,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    root_manifest_file: Option<FileMeta>,
 }
 
 impl std::fmt::Debug for UpdateTableTransactionBuilder {
@@ -46,14 +41,12 @@ impl UpdateTableTransactionBuilder {
     pub(crate) fn new(snapshot: SnapshotRef) -> Self {
         Self {
             snapshot,
-            config: TransactionConfig::new(),
+            state: TransactionBuilderState::new(),
             operation: None,
+            transaction_ids: Vec::new(),
             schema_changes: Vec::new(),
             domain_metadata_removals: Vec::new(),
-            row_tracking_high_water_mark: None,
             is_blind_append: false,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            root_manifest_file: None,
         }
     }
 
@@ -77,18 +70,17 @@ impl UpdateTableTransactionBuilder {
         self.validate()?;
         let Self {
             snapshot,
-            config,
+            state,
             operation,
+            transaction_ids,
             schema_changes,
             domain_metadata_removals,
-            row_tracking_high_water_mark,
             is_blind_append,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            root_manifest_file,
         } = self;
 
         let mut transaction = Transaction::try_new_existing_table(snapshot, committer, engine)?
-            .with_transaction_config(config)?;
+            .with_builder_state(state)?
+            .with_transaction_ids(transaction_ids);
 
         if let Some(operation) = operation {
             transaction = transaction.with_update_table_operation(operation);
@@ -102,29 +94,96 @@ impl UpdateTableTransactionBuilder {
         for domain in domain_metadata_removals {
             transaction = transaction.with_domain_metadata_removed(domain);
         }
-        if let Some(high_water_mark) = row_tracking_high_water_mark {
-            transaction = transaction.with_row_tracking_high_water_mark(high_water_mark)?;
-        }
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(root_manifest_file) = root_manifest_file {
-            transaction = transaction.with_root_manifest_file(root_manifest_file)?;
-        }
+        transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 
-    /// Replaces the options shared by transaction variants.
+    /// Sets the connector name and version recorded in `commitInfo`.
     ///
-    /// This replaces values previously set through option-specific builder methods such as
-    /// [`Self::with_correlation_id`]. Call those methods after `with_options` to override an
-    /// individual option.
-    pub fn with_options(mut self, options: TransactionOptions) -> Self {
-        self.config.set_options(options);
+    /// Consecutive calls replace the previous value.
+    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
+        self.state = self.state.with_engine_info(engine_info);
         self
     }
 
     /// Attaches an opaque identifier to the transaction's metric events.
+    ///
+    /// Consecutive calls replace the previous value. An empty identifier is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<std::sync::Arc<str>>) -> Self {
-        self.config.set_correlation_id(correlation_id);
+        self.state = self.state.with_correlation_id(correlation_id);
+        self
+    }
+
+    /// Replaces the operation parameters recorded in `commitInfo`.
+    ///
+    /// This map replaces rather than merges with a map from an earlier call. Dedicated operation
+    /// parameters take precedence over a same-named nested field supplied by
+    /// [`with_commit_info`](Self::with_commit_info).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.state = self.state.with_operation_parameters(parameters)?;
+        Ok(self)
+    }
+
+    /// Replaces the operation metrics recorded in `commitInfo`.
+    ///
+    /// This map replaces rather than merges with a map from an earlier call. Metrics supplied to
+    /// the built [`Transaction`] replace these values. Dedicated operation metrics take
+    /// precedence over a same-named nested field supplied by
+    /// [`with_commit_info`](Self::with_commit_info).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a key is empty or occurs more than once.
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.state = self.state.with_operation_metrics(metrics)?;
+        Ok(self)
+    }
+
+    /// Supplies one arbitrary connector-provided `commitInfo` row.
+    ///
+    /// Consecutive calls replace the previous row. Kernel-owned fields and dedicated operation
+    /// parameter or metric maps take precedence over same-named fields in this row.
+    pub fn with_commit_info(
+        mut self,
+        commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.state = self.state.with_commit_info(commit_info, commit_info_schema);
+        self
+    }
+
+    /// Adds an application transaction identifier to emit as a `txn` action.
+    ///
+    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.transaction_ids.push((app_id.into(), version));
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    ///
+    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
+    /// [`build`](Self::build).
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.state = self.state.with_domain_metadata(domain, configuration);
         self
     }
 
@@ -135,23 +194,22 @@ impl UpdateTableTransactionBuilder {
     /// Other operations default to `true`. Set this explicitly to `false` for a protocol-valid
     /// logical-preserving rewrite.
     pub fn with_data_change(mut self, data_change: bool) -> Self {
-        self.config.set_data_change(data_change);
-        self
-    }
-
-    /// Acknowledges that the connector applies column defaults before writing.
-    pub fn ack_column_defaults(mut self) -> Self {
-        self.config.acknowledge_column_defaults();
+        self.state.data_change = Some(data_change);
         self
     }
 
     /// Marks the transaction as a blind append assertion.
+    ///
+    /// Blind append is invalid for `ALTER TABLE` and for transactions that remove files.
     pub fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
         self
     }
 
     /// Sets the operation recorded in `commitInfo`.
+    ///
+    /// Consecutive calls replace the previous operation. Invalid custom names and incompatible
+    /// operation/schema-change combinations are rejected by [`build`](Self::build).
     pub fn with_operation(mut self, operation: UpdateTableOperation) -> Self {
         self.operation = Some(operation);
         self
@@ -170,6 +228,8 @@ impl UpdateTableTransactionBuilder {
     }
 
     /// Adds a nullable top-level column to the table schema.
+    ///
+    /// Schema changes are applied in call order and validated by [`build`](Self::build).
     pub fn add_column(mut self, field: StructField) -> Self {
         self.schema_changes
             .push(SchemaOperation::add_column(None, field));
@@ -177,14 +237,17 @@ impl UpdateTableTransactionBuilder {
     }
 
     /// Adds a nullable field under `parent` in the table schema.
-    #[internal_api]
-    pub(crate) fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
+    ///
+    /// `parent` may identify a nested struct. Schema changes are applied in call order.
+    pub fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
         self.schema_changes
             .push(SchemaOperation::add_column(parent, field));
         self
     }
 
-    /// Changes a column from non-nullable to nullable.
+    /// Changes a possibly nested column from non-nullable to nullable.
+    ///
+    /// The column path is resolved after all preceding schema changes.
     pub fn set_nullable(mut self, column: ColumnName) -> Self {
         self.schema_changes
             .push(SchemaOperation::SetNullable { column });
@@ -192,28 +255,11 @@ impl UpdateTableTransactionBuilder {
     }
 
     /// Adds a user-controlled domain metadata tombstone to the transaction.
+    ///
+    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
+    /// [`build`](Self::build).
     pub fn with_domain_metadata_removed(mut self, domain: impl Into<String>) -> Self {
         self.domain_metadata_removals.push(domain.into());
-        self
-    }
-
-    /// Acknowledges the connector's row-tracking preservation responsibilities.
-    pub fn ack_row_tracking_preservation(mut self) -> Self {
-        self.config.acknowledge_row_tracking_preservation();
-        self
-    }
-
-    /// Sets an explicit row-tracking high-water mark.
-    #[internal_api]
-    pub(crate) fn with_row_tracking_high_water_mark(mut self, high_water_mark: i64) -> Self {
-        self.row_tracking_high_water_mark = Some(high_water_mark);
-        self
-    }
-
-    /// Stages the table's root manifest file.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn with_root_manifest_file(mut self, file: FileMeta) -> Self {
-        self.root_manifest_file = Some(file);
         self
     }
 
@@ -221,27 +267,27 @@ impl UpdateTableTransactionBuilder {
         if let Some(operation) = &self.operation {
             operation
                 .validate()
-                .map_err(Error::invalid_transaction_state)?;
+                .map_err(KernelError::invalid_transaction_state)?;
         }
         if self.operation.as_ref() == Some(&UpdateTableOperation::AlterTable) {
             if self.schema_changes.is_empty() {
-                return Err(Error::invalid_transaction_state(
+                return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ));
             }
             if self.is_blind_append {
-                return Err(Error::invalid_transaction_state(
+                return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE cannot be marked as a blind append",
                 ));
             }
         }
-        if self.is_blind_append && self.config.data_change == Some(false) {
-            return Err(Error::invalid_transaction_state(
+        if self.is_blind_append && self.state.data_change == Some(false) {
+            return Err(KernelError::invalid_transaction_state(
                 "blind append requires data_change to be true",
             ));
         }
         if self.is_blind_append && !self.schema_changes.is_empty() {
-            return Err(Error::invalid_transaction_state(
+            return Err(KernelError::invalid_transaction_state(
                 "blind append cannot include schema changes",
             ));
         }
@@ -252,22 +298,32 @@ impl UpdateTableTransactionBuilder {
             .iter()
             .find(|domain| !removals.insert(domain.as_str()))
         {
-            return Err(Error::invalid_transaction_state(format!(
+            return Err(KernelError::invalid_transaction_state(format!(
                 "domain metadata '{domain}' is removed more than once"
             )));
         }
         if let Some(domain) = self
-            .config
-            .options
+            .state
             .domain_metadata_additions
             .iter()
             .map(|metadata| metadata.domain())
             .find(|domain| removals.contains(domain))
         {
-            return Err(Error::invalid_transaction_state(format!(
+            return Err(KernelError::invalid_transaction_state(format!(
                 "domain metadata '{domain}' cannot be added and removed in one transaction"
             )));
         }
+        let mut app_ids = HashSet::with_capacity(self.transaction_ids.len());
+        if let Some((app_id, _)) = self
+            .transaction_ids
+            .iter()
+            .find(|(app_id, _)| !app_ids.insert(app_id.as_str()))
+        {
+            return Err(KernelError::invalid_transaction_state(format!(
+                "app_id {app_id} appears more than once"
+            )));
+        }
+        self.state.validate()?;
         Ok(())
     }
 }
@@ -286,11 +342,10 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
     use crate::schema::{schema_ref, DataType, StructField};
-    use crate::transaction::{SchemaOperation, TransactionOptions, UpdateTableOperation};
+    use crate::transaction::builder::TransactionBuilderState;
+    use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::load_test_table;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::FileMeta;
-    use crate::{DeltaResult, Error};
+    use crate::{DeltaResult, KernelError};
 
     #[test]
     fn builder_collects_existing_table_transaction_intent() -> DeltaResult<()> {
@@ -298,13 +353,10 @@ mod tests {
         let transaction = snapshot
             .transaction_builder()
             .with_operation(UpdateTableOperation::Write)
-            .with_options(
-                TransactionOptions::new()
-                    .with_engine_info("test-engine")
-                    .with_operation_parameters([("mode", "Append")])?
-                    .with_operation_metrics([("numFiles", "3")])?
-                    .with_transaction_id("app", 7),
-            )
+            .with_engine_info("test-engine")
+            .with_operation_parameters([("mode", "Append")])?
+            .with_operation_metrics([("numFiles", "3")])?
+            .with_transaction_id("app", 7)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         assert_eq!(
@@ -315,6 +367,39 @@ mod tests {
         assert_eq!(transaction.operation_parameters["mode"], "Append");
         assert_eq!(transaction.operation_metrics["numFiles"], "3");
         assert_eq!(transaction.set_transactions[0].app_id, "app");
+        assert!(transaction.data_change);
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_setters_use_the_last_value_and_empty_correlation_clears() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
+            .with_operation(UpdateTableOperation::Delete)
+            .with_engine_info("first-engine")
+            .with_engine_info("second-engine")
+            .with_correlation_id("first-correlation")
+            .with_correlation_id("")
+            .with_operation_parameters([("first", "value")])?
+            .with_operation_parameters([("second", "value")])?
+            .with_operation_metrics([("first", "value")])?
+            .with_operation_metrics([("second", "value")])?
+            .with_data_change(false)
+            .with_data_change(true)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert_eq!(
+            transaction.operation,
+            Some(UpdateTableOperation::Delete.into())
+        );
+        assert_eq!(transaction.engine_info.as_deref(), Some("second-engine"));
+        assert!(transaction.correlation_id.is_none());
+        assert_eq!(transaction.operation_parameters.len(), 1);
+        assert_eq!(transaction.operation_parameters["second"], "value");
+        assert_eq!(transaction.operation_metrics.len(), 1);
+        assert_eq!(transaction.operation_metrics["second"], "value");
         assert!(transaction.data_change);
         Ok(())
     }
@@ -344,25 +429,20 @@ mod tests {
         let commit_info = Box::new(ArrowEngineData::new(RecordBatch::new_empty(Arc::new(
             arrow_schema,
         ))));
-        let options = TransactionOptions::new()
-            .with_engine_info("test-engine")
-            .with_commit_info(commit_info, commit_info_schema);
-        assert!(format!("{options:?}").contains("engine_commit_info: true"));
-
-        let transaction = snapshot
+        let mut transaction = snapshot
             .transaction_builder()
-            .with_options(options)
+            .with_engine_info("test-engine")
+            .with_commit_info(commit_info, commit_info_schema)
             .with_correlation_id("correlation-id")
             .with_data_change(false)
             .with_schema_changes([SchemaOperation::add_column(
                 None,
                 StructField::nullable("new_column", DataType::STRING),
             )])
-            .with_domain_metadata_removed("missing-domain")
-            .ack_column_defaults()
-            .ack_row_tracking_preservation()
-            .with_row_tracking_high_water_mark(17)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        transaction.ack_column_defaults();
+        transaction.ack_row_tracking_preservation();
+        transaction = transaction.with_row_tracking_high_water_mark(17)?;
 
         assert_eq!(
             transaction.correlation_id.as_deref(),
@@ -373,29 +453,20 @@ mod tests {
         assert!(transaction.row_tracking_preservation_acknowledged);
         assert_eq!(transaction.provided_row_tracking_high_water_mark, Some(17));
         assert!(transaction.engine_commit_info.is_some());
-        assert_eq!(transaction.user_domain_removals.len(), 1);
+        assert!(transaction.user_domain_removals.is_empty());
         Ok(())
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn internal_builder_methods_collect_nested_schema_and_manifest_intent() -> DeltaResult<()> {
+    fn builder_collects_nested_schema_intent() -> DeltaResult<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let manifest = FileMeta {
-            location: snapshot.table_root().join("manifest.json")?,
-            last_modified: 0,
-            size: 1,
-        };
-        let builder = snapshot
-            .transaction_builder()
-            .add_column_at(
-                ColumnName::new(["parent"]),
-                StructField::nullable("child", DataType::STRING),
-            )
-            .with_root_manifest_file(manifest);
+        let builder = snapshot.transaction_builder().add_column_at(
+            ColumnName::new(["parent"]),
+            StructField::nullable("child", DataType::STRING),
+        );
 
         assert_eq!(builder.schema_changes.len(), 1);
-        assert!(builder.root_manifest_file.is_some());
         Ok(())
     }
 
@@ -445,25 +516,6 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("reserved"));
-        Ok(())
-    }
-
-    #[rstest]
-    #[case("CREATE TABLE", "cannot use an update-table transaction")]
-    #[case("REPLACE TABLE", "reserved")]
-    #[case("ALTER TABLE", "requires at least one schema change")]
-    fn legacy_transaction_rejects_builder_specific_operations(
-        #[case] operation: &str,
-        #[case] expected: &str,
-    ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let error = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation(operation)
-            .commit(engine.as_ref())
-            .unwrap_err();
-
-        assert!(error.to_string().contains(expected), "{error}");
         Ok(())
     }
 
@@ -526,13 +578,27 @@ mod tests {
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
-        assert!(matches!(&error, Error::InvalidTransactionState(_)));
+        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
         assert!(error.to_string().contains(expected), "{error}");
         Ok(())
     }
 
-    #[test]
-    fn alter_table_infers_data_change_after_actions_are_staged() -> DeltaResult<()> {
+    #[derive(Clone, Copy, Debug)]
+    enum StagedFileAction {
+        Add,
+        Remove,
+        DeletionVectorUpdate,
+    }
+
+    #[rstest]
+    fn alter_table_infers_data_change_after_actions_are_staged(
+        #[values(
+            StagedFileAction::Add,
+            StagedFileAction::Remove,
+            StagedFileAction::DeletionVectorUpdate
+        )]
+        action: StagedFileAction,
+    ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut transaction = snapshot
             .transaction_builder()
@@ -543,10 +609,20 @@ mod tests {
         transaction.resolve_data_change();
         assert!(!transaction.data_change);
 
-        let add_schema: ArrowSchema = transaction.add_files_schema().as_ref().try_into_arrow()?;
-        transaction.add_files(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
-            Arc::new(add_schema),
-        ))));
+        let data = || {
+            Box::new(ArrowEngineData::new(RecordBatch::new_empty(Arc::new(
+                ArrowSchema::empty(),
+            ))))
+        };
+        match action {
+            StagedFileAction::Add => transaction.add_files_metadata.push(data()),
+            StagedFileAction::Remove => transaction
+                .remove_files_metadata
+                .push(crate::FilteredEngineData::with_all_rows_selected(data())),
+            StagedFileAction::DeletionVectorUpdate => transaction
+                .dv_matched_files
+                .push(crate::FilteredEngineData::with_all_rows_selected(data())),
+        }
         transaction.resolve_data_change();
         assert!(transaction.data_change);
         Ok(())
@@ -570,35 +646,26 @@ mod tests {
     }
 
     #[rstest]
-    #[case::duplicate_app_id(
-        TransactionOptions::new()
-            .with_transaction_id("app", 1)
-            .with_transaction_id("app", 2),
-        None,
-        "app_id app already exists"
-    )]
-    #[case::duplicate_domain(
-        TransactionOptions::new()
-            .with_domain_metadata("domain", "first")
-            .with_domain_metadata("domain", "second"),
-        None,
-        "domain metadata 'domain' appears more than once"
-    )]
-    #[case::added_and_removed_domain(
-        TransactionOptions::new().with_domain_metadata("domain", "value"),
-        Some("domain"),
-        "cannot be added and removed"
-    )]
-    fn duplicate_transaction_options_are_rejected(
-        #[case] options: TransactionOptions,
-        #[case] removed_domain: Option<&str>,
+    #[case::duplicate_app_id(0, "app_id app appears more than once")]
+    #[case::duplicate_domain(1, "domain metadata 'domain' appears more than once")]
+    #[case::added_and_removed_domain(2, "cannot be added and removed")]
+    fn duplicate_builder_values_are_rejected(
+        #[case] kind: u8,
         #[case] expected: &str,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut builder = snapshot.transaction_builder().with_options(options);
-        if let Some(domain) = removed_domain {
-            builder = builder.with_domain_metadata_removed(domain);
-        }
+        let builder = snapshot.transaction_builder();
+        let builder = match kind {
+            0 => builder
+                .with_transaction_id("app", 1)
+                .with_transaction_id("app", 2),
+            1 => builder
+                .with_domain_metadata("domain", "first")
+                .with_domain_metadata("domain", "second"),
+            _ => builder
+                .with_domain_metadata("domain", "value")
+                .with_domain_metadata_removed("domain"),
+        };
 
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
@@ -624,29 +691,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn domain_metadata_without_table_feature_is_rejected_during_build() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .transaction_builder()
+            .with_domain_metadata("app.config", "{}")
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("domainMetadata"), "{error}");
+        Ok(())
+    }
+
     #[rstest]
     #[case::empty_parameter(
-        TransactionOptions::new().with_operation_parameters([("", "value")]),
+        TransactionBuilderState::new().with_operation_parameters([("", "value")]),
         "parameter key cannot be empty"
     )]
     #[case::duplicate_parameter(
-        TransactionOptions::new().with_operation_parameters([("key", "first"), ("key", "second")]),
+        TransactionBuilderState::new().with_operation_parameters([("key", "first"), ("key", "second")]),
         "parameter key 'key' appears more than once"
     )]
     #[case::empty_metric(
-        TransactionOptions::new().with_operation_metrics([("", "value")]),
+        TransactionBuilderState::new().with_operation_metrics([("", "value")]),
         "metric key cannot be empty"
     )]
     #[case::duplicate_metric(
-        TransactionOptions::new().with_operation_metrics([("key", "first"), ("key", "second")]),
+        TransactionBuilderState::new().with_operation_metrics([("key", "first"), ("key", "second")]),
         "metric key 'key' appears more than once"
     )]
     fn invalid_operation_metadata_is_rejected(
-        #[case] result: DeltaResult<TransactionOptions>,
+        #[case] result: DeltaResult<TransactionBuilderState>,
         #[case] expected: &str,
     ) {
         let error = result.unwrap_err();
-        assert!(matches!(&error, Error::InvalidTransactionState(_)));
+        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
         assert!(error.to_string().contains(expected), "{error}");
     }
 }
