@@ -147,7 +147,7 @@ impl Snapshot {
     /// to a more recent version.
     ///
     /// Refreshes compare sizes and modification times for overlapping log files from the normal
-    /// listing with cached files. Changed files trigger a rebuild; newly loaded metadata must
+    /// listing with cached files. Changed cached files cause an error; newly loaded metadata must
     /// retain the input snapshot's table ID. Use [`Snapshot::builder_for`] to load a
     /// replacement table. This does not detect replacements whose compared file metadata is
     /// identical.
