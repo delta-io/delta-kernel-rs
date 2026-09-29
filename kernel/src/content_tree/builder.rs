@@ -62,10 +62,11 @@ fn write_metadata_input_schema() -> DeltaResult<SchemaRef> {
 }
 
 /// The write-metadata leaf columns this path requires to be non-null on every row, in leaf order:
-/// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. The non-null contract is enforced by
-/// [`RequiredFieldsNonNullVisitor`], not this schema: these populate root-manifest entry fields
-/// that are themselves `Option` on the output entry, so the output schema can't enforce it.
-/// `path`/`size` are exempt because the upstream add-file writer always populates them.
+/// `stats.numRecords`, `baseRowId`, `defaultRowCommitVersion`. The evaluator does not enforce
+/// input-schema non-nullability, so [`RequiredFieldsNonNullVisitor`] rejects nulls up front:
+/// otherwise a null would land in a root-manifest entry field the manifest requires (`recordCount`,
+/// `firstRowId`, `sequenceNumber`, `fileSequenceNumber`). `path`/`size` are exempt because the
+/// upstream add-file writer always populates them.
 static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     StructType::new_unchecked([
         StructField::not_null(
