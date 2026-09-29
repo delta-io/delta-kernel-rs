@@ -3342,7 +3342,8 @@ mod tests {
         };
         let err = serde_json::to_value(&action).expect_err("invalid action must not serialize");
         assert!(
-            err.to_string().contains("exceeds checkpointMetadata.version"),
+            err.to_string()
+                .contains("exceeds checkpointMetadata.version"),
             "expected content-root-version error, got: {err}"
         );
     }
