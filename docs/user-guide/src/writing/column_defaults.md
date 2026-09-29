@@ -109,7 +109,7 @@ and per-row `DEFAULT` requests need separate handling.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::expressions::Scalar;
 # use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, Error, SnapshotRef};
+# use delta_kernel::{DeltaResult, KernelError, SnapshotRef};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
 // Describe how each table column gets its values.
@@ -136,10 +136,13 @@ async fn append_with_defaults(
             Ok(index) => ColumnSource::Input(index),
             Err(_) => {
                 let column_default = defaults.get(field.name()).ok_or_else(|| {
-                    Error::generic(format!("missing column without a default: {}", field.name()))
+                    KernelError::generic(format!(
+                        "missing column without a default: {}",
+                        field.name()
+                    ))
                 })?;
                 let scalar = column_default.to_scalar()?.ok_or_else(|| {
-                    Error::generic(format!("cannot evaluate default for {}", field.name()))
+                    KernelError::generic(format!("cannot evaluate default for {}", field.name()))
                 })?;
                 ColumnSource::Default(scalar)
             }
@@ -215,7 +218,7 @@ SQL with the appropriate SQL semantics and return a value of the declared type:
 # extern crate delta_kernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{ColumnDefault, DataType};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 
 fn resolve_default(
     column_default: &ColumnDefault<'_>,
@@ -223,7 +226,7 @@ fn resolve_default(
 ) -> DeltaResult<Scalar> {
     let scalar = evaluate_sql(column_default.raw_sql(), column_default.data_type())?;
     if &scalar.data_type() != column_default.data_type() {
-        return Err(Error::generic("default evaluator returned the wrong type"));
+        return Err(KernelError::generic("default evaluator returned the wrong type"));
     }
     Ok(scalar)
 }

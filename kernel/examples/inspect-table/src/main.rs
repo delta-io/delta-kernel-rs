@@ -18,7 +18,7 @@ use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, Snapshot};
+use delta_kernel::{DeltaResult, KernelError, Snapshot};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -117,7 +117,7 @@ impl RowVisitor for LogVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let expected = NAMES_AND_TYPES.as_ref().0.len();
         if getters.len() != expected {
-            return Err(Error::InternalError(format!(
+            return Err(KernelError::InternalError(format!(
                 "Wrong number of LogVisitor getters: {}, expected {expected}",
                 getters.len()
             )));

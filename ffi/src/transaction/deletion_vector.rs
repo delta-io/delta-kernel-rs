@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveTransaction;
@@ -100,14 +100,14 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 }
 
 impl TryFrom<c_int> for KernelDvStorageType {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(value: c_int) -> DeltaResult<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
             2 => Ok(Self::PersistedAbsolute),
-            _ => Err(Error::generic(format!(
+            _ => Err(KernelError::generic(format!(
                 "invalid deletion vector storage type: {value}"
             ))),
         }
@@ -267,28 +267,12 @@ fn transaction_update_deletion_vectors_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use delta_kernel::Engine;
-
     use super::*;
-    use crate::error::{AllocateError, AllocateErrorFn, KernelError};
-    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_with_message};
-    use crate::{free_engine, ExternEngine};
-
-    struct ErrorOnlyExternEngine {
-        allocate_error: AllocateErrorFn,
-    }
-
-    impl ExternEngine for ErrorOnlyExternEngine {
-        fn engine(&self) -> Arc<dyn Engine> {
-            panic!("error-only test engine does not expose a kernel engine")
-        }
-
-        fn error_allocator(&self) -> &dyn AllocateError {
-            &self.allocate_error
-        }
-    }
+    use crate::error::FFIKernelError;
+    use crate::ffi_test_utils::{
+        assert_extern_result_error_with_message, error_only_engine_handle,
+    };
+    use crate::free_engine;
 
     #[test]
     fn kernel_dv_storage_type_maps_to_kernel_storage_type() {
@@ -365,7 +349,7 @@ mod tests {
 
         let result = dv_descriptor_map_insert_impl(
             &mut map,
-            Err(Error::generic("bad data file path")),
+            Err(KernelError::generic("bad data file path")),
             *descriptor,
         );
 
@@ -375,10 +359,7 @@ mod tests {
 
     #[test]
     fn dv_descriptor_map_insert_invalid_utf8_consumes_descriptor() {
-        let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
-            allocate_error: allocate_err,
-        });
-        let engine: Handle<SharedExternEngine> = engine.into();
+        let engine = error_only_engine_handle();
         let map = dv_descriptor_map_new();
         let descriptor =
             dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, 1)
@@ -398,7 +379,7 @@ mod tests {
             )
         };
 
-        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::Utf8Error, None);
         unsafe {
             free_dv_descriptor_map(map);
             free_engine(engine);

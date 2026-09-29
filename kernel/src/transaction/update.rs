@@ -26,7 +26,7 @@ use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
-use crate::error::Error;
+use crate::error::KernelError;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::null_lit;
 use crate::expressions::{
@@ -173,7 +173,7 @@ impl Transaction {
             .effective_table_config
             .is_feature_enabled(&TableFeature::IcebergCompatV3)
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
@@ -181,17 +181,17 @@ impl Transaction {
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults)
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
             ));
         }
         require!(
             !changes.is_empty(),
-            Error::generic("with_schema_changes requires at least one schema operation")
+            KernelError::generic("with_schema_changes requires at least one schema operation")
         );
         require!(
             !self.has_data_file_actions(),
-            Error::invalid_transaction_state(
+            KernelError::invalid_transaction_state(
                 "with_schema_changes must be called before staging data files"
             )
         );
@@ -253,7 +253,7 @@ impl Transaction {
         high_water_mark: i64,
     ) -> DeltaResult<Self> {
         if self.provided_row_tracking_high_water_mark.is_some() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Row-tracking high-water mark already specified in this transaction",
             ));
         }
@@ -265,7 +265,7 @@ impl Transaction {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
         let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-            Error::internal_error("existing-table transaction unexpectedly has no snapshot")
+            KernelError::internal_error("existing-table transaction unexpectedly has no snapshot")
         })?;
         self.root_manifest_file = Some(RootManifestFile::new(file, read_snapshot));
         Ok(self)
@@ -406,7 +406,7 @@ impl Transaction {
         existing_data_files: impl Iterator<Item = DeltaResult<FilteredEngineData>>,
     ) -> DeltaResult<()> {
         if self.is_create_table() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Deletion vector operations require an existing table",
             ));
         }
@@ -452,7 +452,7 @@ impl Transaction {
         }
 
         if matched_dv_files != new_dv_descriptors.len() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
@@ -471,7 +471,7 @@ impl Transaction {
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Deletion vector writes require reader version 3, writer version 7, the \
                  'deletionVectors' feature in both reader and writer features, and the \
                  `delta.enableDeletionVectors` table property set to `true`",
@@ -594,7 +594,7 @@ impl<S> Transaction<S> {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
-            return Err(crate::error::Error::internal_error(
+            return Err(crate::error::KernelError::internal_error(
                 "CREATE TABLE transaction cannot have DV update actions",
             ));
         }
@@ -770,18 +770,18 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
                 let stats = stats.ok_or_else(|| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "update_deletion_vectors: file {path} has no stats; \
                          deletion vectors require an accurate {NUM_RECORDS}"
                     ))
                 })?;
                 let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
                     ))
                 })?;
                 let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    Error::generic(format!(
+                    KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not a JSON object"
                     ))
                 })?;
@@ -790,7 +790,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
                     )));
@@ -807,7 +807,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 } else {
                     stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
                     serde_json::to_string(&parsed).map_err(|e| {
-                        Error::generic(format!(
+                        KernelError::generic(format!(
                             "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
                         ))
                     })?

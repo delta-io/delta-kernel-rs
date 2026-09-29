@@ -1,13 +1,13 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
-use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel::{DeltaResult, KernelError, Version};
 
 use crate::delta_types::{FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{FfiSnapshotBuilder, FfiSnapshotBuilderSource, MutableFfiSnapshotBuilder};
+use crate::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
 
 /// Freshness claim attached to a connector-provided snapshot hint.
 ///
@@ -24,7 +24,7 @@ pub enum FfiSnapshotHintFreshness {
 /// Complete borrowed representation of a connector-provided snapshot hint.
 ///
 /// Every pointer reachable from this value is borrowed only for the duration of
-/// [`snapshot_builder_set_snapshot_hint`]. The setter copies the input into owned kernel values.
+/// [`snapshot_builder_with_snapshot_hint`]. The call copies the input into owned kernel values.
 #[repr(C)]
 pub struct FfiSnapshotHint {
     /// Target table version described by the hint.
@@ -43,7 +43,7 @@ pub struct FfiSnapshotHint {
     pub crc: *const FfiCrc,
 }
 
-fn invalid_with_source(message: impl Into<String>, source: Error) -> Error {
+fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
     SnapshotHintError::Connector {
         message: message.into(),
         source: Some(Box::new(source)),
@@ -51,7 +51,7 @@ fn invalid_with_source(message: impl Into<String>, source: Error) -> Error {
     .into()
 }
 
-pub(crate) fn invalid(message: impl Into<String>) -> Error {
+pub(crate) fn invalid(message: impl Into<String>) -> KernelError {
     SnapshotHintError::Connector {
         message: message.into(),
         source: None,
@@ -59,7 +59,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     .into()
 }
 
-fn invalid_crc(source: Error) -> Error {
+fn invalid_crc(source: KernelError) -> KernelError {
     invalid_with_source("supplied CRC is invalid", source)
 }
 
@@ -72,19 +72,15 @@ impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
     }
 }
 
-fn report(builder: &FfiSnapshotBuilder, result: DeltaResult<bool>) -> ExternResult<bool> {
-    unsafe { result.into_extern_result(&builder.engine.as_ref()) }
-}
-
-unsafe fn snapshot_builder_set_snapshot_hint_impl(
+unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
-) -> DeltaResult<bool> {
+) -> DeltaResult<()> {
     if matches!(
         &builder.source,
         FfiSnapshotBuilderSource::ExistingSnapshot(_)
     ) {
-        return Err(Error::unsupported(
+        return Err(KernelError::unsupported(
             "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
         ));
     }
@@ -114,16 +110,17 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
         freshness,
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
-    Ok(true)
+    Ok(())
 }
 
-/// Copies and installs a complete typed snapshot hint on a snapshot builder.
+/// Copies and installs a complete typed snapshot hint, returning the updated builder handle on
+/// success.
 ///
 /// The input is converted and validated before replacing any previously installed hint. Build
-/// performs the remaining structural and table-configuration validation. Kernel does not verify
-/// that supplied log locations belong to the builder's table; the caller must ensure every log
-/// path addresses that table. `Latest` makes `is_built_as_latest()` true, and kernel trusts that
-/// caller claim. `Unverified` makes it false.
+/// preserves the supplied log locations and requires them to be beneath the builder's table log
+/// root, then performs the remaining structural and table-configuration validation. The connector
+/// must canonicalize every location into the same URL form as the table root. `Latest` makes
+/// `is_built_as_latest()` true, and kernel trusts that caller claim. `Unverified` makes it false.
 ///
 /// # Errors
 ///
@@ -132,21 +129,23 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
 /// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path names an unsupported
 /// log compaction file.
 /// Structural log-segment and table-configuration errors are returned when the builder is built.
-/// A failed call leaves the builder unchanged.
+/// A failed call drops the builder.
 ///
 /// # Safety
 ///
-/// The builder is borrowed and remains caller-owned. Every enum must have a valid tag. Every
-/// selected pointer must be aligned and address initialized storage for its declared element count,
-/// and all such storage must remain valid for this call.
+/// The builder is consumed unconditionally and must not be used or freed after this call. Every
+/// enum must have a valid tag. Every selected pointer must be aligned and address initialized
+/// storage for its declared element count, and all such storage must remain valid for this call.
 #[no_mangle]
-pub unsafe extern "C" fn snapshot_builder_set_snapshot_hint(
-    builder: &mut Handle<MutableFfiSnapshotBuilder>,
+pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
+    builder: Handle<ExclusiveSnapshotBuilder>,
     value: &FfiSnapshotHint,
-) -> ExternResult<bool> {
-    let builder = unsafe { builder.as_mut() };
-    let result = unsafe { snapshot_builder_set_snapshot_hint_impl(builder, value) };
-    report(builder, result)
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
+        .map(|_| builder.into())
+        .into_extern_result(&engine.as_ref())
 }
 
 #[cfg(test)]
