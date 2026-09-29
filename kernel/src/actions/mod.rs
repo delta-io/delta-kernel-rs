@@ -1368,16 +1368,10 @@ impl LastManifestCommit {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
-/// This type has two distinct wire representations:
-/// - In the **Delta log**, it is a `checkpoint` array of single-key tagged objects, encoded and
-///   decoded through the `EngineData` path (`try_into_scalar` / `try_new_from_data`). See the
-///   example below.
-/// - In the **`_last_checkpoint` hint**, it is serde-(de)serialized in its natural struct form (one
-///   field per member) as prefetch embedded in the hint's `amtCheckpoint`.
 ///
 /// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
 ///
-/// Example manifest-commit (Delta log) JSON:
+/// Example manifest-commit JSON:
 /// ```json
 /// { "checkpoint": [
 ///     { "checkpointMetadata": { "version": 42 } },
@@ -3006,6 +3000,37 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
+    fn test_checkpoint_action_scalar_round_trip() -> DeltaResult<()> {
+        let engine = ExprEngine::new();
+        let action = sample_checkpoint_action();
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
+        Ok(())
+    }
+
+    // The `contentRoot.version <= checkpointMetadata.version` invariant is enforced on the
+    // serialize path too, not just when parsing. `content_root_version_too_high` in visitors.rs
+    // covers the parse-path guard; this covers the `validate()` call during scalar conversion.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_scalar_rejects_invalid_content_root_version() {
+        let base = sample_checkpoint_action();
+        let action = CheckpointAction {
+            content_root: ContentRoot {
+                version: base.version + 1,
+                ..base.content_root
+            },
+            ..sample_checkpoint_action()
+        };
+        let result = action.try_into_scalar();
+        assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
     fn test_checkpoint_action_wire_format() -> DeltaResult<()> {
         // Build the action's engine data, then write it out through the engine JSON writer and
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
@@ -3047,6 +3072,84 @@ mod tests {
         // `Ok(None)` rather than an error.
         let data = crate::unit_test_utils::action_batch();
         assert!(CheckpointAction::try_new_from_data(data.as_ref())?.is_none());
+        Ok(())
+    }
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> DeltaResult<()> {
+        // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
+        // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
+        let sidecar = |path: &str| Sidecar {
+            path: path.to_string(),
+            size_in_bytes: 1,
+            modification_time: 2,
+            tags: None,
+        };
+        let action = CheckpointAction {
+            version: 10,
+            content_root: ContentRoot {
+                path: "s3://bucket/manifest".to_string(),
+                size_in_bytes: 8,
+                version: 8,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: vec![
+                SetTransaction {
+                    app_id: "a1".to_string(),
+                    version: 1,
+                    last_updated: None,
+                },
+                SetTransaction {
+                    app_id: "a2".to_string(),
+                    version: 2,
+                    last_updated: None,
+                },
+            ],
+            domain_metadata: vec![
+                DomainMetadata {
+                    domain: "d1".to_string(),
+                    configuration: "c1".to_string(),
+                    removed: false,
+                },
+                DomainMetadata {
+                    domain: "d2".to_string(),
+                    configuration: "c2".to_string(),
+                    removed: true,
+                },
+            ],
+            txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
+            domain_metadata_sidecars: vec![],
+        };
+        let engine = ExprEngine::new();
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> DeltaResult<()> {
+        // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
+        // read-time feature-consistency check) must survive scalar conversion -> parse.
+        let action = CheckpointAction {
+            protocol: Protocol::new_unchecked(
+                3,
+                7,
+                Some(vec![TableFeature::AdaptiveMetadataPreview]),
+                Some(vec![TableFeature::AdaptiveMetadataPreview]),
+            ),
+            ..sample_checkpoint_action()
+        };
+        let engine = ExprEngine::new();
+        let scalar = action.clone().try_into_scalar()?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
         Ok(())
     }
 }

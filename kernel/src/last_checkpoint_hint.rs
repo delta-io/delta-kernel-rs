@@ -67,11 +67,11 @@ pub(crate) struct LastCheckpointHint {
     /// - **`AdaptiveMetadataTree`**: an AMT checkpoint; the embedded
     ///   [`amt_checkpoint`](Self::amt_checkpoint) carries the prefetched checkpoint state.
     /// - **`Unknown`**: a `checkpointType` value kernel does not recognize (e.g. from a newer
-    ///   writer). It does not enable any AMT handling; the hint's remaining fields are consumed as
-    ///   for a legacy checkpoint.
+    ///   writer). The whole hint is dropped at read time (see [`Self::try_read`]) and the reader
+    ///   falls back to log replay.
     ///
-    /// Absent and `Unknown` are distinct: absence is a known (legacy) checkpoint, whereas
-    /// `Unknown` is a tag kernel cannot interpret.
+    /// Absent and `Unknown` are thus distinct: absence is a known (legacy) checkpoint, whereas an
+    /// unrecognized value invalidates the hint.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) checkpoint_type: Option<CheckpointType>,
 
@@ -84,16 +84,19 @@ pub(crate) struct LastCheckpointHint {
 
 /// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field
 /// (adaptiveMetadata RFC). An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
-/// rather than failing the parse.
+/// rather than failing the parse, signaling [`LastCheckpointHint::try_read`] to drop the hint so
+/// the reader falls back to log replay.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum CheckpointType {
     /// An adaptive-metadata (Iceberg V4) embedded-tree checkpoint.
     AdaptiveMetadataTree,
-    /// Any value kernel does not recognize (e.g. from a newer writer). Read-only: it is produced
-    /// only by deserializing an unrecognized wire value, never written by kernel (see the
-    /// hand-written [`Serialize`], which refuses it).
+    /// Any value kernel does not recognize (e.g. from a newer writer). A hint carrying it is
+    /// dropped entirely (the reader falls back to log replay), unlike an absent `checkpointType`,
+    /// which is a usable legacy checkpoint. Read-only: it is produced only by deserializing an
+    /// unrecognized wire value, never written by kernel (see the hand-written [`Serialize`], which
+    /// refuses it).
     #[serde(other)]
     Unknown,
 }
@@ -341,10 +344,25 @@ impl LastCheckpointHint {
             .next()
         {
             Some(Ok(data)) => {
-                let result: Option<LastCheckpointHint> =
-                    Self::from_bytes_with_oversized_fields_dropped(&data)
-                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                        .ok();
+                let result = Self::from_bytes_with_oversized_fields_dropped(&data)
+                    .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                    .ok()
+                    // A hint tagged with a `checkpointType` kernel does not recognize
+                    // ([`CheckpointType::Unknown`]) is dropped entirely: kernel cannot interpret
+                    // it, so the reader falls back to log replay. An absent
+                    // `checkpointType` (a classic / multi-part / V2 checkpoint)
+                    // and an `AdaptiveMetadataTree` type are both kept. Without
+                    // the `adaptive-metadata-in-dev` feature the field does not exist, so
+                    // every hint is kept.
+                    .filter(|_hint| {
+                        #[cfg(feature = "adaptive-metadata-in-dev")]
+                        if _hint.checkpoint_type == Some(CheckpointType::Unknown) {
+                            warn!("_last_checkpoint has an unrecognized checkpointType; dropping");
+                            return false;
+                        }
+                        true
+                    });
+                info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
             Some(Err(KernelError::FileNotFound(_))) => {
@@ -357,6 +375,14 @@ impl LastCheckpointHint {
                 Ok(None)
             }
         }
+    }
+
+    /// Succinct summary string for logging purposes.
+    fn summary(&self) -> String {
+        format!(
+            "{{v={}, size={}, parts={:?}}}",
+            self.version, self.size, self.parts
+        )
     }
 
     /// Convert the LastCheckpointHint to JSON bytes
@@ -547,6 +573,55 @@ mod tests {
         let json = br#"{"version": 5, "size": 10, "checkpointType": "SomethingNewer"}"#;
         let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
         assert_eq!(hint.checkpoint_type, Some(CheckpointType::Unknown));
+    }
+
+    /// `try_read` distinguishes the three `checkpointType` states: an absent type (a classic /
+    /// multi-part / V2 checkpoint) and an `AdaptiveMetadataTree` type are both recognized formats
+    /// and retained, whereas an unrecognized value drops the whole hint so the reader falls back
+    /// to log replay.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn try_read_retains_recognized_and_drops_unrecognized_checkpoint_type() {
+        use crate::engine::sync::SyncEngine;
+        use crate::object_store::memory::InMemory;
+        use crate::Engine;
+
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+        let read_hint = |json: &str| {
+            let engine = SyncEngine::new_with_store(std::sync::Arc::new(InMemory::new()));
+            let storage = engine.storage_handler();
+            storage
+                .put(
+                    &LastCheckpointHint::path(&log_root).unwrap(),
+                    bytes::Bytes::copy_from_slice(json.as_bytes()),
+                    true,
+                )
+                .unwrap();
+            LastCheckpointHint::try_read(storage.as_ref(), &log_root, None).unwrap()
+        };
+
+        // Absent checkpointType (classic / multi-part / V2): recognized, so retained.
+        let hint = read_hint(r#"{"version": 5, "size": 10}"#).expect("legacy hint retained");
+        assert_eq!(hint.version, 5);
+        assert!(hint.checkpoint_type.is_none());
+
+        // AdaptiveMetadataTree: recognized, so retained.
+        let hint = read_hint(
+            r#"{"version": 6, "size": -1, "checkpointType": "AdaptiveMetadataTree",
+                "amtCheckpoint": {"manifestCommitVersion": 6}}"#,
+        )
+        .expect("AMT hint retained");
+        assert_eq!(
+            hint.checkpoint_type,
+            Some(CheckpointType::AdaptiveMetadataTree)
+        );
+
+        // Unrecognized checkpointType: the whole hint is dropped.
+        assert!(
+            read_hint(r#"{"version": 5, "size": 10, "checkpointType": "SomethingNewer"}"#)
+                .is_none(),
+            "unrecognized checkpointType must drop the hint"
+        );
     }
 
     /// `AdaptiveMetadataTree` serializes to its wire string, but `Unknown` refuses to serialize --
