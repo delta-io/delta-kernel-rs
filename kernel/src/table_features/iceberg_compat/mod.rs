@@ -13,7 +13,7 @@ use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 pub(crate) enum IcebergCompatVersion {
     // TODO: Add V1 when kernel supports it
@@ -110,7 +110,7 @@ pub(super) fn check_only_supported_types(
     let Some(offender) = v.offender else {
         return Ok(());
     };
-    Err(Error::generic(format!(
+    Err(KernelError::generic(format!(
         "{feature_label} does not support type at column: {offender}",
     )))
 }
@@ -184,7 +184,7 @@ pub(super) fn check_no_legacy_nested_ids(tc: &TableConfiguration) -> DeltaResult
     let Some(offender) = v.offender else {
         return Ok(());
     };
-    Err(Error::generic(format!(
+    Err(KernelError::generic(format!(
         "field `{offender}` carries deprecated `{}` metadata; use `{}` instead. \
          See https://github.com/delta-io/delta/issues/6688",
         ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
@@ -253,19 +253,19 @@ impl TypeChangesValidator {
         };
         let path = self.path.join(".");
         let MetadataValue::Other(value) = metadata else {
-            return Err(Error::schema(format!(
+            return Err(KernelError::schema(format!(
                 "Field '{path}' has a non-array `{type_changes_key}` annotation: \
                  {metadata}"
             )));
         };
         let type_changes: Vec<TypeChange> = serde_json::from_value(value.clone()).map_err(|e| {
-            Error::schema(format!(
+            KernelError::schema(format!(
                 "Field '{path}' has an invalid `{type_changes_key}` annotation: {e}"
             ))
         })?;
         for type_change in type_changes {
             if !is_iceberg_allowed_type_change(&type_change.from_type, &type_change.to_type) {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "{} does not support type change on field '{path}': {} -> {}",
                     self.version.as_table_feature(),
                     type_change.from_type,

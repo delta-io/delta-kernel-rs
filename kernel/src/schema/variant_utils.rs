@@ -5,7 +5,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 pub(crate) struct UsesVariant;
@@ -32,7 +32,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
     {
         require!(
             !schema_contains_variant_type(&tc.logical_schema()),
-            Error::unsupported(
+            KernelError::unsupported(
                 "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features"
             )
         );

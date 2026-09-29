@@ -12,7 +12,7 @@ use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, KernelError};
 
 /// Result of sequential scan metadata processing.
 ///
@@ -225,8 +225,9 @@ impl ParallelState {
     #[allow(unused)]
     pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
-        serde_json::to_vec(&state)
-            .map_err(|e| Error::generic(format!("Failed to serialize ParallelState to bytes: {e}")))
+        serde_json::to_vec(&state).map_err(|e| {
+            KernelError::generic(format!("Failed to serialize ParallelState to bytes: {e}"))
+        })
     }
 
     /// Reconstruct a ParallelState from bytes.
@@ -240,7 +241,7 @@ impl ParallelState {
     #[allow(unused)]
     pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> DeltaResult<Self> {
         let state: SerializableScanState =
-            serde_json::from_slice(bytes).map_err(Error::MalformedJson)?;
+            serde_json::from_slice(bytes).map_err(KernelError::MalformedJson)?;
         Self::from_serializable_state(engine, state)
     }
 }

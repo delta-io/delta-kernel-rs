@@ -16,6 +16,7 @@ use crate::actions::{
 };
 use crate::arrow::array::{StringArray, StructArray};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
+use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -42,10 +43,16 @@ use crate::scan::{
 use crate::schema::{
     schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::{
+    minimal_checkpoint_action, setup_table, write_commit,
+};
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, load_test_table, string_array_to_engine_data, Action,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Snapshot;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
@@ -174,7 +181,7 @@ async fn write_multi_row_group_parquet_to_store(
         .collect::<DeltaResult<Vec<_>>>()?;
     let schema = batches
         .first()
-        .ok_or_else(|| Error::internal_error("at least one row group is required"))?
+        .ok_or_else(|| KernelError::internal_error("at least one row group is required"))?
         .record_batch()
         .schema();
 
@@ -1150,14 +1157,23 @@ async fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
+    assert!(matches!(
+        log_segment_res,
+        Err(KernelError::MissingVersion(1))
+    ));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
-    assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
+    assert!(matches!(
+        log_segment_res,
+        Err(KernelError::MissingVersion(1))
+    ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
-    assert!(matches!(log_segment_res, Err(Error::MissingVersion(1))));
+    assert!(matches!(
+        log_segment_res,
+        Err(KernelError::MissingVersion(1))
+    ));
 }
 
 #[tokio::test]
@@ -2466,7 +2482,7 @@ fn test_validate_listed_log_file_out_of_order_compaction_files() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
 }
 
 #[test]
@@ -2488,7 +2504,7 @@ fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
+    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
 }
 
 #[rstest]
@@ -2513,7 +2529,7 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
         end_version,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
 }
 
 #[rstest]
@@ -2522,7 +2538,7 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
 fn test_validate_empty_log_segment(#[case] end_version: Option<Version>) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(LogSegmentFiles::default(), log_root, end_version, None);
-    assert!(matches!(result, Err(Error::EmptyLog)));
+    assert!(matches!(result, Err(KernelError::EmptyLog)));
 }
 
 #[test]
@@ -2535,7 +2551,7 @@ fn test_validate_listed_log_file_cached_fields_match_location() {
         ..Default::default()
     })
     .unwrap_err();
-    assert!(matches!(err, Error::InvalidLogPath(_)));
+    assert!(matches!(err, KernelError::InvalidLogPath(_)));
 }
 
 #[test]
@@ -2571,7 +2587,7 @@ fn test_validate_truncated_log_segment_reports_first_missing_version() {
         Some(4),
         None,
     );
-    assert!(matches!(result, Err(Error::MissingVersion(3))));
+    assert!(matches!(result, Err(KernelError::MissingVersion(3))));
 }
 
 #[rstest]
@@ -2598,7 +2614,7 @@ fn test_validate_checkpoint_commit_gap_reports_lowest_missing_version(
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::MissingVersion(version)) if version == expected));
+    assert!(matches!(result, Err(KernelError::MissingVersion(version)) if version == expected));
 }
 
 #[test]
@@ -2673,7 +2689,7 @@ fn test_try_new_crc_rejects_non_crc_path() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, Error::InvalidLogPath(_)));
+    assert!(matches!(err, KernelError::InvalidLogPath(_)));
 }
 
 #[test]
@@ -2739,7 +2755,7 @@ fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
+    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
 }
 
 #[rstest]
@@ -2795,7 +2811,7 @@ fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
+    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
 }
 
 #[test]
@@ -2813,7 +2829,7 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
+    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
 }
 
 #[test]
@@ -2832,7 +2848,7 @@ fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidCheckpoint(_))));
+    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
 }
 
 #[test]
@@ -2849,7 +2865,7 @@ fn test_validate_listed_log_file_commit_files_contains_non_commit() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
 }
 
 #[test]
@@ -2872,7 +2888,7 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
     );
     assert!(matches!(
         result,
-        Err(Error::InvalidLogSegment(message)) if message.contains("Commit")
+        Err(KernelError::InvalidLogSegment(message)) if message.contains("Commit")
     ));
 }
 
@@ -2895,7 +2911,7 @@ fn test_validate_listed_log_file_compaction_start_exceeds_end() {
         None,
         None,
     );
-    assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
 }
 
 #[tokio::test]
@@ -3079,7 +3095,7 @@ async fn for_timestamp_conversion_no_commit_files() {
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
-    assert!(matches!(res, Err(Error::EmptyLog)));
+    assert!(matches!(res, Err(KernelError::EmptyLog)));
 }
 
 #[tokio::test]
@@ -3281,7 +3297,7 @@ fn test_log_segment_contiguous_commit_files() {
         None,
         None,
     );
-    assert!(matches!(log_segment, Err(Error::MissingVersion(2))));
+    assert!(matches!(log_segment, Err(KernelError::MissingVersion(2))));
 }
 
 #[test]
@@ -3298,7 +3314,7 @@ fn test_log_segment_commit_contiguity_rejects_version_overflow() {
 fn test_log_segment_checkpoint_gap_rejects_version_overflow() {
     let commit = create_log_path("file:///_delta_log/00000000000000000000.json");
     let err = validate_checkpoint_commit_gap(Some(Version::MAX), &[commit]).unwrap_err();
-    assert!(matches!(err, Error::InvalidCheckpoint(_)));
+    assert!(matches!(err, KernelError::InvalidCheckpoint(_)));
     assert!(err
         .to_string()
         .contains("checkpoint version 18446744073709551615 is the maximum supported version"));
@@ -3681,7 +3697,7 @@ async fn validate_published_uses_published_commit_watermark(
     match expected {
         Some(expected) => assert!(matches!(
             result,
-            Err(Error::UnpublishedVersion(version)) if version == expected
+            Err(KernelError::UnpublishedVersion(version)) if version == expected
         )),
         None => assert!(result.is_ok()),
     }
@@ -3699,7 +3715,7 @@ async fn validate_published_rejects_watermark_after_segment_end() {
     let result = log_segment.validate_published();
     assert!(matches!(
         result,
-        Err(Error::InvalidLogSegment(message))
+        Err(KernelError::InvalidLogSegment(message))
             if message == "publication watermark 3 exceeds log segment end version 2"
     ));
 }
@@ -5283,6 +5299,13 @@ fn test_combine_checkpoint_predicates(
     "configuration",
     r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
 )]
+// metaData.format.options.k: null
+#[should_panic(expected = "StructArray re-validation failed")]
+#[case::metadata_format_options_known_issue(
+    "metaData",
+    "format.options",
+    r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{"k":null}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#
+)]
 #[tokio::test]
 async fn read_actions_with_null_map_values(
     #[case] action_name: &str,
@@ -5329,12 +5352,9 @@ async fn read_actions_with_null_map_values(
         let Some(action_col) = rb.column_by_name(action_name) else {
             continue;
         };
-        let action_struct = action_col
-            .as_struct_opt()
-            .unwrap_or_else(|| panic!("{action_name} column should be a struct"));
-        let map_col = action_struct
-            .column_by_name(map_field)
-            .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"));
+        let map_path = map_field.split('.').collect_vec();
+        let map_col = extract_column_ref(action_col.as_struct(), &map_path)
+            .unwrap_or_else(|e| panic!("{action_name}.{map_field}: {e}"));
         let map_array = map_col
             .as_any()
             .downcast_ref::<MapArray>()
@@ -5473,4 +5493,45 @@ fn amt_checkpoint_hint_accessor_gates_on_checkpoint_type() {
     let seg = segment(Some(hint(Some(CheckpointType::AdaptiveMetadataTree), None)));
     assert_eq!(seg.amt_checkpoint_hint(), None);
     assert_eq!(segment(None).amt_checkpoint_hint(), None);
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn find_last_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<()> {
+    let (engine, table_root) = setup_table()?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert!(snapshot
+        .log_segment()
+        .find_last_checkpoint_action(&engine)?
+        .is_none());
+    Ok(())
+}
+
+// The log is replayed newest-first, so the most recent `checkpoint` action wins.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> DeltaResult<()> {
+    let (engine, table_root) = setup_table()?;
+    write_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+    )?;
+    write_commit(
+        &engine,
+        &table_root,
+        2,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert_eq!(snapshot.version(), 2);
+    let checkpoint = snapshot
+        .log_segment()
+        .find_last_checkpoint_action(&engine)?
+        .expect("checkpoint present");
+    assert_eq!(checkpoint.version(), 2);
+    assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
+    Ok(())
 }

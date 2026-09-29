@@ -7,12 +7,12 @@ cbindgen-generated headers (`.h` and `.hpp`).
 
 Objects crossing the FFI boundary may be wrapped in **handles** -- opaque pointers with
 ownership semantics:
-- **Mutable handles** (`Box`-like) -- exclusive ownership, neither `Copy` nor `Clone`
+- **Exclusive handles** (`mutable=true`, `Box`-like) -- one owner, neither `Copy` nor `Clone`
 - **Shared handles** (`Arc`-like) -- shared ownership via reference counting
 
 A handle is needed when a value might outlive the function call that passes it across the
 FFI boundary, or when the type is not representable in C/C++ (dyn trait references, slices,
-options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelError`,
+options, etc.). Short-lived "plain old data" types like `ExternResult`, `FFIKernelError`,
 `KernelStringSlice`, and `EngineIterator` do not need handles.
 
 Borrowed record arrays use `FfiSlice<T>`: empty slices accept null or non-null pointers, while
@@ -63,20 +63,22 @@ get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> sc
 Snapshot builder API (`ffi/src/lib.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
-- `snapshot_builder_set_version(builder, version)` -- optional: pin to a specific version
-- `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
-- `snapshot_builder_set_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
-- `snapshot_builder_set_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
+- `snapshot_builder_with_version(builder, version)` -- optional: pin to a specific version
+- `snapshot_builder_with_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
+- `snapshot_builder_with_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
+- `snapshot_builder_with_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
   typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
   files, or CRC files; log compaction paths are rejected. Kernel cannot verify that supplied log
   paths belong to the builder's table, so the caller must ensure every path addresses that table.
-  A failed call leaves the builder's existing hint unchanged
+  A failed call consumes and drops the builder
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
 
-Snapshot-hint inputs and all nested pointers are borrowed only for the setter call and copied into
-the builder. Cross-component and table validation occurs when the builder is built. The caller owns
-the returned builder handle and must call either `snapshot_builder_build` or
+Each `snapshot_builder_with_*` call consumes its input handle and returns the updated handle on
+success. The caller must replace the input handle with that result. On error, the builder is
+dropped. Snapshot-hint inputs and all nested pointers are borrowed only for the call and copied
+into the builder. Cross-component and table validation occurs when the builder is built. The caller
+must eventually pass the final returned handle to either `snapshot_builder_build` or
 `free_snapshot_builder`.
 
 Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
@@ -101,9 +103,9 @@ builder (`ffi/src/commit_range.rs`):
 
 ```
 commit_range_builder_for(path, start_version, engine)
-  -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
-  -> commit_range_builder_set_log_tail(builder, log_tail, max)    // optional catalog commits
-  -> commit_range_builder_set_max_catalog_version(builder, max)   // optional without a log tail
+  -> builder = commit_range_builder_with_end_version(builder, end_version) // optional
+  -> builder = commit_range_builder_with_log_tail(builder, log_tail, max)  // optional
+  -> builder = commit_range_builder_with_max_catalog_version(builder, max) // optional
   -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
   -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
        // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)
@@ -113,10 +115,11 @@ commit_range_builder_for(path, start_version, engine)
        //                    -> read_result_next(...) -> free_read_result_iter(...)
 ```
 
-The caller owns the builder and must call either `commit_range_builder_build` or
-`free_commit_range_builder`. Release the range with `free_commit_range` and the commits iterator
-with `free_commit_actions_iter`. Each `SharedCommitAction` handed to the visitor must be released
-with `free_commit_action`.
+Each `commit_range_builder_with_*` call consumes its input handle and returns the updated handle on
+success; on error, it drops the builder. The caller must pass the final returned handle to either
+`commit_range_builder_build` or `free_commit_range_builder`. Release the range with
+`free_commit_range` and the commits iterator with `free_commit_actions_iter`. Each
+`SharedCommitAction` handed to the visitor must be released with `free_commit_action`.
 
 ## Incremental Scan Flow
 
@@ -177,7 +180,7 @@ defaults but never materializes them, so the connector fills every omitted colum
 transaction()
   -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
-                                            // KernelError::InvalidTransactionStateError
+                                            // FFIKernelError::InvalidTransactionStateError
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
@@ -205,7 +208,8 @@ worker with `write_state_decode`. Local writers can skip this round trip.
 Create-table writes use the `create_table_get_*_write_context` functions and do not expose
 transportable write state.
 Create a builder for each output partition with `write_context_builder`. Partitioned writers set
-values with `write_context_builder_with_partition_values`; writers that provide materialized
+values keyed by logical names with `write_context_builder_with_partition_values` or exact physical
+names with `write_context_builder_with_physical_partition_values`; writers that provide materialized
 row-tracking columns also call `write_context_builder_with_row_tracking_columns`. Finish with
 `write_context_builder_build`. Builders and bound contexts hold their own state reference, so they
 remain valid after `free_write_state`. Drop an unused builder with `free_write_context_builder` and
