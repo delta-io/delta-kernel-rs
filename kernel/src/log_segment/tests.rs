@@ -396,19 +396,10 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -498,19 +489,9 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_out_of_date_last_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 3,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -550,19 +531,10 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -607,19 +579,10 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -668,19 +631,10 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
     #[case] expect_hint_applies: bool,
 ) {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: hint_parts,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -798,19 +752,9 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
     // Snapshot should be made of the most recent complete checkpoint and the commit files that
     // follow it.
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 3,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -917,19 +861,9 @@ async fn build_snapshot_without_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 5,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -971,19 +905,9 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
 #[tokio::test]
 async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 3,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint_type: None,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        amt_checkpoint: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -1019,19 +943,9 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
 #[rstest::rstest]
 #[case::no_hint(None)]
 #[case::stale_hint(Some(LastCheckpointHint {
-    v2_checkpoint: None,
     version: 10, // stale: 10 > end_version 5, so it is discarded
     size: 10,
-    parts: None,
-    size_in_bytes: None,
-    num_of_add_files: None,
-    checkpoint_schema: None,
-    checksum: None,
-    tags: None,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_type: None,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    amt_checkpoint: None,
+    ..Default::default()
 }))]
 #[tokio::test]
 async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(

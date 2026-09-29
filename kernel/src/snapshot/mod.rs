@@ -1652,19 +1652,10 @@ mod tests {
 
     fn valid_last_checkpoint() -> (Vec<u8>, LastCheckpointHint) {
         let checkpoint = LastCheckpointHint {
-            v2_checkpoint: None,
             version: 1,
             size: 8,
-            parts: None,
             size_in_bytes: Some(21857),
-            num_of_add_files: None,
-            checkpoint_schema: None,
-            checksum: None,
-            tags: None,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_type: None,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            amt_checkpoint: None,
+            ..Default::default()
         };
         let data = checkpoint.to_json_bytes();
         (data, checkpoint)
