@@ -19,8 +19,8 @@ For the common case (use the default engine), add both crates:
 
 ```toml
 [dependencies]
-delta_kernel = "0.28.0"
-delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
+delta_kernel = "0.29.0"
+delta_kernel_default_engine = { version = "0.29.0", features = ["rustls"] }
 ```
 
 That gives you Kernel plus a default engine that handles I/O and expression evaluation for you,
@@ -31,7 +31,7 @@ and enable whatever Arrow interop flags you want:
 
 ```toml
 [dependencies]
-delta_kernel = { version = "0.28.0", features = ["arrow-conversion", "arrow-expression"] }
+delta_kernel = { version = "0.29.0", features = ["arrow-conversion", "arrow-expression"] }
 ```
 
 ## Choosing features
@@ -57,8 +57,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-delta_kernel = "0.28.0"
-delta_kernel_default_engine = { version = "0.28.0", features = ["rustls"] }
+delta_kernel = "0.29.0"
+delta_kernel_default_engine = { version = "0.29.0", features = ["rustls"] }
 ```
 
 ## What's next
