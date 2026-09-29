@@ -17,7 +17,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, KernelError, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -163,7 +163,7 @@ impl Snapshot {
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
-                return Err(Error::Generic(format!(
+                return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
                 )));
@@ -214,9 +214,9 @@ impl Snapshot {
                     built_as_latest,
                 )?;
                 return Ok(Arc::new(Self::new_with_validated_crc(
-                    current_segment
-                        .take()
-                        .ok_or_else(|| Error::internal_error("Missing prepared log segment"))?,
+                    current_segment.take().ok_or_else(|| {
+                        KernelError::internal_error("Missing prepared log segment")
+                    })?,
                     table_configuration,
                     crc,
                     built_as_latest,
@@ -289,7 +289,7 @@ impl Snapshot {
         Ok(Arc::new(Self::new_with_validated_crc(
             current_segment
                 .take()
-                .ok_or_else(|| Error::internal_error("Missing prepared log segment"))?,
+                .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?,
             table_configuration,
             crc,
             built_as_latest,
@@ -353,7 +353,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(_) => Err(Error::MissingVersion(existing_snapshot_version + 1)),
+                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => Ok(NewSegment::Unchanged),
             };
@@ -374,7 +374,7 @@ impl Snapshot {
         if new_end_version < existing_snapshot_version {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
-            return Err(Error::invalid_log_segment(format!(
+            return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
@@ -802,7 +802,7 @@ mod tests {
             size: 100,
         };
         let parsed_path = ParsedLogPath::try_from(file_meta)?
-            .ok_or_else(|| Error::Generic("Failed to parse log path".to_string()))?;
+            .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 
         // Create new snapshot from base to version 2 using try_new_from directly
@@ -894,7 +894,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())
@@ -1098,7 +1098,7 @@ mod tests {
             .expect_err("version 2 does not exist");
 
         // ===== THEN =====
-        assert!(matches!(unavailable, Error::MissingVersion(2)));
+        assert!(matches!(unavailable, KernelError::MissingVersion(2)));
 
         // ===== WHEN =====
         commit(
@@ -1115,7 +1115,10 @@ mod tests {
             .expect_err("version 3 is beyond the latest commit");
 
         // ===== THEN =====
-        assert!(matches!(partially_available, Error::MissingVersion(3)));
+        assert!(matches!(
+            partially_available,
+            KernelError::MissingVersion(3)
+        ));
 
         Ok(())
     }
@@ -1233,7 +1236,7 @@ mod tests {
 
         // ===== THEN =====
         let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
-        assert!(matches!(error, Error::MissingVersion(3)));
+        assert!(matches!(error, KernelError::MissingVersion(3)));
 
         Ok(())
     }
@@ -1451,7 +1454,7 @@ mod tests {
             .build(&engine);
         assert!(matches!(
             snapshot_res,
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
+            Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
@@ -1537,7 +1540,7 @@ mod tests {
             Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
                 .build(&engine),
-            Err(Error::MissingVersion(1))
+            Err(KernelError::MissingVersion(1))
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -1605,7 +1608,7 @@ mod tests {
             Snapshot::builder_from(base_snapshot.clone())
                 .at_version(4)
                 .build(&engine),
-            Err(Error::MissingVersion(2))
+            Err(KernelError::MissingVersion(2))
         ));
 
         // ii. commits have (new protocol, no metadata)
@@ -2608,7 +2611,7 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
-        assert!(matches!(result, Err(Error::InvalidLogSegment(_))));
+        assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
 
         let events = reporter.events();
         let failure = events
@@ -2646,7 +2649,7 @@ mod tests {
         let result = Snapshot::builder_from(base)
             .at_version(5)
             .build(ctx.engine.as_ref());
-        assert!(matches!(result, Err(Error::MissingVersion(3))));
+        assert!(matches!(result, Err(KernelError::MissingVersion(3))));
 
         let events = reporter.events();
         let failure = events

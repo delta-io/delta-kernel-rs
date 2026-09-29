@@ -46,7 +46,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler};
+use crate::{DeltaResult, Engine, KernelError, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -161,10 +161,10 @@ fn ensure_table_does_not_exist(
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
             match files.next() {
-                Some(Ok(_)) => Err(Error::generic(format!(
+                Some(Ok(_)) => Err(KernelError::generic(format!(
                     "Table already exists at path: {table_path}"
                 ))),
-                Some(Err(Error::FileNotFound(_))) | None => {
+                Some(Err(KernelError::FileNotFound(_))) | None => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
                 }
@@ -174,7 +174,7 @@ fn ensure_table_does_not_exist(
                 }
             }
         }
-        Err(Error::FileNotFound(_)) => {
+        Err(KernelError::FileNotFound(_)) => {
             // Directory doesn't exist - this is expected for a new table.
             // The storage layer will create the full path (including _delta_log/)
             // when the commit writes the first log file via write_json_file().
@@ -263,10 +263,12 @@ fn validate_partition_columns(
     partition_columns: &[ColumnName],
 ) -> DeltaResult<()> {
     if partition_columns.is_empty() {
-        return Err(Error::generic("Partitioning requires at least one column"));
+        return Err(KernelError::generic(
+            "Partitioning requires at least one column",
+        ));
     }
     if partition_columns.len() >= schema.fields().len() {
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "Table must have at least one non-partition column",
         ));
     }
@@ -275,14 +277,14 @@ fn validate_partition_columns(
     for col in partition_columns {
         let path = col.path();
         if path.len() != 1 {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Partition column '{}' must be a top-level column (nested paths are not supported)",
                 col
             )));
         }
 
         if !seen.insert(col) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Duplicate partition column: '{col}'"
             )));
         }
@@ -290,11 +292,11 @@ fn validate_partition_columns(
         // Safety: path.len() == 1 is enforced by the top-level check above
         let col_name = &path[0];
         let field = schema.field(col_name).ok_or_else(|| {
-            Error::generic(format!("Partition column '{col}' not found in schema"))
+            KernelError::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
         let DataType::Primitive(_) = field.data_type() else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
@@ -476,7 +478,7 @@ fn maybe_enable_ict_for_catalog_managed(
             .get(ENABLE_IN_COMMIT_TIMESTAMPS)
             .is_some_and(|v| v != "true")
         {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Catalog-managed tables require '{ENABLE_IN_COMMIT_TIMESTAMPS}=true', \
                  but it was explicitly set to '{}'",
                 validated.properties[ENABLE_IN_COMMIT_TIMESTAMPS]
@@ -526,7 +528,7 @@ fn require_iceberg_compat_column_mapping(
         }
         Some("name") | Some("id") => {}
         Some(other) => {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
                  '{other}'"
             )));
@@ -572,7 +574,7 @@ fn maybe_enable_iceberg_compat_v2_dependencies(
         ENABLE_DELETION_VECTORS,
     ] {
         if validated.is_property_true(key) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "IcebergCompatV2 cannot be enabled together with '{key}'"
             )));
         }
@@ -601,7 +603,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     // Row tracking must not be suspended (suspension cannot coexist with row tracking actively
     // enabled, which V3 requires).
     if validated.is_property_true(ROW_TRACKING_SUSPENDED) {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "IcebergCompatV3 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
         )));
     }
@@ -619,7 +621,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         }
         Some("true") => {}
         Some(other) => {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "IcebergCompatV3 requires '{ENABLE_ROW_TRACKING}' to be 'true', got '{other}'"
             )));
         }
@@ -628,7 +630,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     // V1/V2 must not be active.
     for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2] {
         if validated.is_property_true(key) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "IcebergCompatV3 cannot be enabled together with '{key}'"
             )));
         }
@@ -734,7 +736,7 @@ fn validate_extract_table_features_and_properties(
 
         // Validate that the value is "supported"
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
             )));
         }
@@ -745,7 +747,7 @@ fn validate_extract_table_features_and_properties(
             .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
 
         if !ALLOWED_DELTA_FEATURES.contains(&feature) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             )));
         }
@@ -776,7 +778,7 @@ fn validate_extract_table_features_and_properties(
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
             )));
         }
@@ -941,6 +943,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema has `delta.invariants` metadata on any column
+    /// - CDF is enabled and the schema contains a top-level column reserved for CDF
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -981,7 +984,11 @@ impl CreateTableTransactionBuilder {
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
-        validate_schema(&effective_schema, column_mapping_mode)?;
+        validate_schema(
+            &effective_schema,
+            column_mapping_mode,
+            validated.is_property_true(ENABLE_CHANGE_DATA_FEED),
+        )?;
 
         // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
         // any annotation the caller supplied is newly introduced (see

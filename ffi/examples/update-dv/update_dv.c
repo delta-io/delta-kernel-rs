@@ -107,16 +107,16 @@ int main(int argc, char* argv[]) {
   HandleExclusiveTransaction txn = NULL;
   HandleExclusiveDvDescriptorMap map = NULL;
   HandleExclusiveDvDescriptor descriptor = NULL;
-  HandleMutableFfiSnapshotBuilder snapshot_builder = NULL;
+  HandleExclusiveSnapshotBuilder snapshot_builder = NULL;
   HandleSharedSnapshot snapshot = NULL;
   HandleSharedScan scan_handle = NULL;
   HandleSharedScanMetadataIterator scan_iter = NULL;
   HandleExclusiveCommittedTransaction committed = NULL;
 
   // === Build engine ===
-  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
+  ExternResultHandleExclusiveEngineBuilder engine_builder_res =
       get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     err = (Error*)engine_builder_res.err;
     print_error("Could not get engine builder.", err);
     goto cleanup;
@@ -171,9 +171,9 @@ int main(int argc, char* argv[]) {
   }
 
   // === Build a fresh scan metadata iterator for the update call ===
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
+  ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res =
       get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+  if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
     err = (Error*)snapshot_builder_res.err;
     print_error("Failed to get snapshot builder.", err);
     goto cleanup;

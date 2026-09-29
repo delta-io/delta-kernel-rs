@@ -8,19 +8,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
-/// Phantom type parameter `T`. The containing type mentions `T` but does not own any `T`.
+/// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
-/// Use this instead of [`PhantomData<T>`] when `T` is only a compile-time parameter: it selects
-/// which methods exist on a type, or appears in a stored closure's signature without being
-/// stored itself. [`PhantomData<T>`] tells the compiler that the containing type may drop a `T`,
-/// and makes `Send`/`Sync` follow `T`. This alias does not claim ownership, is always
-/// `Send`/`Sync`, and is covariant in `T`.
+/// It is covariant in `T`, and Send+Sync even if `T` is not. Use this instead of [`PhantomData<T>`]
+/// when `T` is only a compile-time parameter, because [`PhantomData<T>`] tells the compiler that
+/// the containing type owns and may drop a `T`, and additionally makes Send/Sync follow `T`.
 ///
-/// Construct values with [`PhantomType::default`]. A generic alias cannot be named as a
-/// constructor.
-pub(crate) type PhantomType<T> = PhantomData<fn() -> T>;
+/// A generic alias cannot be named as a constructor, so construct values with
+/// [`PhantomType::default`] instead of `PhantomType`.
+pub(crate) type PhantomType<T> = PhantomData<fn() -> *const T>;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -79,25 +77,25 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
         UriType::LocalPath(path) => {
             if !path.exists() {
                 // When we support writes, create a directory if we can
-                return Err(Error::InvalidTableLocation(format!(
+                return Err(KernelError::InvalidTableLocation(format!(
                     "Path does not exist: {path:?}"
                 )));
             }
             if !path.is_dir() {
-                return Err(Error::InvalidTableLocation(format!(
+                return Err(KernelError::InvalidTableLocation(format!(
                     "{path:?} is not a directory"
                 )));
             }
             let path = std::fs::canonicalize(path).map_err(|err| {
                 let msg = format!("Invalid table location: {uri} Error: {err:?}");
-                Error::InvalidTableLocation(msg)
+                KernelError::InvalidTableLocation(msg)
             })?;
             Url::from_directory_path(path.clone()).map_err(|_| {
                 let msg = format!(
                     "Could not construct a URL from canonicalized path: {path:?}.\n\
                      Something must be very wrong with the table path."
                 );
-                Error::InvalidTableLocation(msg)
+                KernelError::InvalidTableLocation(msg)
             })?
         }
         UriType::Url(url) => url,
@@ -127,10 +125,9 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
     if let Ok(url) = Url::parse(&table_uri) {
         let scheme = url.scheme().to_string();
         if url.scheme() == "file" {
-            Ok(UriType::LocalPath(
-                url.to_file_path()
-                    .map_err(|_| Error::invalid_table_location(table_uri))?,
-            ))
+            Ok(UriType::LocalPath(url.to_file_path().map_err(|_| {
+                KernelError::invalid_table_location(table_uri)
+            })?))
         } else if scheme.len() == 1 {
             // NOTE this check is required to support absolute windows paths which may properly
             // parse as url we assume here that a single character scheme is a windows drive letter
@@ -147,14 +144,14 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
+        .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
 pub(crate) fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
-        .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
+        .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.

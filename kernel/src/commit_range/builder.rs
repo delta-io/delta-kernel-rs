@@ -5,7 +5,7 @@ use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, LogPath, Version};
+use crate::{DeltaResult, Engine, KernelError, LogPath, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -82,9 +82,9 @@ impl CommitRangeBuilder {
     /// path-based builder lists `_delta_log/`; a snapshot-based builder reuses the snapshot's log
     /// segment. Neither path reads commit JSON.
     ///
-    /// Returns [`Error::MissingVersion`] if a snapshot-derived range requires a commit beyond what
-    /// is available from the snapshot's log segment and the supplied catalog tail. Returns an error
-    /// if the resolved version range is invalid (start > end), the listed commits are
+    /// Returns [`KernelError::MissingVersion`] if a snapshot-derived range requires a commit beyond
+    /// what is available from the snapshot's log segment and the supplied catalog tail. Returns
+    /// an error if the resolved version range is invalid (start > end), the listed commits are
     /// non-contiguous, or the requested start version is unavailable from both the filesystem and
     /// the supplied catalog tail.
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
@@ -120,7 +120,7 @@ impl CommitRangeBuilder {
             commit_files.sort_unstable_by_key(|path| path.version);
             validate_start_version_available(start_version, commit_files.first())?;
             if end_version > available_end_version {
-                return Err(Error::MissingVersion(available_end_version + 1));
+                return Err(KernelError::MissingVersion(available_end_version + 1));
             }
             (commit_files, end_version)
         } else {
@@ -159,7 +159,7 @@ impl CommitRangeBuilder {
         if let Some(max_catalog_version) = self.max_catalog_version {
             require!(
                 self.start_version <= max_catalog_version,
-                Error::MaxCatalogVersion(format!(
+                KernelError::MaxCatalogVersion(format!(
                     "Start version {} exceeds max catalog version {max_catalog_version}",
                     self.start_version
                 ))
@@ -169,7 +169,7 @@ impl CommitRangeBuilder {
             log_tail
                 .iter()
                 .all(|path| path.file_type == LogPathFileType::StagedCommit),
-            Error::generic("Commit range log tail must contain only staged commits")
+            KernelError::generic("Commit range log tail must contain only staged commits")
         );
         validate_catalog_managed_log_tail(self.end_version, self.max_catalog_version, log_tail)
     }
@@ -192,7 +192,7 @@ pub enum CommitOrdering {
 
 fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
     if start > end {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "start_version ({start}) must be <= end_version ({end})",
         )));
     }
@@ -208,7 +208,7 @@ fn validate_start_version_available(
     if first_commit.map(|f| f.version) == Some(start_version) {
         return Ok(());
     }
-    Err(Error::MissingVersion(start_version))
+    Err(KernelError::MissingVersion(start_version))
 }
 
 fn validate_number_of_commit_files(
@@ -219,7 +219,7 @@ fn validate_number_of_commit_files(
     let expected = end - start + 1;
     let actual = commit_file_count as u64;
     if expected != actual {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "The number of commit files: {actual} does not match the expected range (start_version: {start}, end_version: {end}): expected {expected} commit files",
         )));
     }
@@ -338,7 +338,7 @@ mod tests {
             .expect_err("must error");
         assert!(matches!(
             err,
-            Error::MissingVersion(version) if version == expected_missing_version
+            KernelError::MissingVersion(version) if version == expected_missing_version
         ));
     }
 
@@ -355,7 +355,7 @@ mod tests {
             .expect_err("must error");
         assert!(matches!(
             err,
-            Error::Generic(message)
+            KernelError::Generic(message)
                 if message.contains("start_version (1) must be <= end_version (0)")
         ));
     }
@@ -375,7 +375,7 @@ mod tests {
         let err = CommitRange::builder_from(snapshot, 1)
             .build(&engine)
             .expect_err("commit at version 1 must be unavailable after checkpoint filtering");
-        assert!(matches!(err, Error::MissingVersion(1)));
+        assert!(matches!(err, KernelError::MissingVersion(1)));
     }
 
     #[test]
@@ -510,7 +510,7 @@ mod tests {
         if let Some(expected_error) = expected_error {
             assert!(matches!(
                 result.unwrap_err(),
-                Error::MaxCatalogVersion(message) if message.contains(expected_error)
+                KernelError::MaxCatalogVersion(message) if message.contains(expected_error)
             ));
         } else {
             let range = result.unwrap();
@@ -545,7 +545,10 @@ mod tests {
             .build(&engine)
             .unwrap_err();
 
-        assert!(matches!(err, Error::LogTailVersionsNotContiguous { .. }));
+        assert!(matches!(
+            err,
+            KernelError::LogTailVersionsNotContiguous { .. }
+        ));
     }
 
     #[test]
@@ -565,7 +568,7 @@ mod tests {
             .build(&engine)
             .unwrap_err();
 
-        assert!(matches!(err, Error::Generic(message) if message.contains("only staged")));
+        assert!(matches!(err, KernelError::Generic(message) if message.contains("only staged")));
     }
 
     #[test]
@@ -576,14 +579,14 @@ mod tests {
             .with_max_catalog_version(1)
             .build(&engine)
             .unwrap_err();
-        assert!(matches!(start_err, Error::MaxCatalogVersion(_)));
+        assert!(matches!(start_err, KernelError::MaxCatalogVersion(_)));
 
         let end_err = CommitRange::builder_for(table_root.as_str(), 0)
             .with_end_version(2)
             .with_max_catalog_version(1)
             .build(&engine)
             .unwrap_err();
-        assert!(matches!(end_err, Error::MaxCatalogVersion(_)));
+        assert!(matches!(end_err, KernelError::MaxCatalogVersion(_)));
     }
 
     #[test]

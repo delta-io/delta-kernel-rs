@@ -129,7 +129,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
     ];
     for batch in batches {
         let metadata = create_add_files_metadata(add_files_schema, batch)
-            .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         txn.add_files(metadata);
     }
     txn.commit(engine.as_ref())?.unwrap_committed();

@@ -93,7 +93,7 @@ async fn test_create_table_with_row_tracking(
                 Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
             ],
         )
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
         let write_context = txn.write_state()?.write_context_builder().build()?;
         let add_files = engine
@@ -210,7 +210,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
             Arc::new(StringArray::from(vec!["a", "b", "c"])),
         ],
     )
-    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
     let batch2 = RecordBatch::try_new(
         arrow_schema,
@@ -219,7 +219,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
             Arc::new(StringArray::from(vec!["d", "e", "f", "g", "h"])),
         ],
     )
-    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
     let write_context = txn.write_state()?.write_context_builder().build()?;
     let adds1 = engine
@@ -332,7 +332,7 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
             Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
         ],
     )
-    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
     let write_context = txn.write_state()?.write_context_builder().build()?;
     let add_files = engine

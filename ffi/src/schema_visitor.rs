@@ -28,7 +28,7 @@ use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use tracing::warn;
 
 use crate::scan::{CMetadataMap, CMetadataValueKind};
@@ -99,7 +99,7 @@ fn visit_engine_metadata(
 
     let mut state = CMetadataMap::default();
     if !(engine_metadata.visitor)(engine_metadata.metadata, &mut state) {
-        return Err(Error::schema("Engine metadata visitor failed"));
+        return Err(KernelError::schema("Engine metadata visitor failed"));
     }
 
     Ok(state.into_values())
@@ -118,7 +118,7 @@ fn visit_metadata_value_impl(
         CMetadataValueKind::MetadataString => MetadataValue::String(value.to_owned()),
         CMetadataValueKind::MetadataBoolean => {
             MetadataValue::Boolean(value.parse().map_err(|_| {
-                Error::schema("Invalid Boolean metadata value: expected true or false")
+                KernelError::schema("Invalid Boolean metadata value: expected true or false")
             })?)
         }
         CMetadataValueKind::MetadataJson => serde_json::from_str(value)?,
@@ -138,16 +138,16 @@ pub fn extract_kernel_schema(
     let schema_element = state
         .elements
         .take(schema_id)
-        .ok_or_else(|| Error::schema("Nonexistent id passed to extract_kernel_schema"))?;
+        .ok_or_else(|| KernelError::schema("Nonexistent id passed to extract_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
-        return Err(Error::schema(
+        return Err(KernelError::schema(
             "Final returned id was not a struct, schema is invalid",
         ));
     };
     if !state.elements.is_empty() {
         warn!("Didn't consume all visited fields, schema is invalid.");
-        Err(Error::schema(
+        Err(KernelError::schema(
             "Didn't consume all visited fields, schema is invalid.",
         ))
     } else {
@@ -595,7 +595,7 @@ pub unsafe extern "C" fn visit_field_struct(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
@@ -611,8 +611,9 @@ fn create_struct_data_type(
     let field_vec = field_ids
         .iter()
         .map(|&field_id| {
-            unwrap_field(state, field_id)
-                .ok_or_else(|| Error::generic(format!("Invalid field ID {field_id} in struct")))
+            unwrap_field(state, field_id).ok_or_else(|| {
+                KernelError::generic(format!("Invalid field ID {field_id} in struct"))
+            })
         })
         .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -669,7 +670,7 @@ fn visit_field_array_impl(
     let name_str = name?.to_string();
     let metadata = metadata?;
     let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Invalid element type ID {element_type_id} for array"
         ))
     })?;
@@ -725,15 +726,17 @@ fn visit_field_map_impl(
     let name_str = name?.to_string();
     let metadata = metadata?;
 
-    let key_field = unwrap_field(state, key_type_id)
-        .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
+    let key_field = unwrap_field(state, key_type_id).ok_or_else(|| {
+        KernelError::generic(format!("Invalid key type ID {key_type_id} for map"))
+    })?;
 
     if key_field.nullable {
-        return Err(Error::generic("Delta Map keys may not be nullable"));
+        return Err(KernelError::generic("Delta Map keys may not be nullable"));
     }
 
-    let value_field = unwrap_field(state, value_type_id)
-        .ok_or_else(|| Error::generic(format!("Invalid value type ID {value_type_id} for map")))?;
+    let value_field = unwrap_field(state, value_type_id).ok_or_else(|| {
+        KernelError::generic(format!("Invalid value type ID {value_type_id} for map"))
+    })?;
 
     let map_type = MapType::new(
         key_field.data_type,
@@ -791,7 +794,7 @@ fn create_variant_data_type(
     let Some(DataType::Struct(variant_struct)) =
         state.elements.take(struct_type_id).map(|f| f.data_type)
     else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Invalid variant struct ID {struct_type_id} - must be DataType::Struct"
         )));
     };
@@ -807,7 +810,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
+    use crate::error::{EngineError, FFIKernelError};
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic,
     };
@@ -888,7 +891,7 @@ mod tests {
             )
         };
 
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         assert!(state.elements.is_empty());
     }
 
@@ -913,37 +916,45 @@ mod tests {
     #[case(
         CMetadataValueKind::MetadataNumber,
         "9223372036854775808",
-        KernelError::ParseIntError
+        FFIKernelError::ParseIntError
     )]
     #[case(
         CMetadataValueKind::MetadataNumber,
         "-9223372036854775809",
-        KernelError::ParseIntError
+        FFIKernelError::ParseIntError
     )]
-    #[case(CMetadataValueKind::MetadataNumber, "1.5", KernelError::ParseIntError)]
-    #[case(CMetadataValueKind::MetadataNumber, "", KernelError::ParseIntError)]
+    #[case(
+        CMetadataValueKind::MetadataNumber,
+        "1.5",
+        FFIKernelError::ParseIntError
+    )]
+    #[case(CMetadataValueKind::MetadataNumber, "", FFIKernelError::ParseIntError)]
     #[case(
         CMetadataValueKind::MetadataNumber,
         "not-a-number",
-        KernelError::ParseIntError
+        FFIKernelError::ParseIntError
     )]
-    #[case(CMetadataValueKind::MetadataBoolean, "TRUE", KernelError::SchemaError)]
-    #[case(CMetadataValueKind::MetadataBoolean, "1", KernelError::SchemaError)]
+    #[case(
+        CMetadataValueKind::MetadataBoolean,
+        "TRUE",
+        FFIKernelError::SchemaError
+    )]
+    #[case(CMetadataValueKind::MetadataBoolean, "1", FFIKernelError::SchemaError)]
     #[case(
         CMetadataValueKind::MetadataBoolean,
         "false ",
-        KernelError::SchemaError
+        FFIKernelError::SchemaError
     )]
-    #[case(CMetadataValueKind::MetadataBoolean, "", KernelError::SchemaError)]
+    #[case(CMetadataValueKind::MetadataBoolean, "", FFIKernelError::SchemaError)]
     #[case(
         CMetadataValueKind::MetadataJson,
         "not-json",
-        KernelError::MalformedJsonError
+        FFIKernelError::MalformedJsonError
     )]
     fn metadata_value_rejects_invalid_text_without_inserting_value(
         #[case] kind: CMetadataValueKind,
         #[case] value: &str,
-        #[case] expected_error: KernelError,
+        #[case] expected_error: FFIKernelError,
     ) {
         let mut state = CMetadataMap::default();
         let result = unsafe {
@@ -987,7 +998,7 @@ mod tests {
             visit_metadata_value(&mut state, key, kind, value, allocate_err)
         };
 
-        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::Utf8Error, None);
         assert!(state.into_values().is_empty());
     }
 
@@ -1021,7 +1032,7 @@ mod tests {
             )
         };
 
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         assert_eq!(
             state.into_values().get("key"),
             Some(&MetadataValue::Number(1))
@@ -1462,7 +1473,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let parent = visit_struct_field!(state, "parent", false, [child], null());
 
         let element = visit_field!(string, state, "element", true, null());
@@ -1476,7 +1487,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let array = visit_array_field!(state, "array", false, element, null());
 
         let key = visit_field!(string, state, "key", false, null());
@@ -1492,7 +1503,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let map = visit_map_field!(state, "map", false, key, value, null());
 
         let child = visit_field!(binary, state, "value", false, null());
@@ -1507,7 +1518,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let variant = visit_field!(variant, state, "variant", variant_struct, false, null());
 
         let schema_id = visit_struct_field!(
@@ -2236,7 +2247,7 @@ mod tests {
         // expect errors.
         #[no_mangle]
         extern "C" fn ensure_map_err(
-            _etype: KernelError,
+            _etype: FFIKernelError,
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {
