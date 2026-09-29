@@ -76,8 +76,13 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) checkpoint_type: Option<CheckpointType>,
 
     /// For an adaptive-metadata (AMT) checkpoint, the embedded AMT checkpoint info: the manifest
-    /// commit version plus optional prefetched checkpoint/leaves. Present iff `checkpoint_type` is
-    /// `AdaptiveMetadataTree`. Mutually exclusive with `v2_checkpoint`.
+    /// commit version plus optional prefetched checkpoint/leaves.
+    ///
+    /// By the adaptiveMetadata RFC a writer pairs this with `checkpoint_type ==
+    /// AdaptiveMetadataTree` and never sets it alongside `v2_checkpoint`. Kernel does not enforce
+    /// either constraint on read: it parses whatever the file contains, so a malformed hint (an
+    /// `AdaptiveMetadataTree` type with no `amtCheckpoint`, or both this and `v2_checkpoint`) is
+    /// retained as-is rather than rejected.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) amt_checkpoint: Option<AmtCheckpoint>,
 }

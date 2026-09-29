@@ -3326,6 +3326,47 @@ mod tests {
         assert_eq!(back, action);
     }
 
+    /// The `Serialize` path validates before emitting, mirroring `try_into_scalar`: an action whose
+    /// `contentRoot.version` exceeds the checkpoint version fails to serialize rather than writing
+    /// an out-of-spec array.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_rejects_invalid_content_root_version() {
+        let base = sample_checkpoint_action();
+        let action = CheckpointAction {
+            content_root: ContentRoot {
+                version: base.version + 1,
+                ..base.content_root
+            },
+            ..sample_checkpoint_action()
+        };
+        let err = serde_json::to_value(&action).expect_err("invalid action must not serialize");
+        assert!(
+            err.to_string().contains("exceeds checkpointMetadata.version"),
+            "expected content-root-version error, got: {err}"
+        );
+    }
+
+    /// The synthesized `checkpointMetadata` element omits `tags` entirely (via
+    /// `skip_serializing_if`) rather than emitting `"tags": null`, matching the EngineData wire
+    /// form. The symmetric round-trip tests cannot observe this because both an absent key and an
+    /// explicit null parse back to `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_omits_checkpoint_metadata_tags() {
+        let json = serde_json::to_value(sample_checkpoint_action()).unwrap();
+        let checkpoint_metadata = json
+            .as_array()
+            .and_then(|elements| elements.first())
+            .and_then(|element| element.get("checkpointMetadata"))
+            .expect("first element is checkpointMetadata");
+        assert_eq!(checkpoint_metadata, &json!({ "version": 42 }));
+        assert!(
+            checkpoint_metadata.get("tags").is_none(),
+            "checkpointMetadata must omit the tags key, got: {checkpoint_metadata}"
+        );
+    }
+
     /// Fully-populated array elements, used to build valid and malformed variants for the serde
     /// fold-error cases below. Mirrors `checkpoint_elements` in `visitors.rs` so the serde path and
     /// the EngineData path are checked against the same inputs.
