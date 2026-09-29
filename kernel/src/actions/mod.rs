@@ -1410,30 +1410,75 @@ pub(crate) struct CheckpointAction {
 }
 
 /// Mid-assembly accumulator for a [`CheckpointAction`]'s elements, filled by both decoders (the
-/// [`visitors`] `RowVisitor` and the serde `TryFrom` path) so the required-field and validation
-/// policy lives in one place ([`Self::assemble`]). Named fields remove the positional footgun of a
-/// many-argument constructor -- transposing `txn_sidecars`/`domain_metadata_sidecars` (or any of
-/// the same-typed groups) no longer type-checks.
+/// [`visitors`] `RowVisitor` and the serde `TryFrom` path) through its typed insertion methods, so
+/// the element-kind-to-slot mapping, its diagnostic names, the sidecar routing, and the
+/// required-field/validation policy ([`Self::assemble`]) all live in one place. Private fields plus
+/// typed setters remove the positional footgun of a many-argument constructor -- neither a
+/// transposed slot/name pair nor swapped sidecar lists is expressible at a call site.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default)]
-pub(crate) struct CheckpointActionParts {
-    /// `checkpointMetadata.version`; assembled into [`CheckpointAction::version`].
-    pub(crate) version: Option<i64>,
-    pub(crate) content_root: Option<ContentRoot>,
-    pub(crate) protocol: Option<Protocol>,
-    pub(crate) metadata: Option<Metadata>,
-    pub(crate) transactions: Vec<SetTransaction>,
-    pub(crate) domain_metadata: Vec<DomainMetadata>,
-    pub(crate) txn_sidecars: Vec<Sidecar>,
-    pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
+struct CheckpointActionParts {
+    version: Option<i64>,
+    content_root: Option<ContentRoot>,
+    protocol: Option<Protocol>,
+    metadata: Option<Metadata>,
+    transactions: Vec<SetTransaction>,
+    domain_metadata: Vec<DomainMetadata>,
+    txn_sidecars: Vec<Sidecar>,
+    domain_metadata_sidecars: Vec<Sidecar>,
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointActionParts {
+    /// Record the `checkpointMetadata.version` singleton, erroring on a duplicate.
+    fn set_checkpoint_metadata(&mut self, version: i64) -> DeltaResult<()> {
+        set_once(&mut self.version, version, "checkpointMetadata")
+    }
+
+    /// Record the `contentRoot` singleton, erroring on a duplicate.
+    fn set_content_root(&mut self, content_root: ContentRoot) -> DeltaResult<()> {
+        set_once(&mut self.content_root, content_root, "contentRoot")
+    }
+
+    /// Record the `protocol` singleton, erroring on a duplicate.
+    fn set_protocol(&mut self, protocol: Protocol) -> DeltaResult<()> {
+        set_once(&mut self.protocol, protocol, "protocol")
+    }
+
+    /// Record the `metaData` singleton, erroring on a duplicate.
+    fn set_metadata(&mut self, metadata: Metadata) -> DeltaResult<()> {
+        set_once(&mut self.metadata, metadata, "metaData")
+    }
+
+    /// Collect an inline `txn` element.
+    fn push_transaction(&mut self, txn: SetTransaction) {
+        self.transactions.push(txn);
+    }
+
+    /// Collect an inline `domainMetadata` element.
+    fn push_domain_metadata(&mut self, domain_metadata: DomainMetadata) {
+        self.domain_metadata.push(domain_metadata);
+    }
+
+    /// Route a `sidecar` element to its list by the `type` discriminator, erroring on any other
+    /// type. Keeps the routing and its error message in one place across both decoders.
+    fn push_sidecar(&mut self, sidecar_type: &str, sidecar: Sidecar) -> DeltaResult<()> {
+        match sidecar_type {
+            SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
+            DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
+            other => {
+                return Err(KernelError::generic(format!(
+                    "checkpoint sidecar has unsupported type `{other}`"
+                )))
+            }
+        }
+        Ok(())
+    }
+
     /// Assembles the collected elements into a [`CheckpointAction`], erroring if a required
     /// singleton (`checkpointMetadata`/`contentRoot`/`protocol`/`metaData`) is absent or if
     /// [`CheckpointAction::validate`] rejects the result.
-    pub(crate) fn assemble(self) -> DeltaResult<CheckpointAction> {
+    fn assemble(self) -> DeltaResult<CheckpointAction> {
         let missing = |field: &str| {
             KernelError::generic(format!(
                 "checkpoint action is missing required `{field}` element"
@@ -1578,30 +1623,25 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
                 element.sidecar.is_some(),
             ])?;
             if let Some(cm) = element.checkpoint_metadata {
-                set_once(&mut parts.version, cm.version, "checkpointMetadata")?;
+                parts.set_checkpoint_metadata(cm.version)?;
             }
             if let Some(cr) = element.content_root {
-                set_once(&mut parts.content_root, cr, "contentRoot")?;
+                parts.set_content_root(cr)?;
             }
             if let Some(p) = element.protocol {
-                set_once(&mut parts.protocol, p, "protocol")?;
+                parts.set_protocol(p)?;
             }
             if let Some(m) = element.metadata {
-                set_once(&mut parts.metadata, m, "metaData")?;
+                parts.set_metadata(m)?;
             }
             if let Some(t) = element.txn {
-                parts.transactions.push(t);
+                parts.push_transaction(t);
             }
             if let Some(dm) = element.domain_metadata {
-                parts.domain_metadata.push(dm);
+                parts.push_domain_metadata(dm);
             }
             if let Some(ts) = element.sidecar {
-                route_content_sidecar(
-                    &ts.sidecar_type,
-                    ts.sidecar,
-                    &mut parts.txn_sidecars,
-                    &mut parts.domain_metadata_sidecars,
-                )?;
+                parts.push_sidecar(&ts.sidecar_type, ts.sidecar)?;
             }
         }
 
@@ -1611,35 +1651,14 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
 
 /// Store `value` in `slot`, erroring if it was already occupied. Checkpoint singleton elements
 /// named by `name` (`checkpointMetadata`/`contentRoot`/`protocol`/`metaData`) may appear at most
-/// once, so a second occurrence is malformed rather than an override. Shared by both decoders --
-/// the [`visitors`] `RowVisitor` and the serde `TryFrom` path.
+/// once, so a second occurrence is malformed rather than an override. Backs
+/// [`CheckpointActionParts`]'s typed setters.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
     require!(
         slot.replace(value).is_none(),
         KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
     );
-    Ok(())
-}
-
-/// Route a `sidecar` element to its list by the `type` discriminator, erroring on any other type.
-/// Shared by both decoders so the routing and error message live in one place.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) fn route_content_sidecar(
-    sidecar_type: &str,
-    sidecar: Sidecar,
-    txn_sidecars: &mut Vec<Sidecar>,
-    domain_metadata_sidecars: &mut Vec<Sidecar>,
-) -> DeltaResult<()> {
-    match sidecar_type {
-        SET_TRANSACTION_NAME => txn_sidecars.push(sidecar),
-        DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(sidecar),
-        other => {
-            return Err(KernelError::generic(format!(
-                "checkpoint sidecar has unsupported type `{other}`"
-            )))
-        }
-    }
     Ok(())
 }
 
@@ -1649,7 +1668,7 @@ pub(crate) fn route_content_sidecar(
 /// unknown element (added by a newer writer), which callers allow and skip. Shared by both decoders
 /// -- the [`visitors`] `RowVisitor` and the serde `TryFrom` path.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) fn require_one_hot_element(populated: &[bool]) -> DeltaResult<()> {
+fn require_one_hot_element(populated: &[bool]) -> DeltaResult<()> {
     require!(
         populated.iter().filter(|p| **p).count() <= 1,
         KernelError::generic("checkpoint action element sets multiple keys")

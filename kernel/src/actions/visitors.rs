@@ -922,21 +922,20 @@ impl RowVisitor for CheckpointElementVisitor {
             ])?;
 
             if let Some(version) = checkpoint_metadata {
-                super::set_once(&mut self.parts.version, version, "checkpointMetadata")?;
+                self.parts.set_checkpoint_metadata(version)?;
             }
             if let Some(content_root) = content_root {
-                super::set_once(&mut self.parts.content_root, content_root, "contentRoot")?;
+                self.parts.set_content_root(content_root)?;
             }
             if let Some(protocol) = protocol {
-                super::set_once(&mut self.parts.protocol, protocol, "protocol")?;
+                self.parts.set_protocol(protocol)?;
             }
             if let Some(metadata) = metadata {
-                super::set_once(&mut self.parts.metadata, metadata, "metaData")?;
+                self.parts.set_metadata(metadata)?;
             }
             if let Some(domain) = domain {
                 self.parts
-                    .domain_metadata
-                    .push(DomainMetadataVisitor::visit_domain_metadata(
+                    .push_domain_metadata(DomainMetadataVisitor::visit_domain_metadata(
                         i,
                         domain,
                         &getters[r.domain_metadata.clone()],
@@ -944,8 +943,7 @@ impl RowVisitor for CheckpointElementVisitor {
             }
             if let Some(app_id) = app_id {
                 self.parts
-                    .transactions
-                    .push(SetTransactionVisitor::visit_txn(
+                    .push_transaction(SetTransactionVisitor::visit_txn(
                         i,
                         app_id,
                         &getters[r.txn.clone()],
@@ -954,12 +952,7 @@ impl RowVisitor for CheckpointElementVisitor {
             if let Some(path) = sidecar_path {
                 let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
                 let sidecar_type: String = getters[r.sidecar_type].get(i, "sidecar.type")?;
-                super::route_content_sidecar(
-                    &sidecar_type,
-                    sidecar,
-                    &mut self.parts.txn_sidecars,
-                    &mut self.parts.domain_metadata_sidecars,
-                )?;
+                self.parts.push_sidecar(&sidecar_type, sidecar)?;
             }
         }
         Ok(())
