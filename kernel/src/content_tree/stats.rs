@@ -24,7 +24,7 @@ use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Field ID offsets for stats fields within a column's stats struct.
 const STATS_OFFSET_LOWER_BOUND: i32 = 1;
@@ -287,7 +287,7 @@ fn leaf_stats_field(
     // stats, so a field ID outside the supported range is expected for some reserved metadata
     // columns; skip (warn) rather than error in that case.
     let field_id = get_field_id(field).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Field '{}' has no usable (present, i32-representable) field ID. metadata: {:#?}",
             field.name(),
             field.metadata()
@@ -304,7 +304,7 @@ fn leaf_stats_field(
         field.data_type(),
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))
     ) {
-        return Err(Error::unsupported(format!(
+        return Err(KernelError::unsupported(format!(
             "AMT stats schema generation is not yet implemented for geospatial column '{}' (type {})",
             field.name(),
             field.data_type(),
@@ -403,7 +403,7 @@ impl<'a> CategoryScopes<'a> {
                 SubSchema::Absent => None,
                 SubSchema::Struct(s) => Some(s),
                 SubSchema::Mismatch => {
-                    return Err(Error::generic(format!(
+                    return Err(KernelError::generic(format!(
                     "Delta stats schema invariant violation: category '{category}' is a scalar, \
                          but it must be a struct mirroring the table"
                 )))
@@ -430,7 +430,7 @@ impl<'a> CategoryScopes<'a> {
                     SubSchema::Absent => None,
                     SubSchema::Struct(sub) => Some(sub),
                     SubSchema::Mismatch => {
-                        return Err(Error::generic(format!(
+                        return Err(KernelError::generic(format!(
                             "Delta stats schema invariant violation at '{}': category '{}' has \
                              '{name}' as a scalar, but the table nests a struct there",
                             ColumnName::new(path),
@@ -466,8 +466,8 @@ impl<'a> CategoryScopes<'a> {
 /// to the sink. A leaf that a projection drops entirely (present in no category) is skipped before
 /// `on_leaf` is called.
 ///
-/// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, the `on_leaf` sink is the
-/// real result, and an `Err` short-circuits the walk.
+/// Uses the `Result<(), KernelError>` carrier: the rebuilt output is discarded, the `on_leaf` sink
+/// is the real result, and an `Err` short-circuits the walk.
 struct StatsLeafWalker<'a, F> {
     /// Field names from the root to the current node; the last segment is the leaf being visited.
     path: Vec<String>,
@@ -479,11 +479,11 @@ struct StatsLeafWalker<'a, F> {
 
 impl<'a, F> SchemaTransform<'a> for StatsLeafWalker<'a, F>
 where
-    F: FnMut(&'a StructField, &[String], Option<StatCategories>) -> Result<(), Error>,
+    F: FnMut(&'a StructField, &[String], Option<StatCategories>) -> Result<(), KernelError>,
 {
-    transform_output_type!(|'a, T| Result<(), Error>);
+    transform_output_type!(|'a, T| Result<(), KernelError>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), Error> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), KernelError> {
         self.path.push(field.name().to_string());
         // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
         // discarded, so the skipped pop is harmless.

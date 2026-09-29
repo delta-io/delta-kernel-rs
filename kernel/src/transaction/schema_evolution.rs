@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
@@ -57,7 +57,7 @@ fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -
         .fields()
         .any(|existing| existing.name().to_lowercase() == lowered)
     {
-        return Err(Error::schema(format!(
+        return Err(KernelError::schema(format!(
             "Cannot add column '{}' under {}: a column with that name already exists",
             field.name(),
             parent_path,
@@ -77,7 +77,7 @@ impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
             key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
                 || key.starts_with("delta.identity.")
         }) {
-            return Err(Error::schema(format!(
+            return Err(KernelError::schema(format!(
                 "Cannot add column '{}': metadata annotation '{}' is not supported",
                 field.name(),
                 key,
@@ -97,7 +97,7 @@ fn set_field_nullable(parent: &mut StructType, name: &str) -> DeltaResult<()> {
         .field_map_mut()
         .values_mut()
         .find(|parent| parent.name().to_lowercase() == name.to_lowercase())
-        .ok_or_else(|| Error::schema(format!("field '{}' does not exist", name)))?;
+        .ok_or_else(|| KernelError::schema(format!("field '{}' does not exist", name)))?;
     parent.nullable = true;
     Ok(())
 }
@@ -138,7 +138,7 @@ pub(crate) fn apply_schema_operations(
     // out-of-range fresh ids.
     if let Some(seed) = current_max_column_id {
         validate_column_mapping_id(seed).map_err(|e| {
-            Error::invalid_protocol(format!(
+            KernelError::invalid_protocol(format!(
                 "Table property `delta.columnMapping.maxColumnId`: {e}"
             ))
         })?;
@@ -164,7 +164,7 @@ pub(crate) fn apply_schema_operations(
             SchemaOperation::AddColumn { parent, field } => {
                 reject_generated_or_identity_metadata(&field)?;
                 if field.is_metadata_column() {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Cannot add column '{}': metadata columns are not allowed in a table schema",
                         field.name()
                     )));
@@ -176,7 +176,7 @@ pub(crate) fn apply_schema_operations(
                 // nullable so existing data files can return NULL for the new column)
                 // NOTE: non-nullable columns depend on invariants feature
                 if !field.is_nullable() {
-                    return Err(Error::schema(format!(
+                    return Err(KernelError::schema(format!(
                         "Cannot add non-nullable column '{}'. Added columns must be nullable \
                          because existing data files do not contain this column.",
                         field.name()
@@ -186,7 +186,7 @@ pub(crate) fn apply_schema_operations(
                 // Preserving them can reuse a dropped column's historical identity.
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
-                        Error::invalid_protocol(
+                        KernelError::invalid_protocol(
                             "Column mapping is enabled but delta.columnMapping.maxColumnId \
                              is not set in table properties",
                         )
@@ -212,15 +212,15 @@ pub(crate) fn apply_schema_operations(
                 let (leaf, parent) = column
                     .path()
                     .split_last()
-                    .ok_or_else(|| Error::generic("empty column path"))?;
+                    .ok_or_else(|| KernelError::generic("empty column path"))?;
                 set_field_nullable(root.struct_at_path(parent)?, leaf).map_err(|e| {
-                    Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
+                    KernelError::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
             }
         }
 
         let DataType::Struct(updated_schema) = root else {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "schema root changed type during schema evolution",
             ));
         };
@@ -235,7 +235,7 @@ pub(crate) fn apply_schema_operations(
         Ordering::Greater => max_id,
         Ordering::Equal => None,
         Ordering::Less => {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "max column ID went backwards during schema evolution",
             ))
         }
@@ -859,7 +859,7 @@ mod tests {
             false, /* cdf_enabled */
         )
         .unwrap_err();
-        assert!(matches!(err, Error::InvalidProtocol(_)));
+        assert!(matches!(err, KernelError::InvalidProtocol(_)));
         assert!(err.to_string().contains("maxColumnId"));
     }
 

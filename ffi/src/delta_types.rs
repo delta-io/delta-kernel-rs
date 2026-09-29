@@ -11,7 +11,7 @@ use delta_kernel::crc::{
     FileStatsState, SetTransactionState,
 };
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
-use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel::{DeltaResult, KernelError, Version};
 
 use crate::{FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue};
 
@@ -372,8 +372,8 @@ pub struct FfiCrc {
     pub deleted_record_counts_histogram: *const FfiDeletedRecordCountsHistogram,
 }
 
-pub(crate) fn invalid(message: impl Into<String>) -> Error {
-    Error::generic(message.into())
+pub(crate) fn invalid(message: impl Into<String>) -> KernelError {
+    KernelError::generic(message.into())
 }
 
 /// Borrows a required native payload, with its lifetime bounded by `owner`.
@@ -596,7 +596,7 @@ impl FfiLastCheckpoint {
             .map(|value| {
                 let value = u32::try_from(*value)
                     .map_err(|_| invalid(format!("checkpoint part count exceeds u32: {value}")))?;
-                Ok::<usize, Error>(value as usize)
+                Ok::<usize, KernelError>(value as usize)
             })
             .transpose()?;
         let checkpoint_schema = Option::<&KernelStringSlice>::from(&self.checkpoint_schema)
@@ -782,6 +782,8 @@ impl FfiCrc {
             Option::<&i64>::from(&self.num_deleted_records).copied(),
             Option::<&i64>::from(&self.num_deletion_vectors).copied(),
             deleted_record_counts_histogram,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            None,
         )
     }
 }

@@ -183,7 +183,7 @@ pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeltaResult, Error};
+    use crate::{DeltaResult, KernelError};
 
     // Simple key extraction function
     fn get_val(x: &i32) -> DeltaResult<i32> {
@@ -250,7 +250,7 @@ mod tests {
 
         let failing_key_fn = |x: &i32| -> DeltaResult<i32> {
             if *x == 5 {
-                Err(Error::generic("Error extracting key"))
+                Err(KernelError::generic("Error extracting key"))
             } else {
                 Ok(*x)
             }
@@ -260,7 +260,7 @@ mod tests {
             binary_search_by_key_with_bounds(&values, 7, failing_key_fn, Bound::LeastUpper);
         assert!(matches!(
             result,
-            Err(SearchError::KeyFunctionError(crate::Error::Generic(msg))) if msg.contains("Error extracting key")
+            Err(SearchError::KeyFunctionError(crate::KernelError::Generic(msg))) if msg.contains("Error extracting key")
         ));
     }
 }

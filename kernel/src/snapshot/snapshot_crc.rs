@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::crc::Crc;
 use crate::utils::require;
-use crate::{DeltaResult, Error, Version};
+use crate::{DeltaResult, KernelError, Version};
 
 /// The newest [`Crc`] a snapshot resolved, at or before the snapshot's version. It is one CRC,
 /// read from disk (or computed) at most once; keeping it lets later queries and CRC writes reuse
@@ -32,14 +32,14 @@ impl SnapshotCrc {
         if let Some(crc) = crc.as_ref() {
             require!(
                 crc.version <= snapshot_version,
-                Error::internal_error(format!(
+                KernelError::internal_error(format!(
                     "CRC version {} is ahead of snapshot version {snapshot_version}",
                     crc.version
                 ))
             );
             require!(
                 checkpoint_version.is_none_or(|ckpt| crc.version >= ckpt),
-                Error::internal_error(format!(
+                KernelError::internal_error(format!(
                     "CRC version {} is below checkpoint version {checkpoint_version:?}",
                     crc.version
                 ))

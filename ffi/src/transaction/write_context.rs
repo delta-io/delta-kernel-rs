@@ -5,7 +5,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::transaction::{
     BoundWriteContext, BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState,
 };
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, KernelError};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::partition_value::{ExclusivePartitionValueMap, PartitionValueMap};
@@ -137,6 +137,23 @@ pub unsafe extern "C" fn write_context_builder_with_partition_values(
     let builder = unsafe { builder.into_inner() };
     let partition_values = unsafe { partition_values.into_inner() };
     Box::new(builder.with_partition_values(partition_values.inner)).into()
+}
+
+/// Sets partition values keyed by exact physical column names and consumes both input handles.
+///
+/// The returned handle replaces `builder`; neither input handle remains valid. Kernel validates the
+/// values in [`write_context_builder_build`]. Unpartitioned writers skip this function.
+///
+/// # Safety
+/// The builder and partition-value map handles must be valid and are consumed by this call.
+#[no_mangle]
+pub unsafe extern "C" fn write_context_builder_with_physical_partition_values(
+    builder: Handle<ExclusiveWriteContextBuilder>,
+    partition_values: Handle<ExclusivePartitionValueMap>,
+) -> Handle<ExclusiveWriteContextBuilder> {
+    let builder = unsafe { builder.into_inner() };
+    let partition_values = unsafe { partition_values.into_inner() };
+    Box::new(builder.with_physical_partition_values(partition_values.inner)).into()
 }
 
 /// Sets the logical names of materialized row-tracking columns and consumes the builder.
@@ -541,7 +558,7 @@ fn resolve_file_path_impl(
     file_url: DeltaResult<&str>,
 ) -> DeltaResult<String> {
     let url = Url::parse(file_url?).map_err(|e| {
-        Error::generic(format!("invalid file URL passed to resolve_file_path: {e}"))
+        KernelError::generic(format!("invalid file URL passed to resolve_file_path: {e}"))
     })?;
     write_context.resolve_file_path(&url)
 }

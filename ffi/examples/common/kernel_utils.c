@@ -34,7 +34,7 @@ void free_error(Error* error)
 
 // kernel will call this to allocate our errors. This can be used to create an "engine native" type
 // error
-EngineError* allocate_error(KernelError etype, const KernelStringSlice msg)
+EngineError* allocate_error(FFIKernelError etype, const KernelStringSlice msg)
 {
   Error* error = malloc(sizeof(Error));
   error->etype.etype = etype;

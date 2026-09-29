@@ -5,7 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
-use crate::{DeltaResult, EngineData, Error};
+use crate::{DeltaResult, EngineData, KernelError};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -32,7 +32,7 @@ pub(crate) fn extract_deletion_vector_content(
             dv.relative_path()?
         }
         DeletionVectorStorageType::Inline => {
-            return Err(Error::DeletionVector(
+            return Err(KernelError::DeletionVector(
                 "Inline deletion vectors are not supported. They must be persisted first."
                     .to_string(),
             ));

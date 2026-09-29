@@ -424,6 +424,8 @@ fn typed_crc_accepts_full_kernel_state() {
         Some(13),
         Some(1),
         Some(DeletedRecordCountsHistogram::try_new(deleted_record_counts.to_vec()).unwrap()),
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        None,
     )
     .unwrap();
     assert_eq!(actual, expected);
@@ -1072,7 +1074,7 @@ fn typed_actions_validate_tags_and_convert_each_payload() {
     for action in &null_actions {
         assert!(matches!(
             unsafe { action.try_to_kernel() },
-            Err(Error::Generic(_))
+            Err(KernelError::Generic(_))
         ));
     }
 }

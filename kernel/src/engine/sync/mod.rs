@@ -26,7 +26,7 @@ use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler,
+    DeltaResult, Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, ParquetHandler,
     PredicateRef, SchemaRef, StorageHandler,
 };
 
@@ -127,13 +127,13 @@ pub(super) fn resolve_scope(
         return Ok((store.clone(), base_url, path));
     }
     if url.scheme() != "file" {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
         )));
     }
     let file_path = url
         .to_file_path()
-        .map_err(|()| Error::generic(format!("Invalid file URL: {url}")))?;
+        .map_err(|()| KernelError::generic(format!("Invalid file URL: {url}")))?;
     // Use the deepest existing ancestor of the URL's directory as the store prefix:
     // `LocalFileSystem::new_with_prefix` canonicalizes its argument (which requires the path
     // to exist), and operating on a non-existent path is a valid case for `list_from` on a
@@ -143,25 +143,25 @@ pub(super) fn resolve_scope(
     } else {
         file_path
             .parent()
-            .ok_or_else(|| Error::generic(format!("File URL has no parent: {url}")))?
+            .ok_or_else(|| KernelError::generic(format!("File URL has no parent: {url}")))?
             .to_path_buf()
     };
     let mut prefix = target_dir.as_path();
     while !prefix.exists() {
-        prefix = prefix
-            .parent()
-            .ok_or_else(|| Error::generic(format!("No existing ancestor for {target_dir:?}")))?;
+        prefix = prefix.parent().ok_or_else(|| {
+            KernelError::generic(format!("No existing ancestor for {target_dir:?}"))
+        })?;
     }
     let prefix = prefix.to_path_buf();
     let relative = file_path
         .strip_prefix(&prefix)
-        .map_err(|e| Error::generic(format!("Failed to strip prefix: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("Failed to strip prefix: {e}")))?;
     let path = Path::from_iter(relative.components().filter_map(|c| match c {
         std::path::Component::Normal(s) => s.to_str().map(String::from),
         _ => None,
     }));
     let base_url = Url::from_directory_path(&prefix)
-        .map_err(|()| Error::generic(format!("Could not URL-encode prefix {prefix:?}")))?;
+        .map_err(|()| KernelError::generic(format!("Could not URL-encode prefix {prefix:?}")))?;
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&prefix)?);
     Ok((store, base_url, path))
 }
@@ -180,7 +180,8 @@ pub(super) fn get_bytes(
 ///
 /// For `file://` URLs the parent directory is created if missing (matching the local FS
 /// behavior callers expect; `LocalFileSystem::put` itself does not create parents). When
-/// `overwrite` is false, an existing file at `location` produces [`Error::FileAlreadyExists`].
+/// `overwrite` is false, an existing file at `location` produces
+/// [`KernelError::FileAlreadyExists`].
 pub(super) fn put_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
@@ -208,9 +209,9 @@ pub(super) fn put_bytes(
     futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(|e| {
         match e {
             crate::object_store::Error::AlreadyExists { .. } => {
-                Error::FileAlreadyExists(location.to_string())
+                KernelError::FileAlreadyExists(location.to_string())
             }
-            other => Error::generic(other.to_string()),
+            other => KernelError::generic(other.to_string()),
         }
     })?;
     Ok(())

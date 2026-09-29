@@ -12,7 +12,7 @@ ownership semantics:
 
 A handle is needed when a value might outlive the function call that passes it across the
 FFI boundary, or when the type is not representable in C/C++ (dyn trait references, slices,
-options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelError`,
+options, etc.). Short-lived "plain old data" types like `ExternResult`, `FFIKernelError`,
 `KernelStringSlice`, and `EngineIterator` do not need handles.
 
 Borrowed record arrays use `FfiSlice<T>`: empty slices accept null or non-null pointers, while
@@ -177,7 +177,7 @@ defaults but never materializes them, so the connector fills every omitted colum
 transaction()
   -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
-                                            // KernelError::InvalidTransactionStateError
+                                            // FFIKernelError::InvalidTransactionStateError
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
@@ -205,7 +205,8 @@ worker with `write_state_decode`. Local writers can skip this round trip.
 Create-table writes use the `create_table_get_*_write_context` functions and do not expose
 transportable write state.
 Create a builder for each output partition with `write_context_builder`. Partitioned writers set
-values with `write_context_builder_with_partition_values`; writers that provide materialized
+values keyed by logical names with `write_context_builder_with_partition_values` or exact physical
+names with `write_context_builder_with_physical_partition_values`; writers that provide materialized
 row-tracking columns also call `write_context_builder_with_row_tracking_columns`. Finish with
 `write_context_builder_build`. Builders and bound contexts hold their own state reference, so they
 remain valid after `free_write_state`. Drop an unused builder with `free_write_context_builder` and

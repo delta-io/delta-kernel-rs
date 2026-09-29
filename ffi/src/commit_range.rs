@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, LogPath, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, KernelError, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -161,7 +161,7 @@ fn commit_range_builder_build_impl(
     } else if let Some(max_catalog_version) = builder.max_catalog_version {
         kernel_builder = kernel_builder.with_log_tail(builder.log_tail, max_catalog_version);
     } else {
-        return Err(Error::MaxCatalogVersion(
+        return Err(KernelError::MaxCatalogVersion(
             "Max catalog version is required when providing staged commits.".to_string(),
         ));
     }
@@ -337,7 +337,7 @@ impl FfiCommitActionsIterator {
     fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
-            .map_err(|_| Error::generic("poisoned commit-actions iterator mutex"))
+            .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
     }
 }
 
@@ -482,7 +482,7 @@ mod tests {
     use super::*;
     use crate::engine_data::engine_data_length;
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
         build_snapshot, ok_or_panic,
@@ -653,7 +653,7 @@ mod tests {
         let result = unsafe { commit_range_builder_build(builder) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidLogSegment,
+            FFIKernelError::InvalidLogSegment,
             Some("Log tail versions 1 and 3 are not contiguous"),
         );
 
@@ -692,7 +692,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidTableLocationError,
+            FFIKernelError::InvalidTableLocationError,
             None,
         );
 
@@ -733,7 +733,7 @@ mod tests {
         let result = unsafe { commit_range_builder_build(builder) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::MissingVersionError,
+            FFIKernelError::MissingVersionError,
             Some("Table version 5 is missing or unavailable for this log operation."),
         );
 
@@ -810,7 +810,7 @@ mod tests {
                 unsafe { free_commit_actions_iter(iter) }
             }
             None => {
-                assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+                assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
             }
         }
 
@@ -836,7 +836,7 @@ mod tests {
                 0,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
