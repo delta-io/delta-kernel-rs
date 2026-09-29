@@ -269,24 +269,6 @@ impl LastCheckpointHint {
         })
     }
 
-    /// Whether kernel recognizes this hint's checkpoint format and may therefore use it. An absent
-    /// `checkpointType` is a classic / multi-part / V2 checkpoint and is always usable; an
-    /// `AdaptiveMetadataTree` checkpoint is usable via the AMT read path. Only an explicit
-    /// unrecognized `checkpointType` ([`CheckpointType::Unknown`]) is unusable: such a hint
-    /// describes a format kernel cannot interpret, so [`Self::try_read`] discards it and the reader
-    /// falls back to log replay. Always `true` without the `adaptive-metadata-in-dev` feature,
-    /// where the field does not exist.
-    fn has_recognized_checkpoint_type(&self) -> bool {
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        {
-            self.checkpoint_type != Some(CheckpointType::Unknown)
-        }
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        {
-            true
-        }
-    }
-
     /// Parses a hint from raw `_last_checkpoint` bytes, dropping oversized fields so the retained
     /// hint is always bounded. This is the only way to construct a hint from disk, so callers can
     /// never hold an untrimmed one.
@@ -364,9 +346,16 @@ impl LastCheckpointHint {
                     .ok()
                     // A hint tagged with a checkpoint format kernel does not recognize is discarded
                     // entirely: kernel cannot interpret it, so the reader falls back to log replay.
-                    // An absent `checkpointType` is a known legacy checkpoint and is kept.
-                    .filter(|hint| {
-                        let usable = hint.has_recognized_checkpoint_type();
+                    // An absent `checkpointType` is a known legacy checkpoint and is kept; an
+                    // `AdaptiveMetadataTree` checkpoint is usable via the AMT read path. Only an
+                    // explicit unrecognized `checkpointType` ([`CheckpointType::Unknown`]) is
+                    // unusable. Without the `adaptive-metadata-in-dev` feature the field does not
+                    // exist, so every hint is usable.
+                    .filter(|_hint| {
+                        #[cfg(feature = "adaptive-metadata-in-dev")]
+                        let usable = _hint.checkpoint_type != Some(CheckpointType::Unknown);
+                        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+                        let usable = true;
                         if !usable {
                             warn!(
                                 "_last_checkpoint has an unrecognized checkpointType; discarding"
