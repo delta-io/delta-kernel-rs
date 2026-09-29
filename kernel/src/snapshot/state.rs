@@ -21,8 +21,18 @@ use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{KernelResult, Snapshot, Version};
 
-/// Immutable transaction-log identity and paths needed to reconstruct a log segment.
+/// An operation-scoped iterator; connector callbacks need not be thread safe.
+pub type SnapshotLogPathIterator<'a> = Box<dyn Iterator<Item = KernelResult<LogPath>> + 'a>;
+
+/// Immutable transaction-log identity and paths needed for planning and validation.
 pub trait SnapshotLogState {
+    /// Optionally stream paths ordered by (version, filename). Each invocation must return
+    /// the same immutable sequence. The consumer may revisit it without retaining input batches.
+    /// `None` selects the unordered compatibility path.
+    fn ordered_log_paths(&self) -> KernelResult<Option<SnapshotLogPathIterator<'_>>> {
+        Ok(None)
+    }
+
     fn table_root(&self) -> &Url;
     fn version(&self) -> Version;
     fn is_latest(&self) -> bool;

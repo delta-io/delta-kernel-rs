@@ -202,6 +202,7 @@ fn test_snapshot_hint(
 
 fn test_snapshot_scan_state(hint: &FfiSnapshotHint) -> FfiSnapshotScanState {
     FfiSnapshotScanState {
+        log_path_source: std::ptr::null(),
         version: hint.version,
         freshness: hint.freshness,
         log_paths: LogPathArray {
@@ -399,6 +400,7 @@ fn externalized_core_borrows_validated_connector_state() {
 fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     #[case] freshness: FfiSnapshotHintFreshness,
     #[values(false, true)] partitioned: bool,
+    #[values(false, true)] batched: bool,
 ) {
     let engine = test_engine();
     let builder = test_builder(&engine);
@@ -437,7 +439,15 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         .unwrap()
         .expect("expected a native plan for a hinted commit");
     let native_bytes = delta_kernel::Operation::QueryPlan(native_plan).to_proto_bytes();
-    let scan_state = test_snapshot_scan_state(&hint);
+    let mut scan_state = test_snapshot_scan_state(&hint);
+    let source = crate::log_path::FfiLogPathSource {
+        context: std::ptr::from_ref(&hint.log_paths).cast_mut().cast(),
+        read_batch: read_test_log_batch,
+    };
+    if batched {
+        scan_state.log_paths = LogPathArray::empty();
+        scan_state.log_path_source = &source;
+    }
 
     let rejected = unsafe {
         snapshot_core_declarative_metadata_plan(
@@ -1246,5 +1256,70 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     unsafe {
         free_snapshot(snapshot);
         free_engine(engine);
+    }
+}
+
+// Return one entry at a time, including a final empty batch, to exercise callback lifetimes.
+unsafe extern "C" fn read_test_log_batch(
+    context: *mut std::ffi::c_void,
+    offset: usize,
+    max_entries: usize,
+    _max_bytes: usize,
+    output: *mut LogPathArray,
+) -> bool {
+    assert!(max_entries > 0);
+    let source = unsafe { &*context.cast::<LogPathArray>() };
+    assert!(offset <= source.len);
+    unsafe {
+        *output = LogPathArray {
+            ptr: source.ptr.add(offset),
+            len: usize::from(offset < source.len),
+        };
+    }
+    true
+}
+
+#[test]
+fn borrowed_log_batch_errors_are_terminal() {
+    unsafe extern "C" fn fail(
+        _: *mut std::ffi::c_void,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: *mut LogPathArray,
+    ) -> bool {
+        false
+    }
+    unsafe extern "C" fn oversized(
+        _: *mut std::ffi::c_void,
+        _: usize,
+        _: usize,
+        _: usize,
+        output: *mut LogPathArray,
+    ) -> bool {
+        unsafe {
+            *output = LogPathArray {
+                ptr: std::ptr::null(),
+                len: 257,
+            };
+        }
+        true
+    }
+    let hint = test_snapshot_hint(&[], 0, FfiSnapshotHintFreshness::Unverified);
+    let root = url::Url::parse("memory:///table/").unwrap();
+    for callback in [fail, oversized] {
+        let source = crate::log_path::FfiLogPathSource {
+            context: std::ptr::null_mut(),
+            read_batch: callback,
+        };
+        let mut value = test_snapshot_scan_state(&hint);
+        value.log_path_source = &source;
+        let state = super::state::BorrowedSnapshotScanState {
+            value: &value,
+            table_root: &root,
+        };
+        let mut paths = state.ordered_log_paths().unwrap().unwrap();
+        assert!(paths.next().unwrap().is_err());
+        assert!(paths.next().is_none());
     }
 }

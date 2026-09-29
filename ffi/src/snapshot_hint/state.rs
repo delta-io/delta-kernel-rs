@@ -85,6 +85,59 @@ pub(super) struct BorrowedSnapshotScanState<'a> {
 }
 
 impl SnapshotLogState for BorrowedSnapshotScanState<'_> {
+    fn ordered_log_paths(
+        &self,
+    ) -> KernelResult<Option<delta_kernel::snapshot::SnapshotLogPathIterator<'_>>> {
+        let Some(source) = (unsafe { self.value.log_path_source.as_ref() }) else {
+            return Ok(None);
+        };
+        if self.value.log_paths.len != 0 {
+            return Err(super::invalid(
+                "Supply either a log path array or a batch source",
+            ));
+        }
+        let mut offset = 0usize;
+        let mut batch = Vec::new().into_iter();
+        let mut done = false;
+        Ok(Some(Box::new(std::iter::from_fn(move || {
+            if let Some(path) = batch.next() {
+                return Some(Ok(path));
+            }
+            if done {
+                return None;
+            }
+            let mut output = crate::log_path::LogPathArray::empty();
+            let result = (|| {
+                if !unsafe { (source.read_batch)(source.context, offset, 256, 65536, &mut output) }
+                {
+                    return Err(super::invalid("Connector log path batch failed"));
+                }
+                if output.len > 256 {
+                    return Err(super::invalid(
+                        "Connector exceeded the log path batch entry limit",
+                    ));
+                }
+                let paths = unsafe { output.log_paths() }?;
+                offset = offset
+                    .checked_add(paths.len())
+                    .ok_or_else(|| super::invalid("Log path count overflow"))?;
+                Ok(paths)
+            })();
+            match result {
+                Ok(paths) => {
+                    batch = paths.into_iter();
+                    let next = batch.next();
+                    done = next.is_none();
+                    next.map(Ok)
+                }
+                Err(error) => {
+                    done = true;
+                    Some(Err(error))
+                }
+            }
+        }))))
+    }
+
     fn table_root(&self) -> &Url {
         self.table_root
     }

@@ -73,7 +73,14 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
     state: &dyn SnapshotScanState,
     engine: &dyn Engine,
 ) -> KernelResult<Option<Plan>> {
-    let log_segment = log_segment_from_state(state)?;
+    let (log_segment, commit_files) = match state.ordered_log_paths()? {
+        Some(paths) => {
+            let (segment, files) =
+                crate::log_segment::LogSegment::stream_scan_inputs(state, paths)?;
+            (segment, Some(files))
+        }
+        None => (log_segment_from_state(state)?, None),
+    };
     let table_configuration = TableConfiguration::try_new(
         state.metadata()?,
         state.protocol()?,
@@ -108,7 +115,7 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
             physical_stats_output_schema: &None,
             partition_values: &PartitionValuesOptions::default(),
         }
-        .build_metadata_scan_plan(&shape);
+        .build_metadata_scan_plan_with_commits(&shape, commit_files);
     }
 
     let stats = StatsOptions::default();
@@ -138,7 +145,7 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
         physical_stats_output_schema: &physical_stats_output_schema,
         partition_values: &partition_values,
     }
-    .build_metadata_scan_plan(&shape)
+    .build_metadata_scan_plan_with_commits(&shape, commit_files)
 }
 
 #[cfg(test)]

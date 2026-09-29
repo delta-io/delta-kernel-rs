@@ -57,6 +57,9 @@ pub struct FfiSnapshotHint {
 /// the FFI call receiving this value.
 #[repr(C)]
 pub struct FfiSnapshotScanState {
+    /// Optional ordered, repeatable log-path source. When present, `log_paths` must be empty.
+    /// Its batches are borrowed until the next read or the end of this FFI call.
+    pub log_path_source: *const crate::log_path::FfiLogPathSource,
     /// Target table version described by the scan state.
     pub version: Version,
     /// Connector-provided freshness claim for `version`.
