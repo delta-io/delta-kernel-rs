@@ -399,9 +399,9 @@ int main(int argc, char* argv[])
       requested_cols = optarg;
       break;
     case 's':
-      // Print the scan's resulting logical schema (scan_logical_schema), separately from the
-      // table's own schema printed above. Useful to verify that a projected/custom requested
-      // schema (-c) was actually honored by the scan.
+      // Also print the scan's logical schema (scan_logical_schema) as "Scan schema", after the
+      // table schema that is always printed as "Schema". Useful to check that a schema requested
+      // with -c was honored.
       print_scan_schema = true;
       break;
     case '?':
@@ -507,7 +507,7 @@ int main(int argc, char* argv[])
   printf("version: %" PRIu64 "\n\n", v);
 
   CSchema *cschema = get_cschema(snapshot, engine);
-  print_cschema(cschema);
+  print_cschema("Schema", cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -562,7 +562,7 @@ int main(int argc, char* argv[])
 
   if (print_scan_schema) {
     CSchema* scan_cschema = build_cschema(logical_schema, engine);
-    print_cschema_as("Scan schema", scan_cschema);
+    print_cschema("Scan schema", scan_cschema);
     free_cschema(scan_cschema);
   }
   struct EngineContext context = {

@@ -423,14 +423,9 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
   return cschema;
 }
 
-// Print a schema tree under a custom header line
-void print_cschema_as(const char *title, CSchema *schema) {
+// Print out a schema
+void print_cschema(const char *title, CSchema *schema) {
   printf("%s:\n", title);
   print_list(schema->builder, schema->list_id, 0, 0);
   printf("\n");
-}
-
-// Print out a schema
-void print_cschema(CSchema *schema) {
-  print_cschema_as("Schema", schema);
 }

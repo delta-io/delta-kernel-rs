@@ -91,7 +91,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
   } else if (strcmp(item->type, "interval day to second") == 0) {
     visit_res = visit_field_interval_day_time(state, name, item->is_nullable, &metadata, allocate_error);
 #ifdef DEFINE_GEO_TYPE_IN_DEV
-  } else if (strncmp(item->type, "geometry(", 9) == 0) {
+  } else if (strncmp(item->type, "geometry", 8) == 0) {
     char crs_buf[256];
     int end_pos = -1;
     int matched = sscanf(item->type, "geometry( %255[^)])%n", crs_buf, &end_pos);
@@ -102,7 +102,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     trim_trailing_whitespace(crs_buf);
     KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
     visit_res = visit_field_geometry(state, name, crs, item->is_nullable, &metadata, allocate_error);
-  } else if (strncmp(item->type, "geography(", 10) == 0) {
+  } else if (strncmp(item->type, "geography", 9) == 0) {
     char crs_buf[256];
     char algorithm_buf[64];
     int end_pos = -1;
