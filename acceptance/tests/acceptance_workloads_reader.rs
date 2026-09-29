@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use acceptance::acceptance_workloads::workload::execute_and_validate_workload;
-use acceptance::acceptance_workloads::TestCase;
+use acceptance::acceptance_workloads::{LoadedTestCase, TestCase};
 
 /// Tests that cannot be executed due to test harness limitations.
 /// These fail at parse time or cause infrastructure issues (OOM, hang).
@@ -504,7 +504,10 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     }
 
     // Load and execute test case
-    let test_case = TestCase::from_spec_path(&spec_path_abs);
+    let test_case = match TestCase::load(&spec_path_abs)? {
+        LoadedTestCase::Supported(test_case) => test_case,
+        LoadedTestCase::Unsupported(_) => return Ok(()),
+    };
     let table_root = test_case.table_root().expect("Failed to get table URL");
     let engine = test_utils::create_default_engine(&table_root).expect("Failed to create engine");
     let result = execute_and_validate_workload(
