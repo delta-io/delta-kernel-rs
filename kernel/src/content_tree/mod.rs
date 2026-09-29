@@ -160,9 +160,10 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 148]
     pub(crate) deletion_vector: Option<DeletionVectorInfo>,
 
-    /// ID of partition spec used to write manifest or data/delete files.
+    /// ID of partition spec used to write manifest or data/delete files. Written as `None` by
+    /// kernel, which does not yet track partition specs.
     #[field_id = 141]
-    pub(crate) spec_id: i32,
+    pub(crate) spec_id: Option<i32>,
 
     /// Partition data tuple, schema based on the partition spec. Required (non-nullable)
     /// when present in the schema. The schema is dynamically generated based on the
@@ -363,7 +364,7 @@ mod tests {
             (FILE_FORMAT, Some(101), false),
             (TRACKING, Some(147), false),
             (DV_INFO, Some(148), true),
-            (PARTITION_SPEC_ID, Some(141), false),
+            (PARTITION_SPEC_ID, Some(141), true),
             (SORT_ORDER_ID, Some(140), true),
             (RECORD_COUNT, Some(103), false),
             (FILE_SIZE_IN_BYTES, Some(104), false),

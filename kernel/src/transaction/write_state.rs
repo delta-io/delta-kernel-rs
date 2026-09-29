@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{DataType, DeltaResult, Error, Expression};
+use crate::{DataType, DeltaResult, Expression, KernelError};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -159,26 +159,28 @@ impl BoundWriteContextBuilder {
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
-            Error::invalid_partition_values(
+            KernelError::invalid_partition_values(
                 "table is not partitioned; partition values are not allowed"
             )
         );
         require!(
             !is_partitioned || self.partition_values.is_some(),
-            Error::invalid_partition_values("table is partitioned; partition values are required")
+            KernelError::invalid_partition_values(
+                "table is partitioned; partition values are required"
+            )
         );
         let has_row_tracking_columns = self.logical_row_id_col_name.is_some()
             || self.logical_row_commit_version_col_name.is_some();
         require!(
             !has_row_tracking_columns || self.write_state.row_tracking_enabled,
-            Error::unsupported(
+            KernelError::unsupported(
                 "Kernel does not allow writing materialized Row IDs or Row Commit Versions when \
                  Row Tracking is not enabled"
             )
         );
         require!(
             !has_row_tracking_columns || !self.write_state.iceberg_compat_v3_enabled,
-            Error::unsupported(
+            KernelError::unsupported(
                 "Kernel does not support writing materialized Row IDs or Row Commit Versions to \
                  IcebergCompatV3 tables"
             )
@@ -209,7 +211,7 @@ impl BoundWriteContextBuilder {
         if let Some(normalized) = &normalized {
             for logical_name in &self.write_state.logical_partition_columns {
                 let scalar = normalized.get(logical_name).ok_or_else(|| {
-                    Error::internal_error(format!(
+                    KernelError::internal_error(format!(
                         "partition column '{logical_name}' missing after validation"
                     ))
                 })?;
@@ -219,7 +221,7 @@ impl BoundWriteContextBuilder {
                     .full_logical_schema
                     .field(logical_name)
                     .ok_or_else(|| {
-                        Error::internal_error(format!(
+                        KernelError::internal_error(format!(
                             "partition column '{logical_name}' not found in schema after validation"
                         ))
                     })?
@@ -299,7 +301,7 @@ impl BoundWriteContextBuilder {
             return Ok(None);
         }
         let physical_name = physical_name.ok_or_else(|| {
-            Error::invalid_protocol(format!(
+            KernelError::invalid_protocol(format!(
                 "The table has Row Tracking enabled, but {configuration_key} is missing from its \
                  metadata configuration"
             ))
@@ -372,7 +374,7 @@ impl WriteState {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "unsupported write state format version {}; expected {}",
                 wire.version, WRITE_STATE_FORMAT_VERSION
             ))
@@ -421,7 +423,7 @@ impl WriteState {
                     let value = partition_values
                         .and_then(|values| values.get(name))
                         .ok_or_else(|| {
-                            Error::internal_error(format!(
+                            KernelError::internal_error(format!(
                                 "partition column '{name}' missing while building \
                                  logical-to-physical expression"
                             ))

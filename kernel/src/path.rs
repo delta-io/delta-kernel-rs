@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, FileMeta, KernelError, Version};
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -314,10 +314,11 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     /// not a commit.
     pub(crate) fn parse_commit(location: Location) -> DeltaResult<Self> {
         let url = location.as_url().to_string();
-        let parsed = Self::try_from(location)?.ok_or_else(|| Error::invalid_log_path(&url))?;
+        let parsed =
+            Self::try_from(location)?.ok_or_else(|| KernelError::invalid_log_path(&url))?;
         require!(
             parsed.is_commit(),
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Expected a commit path, got {} of type {:?}",
                 url, parsed.file_type
             ))
@@ -384,7 +385,7 @@ impl ParsedLogPath<FileMeta> {
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "read_in_commit_timestamp can only be called on commit files, got: {:?}",
                 self.file_type
             )));
@@ -403,12 +404,12 @@ impl ParsedLogPath<FileMeta> {
             Some(Ok(actions)) => {
                 let mut visitor = InCommitTimestampVisitor::default();
                 visitor.visit_rows_of(actions.as_ref())?;
-                visitor
-                    .in_commit_timestamp
-                    .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
+                visitor.in_commit_timestamp.ok_or_else(|| {
+                    KernelError::generic("In-Commit Timestamp not found in commit file")
+                })
             }
             Some(Err(err)) => Err(err),
-            None => Err(Error::generic("Commit file contains no actions")),
+            None => Err(KernelError::generic("Commit file contains no actions")),
         }
     }
 }
@@ -418,7 +419,7 @@ impl ParsedLogPath<Url> {
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
         let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
         Self::try_from(location)?.ok_or_else(|| {
-            Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
+            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
 
@@ -430,7 +431,7 @@ impl ParsedLogPath<Url> {
         let filename = format!("{version:020}.json");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_commit() {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "ParsedLogPath::new_commit created a non-commit path",
             ));
         }
@@ -445,7 +446,7 @@ impl ParsedLogPath<Url> {
         let filename = format!("{version:020}.checkpoint.parquet");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "ParsedLogPath::new_classic_parquet_checkpoint created a non-checkpoint path",
             ));
         }
@@ -461,7 +462,7 @@ impl ParsedLogPath<Url> {
         let filename = format!("{:020}.checkpoint.{}.parquet", version, Uuid::new_v4());
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "ParsedLogPath::new_uuid_parquet_checkpoint created a non-checkpoint path",
             ));
         }
@@ -474,7 +475,7 @@ impl ParsedLogPath<Url> {
         let filename = format!("{version:020}.crc");
         let path = Self::create_path(table_root, filename)?;
         if !matches!(path.file_type, LogPathFileType::Crc) {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "ParsedLogPath::new_crc created a non-CRC path",
             ));
         }
@@ -492,7 +493,7 @@ impl ParsedLogPath<Url> {
         let filename = format!("{start_version:020}.{end_version:020}.compacted.json");
         let path = Self::create_path(table_root, filename)?;
         if !matches!(path.file_type, LogPathFileType::CompactedCommit { .. }) {
-            return Err(Error::internal_error(
+            return Err(KernelError::internal_error(
                 "ParsedLogPath::new_log_compaction created a non-compaction path",
             ));
         }
@@ -552,7 +553,7 @@ impl LogRoot {
         let filename = format!("{version:020}.json");
         let path = self.log_root().join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
-            Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
+            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
 
@@ -565,7 +566,7 @@ impl LogRoot {
         let filename = format!("{version:020}.{uuid}.json");
         let path = self.log_root().join(STAGED_COMMITS_DIR)?.join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
-            Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
+            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
 }

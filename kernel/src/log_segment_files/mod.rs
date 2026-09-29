@@ -24,7 +24,7 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{DeltaResult, Error, StorageHandler, Version};
+use crate::{DeltaResult, KernelError, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -669,7 +669,7 @@ impl LogSegmentFiles {
             //     the drop leaves commits 0-2 behind, the new table writes its own 0, 1, 2, ...,
             //     and listing from version 0 sees one contiguous sequence whose low versions belong
             //     to two different tables and replays it as a single history.
-            return Err(Error::invalid_checkpoint(
+            return Err(KernelError::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
             ));
         };

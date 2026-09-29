@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
+use delta_kernel::{DeltaResult, KernelError, PredicateRef, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
@@ -65,7 +65,7 @@ pub struct FfiIncrementalScanBuilder {
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiIncrementalScanBuilder`].
 #[handle_descriptor(target=FfiIncrementalScanBuilder, mutable=true, sized=true)]
-pub struct MutableFfiIncrementalScanBuilder;
+pub struct ExclusiveIncrementalScanBuilder;
 
 /// An incremental scan stream, guarded by a mutex so it can cross the FFI boundary as a shared
 /// handle. The stream itself is single-consumer; the mutex serializes concurrent `next` calls.
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
     snapshot: Handle<SharedSnapshot>,
     base_version: Version,
     engine: Handle<SharedExternEngine>,
-) -> Handle<MutableFfiIncrementalScanBuilder> {
+) -> Handle<ExclusiveIncrementalScanBuilder> {
     let target_snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.clone_as_arc() };
     Box::new(FfiIncrementalScanBuilder {
@@ -130,10 +130,10 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// fields are safe to call and read.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
-    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    builder: Handle<ExclusiveIncrementalScanBuilder>,
     engine: Handle<SharedExternEngine>,
     predicate: &mut EnginePredicate,
-) -> ExternResult<Handle<MutableFfiIncrementalScanBuilder>> {
+) -> ExternResult<Handle<ExclusiveIncrementalScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
     incremental_scan_builder_with_predicate_impl(*builder, predicate).into_extern_result(&engine)
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
 fn incremental_scan_builder_with_predicate_impl(
     mut builder: FfiIncrementalScanBuilder,
     predicate: &mut EnginePredicate,
-) -> DeltaResult<Handle<MutableFfiIncrementalScanBuilder>> {
+) -> DeltaResult<Handle<ExclusiveIncrementalScanBuilder>> {
     builder.predicate = Some(Arc::new(decode_engine_predicate(predicate)?));
     Ok(Box::new(builder).into())
 }
@@ -165,7 +165,7 @@ fn incremental_scan_builder_with_predicate_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_builder_build(
-    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
@@ -198,7 +198,7 @@ fn incremental_scan_builder_build_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn free_incremental_scan_builder(
-    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) {
     builder.drop_handle();
 }
@@ -237,7 +237,7 @@ fn incremental_scan_stream_next_arrow_impl(
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
-        return Err(Error::generic(
+        return Err(KernelError::generic(
             "incremental scan stream was already consumed",
         ));
     };
@@ -295,7 +295,7 @@ fn incremental_scan_stream_into_summary_impl(
 ) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
     let inner = lock_stream(stream)?
         .take()
-        .ok_or_else(|| Error::generic("incremental scan stream was already consumed"))?;
+        .ok_or_else(|| KernelError::generic("incremental scan stream was already consumed"))?;
     let summary = inner.into_summary()?;
     Ok(Arc::new(summary).into())
 }
@@ -306,7 +306,7 @@ fn lock_stream(
     stream
         .stream
         .lock()
-        .map_err(|_| Error::generic("poisoned incremental scan stream mutex"))
+        .map_err(|_| KernelError::generic("poisoned incremental scan stream mutex"))
 }
 
 /// The base (exclusive lower bound) version of the scanned range.
@@ -432,7 +432,7 @@ mod tests {
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_gt,
         KernelExpressionVisitorState,
@@ -444,7 +444,7 @@ mod tests {
     use crate::scan::free_scan_metadata_arrow_result;
     use crate::{
         engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
-        snapshot_builder_build, snapshot_builder_set_version, NullableCvoid, TryFromStringSlice,
+        snapshot_builder_build, snapshot_builder_with_version, NullableCvoid, TryFromStringSlice,
     };
 
     /// Build an in-memory engine handle and a snapshot pinned to the last version, from a v0
@@ -467,13 +467,13 @@ mod tests {
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
-        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
+        let builder = unsafe { snapshot_builder_with_version(builder, target_version) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
         (engine, snapshot)
     }
@@ -655,7 +655,7 @@ mod tests {
             snapshot_incremental_scan_builder(snapshot.shallow_copy(), 2, engine.shallow_copy())
         };
         let result = unsafe { incremental_scan_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -723,9 +723,9 @@ mod tests {
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
 
         let next = unsafe { incremental_scan_stream_next_arrow(surviving.shallow_copy()) };
-        assert_extern_result_error_with_message(next, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(next, FFIKernelError::GenericError, None);
         let again = unsafe { incremental_scan_stream_into_summary(surviving) };
-        assert_extern_result_error_with_message(again, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(again, FFIKernelError::GenericError, None);
 
         unsafe { free_incremental_scan_summary(summary) };
         unsafe { free_snapshot(snapshot) };
@@ -755,9 +755,9 @@ mod tests {
         drop(unsafe { recover_error(e) });
 
         let again = unsafe { incremental_scan_stream_next_arrow(stream.shallow_copy()) };
-        assert_extern_result_error_with_message(again, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(again, FFIKernelError::GenericError, None);
         let summary = unsafe { incremental_scan_stream_into_summary(stream) };
-        assert_extern_result_error_with_message(summary, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(summary, FFIKernelError::GenericError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -921,7 +921,7 @@ mod tests {
             ))
         };
         let result = unsafe { incremental_scan_builder_build(builder) };
-        assert_extern_result_error_with_message(result, KernelError::MissingColumnError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::MissingColumnError, None);
 
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -1070,13 +1070,13 @@ mod tests {
 
         // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and
         // drops commit 1's JSON.
-        let mut builder_v2 = unsafe {
+        let builder_v2 = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
-        unsafe { snapshot_builder_set_version(&mut builder_v2, 2) };
+        let builder_v2 = unsafe { snapshot_builder_with_version(builder_v2, 2) };
         let snapshot_v2 = unsafe { ok_or_panic(snapshot_builder_build(builder_v2)) };
         // checkpoint_snapshot borrows its handle (clone_as_arc) but does not consume it, so pass a
         // shallow copy and free the original separately.
@@ -1094,13 +1094,13 @@ mod tests {
         unsafe { free_snapshot(snapshot_v2) };
 
         // Fresh snapshot at v3: its log segment starts at the v2 checkpoint, so commit 1 is gone.
-        let mut builder_v3 = unsafe {
+        let builder_v3 = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
-        unsafe { snapshot_builder_set_version(&mut builder_v3, 3) };
+        let builder_v3 = unsafe { snapshot_builder_with_version(builder_v3, 3) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder_v3)) };
 
         // base_version 0 needs commit 1, which the checkpoint truncated => None, not an error.

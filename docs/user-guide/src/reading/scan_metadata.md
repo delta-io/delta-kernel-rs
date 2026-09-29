@@ -109,7 +109,7 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| Error::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine
@@ -308,7 +308,7 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // may yield Err(Error::Cancelled) if cancellation stops replay
+    let metadata = metadata?; // may yield Err(KernelError::Cancelled) if cancellation stops replay
     // ... process the batch ...
 }
 ```
@@ -320,7 +320,7 @@ flight.
 
 Cancellation can race with successful completion. Work already initiated may complete and its
 results may still be returned. If cancellation stops replay before completion, it surfaces as
-`Error::Cancelled` rather than a partial result that appears complete.
+`KernelError::Cancelled` rather than a partial result that appears complete.
 
 Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
 to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does

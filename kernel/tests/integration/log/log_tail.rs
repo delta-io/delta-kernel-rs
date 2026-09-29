@@ -3,7 +3,7 @@ use std::sync::Arc;
 use delta_kernel::commit_range::CommitRange;
 use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::{Error, Snapshot};
+use delta_kernel::{KernelError, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -558,7 +558,7 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .with_log_tail(log_tail)
         .build(engine.as_ref());
 
-    assert!(matches!(result, Err(Error::MissingVersion(3))));
+    assert!(matches!(result, Err(KernelError::MissingVersion(3))));
 
     Ok(())
 }

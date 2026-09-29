@@ -5,7 +5,7 @@ use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Validates that if a table schema contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns,
 /// the table must have the TimestampNanos and TimestampNtz features in both reader and writer
@@ -17,7 +17,7 @@ pub(crate) fn validate_timestamp_nanos_feature_support(tc: &TableConfiguration) 
     {
         require!(
             !schema_contains_timestamp_nanos(&tc.logical_schema()),
-            Error::unsupported(
+            KernelError::unsupported(
                 "Table contains TIMESTAMP_NANOS or TIMESTAMP_NANOS_NTZ columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features"
             )
         );

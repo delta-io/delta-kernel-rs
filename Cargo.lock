@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acceptance"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "datatest-stable",
  "delta_kernel",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "clap",
  "delta_kernel",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "arrow 58.1.0",
  "arrow 59.0.0",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_benchmarks"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "criterion",
  "delta-kernel-unity-catalog",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_default_engine"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1427,14 +1427,14 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_default_engine_test_utils"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "delta_kernel",
 ]
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "bytes",
  "cbindgen",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi_macros"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_workloads"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
@@ -1671,7 +1671,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "feature_tests"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "mem-test"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "test_utils"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",

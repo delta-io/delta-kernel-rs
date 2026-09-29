@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
@@ -19,7 +19,7 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<
     if has_scheme(path) {
         // A URI scheme means the path is absolute and used as-is.
         Url::parse(path).map_err(|e| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Failed to parse absolute AMT location {path:?}: {e}"
             ))
         })
@@ -30,7 +30,7 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<
             base.push('/');
         }
         Url::parse(&format!("{base}{path}")).map_err(|e| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
             ))
         })

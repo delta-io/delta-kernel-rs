@@ -15,8 +15,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, PredicateRef,
-    Version,
+    DeltaResult, Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError,
+    PredicateRef, Version,
 };
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
@@ -78,7 +78,7 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
-    /// - [`Error::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
+    /// - [`KernelError::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
@@ -90,7 +90,7 @@ impl IncrementalScanBuilder {
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
                 self.base_version, target_version
             ))
@@ -102,7 +102,7 @@ impl IncrementalScanBuilder {
         // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
         // `checked_add` to make the dependency explicit and panic-free.
         let start_version = self.base_version.checked_add(1).ok_or_else(|| {
-            Error::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
+            KernelError::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
         })?;
 
         // TODO(#2552): surface in-range protocol/metadata changes to the consumer.
@@ -124,8 +124,8 @@ impl IncrementalScanBuilder {
         let snapshot_first_version = snapshot_commits.first().map(|c| c.version);
 
         // TODO(#2493): this "snapshot covers range" check becomes a typed error from
-        // `CommitRange::build` (e.g. `Error::CommitsUnavailable { missing: Range<Version> }`),
-        // pattern-matched here to return `None`.
+        // `CommitRange::build` (e.g. `KernelError::CommitsUnavailable { missing: Range<Version>
+        // }`), pattern-matched here to return `None`.
         if snapshot_first_version.is_none_or(|v| v > start_version) {
             return Ok(None);
         }
@@ -273,20 +273,20 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// - [`Error::IOError`], [`Error::ObjectStore`], or [`Error::Reqwest`] on transient I/O while
-    ///   reading commit JSONs. Retryable by rebuilding the stream.
-    /// - [`Error::FileNotFound`] if a commit was vacuumed between [`IncrementalScanBuilder::build`]
-    ///   and stream consumption. Rebuilding will likely return `Ok(None)` (commits unavailable);
-    ///   fall back to [`crate::Snapshot::scan_builder`].
-    /// - [`Error::MalformedJson`] or [`Error::Arrow`] (default-engine) on commit JSON corruption.
-    ///   Not retryable.
-    /// - [`Error::Generic`] on malformed `deletionVector` fields in a commit row, or on "cannot
-    ///   finish a stream that previously errored" when a terminal method is called after a prior
-    ///   `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
+    /// - [`KernelError::IOError`], [`KernelError::ObjectStore`], or [`KernelError::Reqwest`] on
+    ///   transient I/O while reading commit JSONs. Retryable by rebuilding the stream.
+    /// - [`KernelError::FileNotFound`] if a commit was vacuumed between
+    ///   [`IncrementalScanBuilder::build`] and stream consumption. Rebuilding will likely return
+    ///   `Ok(None)` (commits unavailable); fall back to [`crate::Snapshot::scan_builder`].
+    /// - [`KernelError::MalformedJson`] or [`KernelError::Arrow`] (default-engine) on commit JSON
+    ///   corruption. Not retryable.
+    /// - [`KernelError::Generic`] on malformed `deletionVector` fields in a commit row, or on
+    ///   "cannot finish a stream that previously errored" when a terminal method is called after a
+    ///   prior `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
     ///   corruption.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
         if self.errored {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "IncrementalScanStream: cannot finish a stream that previously errored",
             ));
         }
@@ -659,7 +659,7 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == NUM_GETTERS,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "IncrementalDedupVisitor expected {NUM_GETTERS} getters, got {}",
                 getters.len()
             ))
