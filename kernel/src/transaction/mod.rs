@@ -336,6 +336,21 @@ where
     }))
 }
 
+fn selected_row_count(batches: &[FilteredEngineData]) -> usize {
+    batches
+        .iter()
+        .map(|batch| {
+            batch
+                .selection_vector()
+                .iter()
+                .filter(|&&selected| selected)
+                .count()
+                + batch.data().len()
+                - batch.selection_vector().len()
+        })
+        .sum()
+}
+
 // =============================================================================
 // Shared methods available on ALL transaction types
 // =============================================================================
@@ -438,19 +453,30 @@ impl<S> Transaction<S> {
         // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
-        // Validate required fields for addFile.
+        let add_file_count = self
+            .add_files_metadata
+            .iter()
+            .map(|batch| batch.len())
+            .sum::<usize>();
+        let remove_file_count = selected_row_count(&self.remove_files_metadata);
+        let dv_update_count = selected_row_count(&self.dv_matched_files);
+        let mut existing_file_actions = write_validation::FileActionTracker::with_capacity(
+            add_file_count + dv_update_count,
+            remove_file_count + dv_update_count,
+        );
         write_validation::StagedDataValidator::staged_add_file(
             self.effective_table_config.physical_partition_columns(),
+            &mut existing_file_actions,
         )
         .validate(&self.add_files_metadata)?;
 
         write_validation::StagedDataValidator::staged_dv_matched_file(
             self.effective_table_config.physical_partition_columns(),
+            &mut existing_file_actions,
         )?
         .validate_filtered(&self.dv_matched_files)?;
 
-        // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file()
+        write_validation::StagedDataValidator::staged_remove_file(&mut existing_file_actions)?
             .validate_filtered(&self.remove_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
