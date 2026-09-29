@@ -1096,6 +1096,8 @@ mod scan_builder_tests {
     use std::ffi::c_void;
 
     use test_utils::{actions_to_string, TestAction};
+    #[cfg(feature = "geo-type-in-dev")]
+    use url::Url;
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
@@ -1293,7 +1295,9 @@ mod scan_builder_tests {
     #[test]
     fn test_scan_builder_with_geo_schema() -> Result<(), Box<dyn std::error::Error>> {
         let table_path = std::fs::canonicalize("../kernel/tests/data/table-with-geo/")?;
-        let table_root = format!("file://{}/", table_path.display());
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
+            .to_string();
         let engine = get_default_engine(&table_root);
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
