@@ -1409,6 +1409,51 @@ pub(crate) struct CheckpointAction {
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
+/// Mid-assembly accumulator for a [`CheckpointAction`]'s elements, filled by both decoders (the
+/// [`visitors`] `RowVisitor` and the serde `TryFrom` path) so the required-field and validation
+/// policy lives in one place ([`Self::assemble`]). Named fields remove the positional footgun of a
+/// many-argument constructor -- transposing `txn_sidecars`/`domain_metadata_sidecars` (or any of
+/// the same-typed groups) no longer type-checks.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+pub(crate) struct CheckpointActionParts {
+    /// `checkpointMetadata.version`; assembled into [`CheckpointAction::version`].
+    pub(crate) version: Option<i64>,
+    pub(crate) content_root: Option<ContentRoot>,
+    pub(crate) protocol: Option<Protocol>,
+    pub(crate) metadata: Option<Metadata>,
+    pub(crate) transactions: Vec<SetTransaction>,
+    pub(crate) domain_metadata: Vec<DomainMetadata>,
+    pub(crate) txn_sidecars: Vec<Sidecar>,
+    pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl CheckpointActionParts {
+    /// Assembles the collected elements into a [`CheckpointAction`], erroring if a required
+    /// singleton (`checkpointMetadata`/`contentRoot`/`protocol`/`metaData`) is absent or if
+    /// [`CheckpointAction::validate`] rejects the result.
+    pub(crate) fn assemble(self) -> DeltaResult<CheckpointAction> {
+        let missing = |field: &str| {
+            KernelError::generic(format!(
+                "checkpoint action is missing required `{field}` element"
+            ))
+        };
+        let action = CheckpointAction {
+            version: self.version.ok_or_else(|| missing("checkpointMetadata"))?,
+            content_root: self.content_root.ok_or_else(|| missing("contentRoot"))?,
+            protocol: self.protocol.ok_or_else(|| missing("protocol"))?,
+            metadata: self.metadata.ok_or_else(|| missing("metaData"))?,
+            transactions: self.transactions,
+            domain_metadata: self.domain_metadata,
+            txn_sidecars: self.txn_sidecars,
+            domain_metadata_sidecars: self.domain_metadata_sidecars,
+        };
+        action.validate()?;
+        Ok(action)
+    }
+}
+
 // === CheckpointAction <- JSON ===
 
 /// One element of a `checkpoint` action's union array, used for both serde directions. Each element
@@ -1418,7 +1463,7 @@ pub(crate) struct CheckpointAction {
 /// skip of element kinds a newer writer added. This is the serde-JSON twin of the
 /// `Scalar`/EngineData builder [`checkpoint_action_union_element`]: parallel by necessity (each
 /// targets a different transport), with the shared required-field/validation policy in
-/// [`CheckpointAction::from_parts`].
+/// [`CheckpointActionParts::assemble`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1515,19 +1560,12 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
     type Error = KernelError;
 
     /// Assembles a [`CheckpointAction`] from its union-array elements, then applies the shared
-    /// `CheckpointAction::from_parts` required-field and validation rules. `checkpointMetadata`,
-    /// `contentRoot`, `protocol`, and `metaData` may appear at most once (enforced by `set_once`);
-    /// `txn` and `domainMetadata` are collected inline; `sidecar` elements are routed by their
-    /// `type`.
+    /// [`CheckpointActionParts::assemble`] required-field and validation rules.
+    /// `checkpointMetadata`, `contentRoot`, `protocol`, and `metaData` may appear at most once
+    /// (enforced by `set_once`); `txn` and `domainMetadata` are collected inline; `sidecar`
+    /// elements are routed by their `type`.
     fn try_from(elements: Vec<CheckpointUnionElement>) -> DeltaResult<Self> {
-        let mut version = None;
-        let mut content_root = None;
-        let mut protocol = None;
-        let mut metadata = None;
-        let mut transactions = vec![];
-        let mut domain_metadata = vec![];
-        let mut txn_sidecars = vec![];
-        let mut domain_metadata_sidecars = vec![];
+        let mut parts = CheckpointActionParts::default();
 
         for element in elements {
             require_one_hot_element(&[
@@ -1540,43 +1578,34 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
                 element.sidecar.is_some(),
             ])?;
             if let Some(cm) = element.checkpoint_metadata {
-                set_once(&mut version, cm.version, "checkpointMetadata")?;
+                set_once(&mut parts.version, cm.version, "checkpointMetadata")?;
             }
             if let Some(cr) = element.content_root {
-                set_once(&mut content_root, cr, "contentRoot")?;
+                set_once(&mut parts.content_root, cr, "contentRoot")?;
             }
             if let Some(p) = element.protocol {
-                set_once(&mut protocol, p, "protocol")?;
+                set_once(&mut parts.protocol, p, "protocol")?;
             }
             if let Some(m) = element.metadata {
-                set_once(&mut metadata, m, "metaData")?;
+                set_once(&mut parts.metadata, m, "metaData")?;
             }
             if let Some(t) = element.txn {
-                transactions.push(t);
+                parts.transactions.push(t);
             }
             if let Some(dm) = element.domain_metadata {
-                domain_metadata.push(dm);
+                parts.domain_metadata.push(dm);
             }
             if let Some(ts) = element.sidecar {
                 route_content_sidecar(
                     &ts.sidecar_type,
                     ts.sidecar,
-                    &mut txn_sidecars,
-                    &mut domain_metadata_sidecars,
+                    &mut parts.txn_sidecars,
+                    &mut parts.domain_metadata_sidecars,
                 )?;
             }
         }
 
-        CheckpointAction::from_parts(
-            version,
-            content_root,
-            protocol,
-            metadata,
-            transactions,
-            domain_metadata,
-            txn_sidecars,
-            domain_metadata_sidecars,
-        )
+        parts.assemble()
     }
 }
 
@@ -1759,41 +1788,6 @@ impl CheckpointAction {
             txn_sidecars: vec![],
             domain_metadata_sidecars: vec![],
         }
-    }
-
-    /// Assembles a checkpoint action from already-collected elements, erroring if a required
-    /// singleton (`checkpointMetadata`/`contentRoot`/`protocol`/`metaData`) is absent or if
-    /// [`Self::validate`] rejects the result. Shared by both decoders -- the [`visitors`]
-    /// `RowVisitor` and the serde `TryFrom` path -- so the required-field and validation policy
-    /// lives in one place.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
-        version: Option<i64>,
-        content_root: Option<ContentRoot>,
-        protocol: Option<Protocol>,
-        metadata: Option<Metadata>,
-        transactions: Vec<SetTransaction>,
-        domain_metadata: Vec<DomainMetadata>,
-        txn_sidecars: Vec<Sidecar>,
-        domain_metadata_sidecars: Vec<Sidecar>,
-    ) -> DeltaResult<Self> {
-        let missing = |field: &str| {
-            KernelError::generic(format!(
-                "checkpoint action is missing required `{field}` element"
-            ))
-        };
-        let action = CheckpointAction {
-            version: version.ok_or_else(|| missing("checkpointMetadata"))?,
-            content_root: content_root.ok_or_else(|| missing("contentRoot"))?,
-            protocol: protocol.ok_or_else(|| missing("protocol"))?,
-            metadata: metadata.ok_or_else(|| missing("metaData"))?,
-            transactions,
-            domain_metadata,
-            txn_sidecars,
-            domain_metadata_sidecars,
-        };
-        action.validate()?;
-        Ok(action)
     }
 
     /// Serialize this checkpoint action into a single-row `EngineData`.

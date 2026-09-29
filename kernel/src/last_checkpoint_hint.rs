@@ -134,12 +134,16 @@ pub(crate) struct AmtCheckpoint {
     /// The embedded `checkpoint` action, prefetched alongside the hint. `None` when the writer
     /// omitted it (e.g. to bound write latency); the reader then reads it from the manifest
     /// commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) checkpoint: Option<CheckpointAction>,
 
     /// The checkpoint's embedded content entries, prefetched alongside the hint. Retained as
     /// untyped [`serde_json::Value`] because a content entry's schema depends on the table's
     /// partition spec / schema, which is not known at hint-parse time; typed materialization is
     /// deferred to the read path. `None` when the writer omitted them.
+    // TODO: parse into a typed content-entry struct mirroring `ContentTreeNodeEntry` (keeping
+    // `partition`/`content_stats` raw until the read path has the table schema) in a follow-up PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) leaves: Option<Vec<serde_json::Value>>,
 }
 

@@ -870,32 +870,16 @@ static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> = LazyLock::
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default)]
 struct CheckpointElementVisitor {
-    version: Option<i64>,
-    content_root: Option<ContentRoot>,
-    protocol: Option<Protocol>,
-    metadata: Option<Metadata>,
-    transactions: Vec<SetTransaction>,
-    domain_metadata: Vec<DomainMetadata>,
-    txn_sidecars: Vec<Sidecar>,
-    domain_metadata_sidecars: Vec<Sidecar>,
+    parts: CheckpointActionParts,
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointElementVisitor {
     /// Assemble the visited elements into a [`CheckpointAction`] via the shared
-    /// [`CheckpointAction::from_parts`], which errors if a required element was absent or if
+    /// [`CheckpointActionParts::assemble`], which errors if a required element was absent or if
     /// [`CheckpointAction::validate`] rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
-        CheckpointAction::from_parts(
-            self.version,
-            self.content_root,
-            self.protocol,
-            self.metadata,
-            self.transactions,
-            self.domain_metadata,
-            self.txn_sidecars,
-            self.domain_metadata_sidecars,
-        )
+        self.parts.assemble()
     }
 }
 
@@ -938,19 +922,20 @@ impl RowVisitor for CheckpointElementVisitor {
             ])?;
 
             if let Some(version) = checkpoint_metadata {
-                super::set_once(&mut self.version, version, "checkpointMetadata")?;
+                super::set_once(&mut self.parts.version, version, "checkpointMetadata")?;
             }
             if let Some(content_root) = content_root {
-                super::set_once(&mut self.content_root, content_root, "contentRoot")?;
+                super::set_once(&mut self.parts.content_root, content_root, "contentRoot")?;
             }
             if let Some(protocol) = protocol {
-                super::set_once(&mut self.protocol, protocol, "protocol")?;
+                super::set_once(&mut self.parts.protocol, protocol, "protocol")?;
             }
             if let Some(metadata) = metadata {
-                super::set_once(&mut self.metadata, metadata, "metaData")?;
+                super::set_once(&mut self.parts.metadata, metadata, "metaData")?;
             }
             if let Some(domain) = domain {
-                self.domain_metadata
+                self.parts
+                    .domain_metadata
                     .push(DomainMetadataVisitor::visit_domain_metadata(
                         i,
                         domain,
@@ -958,11 +943,13 @@ impl RowVisitor for CheckpointElementVisitor {
                     )?);
             }
             if let Some(app_id) = app_id {
-                self.transactions.push(SetTransactionVisitor::visit_txn(
-                    i,
-                    app_id,
-                    &getters[r.txn.clone()],
-                )?);
+                self.parts
+                    .transactions
+                    .push(SetTransactionVisitor::visit_txn(
+                        i,
+                        app_id,
+                        &getters[r.txn.clone()],
+                    )?);
             }
             if let Some(path) = sidecar_path {
                 let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
@@ -970,8 +957,8 @@ impl RowVisitor for CheckpointElementVisitor {
                 super::route_content_sidecar(
                     &sidecar_type,
                     sidecar,
-                    &mut self.txn_sidecars,
-                    &mut self.domain_metadata_sidecars,
+                    &mut self.parts.txn_sidecars,
+                    &mut self.parts.domain_metadata_sidecars,
                 )?;
             }
         }
