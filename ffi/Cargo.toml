@@ -82,6 +82,8 @@ geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
 
 # Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
 adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]
+# Experimental feature flag gating nanosecond timestamps.
+nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps", "test_utils/nanosecond-timestamps"]
 
 # Tracking global allocator for process-wide native live/peak bytes, readable via the
 # `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:

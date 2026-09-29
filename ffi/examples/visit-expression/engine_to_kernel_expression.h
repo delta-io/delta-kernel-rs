@@ -54,6 +54,26 @@ uintptr_t convert_engine_to_kernel_literal(
     case TimestampNtz:
       return visit_expression_literal_timestamp_ntz(state,
           lit->value.long_data);
+    case TimestampNanos: {
+      ExternResultusize result = visit_expression_literal_timestamp_nanos(
+          state, lit->value.long_data, allocate_error);
+      if (result.tag == Errusize) {
+        print_error("visit_expression_literal_timestamp_nanos failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
+    case TimestampNanosNtz: {
+      ExternResultusize result = visit_expression_literal_timestamp_nanos_ntz(
+          state, lit->value.long_data, allocate_error);
+      if (result.tag == Errusize) {
+        print_error("visit_expression_literal_timestamp_nanos_ntz failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
     case Date:
       return visit_expression_literal_date(state, lit->value.integer_data);
     case IntervalYearMonth:
