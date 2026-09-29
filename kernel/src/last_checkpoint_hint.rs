@@ -84,7 +84,7 @@ pub(crate) struct LastCheckpointHint {
 
 /// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field
 /// (adaptiveMetadata RFC). An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
-/// rather than failing the parse, signaling [`LastCheckpointHint::try_read`] to drop the hint so
+/// rather than failing the parse, signaling `LastCheckpointHint::try_read` to drop the hint so
 /// the reader falls back to log replay.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

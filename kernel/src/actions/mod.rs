@@ -3074,6 +3074,7 @@ mod tests {
         assert!(CheckpointAction::try_new_from_data(data.as_ref())?.is_none());
         Ok(())
     }
+
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> DeltaResult<()> {
