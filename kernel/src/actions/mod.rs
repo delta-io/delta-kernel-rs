@@ -3442,8 +3442,8 @@ mod tests {
           elements::PROTOCOL, elements::METADATA],
         "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
     // A single element setting more than one variant key violates the one-hot grammar; both
-    // transports must reject it rather than interpret it (the serde loop would process every set
-    // field, the visitor only the first).
+    // transports must reject it rather than interpret it (both decoders would otherwise process
+    // every set field, silently accepting a malformed element instead of rejecting it).
     #[case::multiple_keys_in_one_element(
         &[r#"{"checkpointMetadata":{"version":42},"sidecar":{"type":"txn","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
           elements::CONTENT_ROOT, elements::PROTOCOL, elements::METADATA],
