@@ -37,6 +37,12 @@ pub struct Stats {
 }
 
 impl DvInfo {
+    /// Returns the number of rows the deletion vector removes, or `None` if there is no deletion
+    /// vector. This reads the descriptor metadata without loading the deletion vector.
+    pub fn cardinality(&self) -> Option<i64> {
+        self.deletion_vector.as_ref().map(|dv| dv.cardinality)
+    }
+
     /// Check if this DvInfo contains a Deletion Vector. This is mostly used to know if the
     /// associated [`Stats`] struct has fully accurate information or not.
     pub fn has_vector(&self) -> bool {
@@ -248,6 +254,7 @@ mod tests {
             Some(&"2017-12-10".to_string())
         );
         assert_eq!(scan_file.partition_values.get("non-existent"), None);
+        assert_eq!(scan_file.dv_info.cardinality(), Some(2));
         assert!(scan_file.dv_info.deletion_vector.is_some());
         let dv = scan_file.dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
