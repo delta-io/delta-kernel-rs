@@ -1368,10 +1368,16 @@ impl LastManifestCommit {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
+/// This type has two distinct wire representations:
+/// - In the **Delta log**, it is a `checkpoint` array of single-key tagged objects, encoded and
+///   decoded through the `EngineData` path (`try_into_scalar` / `try_new_from_data`). See the
+///   example below.
+/// - In the **`_last_checkpoint` hint**, it is serde-(de)serialized in its natural struct form (one
+///   field per member) as prefetch embedded in the hint's `amtCheckpoint`.
 ///
 /// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
 ///
-/// Example manifest-commit JSON:
+/// Example manifest-commit (Delta log) JSON:
 /// ```json
 /// { "checkpoint": [
 ///     { "checkpointMetadata": { "version": 42 } },
@@ -1385,8 +1391,8 @@ impl LastManifestCommit {
 /// }
 /// ```
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "Vec<CheckpointUnionElement>")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct CheckpointAction {
     /// The table version up to which the checkpoint is complete, sourced from the wire
@@ -1399,13 +1405,17 @@ pub(crate) struct CheckpointAction {
     pub(crate) protocol: Protocol,
     /// The table metadata at the checkpoint version.
     pub(crate) metadata: Metadata,
-    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint array.
+    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) transactions: Vec<SetTransaction>,
-    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint array.
+    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) domain_metadata: Vec<DomainMetadata>,
     /// `sidecar` entries of type `txn`, referencing spilled [`SetTransaction`] actions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) txn_sidecars: Vec<Sidecar>,
     /// `sidecar` entries of type `domainMetadata`, referencing spilled [`DomainMetadata`] actions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
@@ -2992,264 +3002,6 @@ mod tests {
             txn_sidecars: vec![sidecar("txn-sidecar.parquet")],
             domain_metadata_sidecars: vec![sidecar("dm-sidecar.parquet")],
         }
-    }
-
-    // === CheckpointAction codec cross-validation ===
-    //
-    // A `CheckpointAction` has two independent codecs for the same `checkpoint` union-array wire
-    // shape, and both must stay consistent:
-    //   - `Serde`: `serde_json` (de)serialization, used when the action is embedded in the
-    //     `_last_checkpoint` hint.
-    //   - `EngineData`: the `Scalar`/`EngineData` path, used in the Delta log (write via
-    //     `try_into_scalar`, read via `try_new_from_data`).
-    // The two do not emit byte-identical JSON (serde spells out null `metaData` fields the engine
-    // JSON writer omits), so consistency is checked by crossing them -- one encodes, the other
-    // decodes, and the reconstructed action must be unchanged.
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[derive(Debug, Clone, Copy)]
-    enum Codec {
-        Serde,
-        EngineData,
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    impl Codec {
-        /// Encode `action` to its `checkpoint` union-array JSON, erroring if the action is invalid
-        /// (both codecs validate before emitting).
-        fn encode(self, action: &CheckpointAction) -> DeltaResult<serde_json::Value> {
-            match self {
-                Codec::Serde => Ok(serde_json::to_value(action)?),
-                Codec::EngineData => {
-                    let scalar = action.clone().try_into_scalar()?;
-                    let data =
-                        create_row(&ExprEngine::new(), LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
-                    let bytes = to_json_bytes(std::iter::once(Ok(
-                        FilteredEngineData::with_all_rows_selected(data),
-                    )))?;
-                    let commit: serde_json::Value = serde_json::from_slice(&bytes)?;
-                    Ok(commit["checkpoint"].clone())
-                }
-            }
-        }
-
-        /// Decode a `checkpoint` union-array JSON back to a [`CheckpointAction`], erroring if it is
-        /// malformed (or, for the `EngineData` path, absent).
-        fn decode(self, union_array: &serde_json::Value) -> DeltaResult<CheckpointAction> {
-            match self {
-                Codec::Serde => Ok(serde_json::from_value(union_array.clone())?),
-                Codec::EngineData => {
-                    let commit = json!({ "checkpoint": union_array }).to_string();
-                    let data = crate::unit_test_utils::parse_json_batch(
-                        crate::arrow::array::StringArray::from(vec![commit]),
-                    );
-                    CheckpointAction::try_new_from_data(data.as_ref())?
-                        .ok_or_else(|| KernelError::generic("no checkpoint action in data"))
-                }
-            }
-        }
-    }
-
-    /// A `checkpoint` union array built from raw element JSON strings, for the malformed/skip
-    /// cases.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn union_array(elements: &[&str]) -> serde_json::Value {
-        serde_json::from_str(&format!("[{}]", elements.join(","))).unwrap()
-    }
-
-    /// Well-formed element fixtures. Each case below drops, duplicates, or corrupts one to build a
-    /// specific malformed array; on their own the four together form a valid action.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    mod elements {
-        pub(super) const CHECKPOINT_METADATA: &str = r#"{"checkpointMetadata":{"version":42}}"#;
-        pub(super) const CONTENT_ROOT: &str =
-            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40}}"#;
-        pub(super) const PROTOCOL: &str =
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
-        pub(super) const METADATA: &str = r#"{"metaData":{"id":"t","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn minimal_action() -> CheckpointAction {
-        CheckpointAction::new(
-            42,
-            ContentRoot::new("p".to_string(), 1, 40),
-            Protocol::new_unchecked(1, 2, None, None),
-            Metadata::default(),
-            vec![],
-            vec![],
-        )
-    }
-
-    /// `contentRoot.version == checkpointMetadata.version`, the upper boundary `validate` allows.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn content_root_at_checkpoint_version_action() -> CheckpointAction {
-        let mut action = minimal_action();
-        action.content_root.version = action.version;
-        action
-    }
-
-    /// Multiple `txn`/`domainMetadata` and same-type sidecars plus an empty sidecar list, to
-    /// exercise the count > 1 and count 0 collection loops in both codecs.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn multiple_and_empty_collections_action() -> CheckpointAction {
-        let sidecar = |path: &str| Sidecar {
-            path: path.to_string(),
-            size_in_bytes: 1,
-            modification_time: 2,
-            tags: None,
-        };
-        let txn = |app_id: &str, version: i64| SetTransaction {
-            app_id: app_id.to_string(),
-            version,
-            last_updated: None,
-        };
-        let dm = |domain: &str, configuration: &str, removed: bool| DomainMetadata {
-            domain: domain.to_string(),
-            configuration: configuration.to_string(),
-            removed,
-        };
-        CheckpointAction {
-            transactions: vec![txn("a1", 1), txn("a2", 2)],
-            domain_metadata: vec![dm("d1", "c1", false), dm("d2", "c2", true)],
-            txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
-            domain_metadata_sidecars: vec![],
-            ..minimal_action()
-        }
-    }
-
-    /// A (3, 7) protocol carrying the same ReaderWriter feature in both lists (required by the
-    /// read-time feature-consistency check).
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn protocol_with_features_action() -> CheckpointAction {
-        CheckpointAction {
-            protocol: Protocol::new_unchecked(
-                3,
-                7,
-                Some(vec![TableFeature::AdaptiveMetadataPreview]),
-                Some(vec![TableFeature::AdaptiveMetadataPreview]),
-            ),
-            ..sample_checkpoint_action()
-        }
-    }
-
-    /// Every action fixture survives each of the four encode/decode codec pairings unchanged: the
-    /// two same-codec round trips and, crucially, the two cross pairings (one codec writes, the
-    /// other reads) that guard the serde and `EngineData` paths against drifting apart.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    #[case::fully_populated(sample_checkpoint_action())]
-    #[case::minimal(minimal_action())]
-    #[case::content_root_at_checkpoint_version(content_root_at_checkpoint_version_action())]
-    #[case::multiple_and_empty_collections(multiple_and_empty_collections_action())]
-    #[case::protocol_with_features(protocol_with_features_action())]
-    fn checkpoint_action_round_trips_within_and_across_codecs(
-        #[case] action: CheckpointAction,
-        #[values(Codec::Serde, Codec::EngineData)] encoder: Codec,
-        #[values(Codec::Serde, Codec::EngineData)] decoder: Codec,
-    ) {
-        let encoded = encoder.encode(&action).unwrap();
-        let decoded = decoder.decode(&encoded).unwrap();
-        assert_eq!(
-            action, decoded,
-            "encode with {encoder:?}, decode with {decoder:?}"
-        );
-    }
-
-    /// Both codecs reject the same malformed union arrays with the same message: a missing or
-    /// duplicated required singleton, an unsupported sidecar `type`, or `contentRoot.version` above
-    /// the checkpoint version. So a `_last_checkpoint` hint carrying such a `checkpoint` falls back
-    /// to log replay rather than trusting a partial action, exactly as the log-replay path does.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    #[case::empty(&[], "missing required `checkpointMetadata`")]
-    #[case::missing_checkpoint_metadata(
-        &[elements::CONTENT_ROOT, elements::PROTOCOL, elements::METADATA],
-        "missing required `checkpointMetadata`")]
-    #[case::missing_content_root(
-        &[elements::CHECKPOINT_METADATA, elements::PROTOCOL, elements::METADATA],
-        "missing required `contentRoot`")]
-    #[case::missing_protocol(
-        &[elements::CHECKPOINT_METADATA, elements::CONTENT_ROOT, elements::METADATA],
-        "missing required `protocol`")]
-    #[case::missing_metadata(
-        &[elements::CHECKPOINT_METADATA, elements::CONTENT_ROOT, elements::PROTOCOL],
-        "missing required `metaData`")]
-    #[case::duplicate_checkpoint_metadata(
-        &[elements::CHECKPOINT_METADATA, elements::CHECKPOINT_METADATA, elements::CONTENT_ROOT,
-          elements::PROTOCOL, elements::METADATA],
-        "duplicate `checkpointMetadata` element in checkpoint action")]
-    #[case::duplicate_metadata(
-        &[elements::CHECKPOINT_METADATA, elements::CONTENT_ROOT, elements::PROTOCOL,
-          elements::METADATA, elements::METADATA],
-        "duplicate `metaData` element in checkpoint action")]
-    #[case::bad_sidecar_type(
-        &[elements::CHECKPOINT_METADATA, elements::CONTENT_ROOT, elements::PROTOCOL,
-          elements::METADATA,
-          r#"{"sidecar":{"type":"bogus","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#],
-        "checkpoint sidecar has unsupported type `bogus`")]
-    #[case::content_root_version_too_high(
-        &[elements::CHECKPOINT_METADATA,
-          r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
-          elements::PROTOCOL, elements::METADATA],
-        "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
-    // A single element setting more than one variant key violates the one-hot grammar; both
-    // transports must reject it rather than interpret it (both decoders would otherwise process
-    // every set field, silently accepting a malformed element instead of rejecting it).
-    #[case::multiple_keys_in_one_element(
-        &[r#"{"checkpointMetadata":{"version":42},"sidecar":{"type":"txn","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
-          elements::CONTENT_ROOT, elements::PROTOCOL, elements::METADATA],
-        "checkpoint action element sets multiple keys")]
-    fn checkpoint_action_decode_rejects_malformed(
-        #[case] elements: &[&str],
-        #[case] expected_msg: &str,
-        #[values(Codec::Serde, Codec::EngineData)] codec: Codec,
-    ) {
-        let err = codec.decode(&union_array(elements)).unwrap_err();
-        assert!(
-            err.to_string().contains(expected_msg),
-            "codec {codec:?}: expected error containing {expected_msg:?}, got: {err}"
-        );
-    }
-
-    /// Both codecs skip an element kind kernel does not recognize (added by a newer writer) rather
-    /// than failing the parse, keeping the AMT fast path forward-compatible.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    fn checkpoint_action_decode_skips_unknown_element(
-        #[values(Codec::Serde, Codec::EngineData)] codec: Codec,
-    ) {
-        let action = codec
-            .decode(&union_array(&[
-                elements::CHECKPOINT_METADATA,
-                r#"{"someFutureElement":{"whatever":true}}"#,
-                elements::CONTENT_ROOT,
-                elements::PROTOCOL,
-                elements::METADATA,
-            ]))
-            .unwrap();
-        assert_eq!(action.version, 42);
-        assert_eq!(action.content_root.path, "p");
-        assert!(action.transactions.is_empty());
-        assert!(action.domain_metadata.is_empty());
-    }
-
-    /// Both codecs run `validate()` before emitting, so kernel cannot write a `checkpoint` (e.g.
-    /// into a `_last_checkpoint` hint) with `contentRoot.version > version` that its own decode
-    /// path would then reject.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    fn checkpoint_action_encode_rejects_content_root_version_above_checkpoint(
-        #[values(Codec::Serde, Codec::EngineData)] codec: Codec,
-    ) {
-        let mut action = sample_checkpoint_action();
-        action.content_root.version = action.version + 1;
-        let err = codec.encode(&action).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("exceeds checkpointMetadata.version"),
-            "codec {codec:?}: {err}"
-        );
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]

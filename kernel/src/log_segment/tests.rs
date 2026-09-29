@@ -21,8 +21,6 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -5449,48 +5447,6 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
     );
 
     Ok(())
-}
-
-/// The AMT hint accessors are gated on `checkpoint_type == AdaptiveMetadataTree`: a hint that tags
-/// itself otherwise (or carries no type) is suppressed even when it still holds an `amtCheckpoint`,
-/// and an AMT-typed hint with no `amtCheckpoint` object yields `None`.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-#[test]
-fn amt_checkpoint_hint_accessor_gates_on_checkpoint_type() {
-    let amt = || AmtCheckpoint {
-        manifest_commit_version: 6,
-        checkpoint: None,
-        leaves: None,
-    };
-    let segment = |hint: Option<LastCheckpointHint>| LogSegment {
-        end_version: 7,
-        checkpoint_version: Some(7),
-        log_root: Url::parse("memory:///_delta_log/").unwrap(),
-        listed: LogSegmentFiles::default(),
-        last_checkpoint_metadata: hint,
-    };
-    let hint = |checkpoint_type, amt_checkpoint| LastCheckpointHint {
-        version: 7,
-        checkpoint_type,
-        amt_checkpoint,
-        ..Default::default()
-    };
-
-    // AMT-typed hint carrying an amtCheckpoint: exposed with its manifestCommitVersion intact.
-    let seg = segment(Some(hint(
-        Some(CheckpointType::AdaptiveMetadataTree),
-        Some(amt()),
-    )));
-    assert_eq!(seg.amt_checkpoint_hint(), Some(&amt()));
-
-    // A non-AMT checkpoint type suppresses the accessor even though amtCheckpoint is present.
-    let seg = segment(Some(hint(Some(CheckpointType::Unknown), Some(amt()))));
-    assert_eq!(seg.amt_checkpoint_hint(), None);
-
-    // AMT type but no amtCheckpoint object, and no hint at all, both yield None.
-    let seg = segment(Some(hint(Some(CheckpointType::AdaptiveMetadataTree), None)));
-    assert_eq!(seg.amt_checkpoint_hint(), None);
-    assert_eq!(segment(None).amt_checkpoint_hint(), None);
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]

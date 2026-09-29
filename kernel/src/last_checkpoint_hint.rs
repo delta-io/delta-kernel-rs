@@ -64,13 +64,14 @@ pub(crate) struct LastCheckpointHint {
     ///
     /// - **absent** (`None`): a classic / multi-part / V2 checkpoint. Kernel knows this format, so
     ///   the hint is valid and used as-is (see [`Self::applies_to`]).
-    /// - **`AdaptiveMetadataTree`**: an AMT checkpoint; the reader takes the AMT fast path via the
-    ///   embedded [`amt_checkpoint`](Self::amt_checkpoint).
-    /// - **`Unknown`**: a format kernel does not recognize. The whole hint is discarded at read
-    ///   time (see [`Self::try_read`]) and the reader falls back to log replay.
+    /// - **`AdaptiveMetadataTree`**: an AMT checkpoint; the embedded
+    ///   [`amt_checkpoint`](Self::amt_checkpoint) carries the prefetched checkpoint state.
+    /// - **`Unknown`**: a `checkpointType` value kernel does not recognize (e.g. from a newer
+    ///   writer). It does not enable any AMT handling; the hint's remaining fields are consumed as
+    ///   for a legacy checkpoint.
     ///
-    /// Absent and `Unknown` are thus distinct: absence is a known (legacy) checkpoint, whereas an
-    /// unrecognized value invalidates the hint.
+    /// Absent and `Unknown` are distinct: absence is a known (legacy) checkpoint, whereas
+    /// `Unknown` is a tag kernel cannot interpret.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) checkpoint_type: Option<CheckpointType>,
 
@@ -82,18 +83,17 @@ pub(crate) struct LastCheckpointHint {
 }
 
 /// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field
-/// (adaptiveMetadata RFC). An unrecognized wire value deserializes to [`CheckpointType::Unknown`],
-/// signaling the reader to fall back to log replay rather than misinterpreting the hint.
+/// (adaptiveMetadata RFC). An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
+/// rather than failing the parse.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum CheckpointType {
     /// An adaptive-metadata (Iceberg V4) embedded-tree checkpoint.
     AdaptiveMetadataTree,
-    /// Any value kernel does not recognize. A hint carrying it is discarded entirely (the reader
-    /// falls back to log replay), unlike an absent `checkpointType`, which is a usable legacy
-    /// checkpoint. Read-only: it is produced only by deserializing an unrecognized wire value,
-    /// never written by kernel (see the hand-written [`Serialize`], which refuses it).
+    /// Any value kernel does not recognize (e.g. from a newer writer). Read-only: it is produced
+    /// only by deserializing an unrecognized wire value, never written by kernel (see the
+    /// hand-written [`Serialize`], which refuses it).
     #[serde(other)]
     Unknown,
 }
@@ -341,29 +341,10 @@ impl LastCheckpointHint {
             .next()
         {
             Some(Ok(data)) => {
-                let result = Self::from_bytes_with_oversized_fields_dropped(&data)
-                    .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                    .ok()
-                    // A hint tagged with a checkpoint format kernel does not recognize is discarded
-                    // entirely: kernel cannot interpret it, so the reader falls back to log replay.
-                    // An absent `checkpointType` is a known legacy checkpoint and is kept; an
-                    // `AdaptiveMetadataTree` checkpoint is usable via the AMT read path. Only an
-                    // explicit unrecognized `checkpointType` ([`CheckpointType::Unknown`]) is
-                    // unusable. Without the `adaptive-metadata-in-dev` feature the field does not
-                    // exist, so every hint is usable.
-                    .filter(|_hint| {
-                        #[cfg(feature = "adaptive-metadata-in-dev")]
-                        let usable = _hint.checkpoint_type != Some(CheckpointType::Unknown);
-                        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-                        let usable = true;
-                        if !usable {
-                            warn!(
-                                "_last_checkpoint has an unrecognized checkpointType; discarding"
-                            );
-                        }
-                        usable
-                    });
-                info!(hint = result.as_ref().map(|h| h.summary()));
+                let result: Option<LastCheckpointHint> =
+                    Self::from_bytes_with_oversized_fields_dropped(&data)
+                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                        .ok();
                 Ok(result)
             }
             Some(Err(KernelError::FileNotFound(_))) => {
@@ -376,14 +357,6 @@ impl LastCheckpointHint {
                 Ok(None)
             }
         }
-    }
-
-    /// Succinct summary string for logging purposes.
-    fn summary(&self) -> String {
-        format!(
-            "{{v={}, size={}, parts={:?}}}",
-            self.version, self.size, self.parts
-        )
     }
 
     /// Convert the LastCheckpointHint to JSON bytes
@@ -517,7 +490,7 @@ mod tests {
 
     /// The full JSON form of an AMT (`AdaptiveMetadataTree`) `_last_checkpoint` hint parses to its
     /// typed fields: `checkpointType`, the required `manifestCommitVersion`, the embedded
-    /// `checkpoint` action (union array), and the prefetched `leaves` (retained raw). Guards the
+    /// `checkpoint` action (struct form), and the prefetched `leaves` (retained raw). Guards the
     /// `camelCase`/`PascalCase` wire keys -- a rename would silently parse to `None`/`Unknown`
     /// (errors are swallowed in `try_read`) and disable the AMT fast path.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -529,14 +502,14 @@ mod tests {
             "checkpointType": "AdaptiveMetadataTree",
             "amtCheckpoint": {
                 "manifestCommitVersion": 6,
-                "checkpoint": [
-                    {"checkpointMetadata": {"version": 7}},
-                    {"contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7}},
-                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
-                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]}},
-                    {"metaData": {"id": "tid", "format": {"provider": "parquet", "options": {}},
-                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}}
-                ],
+                "checkpoint": {
+                    "version": 7,
+                    "contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7},
+                    "protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]},
+                    "metadata": {"id": "tid", "format": {"provider": "parquet", "options": {}},
+                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}
+                },
                 "leaves": [
                     {"contentType": 0, "location": "data/part-0.parquet", "recordCount": 3}
                 ]
@@ -566,63 +539,14 @@ mod tests {
         assert!(hint.amt_checkpoint.is_none());
     }
 
-    /// A `checkpointType` value kernel does not recognize parses to `Unknown` (rather than
-    /// failing), signaling the reader to fall back to log replay.
+    /// A `checkpointType` value kernel does not recognize parses to `Unknown` rather than failing
+    /// the whole-hint parse.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn unrecognized_checkpoint_type_parses_to_unknown() {
         let json = br#"{"version": 5, "size": 10, "checkpointType": "SomethingNewer"}"#;
         let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
         assert_eq!(hint.checkpoint_type, Some(CheckpointType::Unknown));
-    }
-
-    /// `try_read` distinguishes the three `checkpointType` states: an absent type (a classic /
-    /// multi-part / V2 checkpoint) and an `AdaptiveMetadataTree` type are both recognized formats
-    /// and retained, whereas an unrecognized value discards the whole hint so the reader falls back
-    /// to log replay.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn try_read_retains_recognized_and_discards_unrecognized_checkpoint_type() {
-        use crate::engine::sync::SyncEngine;
-        use crate::object_store::memory::InMemory;
-        use crate::Engine;
-
-        let log_root = Url::parse("memory:///_delta_log/").unwrap();
-        let read_hint = |json: &str| {
-            let engine = SyncEngine::new_with_store(std::sync::Arc::new(InMemory::new()));
-            let storage = engine.storage_handler();
-            storage
-                .put(
-                    &LastCheckpointHint::path(&log_root).unwrap(),
-                    bytes::Bytes::copy_from_slice(json.as_bytes()),
-                    true,
-                )
-                .unwrap();
-            LastCheckpointHint::try_read(storage.as_ref(), &log_root, None).unwrap()
-        };
-
-        // Absent checkpointType (classic / multi-part / V2): recognized, so retained.
-        let hint = read_hint(r#"{"version": 5, "size": 10}"#).expect("legacy hint retained");
-        assert_eq!(hint.version, 5);
-        assert!(hint.checkpoint_type.is_none());
-
-        // AdaptiveMetadataTree: recognized, so retained.
-        let hint = read_hint(
-            r#"{"version": 6, "size": -1, "checkpointType": "AdaptiveMetadataTree",
-                "amtCheckpoint": {"manifestCommitVersion": 6}}"#,
-        )
-        .expect("AMT hint retained");
-        assert_eq!(
-            hint.checkpoint_type,
-            Some(CheckpointType::AdaptiveMetadataTree)
-        );
-
-        // Unrecognized checkpointType: the whole hint is discarded.
-        assert!(
-            read_hint(r#"{"version": 5, "size": 10, "checkpointType": "SomethingNewer"}"#)
-                .is_none(),
-            "unrecognized checkpointType must discard the hint"
-        );
     }
 
     /// `AdaptiveMetadataTree` serializes to its wire string, but `Unknown` refuses to serialize --
@@ -649,7 +573,7 @@ mod tests {
     }
 
     /// An AMT hint round-trips through serialization: the embedded `checkpoint` action re-emits its
-    /// union array and the raw `leaves` re-emit verbatim, so the reparsed hint equals the original.
+    /// struct form and the raw `leaves` re-emit verbatim, so the reparsed hint equals the original.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn amt_checkpoint_hint_json_round_trips() {
@@ -659,14 +583,14 @@ mod tests {
             "checkpointType": "AdaptiveMetadataTree",
             "amtCheckpoint": {
                 "manifestCommitVersion": 6,
-                "checkpoint": [
-                    {"checkpointMetadata": {"version": 7}},
-                    {"contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7}},
-                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
-                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]}},
-                    {"metaData": {"id": "tid", "format": {"provider": "parquet", "options": {}},
-                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}}
-                ],
+                "checkpoint": {
+                    "version": 7,
+                    "contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7},
+                    "protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]},
+                    "metadata": {"id": "tid", "format": {"provider": "parquet", "options": {}},
+                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}
+                },
                 "leaves": [{"contentType": 0, "location": "data/part-0.parquet", "recordCount": 3}]
             }
         }"#;

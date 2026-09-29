@@ -18,8 +18,6 @@ use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -396,21 +394,6 @@ impl LogSegment {
         serde_json::from_str::<StructType>(raw)
             .inspect_err(|e| warn!("Unparseable sidecarFileSchema tag, ignoring: {e}"))
             .ok()
-    }
-
-    /// The embedded adaptiveMetadata (AMT) checkpoint info from the `_last_checkpoint` hint, when
-    /// the hint tagged itself `AdaptiveMetadataTree`.
-    ///
-    /// Unlike [`Self::checkpoint_hint`], this is not gated by the classic/V2 checkpoint-part
-    /// identity filter: an AMT checkpoint is not a listed checkpoint file, so verifying the hint
-    /// against the selected checkpoint action is the AMT read path's responsibility.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[allow(unused)] // consumed by the AMT read path
-    pub(crate) fn amt_checkpoint_hint(&self) -> Option<&AmtCheckpoint> {
-        let hint = self.last_checkpoint_metadata.as_ref()?;
-        (hint.checkpoint_type == Some(CheckpointType::AdaptiveMetadataTree))
-            .then_some(hint.amt_checkpoint.as_ref())
-            .flatten()
     }
 
     /// Succinct summary string for logging purposes.
