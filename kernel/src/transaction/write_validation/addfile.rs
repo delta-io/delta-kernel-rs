@@ -26,7 +26,7 @@ impl StagedDataValidator {
     ) -> Self {
         StagedDataValidator::new(
             &MANDATORY_ADD_FILE_COLUMNS,
-            vec![Box::new(AddFileRequiredFields {
+            vec![Box::new(RequiredAddFileVal {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
             })],
         )
@@ -42,11 +42,11 @@ impl StagedDataValidator {
 ///
 /// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
 /// TODO(2869): Add intent-based validation for dataChange.
-pub(crate) struct AddFileRequiredFields {
+pub(crate) struct RequiredAddFileVal {
     physical_partition_columns: HashSet<String>,
 }
 
-impl Validation for AddFileRequiredFields {
+impl Validation for RequiredAddFileVal {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?

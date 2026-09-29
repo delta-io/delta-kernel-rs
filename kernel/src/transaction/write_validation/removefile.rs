@@ -25,7 +25,7 @@ impl StagedDataValidator {
     pub(crate) fn staged_remove_file() -> Self {
         StagedDataValidator::new(
             &MANDATORY_REMOVE_FILE_COLUMNS,
-            vec![Box::new(RemoveFileRequiredFields)],
+            vec![Box::new(RequiredRemoveFileVal)],
         )
     }
 }
@@ -35,9 +35,9 @@ impl StagedDataValidator {
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct RemoveFileRequiredFields;
+struct RequiredRemoveFileVal;
 
-impl Validation for RemoveFileRequiredFields {
+impl Validation for RequiredRemoveFileVal {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get_opt(row, "path")?.ok_or_else(|| {
             KernelError::missing_data("RemoveFile is missing required field 'path'")
