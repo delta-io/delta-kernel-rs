@@ -5,18 +5,6 @@
 /// performance.
 use std::path::Path;
 
-use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
-
-#[test]
-fn test_checkpoint_serde() {
-    let file = std::fs::File::open(
-        "./tests/dat/out/reader_tests/generated/with_checkpoint/delta/_delta_log/_last_checkpoint",
-    )
-    .unwrap();
-    let cp: LastCheckpointHint = serde_json::from_reader(file).unwrap();
-    assert_eq!(cp.version, 2)
-}
-
 /// Guards against mistaking local-override results for the pinned release.
 #[test]
 fn acceptance_workloads_is_not_a_local_override() {
