@@ -29,7 +29,7 @@ internally, as the default engine does, without requiring every Kernel caller to
 
 ## Capability boundaries
 
-An Engine supplies four kinds of capability:
+An Engine supplies these handler capabilities:
 
 | Handler | Responsibility | API contract |
 |---------|----------------|--------------|
@@ -42,6 +42,14 @@ An Engine supplies four kinds of capability:
 [`JsonHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.JsonHandler.html
 [`ParquetHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.ParquetHandler.html
 [`EvaluationHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.EvaluationHandler.html
+
+With the experimental `declarative-plans` feature, your Engine can also provide a [`PlanExecutor`].
+Kernel describes data work as a plan that your executor can run using your compute engine's
+optimizer, parallelism, and I/O. This capability is optional; see the
+[declarative plans rustdoc] for the execution model and contracts.
+
+[`PlanExecutor`]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.PlanExecutor.html
+[declarative plans rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/plans/index.html
 
 The split lets you replace one capability without coupling Kernel to the rest of your connector.
 For example, a connector can keep the default storage and JSON handlers while providing a Parquet

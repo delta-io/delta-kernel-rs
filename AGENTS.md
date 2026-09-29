@@ -23,6 +23,12 @@ Keep each fact in the documentation surface whose audience needs it:
 Before adding documentation, find its owner and link there from other surfaces. If the destination
 does not answer the question, improve the owner instead of copying an incomplete answer elsewhere.
 
+For example, `Snapshot::checkpoint` rustdoc explains how to call the method, its requirements,
+return value, and errors, with a focused usage example. The user guide explains when to checkpoint
+and how checkpointing fits into a connector's maintenance workflow, linking to rustdoc for method
+details. A signature change requires a rustdoc update and corresponding fixes to guide examples
+that call it. A change to the connector workflow also requires updating the guide's explanation.
+
 ## Build & Test Commands
 
 > **`datafusion-executor` and `integration-tests` are separate workspaces.** Root `--workspace`
