@@ -27,7 +27,6 @@ To rewrite files on a partitioned table without row tracking enabled:
 
 The following pseudocode uses `DefaultEngine` for writes. You implement the `connector_*`
 functions to select files, read their live rows, and regroup those rows into replacement files.
-The hidden definitions are placeholders so the Kernel API calls can be compile-checked.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -58,7 +57,7 @@ The hidden definitions are placeholders so the Kernel API calls can be compile-c
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot.clone().scan_builder().build()?;
 
-// Connector-defined: choose source files by narrowing the scan's selection vectors.
+// connector_select_files is connector-defined; it narrows the scan's selection vectors.
 let source_files = scan
     .scan_metadata(&engine)?
     .map(|metadata| connector_select_files(metadata?))
@@ -97,8 +96,7 @@ let result = txn.commit(&engine)?;
 ```
 
 Don't mark the transaction as a blind append: it depends on existing files and removes them.
-Handle the [commit result](./append.md#committing); if another writer conflicts, load a new
-snapshot and re-evaluate the rewrite before committing again.
+Handle the [commit result](./append.md#committing).
 
 Don't split the additions and removals into separate transactions: readers could observe
 duplicated or missing rows between commits.
@@ -171,7 +169,7 @@ let scan = snapshot
     .with_schema(Arc::new(schema))
     .build()?;
 
-// Connector-defined: choose source files by narrowing the scan's selection vectors.
+// connector_select_files is connector-defined; it narrows the scan's selection vectors.
 let source_files = scan
     .scan_metadata(&engine)?
     .map(|metadata| connector_select_files(metadata?))
