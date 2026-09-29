@@ -1605,7 +1605,7 @@ impl TryFrom<Vec<CheckpointUnionElement>> for CheckpointAction {
     type Error = KernelError;
 
     /// Assembles a [`CheckpointAction`] from its union-array elements, then applies the shared
-    /// [`CheckpointActionParts::assemble`] required-field and validation rules.
+    /// `CheckpointActionParts::assemble` required-field and validation rules.
     /// `checkpointMetadata`, `contentRoot`, `protocol`, and `metaData` may appear at most once
     /// (enforced by `set_once`); `txn` and `domainMetadata` are collected inline; `sidecar`
     /// elements are routed by their `type`.
