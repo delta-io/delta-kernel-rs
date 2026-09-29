@@ -24,6 +24,17 @@ layouts change more often than their ownership boundaries.
 
 ## Boundaries that matter in implementation work
 
+Kernel handles the Delta protocol; connectors handle execution, distribution, and data flow.
+
+```text
+Compute engine (Spark, Flink, DuckDB, Polars, ...)
+  -> Delta connector (implements the compute engine's data source API)
+    -> Delta Kernel (protocol logic)
+      -> Engine trait (I/O and computation boundary)
+        -> DefaultEngine or a custom engine
+          -> Storage and computation runtime
+```
+
 - Kernel describes I/O and computation through `Engine`; engine implementations perform them.
 - `EngineData` is opaque to kernel production code. Inspect rows through the visitor APIs, and
   handle every batch returned for a file.

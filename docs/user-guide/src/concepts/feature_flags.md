@@ -65,7 +65,11 @@ Do not infer the current versions from examples written for another release.
 ## Use unstable and development features
 
 The `internal-api` feature exposes APIs that have not reached Kernel's public stability boundary.
-Code that depends on it must expect source changes between minor releases.
+These APIs have no compatibility guarantees and may change at any time, including patch releases.
+
+For production connectors, prefer stable public APIs. Internal APIs and experimental features
+aren't recommended for production use: upgrades may require changes to your connector. Enable them
+only if you can track and adapt to incompatible changes.
 
 Development and test features exist for in-progress protocol work, generated plans, test helpers,
 and heavyweight integration environments. Treat their manifest descriptions and feature
