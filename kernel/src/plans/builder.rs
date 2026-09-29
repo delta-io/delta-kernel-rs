@@ -255,10 +255,9 @@ impl PlanBuilder {
     /// # use std::sync::Arc;
     /// # use delta_kernel::{DeltaResult, PlanBuilder};
     /// # use delta_kernel::expressions::col;
-    /// # use delta_kernel::plans::PlanExecutor;
+    /// # use delta_kernel::plans::ScopedPlanExecutor;
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
-    /// # fn build_plan(executor: &dyn PlanExecutor) -> DeltaResult<()> {
-    /// let scoped = executor.get_scoped()?;
+    /// # fn build_plan(scoped: &dyn ScopedPlanExecutor) -> DeltaResult<()> {
     /// let schema = Arc::new(StructType::try_new([
     ///     StructField::not_null("id", DataType::INTEGER),
     /// ])?);

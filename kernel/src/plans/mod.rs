@@ -91,19 +91,6 @@ pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
 
-    /// Returns an executor that retains relations within its own scope.
-    ///
-    /// Unlike [`execute_op`](Self::execute_op), which materializes a plan's result and streams it
-    /// to kernel, [`ScopedPlanExecutor::execute_and_retain`] keeps the result on the engine side.
-    /// A [`RelationSource`](ir::nodes::Operator::RelationSource) node can then read it in another
-    /// plan executed by the scoped executor. The scoped executor should release every relation it
-    /// retained when it is dropped.
-    fn get_scoped(&self) -> DeltaResult<Box<dyn ScopedPlanExecutor>> {
-        Err(KernelError::unsupported(
-            "scoped execution is not supported by this PlanExecutor",
-        ))
-    }
-
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
     /// [`IoOperation::ParquetFooter`] op.
     fn read_parquet_footer(&self, file: FileMeta) -> DeltaResult<ParquetFooter> {
@@ -113,6 +100,8 @@ pub trait PlanExecutor: AsAny {
 }
 
 /// A [`PlanExecutor`] that can retain relations within its own lifetime.
+///
+/// The connector creates and owns the scoped executor.
 ///
 /// Implementations should release every relation retained through
 /// [`execute_and_retain`](Self::execute_and_retain) when this executor is dropped. A
