@@ -393,6 +393,13 @@ impl<S> Transaction<S> {
             self.ensure_row_tracking_preservation_acknowledged()?;
         }
 
+        // Block the write if the table's CHECK constraints apply to it and the writer has not
+        // acknowledged enforcing them.
+        #[cfg(feature = "check-constraints-in-dev")]
+        if !self.add_files_metadata.is_empty() || self.introduces_check_constraints() {
+            self.ensure_check_constraints_acknowledged()?;
+        }
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -420,17 +427,6 @@ impl<S> Transaction<S> {
         // metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
-        }
-
-        // Block the write if the table's CHECK constraints apply to it and the writer has not
-        // acknowledged enforcing them.
-        #[cfg(feature = "check-constraints-in-dev")]
-        {
-            let enforcement_required = self
-                .effective_table_config
-                .is_feature_enabled(&TableFeature::CheckConstraints)
-                && (!self.add_files_metadata.is_empty() || self.introduces_check_constraints());
-            self.ensure_check_constraints_acknowledged(enforcement_required)?;
         }
 
         // If a data-changing transaction has add files together with remove files or DV updates,
@@ -973,15 +969,18 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Rejects an operation that would add rows to, or introduce a constraint on, a table with
-    /// CHECK constraints unless the connector acknowledged enforcing them by calling
-    /// [`Self::ack_check_constraints`]. The caller decides whether the operation carries that
-    /// obligation: the commit gate inspects the staged files, the write-state gate always requires
-    /// it on a constrained table. Passes when acknowledged, or when no enforcement is required.
+    /// Rejects a write to a table with CHECK constraints when the connector has not acknowledged
+    /// enforcing them.
     #[cfg(feature = "check-constraints-in-dev")]
-    fn ensure_check_constraints_acknowledged(&self, enforcement_required: bool) -> DeltaResult<()> {
+    fn ensure_check_constraints_acknowledged(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::CheckConstraints)
+        {
+            return Ok(());
+        }
         require!(
-            self.check_constraints_acknowledged || !enforcement_required,
+            self.check_constraints_acknowledged,
             Error::invalid_transaction_state(
                 "Writing to a table with CHECK constraints requires calling \
                  Transaction::ack_check_constraints() first",
@@ -1274,10 +1273,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
-        self.ensure_check_constraints_acknowledged(
-            self.effective_table_config
-                .is_feature_enabled(&TableFeature::CheckConstraints),
-        )?;
+        self.ensure_check_constraints_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
