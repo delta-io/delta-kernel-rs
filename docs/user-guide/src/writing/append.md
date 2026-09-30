@@ -216,8 +216,8 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Existing-table transactions, including `ALTER TABLE`, can stage file actions. Kernel infers
-> `dataChange` from staged file actions unless the connector supplies an explicit override.
+> Unless overridden, non-`ALTER TABLE` operations default `dataChange` to `true`.
+> `ALTER TABLE` infers `false` for metadata-only commits and `true` when file actions are staged.
 
 ## Committing
 

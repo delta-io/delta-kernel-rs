@@ -4,9 +4,9 @@ use std::fmt;
 ///
 /// Known operations provide compiler-checked names. [`Custom`](Self::Custom) preserves the
 /// protocol's extensibility for connector-specific operations. Create-table transactions fix their
-/// operation internally; replace-table operations will be introduced with their dedicated builder.
+/// operation internally; replace-table operations are not supported.
 ///
-/// Builder-specific typing prevents create and replace operations from being selected here:
+/// Builder-specific typing prevents create operations from being selected here:
 ///
 /// ```compile_fail
 /// use delta_kernel::transaction::UpdateTableOperation;

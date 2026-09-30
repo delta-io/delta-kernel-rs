@@ -280,7 +280,7 @@ unpartitioned writes.
 | `create_table_txn_builder_with_table_property` | Add a table property to the builder |
 | `create_table_txn_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
 | `create_table_txn_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
-| `create_table_txn_get_unpartitioned_write_context` | Get a `BoundWriteContext` to stage initial data files during table creation |
+| `create_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` to stage initial data files during table creation |
 | `create_table_txn_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
 | `create_table_txn_commit` | Commit the create-table transaction |
 | `free_create_table_txn_builder` | Release a create-table builder handle (before it is consumed by `create_table_txn_builder_build*`) |

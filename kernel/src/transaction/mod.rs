@@ -381,7 +381,7 @@ impl<S> Transaction<S> {
 
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
-        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
+        if self.has_remove_file_actions() || self.has_dv_update_actions() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
             self.ensure_row_tracking_preservation_acknowledged()?;
@@ -412,7 +412,7 @@ impl<S> Transaction<S> {
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
-        if !self.add_files_metadata.is_empty() {
+        if self.has_add_file_actions() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
@@ -421,8 +421,8 @@ impl<S> Transaction<S> {
         // update rows require a `cdc` file, but Kernel does not currently support writing CDC
         // files.
         if !self.is_create_table()
-            && !self.add_files_metadata.is_empty()
-            && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
+            && self.has_add_file_actions()
+            && (self.has_remove_file_actions() || self.has_dv_update_actions())
             && self.data_change
         {
             let cdf_enabled = self
@@ -848,7 +848,7 @@ impl<S> Transaction<S> {
             )
         );
         require!(
-            !self.add_files_metadata.is_empty(),
+            self.has_add_file_actions(),
             KernelError::invalid_transaction_state(
                 "Blind append requires at least one added data file"
             )
@@ -858,11 +858,11 @@ impl<S> Transaction<S> {
             KernelError::invalid_transaction_state("Blind append requires data_change to be true")
         );
         require!(
-            self.remove_files_metadata.is_empty(),
+            !self.has_remove_file_actions(),
             KernelError::invalid_transaction_state("Blind append cannot remove files")
         );
         require!(
-            self.dv_matched_files.is_empty(),
+            !self.has_dv_update_actions(),
             KernelError::invalid_transaction_state("Blind append cannot update deletion vectors")
         );
 
@@ -1046,11 +1046,30 @@ impl<S> Transaction<S> {
         }
     }
 
-    /// True iff this transaction stages any data-file action (add, remove, or DV update).
+    /// True iff this transaction emits at least one add-file action.
+    fn has_add_file_actions(&self) -> bool {
+        self.add_files_metadata.iter().any(|data| !data.is_empty())
+    }
+
+    /// True iff this transaction emits at least one remove-file action.
+    fn has_remove_file_actions(&self) -> bool {
+        self.remove_files_metadata
+            .iter()
+            .any(HasSelectionVector::has_selected_rows)
+    }
+
+    /// True iff this transaction emits at least one deletion-vector update.
+    fn has_dv_update_actions(&self) -> bool {
+        self.dv_matched_files
+            .iter()
+            .any(HasSelectionVector::has_selected_rows)
+    }
+
+    /// True iff this transaction emits any data-file action (add, remove, or DV update).
     fn has_data_file_actions(&self) -> bool {
-        !self.add_files_metadata.is_empty()
-            || !self.remove_files_metadata.is_empty()
-            || !self.dv_matched_files.is_empty()
+        self.has_add_file_actions()
+            || self.has_remove_file_actions()
+            || self.has_dv_update_actions()
     }
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.

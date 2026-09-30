@@ -121,8 +121,8 @@ You can call `remove_files()` multiple times to remove files from different
 pending removals.
 
 > [!NOTE]
-> Existing-table transactions, including `ALTER TABLE`, can register file removals. Kernel infers
-> `dataChange` from staged file actions unless the connector supplies an explicit override.
+> Unless overridden, non-`ALTER TABLE` operations default `dataChange` to `true`.
+> `ALTER TABLE` infers `false` for metadata-only commits and `true` when file actions are staged.
 
 ## Full example
 
@@ -150,7 +150,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
     .clone()
     .transaction_builder()
-    .with_operation(UpdateTableOperation::Custom("DELETE".to_string()))
+    .with_operation(UpdateTableOperation::Delete)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Build a scan and get file metadata

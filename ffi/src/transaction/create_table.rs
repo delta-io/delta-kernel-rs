@@ -352,9 +352,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_partition_columns(
         .into_extern_result(&engine)
 }
 
-/// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
-/// wrappers so it can be unit-tested. `layout` is a `DeltaResult` so a column-parse failure
-/// short-circuits here, dropping the already-consumed builder rather than producing a layout.
+/// Applies a parsed layout while preserving consuming-handle semantics on parse failure.
 pub(super) fn create_table_txn_builder_with_data_layout_impl(
     builder: CreateTableTransactionBuilder,
     layout: DeltaResult<DataLayout>,

@@ -90,8 +90,8 @@ column by including it in the `RecordBatch` they pass to
 | Column mapping tables must be protocol-valid | When column mapping is enabled, Kernel assigns or preserves column-mapping IDs and physical names for the added column and updates `delta.columnMapping.maxColumnId`. |
 
 > [!NOTE]
-> `ALTER TABLE` is still rejected on tables with unsupported writer features, and
-> currently on tables with `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults` enabled.
+> `ALTER TABLE` is rejected on tables with unsupported writer features, including
+> `icebergCompatV2`, `icebergCompatV3`, and `allowColumnDefaults`.
 
 ## Chaining multiple operations
 
