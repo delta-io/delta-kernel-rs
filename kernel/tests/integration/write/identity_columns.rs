@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    concurrent_identity_column, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
+    StructType,
 };
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -21,27 +22,6 @@ const CATALOG_MANAGED_PROPERTIES: [(&str, &str); 3] = [
     ("io.unitycatalog.tableId", "cic-integration-test"),
 ];
 
-/// A non-nullable LONG field carrying the three CIC metadata keys, built through the public
-/// `ColumnMetadataKey` + `add_metadata` path (the kernel stamper is test-internal).
-fn cic_field(name: &str, sequence_id: &str, start: i64, step: i64) -> StructField {
-    StructField::not_null(name, DataType::LONG).add_metadata([
-        (
-            ColumnMetadataKey::IdentityConcurrentSequenceId
-                .as_ref()
-                .to_string(),
-            MetadataValue::String(sequence_id.to_string()),
-        ),
-        (
-            ColumnMetadataKey::IdentityStart.as_ref().to_string(),
-            MetadataValue::Number(start),
-        ),
-        (
-            ColumnMetadataKey::IdentityStep.as_ref().to_string(),
-            MetadataValue::Number(step),
-        ),
-    ])
-}
-
 fn plain_schema() -> SchemaRef {
     Arc::new(
         StructType::try_new(vec![
@@ -55,7 +35,7 @@ fn plain_schema() -> SchemaRef {
 fn cic_schema() -> SchemaRef {
     Arc::new(
         StructType::try_new(vec![
-            cic_field("id", "seq-abc", 10, 2),
+            concurrent_identity_column("id", "seq-abc", 10, 2),
             StructField::nullable("name", DataType::STRING),
         ])
         .unwrap(),
@@ -195,7 +175,7 @@ async fn alter_table_rejects_adding_concurrent_identity_column() -> DeltaResult<
 
     let result = snapshot
         .alter_table()
-        .add_column(cic_field("new_id", "seq-1", 1, 1))
+        .add_column(concurrent_identity_column("new_id", "seq-1", 1, 1))
         .build(engine, Box::new(FileSystemCommitter::new()));
     assert!(
         result.is_err(),

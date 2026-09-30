@@ -193,7 +193,7 @@ pub fn concurrent_identity_column(
     start: i64,
     step: i64,
 ) -> StructField {
-    StructField::new(name, DataType::LONG, false).with_metadata(cic_metadata(
+    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
         sequence_id,
         start,
         step,

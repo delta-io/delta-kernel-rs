@@ -965,6 +965,7 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     use crate::schema::concurrent_identity_column::concurrent_identity_column;
     use crate::schema::{
         column_name, schema, schema_ref, ColumnMetadataKey, ColumnName, DataType, MetadataValue,
@@ -1834,7 +1835,7 @@ mod test {
     // A LONG column carrying a classic `delta.identity.highWaterMark` (and no concurrent
     // sequenceId).
     fn high_water_mark_field(name: &str) -> StructField {
-        StructField::new(name, DataType::LONG, false).with_metadata(vec![
+        StructField::not_null(name, DataType::LONG).with_metadata(vec![
             (
                 ColumnMetadataKey::IdentityStart.as_ref().to_string(),
                 MetadataValue::Number(1),
@@ -1854,6 +1855,7 @@ mod test {
 
     // A valid concurrent-identity table configuration containing the CIC features and the
     // `catalogManaged` dependency (and its own `inCommitTimestamp`, enabled via property).
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn concurrent_identity_config(schema: StructType) -> TableConfiguration {
         MockTableConfigurationBuilder::new()
             .with_schema(schema)
@@ -1871,6 +1873,7 @@ mod test {
             .build()
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
     fn concurrent_identity_columns_write_supported_when_all_concurrent() {
         // The full feature set + only a concurrent column (sequenceId, no high-water mark): writes
@@ -1883,6 +1886,7 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
     fn concurrent_identity_columns_write_requires_catalog_managed() {
         // Dropping `catalogManaged` (and its inCommitTimestamp) leaves an incomplete CIC protocol;
@@ -1906,6 +1910,7 @@ mod test {
         );
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
     fn concurrent_identity_columns_write_rejected_with_surviving_high_water_mark() {
         // Defense-in-depth: a protocol claiming the features but with a surviving classic
