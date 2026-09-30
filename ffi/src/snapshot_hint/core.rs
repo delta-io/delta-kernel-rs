@@ -205,30 +205,181 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan(
     let core = unsafe { core.as_ref() };
     let extern_engine = unsafe { engine.as_ref() };
     let inner_engine = extern_engine.engine();
-    let result = (|| {
-        if generation != core.generation
-            || value.version != core.version
-            || matches!(value.freshness, super::FfiSnapshotHintFreshness::Latest) != core.latest
-        {
-            return Err(invalid(
-                "host snapshot generation, version, or freshness changed",
-            ));
-        }
-        let state = BorrowedSnapshotScanState {
-            value,
-            table_root: &core.table_root,
-        };
-        let plan = delta_kernel::scan::declarative_metadata_scan_plan_from_state(
-            &state,
-            inner_engine.as_ref(),
-        )?;
-        Ok(plan
-            .map(|plan| {
-                delta_kernel::Operation::QueryPlan(plan)
-                    .to_proto_bytes()
-                    .into()
-            })
-            .into())
-    })();
+    let result = metadata_plan(core, value, generation, inner_engine.as_ref(), None);
     result.into_extern_result(&extern_engine)
+}
+
+#[cfg(feature = "declarative-plans")]
+fn metadata_plan(
+    core: &SnapshotCore,
+    value: &FfiSnapshotScanState,
+    generation: u64,
+    engine: &dyn delta_kernel::Engine,
+    metadata: Option<delta_kernel::actions::Metadata>,
+) -> DeltaResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
+    if generation != core.generation
+        || value.version != core.version
+        || matches!(value.freshness, super::FfiSnapshotHintFreshness::Latest) != core.latest
+    {
+        return Err(invalid(
+            "host snapshot generation, version, or freshness changed",
+        ));
+    }
+    let state = BorrowedSnapshotScanState {
+        value,
+        table_root: &core.table_root,
+    };
+    let plan = match metadata {
+        Some(metadata) => {
+            delta_kernel::scan::declarative_metadata_scan_plan_from_state_with_metadata(
+                &state, metadata, engine,
+            )?
+        }
+        None => delta_kernel::scan::declarative_metadata_scan_plan_from_state(&state, engine)?,
+    };
+    Ok(plan
+        .map(|plan| {
+            delta_kernel::Operation::QueryPlan(plan)
+                .to_proto_bytes()
+                .into()
+        })
+        .into())
+}
+
+/// A preallocated schema transfer buffer. It does not retain connector pointers.
+pub struct SnapshotSchemaUpload {
+    bytes: DeltaResult<Vec<u8>>,
+    expected: usize,
+}
+
+/// An exclusively owned schema upload, consumed by planning or explicitly freed.
+#[handle_descriptor(target=SnapshotSchemaUpload, mutable=true, sized=true)]
+pub struct ExclusiveSnapshotSchemaUpload;
+
+/// Reserve schema storage before entering a pinned Java-array call.
+/// Allocation errors are deferred until planning; appending to a failed upload returns false.
+#[no_mangle]
+pub extern "C" fn snapshot_schema_upload_new(
+    length: usize,
+) -> Handle<ExclusiveSnapshotSchemaUpload> {
+    let mut bytes = Vec::new();
+    let reserved = bytes.try_reserve_exact(length);
+    Box::new(SnapshotSchemaUpload {
+        bytes: reserved.map(|()| bytes).map_err(|e| invalid(e.to_string())),
+        expected: length,
+    })
+    .into()
+}
+
+/// Copy at most 64 KiB from a call-scoped borrowed array into reserved schema storage.
+/// Returns false for a failed reservation, oversized chunk, or excess input. Never calls the
+/// connector, allocates, parses the schema, or retains the input pointer.
+///
+/// # Safety
+/// The upload handle is exclusively borrowed. `bytes` must address `length` readable bytes and
+/// remain immutable for this call. No other thread may access the upload during the call.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_schema_upload_append(
+    mut upload: Handle<ExclusiveSnapshotSchemaUpload>,
+    bytes: *const u8,
+    length: usize,
+) -> bool {
+    let upload = unsafe { upload.as_mut() };
+    let Ok(output) = &mut upload.bytes else {
+        return false;
+    };
+    if bytes.is_null() || length > 65536 || length > upload.expected - output.len() {
+        return false;
+    }
+    output.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes, length) });
+    true
+}
+
+/// Discard an upload without planning.
+///
+/// # Safety
+/// Consumes a valid owned handle unconditionally; the caller must not use it again.
+#[no_mangle]
+pub unsafe extern "C" fn free_snapshot_schema_upload(
+    upload: Handle<ExclusiveSnapshotSchemaUpload>,
+) {
+    upload.drop_handle();
+}
+
+impl SnapshotSchemaUpload {
+    pub(super) fn finish(self) -> DeltaResult<String> {
+        let bytes = self.bytes?;
+        if bytes.len() != self.expected {
+            return Err(invalid("Incomplete schema upload"));
+        }
+        String::from_utf8(bytes).map_err(|e| invalid(e.to_string()))
+    }
+}
+
+/// Plan using a transferred schema, without a second full schema string in FFI staging.
+/// All scan validation runs here, after the connector has released pinned array access.
+/// `value.metadata.schema_string` must be empty; the upload supplies that field.
+///
+/// # Safety
+/// Consumes `upload` unconditionally, including on errors. Other handles and `value` are borrowed
+/// and all nested storage must be valid for this call. No pinned JVM arrays may remain acquired:
+/// this call may invoke Java engine and error callbacks.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_with_schema(
+    core: Handle<SharedSnapshotCore>,
+    value: &FfiSnapshotScanState,
+    generation: u64,
+    upload: Handle<ExclusiveSnapshotSchemaUpload>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
+    let upload = unsafe { upload.into_inner() };
+    let core = unsafe { core.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let result = (|| {
+        if value.metadata.schema_string.len != 0 {
+            return Err(invalid("Schema supplied both inline and as an upload"));
+        }
+        let schema = upload.finish()?;
+        let metadata = unsafe { value.metadata.try_to_kernel_with_schema(schema) }?;
+        metadata_plan(
+            core,
+            value,
+            generation,
+            engine.engine().as_ref(),
+            Some(metadata),
+        )
+    })();
+    result.into_extern_result(&engine)
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn uploaded_schema_keeps_storage_and_rejects_invalid_chunks() {
+        let upload = snapshot_schema_upload_new(4);
+        let pointer = unsafe { upload.as_ref() }.bytes.as_ref().unwrap().as_ptr();
+        assert!(unsafe { snapshot_schema_upload_append(upload.shallow_copy(), b"ab".as_ptr(), 2) });
+        assert!(!unsafe {
+            snapshot_schema_upload_append(upload.shallow_copy(), b"xyz".as_ptr(), 3)
+        });
+        assert!(unsafe { snapshot_schema_upload_append(upload.shallow_copy(), b"cd".as_ptr(), 2) });
+        let result = unsafe { upload.into_inner() }.finish().unwrap();
+        assert_eq!(result, "abcd");
+        assert_eq!(result.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn incomplete_and_invalid_utf8_uploads_fail() {
+        for bytes in [b"a".as_slice(), &[0xff, 0xff]] {
+            let upload = snapshot_schema_upload_new(2);
+            assert!(unsafe {
+                snapshot_schema_upload_append(upload.shallow_copy(), bytes.as_ptr(), bytes.len())
+            });
+            assert!(unsafe { upload.into_inner() }.finish().is_err());
+        }
+        unsafe { free_snapshot_schema_upload(snapshot_schema_upload_new(10)) };
+    }
 }

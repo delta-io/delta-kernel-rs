@@ -111,6 +111,14 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
 ) -> DeltaResult<bool> {
+    unsafe { snapshot_builder_set_snapshot_hint_with_schema_impl(builder, value, None) }
+}
+
+unsafe fn snapshot_builder_set_snapshot_hint_with_schema_impl(
+    builder: &mut FfiSnapshotBuilder,
+    value: &FfiSnapshotHint,
+    schema: Option<String>,
+) -> DeltaResult<bool> {
     let table_root = match &builder.source {
         FfiSnapshotBuilderSource::TableRoot(table_root) => table_root,
         FfiSnapshotBuilderSource::ExistingSnapshot(_) => {
@@ -130,7 +138,10 @@ unsafe fn snapshot_builder_set_snapshot_hint_impl(
         Ok(())
     })?;
     let protocol = state.protocol()?;
-    let metadata = state.metadata()?;
+    let metadata = match schema {
+        Some(schema) => unsafe { value.metadata.try_to_kernel_with_schema(schema) }?,
+        None => state.metadata()?,
+    };
     let last_checkpoint_hint = state.last_checkpoint()?;
     let crc = state.crc()?;
     let snapshot_hint = SnapshotHint::try_new(
@@ -175,6 +186,31 @@ pub unsafe extern "C" fn snapshot_builder_set_snapshot_hint(
 ) -> ExternResult<bool> {
     let builder = unsafe { builder.as_mut() };
     let result = unsafe { snapshot_builder_set_snapshot_hint_impl(builder, value) };
+    report(builder, result)
+}
+
+/// Install a snapshot hint using transferred schema storage instead of an inline schema string.
+/// Validation and builder replacement follow [`snapshot_builder_set_snapshot_hint`].
+///
+/// # Safety
+/// Consumes `upload` unconditionally. The builder and hint storage are borrowed as documented by
+/// [`snapshot_builder_set_snapshot_hint`]. The inline schema must be empty. No pinned Java array
+/// may remain acquired because errors may invoke the connector.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_set_snapshot_hint_with_schema(
+    builder: &mut Handle<MutableFfiSnapshotBuilder>,
+    value: &FfiSnapshotHint,
+    upload: Handle<ExclusiveSnapshotSchemaUpload>,
+) -> ExternResult<bool> {
+    let upload = unsafe { upload.into_inner() };
+    let builder = unsafe { builder.as_mut() };
+    let result = (|| {
+        if value.metadata.schema_string.len != 0 {
+            return Err(invalid("Schema supplied both inline and as an upload"));
+        }
+        let schema = upload.finish()?;
+        unsafe { snapshot_builder_set_snapshot_hint_with_schema_impl(builder, value, Some(schema)) }
+    })();
     report(builder, result)
 }
 

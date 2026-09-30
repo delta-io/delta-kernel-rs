@@ -73,6 +73,27 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
     state: &dyn SnapshotScanState,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<Plan>> {
+    metadata_plan_with_components(state, engine, || Ok((state.metadata()?, state.protocol()?)))
+}
+
+/// Build the default metadata plan, consuming transferred metadata at the validation phase.
+/// Protocol and scan validation remain identical to planning directly from `state`.
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+#[internal_api]
+pub(crate) fn declarative_metadata_scan_plan_from_state_with_metadata(
+    state: &dyn SnapshotScanState,
+    metadata: crate::actions::Metadata,
+    engine: &dyn Engine,
+) -> DeltaResult<Option<Plan>> {
+    metadata_plan_with_components(state, engine, || Ok((metadata, state.protocol()?)))
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+fn metadata_plan_with_components(
+    state: &dyn SnapshotScanState,
+    engine: &dyn Engine,
+    components: impl FnOnce() -> DeltaResult<(crate::actions::Metadata, crate::actions::Protocol)>,
+) -> DeltaResult<Option<Plan>> {
     let (log_segment, commit_files) = match state.ordered_log_paths()? {
         Some(paths) => {
             let (segment, files) =
@@ -81,9 +102,10 @@ pub(crate) fn declarative_metadata_scan_plan_from_state(
         }
         None => (log_segment_from_state(state)?, None),
     };
+    let (metadata, protocol) = components()?;
     let table_configuration = TableConfiguration::try_new(
-        state.metadata()?,
-        state.protocol()?,
+        metadata,
+        protocol,
         state.table_root().clone(),
         state.version(),
     )?;
