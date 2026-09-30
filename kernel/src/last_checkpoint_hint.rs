@@ -59,7 +59,7 @@ pub(crate) struct LastCheckpointHint {
     /// file the hint describes. Absent for V1 / classic checkpoints.
     pub(crate) v2_checkpoint: Option<LastCheckpointV2>,
 
-    /// The checkpoint format the writer tagged this hint with (adaptiveMetadata RFC), which
+    /// The checkpoint format the writer tagged this hint with, which
     /// determines how the hint is consumed:
     ///
     /// - **absent** (`None`): a classic / multi-part / V2 checkpoint. Kernel knows this format, so
@@ -82,7 +82,7 @@ pub(crate) struct LastCheckpointHint {
     /// For an adaptive-metadata (AMT) checkpoint, the embedded AMT checkpoint info: the manifest
     /// commit version plus optional prefetched checkpoint/leaves.
     ///
-    /// By the adaptiveMetadata RFC a writer pairs this with `checkpoint_type ==
+    /// A writer pairs this with `checkpoint_type ==
     /// AdaptiveMetadataTree` and never sets it alongside `v2_checkpoint`. Kernel does not enforce
     /// either constraint on read: it parses whatever the file contains, so a malformed hint (an
     /// `AdaptiveMetadataTree` type with no `amtCheckpoint`, or both this and `v2_checkpoint`) is
@@ -95,8 +95,8 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) amt_checkpoint: Option<AmtCheckpoint>,
 }
 
-/// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field
-/// (adaptiveMetadata RFC). An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
+/// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field.
+/// An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
 /// rather than failing the parse, signaling `LastCheckpointHint::try_read` to drop the hint so
 /// the reader falls back to log replay.
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -133,7 +133,7 @@ impl Serialize for CheckpointType {
 }
 
 /// The `amtCheckpoint` object embedded in a `_last_checkpoint` hint for an adaptive-metadata
-/// checkpoint (adaptiveMetadata RFC). `manifest_commit_version` lets a reader locate the checkpoint
+/// checkpoint. `manifest_commit_version` lets a reader locate the checkpoint
 /// action without full log replay; `checkpoint` and `leaves` are optional prefetch that writers may
 /// omit. Absent for classic / V2 checkpoints.
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -147,7 +147,7 @@ pub(crate) struct AmtCheckpoint {
     /// checkpoint action even when `checkpoint`/`leaves` are omitted.
     pub(crate) manifest_commit_version: Version,
 
-    /// The embedded `checkpoint` action, prefetched alongside the hint. Serialized as the RFC's
+    /// The embedded `checkpoint` action, prefetched alongside the hint. Serialized as an
     /// array of tagged action entries and folded into a typed [`CheckpointAction`] on parse (see
     /// its hand-written serde). `None` when the writer omitted it (e.g. to bound write
     /// latency); the reader then reads it from the manifest commit. A malformed array fails
@@ -531,7 +531,7 @@ mod tests {
 
     /// The full JSON form of an AMT (`AdaptiveMetadataTree`) `_last_checkpoint` hint parses to its
     /// typed fields: `checkpointType`, the required `manifestCommitVersion`, the embedded
-    /// `checkpoint` action (RFC array of tagged entries), and the prefetched `leaves` (retained
+    /// `checkpoint` action (array of tagged entries), and the prefetched `leaves` (retained
     /// raw). Guards the `camelCase`/`PascalCase` wire keys -- a rename would silently parse to
     /// `None`/`Unknown` (errors are swallowed in `try_read`) and disable the AMT fast path.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -761,7 +761,7 @@ mod tests {
     }
 
     /// Cross-check that the Delta-log `CheckpointAction` EngineData (de)serializer and its
-    /// serde (used by the `_last_checkpoint` hint) agree on the RFC checkpoint-action array wire
+    /// serde (used by the `_last_checkpoint` hint) agree on the checkpoint-action array wire
     /// form. The action the log path writes as JSON parses back through serde to the identical
     /// action, and the JSON serde writes parses back through the log path -- so a rename or
     /// element-shape change on either side is caught. Compared at the typed level (not raw JSON) so

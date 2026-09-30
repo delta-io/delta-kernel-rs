@@ -168,7 +168,7 @@ static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 
 /// The `checkpoint` action serializes as an array whose elements are each one of the metadata
 /// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
-/// element type that may appear in that array (per the adaptiveMetadata RFC, delta-io/delta#6978):
+/// element type that may appear in that array:
 /// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -1301,7 +1301,7 @@ pub(crate) struct ContentRoot {
     /// Size of the root manifest file in bytes. Not exposed directly -- use
     /// [`CheckpointAction::root_filemeta`] to get a validated [`FileMeta`].
     size_in_bytes: i64,
-    /// The table version the root manifest reflects. Per the adaptiveMetadata RFC this is
+    /// The table version the root manifest reflects. This is
     /// `<= checkpointMetadata.version`: equal in a manifest commit, and strictly less in a
     /// standalone checkpoint (where inline file actions cover the gap up to the checkpoint
     /// version). Distinct from [`CheckpointAction::version`], which is
@@ -1368,9 +1368,6 @@ impl LastManifestCommit {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
-///
-/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
-///
 /// Example manifest-commit JSON:
 /// ```json
 /// { "checkpoint": [
@@ -1384,7 +1381,7 @@ impl LastManifestCommit {
 ///   ]
 /// }
 /// ```
-// Serde is hand-written (see below), not derived: the wire form is the RFC array of tagged element
+// Serde is hand-written (see below), not derived: the wire form is a JSON array of tagged element
 // objects (`[{"checkpointMetadata":..}, {"contentRoot":..}, ..]`), not a struct. This is the same
 // shape the EngineData path uses, so the `_last_checkpoint` hint (which serdes this action) and log
 // replay share the wire form and the enumerated invariants (required singletons, no duplicates,
@@ -1417,11 +1414,12 @@ pub(crate) struct CheckpointAction {
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
-// === CheckpointAction <-> JSON (RFC array of tagged elements) ===
+// === CheckpointAction <-> JSON (array of tagged elements) ===
 
-/// One element of a [`CheckpointAction`]'s serialized array (adaptiveMetadata RFC "Checkpoint
-/// Action"). A checkpoint action serializes as a JSON array of single-key tagged objects, so this
-/// is an externally-tagged enum keyed by the action name, reusing kernel's action structs to yield
+/// One element of a [`CheckpointAction`]'s serialized array (the adaptiveMetadata "Checkpoint
+/// Action" wire form). A checkpoint action serializes as a JSON array of single-key tagged objects,
+/// so this is an externally-tagged enum keyed by the action name, reusing kernel's action structs
+/// to yield
 /// the same types as log replay. Having no catch-all variant, it fails the parse on an unrecognized
 /// action key -- deliberately fail-closed, unlike the forward-compatible EngineData
 /// `CheckpointElementVisitor`, which skips unknown elements. A hint carrying a future
@@ -1441,9 +1439,9 @@ pub(crate) enum CheckpointActionElement {
     Sidecar(CheckpointSidecar),
 }
 
-/// A `sidecar` element inside a checkpoint action array. The RFC prefixes the [`Sidecar`] fields
-/// with a `type` discriminator (`"txn"` or `"domainMetadata"`) identifying which action kind the
-/// sidecar spills; [`Sidecar`] itself carries no type, so it is flattened in alongside it.
+/// A `sidecar` element inside a checkpoint action array. The wire form prefixes the [`Sidecar`]
+/// fields with a `type` discriminator (`"txn"` or `"domainMetadata"`) identifying which action kind
+/// the sidecar spills; [`Sidecar`] itself carries no type, so it is flattened in alongside it.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1458,7 +1456,7 @@ pub(crate) struct CheckpointSidecar {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl Serialize for CheckpointAction {
-    /// Emits the RFC array of tagged elements in the same canonical order as
+    /// Emits the array of tagged elements in the same canonical order as
     /// `try_into_scalar` (`checkpointMetadata`, `contentRoot`, `protocol`, `metaData`,
     /// then `txn`, `domainMetadata`, and the `txn`/`domainMetadata` sidecars). Validates first,
     /// so an invalid action can never be written through serde either.
@@ -1508,7 +1506,7 @@ impl Serialize for CheckpointAction {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl<'de> Deserialize<'de> for CheckpointAction {
-    /// Folds the RFC array of tagged elements into a typed action, applying the same enumerated
+    /// Folds the array of tagged elements into a typed action, applying the same enumerated
     /// checks as the EngineData [`visitors::CheckpointVisitor`]: required singletons, no
     /// duplicates, known sidecar `type`, and the `contentRoot.version <=
     /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
@@ -1678,7 +1676,7 @@ impl CheckpointAction {
         Ok(visitor.checkpoint)
     }
 
-    /// Folds a deserialized RFC array of tagged [`CheckpointActionElement`]s into a checkpoint
+    /// Folds a deserialized array of tagged [`CheckpointActionElement`]s into a checkpoint
     /// action, mirroring [`visitors::CheckpointVisitor`]: the four required elements are singletons
     /// (missing or repeated is an error), `txn`/`domainMetadata` are collected, `sidecar` entries
     /// are split by their `type` (unknown types error), and the assembled action is validated.
@@ -3059,8 +3057,8 @@ mod tests {
                 SIDECAR_NAME,
             ]
         );
-        // `commitInfo` must NOT be a checkpoint-array element; the RFC routes it to the top-level
-        // Delta log.
+        // `commitInfo` must NOT be a checkpoint-array element; adaptiveMetadata routes it to the
+        // top-level Delta log.
         assert!(!field_names.contains(&COMMIT_INFO_NAME));
 
         // Every element type is an optional (union member) struct.
@@ -3325,7 +3323,7 @@ mod tests {
         Ok(())
     }
 
-    /// The hand-written serde folds/expands the RFC array losslessly: an action expands to the
+    /// The hand-written serde folds/expands the array losslessly: an action expands to the
     /// tagged-element array and folds back to the identical action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
