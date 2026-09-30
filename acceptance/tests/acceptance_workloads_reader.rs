@@ -314,20 +314,12 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "st_string_stats/specs/st_string_stats_filter_string_like",
         ],
     ),
-    // Predicate parser: CAST function not supported
+    // Predicate parser: timestamp CAST expressions are not supported.
     (
-        "Predicate parser: CAST function not supported",
+        "Predicate parser: timestamp CAST expressions are not supported",
         &[
             "dpReadPartitionTimestamp/specs/dpReadPartitionTimestamp_filterTsEq",
             "dpReadPartitionTimestamp/specs/dpReadPartitionTimestamp_filterTsGt",
-            "pve_byte_partition/specs/pve_byte_partition_filter_max",
-            "pve_byte_partition/specs/pve_byte_partition_filter_min",
-            "pve_byte_partition/specs/pve_byte_partition_filter_positive",
-            "pve_float_partition/specs/pve_float_partition_filter_eq",
-            "pve_float_partition/specs/pve_float_partition_filter_positive",
-            "pve_short_partition/specs/pve_short_partition_filter_max",
-            "pve_short_partition/specs/pve_short_partition_filter_min",
-            "pve_short_partition/specs/pve_short_partition_filter_range",
         ],
     ),
     // Predicate parser: date/time functions not supported (date_add, datediff, month, year, trunc)
@@ -440,8 +432,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     (
         "Simple predicates but timestamp schema mismatch in result validation",
         &[
-            "cc_007_multiple_constraints/specs/cc_007_multiple_constraints_filter_amount",
-            "cc_020_decimal_constraint/specs/cc_020_decimal_constraint_filter_high_price",
             "ds_stats_after_drop/specs/ds_stats_after_drop_hit_c1_eq_1",
             "ds_stats_after_drop/specs/ds_stats_after_drop_hit_c10_gt_1_5",
             "ds_stats_after_drop/specs/ds_stats_after_drop_hit_c3_lt_1_5",
@@ -497,12 +487,10 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "ds_typed_stats/specs/ds_typed_stats_miss_c5_gte_future",
             "ds_typed_stats/specs/ds_typed_stats_miss_c6_gte_future_ntz",
             "ds_typed_stats/specs/ds_typed_stats_miss_c7_eq_future",
-            "dsReadDecimalType/specs/dsReadDecimalType_readExpensive",
             "gc_append_data/specs/gc_append_data_filter_partition",
             "gc_delete/specs/gc_delete_filter_remaining",
             "gc_insert_by_name/specs/gc_insert_by_name_filter_c2_g",
             "gc_update_source/specs/gc_update_source_filter_c2_g_updated",
-            "tw_decimal_precision_read_large_values",
         ],
     ),
     (
