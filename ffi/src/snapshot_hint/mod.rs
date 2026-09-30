@@ -106,6 +106,7 @@ impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
 unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
+    schema: Option<String>,
 ) -> KernelResult<()> {
     let table_root = match &builder.source {
         FfiSnapshotBuilderSource::TableRoot(table_root) => table_root,
@@ -126,7 +127,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         Ok(())
     })?;
     let protocol = state.protocol()?;
-    let metadata = state.metadata()?;
+    let metadata = match schema {
+        Some(schema) => unsafe { value.metadata.try_to_kernel_with_schema(schema) }?,
+        None => state.metadata()?,
+    };
     let last_checkpoint_hint = state.last_checkpoint()?;
     let crc = state.crc()?;
     let snapshot_hint = SnapshotHint::try_new(
@@ -172,9 +176,36 @@ pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
+    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value, None) }
         .map(|_| builder.into())
         .into_extern_result(&engine.as_ref())
+}
+
+/// Install a snapshot hint using transferred schema storage instead of an inline schema string.
+/// Validation and builder replacement follow [`snapshot_builder_with_snapshot_hint`].
+///
+/// # Safety
+/// Consumes `builder` and `upload` unconditionally. The hint storage is borrowed as documented by
+/// [`snapshot_builder_with_snapshot_hint`]. The inline schema must be empty. No pinned Java array
+/// may remain acquired because errors may invoke the connector.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint_with_schema(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    value: &FfiSnapshotHint,
+    upload: Handle<ExclusiveSnapshotSchemaUpload>,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let upload = unsafe { upload.into_inner() };
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    let result = (|| {
+        if value.metadata.schema_string.len != 0 {
+            return Err(invalid("Schema supplied both inline and as an upload"));
+        }
+        let schema = upload.finish()?;
+        unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value, Some(schema)) }?;
+        Ok(builder.into())
+    })();
+    result.into_extern_result(&engine.as_ref())
 }
 
 pub(super) fn validate_handoff(

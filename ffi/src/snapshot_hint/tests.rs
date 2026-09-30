@@ -37,6 +37,16 @@ fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
 }
 
+fn schema_upload(schema: &str) -> Handle<ExclusiveSnapshotSchemaUpload> {
+    let upload = snapshot_schema_upload_new(schema.len());
+    for chunk in schema.as_bytes().chunks(65536) {
+        assert!(unsafe {
+            snapshot_schema_upload_append(upload.shallow_copy(), chunk.as_ptr(), chunk.len())
+        });
+    }
+    upload
+}
+
 fn invalid_utf8() -> KernelStringSlice {
     static INVALID_UTF8: [u8; 1] = [0xff];
     KernelStringSlice {
@@ -401,6 +411,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     #[case] freshness: FfiSnapshotHintFreshness,
     #[values(false, true)] partitioned: bool,
     #[values(false, true)] batched: bool,
+    #[values(false, true)] uploaded: bool,
 ) {
     let engine = test_engine();
     let builder = test_builder(&engine);
@@ -417,7 +428,21 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     if partitioned {
         hint.metadata.partition_columns = unsafe { FfiStringArray::new_unsafe(&partition_columns) };
     }
-    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    let schema_text = unsafe { hint.metadata.schema_string.try_to_string() }.unwrap();
+    let builder = if uploaded {
+        let schema = std::mem::replace(&mut hint.metadata.schema_string, slice(""));
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_snapshot_hint_with_schema(
+                builder,
+                &hint,
+                schema_upload(&schema_text),
+            ))
+        };
+        hint.metadata.schema_string = schema;
+        builder
+    } else {
+        unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
+    };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let core = unsafe {
         ok_or_panic(snapshot_externalize_core(
@@ -449,24 +474,31 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         scan_state.log_path_source = &source;
     }
 
-    let rejected = unsafe {
-        snapshot_core_declarative_metadata_plan(
-            core.shallow_copy(),
-            &scan_state,
-            43,
-            plan_engine.shallow_copy(),
-        )
+    if uploaded {
+        scan_state.metadata.schema_string = slice("");
+    }
+    let run_plan = |generation| unsafe {
+        if uploaded {
+            snapshot_core_declarative_metadata_plan_with_schema(
+                core.shallow_copy(),
+                &scan_state,
+                generation,
+                schema_upload(&schema_text),
+                plan_engine.shallow_copy(),
+            )
+        } else {
+            snapshot_core_declarative_metadata_plan(
+                core.shallow_copy(),
+                &scan_state,
+                generation,
+                plan_engine.shallow_copy(),
+            )
+        }
     };
+    let rejected = run_plan(43);
     assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
 
-    let result = unsafe {
-        snapshot_core_declarative_metadata_plan(
-            core.shallow_copy(),
-            &scan_state,
-            42,
-            plan_engine.shallow_copy(),
-        )
-    };
+    let result = run_plan(42);
     let bytes = match ok_or_panic(result) {
         OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
         OptionalValue::None => panic!("expected a plan for a hinted commit"),
