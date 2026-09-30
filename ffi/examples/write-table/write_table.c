@@ -33,12 +33,10 @@
 //     snapshot load
 //   - free_committed_transaction to release the result handle
 //
-// NOTE: This example does NOT call update_table_txn_add_files. Staging new files requires building an Arrow
-// RecordBatch that matches Transaction::add_files_schema (path, partitionValues, size,
-// modificationTime, stats), which needs arrow-glib (or equivalent) on the C side to
-// construct. That flow is tracked as a follow-up; once the shared arrow-glib writer helper
-// lands in ffi/examples/common/, this example should be extended to stage a real parquet
-// file and exercise the full update_table_txn_add_files -> update_table_txn_commit path.
+// NOTE: This example does NOT call update_table_txn_add_files. Staging new files requires
+// constructing an Arrow RecordBatch that matches Transaction::add_files_schema (path,
+// partitionValues, size, modificationTime, stats), which needs arrow-glib (or equivalent) on the C
+// side. This example demonstrates the transaction lifecycle without staging a parquet file.
 
 int main(int argc, char* argv[]) {
   if (argc != 2) {

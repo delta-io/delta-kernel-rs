@@ -76,9 +76,8 @@ impl Transaction {
     /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
     /// to read the current state of the table (e.g. to read the current version).
     ///
-    /// Instead of using this API, the more typical (user-facing) API is
-    /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
-    /// a snapshot.
+    /// Instead of using this API, the typical user-facing API is
+    /// [`Snapshot::transaction_builder`](crate::snapshot::Snapshot::transaction_builder).
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,

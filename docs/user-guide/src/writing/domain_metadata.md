@@ -170,10 +170,8 @@ apply:
   transaction.
 
 > [!NOTE]
-> Validation is deferred until `commit()`. The builder methods
-> `with_domain_metadata()` and `with_domain_metadata_removed()` do not check
-> for duplicates or reserved prefixes eagerly. Errors surface when you call
-> `commit()`.
+> Builder-provided domain metadata is validated by `build()`. Additions attached to a built
+> transaction are validated by `commit()`. Setter calls themselves only accumulate intent.
 
 ## What's next
 

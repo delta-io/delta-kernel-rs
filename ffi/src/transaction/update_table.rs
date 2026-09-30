@@ -22,7 +22,8 @@ pub struct ExclusiveUpdateTableTransactionBuilder;
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles and path pointer.
+/// `snapshot` must be a valid shared handle. This call borrows it, and the caller retains
+/// ownership.
 #[no_mangle]
 pub unsafe extern "C" fn get_update_table_txn_builder(
     snapshot: Handle<SharedSnapshot>,
