@@ -1,10 +1,11 @@
 //! Tests for `adaptiveMetadata-preview` manifest (content-tree) commits and root manifest file
 //! commits.
 
-use super::super::{ManifestCommitState, ManifestWrite, Transaction};
+use super::super::{ManifestCommitState, ManifestWrite, SchemaOperation, Transaction};
 use super::{add_dummy_file, create_existing_table_txn};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::schema::{DataType, StructField};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -146,7 +147,7 @@ fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> DeltaResult<()> 
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 1);
-    // Checkpoint content-root version (1) >= snapshot version (1), so the guard passes.
+    // Checkpoint version (1) >= snapshot version (1), so the guard passes.
     ManifestCommitState::try_new(&engine, snapshot.clone(), 2, &adaptive_table_config())?;
     Ok(())
 }
@@ -161,7 +162,7 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> DeltaResult<
         1,
         minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
     )?;
-    // A later delta commit bumps the snapshot past the checkpoint's content-root version.
+    // A later delta commit bumps the snapshot past the checkpoint version.
     let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
     write_commit(
         &engine,
@@ -174,6 +175,51 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> DeltaResult<
     let result =
         ManifestCommitState::try_new(&engine, snapshot.clone(), 3, &adaptive_table_config());
     assert_result_error_with_message(result, "does not currently support delta log commits");
+    Ok(())
+}
+
+// === physical schema source / schema evolution (Blocker1) ===
+
+// The leaf writer's physical schema must come from the effective table config passed to try_new,
+// not from the read snapshot (which may predate schema evolution).
+#[test]
+fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> DeltaResult<()> {
+    let (engine, table_root) = setup_table()?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let config = adaptive_table_config();
+    let state = ManifestCommitState::try_new(&engine, snapshot.clone(), 1, &config)?;
+    let writer = state.new_leaf_node_writer(&engine);
+    assert_eq!(writer.physical_schema(), &config.physical_schema());
+    assert_ne!(writer.physical_schema(), &snapshot.schema());
+    Ok(())
+}
+
+#[test]
+fn with_schema_changes_rejects_after_staging_manifest_commit() -> DeltaResult<()> {
+    let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+    txn.effective_table_config = adaptive_table_config();
+    txn.with_manifest_commit(engine.as_ref())?;
+    let result = txn.with_schema_changes(vec![SchemaOperation::add_column(
+        None,
+        StructField::nullable("fresh_column", DataType::INTEGER),
+    )]);
+    assert_result_error_with_message(result, "after staging a manifest commit");
+    Ok(())
+}
+
+#[test]
+fn manifest_commit_after_schema_change_uses_evolved_schema() -> DeltaResult<()> {
+    let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+    txn.effective_table_config = adaptive_table_config();
+    let mut txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
+        None,
+        StructField::nullable("fresh_column", DataType::INTEGER),
+    )])?;
+    let expected = txn.effective_table_config.physical_schema();
+    let writer = txn
+        .with_manifest_commit(engine.as_ref())?
+        .new_leaf_node_writer(engine.as_ref());
+    assert_eq!(writer.physical_schema(), &expected);
     Ok(())
 }
 
@@ -196,7 +242,7 @@ fn leaf_writer_ops_unsupported() -> DeltaResult<()> {
     txn.effective_table_config = adaptive_table_config();
     let mut leaf_writer = txn
         .with_manifest_commit(engine.as_ref())?
-        .new_leaf_node_writer(engine.as_ref())?;
+        .new_leaf_node_writer(engine.as_ref());
     let add_batch = create_valid_add_file_batch(false /* all_nullable */);
     assert_result_error_with_message(
         leaf_writer.add_files(engine.as_ref(), Box::new(ArrowEngineData::new(add_batch))),

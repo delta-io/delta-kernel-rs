@@ -19,7 +19,7 @@ pub(crate) struct LeafNodeWriter {
 }
 
 /// Output of finishing a [`LeafNodeWriter`], folded back into the commit via
-/// [`ManifestCommitState::add_leaf`](super::manifest_commit_state::ManifestCommitState::add_leaf).
+/// [`ManifestCommitState::add_leaf`](super::ManifestCommitState::add_leaf).
 ///
 /// Opaque: its contents are an implementation detail filled in as the manifest-commit write path
 /// is built out.
@@ -31,6 +31,11 @@ pub(crate) struct LeafNodeWriterResult {}
 impl LeafNodeWriter {
     pub(super) fn new(physical_schema: SchemaRef) -> Self {
         LeafNodeWriter { physical_schema }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_schema(&self) -> &SchemaRef {
+        &self.physical_schema
     }
 
     /// Buffers new data files described by `add_metadata` for writing into this leaf manifest.

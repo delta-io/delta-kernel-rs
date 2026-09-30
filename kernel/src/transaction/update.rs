@@ -199,6 +199,13 @@ impl Transaction {
                 "with_schema_changes must be called before staging data files"
             )
         );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        require!(
+            !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
+            KernelError::invalid_transaction_state(
+                "with_schema_changes cannot be called after staging a manifest commit"
+            )
+        );
         self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
         self.should_emit_metadata = true;
         Ok(self)

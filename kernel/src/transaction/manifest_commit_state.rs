@@ -1,11 +1,10 @@
 //! State for an in-progress manifest (content-tree) commit.
 
-use std::sync::Arc;
-
 use delta_kernel_derive::internal_api;
 
 use super::leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 use crate::error::KernelError;
+use crate::schema::SchemaRef;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -20,7 +19,9 @@ pub(crate) struct ManifestCommitState {
     #[allow(dead_code)]
     version_to_write: Version,
     /// Snapshot the commit updates.
+    #[allow(dead_code)]
     read_snapshot: SnapshotRef,
+    physical_schema: SchemaRef,
 }
 
 impl ManifestCommitState {
@@ -63,6 +64,7 @@ impl ManifestCommitState {
         }
         Ok(ManifestCommitState {
             version_to_write,
+            physical_schema: table_config.physical_schema(),
             read_snapshot,
         })
     }
@@ -73,22 +75,9 @@ impl ManifestCommitState {
     /// deliberate (rather than folding a leaf in when its writer drops): they keep the door open to
     /// writing leaf manifests on executors for large appends/CTAS, so a finished leaf's result is
     /// handed back explicitly and `engine` is reserved for that write I/O.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table's physical schema cannot be derived.
     #[internal_api]
-    pub(crate) fn new_leaf_node_writer(&self, _engine: &dyn Engine) -> DeltaResult<LeafNodeWriter> {
-        let column_mapping_mode = self
-            .read_snapshot
-            .table_configuration()
-            .column_mapping_mode();
-        let physical_schema = Arc::new(
-            self.read_snapshot
-                .schema()
-                .make_physical(column_mapping_mode)?,
-        );
-        Ok(LeafNodeWriter::new(physical_schema))
+    pub(crate) fn new_leaf_node_writer(&self, _engine: &dyn Engine) -> LeafNodeWriter {
+        LeafNodeWriter::new(self.physical_schema.clone())
     }
 
     /// Folds a finished leaf's [`LeafNodeWriterResult`] into this commit.
