@@ -2044,14 +2044,14 @@ mod tests {
             visitor: visit_single_geometry_field_schema,
         };
         let builder = ok_or_panic(unsafe {
-            get_create_table_builder(
+            get_create_table_txn_builder(
                 kernel_string_slice!(table_path),
                 &schema_arg,
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
-        let build_res = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
+        let build_res = unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) };
         assert_extern_result_error_contains(
             build_res,
             FFIKernelError::UnsupportedError,
