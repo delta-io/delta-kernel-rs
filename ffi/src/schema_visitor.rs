@@ -28,6 +28,8 @@ use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 use delta_kernel::{DeltaResult, KernelError};
 use tracing::warn;
 
@@ -521,6 +523,107 @@ pub unsafe extern "C" fn visit_field_void(
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata)
         .into_extern_result(&allocate_error)
+}
+
+/// Visit a geometry field with the given coordinate reference system.
+///
+/// Returns an error if the field name or CRS is invalid UTF-8, or if the CRS is not in
+/// `AUTHORITY:CODE` form.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, valid `name` and `crs` slices, and
+/// `allocate_error` function pointer, all valid for the duration of this call. When non-null,
+/// `metadata` must point to a valid descriptor and callback.
+#[cfg(feature = "geo-type-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_geometry(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    crs: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_geometry_impl(state, name_str, crs, nullable, metadata)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn visit_field_geometry_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    crs: DeltaResult<&str>,
+    nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
+) -> DeltaResult<usize> {
+    let geometry = GeometryType::try_new(crs?)?;
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::Geometry(Box::new(geometry)),
+        nullable,
+        metadata,
+    )
+}
+
+/// Visit a geography field with the given coordinate reference system and edge interpolation
+/// algorithm.
+///
+/// Returns an error if the field name, CRS, or algorithm is invalid UTF-8, if the CRS is not in
+/// `AUTHORITY:CODE` form, or if the algorithm is not a recognized Delta protocol token.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, valid `name`, `crs`, and `algorithm`
+/// slices, and `allocate_error` function pointer, all valid for the duration of this call. When
+/// non-null, `metadata` must point to a valid descriptor and callback.
+#[cfg(feature = "geo-type-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_geography(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    crs: KernelStringSlice,
+    algorithm: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
+    let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn visit_field_geography_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    crs: DeltaResult<&str>,
+    algorithm: DeltaResult<&str>,
+    nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
+) -> DeltaResult<usize> {
+    let algorithm = algorithm?
+        .parse::<EdgeInterpolationAlgorithm>()
+        .map_err(|err| {
+            KernelError::invalid_geo_params(format!(
+                "Invalid geography edge interpolation algorithm: {err}"
+            ))
+        })?;
+    let geography = GeographyType::try_new(crs?, algorithm)?;
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::Geography(Box::new(geography)),
+        nullable,
+        metadata,
+    )
 }
 
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
@@ -1360,6 +1463,98 @@ mod tests {
         assert_field_metadata!(interval_day_time, "interval_day_time");
         assert_field_metadata!(void, "void");
         assert_field_metadata!(decimal, "decimal", 10, 2);
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            assert_field_metadata!(
+                geometry,
+                "geometry",
+                KernelStringSlice::new_unsafe("OGC:CRS84")
+            );
+            assert_field_metadata!(
+                geography,
+                "geography",
+                KernelStringSlice::new_unsafe("OGC:CRS84"),
+                KernelStringSlice::new_unsafe("spherical")
+            );
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case::bad_geometry_crs("geom", "EPSG:4326 ", None)]
+    #[case::bad_geography_crs("geog", "EPSG:4326 ", Some("spherical"))]
+    #[case::bad_geography_algorithm("geog", "OGC:CRS84", Some("not-an-algorithm"))]
+    fn invalid_geo_field_parameters_return_recoverable_errors_without_inserting_fields(
+        #[case] name: &str,
+        #[case] crs: &str,
+        #[case] algorithm: Option<&str>,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let result = match algorithm {
+            None => unsafe {
+                visit_field_geometry(
+                    &mut state,
+                    KernelStringSlice::new_unsafe(name),
+                    KernelStringSlice::new_unsafe(crs),
+                    true,
+                    null(),
+                    allocate_err,
+                )
+            },
+            Some(algorithm) => unsafe {
+                visit_field_geography(
+                    &mut state,
+                    KernelStringSlice::new_unsafe(name),
+                    KernelStringSlice::new_unsafe(crs),
+                    KernelStringSlice::new_unsafe(algorithm),
+                    true,
+                    null(),
+                    allocate_err,
+                )
+            },
+        };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::InvalidGeoParamsError,
+            None,
+        );
+        assert!(state.elements.is_empty());
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn state_remains_usable_after_a_rejected_geo_field() {
+        let mut state = KernelSchemaVisitorState::default();
+
+        let result = unsafe {
+            visit_field_geography(
+                &mut state,
+                KernelStringSlice::new_unsafe("geog"),
+                KernelStringSlice::new_unsafe("OGC:CRS84"),
+                KernelStringSlice::new_unsafe("not-an-algorithm"),
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::InvalidGeoParamsError,
+            None,
+        );
+        assert!(state.elements.is_empty());
+
+        let valid = visit_field!(
+            geography,
+            state,
+            "geog",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            KernelStringSlice::new_unsafe("spherical"),
+            true,
+            null()
+        );
+        let field = unwrap_field(&mut state, valid).unwrap();
+        assert_eq!(field.name(), "geog");
     }
 
     #[test]
@@ -1611,6 +1806,8 @@ mod tests {
         //   col_map: map<string, long>,
         //   col_struct: struct<inner: string>,
         //   col_variant: variant<metadata: binary, value: binary>
+        //   col_geometry: geometry(OGC:CRS84),
+        //   col_geography: geography(OGC:CRS84, spherical)
         // >
 
         let mut state = KernelSchemaVisitorState::default();
@@ -1676,6 +1873,25 @@ mod tests {
 
         // Create variant<metadata: binary, value: binary>
         let col_variant = visit_variant_field!(state, "col_variant", false, null());
+        #[cfg(feature = "geo-type-in-dev")]
+        let col_geometry = visit_field!(
+            geometry,
+            state,
+            "col_geometry",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            false,
+            null()
+        );
+        #[cfg(feature = "geo-type-in-dev")]
+        let col_geography = visit_field!(
+            geography,
+            state,
+            "col_geography",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            KernelStringSlice::new_unsafe("spherical"),
+            false,
+            null()
+        );
 
         // Build the final schema
         let all_columns = [
@@ -1699,6 +1915,10 @@ mod tests {
             col_map,
             col_struct,
             col_variant,
+            #[cfg(feature = "geo-type-in-dev")]
+            col_geometry,
+            #[cfg(feature = "geo-type-in-dev")]
+            col_geography,
         ];
         let schema_id = ok_or_panic(unsafe {
             visit_field_struct(
@@ -1715,7 +1935,11 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 20);
+        #[cfg(feature = "geo-type-in-dev")]
+        let expected_len = 22;
+        #[cfg(not(feature = "geo-type-in-dev"))]
+        let expected_len = 20;
+        assert_eq!(fields.len(), expected_len);
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -1780,6 +2004,26 @@ mod tests {
             variant_fields[1].data_type(),
             &DataType::Primitive(PrimitiveType::Binary)
         );
+
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            assert_eq!(fields[20].name(), "col_geometry");
+            let DataType::Primitive(PrimitiveType::Geometry(geometry_type)) =
+                fields[20].data_type()
+            else {
+                panic!("Field col_geometry is not a geometry type");
+            };
+            assert_eq!(geometry_type.crs(), "OGC:CRS84");
+
+            assert_eq!(fields[21].name(), "col_geography");
+            let DataType::Primitive(PrimitiveType::Geography(geography_type)) =
+                fields[21].data_type()
+            else {
+                panic!("Field col_geography is not a geography type");
+            };
+            assert_eq!(geography_type.crs(), "OGC:CRS84");
+            assert_eq!(geography_type.algorithm().to_string(), "spherical");
+        }
     }
 
     #[test]

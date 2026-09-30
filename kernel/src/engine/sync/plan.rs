@@ -167,6 +167,9 @@ impl SyncPlanExecutor {
                 schema,
             }) => self.eval_scan(FileType::Parquet, files, file_constant_columns, schema),
             Operator::Values(values) => Ok(vec![values_to_record_batch(values)?]),
+            Operator::RelationSource(_) => Err(KernelError::unsupported(
+                "SyncPlanExecutor does not support RelationSource",
+            )),
             Operator::UnionAll(_) => Ok(Vec::from_iter(
                 inputs.iter().flat_map(|&i| results[i].iter().cloned()),
             )),

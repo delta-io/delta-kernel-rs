@@ -580,13 +580,10 @@ impl LogSegment {
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
-        require!(
-            listed_files
-                .ascending_commit_files()
-                .first()
-                .is_some_and(|first_commit| first_commit.version == start_version),
-            KernelError::MissingVersion(start_version)
-        );
+        validate_start_version_available(
+            start_version,
+            listed_files.ascending_commit_files().first(),
+        )?;
         LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
@@ -1775,6 +1772,29 @@ fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> DeltaResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Classifies a requested commit-range/table-changes start against the first available commit.
+///
+/// - no commit at or after the start -> [`KernelError::EmptyLog`];
+/// - the first available commit is not the requested start ->
+///   [`KernelError::StartVersionNotFound`], carrying that commit as `earliest`;
+/// - the first available commit is the requested start -> `Ok`.
+///
+/// A gap *after* a present start is not handled here -- it surfaces as
+/// [`KernelError::MissingVersion`] during contiguity validation in [`LogSegment::try_new`].
+pub(crate) fn validate_start_version_available(
+    start_version: Version,
+    first_commit: Option<&ParsedLogPath>,
+) -> DeltaResult<()> {
+    match first_commit {
+        None => Err(KernelError::EmptyLog),
+        Some(commit) if commit.version == start_version => Ok(()),
+        Some(commit) => Err(KernelError::StartVersionNotFound {
+            requested: start_version,
+            earliest: commit.version,
+        }),
+    }
 }
 
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {

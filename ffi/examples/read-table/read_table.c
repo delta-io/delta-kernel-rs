@@ -383,8 +383,9 @@ int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
+  bool print_scan_schema = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:")) != -1) {
+  while ((c = getopt (argc, argv, "ac:s")) != -1) {
     switch (c) {
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
@@ -396,6 +397,11 @@ int main(int argc, char* argv[])
       break;
     case 'c':
       requested_cols = optarg;
+      break;
+    case 's':
+      // Print the scan's logical schema (scan_logical_schema) as "Scan schema". Useful to check
+      // that a schema requested with -c was honored.
+      print_scan_schema = true;
       break;
     case '?':
       if (optopt == 'c') {
@@ -416,7 +422,7 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] table/path\n", argv[0]);
     return -1;
   }
 
@@ -500,7 +506,7 @@ int main(int argc, char* argv[])
   printf("version: %" PRIu64 "\n\n", v);
 
   CSchema *cschema = get_cschema(snapshot, engine);
-  print_cschema(cschema);
+  print_cschema("Schema", cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -552,6 +558,12 @@ int main(int argc, char* argv[])
 
   SharedSchema* logical_schema = scan_logical_schema(scan);
   SharedSchema* physical_schema = scan_physical_schema(scan);
+
+  if (print_scan_schema) {
+    CSchema* scan_cschema = build_cschema(logical_schema, engine);
+    print_cschema("Scan schema", scan_cschema);
+    free_cschema(scan_cschema);
+  }
   struct EngineContext context = {
     logical_schema,
     physical_schema,

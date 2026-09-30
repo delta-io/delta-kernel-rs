@@ -1096,6 +1096,8 @@ mod scan_builder_tests {
     use std::ffi::c_void;
 
     use test_utils::{actions_to_string, TestAction};
+    #[cfg(feature = "geo-type-in-dev")]
+    use url::Url;
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
@@ -1107,11 +1109,18 @@ mod scan_builder_tests {
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::ffi_test_utils::build_snapshot;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
     use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::{
+        schema_visitor::{visit_field_geography, visit_field_geometry},
+        tests::get_default_engine,
+    };
 
     /// Schema visitor that produces `{id: integer (nullable)}` -- a single-column projection of
     /// the standard test table schema.
@@ -1137,6 +1146,51 @@ mod scan_builder_tests {
                 kernel_string_slice!(schema),
                 field_ids.as_ptr(),
                 1,
+                false,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    extern "C" fn visit_geo_schema(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let geom = "geom";
+        let crs = "OGC:CRS84";
+        let geom_field_id = unsafe {
+            ok_or_panic(visit_field_geometry(
+                state,
+                kernel_string_slice!(geom),
+                kernel_string_slice!(crs),
+                true,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        };
+        let geog = "geog";
+        let algorithm = "spherical";
+        let geog_field_id = unsafe {
+            ok_or_panic(visit_field_geography(
+                state,
+                kernel_string_slice!(geog),
+                kernel_string_slice!(crs),
+                kernel_string_slice!(algorithm),
+                true,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        };
+        let field_ids = [geom_field_id, geog_field_id];
+        let schema = "schema";
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                kernel_string_slice!(schema),
+                field_ids.as_ptr(),
+                field_ids.len(),
                 false,
                 std::ptr::null(),
                 allocate_err,
@@ -1235,6 +1289,40 @@ mod scan_builder_tests {
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn test_scan_builder_with_geo_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/table-with-geo/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
+            .to_string();
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_geo_schema,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_schema(
+                builder,
+                engine.shallow_copy(),
+                &schema_arg,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+        let schema_ref = unsafe { schema.as_ref() };
+        let table_schema = unsafe { snapshot.as_ref() }.schema();
+        assert_eq!(schema_ref, table_schema.as_ref());
+        unsafe { free_schema(schema) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
     }
 
     #[tokio::test]
