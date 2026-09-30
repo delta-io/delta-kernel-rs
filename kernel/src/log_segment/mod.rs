@@ -292,7 +292,7 @@ impl LogSegment {
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> DeltaResult<Self> {
-        validate_log_path_fields(&listed_files)?;
+        validate_log_path_fields(listed_files.iter_all_paths())?;
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
@@ -317,7 +317,11 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
-        validate_latest_commit_file(&listed_files, effective_version)?;
+        validate_latest_commit_file(
+            &listed_files.ascending_commit_files,
+            listed_files.latest_commit_file.as_ref(),
+            effective_version,
+        )?;
         validate_crc(
             listed_files.latest_crc_file.as_ref(),
             checkpoint_version,
@@ -335,6 +339,33 @@ impl LogSegment {
         info!(segment = %log_segment.summary());
 
         Ok(log_segment)
+    }
+
+    /// Validates endpoint artifacts without revalidating this segment's unchanged replay files.
+    ///
+    /// `requested_version`, when specified, must match the segment's endpoint. `latest_commit_file`
+    /// and `latest_crc_file` are replacement paths selected for that endpoint.
+    ///
+    /// Returns an error if the requested endpoint is unavailable, either path has inconsistent
+    /// fields, the latest commit does not match the endpoint, or the CRC is outside segment bounds.
+    pub(crate) fn validate_unchanged_endpoint(
+        &self,
+        requested_version: Option<Version>,
+        latest_commit_file: Option<&ParsedLogPath>,
+        latest_crc_file: Option<&ParsedLogPath>,
+    ) -> DeltaResult<()> {
+        validate_log_path_fields(latest_crc_file.into_iter().chain(latest_commit_file))?;
+        let effective_version = validate_end_version(
+            &self.listed.ascending_commit_files,
+            &self.listed.checkpoint_parts,
+            requested_version,
+        )?;
+        validate_latest_commit_file(
+            &self.listed.ascending_commit_files,
+            latest_commit_file,
+            effective_version,
+        )?;
+        validate_crc(latest_crc_file, self.checkpoint_version, effective_version)
     }
 
     /// Returns the checkpoint version from the `_last_checkpoint` hint
@@ -1673,8 +1704,10 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
-fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> DeltaResult<()> {
-    for path in listed_files.iter_all_paths() {
+fn validate_log_path_fields<'a>(
+    paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+) -> DeltaResult<()> {
+    for path in paths {
         let reparsed = ParsedLogPath::try_from(path.location.clone())?
             .ok_or_else(|| KernelError::invalid_log_path(path.location.location.as_str()))?;
         require!(
@@ -1870,18 +1903,19 @@ fn validate_end_version(
 /// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
 /// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
 fn validate_latest_commit_file(
-    listed: &LogSegmentFiles,
+    commits: &[ParsedLogPath],
+    latest_commit_file: Option<&ParsedLogPath>,
     effective_version: Version,
 ) -> DeltaResult<()> {
     // TODO(#3293): Determine whether every non-empty commit list can require `latest_commit_file`;
     // legacy callers may omit it.
     require!(
-        listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
+        commits.is_empty() || latest_commit_file.is_some(),
         KernelError::internal_error(
             "latest_commit_file must be Some when ascending_commit_files is non-empty"
         )
     );
-    if let Some(commit) = &listed.latest_commit_file {
+    if let Some(commit) = latest_commit_file {
         require!(
             commit.version == effective_version,
             KernelError::internal_error(format!(

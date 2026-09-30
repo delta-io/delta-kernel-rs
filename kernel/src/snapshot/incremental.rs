@@ -333,7 +333,7 @@ impl Snapshot {
             // No version can follow Version::MAX.
             return Ok(NewSegment::Unchanged);
         };
-        let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
+        let mut new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
             storage.as_ref(),
             &log_root,
             log_tail,
@@ -359,19 +359,20 @@ impl Snapshot {
             };
         }
 
-        // create a log segment just from existing_checkpoint.version -> new_version
-        // OR could be from 1 -> new_version
-        // Save the latest_commit before moving new_listed_files
-        let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
-        // Note: new_log_segment won't have last_checkpoint_metadata since we're listing without a
-        // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
-        // will preserve last_checkpoint_metadata when merging the new log segment with the
-        // old one.
-        let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
-
-        let new_end_version = new_log_segment.end_version;
+        let new_checkpoint_version = new_listed_files
+            .checkpoint_parts
+            .first()
+            .map(|checkpoint| checkpoint.version);
+        let new_end_version = new_listed_files
+            .ascending_commit_files
+            .last()
+            .map(|commit| commit.version)
+            .max(new_checkpoint_version)
+            .ok_or(KernelError::EmptyLog)?;
         if new_end_version < existing_snapshot_version {
+            if requested_version.is_some_and(|target| new_end_version < target) {
+                return Err(KernelError::MissingVersion(new_end_version + 1));
+            }
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
             return Err(KernelError::invalid_log_segment(format!(
@@ -379,50 +380,27 @@ impl Snapshot {
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
         }
-        if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
-            if new_checkpoint_version > existing_snapshot_version {
-                // Case D.1: checkpoint ahead of existing snapshot. Commits between
-                // existing_snapshot_version+1 and new_checkpoint_version were filtered out
-                // of the listing, so a full rebuild is required. The existing snapshot's CRC
-                // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
-                // at or above the new checkpoint still advances per `incremental_replay`.
-                return Ok(NewSegment::Rebuild(new_log_segment));
-            }
-            // Case D.2: checkpoint at or below existing snapshot; fall through to case F to
-            // replay only the new commits and advance the checkpoint base.
+        if new_checkpoint_version.is_some_and(|checkpoint| checkpoint > existing_snapshot_version) {
+            // Case D.1: checkpoint ahead of existing snapshot. Commits between
+            // existing_snapshot_version+1 and new_checkpoint_version were filtered out
+            // of the listing, so a full rebuild is required. The existing snapshot's CRC
+            // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
+            // at or above the new checkpoint still advances per `incremental_replay`.
+            return Ok(NewSegment::Rebuild(LogSegment::try_new(
+                new_listed_files,
+                log_root,
+                requested_version,
+                None,
+            )?));
         }
+        // Case D.2: a checkpoint at or below the existing snapshot falls through to case F to
+        // replay only the new commits and advance the checkpoint base.
 
-        // Case E: no new checkpoint, version did not advance; return existing.
-        if new_end_version == existing_snapshot_version
-            && new_log_segment.checkpoint_version.is_none()
-        {
-            // We must check checkpoint_version here: if a checkpoint at or below the existing
-            // snapshot version was discovered, we still need to fall through to advance the
-            // checkpoint base even though the version did not change.
-            return Ok(NewSegment::Unchanged);
-        }
-
-        // Case F: lightweight P+M replay on new commits, merge with existing segment.
-        // (Also reached from Case D.2 when a checkpoint at or below the existing snapshot
-        // version was discovered.)
-        //
-        // The example below illustrates Case D.2 -> F.
-        #[rustfmt::skip]
-        // Example: existing segment = checkpoint@v0 + commit@v1, v2, v3
-        //          existing_snapshot_version = v3, listing_start = v1
-        //          target=v4, new checkpoint@v2 written since last build (Case D.2 -> F):
-        //
-        //    listing:          commit@v1, then checkpoint@v2 + commit@v3, v4
-        //                      (checkpoint flush drops v1)
-        //    new segment:      checkpoint@v2 + commit@v3, v4
-        //    after dedup:      drop commit@v3 (already in existing snapshot)
-        //                      -> ascending_commit_files = [commit@v4]
-        //    commit@v3 is not lost: the existing segment contributes it below
-        //    (existing commits above checkpoint@v2 = [commit@v3])
-        //    combined segment: checkpoint@v2 + commit@v3 (from existing) + commit@v4 (from new)
-        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
-        new_log_segment
-            .listed
+        // Save the latest commit before trimming commits at or below the existing snapshot version.
+        let new_latest_commit_file = new_listed_files.latest_commit_file.take();
+        // Cached commits supply the complete prefix, including staged paths absent from the
+        // filesystem listing and the caller's catalog suffix.
+        new_listed_files
             .ascending_commit_files
             .retain(|log_path| existing_snapshot_version < log_path.version);
         // Deduplicate compaction files the same way: the new listing re-lists from
@@ -431,47 +409,82 @@ impl Snapshot {
         // `existing_snapshot_version`, which may drop useful compaction files that span
         // across the old/new boundary (e.g. a new compaction(1, 3) when
         // existing_snapshot_version=2). This is conservative but safe.
-        new_log_segment
-            .listed
+        new_listed_files
             .ascending_compaction_files
             .retain(|log_path| existing_snapshot_version < log_path.version);
 
         // The CRC file the combined segment carries on disk.
-        let crc_file = Self::resolve_crc_file(&new_log_segment, existing_log_segment);
+        let crc_file = Self::resolve_crc_file(&new_listed_files, existing_log_segment);
 
-        // Combine existing and new log segments. When the new listing found a checkpoint at or
+        // Case E: no new checkpoint, version did not advance; return existing.
+        // We must check checkpoint_version here: if a checkpoint at or below the existing
+        // snapshot version was discovered, we still need to fall through to advance the
+        // checkpoint base even though the version did not change. Retained compaction files
+        // require full segment validation below before returning the existing snapshot.
+        if new_end_version == existing_snapshot_version
+            && new_checkpoint_version.is_none()
+            && new_listed_files.ascending_compaction_files.is_empty()
+        {
+            existing_log_segment.validate_unchanged_endpoint(
+                requested_version,
+                new_latest_commit_file.as_ref(),
+                crc_file.as_ref(),
+            )?;
+            return Ok(NewSegment::Unchanged);
+        }
+
+        // Case F: lightweight P+M replay on new commits, merge with existing segment.
+        // (Also reached from Case D.2 when a checkpoint at or below the existing snapshot
+        // version was discovered.)
+        //
+        // Combine existing and discovered files. When the listing found a checkpoint at or
         // below the existing snapshot version, trim existing commits and compaction files
         // already covered by it; otherwise keep all existing files.
-        let new_checkpoint_version = new_log_segment.checkpoint_version;
+        //
+        // The example below illustrates Case D.2 -> F.
+        #[rustfmt::skip]
+        // Example: existing segment = checkpoint@v0 + commit@v1, v2, v3
+        //          existing_snapshot_version = v3, listing_start = v1
+        //          target=v4, discovered checkpoint@v2 (Case D.2 -> F):
+        //
+        //    listing:          commit@v1, then checkpoint@v2 + commit@v3, v4
+        //                      (checkpoint flush drops v1)
+        //    discovered files: checkpoint@v2 + commit@v3, v4
+        //    after dedup:      drop commit@v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = [commit@v4]
+        //    commit@v3 is not lost: the existing segment contributes it below
+        //    (existing commits above checkpoint@v2 = [commit@v3])
+        //    combined segment: checkpoint@v2 + commit@v3 (from existing) + commit@v4 (discovered)
+        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
         let mut ascending_commit_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_commit_files,
             new_checkpoint_version,
         );
-        ascending_commit_files.extend(new_log_segment.listed.ascending_commit_files);
+        ascending_commit_files.extend(new_listed_files.ascending_commit_files);
         let mut ascending_compaction_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_compaction_files,
             new_checkpoint_version,
         );
-        ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
+        ascending_compaction_files.extend(new_listed_files.ascending_compaction_files);
 
-        // When the new listing found a checkpoint at or below the existing snapshot version,
+        // When the listing found a checkpoint at or below the existing snapshot version,
         // advance the base so future listings start from new_checkpoint_version+1; otherwise
         // preserve the existing base.
-        // Note: the incremental listing never uses a _last_checkpoint hint, so
-        // new_log_segment.last_checkpoint_metadata is always None when a new checkpoint
-        // is found here. The combined segment will read the new checkpoint's parquet footer at
-        // scan time. When no new checkpoint was found, preserve the existing hint if available.
+        // The incremental listing never uses a _last_checkpoint hint, so adopting a discovered
+        // checkpoint leaves last_checkpoint_metadata unset. The combined segment will read the
+        // checkpoint's parquet footer at scan time. When no checkpoint was discovered, preserve
+        // the existing hint if available.
         let (new_checkpoint_parts, new_checkpoint_hint) = if new_checkpoint_version.is_some() {
-            (
-                new_log_segment.listed.checkpoint_parts.clone(),
-                new_log_segment.last_checkpoint_metadata.clone(),
-            )
+            (new_listed_files.checkpoint_parts, None)
         } else {
             (
                 existing_log_segment.listed.checkpoint_parts.clone(),
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
+        let max_published_version = new_listed_files
+            .max_published_version
+            .max(existing_log_segment.listed.max_published_version);
         let combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
                 ascending_commit_files,
@@ -479,20 +492,22 @@ impl Snapshot {
                 checkpoint_parts: new_checkpoint_parts,
                 latest_crc_file: crc_file,
                 // In Case F there are new commits (new_end_version > existing_snapshot_version
-                // with no new checkpoint), so the new listing's `latest_commit_file` is always
+                // with no new checkpoint), so the listing's `latest_commit_file` is always
                 // `Some(commit @ new_end_version)` and matches the combined snapshot version.
                 latest_commit_file: new_latest_commit_file,
-                max_published_version: new_log_segment
-                    .listed
-                    .max_published_version
-                    .max(existing_log_segment.listed.max_published_version),
+                max_published_version,
             },
             log_root,
             requested_version,
             new_checkpoint_hint,
         )?;
 
-        Ok(NewSegment::Combined(combined_log_segment))
+        if new_end_version == existing_snapshot_version && new_checkpoint_version.is_none() {
+            // Case E with retained compaction files: the combined segment passed validation.
+            Ok(NewSegment::Unchanged)
+        } else {
+            Ok(NewSegment::Combined(combined_log_segment))
+        }
     }
 
     /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
@@ -519,29 +534,31 @@ impl Snapshot {
 
     /// Determine the on-disk CRC file the combined segment should carry.
     ///
-    /// Prefers the new segment's CRC; falls back to the existing segment's CRC if and only if
-    /// its version is >= the new segment's checkpoint version, so the fallback never violates the
+    /// Prefers the discovered CRC; falls back to the existing segment's CRC if no checkpoint was
+    /// discovered or the CRC version is >= the discovered checkpoint version. This preserves the
     /// [`LogSegmentFiles`] invariant `crc.version >= checkpoint.version` (enforced in
     /// [`LogSegment::try_new`]).
     fn resolve_crc_file(
-        new_log_segment: &LogSegment,
+        new_listed_files: &LogSegmentFiles,
         existing_log_segment: &LogSegment,
     ) -> Option<ParsedLogPath> {
-        let crc_satisfies_new_ckpt = |crc: &ParsedLogPath| {
-            new_log_segment
-                .checkpoint_version
-                .is_none_or(|ckpt_v| crc.version >= ckpt_v)
-        };
-        let existing_crc_file = existing_log_segment
-            .listed
+        let new_checkpoint_version = new_listed_files
+            .checkpoint_parts
+            .first()
+            .map(|checkpoint| checkpoint.version);
+        let existing_crc_file =
+            existing_log_segment
+                .listed
+                .latest_crc_file
+                .as_ref()
+                .filter(|crc| {
+                    new_checkpoint_version.is_none_or(|checkpoint| crc.version >= checkpoint)
+                });
+        new_listed_files
             .latest_crc_file
-            .clone()
-            .filter(crc_satisfies_new_ckpt);
-        new_log_segment
-            .listed
-            .latest_crc_file
-            .clone()
+            .as_ref()
             .or(existing_crc_file)
+            .cloned()
     }
 
     /// Filters `files` to only those with version above `checkpoint_version`, or clones all if
@@ -587,7 +604,8 @@ mod tests {
     use crate::path::LogPathFileType;
     use crate::snapshot::{commit, CheckpointWriteResult};
     use crate::unit_test_utils::{
-        install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
+        create_log_path, install_thread_local_metrics_reporter, string_array_to_engine_data,
+        CapturingReporter,
     };
 
     // ============================================================================
@@ -2593,9 +2611,193 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::listing_start_overflow(Version::MAX, false, None)]
+    #[case::maximum_shortfall(Version::MAX - 1, false, Some(Version::MAX))]
+    #[case::maximum_commit(Version::MAX - 1, true, Some(Version::MAX))]
+    #[tokio::test]
+    async fn test_incremental_segment_version_arithmetic_at_maximum(
+        #[case] existing_version: Version,
+        #[case] with_new_commit: bool,
+        #[case] requested_version: Option<Version>,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        let cached_commit = ParsedLogPath::try_from(crate::FileMeta {
+            location: ctx
+                .url
+                .join(delta_path_for_version(existing_version, "json").as_ref())?,
+            last_modified: 0,
+            size: 0,
+        })?
+        .unwrap();
+        let existing = LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![cached_commit.clone()],
+                latest_commit_file: Some(cached_commit),
+                ..Default::default()
+            },
+            ctx.url.join("_delta_log/")?,
+            Some(existing_version),
+            None,
+        )?;
+        if with_new_commit {
+            commit(ctx.url.as_str(), &ctx.store, Version::MAX, vec![]).await;
+        }
+        let result = Snapshot::build_new_segment(
+            ctx.engine.as_ref(),
+            &existing,
+            existing_version,
+            vec![],
+            requested_version,
+            CheckpointHandling::Ignore,
+            None,
+        );
+        if with_new_commit {
+            let NewSegment::Combined(segment) = result? else {
+                panic!("the maximum-version commit must extend the cached segment");
+            };
+            assert_eq!(segment.end_version, Version::MAX);
+            assert_eq!(segment.listed.ascending_commit_files.len(), 2);
+        } else if requested_version.is_some() {
+            assert!(matches!(
+                result,
+                Err(KernelError::MissingVersion(Version::MAX))
+            ));
+        } else {
+            assert!(matches!(result, Ok(NewSegment::Unchanged)));
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::relisted_commits(CheckpointHandling::Adopt, None)]
+    #[case::relisted_target_crc(CheckpointHandling::Adopt, Some(2))]
+    #[case::relisted_future_crc(CheckpointHandling::Adopt, Some(3))]
+    #[case::empty_listing(CheckpointHandling::Ignore, None)]
+    #[case::crc_only_listing(CheckpointHandling::Ignore, Some(3))]
+    #[tokio::test]
+    async fn test_incremental_no_progress_validates_requested_endpoint(
+        #[case] checkpoint_handling: CheckpointHandling,
+        #[case] crc_version: Option<Version>,
+        #[values(None, Some(3))] requested_version: Option<Version>,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(2)
+            .build(ctx.engine.as_ref())?;
+        if let Some(version) = crc_version {
+            ctx.store
+                .put(&delta_path_for_version(version, "crc"), "{}".into())
+                .await?;
+        }
+        let result = Snapshot::build_new_segment(
+            ctx.engine.as_ref(),
+            base.log_segment(),
+            base.version(),
+            vec![],
+            requested_version,
+            checkpoint_handling,
+            None,
+        );
+        if requested_version.is_some() {
+            assert!(matches!(result, Err(KernelError::MissingVersion(3))));
+        } else if checkpoint_handling == CheckpointHandling::Adopt && crc_version == Some(3) {
+            assert!(matches!(result, Err(KernelError::InternalError(_))));
+        } else {
+            assert!(matches!(result, Ok(NewSegment::Unchanged)));
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_incremental_no_progress_reuses_cached_staged_predecessor(
+        #[values(None, Some(4))] requested_version: Option<Version>,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        commit(ctx.url.as_str(), &ctx.store, 1, vec![]).await;
+        let staged_v2 = create_log_path(
+            ctx.url
+                .join(test_utils::staged_commit_path_for_version(2).as_ref())?
+                .as_str(),
+        );
+        let staged_v3 = create_log_path(
+            ctx.url
+                .join(test_utils::staged_commit_path_for_version(3).as_ref())?
+                .as_str(),
+        );
+        let existing = LogSegment::try_new(
+            LogSegmentFiles {
+                ascending_commit_files: vec![
+                    create_log_path("memory:///_delta_log/00000000000000000000.json"),
+                    create_log_path("memory:///_delta_log/00000000000000000001.json"),
+                    staged_v2,
+                    staged_v3.clone(),
+                ],
+                latest_commit_file: Some(staged_v3.clone()),
+                max_published_version: Some(1),
+                ..Default::default()
+            },
+            ctx.url.join("_delta_log/")?,
+            Some(3),
+            None,
+        )?;
+        let result = Snapshot::build_new_segment(
+            ctx.engine.as_ref(),
+            &existing,
+            3,
+            vec![staged_v3],
+            requested_version,
+            CheckpointHandling::Adopt,
+            None,
+        );
+        if requested_version.is_some() {
+            assert!(matches!(result, Err(KernelError::MissingVersion(4))));
+        } else {
+            assert!(matches!(result, Ok(NewSegment::Unchanged)));
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_incremental_missing_new_commit_is_not_covered_by_crc(
+        #[values(false, true)] with_crc: bool,
+        #[values(4, 5)] requested_version: Version,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(2)
+            .build(ctx.engine.as_ref())?;
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            4,
+            vec![add_action("file4.parquet")],
+        )
+        .await;
+        if with_crc {
+            ctx.store
+                .put(&delta_path_for_version(4, "crc"), "{}".into())
+                .await?;
+        }
+        let result = Snapshot::builder_from(base)
+            .at_version(requested_version)
+            .build(ctx.engine.as_ref());
+        assert!(matches!(result, Err(KernelError::MissingVersion(3))));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::unbounded(None)]
+    #[case::bounded(Some(6))]
+    #[case::maximum_target(Some(Version::MAX))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_version_regression_emits_log_segment_load_failure() -> DeltaResult<()>
-    {
+    async fn test_incremental_version_regression_emits_log_segment_load_failure(
+        #[case] requested_version: Option<Version>,
+    ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?; // v0..=v5
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2610,8 +2812,16 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
-        assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+        let mut builder = Snapshot::builder_from(base);
+        if let Some(version) = requested_version {
+            builder = builder.at_version(version);
+        }
+        let result = builder.build(ctx.engine.as_ref());
+        if requested_version.is_some() {
+            assert!(matches!(result, Err(KernelError::MissingVersion(4))));
+        } else {
+            assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+        }
 
         let events = reporter.events();
         let failure = events
