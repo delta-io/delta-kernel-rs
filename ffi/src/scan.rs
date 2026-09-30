@@ -20,6 +20,7 @@ use url::Url;
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
+use crate::error::AllocateErrorFn;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
@@ -870,6 +871,30 @@ pub unsafe extern "C" fn get_transform_for_row(
         .flatten()
         .map(Into::into)
         .into()
+}
+
+/// Returns the number of rows removed by `dv_info`, or [`OptionalValue::None`] if there is no
+/// deletion vector. Reads descriptor metadata without loading the deletion vector.
+///
+/// A negative cardinality returns a deletion-vector error allocated by `allocate_error`.
+/// The caller owns the returned error and must free it.
+///
+/// # Safety
+///
+/// `dv_info` must be a valid pointer to a [`DvInfo`], borrowed for the duration of this call.
+/// When obtained from the `info` field of [`CDvInfo`], it is valid only during the scan callback.
+/// `allocate_error` must be a valid error allocator and copy any message it retains.
+#[no_mangle]
+pub unsafe extern "C" fn cardinality_from_dv(
+    dv_info: &DvInfo,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<OptionalValue<u64>> {
+    unsafe {
+        dv_info
+            .cardinality()
+            .map(Into::into)
+            .into_extern_result(&allocate_error)
+    }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -1812,7 +1837,51 @@ mod tests {
     use std::collections::HashMap;
     use std::ptr::NonNull;
 
-    use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
+    use delta_kernel::scan::state::DvInfo;
+    use rstest::rstest;
+
+    use super::cardinality_from_dv;
+    use crate::error::FFIKernelError;
+    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_contains, ok_or_panic};
+    use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
+
+    #[rstest]
+    #[case::absent(None, Ok(None))]
+    #[case::empty(Some(0), Ok(Some(0)))]
+    #[case::present(Some(2), Ok(Some(2)))]
+    #[case::maximum(Some(i64::MAX), Ok(Some(i64::MAX as u64)))]
+    #[case::negative(Some(-1), Err("cardinality must be non-negative"))]
+    #[case::minimum(Some(i64::MIN), Err("cardinality must be non-negative"))]
+    fn test_cardinality_from_dv(
+        #[case] cardinality: Option<i64>,
+        #[case] expected: Result<Option<u64>, &str>,
+    ) {
+        let dv_info: DvInfo = cardinality
+            .map(|cardinality| {
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::Inline,
+                    path_or_inline_dv: String::new(),
+                    offset: None,
+                    size_in_bytes: 0,
+                    cardinality,
+                }
+                .into()
+            })
+            .unwrap_or_default();
+
+        let result = unsafe { cardinality_from_dv(&dv_info, allocate_err) };
+        match expected {
+            Ok(expected) => assert_eq!(ok_or_panic(result), OptionalValue::from(expected)),
+            Err(message) => assert_extern_result_error_contains(
+                result,
+                FFIKernelError::DeletionVectorError,
+                message,
+            ),
+        }
+    }
 
     extern "C" fn visit_entry(
         engine_context: NullableCvoid,

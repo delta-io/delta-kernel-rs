@@ -594,7 +594,7 @@ fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());
         assert!(scan_file.dv_info.deletion_vector.is_none());
-        assert_eq!(scan_file.dv_info.cardinality(), None);
+        assert_eq!(scan_file.dv_info.cardinality().unwrap(), None);
     }
     let mut files = vec![];
     for res in scan_metadata_iter {
