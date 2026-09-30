@@ -171,7 +171,7 @@ pub fn execute_and_validate_workload(
                 .as_ref()
                 .ok_or("SnapshotSpec must have expected or error field")?;
             let result = execute_snapshot_workload(engine, table_root, snapshot_spec.as_ref());
-            validate_snapshot(result, expected)?;
+            validate_snapshot(result, snapshot_spec.time_travel.as_ref(), expected)?;
         }
     }
     Ok(())

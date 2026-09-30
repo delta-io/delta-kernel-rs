@@ -260,6 +260,21 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_snapshot_v2.json",
         ],
     ),
+    (
+        "Metadata decoding fails before Kernel reaches the expected protocol validation",
+        &[
+            "pm_err_001_unsupported_reader_version_error",
+            "pm_err_002_unsupported_reader_feature_error",
+            "prod_unknown_reader_feature_error",
+            "pv_err_001_protocol_too_high_error",
+            "pv_err_002_unsupported_feature_error",
+            "pv_features_case_sensitivity_error",
+            "pv_reader_feature_not_in_writer_error",
+            "pv_reader_v3_writer_lt_7_error",
+            "pv_reader_v4_error_error",
+            "pv_unknown_reader_feature_error",
+        ],
+    ),
     // Predicate parser: LIKE operator not supported
     (
         "Predicate parser: LIKE operator not supported",
@@ -408,6 +423,8 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     (
         "Timestamp-based time travel not yet supported",
         &[
+            "ict_err_001_missing_commit_info_error",
+            "ict_err_002_missing_commit_timestamp_error",
             "ict_basic_read_v0_ts",
             "ict_dml_read_v0_ts",
             "ict_enable_later_read_v0_no_ict_ts",
@@ -452,6 +469,9 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "tt_version_read_timestamp_v0",
             "tt_version_read_timestamp_v1",
             "tt_version_read_timestamp_v2",
+            "tt_future_timestamp_error_error",
+            "tt_invalid_timestamp_error_error",
+            "tt_timestamp_before_retention_error_error",
         ],
     ),
     // IS NULL predicates on struct columns fail because kernel's GetReferencedFields only

@@ -4,6 +4,7 @@
 //! expected data is loaded from Parquet files in `expected_data/` and compared order-independently.
 //! For snapshot workloads, protocol and metadata are compared directly.
 
+use std::error::Error as StdError;
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::Arc;
@@ -17,8 +18,9 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSch
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::{KernelError as Error, Result};
-use delta_kernel_workloads::models::{ReadExpected, SnapshotExpected};
+use delta_kernel_workloads::models::{ExpectedError, ReadExpected, SnapshotExpected, TimeTravel};
 use itertools::Itertools;
+use serde_json::Value;
 use tracing::debug;
 
 use super::workload::{ReadResult, SnapshotResult};
@@ -208,6 +210,174 @@ fn require_map_compatibility(
     require_same_nullability("map entry", source_field, target_field)
 }
 
+fn protocols_equal(
+    actual: &delta_kernel::actions::Protocol,
+    expected: &delta_kernel::actions::Protocol,
+) -> Result<bool, String> {
+    fn normalized(protocol: &delta_kernel::actions::Protocol) -> Result<Value, String> {
+        let mut value = serde_json::to_value(protocol).map_err(|error| error.to_string())?;
+        for name in ["readerFeatures", "writerFeatures"] {
+            if let Some(features) = value.get_mut(name).and_then(Value::as_array_mut) {
+                features.sort_by_key(Value::to_string);
+            }
+        }
+        Ok(value)
+    }
+
+    Ok(normalized(actual)? == normalized(expected)?)
+}
+
+fn error_without_backtrace(error: &Error) -> &Error {
+    match error {
+        Error::Backtraced { source, .. } => error_without_backtrace(source),
+        error => error,
+    }
+}
+
+fn source_is_not_found(error: &(dyn StdError + 'static)) -> bool {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return true;
+    }
+    if error
+        .downcast_ref::<delta_kernel::object_store::Error>()
+        .is_some_and(|error| matches!(error, delta_kernel::object_store::Error::NotFound { .. }))
+    {
+        return true;
+    }
+    error.source().is_some_and(source_is_not_found)
+}
+
+fn is_file_not_found_error(error: &Error) -> bool {
+    match error {
+        Error::FileNotFound(_) => true,
+        Error::ObjectStore(error) => source_is_not_found(error),
+        Error::Arrow(delta_kernel::arrow::error::ArrowError::ExternalError(source)) => {
+            source_is_not_found(source.as_ref())
+        }
+        Error::Parquet(delta_kernel::parquet::errors::ParquetError::External(source)) => {
+            source_is_not_found(source.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
+    let actual = error_without_backtrace(actual);
+    match expected.error_code.as_str() {
+        "DELTA_STATE_RECOVER_ERROR" => {
+            matches!(
+                actual,
+                Error::MissingMetadata | Error::MissingProtocol | Error::MissingMetadataAndProtocol
+            ) || matches!(
+                actual,
+                Error::InvalidCheckpoint(message)
+                    if message == "Had a _last_checkpoint hint but didn't find any checkpoints"
+            )
+        }
+        "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG" => matches!(
+            actual,
+            Error::EmptyLog | Error::MissingVersion(_) | Error::FileNotFound(_)
+        ),
+        "DELTA_LOG_FILE_NOT_FOUND" => {
+            matches!(actual, Error::FileNotFound(_))
+                || matches!(actual, Error::Generic(message) if message == "Only non-negative snapshot versions are supported")
+        }
+        "DELTA_TRUNCATED_TRANSACTION_LOG" => {
+            matches!(
+                actual,
+                Error::EmptyLog | Error::MissingVersion(_) | Error::FileNotFound(_)
+            )
+        }
+        "DELTA_VERSIONS_NOT_CONTIGUOUS" | "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC" => matches!(
+            actual,
+            Error::LogTailVersionsNotContiguous { .. } | Error::MissingVersion(_)
+        ),
+        "ColumnMappingUnsupportedException" => {
+            matches!(actual, Error::InvalidColumnMappingMode(_))
+        }
+        "COLUMN_ALREADY_EXISTS" => {
+            matches!(
+                actual,
+                Error::Schema(message)
+                    if message.starts_with("Duplicate field name (case-insensitive):")
+            ) || matches!(
+                actual,
+                Error::MalformedJson(error)
+                    if error
+                        .to_string()
+                        .starts_with("Schema error: Duplicate field name (case-insensitive):")
+            )
+        }
+        "UNRESOLVED_COLUMN" => matches!(
+            actual,
+            Error::Generic(message)
+                if message.starts_with("Cannot determine types for: Identifier(")
+        ),
+        "FIELD_NOT_FOUND" => matches!(
+            actual,
+            Error::Generic(message)
+                if message.starts_with("Cannot determine types for: CompoundIdentifier(")
+        ),
+        "DELTA_VERSION_NOT_FOUND" => {
+            matches!(actual, Error::MissingVersion(_) | Error::EmptyLog)
+        }
+        "DELTA_TABLE_RESTORE_VERSION_INVALID" => matches!(
+            actual,
+            Error::Generic(message)
+                if message == "Only non-negative snapshot versions are supported"
+        ),
+        "DELTA_INVALID_PROTOCOL_VERSION" => {
+            matches!(actual, Error::Unsupported(message) if message.starts_with("Unsupported minimum reader version "))
+                || matches!(actual, Error::InvalidProtocol(message) if message.contains("min_reader_version"))
+        }
+        "DELTA_UNSUPPORTED_READER_VERSION" => matches!(
+            actual,
+            Error::InvalidProtocol(message)
+                if message == "Writer features must be present when minimum writer version = 7"
+        ),
+        "DELTA_UNSUPPORTED_FEATURES_FOR_READ" => {
+            matches!(actual, Error::Unsupported(message) if message.contains(" is not supported"))
+        }
+        "DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH" => {
+            matches!(
+                actual,
+                Error::InvalidProtocol(message)
+                    if message.starts_with(
+                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
+                    )
+            ) || matches!(actual, Error::Unsupported(message) if message.contains(" requires "))
+        }
+        "DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION" | "DELTA_TIMESTAMP_GREATER_THAN_COMMIT" => {
+            matches!(actual, Error::LogHistory(_))
+        }
+        "FAILED_READ_FILE.DBR_FILE_NOT_EXIST" => is_file_not_found_error(actual),
+        "FAILED_READ_FILE.NO_HINT" => {
+            is_file_not_found_error(actual)
+                || matches!(actual, Error::DeletionVector(_))
+                || matches!(actual, Error::InternalError(message) if message.starts_with("Unsupported deletion vector format option:"))
+        }
+        _ => false,
+    }
+}
+
+fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> Result<(), String> {
+    if expected_error_matches(expected, actual) {
+        debug!(
+            "Got expected error '{}' with message: {:?}\nKernel error: {}",
+            expected.error_code, expected.error_message, actual
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "Expected error category '{}', got: {actual}",
+            expected.error_code
+        ))
+    }
+}
+
 /// Read expected data from parquet files in expected_dir/expected_data/.
 fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
     let expected_data_dir = expected_dir.join("expected_data");
@@ -298,11 +468,7 @@ pub fn validate_read_result(
             Ok(())
         }
         (Err(kernel_err), ReadExpected::Error { error }) => {
-            debug!(
-                "Got expected error '{}' with message: {:?}\nKernel error: {}",
-                error.error_code, error.error_message, kernel_err
-            );
-            Ok(())
+            validate_expected_error(&kernel_err, error)
         }
         (Ok(_), ReadExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",
@@ -317,11 +483,22 @@ pub fn validate_read_result(
 /// Validate snapshot result against expected outcome.
 pub fn validate_snapshot(
     result: Result<SnapshotResult>,
+    time_travel: Option<&TimeTravel>,
     expected: &SnapshotExpected,
 ) -> Result<(), String> {
     match (result, expected) {
         (Ok(snapshot_result), SnapshotExpected::Success { expected }) => {
-            if snapshot_result.protocol != *expected.protocol {
+            if let Some(TimeTravel::Version { version }) = time_travel {
+                let expected_version = u64::try_from(*version)
+                    .map_err(|_| "Only non-negative snapshot versions are supported")?;
+                if snapshot_result.version != expected_version {
+                    return Err(format!(
+                        "Snapshot version mismatch: expected {expected_version}, got {}",
+                        snapshot_result.version
+                    ));
+                }
+            }
+            if !protocols_equal(&snapshot_result.protocol, &expected.protocol)? {
                 return Err(format!(
                     "Expected protocol to match:\n{:?}\n{:?}",
                     snapshot_result.protocol, expected.protocol
@@ -336,11 +513,7 @@ pub fn validate_snapshot(
             Ok(())
         }
         (Err(kernel_err), SnapshotExpected::Error { error }) => {
-            debug!(
-                "Got expected error '{}' with message: {:?}\nKernel error: {}",
-                error.error_code, error.error_message, kernel_err
-            );
-            Ok(())
+            validate_expected_error(&kernel_err, error)
         }
         (Ok(_), SnapshotExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",
@@ -356,8 +529,211 @@ pub fn validate_snapshot(
 mod tests {
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, TimestampNanosecondArray};
     use delta_kernel::arrow::datatypes::{Field, Schema, TimeUnit};
+    use delta_kernel_workloads::models::{ExpectedError, SnapshotExpected};
 
     use super::*;
+
+    fn expected_error(code: &str) -> ExpectedError {
+        ExpectedError {
+            error_code: code.to_string(),
+            error_message: None,
+        }
+    }
+
+    fn snapshot_expected() -> SnapshotExpected {
+        serde_json::from_value(serde_json::json!({
+            "expected": {
+                "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 },
+                "metadata": {
+                    "id": "id",
+                    "format": { "provider": "parquet", "options": {} },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn expected_error_rejects_unrelated_kernel_error() {
+        let expected = expected_error("DELTA_STATE_RECOVER_ERROR");
+        assert!(validate_expected_error(&Error::MissingMetadata, &expected).is_ok());
+        assert!(validate_expected_error(
+            &Error::InvalidCheckpoint(
+                "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
+            ),
+            &expected
+        )
+        .is_ok());
+
+        let error = validate_expected_error(&Error::FileNotFound("x".into()), &expected)
+            .expect_err("wrong error category must fail");
+        assert!(error.contains("Expected error category 'DELTA_STATE_RECOVER_ERROR'"));
+    }
+
+    #[test]
+    fn protocol_error_categories_do_not_overlap() {
+        let invalid_version = Error::unsupported("Unsupported minimum reader version 4");
+        assert!(expected_error_matches(
+            &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
+            &invalid_version
+        ));
+        assert!(!expected_error_matches(
+            &expected_error("DELTA_UNSUPPORTED_FEATURES_FOR_READ"),
+            &invalid_version
+        ));
+
+        let unsupported_feature = Error::unsupported("Feature 'future' is not supported");
+        assert!(expected_error_matches(
+            &expected_error("DELTA_UNSUPPORTED_FEATURES_FOR_READ"),
+            &unsupported_feature
+        ));
+        assert!(!expected_error_matches(
+            &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
+            &unsupported_feature
+        ));
+
+        let feature_mismatch = Error::invalid_protocol(
+            "Reader features must contain only ReaderWriter features that are also listed in writer features",
+        );
+        assert!(expected_error_matches(
+            &expected_error("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH"),
+            &feature_mismatch
+        ));
+        assert!(!expected_error_matches(
+            &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
+            &feature_mismatch
+        ));
+
+        let missing_writer_features = Error::invalid_protocol(
+            "Writer features must be present when minimum writer version = 7",
+        );
+        assert!(expected_error_matches(
+            &expected_error("DELTA_UNSUPPORTED_READER_VERSION"),
+            &missing_writer_features
+        ));
+        assert!(!expected_error_matches(
+            &expected_error("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH"),
+            &missing_writer_features
+        ));
+    }
+
+    #[test]
+    fn versions_not_contiguous_accepts_missing_version() {
+        assert!(expected_error_matches(
+            &expected_error("DELTA_VERSIONS_NOT_CONTIGUOUS"),
+            &Error::MissingVersion(2)
+        ));
+    }
+
+    #[test]
+    fn column_already_exists_accepts_duplicate_schema_field() {
+        let malformed_json = <serde_json::Error as serde::de::Error>::custom(
+            "Schema error: Duplicate field name (case-insensitive): 'id'",
+        );
+        assert!(expected_error_matches(
+            &expected_error("COLUMN_ALREADY_EXISTS"),
+            &Error::MalformedJson(malformed_json)
+        ));
+    }
+
+    #[test]
+    fn unresolved_column_accepts_unknown_predicate_identifier() {
+        assert!(expected_error_matches(
+            &expected_error("UNRESOLVED_COLUMN"),
+            &Error::generic("Cannot determine types for: Identifier(nonExistentCol) and Value(1)")
+        ));
+    }
+
+    #[test]
+    fn version_errors_match_kernel_version_failures() {
+        assert!(expected_error_matches(
+            &expected_error("DELTA_VERSION_NOT_FOUND"),
+            &Error::MissingVersion(2)
+        ));
+        assert!(expected_error_matches(
+            &expected_error("DELTA_VERSION_NOT_FOUND"),
+            &Error::EmptyLog
+        ));
+        assert!(expected_error_matches(
+            &expected_error("DELTA_TABLE_RESTORE_VERSION_INVALID"),
+            &Error::generic("Only non-negative snapshot versions are supported")
+        ));
+    }
+
+    #[test]
+    fn expected_file_not_found_rejects_unrelated_storage_errors() {
+        let expected = expected_error("FAILED_READ_FILE.DBR_FILE_NOT_EXIST");
+        assert!(expected_error_matches(
+            &expected,
+            &Error::FileNotFound("missing.parquet".to_string())
+        ));
+        assert!(!expected_error_matches(
+            &expected,
+            &Error::ObjectStore(delta_kernel::object_store::Error::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "permission denied"
+                )),
+            })
+        ));
+    }
+
+    #[test]
+    fn expected_categories_reject_harness_limitations() {
+        assert!(!expected_error_matches(
+            &expected_error("DELTA_TIMESTAMP_GREATER_THAN_COMMIT"),
+            &Error::generic("Timestamp-based time travel is not yet supported")
+        ));
+        assert!(!expected_error_matches(
+            &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
+            &Error::Arrow(delta_kernel::arrow::error::ArrowError::JsonError(
+                "metadata decode failed".to_string()
+            ))
+        ));
+    }
+
+    #[test]
+    fn snapshot_validation_checks_requested_version() {
+        let expected = snapshot_expected();
+        let SnapshotExpected::Success { expected: state } = &expected else {
+            unreachable!()
+        };
+        let result = SnapshotResult {
+            version: 4,
+            protocol: state.protocol.as_ref().clone(),
+            metadata: state.metadata.as_ref().clone(),
+        };
+        let time_travel = TimeTravel::Version { version: 3 };
+
+        let error = validate_snapshot(Ok(result), Some(&time_travel), &expected)
+            .expect_err("wrong snapshot version must fail");
+        assert_eq!(error, "Snapshot version mismatch: expected 3, got 4");
+    }
+
+    #[test]
+    fn protocol_feature_order_is_semantically_irrelevant() {
+        let first = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["columnMapping", "deletionVectors"],
+            "writerFeatures": ["columnMapping", "deletionVectors"]
+        }))
+        .unwrap();
+        let second = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["deletionVectors", "columnMapping"],
+            "writerFeatures": ["deletionVectors", "columnMapping"]
+        }))
+        .unwrap();
+
+        assert!(protocols_equal(&first, &second).unwrap());
+    }
 
     #[test]
     fn timestamp_normalization_accepts_microsecond_precision() {
