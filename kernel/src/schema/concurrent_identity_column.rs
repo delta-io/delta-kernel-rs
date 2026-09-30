@@ -61,6 +61,26 @@ impl<'a> ConcurrentIdentityColumn<'a> {
     }
 }
 
+/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
+/// concurrent `sequenceId` and the classic `start`/`step` keys.
+///
+/// This is a convenience over stamping the [`ColumnMetadataKey`] entries by hand. The `sequence_id`
+/// is an identifier provided by the connector (at most 64 characters); `start` is the first value
+/// the sequence issues and `step` the (non-zero) increment.
+#[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
+pub fn concurrent_identity_column(
+    name: impl Into<String>,
+    sequence_id: impl Into<String>,
+    start: i64,
+    step: i64,
+) -> StructField {
+    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
+        sequence_id,
+        start,
+        step,
+    ))
+}
+
 /// Scans the top-level fields of `schema` for Concurrent Identity Columns (CIC), returning a
 /// borrowed [`ConcurrentIdentityColumn`] view of each.
 ///
@@ -140,12 +160,14 @@ pub(crate) fn validate_concurrent_identity_columns(
     Ok(found)
 }
 
+/// Returns whether `field` carries the `delta.identity.concurrent.sequenceId` metadata key.
 pub(crate) fn has_concurrent_sequence_id(field: &StructField) -> bool {
     field
         .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
         .is_some()
 }
 
+/// Returns whether any top-level field of `schema` carries a `delta.identity.highWaterMark`.
 pub(crate) fn has_high_water_mark(schema: &StructType) -> bool {
     schema.fields().any(|field| {
         field
@@ -178,26 +200,6 @@ pub(crate) fn cic_metadata(
             MetadataValue::Number(step),
         ),
     ]
-}
-
-/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
-/// concurrent `sequenceId` and the classic `start`/`step` keys.
-///
-/// This is a convenience over stamping the [`ColumnMetadataKey`] entries by hand. The `sequence_id`
-/// is an identifier provided by the connector (at most 64 characters); `start` is the first value
-/// the sequence issues and `step` the (non-zero) increment.
-#[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
-pub fn concurrent_identity_column(
-    name: impl Into<String>,
-    sequence_id: impl Into<String>,
-    start: i64,
-    step: i64,
-) -> StructField {
-    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
-        sequence_id,
-        start,
-        step,
-    ))
 }
 
 /// Validates a single top-level Concurrent Identity Column field and returns its sequence id. See
