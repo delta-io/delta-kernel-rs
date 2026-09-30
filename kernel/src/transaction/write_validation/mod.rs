@@ -3,8 +3,7 @@
 //! [`Transaction`]: super::Transaction
 
 // TODO(#2869): Add the remaining write-side validations:
-// - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
-//   `txn.dv_matched_files`
+// - No duplicate (path, DvId) across staged adds, removes, and matched DV files
 
 mod addfile;
 mod dv;

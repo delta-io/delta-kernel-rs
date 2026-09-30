@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use super::Transaction;
+use super::{Imperative, Transaction};
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
@@ -73,7 +73,7 @@ fn string_map_literal_expr(
     Ok(Arc::new(expression))
 }
 
-impl<S> Transaction<S> {
+impl<S> Transaction<S, Imperative> {
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,

@@ -12,7 +12,7 @@ use crate::committer::Committer;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::transaction::{AlterTable, Transaction};
+use crate::transaction::{AlterTable, ExecutionMode, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
 use crate::KernelResult;
 
@@ -23,7 +23,7 @@ use crate::KernelResult;
 /// does not implement [`SupportsDataFiles`](super::SupportsDataFiles).
 pub type AlterTableTransaction = Transaction<AlterTable>;
 
-impl AlterTableTransaction {
+impl<E: ExecutionMode> Transaction<AlterTable, E> {
     /// Create a new transaction for altering a table's schema. Produces a metadata-only commit
     /// that emits an updated Metadata action with the evolved schema.
     ///
@@ -60,8 +60,7 @@ impl AlterTableTransaction {
             engine_info: None,
             operation_parameters: None,
             operation_metrics: None,
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
+            staged_data_changes: Default::default(),
             set_transactions: vec![],
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
@@ -76,8 +75,6 @@ impl AlterTableTransaction {
             // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for
             // now: safe, but misses the true-case optimization delta-spark applies.
             is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             manifest_write: None,
             physical_clustering_columns: None,
