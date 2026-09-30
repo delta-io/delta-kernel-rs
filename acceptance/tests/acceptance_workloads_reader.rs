@@ -183,14 +183,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &["cp_checkpoint_only_table/specs/cp_checkpoint_only_table_error"],
     ),
     (
-        "Projected column not found after column mapping/schema order change",
-        &[
-            "ds_schema_order_mismatch/specs/ds_schema_order_mismatch_single_col_last",
-            "ds_with_dvs_edge/specs/ds_with_dvs_edge_proj_and_skip_with_dv",
-            "dv_projection_with_pred/specs/dv_projection_with_pred_proj_and_pred",
-        ],
-    ),
-    (
         "Does not reject unsupported column mapping mode",
         &["cm_err_003_invalid_mode/specs/cm_err_003_invalid_mode_error"],
     ),
