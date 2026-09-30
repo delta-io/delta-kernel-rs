@@ -78,8 +78,6 @@ mod domain_metadata;
 mod leaf_writer;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod manifest_commit_state;
-#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
-mod manifest_commit_tests;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod root_manifest_file;
 pub(crate) mod schema_evolution;
@@ -1858,6 +1856,13 @@ pub struct RetryableTransaction<S = ExistingTable> {
 
 #[cfg(test)]
 mod tests {
+    // Manifest-commit and root-manifest tests live in their own file
+    // (tests/manifest_commit_tests.rs) but as a submodule of `tests`, so they reuse this
+    // module's private helpers (e.g. `create_existing_table_txn`) without widening their
+    // visibility.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod manifest_commit_tests;
+
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -3015,7 +3020,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    pub(super) fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
         let batch = create_valid_add_file_batch(false /* all_nullable */);
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
@@ -3105,8 +3110,8 @@ mod tests {
     }
 
     /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
-    pub(super) fn create_existing_table_txn(
-    ) -> DeltaResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)> {
+    fn create_existing_table_txn() -> DeltaResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
+    {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;

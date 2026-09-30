@@ -1,9 +1,8 @@
 //! Tests for `adaptiveMetadata-preview` manifest (content-tree) commits and root manifest file
 //! commits.
 
-use super::manifest_commit_state::ManifestCommitState;
-use super::tests::{add_dummy_file, create_existing_table_txn};
-use super::{ManifestWrite, Transaction};
+use super::super::{ManifestCommitState, ManifestWrite, Transaction};
+use super::{add_dummy_file, create_existing_table_txn};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::snapshot::Snapshot;
