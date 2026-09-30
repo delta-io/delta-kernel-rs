@@ -23,7 +23,7 @@ use crate::schema::SchemaRef;
 pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::CollectInto;
-use crate::{DataType, DeltaResult, DynPartialEq, Error};
+use crate::{DataType, DeltaResult, DynPartialEq, KernelError};
 
 mod column_names;
 mod scalars;
@@ -756,7 +756,7 @@ impl MapToStructOptions {
 ///
 /// Non-empty geometry and geography values are unsupported. Struct, array, map, and variant target
 /// fields are not primitive partition types and are rejected. Any other unparseable non-empty value
-/// returns [`Error::ParseError`] and fails evaluation; it does not silently become null.
+/// returns [`KernelError::ParseError`] and fails evaluation; it does not silently become null.
 ///
 /// # Implementing this expression
 ///
@@ -864,7 +864,7 @@ impl Expression {
     pub fn struct_patch<P>(patch: P) -> DeltaResult<Self>
     where
         P: TryInto<ExpressionStructPatch>,
-        Error: From<P::Error>,
+        KernelError: From<P::Error>,
     {
         Ok(Self::StructPatch(patch.try_into()?))
     }

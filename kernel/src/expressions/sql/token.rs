@@ -14,7 +14,7 @@ use std::iter::Peekable;
 use std::str::Chars;
 
 use crate::expressions::column_names::{is_simple_char, parse_escaped_field_name};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// A peekable character stream over the source string.
 type CharStream<'a> = Peekable<Chars<'a>>;
@@ -159,8 +159,8 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
     Ok(tokens)
 }
 
-fn unexpected(c: char, sql: &str) -> Error {
-    Error::generic(format!("unexpected character '{c}' in {sql}"))
+fn unexpected(c: char, sql: &str) -> KernelError {
+    KernelError::generic(format!("unexpected character '{c}' in {sql}"))
 }
 
 /// Peek the second character of the stream (the one after the next), without consuming anything.
@@ -177,7 +177,7 @@ fn peek_second(chars: &CharStream<'_>) -> Option<char> {
 /// with a `'`.
 fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<String> {
     if chars.next_if_eq(&'\'').is_none() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "string literal must start with a quote in {sql}"
         )));
     }
@@ -195,7 +195,7 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
             }
             Some(c) => out.push(c),
             None => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "unterminated string literal in {sql}"
                 )))
             }

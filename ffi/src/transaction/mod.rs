@@ -136,10 +136,10 @@ fn commit_result_to_committed_handle<S>(
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
-        CommitResult::Retryable(_) => Err(delta_kernel::Error::unsupported(
+        CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
-        CommitResult::Conflicted(conflicted) => Err(delta_kernel::Error::Generic(format!(
+        CommitResult::Conflicted(conflicted) => Err(delta_kernel::KernelError::Generic(format!(
             "commit conflict at version {}",
             conflicted.conflict_version()
         ))),
@@ -334,7 +334,7 @@ fn with_root_manifest_file_impl(
     let size = file
         .size
         .try_into()
-        .map_err(|_| delta_kernel::Error::generic("manifest size does not fit a FileSize"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("manifest size does not fit a FileSize"))?;
     let delta_file = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
@@ -897,7 +897,7 @@ mod tests {
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::delta_types::FfiColumnNameArray;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
-    use delta_kernel_ffi::error::KernelError;
+    use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, engine_handle_for_store,
@@ -916,13 +916,16 @@ mod tests {
         free_write_context, get_logical_to_physical, get_partitioned_write_context,
         get_physical_write_schema, get_unpartitioned_write_context, get_write_dir, get_write_path,
         get_write_schema, resolve_file_path, visit_partition_values, write_context_builder_build,
-        write_context_builder_with_partition_values, FfiRowTrackingMetadataColumns,
+        write_context_builder_with_partition_values,
+        write_context_builder_with_physical_partition_values, FfiRowTrackingMetadataColumns,
         SharedWriteContext,
     };
 
     use super::*;
     use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
     use crate::expressions::free_kernel_expression;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema_visitor::visit_field_geometry;
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
@@ -1278,6 +1281,7 @@ mod tests {
     async fn test_distributed_write_state_outlives_transaction(
         #[case] partitioned: bool,
         #[values(false, true)] roundtrip: bool,
+        #[values(false, true)] physical_partition_keys: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let schema = schema_ref! {
             nullable "number": INTEGER,
@@ -1345,7 +1349,7 @@ mod tests {
                 unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
             assert_extern_result_error_contains(
                 invalid_partition_build,
-                KernelError::UnknownError,
+                FFIKernelError::UnknownError,
                 if partitioned {
                     "unknown partition column 'unknown'"
                 } else {
@@ -1362,7 +1366,7 @@ mod tests {
                     unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
                 assert_extern_result_error_contains(
                     missing_partition_build,
-                    KernelError::UnknownError,
+                    FFIKernelError::UnknownError,
                     "missing partition column 'part'",
                 );
             }
@@ -1385,7 +1389,7 @@ mod tests {
             };
             assert_extern_result_error_with_message(
                 invalid_row_tracking,
-                KernelError::Utf8Error,
+                FFIKernelError::Utf8Error,
                 None,
             );
 
@@ -1423,7 +1427,7 @@ mod tests {
                 unsafe { write_context_builder_build(builder, engine.shallow_copy()) };
             assert_extern_result_error_with_message(
                 unsupported_row_tracking_build,
-                KernelError::UnsupportedError,
+                FFIKernelError::UnsupportedError,
                 None,
             );
 
@@ -1446,8 +1450,15 @@ mod tests {
                             engine.shallow_copy(),
                         )
                     });
-                    builder =
-                        unsafe { write_context_builder_with_partition_values(builder, partitions) };
+                    builder = if physical_partition_keys {
+                        unsafe {
+                            write_context_builder_with_physical_partition_values(
+                                builder, partitions,
+                            )
+                        }
+                    } else {
+                        unsafe { write_context_builder_with_partition_values(builder, partitions) }
+                    };
                 }
                 builders.push((value, builder));
             }
@@ -1486,7 +1497,7 @@ mod tests {
                 };
                 assert_extern_result_error_with_message(
                     result,
-                    KernelError::MalformedJsonError,
+                    FFIKernelError::MalformedJsonError,
                     None,
                 );
                 let snapshot = unsafe {
@@ -2005,7 +2016,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
         );
 
@@ -2028,7 +2039,7 @@ mod tests {
 
         assert_extern_result_error_contains(
             unsafe { commit(txn, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "requires the 'rowTracking' feature",
         );
 
@@ -2051,7 +2062,7 @@ mod tests {
 
         assert_extern_result_error_contains(
             unsafe { with_row_tracking_high_water_mark(txn, 8, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "already specified in this transaction",
         );
 
@@ -2111,7 +2122,7 @@ mod tests {
         });
         assert_extern_result_error_contains(
             unsafe { commit(txn, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "cannot be less than the calculated value 7",
         );
 
@@ -2177,7 +2188,7 @@ mod tests {
         });
         assert_extern_result_error_contains(
             unsafe { commit(txn, engine.shallow_copy()) },
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             "cannot be less than the calculated value 1",
         );
 
@@ -2220,7 +2231,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::GenericError,
+            FFIKernelError::GenericError,
             Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
         );
 
@@ -2271,7 +2282,7 @@ mod tests {
         let result = unsafe { commit(txn, engine.shallow_copy()) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::UnsupportedError,
+            FFIKernelError::UnsupportedError,
             Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
         );
 
@@ -2283,7 +2294,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel_ffi::{
-            get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
+            get_snapshot_builder, snapshot_builder_build, snapshot_builder_with_max_catalog_version,
         };
 
         use crate::delta_kernel_unity_catalog::tests::{
@@ -2339,11 +2350,11 @@ mod tests {
             let engine = engine_handle_for_store(Arc::clone(&store));
 
             let snapshot = unsafe {
-                let mut ptr = ok_or_panic(get_snapshot_builder(
+                let ptr = ok_or_panic(get_snapshot_builder(
                     kernel_string_slice!(table_path_str),
                     engine.shallow_copy(),
                 ));
-                snapshot_builder_set_max_catalog_version(&mut ptr, 0);
+                let ptr = snapshot_builder_with_max_catalog_version(ptr, 0);
                 ok_or_panic(snapshot_builder_build(ptr))
             };
 
@@ -2721,6 +2732,74 @@ mod tests {
         Ok(())
     }
 
+    /// Schema visitor callback for tests: builds a one-field `{geom: geometry(OGC:CRS84)}` schema.
+    #[cfg(feature = "geo-type-in-dev")]
+    extern "C" fn visit_single_geometry_field_schema(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let name = "geom";
+        let crs = "OGC:CRS84";
+        let field_id = unsafe {
+            ok_or_panic(visit_field_geometry(
+                state,
+                kernel_string_slice!(name),
+                kernel_string_slice!(crs),
+                true,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        };
+        let field_ids = [field_id];
+        let root = "schema";
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                kernel_string_slice!(root),
+                field_ids.as_ptr(),
+                field_ids.len(),
+                false,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        }
+    }
+
+    /// A visitor-built geo schema handed to the create-table path must be rejected: `create_table`
+    /// does not declare the `geospatial` reader/writer feature for the tables it builds, so a
+    /// schema containing a geometry/geography column always fails table-configuration validation
+    /// before any data write is attempted.
+    #[cfg(feature = "geo-type-in-dev")]
+    #[tokio::test]
+    async fn test_create_table_rejects_geospatial_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table_rejects_geospatial_schema", None);
+        let table_path = table_url.to_string();
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_single_geometry_field_schema,
+        };
+        let builder = ok_or_panic(unsafe {
+            get_create_table_builder(
+                kernel_string_slice!(table_path),
+                &schema_arg,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+        let build_res = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
+        assert_extern_result_error_contains(
+            build_res,
+            FFIKernelError::UnsupportedError,
+            "does not have the required 'geospatial' feature",
+        );
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_create_table_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
@@ -2828,7 +2907,7 @@ mod tests {
         } else {
             assert_extern_result_error_with_message(
                 unsafe { commit(txn, engine.shallow_copy()) },
-                KernelError::GenericError,
+                FFIKernelError::GenericError,
                 Some(
                     "Generic delta kernel error: root manifest file commit requires the \
                      adaptiveMetadata-preview feature",
@@ -2962,7 +3041,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             missing_partition_value,
-            KernelError::UnknownError,
+            FFIKernelError::UnknownError,
             Some("Invalid partition values: missing partition column 'date'. Provided: []"),
         );
 
@@ -3090,7 +3169,7 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
-        let layout: DeltaResult<DataLayout> = Err(delta_kernel::Error::generic("bad column"));
+        let layout: DeltaResult<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
         let result = create_table_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };
@@ -3820,7 +3899,7 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::Error>(r?.len()))
+            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
             .sum::<Result<_, _>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 
@@ -3922,7 +4001,7 @@ mod tests {
                 unsafe {
                     get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
                 },
-                KernelError::InvalidTransactionStateError,
+                FFIKernelError::InvalidTransactionStateError,
                 Some(
                     "Invalid transaction state: Writing data to a table with column defaults \
                      requires calling Transaction::ack_column_defaults() first",

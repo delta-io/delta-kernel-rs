@@ -35,7 +35,8 @@ use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{
     CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
-    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
+    FileDataReadResultIterator, FileMeta, FileSize, ParquetFooter, ParquetHandler, PredicateRef,
+    Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -593,6 +594,7 @@ fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());
         assert!(scan_file.dv_info.deletion_vector.is_none());
+        assert_eq!(scan_file.dv_info.cardinality().unwrap(), None);
     }
     let mut files = vec![];
     for res in scan_metadata_iter {
@@ -697,7 +699,7 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
         .unwrap();
 
     token.cancel();
-    assert!(matches!(metadata.next(), Some(Err(Error::Cancelled))));
+    assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
 }
 
 // reading v0 with 3 files.
@@ -1756,7 +1758,7 @@ impl ParquetHandler for RecordingParquetHandler {
         &self,
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 }
@@ -2325,7 +2327,7 @@ impl ParquetHandler for EmptyParquetHandler {
         &self,
         _location: url::Url,
         _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         unimplemented!()
     }
 }

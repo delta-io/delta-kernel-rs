@@ -39,7 +39,9 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
 add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
 if(GEO_TYPE_IN_DEV)
+  target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
+  add_test(NAME read_and_print_projected_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo-cols.expected "-cgeom,geog -s")
 endif()
 
 if(WIN32)

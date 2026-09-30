@@ -27,7 +27,7 @@ use crate::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
@@ -574,7 +574,8 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             ArrowDataType::Decimal128(p, s) => {
                 if *s < 0 {
                     return Err(ArrowError::from_external_error(
-                        Error::invalid_decimal("Negative scales are not supported in Delta").into(),
+                        KernelError::invalid_decimal("Negative scales are not supported in Delta")
+                            .into(),
                     ));
                 };
                 DataType::decimal(*p, *s as u8)

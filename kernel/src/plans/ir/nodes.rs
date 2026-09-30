@@ -16,7 +16,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
-use crate::{DeltaResult, Error, FileMeta};
+use crate::{DeltaResult, FileMeta, KernelError};
 
 // ============================================================================
 // Operator: enumerates every operator kind
@@ -35,6 +35,9 @@ pub enum Operator {
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
     Values(Values),
+    /// Reads all rows of a relation previously retained by the engine. The [`RelationRef`]'s
+    /// schema is this node's output schema.
+    RelationSource(RelationRef),
 
     // === Unary operators (1 input) ===========================================
     Project(Project),
@@ -47,6 +50,43 @@ pub enum Operator {
 
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
+}
+
+/// An engine-assigned identifier for a relation retained by a
+/// [`PlanExecutor`](crate::plans::PlanExecutor). Opaque to kernel.
+pub type RelationId = String;
+
+/// An opaque handle to a relation retained by the engine's
+/// [`PlanExecutor`](crate::plans::PlanExecutor). See [`Operator::RelationSource`].
+///
+/// Kernel holds only the [`RelationId`] and the relation's output schema; the rows themselves are
+/// never materialized into kernel. A handle is produced by
+/// [`ScopedPlanExecutor::execute_and_retain`](crate::plans::ScopedPlanExecutor::execute_and_retain)
+/// and read back by an [`Operator::RelationSource`] node while the scoped executor lives.
+#[derive(Debug, Clone)]
+pub struct RelationRef {
+    id: RelationId,
+    schema: SchemaRef,
+}
+
+impl RelationRef {
+    /// A handle to the relation identified by `id`, producing rows matching `schema`.
+    pub fn new(id: impl Into<RelationId>, schema: impl Into<SchemaRef>) -> Self {
+        Self {
+            id: id.into(),
+            schema: schema.into(),
+        }
+    }
+
+    /// The engine-assigned identifier of the retained relation.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The output schema of the retained relation.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
 }
 
 /// One file to scan plus literal values broadcast to every row read from that file.
@@ -274,9 +314,9 @@ impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
 /// [`TryFrom`].
 impl<T> TryFrom<Values> for Vec<T>
 where
-    T: TryFrom<StructData, Error = Error> + ToSchema,
+    T: TryFrom<StructData, Error = KernelError> + ToSchema,
 {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
         rows.into_iter()
@@ -484,7 +524,7 @@ impl DynamicScan {
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
 
         if self.base_url.cannot_be_a_base() || !self.base_url.path().ends_with('/') {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "dynamic scan: base URL `{}` must be hierarchical and end in `/`",
                 self.base_url
             )));
@@ -501,23 +541,25 @@ impl DynamicScan {
 
         if let Some(dv_column) = &self.dv_column {
             let fields = input_schema.fields_of_path(dv_column).map_err(|err| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
                 ))
             })?;
             let Some((field, _ancestors)) = fields.split_last() else {
-                return Err(Error::internal_error("fields_of_path returned no fields"));
+                return Err(KernelError::internal_error(
+                    "fields_of_path returned no fields",
+                ));
             };
             let expected = &*DELETION_VECTOR_DATA_TYPE;
             if field.data_type() != expected {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan: deletion-vector column `{dv_column}` must have type \
                      {expected}, found {}",
                     field.data_type()
                 )));
             }
             if !field.is_nullable() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan: deletion-vector column `{dv_column}` must be nullable"
                 )));
             }
@@ -533,16 +575,18 @@ impl DynamicScan {
     ) -> DeltaResult<()> {
         let fields = schema.fields_of_path(column)?;
         let Some((field, ancestors)) = fields.split_last() else {
-            return Err(Error::internal_error("fields_of_path returned no fields"));
+            return Err(KernelError::internal_error(
+                "fields_of_path returned no fields",
+            ));
         };
         if field.data_type() != expected_type {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "dynamic scan: column `{column}` must have type {expected_type}, found {}",
                 field.data_type()
             )));
         }
         if field.is_nullable() || ancestors.iter().any(|field| field.is_nullable()) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "dynamic scan: required column `{column}` is nullable"
             )));
         }
@@ -556,32 +600,32 @@ impl DynamicScan {
     ) -> DeltaResult<()> {
         for name in file_constant_columns {
             let Some(input_field) = input_schema.field(name) else {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant source: column `{name}` not found; schema has \
                      {:?}",
                     Vec::from_iter(input_schema.fields().map(|field| field.name())),
                 )));
             };
             if input_field.is_metadata_column() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant source: column `{name}` is a metadata column"
                 )));
             }
             let Some(output_field) = output_schema.field(name) else {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` not found; schema has {:?}",
                     Vec::from_iter(output_schema.fields().map(|field| field.name())),
                 )));
             };
             if output_field.is_metadata_column() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` is a metadata column"
                 )));
             }
             if input_field.data_type() != output_field.data_type()
                 || input_field.is_nullable() != output_field.is_nullable()
             {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "dynamic scan file_constant: column `{name}` must have the same type and \
                      nullability in input and output"
                 )));
@@ -999,7 +1043,7 @@ impl AggregateBuilder {
 }
 
 impl TryFrom<AggregateBuilder> for Aggregate {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(builder: AggregateBuilder) -> DeltaResult<Self> {
         builder.build()

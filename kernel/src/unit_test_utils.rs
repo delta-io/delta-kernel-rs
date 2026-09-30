@@ -45,7 +45,9 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef, Version};
+use crate::{
+    DeltaResult, Engine, EngineData, FileMeta, KernelError, Snapshot, SnapshotRef, Version,
+};
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -315,6 +317,77 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
     ]
     .into();
     parse_json_batch(json_strings)
+}
+
+/// Test fixtures for building adaptiveMetadata tables and their `checkpoint` (content-root)
+/// actions.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) mod adaptive_metadata_fixtures {
+    use std::iter;
+
+    use super::*;
+    use crate::actions::{CheckpointAction, ContentRoot};
+    use crate::engine_data::FilteredEngineData;
+    use crate::path::LogRoot;
+    use crate::version_as_i64;
+
+    /// The protocol and metadata of a minimal adaptiveMetadata table.
+    pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
+        let table_config =
+            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        (
+            table_config.protocol().clone(),
+            table_config.metadata().clone(),
+        )
+    }
+
+    /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
+    pub(crate) fn minimal_checkpoint_action(
+        path: &str,
+        version: Version,
+    ) -> DeltaResult<CheckpointAction> {
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        let version = version_as_i64(version)?;
+        Ok(CheckpointAction::new(
+            version,
+            ContentRoot::new(path.to_string(), 1024, version),
+            protocol,
+            metadata,
+            vec![],
+            vec![],
+        ))
+    }
+
+    /// Creates an empty in-memory table and returns its engine and table-root URL.
+    pub(crate) fn setup_table() -> DeltaResult<(SyncEngine, Url)> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let _ = create_table("memory:///", schema, "test")
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+        let table_root = Snapshot::builder_for("memory:///")
+            .build(&engine)?
+            .table_root()
+            .clone();
+        Ok((engine, table_root))
+    }
+
+    /// Writes a JSON commit at `version` containing `data`.
+    pub(crate) fn write_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        data: Box<dyn EngineData>,
+    ) -> DeltaResult<()> {
+        let filtered = FilteredEngineData::with_all_rows_selected(data);
+        let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
+        engine.json_handler().write_json_file(
+            &commit_path.location,
+            Box::new(iter::once(Ok(filtered))),
+            false,
+        )?;
+        Ok(())
+    }
 }
 
 // TODO: allow tests to pass in context (issue#1133)
@@ -1197,7 +1270,7 @@ fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<Tem
                 .join("tests/data")
                 .join(table_name);
             let path = std::fs::canonicalize(path)
-                .map_err(|e| Error::generic(format!("Failed to canonicalize path: {e}")))?;
+                .map_err(|e| KernelError::generic(format!("Failed to canonicalize path: {e}")))?;
             Ok((path, None))
         }
     }
@@ -1209,9 +1282,9 @@ pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
     let tempdir = tempfile::tempdir()?;
     let table_path = tempdir.path().join(table_name);
     copy_directory(&source, &table_path)
-        .map_err(|e| Error::generic(format!("Failed to copy test table: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("Failed to copy test table: {e}")))?;
     let url = Url::from_directory_path(&table_path)
-        .map_err(|_| Error::generic("Failed to create URL from path"))?;
+        .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
     Ok((url, tempdir))
 }
 
@@ -1225,7 +1298,7 @@ pub(crate) fn load_test_table(
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)
-        .map_err(|_| Error::generic("Failed to create URL from path"))?;
+        .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
 
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;

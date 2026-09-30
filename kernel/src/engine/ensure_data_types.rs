@@ -11,7 +11,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Ti
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -225,7 +225,7 @@ impl EnsureDataTypes {
         if matches!(self.mode, ValidationMode::Full)
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
-            Err(Error::Generic(format!(
+            Err(KernelError::Generic(format!(
                 "{desc} has nullability {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
             )))
         } else {
@@ -246,7 +246,7 @@ impl EnsureDataTypes {
         if matches!(self.mode, ValidationMode::Full)
             && !metadata_eq(&kernel_field.metadata, arrow_field.metadata())
         {
-            Err(Error::Generic(format!(
+            Err(KernelError::Generic(format!(
                 "Field {} has metadata {:?} in kernel and {:?} in arrow",
                 kernel_field.name,
                 kernel_field.metadata,

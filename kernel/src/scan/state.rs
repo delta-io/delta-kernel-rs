@@ -16,7 +16,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
+use crate::{DeltaResult, Engine, EngineData, ExpressionRef, KernelError};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq, From)]
@@ -37,6 +37,20 @@ pub struct Stats {
 }
 
 impl DvInfo {
+    /// Returns the number of rows the deletion vector removes, or `None` if there is no deletion
+    /// vector. This reads the descriptor metadata without loading the deletion vector.
+    ///
+    /// Returns [`KernelError::DeletionVector`] if the stored cardinality is negative.
+    pub fn cardinality(&self) -> DeltaResult<Option<u64>> {
+        self.deletion_vector
+            .as_ref()
+            .map(|dv| {
+                u64::try_from(dv.cardinality)
+                    .map_err(|_| KernelError::deletion_vector("cardinality must be non-negative"))
+            })
+            .transpose()
+    }
+
     /// Check if this DvInfo contains a Deletion Vector. This is mostly used to know if the
     /// associated [`Stats`] struct has fully accurate information or not.
     pub fn has_vector(&self) -> bool {
@@ -180,7 +194,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     ) -> DeltaResult<()> {
         require!(
             getters.len() == 14,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
             ))
@@ -202,7 +216,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")
-                    .ok_or_else(|| Error::missing_column("deletionVector"))?;
+                    .ok_or_else(|| KernelError::missing_column("deletionVector"))?;
                 let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
@@ -225,9 +239,33 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::scan::state::ScanFile;
+    use rstest::rstest;
+
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::scan::state::{DvInfo, ScanFile};
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
     use crate::scan::COMMIT_READ_SCHEMA;
+    use crate::KernelError;
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::minimum(i64::MIN)]
+    fn test_cardinality_rejects_negative_count(#[case] cardinality: i64) {
+        let dv_info = DvInfo::from(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::Inline,
+            path_or_inline_dv: String::new(),
+            offset: None,
+            size_in_bytes: 0,
+            cardinality,
+        });
+
+        let error = dv_info.cardinality().unwrap_err();
+        assert!(matches!(&error, KernelError::DeletionVector(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Deletion Vector error: cardinality must be non-negative"
+        );
+    }
 
     #[derive(Clone)]
     struct TestContext {
@@ -248,6 +286,7 @@ mod tests {
             Some(&"2017-12-10".to_string())
         );
         assert_eq!(scan_file.partition_values.get("non-existent"), None);
+        assert_eq!(scan_file.dv_info.cardinality().unwrap(), Some(2_u64));
         assert!(scan_file.dv_info.deletion_vector.is_some());
         let dv = scan_file.dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");

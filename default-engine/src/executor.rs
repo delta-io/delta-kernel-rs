@@ -53,7 +53,7 @@ pub mod tokio {
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
 
-    use delta_kernel::{DeltaResult, Error};
+    use delta_kernel::{DeltaResult, KernelError};
     use futures::future::BoxFuture;
     use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
@@ -179,7 +179,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
         }
 
         fn enter(&self) -> EnterGuard<'_> {
@@ -238,9 +238,9 @@ pub mod tokio {
                 builder.max_blocking_threads(max_blocking);
             }
 
-            let runtime = builder
-                .build()
-                .map_err(|e| Error::generic(format!("Failed to create Tokio runtime: {e}")))?;
+            let runtime = builder.build().map_err(|e| {
+                KernelError::generic(format!("Failed to create Tokio runtime: {e}"))
+            })?;
 
             let handle = runtime.handle().clone();
             Ok(Self {
@@ -304,7 +304,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
         }
 
         fn enter(&self) -> EnterGuard<'_> {

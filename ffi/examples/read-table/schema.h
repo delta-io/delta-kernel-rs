@@ -368,8 +368,9 @@ void free_cschema(CSchema *schema) {
   free(schema);
 }
 
-// Get the schema of the snapshot
-CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
+// Build a printable CSchema by visiting an already-obtained schema handle. The caller retains
+// ownership of `schema`: this function only borrows it for the duration of the visit.
+CSchema* build_cschema(SharedSchema* schema, SharedExternEngine* engine)
 {
   print_diag("Building schema\n");
   SchemaBuilder* builder = malloc(sizeof(SchemaBuilder));
@@ -402,7 +403,6 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
     .visit_void = visit_void,
     .visit_variant = visit_variant,
   };
-  SharedSchema* schema = logical_schema(snapshot);
   uintptr_t schema_list_id = visit_schema(schema, &visitor);
 #ifdef VERBOSE
   printf("Schema returned in list %" PRIxPTR "\n", schema_list_id);
@@ -411,13 +411,21 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
   CSchema* cschema = malloc(sizeof(CSchema));
   cschema->list_id = schema_list_id;
   cschema->builder = builder;
+  return cschema;
+}
+
+// Get the schema of the snapshot
+CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
+{
+  SharedSchema* schema = logical_schema(snapshot);
+  CSchema* cschema = build_cschema(schema, engine);
   free_schema(schema);
   return cschema;
 }
 
 // Print out a schema
-void print_cschema(CSchema *schema) {
-  printf("Schema:\n");
+void print_cschema(const char *title, CSchema *schema) {
+  printf("%s:\n", title);
   print_list(schema->builder, schema->list_id, 0, 0);
   printf("\n");
 }

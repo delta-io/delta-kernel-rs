@@ -40,7 +40,7 @@ cargo build -p delta_kernel_ffi --release
 Objects that cross the FFI boundary are wrapped in **handles**. These are opaque pointers
 that carry ownership semantics. There are two kinds:
 
-- **Mutable handles** (`Box`-like) represent exclusive ownership. Dropping the handle
+- **Exclusive handles** (`Box`-like) represent exclusive ownership. Dropping the handle
   drops the underlying object. These are neither `Copy` nor `Clone`.
 - **Shared handles** (`Arc`-like) represent shared ownership. Dropping the handle only
   drops the underlying object if it was the last reference.
@@ -60,7 +60,7 @@ is needed for reads):
 ```text
 get_default_engine()        ->  Handle<SharedExternEngine>
         |
-get_snapshot_builder()      ->  Handle<MutableFfiSnapshotBuilder>
+get_snapshot_builder()      ->  Handle<ExclusiveSnapshotBuilder>
         |
 snapshot_builder_build()    ->  Handle<SharedSnapshot>
         |
@@ -115,10 +115,14 @@ authoritative list and signatures, consult the generated
 | Function | Purpose |
 |----------|---------|
 | `get_default_engine` | Create an engine from a table path with default options |
-| `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
-| `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
-| `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
+| `get_engine_builder` / `builder_with_option` / `builder_build` | Create an engine with custom storage options |
+| `builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
+
+Builder `with_*` functions consume their input handle and return the updated handle on success.
+Replace the input handle with the result; on error, the builder has been dropped. `build` and
+`free` also consume the builder.
 
 **Snapshots**
 
@@ -126,9 +130,9 @@ authoritative list and signatures, consult the generated
 |----------|---------|
 | `get_snapshot_builder` | Create a snapshot builder from a table path |
 | `get_snapshot_builder_from` | Create a snapshot builder incrementally from an existing snapshot |
-| `snapshot_builder_set_version` | Pin the snapshot to a specific table version |
-| `snapshot_builder_set_log_tail` | Provide a log tail for catalog-managed tables |
-| `snapshot_builder_set_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
+| `snapshot_builder_with_version` | Pin the snapshot to a specific table version |
+| `snapshot_builder_with_log_tail` | Provide a log tail for catalog-managed tables |
+| `snapshot_builder_with_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
 | `snapshot_builder_build` | Consume the builder and produce the snapshot |
 | `free_snapshot_builder` / `free_snapshot` | Release snapshot-related handles |
 
@@ -183,6 +187,7 @@ borrowed slices. Don't retain the callback's state.
 | `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
+| `visit_field_geometry` / `visit_field_geography` | Build a geospatial `StructField` (geometry with a CRS; geography with a CRS and edge-interpolation algorithm) |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
 | `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
 
@@ -412,7 +417,7 @@ callback to allocate error objects in your memory space whenever an operation fa
 Because the engine allocates these errors, the engine is also responsible for freeing
 them. Kernel returns the error pointer immediately and does not retain it.
 
-The `EngineError` struct contains a `KernelError` enum that classifies the error type
+The `EngineError` struct contains a `FFIKernelError` enum that classifies the error type
 (e.g., `GenericError`, `FileNotFoundError`, `InvalidUrlError`). The error message
 string passed to `allocate_error` is only valid for the duration of the callback, so
 you must copy it if you need to keep it.
@@ -439,7 +444,7 @@ ExternResultHandleSharedExternEngine engine_res =
     get_default_engine(table_path, allocate_error);
 
 // 2. Build a snapshot
-ExternResultHandleMutableFfiSnapshotBuilder builder_res =
+ExternResultHandleExclusiveSnapshotBuilder builder_res =
     get_snapshot_builder(table_path, engine);
 ExternResultHandleSharedSnapshot snap_res =
     snapshot_builder_build(builder);

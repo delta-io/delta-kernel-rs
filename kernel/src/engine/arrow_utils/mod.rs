@@ -41,7 +41,7 @@ use crate::schema::{
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error};
+use crate::{DeltaResult, EngineData, KernelError};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -50,11 +50,11 @@ macro_rules! prim_array_cmp {
         $(
             $data_ty => {
                 let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
-                        .ok_or(Error::invalid_expression(
+                        .ok_or(KernelError::invalid_expression(
                             format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
                         )?;
                     let list_array = $right_arr.as_list_opt::<i32>()
-                        .ok_or(Error::invalid_expression(
+                        .ok_or(KernelError::invalid_expression(
                             format!("Cannot cast to list array: {}", $right_arr.data_type()))
                         )?;
                 crate::arrow::compute::kernels::comparison::in_list(prim_array, list_array)
@@ -66,7 +66,7 @@ macro_rules! prim_array_cmp {
                             $right_arr.data_type())
                         )
                 )
-        }.map_err(Error::generic_err);
+        }.map_err(KernelError::generic_err);
     };
 }
 
@@ -96,7 +96,7 @@ pub(crate) fn list_type_with_element(
         ArrowDataType::LargeList(_) => Ok(ArrowDataType::LargeList(element)),
         ArrowDataType::ListView(_) => Ok(ArrowDataType::ListView(element)),
         ArrowDataType::LargeListView(_) => Ok(ArrowDataType::LargeListView(element)),
-        _ => Err(Error::internal_error(format!(
+        _ => Err(KernelError::internal_error(format!(
             "Expected a variable-length list type, got {list_type:?}."
         ))),
     }
@@ -131,10 +131,10 @@ struct MatchedParquetField<'p, 'k> {
     kernel_field_info: Option<KernelFieldInfo<'k>>,
 }
 
-/// Create an [`Error::Arrow`] with a backtrace from the given message.
+/// Create a [`KernelError::Arrow`] with a backtrace from the given message.
 #[internal_api]
-pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
-    Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
+pub(crate) fn make_arrow_error(s: impl Into<String>) -> KernelError {
+    KernelError::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
         s.into(),
     ))
     .with_backtrace()
@@ -187,7 +187,7 @@ impl RowIndexBuilder {
                     .map(|&i| {
                         // We verify that there are no duplicate or out of bounds ordinals
                         if !seen_ordinals.insert(i) {
-                            return Err(Error::generic("Found duplicate row group ordinal"));
+                            return Err(KernelError::generic("Found duplicate row group ordinal"));
                         }
                         // We have to clone here to avoid modifying the original vector in each
                         // iteration
@@ -195,7 +195,9 @@ impl RowIndexBuilder {
                             .get(i)
                             .cloned()
                             .ok_or_else(|| {
-                                Error::generic(format!("Row group ordinal {i} is out of bounds"))
+                                KernelError::generic(format!(
+                                    "Row group ordinal {i} is out of bounds"
+                                ))
                             })
                     })
                     .try_collect()?
@@ -446,8 +448,8 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
 /// sure that the default engine does not try to read shredded Variants, which it currently does
 /// not support.
 fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
-    fn variant_parquet_error(field_name: &String) -> Error {
-        Error::Generic(format!(
+    fn variant_parquet_error(field_name: &String) -> KernelError {
+        KernelError::Generic(format!(
             "The field {field_name} presumed to be of Variant type might be \
             shredded in the parquet file. The default engine does not support \
             shredded reads yet."
@@ -549,7 +551,7 @@ fn get_indices(
                             ));
                         }
                     } else {
-                        return Err(Error::unexpected_column_type(field.name()));
+                        return Err(KernelError::unexpected_column_type(field.name()));
                     }
                 }
                 ArrowDataType::List(list_field)
@@ -583,7 +585,7 @@ fn get_indices(
                                 Arc::new(requested_field.try_into_arrow()?),
                             ));
                         } else if children.len() != 1 {
-                            return Err(Error::generic(
+                            return Err(KernelError::generic(
                                 "List call should not have generated more than one reorder index",
                             ));
                         } else {
@@ -598,7 +600,7 @@ fn get_indices(
                                 let ArrowDataType::List(target_element_field) =
                                     target_field.data_type()
                                 else {
-                                    return Err(Error::internal_error(
+                                    return Err(KernelError::internal_error(
                                         "Kernel array converted to a non-list Arrow type.",
                                     ));
                                 };
@@ -620,7 +622,7 @@ fn get_indices(
                             reorder_indices.push(child);
                         }
                     } else {
-                        return Err(Error::unexpected_column_type(list_field.name()));
+                        return Err(KernelError::unexpected_column_type(list_field.name()));
                     }
                 }
                 ArrowDataType::Map(key_val_field, _) => {
@@ -629,13 +631,15 @@ fn get_indices(
                             let mut key_val_names =
                                 inner_fields.iter().map(|f| f.name().to_string());
                             let key_name = key_val_names.next().ok_or_else(|| {
-                                Error::generic("map fields didn't include a key col")
+                                KernelError::generic("map fields didn't include a key col")
                             })?;
                             let val_name = key_val_names.next().ok_or_else(|| {
-                                Error::generic("map fields didn't include a val col")
+                                KernelError::generic("map fields didn't include a val col")
                             })?;
                             if key_val_names.next().is_some() {
-                                return Err(Error::generic("map fields had more than 2 members"));
+                                return Err(KernelError::generic(
+                                    "map fields had more than 2 members",
+                                ));
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
                             let mask_before = mask_indices.len();
@@ -658,7 +662,7 @@ fn get_indices(
                                     Arc::new(requested_field.try_into_arrow()?),
                                 ));
                             } else if children.len() != 2 {
-                                return Err(Error::generic(
+                                return Err(KernelError::generic(
                                     "Map call should have generated exactly two reorder indices",
                                 ));
                             } else {
@@ -680,7 +684,7 @@ fn get_indices(
                             }
                         }
                         _ => {
-                            return Err(Error::unexpected_column_type(field.name()));
+                            return Err(KernelError::unexpected_column_type(field.name()));
                         }
                     }
                 }
@@ -700,7 +704,7 @@ fn get_indices(
                             reorder_indices.push(ReorderIndex::cast(index, target))
                         }
                         DataTypeCompat::Nested => {
-                            return Err(Error::internal_error(
+                            return Err(KernelError::internal_error(
                                 "Comparing nested types in get_indices",
                             ))
                         }
@@ -743,7 +747,7 @@ fn get_indices(
                         ));
                     }
                     Some(metadata_spec) => {
-                        return Err(Error::Generic(format!(
+                        return Err(KernelError::Generic(format!(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
                         )));
                     }
@@ -755,7 +759,7 @@ fn get_indices(
                         ));
                     }
                     None => {
-                        return Err(Error::Generic(format!(
+                        return Err(KernelError::Generic(format!(
                             "Requested field not found in parquet schema, and field is not nullable: {}",
                             field.name()
                         )));
@@ -1013,7 +1017,7 @@ pub(crate) fn reorder_struct_array(
                         }
                         // TODO(#3178): ListView/LargeListView fall through here.
                         _ => {
-                            return Err(Error::internal_error(
+                            return Err(KernelError::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
                             ));
                         }
@@ -1031,7 +1035,7 @@ pub(crate) fn reorder_struct_array(
                 }
                 ReorderIndexTransform::RowIndex(field) => {
                     let Some(ref mut row_index_iter) = row_indexes else {
-                        return Err(Error::generic(
+                        return Err(KernelError::generic(
                             "Row index column requested but row index iterator not provided",
                         ));
                     };
@@ -1039,7 +1043,7 @@ pub(crate) fn reorder_struct_array(
                         row_index_iter.take(num_rows).collect();
                     require!(
                         row_index_array.len() == num_rows,
-                        Error::internal_error(
+                        KernelError::internal_error(
                             "Row index iterator exhausted before reaching the end of the file"
                         )
                     );
@@ -1048,7 +1052,7 @@ pub(crate) fn reorder_struct_array(
                 }
                 ReorderIndexTransform::FilePath(field) => {
                     let Some(file_path) = file_location else {
-                        return Err(Error::generic(
+                        return Err(KernelError::generic(
                             "File path column requested but file location not provided",
                         ));
                     };
@@ -1062,7 +1066,9 @@ pub(crate) fn reorder_struct_array(
         let (field_vec, reordered_columns): (Vec<Arc<ArrowField>>, _) =
             final_fields_cols.into_iter().flatten().unzip();
         if field_vec.len() != num_cols {
-            Err(Error::internal_error("Found a None in final_fields_cols."))
+            Err(KernelError::internal_error(
+                "Found a None in final_fields_cols.",
+            ))
         } else {
             Ok(StructArray::try_new(
                 field_vec.into(),
@@ -1108,7 +1114,7 @@ fn reorder_list<O: OffsetSizeTrait>(
         ));
         Ok(Some((new_field, list)))
     } else {
-        Err(Error::internal_error(
+        Err(KernelError::internal_error(
             "Nested reorder of list should have had struct child.",
         ))
     }
@@ -1244,7 +1250,7 @@ pub(crate) fn parse_json_impl(
         ArrowDataType::Utf8View => {
             parse_json_inner(json_strings.as_string_view().iter(), num_rows, schema)
         }
-        dt => Err(Error::generic(format!(
+        dt => Err(KernelError::generic(format!(
             "Expected string array for JSON parsing, got {dt}"
         ))),
     }
@@ -1294,13 +1300,13 @@ fn decode_with_arrow_json<'a>(
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
             )));
         }
         // did we decode exactly one record
         if decoder.len() != row_number {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
             )));
         }
@@ -1308,7 +1314,7 @@ fn decode_with_arrow_json<'a>(
     // Get the final batch out
     if let Some(batch) = decoder.flush()? {
         if batch.num_rows() != num_rows {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "Unexpected number of rows decoded. Got {}, expected{}",
                 batch.num_rows(),
                 num_rows
@@ -1316,7 +1322,7 @@ fn decode_with_arrow_json<'a>(
         }
         return Ok(batch);
     }
-    Err(Error::generic(
+    Err(KernelError::generic(
         "Malformed JSON: exited parse_json_impl without deserializing anything useful",
     ))
 }
@@ -1438,7 +1444,7 @@ fn cast_array_to_type(
     match target {
         ArrowDataType::Struct(target_fields) => {
             let s = array.as_struct_opt().ok_or_else(|| {
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "cannot cast {} to a struct target",
                     array.data_type()
                 ))
@@ -1446,7 +1452,7 @@ fn cast_array_to_type(
             let nulls = s.nulls().cloned();
             require!(
                 s.columns().len() == target_fields.len(),
-                Error::generic(format!(
+                KernelError::generic(format!(
                     "cannot cast struct with {} children to target with {} fields",
                     s.columns().len(),
                     target_fields.len()

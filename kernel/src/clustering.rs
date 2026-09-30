@@ -15,7 +15,7 @@ use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::schema::{DataType, StructType};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Domain metadata structure for clustering columns.
 ///
@@ -86,14 +86,16 @@ pub(crate) fn validate_clustering_columns(
 
     // Structural validation: at least one column required
     if columns.is_empty() {
-        return Err(Error::generic("Clustering requires at least one column"));
+        return Err(KernelError::generic(
+            "Clustering requires at least one column",
+        ));
     }
 
     // Validate each column and check for duplicates
     let mut seen = HashSet::new();
     for col in columns {
         if !seen.insert(col) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Duplicate clustering column: '{col}'"
             )));
         }
@@ -102,7 +104,7 @@ pub(crate) fn validate_clustering_columns(
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
                      Decimal, Date, Timestamp, TimestampNtz, String"

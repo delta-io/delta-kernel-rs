@@ -1,5 +1,284 @@
 # Changelog
 
+## [v0.29.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.29.0/) (2026-09-28)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.28.0...v0.29.0)
+
+### 🏗️ Breaking changes
+1. Introduce writectx builder ([#3226])
+    - Replace `WriteState::unpartitioned_write_context()` with `write_context_builder().build()`,
+    and `partitioned_write_context(values)` with
+    `write_context_builder().with_partition_values(values).build()`.
+2. Let scans request stats for columns beyond dataSkippingNumIndexedCols ([#3230])
+    - This changes `StructStats`:
+      - `StructStats::All` becomes `All { extra_indexed: Vec<ColumnName> }`.
+      - `StructStats::Columns(Vec<ColumnName>)` becomes `Columns { requested: Vec<ColumnName> }`.
+3. Add row tracking metadata cols into writecontext ([#3229])
+    - Rename `WriteContextBuilder` to `BoundWriteContextBuilder`, and replace
+    `BoundWriteContext::logical_schema()` / `physical_schema()` with `logical_data_schema()` /
+    `physical_data_schema()`. To preserve materialized row-tracking columns, configure them through
+    `with_row_tracking_columns(RowTrackingMetadataColumns { ... })`.
+4. Add row tracking metadata ackowledgement ([#3252])
+    - Before committing removals or deletion-vector updates on Row Tracking-enabled tables, call
+    `txn.ack_row_tracking_preservation()`, acknowledging preservation of stable row IDs for
+    copied/updated rows and stable row commit versions for copied rows. This requirement was
+    initially gated by `row-tracking-preservation-in-dev`.
+5. Emit row tracking preservation tag in commitInfo ([#3268])
+    - Remove `row-tracking-preservation-in-dev` from your Cargo feature list; the acknowledgment
+    requirement introduced in #3252 now applies regardless of feature flags. Kernel automatically
+    emits the row-tracking preservation tag and merges it with custom commit-info tags, with
+    Kernel-owned values taking precedence.
+6. Validate default evaluator input schemas at top level ([#3274])
+    - `SequentialPhase::try_new` now needs to have the checkpoint read schema passed to it
+7. Add reader timezone to map-to-struct ([#3118])
+    - `Expression::map_to_struct` now requires `MapToStructOptions`, and `MapToStructExpression`
+    stores the options.
+8. Support map-to-struct options in engine adapters ([#3296])
+    - The existing `MapToStruct` FFI visitor callback and constructor now accept a borrowed
+    `FfiMapToStructOptions` pointer.
+9. Add schema field metadata visitor for projected scan FFI ([#3332])
+    - every visit_field_* function now requires a mutable `EngineMetadata *`, which allows engines
+    to pass metadata for schema fields. See the PR for code details.
+10. Add validation for snapshot load ([#3336])
+    - Handle unsupported reader protocol/features and unmet reader-feature requirements as errors
+    during snapshot construction, rather than deferring them to subsequent operations. Unsupported
+    writer-only features alone do not prevent snapshot construction.
+11. Report cumulative scan action-transform time ([#3396])
+    - Rust `ScanMetadataCompleted` adds `action_transform_time: Duration`.
+    - FFI `ScanMetadataCompleted` adds `action_transform_time_ns: u64`. This changes its C layout,
+    so consumers must recompile against the matching generated header.
+12. Migrate engine builder to handle system ([#3369])
+    - This is breaking for the FFI ABI:
+    - `get_engine_builder` returns `ExternResultHandleMutableFfiEngineBuilder`.
+    - Builder setters accept `HandleMutableFfiEngineBuilder *`.
+    - `builder_build` and `free_engine_builder` consume `HandleMutableFfiEngineBuilder`.
+    - Null engine-builder handles are invalid, consistent with other FFI handles.
+13. Reclassify generic log segment errors ([#3195])
+    - Adds new error variants: `MissingVersion`, `UnpublishedVersion`, `EmptyLog`, and
+      `InvalidLogSegment`
+14. Overhaul EvaluationHandler::create_xxx methods ([#3285])
+    - `EvaluationHandler::create_many` now requires owned `Vec<Vec<Scalar>>`.
+    - Removed `EvaluationHandler::create_null` method. Use `create_many` instead.
+    - The `EvaluationHandlerExtension` trait was removed. Use the new `create_row` helper instead.
+    - The `IntoEngineData` trait was removed, along with its companion derive macro. Derive
+      `IntoStructData` instead.
+    - The `Error::LiteralExpressionTransformError` variant was removed and FFI error updated to
+      match.
+15. Clean up Engine cancellation contract ([#3239])
+    - The cancellation-aware handler contract now puts more responsibility on engines. Kernel no
+    longer attempts to compensate for engines that fail to honor cancellation when kernel correctly
+    invoked cancellation-aware engine handler methods.
+16. Generalize borrowed ffi slices ([#3325])
+    - Changes borrowed array structs, including `KernelI64Slice`, into descriptive type aliases.
+17. Use DeltaResultIterator[Static] type alias ([#3241])
+    - `StorageHandler::list_from` and `StorageHandler::read_files` now return Send iterators where
+    previously they did not.
+18. Demote arrow expression helper visibility ([#3328])
+    - Direct callers of `coalesce_arrays` must use expression evaluation or their own implementation
+    because the helper is now private. Direct callers of `to_json` must enable the unstable
+    `internal-api` feature or use expression evaluation; `evaluate_predicate` remains public.
+19. Strip gratuitous Transaction suffix from CommitResult variants ([#3384])
+    - `CommitResult` enum variant names are now shorter.
+
+### 🚀 Features / new APIs
+
+1. Optimize checkpoint shape resolution using sidecarSchema tag ([#3209])
+2. Support reading stable row commit version ([#3224])
+3. *(ffi)* Add create-table domain metadata setter ([#3267])
+4. Schema evolution API and nested add-column paths ([#3103])
+5. Add void schema field visitor ([#3275])
+6. Add option to skip checkpoints during incremental snapshot updates ([#3249])
+7. Add frame reporting support to metrics layers ([#3306])
+8. Annotate call sites with frame graph tracing events ([#3327])
+9. Support for committing externally produced root manifests ([#3216])
+10. Allow null variant scalar ([#3287])
+11. Support metadata.format.options in FFI visitor ([#3323])
+12. Add `BackReference` and add it to `Add` and `Remove` ([#3302])
+13. Correctly set fields on Remove action when AMT is enabled ([#3318])
+14. Reject tables with row tracking enabled + suspended ([#3348])
+15. Ensure `v2Checkpoint` and `adaptiveMetadata` are exclusive ([#3356])
+16. Expose CRC allFiles via a public accessor ([#3353])
+17. Support iceberg_compat_v2 feature ([#3225])
+18. Support catalog-managed commit ranges ([#3326])
+19. Expose distributed write state through ffi ([#3387])
+20. Reject cdf reserved cols on create and alter ([#3347])
+21. Accept physical column names for partition values ([#3408])
+22. Add ability to project AMT schema ([#3171])
+23. Add SnapshotHint builder support ([#3222])
+24. Expose SnapshotHint through FFI ([#3284])
+25. Add `LastManifestCommit` to `Crc` and `CommitInfo` ([#3390])
+26. Expose snapshot row tracking high-water mark ([#3330])
+
+### 🐛 Bug Fixes
+
+1. Validate deletion vector visitor inputs ([#3205])
+2. Preserve scan file modification time ([#3206])
+3. Omit the dv column when scanning v2 checkpoint sidecars ([#3217])
+4. Decode storage read paths once ([#3204])
+5. Fix dv descriptor map insert potential FFI pointer leak ([#3265])
+6. Use platform c_char in FFI test ([#3277])
+7. Tolerate negative file sizes in CRC replay ([#3259])
+8. Harden multipart checkpoint validation ([#3298])
+9. Cast widened array elements during parquet reads ([#3261])
+10. Harden the release workflow ([#3283])
+11. #[internal_api] rejects pub items instead of panicking ([#3337])
+12. Reduce snapshot builder stack size ([#3342])
+13. Proper isolation for ffi tracing tests ([#3343])
+14. Sign-extend negative decimal statistics in row-group skipping ([#3250])
+15. Validate complete CRC state consistently ([#3333])
+16. Stop snapshot-loading spans from capturing full LogSegment ([#2839])
+17. Reject truncated inline deletion vectors ([#3366])
+
+### 📚 Documentation
+
+1. Clarify MapToStruct contract ([#3231])
+2. Add todo in code for issues ([#3242])
+3. Doc the requirement for ParquetHandler to do type widening ([#3313])
+4. Update ffi doc comment from engine to allocate error ([#3363])
+5. Add column defaults doc ([#2968])
+
+### ⚡ Performance
+
+1. Filter irrelevant actions from declarative P&M replay ([#3417])
+
+### 🚜 Refactor
+
+1. Eliminate the CommitReader class ([#3238])
+2. Tighten unity-catalog-delta-rest-client public surface ([#3264])
+3. SnapshotBuilder::build should use ? instead of and_then chains ([#3271])
+4. Use Markdown reviewer prompts ([#3305])
+5. Extract shared StatsLeafWalker for AMT content_stats walk ([#3350])
+6. Define and use PhantomType instead of PhantomData ([#3373])
+7. Retain checkpoint leaf schema in CheckpointShape ([#3044])
+
+### 🧪 Testing
+
+1. Remove racy allocator assertion ([#3244])
+2. Fix free count race in opaque eval tests ([#3335])
+3. Cover null values in format.options ([#3401])
+
+### ⚙️ Chores/CI
+
+1. Fix AI review gateway endpoints ([#3220])
+2. Support automatic AI review for forks ([#3228])
+3. Bind AI reviewer dispatches to PR context ([#3237])
+4. Prototype inline AI review comments ([#3245])
+5. Fix inline AI review startup ([#3255])
+6. Validate AI review source before runtime rewrite ([#3256])
+7. Clarify AI review finding IDs ([#3258])
+8. Git-ignore editor backup files with names like #foo.rs# ([#3270])
+9. Test workspace on ubuntu arm64 ([#3276])
+10. Default automatic AI reviews to inline ([#3262])
+11. Remove MODIFIED status ([#3303])
+12. Make `location` and `file_size_in_bytes` required ([#3304])
+13. Ignore issue-tracked review findings ([#3299])
+14. Use derive-more From, Deref, Constructor ([#3331])
+15. PhantomType cleanup ([#3391])
+16. Include license and notice files in default_engine crate ([#3370])
+17. Introduce fixture in `remove_dv.rs` ([#3364])
+18. Move location helpers out of `actions/mod.rs` ([#3365])
+19. Add feedback reactions to ai inline reviews ([#3415])
+
+
+[#3205]: https://github.com/delta-io/delta-kernel-rs/pull/3205
+[#3206]: https://github.com/delta-io/delta-kernel-rs/pull/3206
+[#3217]: https://github.com/delta-io/delta-kernel-rs/pull/3217
+[#3220]: https://github.com/delta-io/delta-kernel-rs/pull/3220
+[#3204]: https://github.com/delta-io/delta-kernel-rs/pull/3204
+[#3228]: https://github.com/delta-io/delta-kernel-rs/pull/3228
+[#3209]: https://github.com/delta-io/delta-kernel-rs/pull/3209
+[#3237]: https://github.com/delta-io/delta-kernel-rs/pull/3237
+[#3244]: https://github.com/delta-io/delta-kernel-rs/pull/3244
+[#3224]: https://github.com/delta-io/delta-kernel-rs/pull/3224
+[#3226]: https://github.com/delta-io/delta-kernel-rs/pull/3226
+[#3238]: https://github.com/delta-io/delta-kernel-rs/pull/3238
+[#3245]: https://github.com/delta-io/delta-kernel-rs/pull/3245
+[#3171]: https://github.com/delta-io/delta-kernel-rs/pull/3171
+[#3241]: https://github.com/delta-io/delta-kernel-rs/pull/3241
+[#3255]: https://github.com/delta-io/delta-kernel-rs/pull/3255
+[#3256]: https://github.com/delta-io/delta-kernel-rs/pull/3256
+[#3230]: https://github.com/delta-io/delta-kernel-rs/pull/3230
+[#3231]: https://github.com/delta-io/delta-kernel-rs/pull/3231
+[#3242]: https://github.com/delta-io/delta-kernel-rs/pull/3242
+[#3258]: https://github.com/delta-io/delta-kernel-rs/pull/3258
+[#3229]: https://github.com/delta-io/delta-kernel-rs/pull/3229
+[#3264]: https://github.com/delta-io/delta-kernel-rs/pull/3264
+[#3252]: https://github.com/delta-io/delta-kernel-rs/pull/3252
+[#3265]: https://github.com/delta-io/delta-kernel-rs/pull/3265
+[#3103]: https://github.com/delta-io/delta-kernel-rs/pull/3103
+[#3270]: https://github.com/delta-io/delta-kernel-rs/pull/3270
+[#3271]: https://github.com/delta-io/delta-kernel-rs/pull/3271
+[#3277]: https://github.com/delta-io/delta-kernel-rs/pull/3277
+[#3276]: https://github.com/delta-io/delta-kernel-rs/pull/3276
+[#3267]: https://github.com/delta-io/delta-kernel-rs/pull/3267
+[#3259]: https://github.com/delta-io/delta-kernel-rs/pull/3259
+[#3275]: https://github.com/delta-io/delta-kernel-rs/pull/3275
+[#3195]: https://github.com/delta-io/delta-kernel-rs/pull/3195
+[#3249]: https://github.com/delta-io/delta-kernel-rs/pull/3249
+[#3268]: https://github.com/delta-io/delta-kernel-rs/pull/3268
+[#3262]: https://github.com/delta-io/delta-kernel-rs/pull/3262
+[#3222]: https://github.com/delta-io/delta-kernel-rs/pull/3222
+[#3285]: https://github.com/delta-io/delta-kernel-rs/pull/3285
+[#3298]: https://github.com/delta-io/delta-kernel-rs/pull/3298
+[#3303]: https://github.com/delta-io/delta-kernel-rs/pull/3303
+[#3304]: https://github.com/delta-io/delta-kernel-rs/pull/3304
+[#3299]: https://github.com/delta-io/delta-kernel-rs/pull/3299
+[#3261]: https://github.com/delta-io/delta-kernel-rs/pull/3261
+[#3305]: https://github.com/delta-io/delta-kernel-rs/pull/3305
+[#3284]: https://github.com/delta-io/delta-kernel-rs/pull/3284
+[#3313]: https://github.com/delta-io/delta-kernel-rs/pull/3313
+[#3306]: https://github.com/delta-io/delta-kernel-rs/pull/3306
+[#3283]: https://github.com/delta-io/delta-kernel-rs/pull/3283
+[#3274]: https://github.com/delta-io/delta-kernel-rs/pull/3274
+[#3327]: https://github.com/delta-io/delta-kernel-rs/pull/3327
+[#3216]: https://github.com/delta-io/delta-kernel-rs/pull/3216
+[#3335]: https://github.com/delta-io/delta-kernel-rs/pull/3335
+[#3337]: https://github.com/delta-io/delta-kernel-rs/pull/3337
+[#3328]: https://github.com/delta-io/delta-kernel-rs/pull/3328
+[#3118]: https://github.com/delta-io/delta-kernel-rs/pull/3118
+[#3287]: https://github.com/delta-io/delta-kernel-rs/pull/3287
+[#3342]: https://github.com/delta-io/delta-kernel-rs/pull/3342
+[#3323]: https://github.com/delta-io/delta-kernel-rs/pull/3323
+[#3343]: https://github.com/delta-io/delta-kernel-rs/pull/3343
+[#3330]: https://github.com/delta-io/delta-kernel-rs/pull/3330
+[#3250]: https://github.com/delta-io/delta-kernel-rs/pull/3250
+[#3302]: https://github.com/delta-io/delta-kernel-rs/pull/3302
+[#3318]: https://github.com/delta-io/delta-kernel-rs/pull/3318
+[#3296]: https://github.com/delta-io/delta-kernel-rs/pull/3296
+[#3348]: https://github.com/delta-io/delta-kernel-rs/pull/3348
+[#3332]: https://github.com/delta-io/delta-kernel-rs/pull/3332
+[#3336]: https://github.com/delta-io/delta-kernel-rs/pull/3336
+[#3333]: https://github.com/delta-io/delta-kernel-rs/pull/3333
+[#3350]: https://github.com/delta-io/delta-kernel-rs/pull/3350
+[#3363]: https://github.com/delta-io/delta-kernel-rs/pull/3363
+[#3356]: https://github.com/delta-io/delta-kernel-rs/pull/3356
+[#3353]: https://github.com/delta-io/delta-kernel-rs/pull/3353
+[#3365]: https://github.com/delta-io/delta-kernel-rs/pull/3365
+[#3239]: https://github.com/delta-io/delta-kernel-rs/pull/3239
+[#3331]: https://github.com/delta-io/delta-kernel-rs/pull/3331
+[#2839]: https://github.com/delta-io/delta-kernel-rs/pull/2839
+[#3225]: https://github.com/delta-io/delta-kernel-rs/pull/3225
+[#3384]: https://github.com/delta-io/delta-kernel-rs/pull/3384
+[#3373]: https://github.com/delta-io/delta-kernel-rs/pull/3373
+[#3369]: https://github.com/delta-io/delta-kernel-rs/pull/3369
+[#3366]: https://github.com/delta-io/delta-kernel-rs/pull/3366
+[#3326]: https://github.com/delta-io/delta-kernel-rs/pull/3326
+[#3325]: https://github.com/delta-io/delta-kernel-rs/pull/3325
+[#3391]: https://github.com/delta-io/delta-kernel-rs/pull/3391
+[#3387]: https://github.com/delta-io/delta-kernel-rs/pull/3387
+[#3370]: https://github.com/delta-io/delta-kernel-rs/pull/3370
+[#3396]: https://github.com/delta-io/delta-kernel-rs/pull/3396
+[#3347]: https://github.com/delta-io/delta-kernel-rs/pull/3347
+[#3364]: https://github.com/delta-io/delta-kernel-rs/pull/3364
+[#3044]: https://github.com/delta-io/delta-kernel-rs/pull/3044
+[#2968]: https://github.com/delta-io/delta-kernel-rs/pull/2968
+[#3401]: https://github.com/delta-io/delta-kernel-rs/pull/3401
+[#3408]: https://github.com/delta-io/delta-kernel-rs/pull/3408
+[#3390]: https://github.com/delta-io/delta-kernel-rs/pull/3390
+[#3415]: https://github.com/delta-io/delta-kernel-rs/pull/3415
+[#3417]: https://github.com/delta-io/delta-kernel-rs/pull/3417
+
+
 ## [v0.28.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.28.0/) (2026-08-28)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.27.1...v0.28.0)

@@ -383,8 +383,9 @@ int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
+  bool print_scan_schema = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:")) != -1) {
+  while ((c = getopt (argc, argv, "ac:s")) != -1) {
     switch (c) {
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
@@ -396,6 +397,11 @@ int main(int argc, char* argv[])
       break;
     case 'c':
       requested_cols = optarg;
+      break;
+    case 's':
+      // Print the scan's logical schema (scan_logical_schema) as "Scan schema". Useful to check
+      // that a schema requested with -c was honored.
+      print_scan_schema = true;
       break;
     case '?':
       if (optopt == 'c') {
@@ -416,7 +422,7 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] table/path\n", argv[0]);
     return -1;
   }
 
@@ -444,9 +450,9 @@ int main(int argc, char* argv[])
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
-  ExternResultHandleMutableFfiEngineBuilder engine_builder_res =
+  ExternResultHandleExclusiveEngineBuilder engine_builder_res =
     get_engine_builder(table_path_slice, allocate_error);
-  if (engine_builder_res.tag != OkHandleMutableFfiEngineBuilder) {
+  if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return -1;
@@ -456,9 +462,8 @@ int main(int argc, char* argv[])
   // keys accepted here come from object_store's configuration vocabulary (e.g. "aws_region",
   // "aws_access_key_id"). They are object-store-specific and only meaningful when the table URL
   // points at that backend -- for a local file:// table the setters have no effect.
-  HandleMutableFfiEngineBuilder engine_builder = engine_builder_res.ok;
+  HandleExclusiveEngineBuilder engine_builder = engine_builder_res.ok;
   if (!set_builder_opt(&engine_builder, "aws_region", "us-west-2")) {
-    free_engine_builder(engine_builder);
     return -1;
   }
   // potentially set credentials here
@@ -478,8 +483,8 @@ int main(int argc, char* argv[])
 
   SharedExternEngine* engine = engine_res.ok;
 
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+  ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
+  if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
     free_error((Error*)snapshot_builder_res.err);
     free_engine(engine);
@@ -501,7 +506,7 @@ int main(int argc, char* argv[])
   printf("version: %" PRIu64 "\n\n", v);
 
   CSchema *cschema = get_cschema(snapshot, engine);
-  print_cschema(cschema);
+  print_cschema("Schema", cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -553,6 +558,12 @@ int main(int argc, char* argv[])
 
   SharedSchema* logical_schema = scan_logical_schema(scan);
   SharedSchema* physical_schema = scan_physical_schema(scan);
+
+  if (print_scan_schema) {
+    CSchema* scan_cschema = build_cschema(logical_schema, engine);
+    print_cschema("Scan schema", scan_cschema);
+    free_cschema(scan_cschema);
+  }
   struct EngineContext context = {
     logical_schema,
     physical_schema,

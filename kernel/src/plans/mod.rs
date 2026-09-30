@@ -8,7 +8,7 @@
 //!
 //! # What a plan is
 //!
-//! A [`Plan`](ir::plan::Plan) is a DAG of relational operators ([`Operator`](ir::nodes::Operator)):
+//! A [`Plan`] is a DAG of relational operators ([`Operator`](ir::nodes::Operator)):
 //! sources, transforms, and set combinators. Most map one-to-one onto a SQL operator, so a plan
 //! reads like a query. The live-add metadata plan built in `scan::scan_plan`, for example, is
 //! roughly:
@@ -31,9 +31,9 @@
 //!
 //! - [`Operation::IoOperation`] is a single I/O request; each [`IoOperation`] variant documents the
 //!   [`PlanResult`] it must return.
-//! - [`Operation::QueryPlan`] is a [`Plan`](ir::plan::Plan), returning [`PlanResult::Data`]. Either
-//!   evaluate [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted
-//!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
+//! - [`Operation::QueryPlan`] is a [`Plan`], returning [`PlanResult::Data`]. Either evaluate
+//!   [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted so a
+//!   node's inputs are already evaluated, or compile the DAG into the engine's own plan.
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
 //! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
@@ -44,7 +44,7 @@
 //! [`PlanExecutor::execute_op`] and [`PlanResult::Data`] provide the generic result contract for
 //! operations whose output is consumed by kernel.
 //!
-//! Some kernel APIs instead return a [`Plan`](ir::plan::Plan) whose terminal rows belong to the
+//! Some kernel APIs instead return a [`Plan`] whose terminal rows belong to the
 //! connector. The connector may execute the plan through its ordinary query engine and keep the
 //! result in the engine's native representation instead of adapting it through [`EngineData`] only
 //! to pass it back to itself. [`Scan::declarative_metadata_scan_plan`] is one example: the
@@ -75,10 +75,12 @@ pub mod proto;
 
 pub use builder::PlanBuilder;
 use bytes::Bytes;
+pub use ir::nodes::{RelationId, RelationRef};
+pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
 
 use crate::{
-    AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
+    AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, FileMeta, KernelError, ParquetFooter,
 };
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
@@ -95,6 +97,26 @@ pub trait PlanExecutor: AsAny {
         self.execute_op(Operation::IoOperation(IoOperation::parquet_footer(file)))?
             .into_parquet_footer()
     }
+}
+
+/// A [`PlanExecutor`] that can retain relations within its own lifetime.
+///
+/// The connector creates and owns the scoped executor.
+///
+/// Implementations should release every relation retained through
+/// [`execute_and_retain`](Self::execute_and_retain) when this executor is dropped. A
+/// [`RelationRef`] may outlive the executor, but reading it after the executor is dropped must
+/// return an error. Reading a ref through a scoped executor other than the one that produced it
+/// is also an error.
+pub trait ScopedPlanExecutor: PlanExecutor {
+    /// Executes `plan` and retains its terminal relation in the engine, returning a handle that
+    /// can be used as a [`RelationSource`](ir::nodes::Operator::RelationSource) in another plan.
+    /// The handle is valid until this scoped executor is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan cannot be executed or its result cannot be retained.
+    fn execute_and_retain(&self, plan: Plan) -> DeltaResult<RelationRef>;
 }
 
 /// The result of executing an [`Operation`].
@@ -172,8 +194,9 @@ impl PlanResult {
         }
     }
 
-    /// Build an [`Error::PlanResultTypeMismatch`] reporting `self`'s variant as the actual one.
-    fn type_mismatch(&self, expected: &'static str) -> Error {
-        Error::plan_result_type_mismatch(expected, self.variant_name())
+    /// Build a [`KernelError::PlanResultTypeMismatch`] reporting `self`'s variant as the actual
+    /// one.
+    fn type_mismatch(&self, expected: &'static str) -> KernelError {
+        KernelError::plan_result_type_mismatch(expected, self.variant_name())
     }
 }
