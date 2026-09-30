@@ -42,8 +42,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -240,6 +240,39 @@ impl PlanBuilder {
         T: Into<StructData> + ToSchema,
     {
         Values::from_iter(rows).into()
+    }
+
+    /// A source reading all rows of a relation the engine previously retained, identified by
+    /// `relation_ref`. Output schema is the handle's schema. See [`Operator::RelationSource`] and
+    /// [`RelationRef`].
+    ///
+    /// Unlike an empty file scan or empty `Values`, a `RelationSource` is never treated as the
+    /// absent relation: kernel cannot know whether the retained relation holds any rows, so it
+    /// always builds a present source node.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::{DeltaResult, PlanBuilder};
+    /// # use delta_kernel::expressions::col;
+    /// # use delta_kernel::plans::ScopedPlanExecutor;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// # fn build_plan(scoped: &dyn ScopedPlanExecutor) -> DeltaResult<()> {
+    /// let schema = Arc::new(StructType::try_new([
+    ///     StructField::not_null("id", DataType::INTEGER),
+    /// ])?);
+    /// let source = PlanBuilder::values(schema, vec![vec![1i32.into()]])?.build()?;
+    /// let relation_ref = scoped.execute_and_retain(source)?;
+    /// let plan = PlanBuilder::relation_source(relation_ref)
+    ///     .filter(col!("id").is_not_null())?
+    ///     .build()?;
+    /// # let _ = plan;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn relation_source(relation_ref: RelationRef) -> Self {
+        let schema = Arc::clone(relation_ref.schema());
+        Self::present(schema, relation_ref, vec![])
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -724,6 +757,29 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
+    }
+
+    /// `relation_source` records the handle's id and schema and builds to a single source node.
+    #[test]
+    fn relation_source_builds_single_node_with_ref_schema() {
+        let src = PlanBuilder::relation_source(RelationRef::new("relation-3", id_schema()));
+        assert_eq!(src.schema(), &id_schema());
+        let plan = assert_plan(src, &[(&[], "relation_source")]);
+        let Operator::RelationSource(relation_ref) = &plan.nodes[0].op else {
+            panic!("expected RelationSource");
+        };
+        assert_eq!(relation_ref.id(), "relation-3");
+        assert_eq!(relation_ref.schema(), &id_schema());
+    }
+
+    /// A `relation_source` feeds downstream transforms, which validate against its schema.
+    #[test]
+    fn relation_source_supports_downstream_transforms() -> DeltaResult<()> {
+        let filtered = PlanBuilder::relation_source(RelationRef::new("relation-1", id_schema()))
+            .filter(col!("id").is_not_null())?;
+        assert_eq!(filtered.schema(), &id_schema());
+        assert_plan(filtered, &[(&[], "relation_source"), (&[0], "filter")]);
+        Ok(())
     }
 
     /// `{ id, part }`, with `part` used as a file-constant column.
@@ -1294,6 +1350,8 @@ mod tests {
     // transforms referencing an absent column
     #[case::filter_unknown_column("`nope` not found",
         || vals(id_schema()).filter(col!("nope").is_not_null()))]
+    #[case::relation_source_unknown_column("`nope` not found",
+        || PlanBuilder::relation_source(RelationRef::new("relation-0", id_schema())).filter(col!("nope").is_not_null()))]
     #[case::project_unknown_column("`nope` not found",
         || vals(id_schema()).project(Expression::struct_from([col!("nope")]), id_schema()))]
     #[case::project_patch_missing_field("does not exist",

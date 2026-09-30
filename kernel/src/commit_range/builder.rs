@@ -1,7 +1,9 @@
 use url::Url;
 
 use crate::commit_range::CommitRange;
-use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
+use crate::log_segment::{
+    validate_catalog_managed_log_tail, validate_start_version_available, LogSegment,
+};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
@@ -83,10 +85,11 @@ impl CommitRangeBuilder {
     /// segment. Neither path reads commit JSON.
     ///
     /// Returns [`KernelError::MissingVersion`] if a snapshot-derived range requires a commit beyond
-    /// what is available from the snapshot's log segment and the supplied catalog tail. Returns
-    /// an error if the resolved version range is invalid (start > end), the listed commits are
-    /// non-contiguous, or the requested start version is unavailable from both the filesystem and
-    /// the supplied catalog tail.
+    /// what is available from the snapshot's log segment and the supplied catalog tail, or if the
+    /// listed commits are non-contiguous. Returns [`KernelError::StartVersionNotFound`] (carrying
+    /// the earliest still-available version) if the requested start is unavailable but later
+    /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
+    /// all, and a generic error if the resolved version range is invalid (start > end).
     pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
@@ -200,17 +203,6 @@ fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
     Ok(())
 }
 
-/// Ensure `start_version` is the first commit in the snapshot's log segment.
-fn validate_start_version_available(
-    start_version: Version,
-    first_commit: Option<&ParsedLogPath>,
-) -> DeltaResult<()> {
-    if first_commit.map(|f| f.version) == Some(start_version) {
-        return Ok(());
-    }
-    Err(KernelError::MissingVersion(start_version))
-}
-
 fn validate_number_of_commit_files(
     start: Version,
     end: Version,
@@ -319,13 +311,13 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::start_past_snapshot_version(5, None, 5)]
-    #[case::end_past_snapshot_version(0, Some(99), 2)]
-    #[case::start_error_precedes_end_error(5, Some(99), 5)]
+    #[case::start_past_snapshot_version(5, None, None)]
+    #[case::end_past_snapshot_version(0, Some(99), Some(2))]
+    #[case::start_error_precedes_end_error(5, Some(99), None)]
     fn test_build_snapshot_based_reports_unavailable_version(
         #[case] start: Version,
         #[case] end: Option<Version>,
-        #[case] expected_missing_version: Version,
+        #[case] expected_missing_version: Option<Version>,
     ) {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
@@ -336,10 +328,12 @@ mod tests {
             .fold_with(end, CommitRangeBuilder::with_end_version)
             .build(&engine)
             .expect_err("must error");
-        assert!(matches!(
-            err,
-            KernelError::MissingVersion(version) if version == expected_missing_version
-        ));
+        match expected_missing_version {
+            Some(version) => {
+                assert!(matches!(err, KernelError::MissingVersion(v) if v == version));
+            }
+            None => assert!(matches!(err, KernelError::EmptyLog)),
+        }
     }
 
     #[test]
@@ -375,7 +369,13 @@ mod tests {
         let err = CommitRange::builder_from(snapshot, 1)
             .build(&engine)
             .expect_err("commit at version 1 must be unavailable after checkpoint filtering");
-        assert!(matches!(err, KernelError::MissingVersion(1)));
+        assert!(matches!(
+            err,
+            KernelError::StartVersionNotFound {
+                requested: 1,
+                earliest: 3
+            }
+        ));
     }
 
     #[test]
