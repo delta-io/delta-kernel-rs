@@ -314,7 +314,7 @@ for metadata in scan.scan_metadata(engine)? {
 ```
 
 Cancellation is cooperative. Kernel passes the token to the Engine's
-[cancellation-aware operations](../connector/implementing_engine.md#cancellation-aware-reads),
+[cancellation-aware operations](../connector/implementing_engine.md#support-cancellation),
 which prevent new I/O after detecting cancellation. An Engine may also interrupt I/O already in
 flight.
 

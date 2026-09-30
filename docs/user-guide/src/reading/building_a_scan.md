@@ -1,7 +1,11 @@
 # Building a scan
 
-To read data from a Delta table, you build a `Scan` from a `Snapshot`, optionally
-configure column selection and filter predicates, and then execute it.
+To read table data, configure a `ScanBuilder`, build a `Scan`, and choose the execution path that
+matches your connector. The [`ScanBuilder` rustdoc] and [`Scan` rustdoc] define the exact API
+contracts; this page shows how the calls fit together.
+
+[`ScanBuilder` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/scan/struct.ScanBuilder.html
+[`Scan` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/scan/struct.Scan.html
 
 ## The basic pattern
 
