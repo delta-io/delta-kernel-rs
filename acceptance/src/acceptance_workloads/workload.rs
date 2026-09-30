@@ -82,13 +82,20 @@ pub fn execute_read_workload(
         None
     };
 
-    if let Some(ref cols) = read_spec.columns {
-        let projected_schema = table_schema.project(cols)?;
-        scan_builder = scan_builder.with_schema(projected_schema);
+    let projected_schema = read_spec
+        .columns
+        .as_ref()
+        .map(|columns| table_schema.project(columns))
+        .transpose()?;
+    let mut needs_post_projection = false;
+    if let Some(columns) = &read_spec.columns {
+        let scan_columns = scan_columns(columns, predicate.as_deref());
+        needs_post_projection = scan_columns.len() != columns.len();
+        scan_builder = scan_builder.with_schema(table_schema.project(&scan_columns)?);
     }
     let scan = scan_builder.build()?;
 
-    let schema = scan.logical_schema();
+    let schema = projected_schema.unwrap_or_else(|| scan.logical_schema().clone());
 
     // Execute scan and apply row-level filtering
     let batches: Vec<RecordBatch> = scan
@@ -96,6 +103,11 @@ pub fn execute_read_workload(
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
     let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
+    let batches = if needs_post_projection {
+        project_batches(batches, read_spec.columns.as_deref())?
+    } else {
+        batches
+    };
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -105,6 +117,39 @@ pub fn execute_read_workload(
         schema: schema.clone(),
         row_count,
     })
+}
+
+fn scan_columns(columns: &[String], predicate: Option<&Predicate>) -> Vec<String> {
+    let mut scan_columns = columns.to_vec();
+    if let Some(predicate) = predicate {
+        for reference in predicate.references() {
+            if let Some(column) = reference.path().first() {
+                if !scan_columns.contains(column) {
+                    scan_columns.push(column.clone());
+                }
+            }
+        }
+    }
+    scan_columns
+}
+
+fn project_batches(
+    batches: Vec<RecordBatch>,
+    columns: Option<&[String]>,
+) -> Result<Vec<RecordBatch>> {
+    let Some(columns) = columns else {
+        return Ok(batches);
+    };
+    batches
+        .into_iter()
+        .map(|batch| {
+            let indices: Vec<usize> = columns
+                .iter()
+                .map(|column| batch.schema().index_of(column).map_err(KernelError::from))
+                .try_collect()?;
+            Ok(batch.project(&indices)?)
+        })
+        .collect()
 }
 
 /// Filter record batches using a predicate expression.
@@ -175,4 +220,41 @@ pub fn execute_and_validate_workload(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::expressions::{col, lit, Predicate};
+
+    use super::*;
+
+    #[test]
+    fn predicate_columns_are_available_until_after_projection() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("selected", ArrowDataType::Int32, true),
+            Field::new("filter", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let predicate = Predicate::gt(col!("filter"), lit(1));
+
+        assert_eq!(
+            scan_columns(&["selected".to_string()], Some(&predicate)),
+            ["selected", "filter"]
+        );
+
+        let filtered = filter_batches_with_predicate(vec![batch], Some(&predicate)).unwrap();
+        let projected = project_batches(filtered, Some(&["selected".to_string()])).unwrap();
+
+        assert_eq!(projected[0].num_rows(), 2);
+        assert_eq!(projected[0].schema().field(0).name(), "selected");
+    }
 }
