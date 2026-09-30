@@ -104,9 +104,25 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
+        // A property key with a variable `<name>` suffix is a prefix family rather than a fixed
+        // key, so it is matched by prefix in a guard here instead of a single constant arm. For
+        // example, `delta.constraints.<name>` records a CHECK constraint.
+        _ if strip_constraint_prefix(k).is_some() => {
+            let name = strip_constraint_prefix(k)?;
+            props
+                .check_constraints
+                .insert(name.to_string(), v.to_string());
+        }
         _ => return None,
     }
     Some(())
+}
+
+/// Returns the constraint name for a `delta.constraints.<name>` configuration key, or `None`
+/// for any other key (including a bare `delta.constraints.` with an empty name).
+fn strip_constraint_prefix(key: &str) -> Option<&str> {
+    key.strip_prefix(CHECK_CONSTRAINT_PREFIX)
+        .filter(|name| !name.is_empty())
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
