@@ -275,7 +275,7 @@ fn collect_single_sidecar(
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
     }?
-    .filter(col!(SIDECAR_NAME).is_not_null())?
+    .filter(col!(SIDECAR_NAME, "path").is_not_null())?
     .build()?;
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
 
@@ -314,7 +314,7 @@ mod tests {
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
 
-    /// Counts I/O operations and verifies that sidecar discovery queries filter out null actions.
+    /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
         inner: SyncPlanExecutor,
         query_scans: AtomicUsize,
@@ -339,7 +339,7 @@ mod tests {
                         Operator::Filter(filter) => Some(filter.predicate.as_ref()),
                         _ => None,
                     });
-                    assert_eq!(predicate, Some(&col!(SIDECAR_NAME).is_not_null()));
+                    assert_eq!(predicate, Some(&col!(SIDECAR_NAME, "path").is_not_null()));
                     _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
                 }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {
