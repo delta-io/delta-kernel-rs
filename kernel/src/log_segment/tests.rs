@@ -4009,8 +4009,10 @@ fn test_schema_has_compatible_stats_parsed_multiple_columns() {
     ));
 }
 
-#[test]
-fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
+#[rstest]
+#[case::primitive(StructField::nullable("id", DataType::INTEGER))]
+#[case::variant(StructField::nullable("v", DataType::unshredded_variant()))]
+fn test_schema_has_compatible_stats_parsed_missing_min_max_values(#[case] needed: StructField) {
     // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
     let checkpoint_schema = schema! {
         nullable "add": {
@@ -4022,7 +4024,7 @@ fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
         },
     };
 
-    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
+    let stats_schema = create_stats_schema(vec![needed]);
 
     // Should return true - missing minValues/maxValues is handled gracefully with continue
     assert!(LogSegment::schema_has_compatible_stats_parsed(
@@ -4203,6 +4205,43 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
         &checkpoint_schema,
         &stats_schema
     ));
+}
+
+#[rstest]
+#[case::unshredded(Some(schema! { not_null "metadata": BINARY, not_null "value": BINARY }), true)]
+#[case::mismatched_inner_type(
+    Some(schema! { not_null "metadata": BINARY, not_null "value": STRING }),
+    false
+)]
+#[case::shredded(
+    Some(schema! {
+        not_null "metadata": BINARY,
+        nullable "value": BINARY,
+        nullable "typed_value": LONG,
+    }),
+    false
+)]
+#[case::shredded_without_value(
+    Some(schema! { not_null "metadata": BINARY, nullable "typed_value": LONG }),
+    false
+)]
+#[case::missing(None, true)]
+fn test_schema_has_compatible_stats_parsed_variant_against_struct(
+    #[case] checkpoint_variant: Option<StructType>,
+    #[case] expected: bool,
+) {
+    let mut checkpoint_fields = vec![StructField::nullable("id", DataType::LONG)];
+    checkpoint_fields.extend(checkpoint_variant.map(|v| StructField::nullable("v", v)));
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(checkpoint_fields);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("v", DataType::unshredded_variant()),
+    ]);
+
+    assert_eq!(
+        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
+        expected
+    );
 }
 
 #[test]

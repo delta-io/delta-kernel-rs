@@ -40,6 +40,8 @@ use crate::{
     Snapshot,
 };
 
+mod variant_stats;
+
 fn field_names(s: &StructArray) -> Vec<String> {
     s.fields().iter().map(|f| f.name().clone()).collect()
 }
@@ -2137,6 +2139,7 @@ fn test_default_stats_options_no_struct_output() {
         struct_stats: StructStats::Columns {
             requested: vec![column_name!("id")],
         },
+        ..Default::default()
     },
     &["id"],
     None,
@@ -2305,6 +2308,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             struct_stats: StructStats::Columns {
                 requested: vec![column_name!("nonexistent_column")],
             },
+            ..Default::default()
         })
         .build();
 

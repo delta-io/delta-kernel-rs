@@ -45,7 +45,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{FoldWithOption as _, IteratorExt};
+use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
     Version,
@@ -134,6 +134,10 @@ pub struct StatsOptions {
 
     /// Which struct stats columns to request in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
+
+    /// Whether a VARIANT column's min/max statistic is requested. See
+    /// [`Self::with_variant_min_max_stats`].
+    pub(crate) variant_min_max: bool,
 }
 
 /// Controls which struct stats columns appear in `stats_parsed`.
@@ -172,6 +176,7 @@ impl Default for StatsOptions {
         Self {
             synthesize_json: true,
             struct_stats: StructStats::None,
+            variant_min_max: false,
         }
     }
 }
@@ -191,6 +196,7 @@ impl StatsOptions {
             struct_stats: StructStats::AllIndexed {
                 extra_indexed: Vec::new(),
             },
+            ..Self::default()
         }
     }
 
@@ -203,6 +209,7 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::Columns { requested: cols },
+            ..Self::default()
         }
     }
 
@@ -214,16 +221,17 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::AllIndexed { extra_indexed },
+            ..Self::default()
         }
     }
 
     /// Both JSON and struct stats. Pays for both representations.
     pub fn all() -> Self {
         Self {
-            synthesize_json: true,
             struct_stats: StructStats::AllIndexed {
                 extra_indexed: Vec::new(),
             },
+            ..Self::default()
         }
     }
 
@@ -236,8 +244,57 @@ impl StatsOptions {
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
-            struct_stats: StructStats::None,
+            ..Self::default()
         }
+    }
+
+    /// Requests each VARIANT column's min/max statistic in the `minValues` and `maxValues` of
+    /// `stats_parsed`, typed as the variant's physical struct. Off by default.
+    ///
+    /// The statistic is itself a VARIANT value, so kernel never prunes with it. It requires struct
+    /// stats without JSON synthesis, such as [`Self::all_struct`]; [`ScanBuilder::build`] rejects
+    /// any other combination.
+    ///
+    /// The protocol encodes the statistic in the stats JSON as a z85 string of the unshredded
+    /// variant, and kernel does not implement that encoding: for commits, and for checkpoints
+    /// without compatible `stats_parsed`, the engine's [`ParseJson`] must decode it. A compatible
+    /// checkpoint's `stats_parsed` stores the statistic as its physical struct, which kernel reads
+    /// directly. If `stats_parsed` omits it, as kernel-written checkpoints do, it reads as null.
+    ///
+    /// With the default engine, a [`ParseJson`] failure on any file's statistic nulls the stats of
+    /// every file in that batch, so kernel cannot prune those files either.
+    ///
+    /// [`ParseJson`]: crate::expressions::ParseJsonExpression
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn with_variant_min_max_stats(mut self, include: bool) -> Self {
+        self.variant_min_max = include;
+        self
+    }
+
+    /// Checks that the options form a supported combination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Unsupported`] if VARIANT min/max stats are requested without struct
+    /// stats output or with JSON stats synthesis.
+    pub(crate) fn validate(&self) -> DeltaResult<()> {
+        if self.variant_min_max {
+            require!(
+                !matches!(self.struct_stats, StructStats::None),
+                KernelError::unsupported(
+                    "StatsOptions::with_variant_min_max_stats requires struct stats output"
+                )
+            );
+            require!(
+                !self.synthesize_json,
+                KernelError::unsupported(
+                    "StatsOptions::with_variant_min_max_stats cannot be combined with JSON stats \
+                     synthesis"
+                )
+            );
+        }
+        Ok(())
     }
 }
 
@@ -764,12 +821,10 @@ fn build_stats_output_schemas(
 ) -> DeltaResult<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::AllIndexed { extra_indexed } => {
-            table_configuration.build_indexed_stats_output_schemas(extra_indexed)
-        }
-        StructStats::Columns { requested } => {
-            table_configuration.build_selected_stats_output_schemas(requested)
-        }
+        StructStats::AllIndexed { extra_indexed } => table_configuration
+            .build_indexed_stats_output_schemas(extra_indexed, stats.variant_min_max),
+        StructStats::Columns { requested } => table_configuration
+            .build_selected_stats_output_schemas(requested, stats.variant_min_max),
     }
 }
 

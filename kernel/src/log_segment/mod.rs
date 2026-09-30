@@ -1552,6 +1552,9 @@ impl LogSegment {
     /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
     ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
+    /// - A needed VARIANT against an available struct: the struct must have exactly the variant's
+    ///   physical fields, with compatible types. A shredded struct is not compatible with an
+    ///   unshredded VARIANT.
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
     fn structs_have_compatible_types(
@@ -1564,14 +1567,14 @@ impl LogSegment {
                 continue;
             };
 
+            let nested_context = || format!("{}.{}", context, needed_field.name());
             match (available_field.data_type(), needed_field.data_type()) {
                 // Both are structs: recurse
                 (DataType::Struct(avail_struct), DataType::Struct(need_struct)) => {
-                    let nested_context = format!("{}.{}", context, needed_field.name());
                     if !Self::structs_have_compatible_types(
                         avail_struct,
                         need_struct,
-                        &nested_context,
+                        &nested_context(),
                     ) {
                         return false;
                     }
@@ -1582,6 +1585,11 @@ impl LogSegment {
                     let compatible = match (avail_type, need_type) {
                         (DataType::Primitive(a), DataType::Primitive(b)) => {
                             a.is_stats_type_compatible_with(b)
+                        }
+                        (DataType::Struct(a), DataType::Variant(b)) => {
+                            a.num_fields() == b.num_fields()
+                                && b.fields().all(|f| a.field(f.name()).is_some())
+                                && Self::structs_have_compatible_types(a, b, &nested_context())
                         }
                         (a, b) => a.can_read_as(b).is_ok(),
                     };
