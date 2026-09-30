@@ -45,7 +45,7 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTy
 
 impl<'a> StagedDataValidator<'a> {
     pub(crate) fn staged_remove_file(
-        existing_file_actions: &'a mut FileActionTracker,
+        existing_file_actions: Option<&'a mut FileActionTracker>,
     ) -> DeltaResult<Self> {
         let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
@@ -54,12 +54,13 @@ impl<'a> StagedDataValidator<'a> {
                     "RemoveFile validation columns must exist in the scan-row schema: {error}"
                 ))
             })?;
-        Ok(StagedDataValidator::new(
-            columns,
-            vec![Box::new(RequiredRemoveFileVal {
+        let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredRemoveFileVal)];
+        if let Some(existing_file_actions) = existing_file_actions {
+            validations.push(Box::new(RepeatedFileAction {
                 existing_file_actions,
-            })],
-        ))
+            }));
+        }
+        Ok(StagedDataValidator::new(columns, validations))
     }
 }
 
@@ -68,11 +69,9 @@ impl<'a> StagedDataValidator<'a> {
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct RequiredRemoveFileVal<'a> {
-    existing_file_actions: &'a mut FileActionTracker,
-}
+struct RequiredRemoveFileVal;
 
-impl Validation for RequiredRemoveFileVal<'_> {
+impl Validation for RequiredRemoveFileVal {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get_opt(row, "path")?.ok_or_else(|| {
             KernelError::missing_data("RemoveFile is missing required field 'path'")
@@ -92,6 +91,17 @@ impl Validation for RequiredRemoveFileVal<'_> {
                 "RemoveFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );
+        Ok(())
+    }
+}
+
+struct RepeatedFileAction<'a> {
+    existing_file_actions: &'a mut FileActionTracker,
+}
+
+impl Validation for RepeatedFileAction<'_> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let dv_id = deletion_vector_unique_id(
             getters[DELETION_VECTOR_STORAGE_TYPE].get_opt(row, STORAGE_TYPE_NAME)?,
             getters[DELETION_VECTOR_PATH_OR_INLINE_DV].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
@@ -312,8 +322,8 @@ mod tests {
 
     fn validate_remove_files(removes: &[FilteredEngineData]) -> DeltaResult<()> {
         let mut file_actions = FileActionTracker::default();
-        let result =
-            StagedDataValidator::staged_remove_file(&mut file_actions)?.validate_filtered(removes);
+        let result = StagedDataValidator::staged_remove_file(Some(&mut file_actions))?
+            .validate_filtered(removes);
         result
     }
 }

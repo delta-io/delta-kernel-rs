@@ -222,6 +222,45 @@ fn selected_scan_file_batch(
 
 #[rstest]
 #[case::valid(FileActionUniquenessCase::valid())]
+#[case::dedup_disabled(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("remove-0.parquet", None),
+    ],
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_add_path(FileActionUniquenessCase {
+    adds: [file_action("", None), file_action("add-1.parquet", None)],
+    dedup_validation_enabled: false,
+    expected_error: Some("AddFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_remove_path(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [file_action("", None), file_action("remove-1.parquet", None)],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    expected_error: Some("RemoveFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_dv_path(FileActionUniquenessCase {
+    dv_updates: SelectedFileActions {
+        rows: [file_action("", None), file_action("dv-1.parquet", None)],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    expected_error: Some("AddFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
 #[case::duplicate_add(FileActionUniquenessCase {
     adds: [
         file_action("same.parquet", None),
@@ -350,6 +389,9 @@ async fn commit_validates_file_action_uniqueness(
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let base_row = batch.slice(0, 1);
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    if !case.dedup_validation_enabled {
+        txn = txn.without_dedup_validation();
+    }
 
     txn.add_files(create_add_files_metadata(
         txn.add_files_schema(),
@@ -422,6 +464,7 @@ struct FileActionUniquenessCase {
     adds: [FileActionInput; 2],
     removes: SelectedFileActions,
     dv_updates: SelectedFileActions,
+    dedup_validation_enabled: bool,
     expected_error: Option<&'static str>,
 }
 
@@ -447,6 +490,7 @@ impl FileActionUniquenessCase {
                 selection_vector: &[true, true],
             },
             expected_error: None,
+            dedup_validation_enabled: true,
         }
     }
 }

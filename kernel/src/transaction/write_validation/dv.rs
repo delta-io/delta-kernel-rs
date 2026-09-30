@@ -58,12 +58,11 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
         Ok((names, types).into())
     });
 
-struct RequiredDvMatchedFileVal<'a> {
+struct RequiredDvMatchedFileVal {
     physical_partition_columns: HashSet<String>,
-    existing_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for RequiredDvMatchedFileVal<'_> {
+impl Validation for RequiredDvMatchedFileVal {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, PATH_NAME)?
@@ -96,6 +95,17 @@ impl Validation for RequiredDvMatchedFileVal<'_> {
             path,
             MODIFICATION_TIME_NAME,
         )?;
+        Ok(())
+    }
+}
+
+struct RepeatedFileAction<'a> {
+    existing_file_actions: &'a mut FileActionTracker,
+}
+
+impl Validation for RepeatedFileAction<'_> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let old_dv_id = deletion_vector_unique_id(
             getters[OLD_DELETION_VECTOR_STORAGE_TYPE].get_opt(row, STORAGE_TYPE_NAME)?,
             getters[OLD_DELETION_VECTOR_PATH_OR_INLINE_DV].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
@@ -117,7 +127,7 @@ impl<'a> StagedDataValidator<'a> {
     /// Errors if the required columns are absent from the intermediate DV schema.
     pub(crate) fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        existing_file_actions: &'a mut FileActionTracker,
+        existing_file_actions: Option<&'a mut FileActionTracker>,
     ) -> DeltaResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
@@ -126,13 +136,16 @@ impl<'a> StagedDataValidator<'a> {
                     "DV validation columns must exist in the intermediate DV schema: {error}"
                 ))
             })?;
-        Ok(StagedDataValidator::new(
-            columns,
+        let mut validations: Vec<Box<dyn Validation + 'a>> =
             vec![Box::new(RequiredDvMatchedFileVal {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
+            })];
+        if let Some(existing_file_actions) = existing_file_actions {
+            validations.push(Box::new(RepeatedFileAction {
                 existing_file_actions,
-            })],
-        ))
+            }));
+        }
+        Ok(StagedDataValidator::new(columns, validations))
     }
 }
 
@@ -246,11 +259,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::selected(&[true, true], Some("multiple RemoveFile actions"))]
-    #[case::implicitly_selected(&[true], Some("multiple RemoveFile actions"))]
-    #[case::unselected(&[true, false], None)]
+    #[case::selected(&[true, true], true, Some("multiple RemoveFile actions"))]
+    #[case::implicitly_selected(&[true], true, Some("multiple RemoveFile actions"))]
+    #[case::unselected(&[true, false], true, None)]
+    #[case::dedup_disabled(&[true, true], false, None)]
+    #[case::dedup_disabled_implicit_tail(&[true], false, None)]
     fn duplicate_dv_update_paths_validate_selected_rows(
         #[case] selection_vector: &[bool],
+        #[case] dedup_validation_enabled: bool,
         #[case] expected_error: Option<&str>,
         #[values(false, true)] multiple_batches: bool,
     ) {
@@ -281,15 +297,17 @@ mod tests {
             )]
         };
         let mut file_actions = FileActionTracker::default();
-        let result =
-            StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
-                .expect("DV validator should use the intermediate DV schema")
-                .validate_filtered(&batches);
+        let result = StagedDataValidator::staged_dv_matched_file(
+            std::iter::empty(),
+            dedup_validation_enabled.then_some(&mut file_actions),
+        )
+        .expect("DV validator should use the intermediate DV schema")
+        .validate_filtered(&batches);
 
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
-            result.expect("unselected duplicate DV update should be ignored");
+            result.expect("DV update should pass the enabled validations");
         }
     }
 
@@ -308,7 +326,7 @@ mod tests {
             vec![true],
         )];
         let mut file_actions = FileActionTracker::default();
-        StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
+        StagedDataValidator::staged_dv_matched_file(std::iter::empty(), Some(&mut file_actions))
             .expect("DV validator should use the intermediate DV schema")
             .validate_filtered(&batches)
             .expect("protocol-valid boundary value should be accepted");
@@ -343,9 +361,12 @@ mod tests {
             .collect();
         let mut file_actions = FileActionTracker::default();
         assert_result_error_with_message(
-            StagedDataValidator::staged_dv_matched_file(std::iter::empty(), &mut file_actions)
-                .expect("DV validator should use the intermediate DV schema")
-                .validate_filtered(&batches),
+            StagedDataValidator::staged_dv_matched_file(
+                std::iter::empty(),
+                Some(&mut file_actions),
+            )
+            .expect("DV validator should use the intermediate DV schema")
+            .validate_filtered(&batches),
             field,
         );
     }
@@ -373,7 +394,7 @@ mod tests {
         let mut file_actions = FileActionTracker::default();
         let result = StagedDataValidator::staged_dv_matched_file(
             ["p1".to_string(), "p2".to_string()],
-            &mut file_actions,
+            Some(&mut file_actions),
         )
         .expect("DV validator should use the intermediate DV schema")
         .validate_filtered(&batches);

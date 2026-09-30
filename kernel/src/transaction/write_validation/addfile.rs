@@ -23,15 +23,17 @@ impl<'a> StagedDataValidator<'a> {
     /// Creates a validator that validates every staged add-file row.
     pub(crate) fn staged_add_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        existing_file_actions: &'a mut FileActionTracker,
+        existing_file_actions: Option<&'a mut FileActionTracker>,
     ) -> Self {
-        StagedDataValidator::new(
-            &ADD_FILE_COLUMNS_FOR_VALIDATION,
-            vec![Box::new(RequiredAddFileVal {
-                physical_partition_columns: physical_partition_columns.into_iter().collect(),
+        let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredAddFileVal {
+            physical_partition_columns: physical_partition_columns.into_iter().collect(),
+        })];
+        if let Some(existing_file_actions) = existing_file_actions {
+            validations.push(Box::new(RepeatedFileAction {
                 existing_file_actions,
-            })],
-        )
+            }));
+        }
+        StagedDataValidator::new(&ADD_FILE_COLUMNS_FOR_VALIDATION, validations)
     }
 }
 
@@ -44,12 +46,11 @@ impl<'a> StagedDataValidator<'a> {
 ///
 /// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
 /// TODO(2869): Add intent-based validation for dataChange.
-pub(crate) struct RequiredAddFileVal<'a> {
+pub(crate) struct RequiredAddFileVal {
     physical_partition_columns: HashSet<String>,
-    existing_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for RequiredAddFileVal<'_> {
+impl Validation for RequiredAddFileVal {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
@@ -79,6 +80,17 @@ impl Validation for RequiredAddFileVal<'_> {
             path,
             "modificationTime",
         )?;
+        Ok(())
+    }
+}
+
+struct RepeatedFileAction<'a> {
+    existing_file_actions: &'a mut FileActionTracker,
+}
+
+impl Validation for RepeatedFileAction<'_> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let path: &str = getters[PATH].get(row, "path")?;
         self.existing_file_actions.record_add(path, None)
     }
 }
@@ -108,7 +120,7 @@ mod tests {
         let mut file_actions = FileActionTracker::default();
         StagedDataValidator::staged_add_file(
             physical_partition_columns.iter().map(|s| s.to_string()),
-            &mut file_actions,
+            Some(&mut file_actions),
         )
         .validate(adds)
     }
@@ -156,8 +168,11 @@ mod tests {
         }
 
         assert_result_error_with_message(
-            StagedDataValidator::staged_add_file(std::iter::empty(), &mut existing_file_actions)
-                .validate(&adds),
+            StagedDataValidator::staged_add_file(
+                std::iter::empty(),
+                Some(&mut existing_file_actions),
+            )
+            .validate(&adds),
             "multiple AddFile actions",
         );
     }
