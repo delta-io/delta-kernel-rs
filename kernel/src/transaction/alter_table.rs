@@ -58,6 +58,8 @@ impl AlterTableTransaction {
             committer,
             operation: Some("ALTER TABLE".to_string()),
             engine_info: None,
+            operation_parameters: None,
+            operation_metrics: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],

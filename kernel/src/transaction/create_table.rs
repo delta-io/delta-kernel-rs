@@ -170,6 +170,8 @@ impl CreateTableTransaction {
             committer,
             operation: Some("CREATE TABLE".to_string()),
             engine_info: Some(engine_info),
+            operation_parameters: None,
+            operation_metrics: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],

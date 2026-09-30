@@ -891,7 +891,7 @@ pub(crate) struct CommitInfo {
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine. For now this is always empty on write.
+    /// operation. This is specified by the engine.
     pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
     /// Map of arbitrary string key-value pairs that provide operation metrics.
     /// This is specified by the engine.
@@ -944,6 +944,20 @@ impl CommitInfo {
             ROW_TRACKING_PRESERVED_TAG.to_string(),
             Some("true".to_string()),
         );
+    }
+
+    pub(crate) fn set_operation_parameters(
+        &mut self,
+        operation_parameters: HashMap<String, Option<String>>,
+    ) {
+        self.operation_parameters = Some(operation_parameters);
+    }
+
+    pub(crate) fn set_operation_metrics(
+        &mut self,
+        operation_metrics: HashMap<String, Option<String>>,
+    ) {
+        self.operation_metrics = Some(operation_metrics);
     }
 
     /// Merges the supplied tags into this CommitInfo's tags.

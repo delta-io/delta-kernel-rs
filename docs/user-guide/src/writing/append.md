@@ -281,6 +281,8 @@ that action, call `with_commit_info()` with your custom data and its schema:
 let txn = snapshot
     .transaction(Box::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
+    .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
+    .with_operation_metrics([("numFiles", Some("1"))])
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 
@@ -291,20 +293,21 @@ into the final `commitInfo` action.
 Kernel reserves certain fields and overrides them regardless of what you provide. Do not set
 these fields in your custom commit info:
 
-| Field | Set by Kernel to |
-|-------|------------------|
-| `timestamp` | The transaction's commit timestamp |
-| `inCommitTimestamp` | The in-commit timestamp (if ICT is enabled on the table) |
-| `operation` | The value from `with_operation()` |
-| `operationParameters` | Operation parameters (if any) |
-| `kernelVersion` | The Kernel library version |
-| `isBlindAppend` | `true` if `with_blind_append()` was called, omitted otherwise |
-| `engineInfo` | The value from `with_engine_info()` |
-| `txnId` | A unique transaction identifier |
+| Field | Meaning | Default when not supplied |
+|-------|---------|---------------------------|
+| `timestamp` | The transaction's commit timestamp | Current time when the transaction is created |
+| `inCommitTimestamp` | The table's in-commit timestamp | Omitted unless the table enables in-commit timestamps |
+| `operation` | The operation name | `UNKNOWN` for existing-table transactions; fixed for create and alter transactions |
+| `operationParameters` | Operation parameters (if any) | `{}` |
+| `operationMetrics` | Operation metrics (if any) | Omitted; an explicitly empty map is written as `{}` |
+| `kernelVersion` | The Kernel library version | Current Kernel version |
+| `isBlindAppend` | Whether the commit is a blind append | Omitted (`false`) |
+| `engineInfo` | The engine identifier | Omitted for existing and alter transactions; create uses its required engine identifier |
+| `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
-Any field in your custom data that shares a name with a Kernel-reserved field is replaced
-with Kernel's value. Fields with names that do not collide are preserved as-is in the final
-`commitInfo`.
+Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and
+`with_operation_metrics()` to set those fields. Each setter replaces the complete map. Fields with
+names that do not collide are preserved as-is.
 
 ## After committing
 

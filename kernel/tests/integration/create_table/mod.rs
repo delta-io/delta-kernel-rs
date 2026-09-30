@@ -487,6 +487,8 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     // Create table
     let _ = create_table(&table_path, schema, engine_info)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_operation_parameters([("mode", Some("Create")), ("description", None)])
+        .with_operation_metrics([("numFiles", Some("0"))])
         .commit(engine.as_ref())?;
 
     // Read the actual Delta log file
@@ -530,6 +532,14 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     assert_eq!(
         commit_info["operation"], "CREATE TABLE",
         "Operation should be CREATE TABLE"
+    );
+    assert_eq!(
+        commit_info["operationParameters"],
+        serde_json::json!({"description": null, "mode": "Create"})
+    );
+    assert_eq!(
+        commit_info["operationMetrics"],
+        serde_json::json!({"numFiles": "0"})
     );
 
     // Verify Protocol action
