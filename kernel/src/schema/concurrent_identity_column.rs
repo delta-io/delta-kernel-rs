@@ -15,15 +15,21 @@
 //! [`Transaction::concurrent_identity_columns`]: crate::transaction::Transaction::concurrent_identity_columns
 //! [`Transaction::ack_concurrent_identity_columns`]: crate::transaction::Transaction::ack_concurrent_identity_columns
 
+use std::collections::HashSet;
+
 use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use crate::{DeltaResult, Error};
 
+/// The maximum length, in characters, of a Concurrent Identity Column's `sequenceId`.
+const MAX_SEQUENCE_ID_LENGTH: usize = 64;
+
 /// A borrowed view of a Concurrent Identity Column, surfaced by
 /// [`Transaction::concurrent_identity_columns`](crate::transaction::Transaction::concurrent_identity_columns).
 ///
-/// See the [module docs](self) for the connector write-flow.
+/// See the module-level documentation for the connector write-flow.
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConcurrentIdentityColumn<'a> {
     column_name: &'a str,
@@ -32,13 +38,14 @@ pub struct ConcurrentIdentityColumn<'a> {
     step: i64,
 }
 
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
 impl<'a> ConcurrentIdentityColumn<'a> {
     /// The logical column name the connector must fill.
     pub fn column_name(&self) -> &'a str {
         self.column_name
     }
 
-    /// The UC sequence id that issues this column's values.
+    /// The catalog sequence id that issues this column's values.
     pub fn sequence_id(&self) -> &'a str {
         self.sequence_id
     }
@@ -70,15 +77,13 @@ impl<'a> ConcurrentIdentityColumn<'a> {
 /// malformed.
 ///
 /// [`Transaction::concurrent_identity_columns`]: crate::transaction::Transaction::concurrent_identity_columns
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub(crate) fn try_collect_concurrent_identity_columns(
     schema: &StructType,
 ) -> DeltaResult<Vec<ConcurrentIdentityColumn<'_>>> {
     let mut result = Vec::new();
     for field in schema.fields() {
-        if field
-            .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
-            .is_none()
-        {
+        if !has_concurrent_sequence_id(field) {
             continue;
         }
         result.push(ConcurrentIdentityColumn {
@@ -100,8 +105,10 @@ pub(crate) fn try_collect_concurrent_identity_columns(
 ///
 /// Shared by the CREATE and ALTER paths. Each top-level CIC column must be a non-nullable `LONG`
 /// with a non-zero step, must not also carry `delta.identity.highWaterMark` (a sequence id and a
-/// high-water mark are mutually exclusive), and must not be a partition column. CIC is only
-/// supported at the top level, so CIC metadata found on any nested field is rejected.
+/// high-water mark are mutually exclusive), must not be a partition column, and must carry a
+/// sequence id of at most [`MAX_SEQUENCE_ID_LENGTH`] characters. Every CIC column's sequence id
+/// must be unique within the schema. CIC is only supported at the top level, so CIC metadata found
+/// on any nested field is rejected.
 ///
 /// `partition_columns` must be the raw, unescaped leaf names (as returned by
 /// [`StructField::name`]) so they compare in the same vocabulary as the schema's field names.
@@ -115,13 +122,17 @@ pub(crate) fn validate_concurrent_identity_columns(
     partition_columns: &[String],
 ) -> DeltaResult<bool> {
     let mut found = false;
+    let mut seen_sequence_ids: HashSet<&str> = HashSet::new();
     for field in schema.fields() {
-        if field
-            .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
-            .is_some()
-        {
+        if has_concurrent_sequence_id(field) {
             found = true;
-            validate_top_level_cic(field, partition_columns)?;
+            let sequence_id = validate_top_level_cic(field, partition_columns)?;
+            if !seen_sequence_ids.insert(sequence_id) {
+                return Err(Error::generic(format!(
+                    "Sequence id '{sequence_id}' is used by more than one Concurrent Identity \
+                     Column; each sequence id must be unique within a table."
+                )));
+            }
         }
         // CIC is only supported at the top level; reject the metadata anywhere below it.
         reject_nested_cic(field.data_type())?;
@@ -129,7 +140,13 @@ pub(crate) fn validate_concurrent_identity_columns(
     Ok(found)
 }
 
-pub(crate) fn schema_has_high_water_mark(schema: &StructType) -> bool {
+pub(crate) fn has_concurrent_sequence_id(field: &StructField) -> bool {
+    field
+        .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
+        .is_some()
+}
+
+pub(crate) fn has_high_water_mark(schema: &StructType) -> bool {
     schema.fields().any(|field| {
         field
             .get_config_value(&ColumnMetadataKey::IdentityHighWaterMark)
@@ -182,12 +199,15 @@ pub(crate) fn concurrent_identity_column(
     ))
 }
 
-/// Validates a single top-level Concurrent Identity Column field. See
+/// Validates a single top-level Concurrent Identity Column field and returns its sequence id. See
 /// [`validate_concurrent_identity_columns`] for the rules.
-fn validate_top_level_cic(field: &StructField, partition_columns: &[String]) -> DeltaResult<()> {
+fn validate_top_level_cic<'a>(
+    field: &'a StructField,
+    partition_columns: &[String],
+) -> DeltaResult<&'a str> {
     let name = field.name();
     // Reject malformed metadata up front (missing or wrong-typed required keys).
-    parse_required(
+    let sequence_id = parse_required(
         field,
         ColumnMetadataKey::IdentityConcurrentSequenceId,
         "string",
@@ -195,6 +215,13 @@ fn validate_top_level_cic(field: &StructField, partition_columns: &[String]) -> 
     )?;
     parse_required(field, ColumnMetadataKey::IdentityStart, "number", as_number)?;
     let step = parse_required(field, ColumnMetadataKey::IdentityStep, "number", as_number)?;
+
+    if sequence_id.chars().count() > MAX_SEQUENCE_ID_LENGTH {
+        return Err(Error::generic(format!(
+            "Identity column '{name}' has a sequence id longer than {MAX_SEQUENCE_ID_LENGTH} \
+             characters."
+        )));
+    }
 
     if field.data_type() != &DataType::LONG {
         return Err(Error::generic(format!(
@@ -224,25 +251,20 @@ fn validate_top_level_cic(field: &StructField, partition_columns: &[String]) -> 
             ColumnMetadataKey::IdentityHighWaterMark.as_ref(),
         )));
     }
-    if partition_columns
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case(name))
-    {
+    // Column-name matching is case-sensitive, consistent with Delta column-name handling.
+    if partition_columns.iter().any(|p| p == name) {
         return Err(Error::generic(format!(
             "Identity column '{name}' cannot also be a partition column"
         )));
     }
-    Ok(())
+    Ok(sequence_id)
 }
 
 fn reject_nested_cic(data_type: &DataType) -> DeltaResult<()> {
     match data_type {
         DataType::Struct(fields) => {
             for field in fields.fields() {
-                if field
-                    .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
-                    .is_some()
-                {
+                if has_concurrent_sequence_id(field) {
                     return Err(Error::generic(format!(
                         "Identity column '{}' is nested; Concurrent Identity Columns are only \
                          supported at the top level of the schema",
@@ -331,6 +353,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
     fn collect_returns_empty_when_no_identity_columns() {
         let schema = StructType::try_new(vec![
@@ -343,6 +366,7 @@ mod tests {
             .is_empty());
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
     fn collect_borrows_a_view_of_each_identity_column() {
         let schema = StructType::try_new(vec![
@@ -363,6 +387,7 @@ mod tests {
         assert_eq!(cols[1].step(), 10);
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[rstest::rstest]
     #[case::missing_start(
         &[
@@ -395,6 +420,7 @@ mod tests {
         assert!(msg.contains(missing_key), "{msg}");
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[rstest::rstest]
     #[case::start_not_a_number(
         vec![
@@ -449,6 +475,25 @@ mod tests {
     )]
     #[case::partition_column(vec![cic_field("id", DataType::LONG, false, 1)], &["id"], Err("cannot also be a partition column"))]
     #[case::partition_column_special_char(vec![cic_field("a.b", DataType::LONG, false, 1)], &["a.b"], Err("cannot also be a partition column"))]
+    // Column-name matching is case-sensitive.
+    #[case::partition_column_case_sensitive(vec![cic_field("id", DataType::LONG, false, 1)], &["ID"], Ok(true))]
+    // Sequence id length: 64 characters is the limit; 65 is rejected.
+    #[case::sequence_id_max_length(vec![concurrent_identity_column("id", "x".repeat(64), 1, 1)], &[], Ok(true))]
+    #[case::sequence_id_too_long(vec![concurrent_identity_column("id", "x".repeat(65), 1, 1)], &[], Err("longer than 64"))]
+    // Sequence ids must be unique within the schema; distinct ids are fine.
+    #[case::duplicate_sequence_id(
+        vec![cic_field("a", DataType::LONG, false, 1), cic_field("b", DataType::LONG, false, 1)],
+        &[],
+        Err("must be unique"),
+    )]
+    #[case::distinct_sequence_ids(
+        vec![
+            concurrent_identity_column("a", "seq-1", 1, 1),
+            concurrent_identity_column("b", "seq-2", 1, 1),
+        ],
+        &[],
+        Ok(true),
+    )]
     #[case::nested_in_struct(
         vec![StructField::nullable(
             "wrapper",

@@ -770,13 +770,13 @@ impl TableConfiguration {
         }
 
         // While concurrent identity columns are supported, classic high-water-mark identity
-        // columns do not exist.
+        // columns must not exist.
         if self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns) {
-            if crate::schema::schema_has_high_water_mark(self.logical_schema.as_ref()) {
+            if crate::schema::has_high_water_mark(self.logical_schema.as_ref()) {
                 return Err(Error::unsupported(
                     "Table supports 'concurrentIdentityColumns' but a column carries \
                      'delta.identity.highWaterMark'; classic high-water-mark identity generation \
-                     is not supported (every identity column must be concurrent)",
+                     is not supported (every identity column must be concurrent).",
                 ));
             }
             crate::schema::validate_concurrent_identity_columns(
@@ -1852,8 +1852,8 @@ mod test {
         ])
     }
 
-    // A valid concurrent-identity table configuration: the CIC features plus their required
-    // `catalogManaged` (and its own `inCommitTimestamp`, enabled via property).
+    // A valid concurrent-identity table configuration containing the CIC features and the
+    // `catalogManaged` dependency (and its own `inCommitTimestamp`, enabled via property).
     fn concurrent_identity_config(schema: StructType) -> TableConfiguration {
         MockTableConfigurationBuilder::new()
             .with_schema(schema)
@@ -1876,8 +1876,9 @@ mod test {
         // The full feature set + only a concurrent column (sequenceId, no high-water mark): writes
         // are supported. `identityColumns` alone would be rejected, but its Custom check passes
         // because `concurrentIdentityColumns` is also present.
-        let schema = StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1)])
-            .expect("valid schema");
+        let schema: StructType =
+            StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1)])
+                .expect("valid schema");
         let config = concurrent_identity_config(schema);
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }

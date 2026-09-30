@@ -203,3 +203,49 @@ async fn alter_table_rejects_adding_concurrent_identity_column() -> DeltaResult<
     );
     Ok(())
 }
+
+/// Adding a nullable column that carries CIC metadata is rejected by CIC validation: a CIC
+/// must be non-nullable. This is the complement of the general ALTER rule that added columns
+/// must be nullable, so a CIC can never be introduced via ALTER.
+#[tokio::test]
+async fn alter_table_rejects_nullable_concurrent_identity_column() -> DeltaResult<()> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let engine = engine.as_ref();
+    create_table(&table_path, cic_schema(), "Test/1.0")
+        .with_table_properties(CATALOG_MANAGED_PROPERTIES)
+        .build(engine, Box::new(TestCatalogCommitter))?
+        .commit(engine)?
+        .unwrap_committed();
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url)
+        .with_max_catalog_version(0)
+        .build(engine)?;
+
+    let nullable_cic = StructField::nullable("new_id", DataType::LONG).add_metadata([
+        (
+            ColumnMetadataKey::IdentityConcurrentSequenceId
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("seq-2".to_string()),
+        ),
+        (
+            ColumnMetadataKey::IdentityStart.as_ref().to_string(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityStep.as_ref().to_string(),
+            MetadataValue::Number(1),
+        ),
+    ]);
+    let err = snapshot
+        .alter_table()
+        .add_column(nullable_cic)
+        .build(engine, Box::new(TestCatalogCommitter))
+        .expect_err("a nullable CIC column must be rejected");
+    assert!(
+        err.to_string().contains("must be non-nullable"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}

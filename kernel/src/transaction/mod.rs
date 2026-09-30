@@ -246,6 +246,7 @@ pub struct Transaction<S = ExistingTable> {
     column_defaults_acknowledged: bool,
     // Whether the connector acknowledged responsibility for filling Concurrent Identity Column
     // values before writing data files.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     concurrent_identity_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
@@ -875,6 +876,7 @@ impl<S> Transaction<S> {
 
     /// Rejects write-state creation when the table has Concurrent Identity Columns and the
     /// connector has not acknowledged filling them.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn ensure_concurrent_identity_columns_acknowledged(&self) -> DeltaResult<()> {
         require!(
             self.concurrent_identity_columns_acknowledged
@@ -1027,6 +1029,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// reserves ranges from its sequence service and fills every identity column itself. This
     /// method records that responsibility but generates no values. Without this acknowledgement,
     /// write-state creation fails.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     pub fn ack_concurrent_identity_columns(&mut self) {
         self.concurrent_identity_columns_acknowledged = true;
     }
@@ -1138,6 +1141,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Propagates malformed CIC metadata errors (a detected column missing a required
     /// `delta.identity.*` key or carrying a malformed value).
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
     pub fn concurrent_identity_columns(
         &self,
     ) -> DeltaResult<Vec<crate::schema::ConcurrentIdentityColumn<'_>>> {
@@ -1175,6 +1179,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
         self.ensure_concurrent_identity_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
