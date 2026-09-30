@@ -34,7 +34,7 @@ pub(crate) mod concurrent_identity_column;
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub(crate) use concurrent_identity_column::try_collect_concurrent_identity_columns;
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
-pub use concurrent_identity_column::ConcurrentIdentityColumn;
+pub use concurrent_identity_column::{concurrent_identity_column, ConcurrentIdentityColumn};
 pub(crate) use concurrent_identity_column::{
     has_high_water_mark, validate_concurrent_identity_columns,
 };

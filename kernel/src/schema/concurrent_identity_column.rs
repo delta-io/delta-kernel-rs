@@ -156,7 +156,7 @@ pub(crate) fn has_high_water_mark(schema: &StructType) -> bool {
 
 /// The three metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus
 /// the classic `start`/`step`.
-#[cfg(test)]
+#[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
 pub(crate) fn cic_metadata(
     sequence_id: impl Into<String>,
     start: i64,
@@ -180,13 +180,14 @@ pub(crate) fn cic_metadata(
     ]
 }
 
-/// Builds a CIC identity column field with the sequence-id marker plus the classic `start`/`step`
-/// metadata keys stamped on it.
+/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
+/// concurrent `sequenceId` and the classic `start`/`step` keys.
 ///
-/// The returned [`StructField`] is a non-nullable `LONG`. Passing it to `create_table` also
-/// requires the `catalogManaged` feature to be enabled; CIC is not accepted on a filesystem table.
-#[cfg(test)]
-pub(crate) fn concurrent_identity_column(
+/// This is a convenience over stamping the [`ColumnMetadataKey`] entries by hand. The `sequence_id`
+/// is an identifier provided by the connector (at most 64 characters); `start` is the first value
+/// the sequence issues and `step` the (non-zero) increment.
+#[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
+pub fn concurrent_identity_column(
     name: impl Into<String>,
     sequence_id: impl Into<String>,
     start: i64,
