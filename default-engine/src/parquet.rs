@@ -29,9 +29,9 @@ use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObject
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
-    PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData,
+    FileDataReadResultIterator, FileMeta, FileSize, FoldWithOption as _, KernelError,
+    ParquetFooter, ParquetHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -108,11 +108,9 @@ impl DataFileMetadata {
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
-        let size: i64 = self
-            .file_meta
-            .size
-            .try_into()
-            .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
+        let size: i64 = self.file_meta.size.try_into().map_err(|_| {
+            KernelError::generic("Failed to convert parquet metadata 'size' to i64")
+        })?;
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![self.file_meta.last_modified]));
 
@@ -215,11 +213,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let size: u64 = buffer
             .len()
             .try_into()
-            .map_err(|_| Error::generic("unable to convert usize to u64"))?;
+            .map_err(|_| KernelError::generic("unable to convert usize to u64"))?;
         let name: String = format!("{}.parquet", Uuid::new_v4());
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Path must end with a trailing slash: {path}"
             )));
         }
@@ -232,7 +230,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         if size != metadata.size {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size
             )));
@@ -365,12 +363,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// The exact number of bytes written to the parquet file.
     fn write_parquet_file(
         &self,
         location: url::Url,
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
@@ -378,7 +376,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             // Get first batch to initialize writer with schema
             let first_batch = data.next().ok_or_else(|| {
-                Error::generic("Cannot write parquet file with empty data iterator")
+                KernelError::generic("Cannot write parquet file with empty data iterator")
             })??;
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
@@ -399,9 +397,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 writer.write(&batch).await?;
             }
 
+            // finish() writes the footer; bytes_written() is accurate only after finish().
             writer.finish().await?;
-
-            Ok(())
+            Ok(writer.bytes_written() as u64)
         })
     }
 
@@ -421,14 +419,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
-                let response =
-                    client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
-                    })?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
+                let response = client.get(location.as_str()).send().await.map_err(|e| {
+                    KernelError::generic(format!("Failed to fetch presigned URL: {e}"))
+                })?;
+                let bytes = response.bytes().await.map_err(|e| {
+                    KernelError::generic(format!("Failed to read response bytes: {e}"))
+                })?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
@@ -443,7 +439,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         // Race the footer read against cancellation so a cancelled request stops promptly.
         match cancellation_token {
             Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
-                .unwrap_or(Err(Error::Cancelled)),
+                .unwrap_or(Err(KernelError::Cancelled)),
             None => self.task_executor.block_on(footer_future),
         }
     }
@@ -1188,13 +1184,16 @@ mod tests {
 
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
-        parquet_handler
+        let write_size = parquet_handler
             .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
+        // The reported size must be non-zero and match the size reported by storage.
+        assert_ne!(write_size, 0);
+        assert_eq!(write_size, metadata.size);
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await

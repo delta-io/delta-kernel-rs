@@ -33,7 +33,7 @@
 //! let plan = scan.build()?;
 //! let [node] = plan.nodes.as_slice() else { panic!("expected one node") };
 //! assert!(matches!(&node.op, Operator::Values(values) if values.rows.is_empty()));
-//! # Ok::<(), delta_kernel::Error>(())
+//! # Ok::<(), delta_kernel::KernelError>(())
 //! ```
 
 use std::collections::HashMap;
@@ -42,15 +42,15 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
 /// `Arc`'s address ([`PlanBuilder::build`] dedups shared subgraphs by pointer). Inputs are always
@@ -147,7 +147,7 @@ impl PlanBuilder {
         let cols = Vec::from_iter(file_constant_columns.iter().map(|&c| c.to_string()));
         for (i, file) in files.iter().enumerate() {
             if file.file_constants.len() != cols.len() {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "scan: file {i} has {} constant value(s) {:?} for {} file-constant column(s) {:?}",
                     file.file_constants.len(),
                     file.file_constants,
@@ -188,14 +188,14 @@ impl PlanBuilder {
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?.build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn values(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> DeltaResult<Self> {
         let schema = schema.into();
         let width = schema.fields().count();
         for (i, row) in rows.iter().enumerate() {
             if row.len() != width {
-                return Err(Error::generic(format!(
+                return Err(KernelError::generic(format!(
                     "values: row {i} has {} value(s) {row:?} but schema has {width} field(s) {:?}",
                     row.len(),
                     Vec::from_iter(schema.fields().map(|f| f.name())),
@@ -232,7 +232,7 @@ impl PlanBuilder {
     /// assert!(PlanBuilder::values_from(std::iter::empty::<Row>())
     ///     .build_opt()?
     ///     .is_none());
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     #[internal_api]
     pub(crate) fn values_from<T>(rows: impl IntoIterator<Item = T>) -> Self
@@ -240,6 +240,39 @@ impl PlanBuilder {
         T: Into<StructData> + ToSchema,
     {
         Values::from_iter(rows).into()
+    }
+
+    /// A source reading all rows of a relation the engine previously retained, identified by
+    /// `relation_ref`. Output schema is the handle's schema. See [`Operator::RelationSource`] and
+    /// [`RelationRef`].
+    ///
+    /// Unlike an empty file scan or empty `Values`, a `RelationSource` is never treated as the
+    /// absent relation: kernel cannot know whether the retained relation holds any rows, so it
+    /// always builds a present source node.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::{DeltaResult, PlanBuilder};
+    /// # use delta_kernel::expressions::col;
+    /// # use delta_kernel::plans::ScopedPlanExecutor;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// # fn build_plan(scoped: &dyn ScopedPlanExecutor) -> DeltaResult<()> {
+    /// let schema = Arc::new(StructType::try_new([
+    ///     StructField::not_null("id", DataType::INTEGER),
+    /// ])?);
+    /// let source = PlanBuilder::values(schema, vec![vec![1i32.into()]])?.build()?;
+    /// let relation_ref = scoped.execute_and_retain(source)?;
+    /// let plan = PlanBuilder::relation_source(relation_ref)
+    ///     .filter(col!("id").is_not_null())?
+    ///     .build()?;
+    /// # let _ = plan;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn relation_source(relation_ref: RelationRef) -> Self {
+        let schema = Arc::clone(relation_ref.schema());
+        Self::present(schema, relation_ref, vec![])
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -256,7 +289,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?
     ///     .filter(col!("id").is_not_null())?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> DeltaResult<Self> {
         let predicate = predicate.into();
@@ -288,7 +321,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(input, vec![vec![1.into(), "a".into()]])?
     ///     .project(Expression::struct_from([col!("id")]), out)?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn project(
         self,
@@ -334,7 +367,10 @@ impl PlanBuilder {
     ///
     /// Produces an error when building `aggregate` fails: a group key or an aggregate's operand
     /// column is absent from its input schema, or two output columns would share a name.
-    pub fn aggregate(self, aggregate: impl TryInto<Aggregate, Error = Error>) -> DeltaResult<Self> {
+    pub fn aggregate(
+        self,
+        aggregate: impl TryInto<Aggregate, Error = KernelError>,
+    ) -> DeltaResult<Self> {
         let aggregate = aggregate.try_into()?;
         let schema = Arc::clone(&aggregate.schema);
         match self.0 {
@@ -378,7 +414,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into(), 7i64.into()]])?
     ///     .aggregate_by([column_name!("id")], |a| a.max(column_name!("version")))?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn aggregate_by(
         self,
@@ -411,7 +447,7 @@ impl PlanBuilder {
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into(), 7i64.into()]])?
     ///     .aggregate_ungrouped(|a| a.max(column_name!("version")))?
     ///     .build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn aggregate_ungrouped(
         self,
@@ -440,7 +476,7 @@ impl PlanBuilder {
     /// let allow = PlanBuilder::values(schema, vec![vec![2.into()]])?;
     /// // Probe rows whose `id` appears in `allow`.
     /// let plan = probe.semi_join(allow, [column_name!("id")], [column_name!("id")])?.build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn semi_join(
         self,
@@ -472,7 +508,7 @@ impl PlanBuilder {
         let probe_keys = Vec::from_iter(probe_keys);
         let build_keys = Vec::from_iter(build_keys);
         if probe_keys.len() != build_keys.len() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "join: {} probe key(s) {probe_keys:?} but {} build key(s) {build_keys:?}; \
                  they must match in length.",
                 probe_keys.len(),
@@ -517,15 +553,17 @@ impl PlanBuilder {
     /// let a = PlanBuilder::values(Arc::clone(&schema), vec![vec![1.into()]])?;
     /// let b = PlanBuilder::values(schema, vec![vec![2.into()]])?;
     /// let plan = PlanBuilder::union_all([a, b])?.build()?;
-    /// # Ok::<(), delta_kernel::Error>(())
+    /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
     pub fn union_all(inputs: impl IntoIterator<Item = PlanBuilder>) -> DeltaResult<Self> {
         let inputs = Vec::from_iter(inputs);
         let Some(schema) = inputs.first().map(|b| Arc::clone(b.schema())) else {
-            return Err(Error::generic("union_all: requires at least one input"));
+            return Err(KernelError::generic(
+                "union_all: requires at least one input",
+            ));
         };
         if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
                 inputs[i].schema(),
                 schema,
@@ -611,7 +649,7 @@ fn check_columns_resolve<'a>(
 ) -> DeltaResult<()> {
     for col in cols {
         schema.field_at(col).map_err(|_| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "{ctx}: column `{col}` not found; schema has {:?}",
                 Vec::from_iter(schema.fields().map(|f| f.name())),
             ))
@@ -630,13 +668,13 @@ fn check_file_constant_columns<'a>(
 ) -> DeltaResult<()> {
     for name in names {
         let Some(field) = schema.field(name.as_str()) else {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "{ctx}: column `{name}` not found; schema has {:?}",
                 Vec::from_iter(schema.fields().map(|f| f.name())),
             )));
         };
         if field.is_metadata_column() {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "{ctx}: column `{name}` is a metadata column"
             )));
         }
@@ -719,6 +757,29 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
+    }
+
+    /// `relation_source` records the handle's id and schema and builds to a single source node.
+    #[test]
+    fn relation_source_builds_single_node_with_ref_schema() {
+        let src = PlanBuilder::relation_source(RelationRef::new("relation-3", id_schema()));
+        assert_eq!(src.schema(), &id_schema());
+        let plan = assert_plan(src, &[(&[], "relation_source")]);
+        let Operator::RelationSource(relation_ref) = &plan.nodes[0].op else {
+            panic!("expected RelationSource");
+        };
+        assert_eq!(relation_ref.id(), "relation-3");
+        assert_eq!(relation_ref.schema(), &id_schema());
+    }
+
+    /// A `relation_source` feeds downstream transforms, which validate against its schema.
+    #[test]
+    fn relation_source_supports_downstream_transforms() -> DeltaResult<()> {
+        let filtered = PlanBuilder::relation_source(RelationRef::new("relation-1", id_schema()))
+            .filter(col!("id").is_not_null())?;
+        assert_eq!(filtered.schema(), &id_schema());
+        assert_plan(filtered, &[(&[], "relation_source"), (&[0], "filter")]);
+        Ok(())
     }
 
     /// `{ id, part }`, with `part` used as a file-constant column.
@@ -1289,6 +1350,8 @@ mod tests {
     // transforms referencing an absent column
     #[case::filter_unknown_column("`nope` not found",
         || vals(id_schema()).filter(col!("nope").is_not_null()))]
+    #[case::relation_source_unknown_column("`nope` not found",
+        || PlanBuilder::relation_source(RelationRef::new("relation-0", id_schema())).filter(col!("nope").is_not_null()))]
     #[case::project_unknown_column("`nope` not found",
         || vals(id_schema()).project(Expression::struct_from([col!("nope")]), id_schema()))]
     #[case::project_patch_missing_field("does not exist",

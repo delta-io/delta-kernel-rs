@@ -34,6 +34,7 @@
 - [Removing Data](./writing/removing_files.md)
 - [Domain Metadata](./writing/domain_metadata.md)
 - [Idempotent Writes](./writing/idempotent_writes.md)
+- [Column Defaults](./writing/column_defaults.md)
 - [Altering a Table](./writing/alter_table.md)
 
 # Maintenance Operations

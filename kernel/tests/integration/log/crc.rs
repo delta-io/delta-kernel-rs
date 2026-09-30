@@ -22,8 +22,8 @@ use delta_kernel::transaction::Transaction;
 use delta_kernel::LogPath;
 use delta_kernel::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
-    FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
-    PredicateRef, StorageHandler, Version,
+    FileDataReadResultIterator, FileMeta, FileSize, FileStats, JsonHandler, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -756,7 +756,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
             Arc::new(arrow_schema),
             vec![Arc::new(Int32Array::from(vec![v as i32]))],
         )
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         let mut txn = snap
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
@@ -947,7 +947,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
             Arc::new(arrow_schema),
             vec![Arc::new(Int32Array::from(vec![v]))],
         )
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         let mut txn = snap
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
@@ -1065,7 +1065,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(e) if !matches!(e, delta_kernel::Error::ChecksumWriteUnsupported(_))
+        Err(e) if !matches!(e, delta_kernel::KernelError::ChecksumWriteUnsupported(_))
     ));
 
     Ok(())
@@ -1099,7 +1099,7 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
     assert!(fresh.crc_at_version().is_none());
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
     ));
 
     Ok(())
@@ -2244,7 +2244,7 @@ async fn commit_data<E: TaskExecutor>(
         Arc::new(arrow_schema),
         vec![Arc::new(Int32Array::from(vec![v as i32]))],
     )
-    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
@@ -2455,7 +2455,7 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
     assert_eq!(fresh.get_file_stats_if_present(), None);
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
     ));
 
     Ok(())
@@ -2521,7 +2521,7 @@ impl ParquetHandler for NoParquetReadsHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 

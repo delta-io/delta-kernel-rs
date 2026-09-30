@@ -191,7 +191,9 @@ pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
+pub use error::{
+    DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error, KernelError, KernelResult,
+};
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -214,7 +216,7 @@ pub type Version = u64;
 pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
     version
         .try_into()
-        .map_err(|_| Error::generic(format!("Delta log version {version} exceeds i64::MAX")))
+        .map_err(|_| KernelError::generic(format!("Delta log version {version} exceeds i64::MAX")))
 }
 
 pub type FileSize = u64;
@@ -253,18 +255,20 @@ impl PartialOrd for FileMeta {
 }
 
 impl TryFrom<DirEntry> for FileMeta {
-    type Error = Error;
+    type Error = KernelError;
 
     fn try_from(ent: DirEntry) -> DeltaResult<FileMeta> {
         let metadata = ent.metadata()?;
         let last_modified = metadata
             .modified()?
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|_| Error::generic("Failed to convert file timestamp to milliseconds"))?;
+            .map_err(|_| {
+                KernelError::generic("Failed to convert file timestamp to milliseconds")
+            })?;
         let location = Url::from_file_path(ent.path())
-            .map_err(|_| Error::generic(format!("Invalid path: {:?}", ent.path())))?;
+            .map_err(|_| KernelError::generic(format!("Invalid path: {:?}", ent.path())))?;
         let last_modified = last_modified.as_millis().try_into().map_err(|_| {
-            Error::generic(format!(
+            KernelError::generic(format!(
                 "Failed to convert file modification time {:?} into i64",
                 last_modified.as_millis()
             ))
@@ -290,7 +294,7 @@ impl FileMeta {
     /// Casts `size` to `i64`. Errors if `size` exceeds `i64::MAX`.
     pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
         i64::try_from(self.size)
-            .map_err(|_| Error::generic(format!("file size {} exceeds i64::MAX", self.size)))
+            .map_err(|_| KernelError::generic(format!("file size {} exceeds i64::MAX", self.size)))
     }
 }
 
@@ -603,18 +607,18 @@ pub trait StorageHandler: AsAny {
     }
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
-    /// it must return Err(Error::FileAlreadyExists).
+    /// it must return Err(KernelError::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 
     /// Write data to the specified path.
     ///
     /// If `overwrite` is false and the file already exists, this must return
-    /// `Err(Error::FileAlreadyExists)`.
+    /// `Err(KernelError::FileAlreadyExists)`.
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
 
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
-    /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
+    /// If the file does not exist, this must return an `Err` with [`KernelError::FileNotFound`].
     fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
 
     /// Delete the file at the given path.
@@ -724,8 +728,8 @@ pub trait JsonHandler: AsAny {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::FileAlreadyExists`] when `overwrite` is false and the destination exists,
-    /// or another error when serialization or storage fails.
+    /// Returns [`KernelError::FileAlreadyExists`] when `overwrite` is false and the destination
+    /// exists, or another error when serialization or storage fails.
     fn write_json_file(
         &self,
         path: &Url,
@@ -972,7 +976,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// The exact number of bytes written to the parquet file.
     ///
     /// [`StructField`]: crate::schema::StructField
     /// [`ColumnMetadataKey::ColumnMappingId`]: crate::schema::ColumnMetadataKey::ColumnMappingId
@@ -984,7 +988,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<FileSize>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///
@@ -1070,11 +1074,11 @@ pub trait Engine: AsAny {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
+    /// Returns [`KernelError::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
     #[cfg(feature = "declarative-plans")]
     fn require_plan_executor(&self) -> DeltaResult<Arc<dyn PlanExecutor>> {
         self.plan_executor()
-            .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))
+            .ok_or_else(|| KernelError::unsupported("this engine does not provide a PlanExecutor"))
     }
 }
 

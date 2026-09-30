@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+use crate::{DeltaResult, FileMeta, KernelError, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -56,6 +58,112 @@ pub(crate) struct LastCheckpointHint {
     /// For a V2 checkpoint, the embedded V2 checkpoint info. Identifies the specific checkpoint
     /// file the hint describes. Absent for V1 / classic checkpoints.
     pub(crate) v2_checkpoint: Option<LastCheckpointV2>,
+
+    /// The checkpoint format the writer tagged this hint with, which
+    /// determines how the hint is consumed:
+    ///
+    /// - **absent** (`None`): a classic / multi-part / V2 checkpoint. Kernel knows this format, so
+    ///   the hint is valid and used as-is (see [`Self::applies_to`]).
+    /// - **`AdaptiveMetadataTree`**: an AMT checkpoint; the embedded
+    ///   [`amt_checkpoint`](Self::amt_checkpoint) carries the prefetched checkpoint state.
+    /// - **`Unknown`**: a `checkpointType` value kernel does not recognize (e.g. from a newer
+    ///   writer). The whole hint is dropped at read time (see [`Self::try_read`]) and the reader
+    ///   falls back to log replay.
+    ///
+    /// Absent and `Unknown` are thus distinct: absence is a known (legacy) checkpoint, whereas an
+    /// unrecognized value invalidates the hint.
+    ///
+    /// Skipped on serialize when `None` so a classic hint's wire form is identical whether or not
+    /// the `adaptive-metadata-in-dev` feature is compiled in.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) checkpoint_type: Option<CheckpointType>,
+
+    /// For an adaptive-metadata (AMT) checkpoint, the embedded AMT checkpoint info: the manifest
+    /// commit version plus optional prefetched checkpoint/leaves.
+    ///
+    /// A writer pairs this with `checkpoint_type ==
+    /// AdaptiveMetadataTree` and never sets it alongside `v2_checkpoint`. Kernel does not enforce
+    /// either constraint on read: it parses whatever the file contains, so a malformed hint (an
+    /// `AdaptiveMetadataTree` type with no `amtCheckpoint`, or both this and `v2_checkpoint`) is
+    /// retained as-is rather than rejected.
+    ///
+    /// Skipped on serialize when `None` so a classic hint's wire form is identical whether or not
+    /// the `adaptive-metadata-in-dev` feature is compiled in.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) amt_checkpoint: Option<AmtCheckpoint>,
+}
+
+/// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field.
+/// An unrecognized wire value deserializes to [`CheckpointType::Unknown`]
+/// rather than failing the parse, signaling `LastCheckpointHint::try_read` to drop the hint so
+/// the reader falls back to log replay.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[internal_api]
+pub(crate) enum CheckpointType {
+    /// An adaptive-metadata (Iceberg V4) embedded-tree checkpoint.
+    AdaptiveMetadataTree,
+    /// Any value kernel does not recognize (e.g. from a newer writer). A hint carrying it is
+    /// dropped entirely (the reader falls back to log replay), unlike an absent `checkpointType`,
+    /// which is a usable legacy checkpoint. Read-only: it is produced only by deserializing an
+    /// unrecognized wire value, never written by kernel (see the hand-written [`Serialize`], which
+    /// refuses it).
+    #[serde(other)]
+    Unknown,
+}
+
+// `Serialize` is hand-written rather than derived so it can refuse `Unknown`: that variant is a
+// read-only fallback sentinel with no wire representation a writer should produce, and the derived
+// impl would emit the bogus string `"Unknown"`. Kernel never writes `Unknown` today, so this only
+// fires if a read-in hint is ever serialized back -- in which case failing closed is correct.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Serialize for CheckpointType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CheckpointType::AdaptiveMetadataTree => {
+                serializer.serialize_str("AdaptiveMetadataTree")
+            }
+            CheckpointType::Unknown => Err(serde::ser::Error::custom(
+                "refusing to serialize CheckpointType::Unknown, a read-only fallback sentinel",
+            )),
+        }
+    }
+}
+
+/// The `amtCheckpoint` object embedded in a `_last_checkpoint` hint for an adaptive-metadata
+/// checkpoint. `manifest_commit_version` lets a reader locate the checkpoint
+/// action without full log replay; `checkpoint` and `leaves` are optional prefetch that writers may
+/// omit. Absent for classic / V2 checkpoints.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(Default))]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct AmtCheckpoint {
+    /// Version of the commit that emitted the latest checkpoint action. Distinct from the
+    /// checkpoint's own `contentRoot.version`; lets a reader detect a stale hint and find the
+    /// checkpoint action even when `checkpoint`/`leaves` are omitted.
+    pub(crate) manifest_commit_version: Version,
+
+    /// The embedded `checkpoint` action, prefetched alongside the hint. Serialized as an
+    /// array of tagged action entries and folded into a typed [`CheckpointAction`] on parse (see
+    /// its hand-written serde). `None` when the writer omitted it (e.g. to bound write
+    /// latency); the reader then reads it from the manifest commit. A malformed array fails
+    /// the whole-hint parse, which `try_read` drops so the reader falls back to log replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) checkpoint: Option<CheckpointAction>,
+
+    /// The checkpoint's embedded content entries, prefetched alongside the hint. Retained as
+    /// untyped [`serde_json::Value`] because a content entry's schema depends on the table's
+    /// partition spec / schema, which is not known at hint-parse time; typed materialization is
+    /// deferred to the read path. `None` when the writer omitted them.
+    // TODO(#3438): parse into a typed content-entry struct mirroring `ContentTreeNodeEntry`
+    // (keeping `partition`/`content_stats` raw until the read path has the table schema) in a
+    // follow-up PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) leaves: Option<Vec<serde_json::Value>>,
 }
 
 /// The `v2Checkpoint` object embedded in a `_last_checkpoint` hint for a V2 checkpoint.
@@ -142,6 +250,10 @@ impl LastCheckpointHint {
             checksum,
             tags,
             v2_checkpoint,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_type: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            amt_checkpoint: None,
         }
         .drop_oversized_fields())
     }
@@ -247,14 +359,28 @@ impl LastCheckpointHint {
             .next()
         {
             Some(Ok(data)) => {
-                let result: Option<LastCheckpointHint> =
-                    Self::from_bytes_with_oversized_fields_dropped(&data)
-                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                        .ok();
+                let result = Self::from_bytes_with_oversized_fields_dropped(&data)
+                    .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                    .ok()
+                    // A hint tagged with a `checkpointType` kernel does not recognize
+                    // ([`CheckpointType::Unknown`]) is dropped entirely: kernel cannot interpret
+                    // it, so the reader falls back to log replay. An absent
+                    // `checkpointType` (a classic / multi-part / V2 checkpoint)
+                    // and an `AdaptiveMetadataTree` type are both kept. Without
+                    // the `adaptive-metadata-in-dev` feature the field does not exist, so
+                    // every hint is kept.
+                    .filter(|_hint| {
+                        #[cfg(feature = "adaptive-metadata-in-dev")]
+                        if _hint.checkpoint_type == Some(CheckpointType::Unknown) {
+                            warn!("_last_checkpoint has an unrecognized checkpointType; dropping");
+                            return false;
+                        }
+                        true
+                    });
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(Error::FileNotFound(_))) => {
+            Some(Err(KernelError::FileNotFound(_))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
@@ -401,6 +527,344 @@ mod tests {
         let bad_type = br#"{"version": 5, "size": 10,
             "v2Checkpoint": {"path": "c.parquet", "sizeInBytes": "not-a-number"}}"#;
         assert!(serde_json::from_slice::<LastCheckpointHint>(bad_type).is_err());
+    }
+
+    /// The full JSON form of an AMT (`AdaptiveMetadataTree`) `_last_checkpoint` hint parses to its
+    /// typed fields: `checkpointType`, the required `manifestCommitVersion`, the embedded
+    /// `checkpoint` action (array of tagged entries), and the prefetched `leaves` (retained
+    /// raw). Guards the `camelCase`/`PascalCase` wire keys -- a rename would silently parse to
+    /// `None`/`Unknown` (errors are swallowed in `try_read`) and disable the AMT fast path.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn parses_amt_checkpoint_from_wire_json() {
+        let json = br#"{
+            "version": 7,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {
+                "manifestCommitVersion": 6,
+                "checkpoint": [
+                    {"checkpointMetadata": {"version": 7}},
+                    {"contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7}},
+                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]}},
+                    {"metaData": {"id": "tid", "format": {"provider": "parquet", "options": {}},
+                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}}
+                ],
+                "leaves": [
+                    {"contentType": 0, "location": "data/part-0.parquet", "recordCount": 3}
+                ]
+            }
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            hint.checkpoint_type,
+            Some(CheckpointType::AdaptiveMetadataTree)
+        );
+        let amt = hint.amt_checkpoint.expect("amtCheckpoint present");
+        assert_eq!(amt.manifest_commit_version, 6);
+        let checkpoint = amt.checkpoint.expect("checkpoint present");
+        assert_eq!(checkpoint.version(), 7);
+        assert_eq!(checkpoint.path(), "metadata/root-v7.parquet");
+        assert_eq!(checkpoint.metadata().id(), "tid");
+        assert_eq!(amt.leaves.expect("leaves present").len(), 1);
+    }
+
+    /// A `_last_checkpoint` without `checkpointType`/`amtCheckpoint` (classic / V2) leaves both
+    /// `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_absent_parses_to_none() {
+        let json = br#"{"version": 5, "size": 10}"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        assert!(hint.checkpoint_type.is_none());
+        assert!(hint.amt_checkpoint.is_none());
+    }
+
+    /// A classic hint (no `checkpoint_type` / `amt_checkpoint`) omits both AMT keys on serialize
+    /// rather than emitting `"checkpointType": null` / `"amtCheckpoint": null`, so the wire form is
+    /// identical whether or not the `adaptive-metadata-in-dev` feature is compiled in.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn classic_hint_omits_amt_keys_on_serialize() {
+        let hint = LastCheckpointHint {
+            version: 5,
+            size: 10,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&hint).unwrap();
+        let obj = json.as_object().expect("hint serializes to an object");
+        assert!(
+            !obj.contains_key("checkpointType"),
+            "classic hint must omit checkpointType, got: {json}"
+        );
+        assert!(
+            !obj.contains_key("amtCheckpoint"),
+            "classic hint must omit amtCheckpoint, got: {json}"
+        );
+    }
+
+    /// A `checkpointType` value kernel does not recognize parses to `Unknown` rather than failing
+    /// the whole-hint parse.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn unrecognized_checkpoint_type_parses_to_unknown() {
+        let json = br#"{"version": 5, "size": 10, "checkpointType": "SomethingNewer"}"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        assert_eq!(hint.checkpoint_type, Some(CheckpointType::Unknown));
+    }
+
+    /// `try_read` distinguishes the three `checkpointType` states: an absent type (a classic /
+    /// multi-part / V2 checkpoint) and an `AdaptiveMetadataTree` type are both recognized formats
+    /// and retained, whereas an unrecognized value drops the whole hint so the reader falls back
+    /// to log replay.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn try_read_retains_recognized_and_drops_unrecognized_checkpoint_type() {
+        use crate::engine::sync::SyncEngine;
+        use crate::object_store::memory::InMemory;
+        use crate::Engine;
+
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+        let read_hint = |json: &str| {
+            let engine = SyncEngine::new_with_store(std::sync::Arc::new(InMemory::new()));
+            let storage = engine.storage_handler();
+            storage
+                .put(
+                    &LastCheckpointHint::path(&log_root).unwrap(),
+                    bytes::Bytes::copy_from_slice(json.as_bytes()),
+                    true,
+                )
+                .unwrap();
+            LastCheckpointHint::try_read(storage.as_ref(), &log_root, None).unwrap()
+        };
+
+        // Absent checkpointType (classic / multi-part / V2): recognized, so retained.
+        let hint = read_hint(r#"{"version": 5, "size": 10}"#).expect("legacy hint retained");
+        assert_eq!(hint.version, 5);
+        assert!(hint.checkpoint_type.is_none());
+
+        // AdaptiveMetadataTree: recognized, so retained.
+        let hint = read_hint(
+            r#"{"version": 6, "size": -1, "checkpointType": "AdaptiveMetadataTree",
+                "amtCheckpoint": {"manifestCommitVersion": 6}}"#,
+        )
+        .expect("AMT hint retained");
+        assert_eq!(
+            hint.checkpoint_type,
+            Some(CheckpointType::AdaptiveMetadataTree)
+        );
+
+        // Unrecognized checkpointType: the whole hint is dropped.
+        assert!(
+            read_hint(r#"{"version": 5, "size": 10, "checkpointType": "SomethingNewer"}"#)
+                .is_none(),
+            "unrecognized checkpointType must drop the hint"
+        );
+    }
+
+    /// `AdaptiveMetadataTree` serializes to its wire string, but `Unknown` refuses to serialize --
+    /// it is a read-only fallback sentinel with no value a writer should emit.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn checkpoint_type_unknown_is_not_serializable() {
+        assert_eq!(
+            serde_json::to_string(&CheckpointType::AdaptiveMetadataTree).unwrap(),
+            r#""AdaptiveMetadataTree""#
+        );
+        assert!(serde_json::to_string(&CheckpointType::Unknown).is_err());
+    }
+
+    /// A malformed `amtCheckpoint` -- missing the required `manifestCommitVersion` -- fails the
+    /// whole-hint parse. `try_read` swallows that to `None`, so the reader falls back to log replay
+    /// rather than trusting a partially-parsed hint.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn malformed_amt_checkpoint_fails_whole_hint_parse() {
+        let json = br#"{"version": 5, "size": 10, "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {}}"#;
+        assert!(serde_json::from_slice::<LastCheckpointHint>(json).is_err());
+    }
+
+    /// An AMT hint round-trips through serialization: the embedded `checkpoint` action re-emits its
+    /// tagged-array form and the raw `leaves` re-emit verbatim, so the reparsed hint equals the
+    /// original.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_hint_json_round_trips() {
+        let json = br#"{
+            "version": 7,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {
+                "manifestCommitVersion": 6,
+                "checkpoint": [
+                    {"checkpointMetadata": {"version": 7}},
+                    {"contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7}},
+                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]}},
+                    {"metaData": {"id": "tid", "format": {"provider": "parquet", "options": {}},
+                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}}
+                ],
+                "leaves": [{"contentType": 0, "location": "data/part-0.parquet", "recordCount": 3}]
+            }
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
+        assert_eq!(hint, reparsed);
+    }
+
+    /// A checkpoint action array carrying every element kind -- including repeatable `txn` /
+    /// `domainMetadata` entries and a `sidecar` with its `type` discriminator -- folds into a typed
+    /// [`CheckpointAction`] with each entry in the right field, and round-trips unchanged.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_full_action_array_parses_and_round_trips() {
+        let json = br#"{
+            "version": 7,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {
+                "manifestCommitVersion": 6,
+                "checkpoint": [
+                    {"checkpointMetadata": {"version": 7}},
+                    {"contentRoot": {"path": "metadata/root-v7.parquet", "sizeInBytes": 2048, "version": 7}},
+                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": ["adaptiveMetadata-preview"], "writerFeatures": ["adaptiveMetadata-preview"]}},
+                    {"metaData": {"id": "tid", "format": {"provider": "parquet", "options": {}},
+                        "schemaString": "{\"type\":\"struct\",\"fields\":[]}", "partitionColumns": [], "configuration": {}}},
+                    {"txn": {"appId": "app", "version": 1}},
+                    {"domainMetadata": {"domain": "d", "configuration": "c", "removed": false}},
+                    {"sidecar": {"type": "txn", "path": "txn-v7.parquet", "sizeInBytes": 42, "modificationTime": 1700000000000}}
+                ]
+            }
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let checkpoint = hint
+            .amt_checkpoint
+            .as_ref()
+            .expect("amtCheckpoint present")
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint present");
+        assert_eq!(checkpoint.version(), 7);
+        assert_eq!(checkpoint.transactions.len(), 1);
+        assert_eq!(checkpoint.transactions[0].app_id, "app");
+        assert_eq!(checkpoint.domain_metadata.len(), 1);
+        assert_eq!(checkpoint.domain_metadata[0].domain(), "d");
+        assert_eq!(checkpoint.txn_sidecars.len(), 1);
+        assert_eq!(checkpoint.txn_sidecars[0].path, "txn-v7.parquet");
+        assert_eq!(checkpoint.txn_sidecars[0].size_in_bytes, 42);
+        assert!(checkpoint.domain_metadata_sidecars.is_empty());
+        let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
+        assert_eq!(hint, reparsed);
+    }
+
+    /// Cross-check that the Delta-log `CheckpointAction` EngineData (de)serializer and its
+    /// serde (used by the `_last_checkpoint` hint) agree on the checkpoint-action array wire
+    /// form. The action the log path writes as JSON parses back through serde to the identical
+    /// action, and the JSON serde writes parses back through the log path -- so a rename or
+    /// element-shape change on either side is caught. Compared at the typed level (not raw JSON) so
+    /// it is robust to the intended null-`tags` emission difference between the two writers.
+    ///
+    /// This exercises only the known element kinds; the two paths intentionally diverge on unknown
+    /// elements (the serde path fails closed, the visitor skips them), which this test does not
+    /// cover.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn checkpoint_action_cross_serializes_between_log_and_hint() -> DeltaResult<()> {
+        use crate::actions::ContentRoot;
+        use crate::engine::sync::SyncEngine;
+        use crate::engine::to_json_bytes;
+        use crate::engine_data::FilteredEngineData;
+        use crate::unit_test_utils::parse_json_batch;
+
+        // A fully-populated action: every element kind, both sidecar `type`s.
+        let action = CheckpointAction {
+            version: 7,
+            content_root: ContentRoot::new("s3://bucket/manifest".to_string(), 512, 5),
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: vec![SetTransaction {
+                app_id: "app".to_string(),
+                version: 1,
+                last_updated: None,
+            }],
+            domain_metadata: vec![DomainMetadata::new("d".to_string(), "c".to_string())],
+            txn_sidecars: vec![Sidecar::new("txn.parquet".to_string(), 1, 2, None)],
+            domain_metadata_sidecars: vec![Sidecar::new("dm.parquet".to_string(), 3, 4, None)],
+        };
+
+        // Log path -> JSON array -> serde: folds back to the identical typed action.
+        let engine = SyncEngine::new();
+        let data = action.clone().into_engine_data(&engine)?;
+        let bytes = to_json_bytes(std::iter::once(Ok(
+            FilteredEngineData::with_all_rows_selected(data),
+        )))?;
+        let commit: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let array = commit
+            .get("checkpoint")
+            .expect("checkpoint field present")
+            .clone();
+        let from_log: CheckpointAction = serde_json::from_value(array).unwrap();
+        assert_eq!(from_log, action);
+
+        // serde -> JSON array -> log path: reparses to the identical typed action.
+        let array = serde_json::to_value(&action).unwrap();
+        let commit = serde_json::json!({ "checkpoint": array }).to_string();
+        let data = parse_json_batch(crate::arrow::array::StringArray::from(vec![commit]));
+        let parsed = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip through serde");
+        assert_eq!(parsed, action);
+        Ok(())
+    }
+
+    /// A writer may omit the optional prefetch: an `amtCheckpoint` carrying only the required
+    /// `manifestCommitVersion` parses with `checkpoint` and `leaves` as `None` and round-trips
+    /// unchanged. Guards the `Option`/`default` serde behavior of the prefetch fields -- a
+    /// regression that made them required, or renamed them, would fail here rather than silently
+    /// drop the prefetch on the happy path.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_omitting_prefetch_parses_and_round_trips() {
+        let json = br#"{
+            "version": 6,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {"manifestCommitVersion": 6}
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let amt = hint.amt_checkpoint.as_ref().expect("amtCheckpoint present");
+        assert_eq!(amt.manifest_commit_version, 6);
+        assert!(amt.checkpoint.is_none());
+        assert!(amt.leaves.is_none());
+        let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
+        assert_eq!(hint, reparsed);
+    }
+
+    /// A multi-element `leaves` array parses to a `Vec` of the same length and round-trips,
+    /// exercising the prefetch beyond the single-leaf happy path.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn amt_checkpoint_with_multiple_leaves_parses_and_round_trips() {
+        let json = br#"{
+            "version": 7,
+            "size": -1,
+            "checkpointType": "AdaptiveMetadataTree",
+            "amtCheckpoint": {
+                "manifestCommitVersion": 7,
+                "leaves": [
+                    {"contentType": 0, "location": "data/part-0.parquet", "recordCount": 3},
+                    {"contentType": 0, "location": "data/part-1.parquet", "recordCount": 5}
+                ]
+            }
+        }"#;
+        let hint: LastCheckpointHint = serde_json::from_slice(json).unwrap();
+        let amt = hint.amt_checkpoint.as_ref().expect("amtCheckpoint present");
+        assert!(amt.checkpoint.is_none());
+        assert_eq!(amt.leaves.as_ref().expect("leaves present").len(), 2);
+        let reparsed: LastCheckpointHint = serde_json::from_slice(&hint.to_json_bytes()).unwrap();
+        assert_eq!(hint, reparsed);
     }
 
     /// `applies_to` accepts the hint only for the checkpoint a segment actually selected: same
@@ -882,6 +1346,6 @@ mod tests {
         let token: CancellationTokenRef =
             std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
         let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
-        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(matches!(result, Err(KernelError::Cancelled)));
     }
 }

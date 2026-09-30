@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
-use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
+use delta_kernel::{DeltaResult, KernelError, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
 
@@ -67,7 +67,7 @@ impl PlanExecutor for FfiPlanExecutor {
             match out {
                 EngineExecResult::Success(plan) => plan,
                 EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(Error::internal_error(
+                EngineExecResult::Uninit => return Err(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
                 )),
             };
@@ -94,7 +94,8 @@ fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
     let CParquetFooter { schema_proto } = footer;
     // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
     let bytes = *unsafe { schema_proto.into_inner() };
-    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(Error::generic_err)?;
+    let proto =
+        proto_schema::StructType::decode(bytes.as_slice()).map_err(KernelError::generic_err)?;
     let schema = Arc::new(StructType::try_from(proto)?);
     Ok(ParquetFooter { schema })
 }
@@ -108,12 +109,12 @@ mod tests {
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
     use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
     use delta_kernel::schema::{schema, DataType as KernelDataType};
-    use delta_kernel::Error;
+    use delta_kernel::KernelError;
     use prost::Message;
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineExecError, KernelError};
+    use crate::error::{EngineExecError, FFIKernelError};
     use crate::handle::Handle;
     use crate::plans::get_plan_executor;
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
@@ -181,7 +182,7 @@ mod tests {
             // Mirror the engine downcalling `allocate_kernel_string` to build the message handle.
             let message: Handle<ExclusiveRustString> = Box::new("kaboom".to_string()).into();
             let err = EngineExecError {
-                etype: KernelError::UnsupportedError,
+                etype: FFIKernelError::UnsupportedError,
                 message,
             };
             unsafe { out.write(EngineExecResult::Failure(err)) };
@@ -197,8 +198,8 @@ mod tests {
             panic!("execute_op should surface the engine failure");
         };
         assert!(
-            matches!(err, Error::Unsupported(ref msg) if msg == "kaboom"),
-            "expected Error::Unsupported(\"kaboom\"), got {err:?}"
+            matches!(err, KernelError::Unsupported(ref msg) if msg == "kaboom"),
+            "expected KernelError::Unsupported(\"kaboom\"), got {err:?}"
         );
     }
 
@@ -315,7 +316,7 @@ mod tests {
             panic!("invalid schema proto bytes should fail to decode");
         };
         assert!(
-            matches!(err, Error::GenericError { .. }),
+            matches!(err, KernelError::GenericError { .. }),
             "expected a proto decode error, got {err:?}"
         );
     }

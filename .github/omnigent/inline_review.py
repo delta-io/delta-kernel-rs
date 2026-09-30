@@ -16,7 +16,7 @@ from review_history import (
     is_duplicate_review,
     previous_inline_comments,
 )
-from review_publish import format_review_body as _format_review_body
+from review_publish import INLINE_FEEDBACK_FOOTER, format_review_body as _format_review_body
 
 
 MAX_INLINE_FINDINGS = 12
@@ -244,7 +244,7 @@ def build_review_payload(
                 "path": path,
                 "line": line,
                 "side": side,
-                "body": f"**{finding_id}** {body}",
+                "body": f"**{finding_id}** {body}{INLINE_FEEDBACK_FOOTER}",
             }
         )
 

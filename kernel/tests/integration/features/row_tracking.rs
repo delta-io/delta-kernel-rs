@@ -14,7 +14,7 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef, StructField};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Error, Snapshot};
+use delta_kernel::{DeltaResult, KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{Deserializer, Value};
@@ -63,7 +63,7 @@ async fn create_row_tracking_table_with_features(
     Arc<DynObjectStore>,
 )> {
     let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path())
-        .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
+        .map_err(|_| KernelError::generic("Failed to convert directory path to URL"))?;
     let (store, engine, table_location) = engine_store_setup(table_name, Some(&tmp_test_dir_url));
 
     let reader_features = extra_reader_writer_features.to_vec();
@@ -81,7 +81,7 @@ async fn create_row_tracking_table_with_features(
         writer_features,
     )
     .await
-    .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
+    .map_err(|e| KernelError::generic(format!("Failed to create table: {e}")))?;
 
     Ok((table_url, Arc::new(engine), store))
 }
@@ -776,7 +776,7 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
 
     // Create a table without row tracking
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path())
-        .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
+        .map_err(|_| KernelError::generic("Failed to convert directory path to URL"))?;
     let (store, engine, table_location) =
         engine_store_setup("test_no_row_tracking", Some(&tmp_test_dir_url));
 
@@ -790,7 +790,7 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
         vec![], // no writer features
     )
     .await
-    .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
+    .map_err(|e| KernelError::generic(format!("Failed to create table: {e}")))?;
 
     let engine = Arc::new(engine);
 
@@ -1026,7 +1026,7 @@ async fn test_read_row_commit_versions_use_add_action_defaults(
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "number": INTEGER };
     let table_url = Url::from_directory_path(&table_path)
-        .map_err(|_| Error::generic("Failed to convert table path to URL"))?;
+        .map_err(|_| KernelError::generic("Failed to convert table path to URL"))?;
     create_table_and_load_snapshot(
         &table_path,
         schema.clone(),
@@ -1098,7 +1098,9 @@ async fn test_read_row_commit_versions_prefer_materialized_values(
         setup_number_table(&tmp_dir, "test_read_materialized_row_commit_versions").await?;
     let materialized_column_name = get_materialized_row_tracking_column_names(&table_url, 0)?
         .row_commit_version_column_name
-        .ok_or_else(|| Error::generic("Materialized Row Commit Version column name not found"))?;
+        .ok_or_else(|| {
+            KernelError::generic("Materialized Row Commit Version column name not found")
+        })?;
     let batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             Field::new("number", ArrowDataType::Int32, true),
@@ -1559,7 +1561,7 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
             json_bytes.into(),
         )
         .await
-        .map_err(|e| Error::generic(e.to_string()))?;
+        .map_err(|e| KernelError::generic(e.to_string()))?;
 
     // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
     // compaction file.

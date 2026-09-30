@@ -40,7 +40,7 @@
 //! # use delta_kernel::Snapshot;
 //! # use delta_kernel::SnapshotRef;
 //! # use delta_kernel::DeltaResult;
-//! # use delta_kernel::Error;
+//! # use delta_kernel::KernelError;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
 //! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
@@ -70,7 +70,7 @@
 //!
 //! // Build the [`LastCheckpointHintStats`] from the exhausted iterator state
 //! let state = std::sync::Arc::into_inner(state)
-//!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+//!     .ok_or(KernelError::internal_error("checkpoint state Arc still has other references"))?;
 //! let last_checkpoint_stats =
 //!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
 //!         state,
@@ -81,7 +81,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, Error>(())
+//! # Ok::<_, KernelError>(())
 //! ```
 //!
 //! ## Warning
@@ -125,8 +125,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta,
-    Version,
+    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta,
+    KernelError, Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -196,22 +196,22 @@ impl LastCheckpointHintStats {
         num_sidecars: u64,
     ) -> DeltaResult<Self> {
         if !state.is_exhausted() {
-            return Err(Error::checkpoint_write(
+            return Err(KernelError::checkpoint_write(
                 "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
                  consumed and all data written to storage before finalizing",
             ));
         }
         let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
-            Error::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
+            KernelError::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
         })?;
         let num_sidecars_i64 = i64::try_from(num_sidecars).map_err(|e| {
-            Error::checkpoint_write(format!("num_sidecars {num_sidecars} exceeds i64: {e}"))
+            KernelError::checkpoint_write(format!("num_sidecars {num_sidecars} exceeds i64: {e}"))
         })?;
         let num_actions = state
             .actions_count()
             .checked_add(num_sidecars_i64)
             .ok_or_else(|| {
-                Error::checkpoint_write(format!(
+                KernelError::checkpoint_write(format!(
                     "checkpoint action count overflowed i64: {} + {num_sidecars}",
                     state.actions_count()
                 ))
@@ -326,7 +326,8 @@ fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
 static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
     lazy_schema_ref! { ..(base_checkpoint_action_fields()) };
 
-/// Schema for V2 checkpoints (includes checkpointMetadata action)
+/// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
+/// a schema, so readers assume this schema for them.
 static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (&CHECKPOINT_METADATA_FIELD),
@@ -440,7 +441,7 @@ impl CheckpointWriter {
     /// }
     /// drop(checkpoint_data);
     /// let state = Arc::into_inner(state)
-    ///     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+    ///     .ok_or(KernelError::internal_error("checkpoint state Arc still has other references"))?;
     /// let last_checkpoint_stats =
     ///     LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, 0)?;
     /// writer.finalize(&engine, &last_checkpoint_stats)?;
@@ -584,7 +585,9 @@ impl CheckpointWriter {
             }
             let is_exhausted = splitter
                 .lock()
-                .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+                .map_err(|e| {
+                    KernelError::internal_error(format!("sidecar splitter lock poisoned: {e}"))
+                })?
                 .is_exhausted();
             if is_exhausted {
                 break;
@@ -594,10 +597,12 @@ impl CheckpointWriter {
         // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
         let non_file_batches = Arc::into_inner(splitter)
             .ok_or_else(|| {
-                Error::internal_error("sidecar splitter Arc should have no other references")
+                KernelError::internal_error("sidecar splitter Arc should have no other references")
             })?
             .into_inner()
-            .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+            .map_err(|e| {
+                KernelError::internal_error(format!("sidecar splitter lock poisoned: {e}"))
+            })?
             .into_non_file_batches();
 
         // Create sidecar action rows for the main checkpoint file. Each row populates only
@@ -611,7 +616,7 @@ impl CheckpointWriter {
         let checkpoint_path = self.checkpoint_path()?;
         let main_data: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
-        engine
+        let main_size = engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), main_data)?;
 
@@ -619,12 +624,13 @@ impl CheckpointWriter {
         let sidecar_sizes_sum = sidecar_metas
             .iter()
             .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
-            .ok_or_else(|| Error::internal_error("sidecar sizes sum overflowed u64"))?;
+            .ok_or_else(|| KernelError::internal_error("sidecar sizes sum overflowed u64"))?;
         let sidecar_count = sidecar_metas.len() as u64;
         build_written_checkpoint_info(
             engine,
             &checkpoint_path,
             iter_state,
+            main_size,
             sidecar_sizes_sum,
             sidecar_count,
         )
@@ -640,7 +646,7 @@ impl CheckpointWriter {
         let data_iter = self.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine
+        let main_size = engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
 
@@ -648,6 +654,7 @@ impl CheckpointWriter {
             engine,
             &checkpoint_path,
             state,
+            main_size,
             0, /* sidecar_sizes_sum */
             0, /* sidecar_count */
         )
@@ -802,27 +809,45 @@ fn write_single_sidecar(
         return Ok(None);
     }
     let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
-    engine
+    let written_size = engine
         .parquet_handler()
         .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
     let meta = engine.storage_handler().head(&sidecar_url)?;
+    verify_written_size(&sidecar_url, written_size, meta.size)?;
     Ok(Some((filename, meta)))
+}
+
+/// Verifies that the size the parquet writer reported matches the size the storage layer reports
+/// via `head`, guarding against a truncated or partially-written file. `path` names the file in
+/// the error message.
+fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> DeltaResult<()> {
+    if written_size != observed_size {
+        return Err(KernelError::generic(format!(
+            "parquet file size mismatch at {path}: writer reported {written_size} bytes, \
+             storage reports {observed_size} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn build_written_checkpoint_info(
     engine: &dyn Engine,
     checkpoint_path: &Url,
     state: Arc<ActionReconciliationIteratorState>,
+    written_size: u64,
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
 ) -> DeltaResult<WrittenCheckpointInfo> {
     let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    verify_written_size(checkpoint_path, written_size, file_meta.size)?;
     let total_size_in_bytes = file_meta
         .size
         .checked_add(sidecar_sizes_sum)
-        .ok_or_else(|| Error::internal_error("checkpoint total size_in_bytes overflowed u64"))?;
+        .ok_or_else(|| {
+            KernelError::internal_error("checkpoint total size_in_bytes overflowed u64")
+        })?;
     let state = Arc::into_inner(state).ok_or_else(|| {
-        Error::internal_error("ActionReconciliationIteratorState Arc has other references")
+        KernelError::internal_error("ActionReconciliationIteratorState Arc has other references")
     })?;
     let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
         state,

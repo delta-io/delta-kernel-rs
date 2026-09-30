@@ -30,7 +30,7 @@ use crate::schema::{
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, ExpressionEvaluator, KernelError};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -144,7 +144,7 @@ pub struct SerializableScanState {
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
 ///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
 ///   is processed.
-/// - Parse-error fallback: If transformation and data skipping return [`Error::ParseError`],
+/// - Parse-error fallback: If transformation and data skipping return [`KernelError::ParseError`],
 ///   deduplicates the raw batch first, then retries transformation and data skipping on the
 ///   surviving actions.
 /// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
@@ -413,8 +413,9 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
         };
-        let internal_state_blob = serde_json::to_vec(&internal_state)
-            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
+        let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
+            KernelError::generic(format!("Failed to serialize internal state: {e}"))
+        })?;
 
         Ok(SerializableScanState {
             predicate,
@@ -444,14 +445,14 @@ impl ScanLogReplayProcessor {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         // Deserialize internal state from json
-        let internal_state: InternalScanState =
-            serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
+        let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
+            .map_err(KernelError::MalformedJson)?;
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
             Some(predicate) => {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
-                    return Err(Error::generic(
+                    return Err(KernelError::generic(
                         "Invalid serialized internal state. Expected predicate schema.",
                     ));
                 };
@@ -494,10 +495,14 @@ impl ScanLogReplayProcessor {
         } else {
             &self.checkpoint_transform
         };
-        let transformed = transform.evaluate(actions)?;
+        let start = std::time::Instant::now();
+        let transformed = transform.evaluate(actions);
+        self.metrics
+            .add_action_transform_time_ns(start.elapsed().as_nanos() as u64);
+        let transformed = transformed?;
         require!(
             transformed.len() == actions.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "transform output length {} != actions length {}",
                 transformed.len(),
                 actions.len()
@@ -507,7 +512,7 @@ impl ScanLogReplayProcessor {
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         require!(
             selection_vector.len() == actions.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "selection vector length {} != actions length {}",
                 selection_vector.len(),
                 actions.len()
@@ -553,7 +558,7 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<()> {
         require!(
             selection_vector.len() == active_add_file_sizes.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "selection vector length {} != active Add file sizes length {}",
                 selection_vector.len(),
                 active_add_file_sizes.len()
@@ -747,7 +752,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let expected_getters = if is_log_batch { 12 } else { 8 };
         require!(
             getters.len() == expected_getters,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of AddRemoveDedupVisitor getters: {}",
                 getters.len()
             ))
@@ -959,7 +964,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = actions_batch;
         require!(
             !is_log_batch,
-            Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
+            KernelError::generic(
+                "Parallel checkpoint processor may only be applied to checkpoint files"
+            )
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -973,7 +980,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err @ KernelError::ParseError(_, _)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1075,7 +1082,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err @ KernelError::ParseError(_, _)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1184,7 +1191,9 @@ pub(crate) fn scan_action_iter(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use rstest::rstest;
 
@@ -1201,8 +1210,9 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::ActionsBatch;
+    use crate::log_replay::{ActionsBatch, LogReplayProcessor};
     use crate::log_segment::CheckpointReadInfo;
+    use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
         assert_transform_spec, get_simple_state_info, get_state_info, RowTrackingState,
@@ -1217,7 +1227,32 @@ mod tests {
     use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{DeltaResult, Expression as Expr, ExpressionRef};
+    use crate::{
+        DeltaResult, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef,
+        KernelError,
+    };
+
+    /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
+    struct RetryOnceEvaluator {
+        inner: Arc<dyn ExpressionEvaluator>,
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl ExpressionEvaluator for RetryOnceEvaluator {
+        /// Delays each attempt for deterministic timing, then triggers exactly one retry.
+        fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+            std::thread::sleep(self.delay);
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(KernelError::ParseError(
+                    "retry".to_string(),
+                    DataType::STRING,
+                ))
+            } else {
+                self.inner.evaluate(batch)
+            }
+        }
+    }
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
@@ -1300,6 +1335,46 @@ mod tests {
             (),
             validate_simple,
         );
+    }
+
+    #[test]
+    fn transform_metrics_include_failed_attempt_and_retry() {
+        // Build a normal replay processor so only the transform's retry behavior is replaced.
+        let engine = SyncEngine::new();
+        let schema = schema_ref! { nullable "value": INTEGER };
+        let mut processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(get_simple_state_info(schema, vec![]).unwrap()),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let delay = Duration::from_millis(5);
+        processor.commit_transform = Arc::new(RetryOnceEvaluator {
+            inner: processor.commit_transform.clone(),
+            calls: calls.clone(),
+            delay,
+        });
+
+        // Process one batch; the injected parse error must trigger one successful retry.
+        LogReplayProcessor::process_actions_batch(
+            &mut processor,
+            ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true),
+        )
+        .unwrap();
+
+        // Confirm both attempts ran and their deterministic delays were accumulated in the event.
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let event = processor.get_metrics().to_event(
+            MetricId::new(),
+            false,
+            None,
+            ScanType::Full,
+            Duration::ZERO,
+        );
+        assert!(event.action_transform_time >= delay * 2);
     }
 
     #[test]

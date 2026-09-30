@@ -2,7 +2,7 @@
   "name": "delta-kernel-rs-ai-review",
   "private": true,
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.243",
-    "@openai/codex": "0.149.1"
+    "@anthropic-ai/claude-code": "2.1.280",
+    "@openai/codex": "0.159.1"
   }
 }

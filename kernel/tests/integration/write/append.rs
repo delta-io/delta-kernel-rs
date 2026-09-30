@@ -19,7 +19,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::WriteState;
-use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
+use delta_kernel::{DeltaResult, KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{json, Deserializer};

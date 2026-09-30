@@ -36,7 +36,7 @@ use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::PhantomType;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, KernelError};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -178,6 +178,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// - The table enables `icebergCompatV2`, `icebergCompatV3`, or `allowColumnDefaults`, which
     ///   ALTER TABLE does not yet support
     /// - Any individual operation fails validation (see per-method errors above)
+    /// - CDF is enabled and the evolved schema contains a top-level column reserved for CDF
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
     ///   `timestampNtz` column without the `timestampNtz` feature)
@@ -193,13 +194,13 @@ impl AlterTableTransactionBuilder<Modifying> {
                 .into_iter()
                 .find(|feature| table_config.is_feature_enabled(feature));
         if let Some(feature) = unsupported_iceberg_compat {
-            return Err(Error::unsupported(format!(
+            return Err(KernelError::unsupported(format!(
                 "ALTER TABLE is not yet supported on tables with {feature} enabled"
             )));
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
             ));
         }

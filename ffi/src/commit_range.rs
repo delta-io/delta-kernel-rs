@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, LogPath, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, KernelError, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -23,8 +23,8 @@ pub struct SharedCommitRange;
 /// Opaque builder for constructing a [`CommitRange`] from a table path.
 ///
 /// Create with [`commit_range_builder_for`]. Optionally pin the end of the range with
-/// [`commit_range_builder_set_end_version`]. Catalog-managed ranges also use
-/// [`commit_range_builder_set_log_tail`] and [`commit_range_builder_set_max_catalog_version`].
+/// [`commit_range_builder_with_end_version`]. Catalog-managed ranges also use
+/// [`commit_range_builder_with_log_tail`] and [`commit_range_builder_with_max_catalog_version`].
 /// Finally, call [`commit_range_builder_build`] to consume the builder and obtain the range. To
 /// discard the builder without building, call [`free_commit_range_builder`].
 pub struct FfiCommitRangeBuilder {
@@ -38,13 +38,13 @@ pub struct FfiCommitRangeBuilder {
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiCommitRangeBuilder`].
 #[handle_descriptor(target=FfiCommitRangeBuilder, mutable=true, sized=true)]
-pub struct MutableFfiCommitRangeBuilder;
+pub struct ExclusiveCommitRangeBuilder;
 
 fn make_commit_range_builder(
     table_root: Url,
     start_version: Version,
     engine: Arc<dyn ExternEngine>,
-) -> Handle<MutableFfiCommitRangeBuilder> {
+) -> Handle<ExclusiveCommitRangeBuilder> {
     Box::new(FfiCommitRangeBuilder {
         engine,
         table_root,
@@ -71,7 +71,7 @@ pub unsafe extern "C" fn commit_range_builder_for(
     path: KernelStringSlice,
     start_version: Version,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<MutableFfiCommitRangeBuilder>> {
+) -> ExternResult<Handle<ExclusiveCommitRangeBuilder>> {
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
@@ -84,33 +84,42 @@ pub unsafe extern "C" fn commit_range_builder_for(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer.
+/// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
+/// the builder with the end version applied.
 #[no_mangle]
-pub unsafe extern "C" fn commit_range_builder_set_end_version(
-    builder: &mut Handle<MutableFfiCommitRangeBuilder>,
+pub unsafe extern "C" fn commit_range_builder_with_end_version(
+    builder: Handle<ExclusiveCommitRangeBuilder>,
     end_version: Version,
-) {
-    unsafe { builder.as_mut() }.end_version = Some(end_version);
+) -> Handle<ExclusiveCommitRangeBuilder> {
+    let mut builder = unsafe { builder.into_inner() };
+    builder.end_version = Some(end_version);
+    builder.into()
 }
 
 /// Set the catalog-ratified log tail and maximum catalog-ratified version on the builder.
 ///
+/// # Errors
+///
+/// Returns an error if `log_tail` does not satisfy the [`FfiSlice`](crate::FfiSlice) contract or
+/// contains an invalid log path.
+///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer. The log-tail array and its contents must remain valid
-/// for the duration of this call.
+/// Caller must pass a valid builder handle. The builder is consumed unconditionally and must not
+/// be used or freed after this call. On error, the builder is dropped. The log-tail array and its
+/// contents must remain valid for the duration of this call.
 #[no_mangle]
-pub unsafe extern "C" fn commit_range_builder_set_log_tail(
-    builder: &mut Handle<MutableFfiCommitRangeBuilder>,
+pub unsafe extern "C" fn commit_range_builder_with_log_tail(
+    builder: Handle<ExclusiveCommitRangeBuilder>,
     log_tail: LogPathArray,
     max_catalog_version: Version,
-) -> ExternResult<bool> {
-    let builder_mut = unsafe { builder.as_mut() };
-    let engine = builder_mut.engine.clone();
+) -> ExternResult<Handle<ExclusiveCommitRangeBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
     let result = unsafe { log_tail.log_paths() }.map(|paths| {
-        builder_mut.log_tail = paths;
-        builder_mut.max_catalog_version = Some(max_catalog_version);
-        true
+        builder.log_tail = paths;
+        builder.max_catalog_version = Some(max_catalog_version);
+        builder.into()
     });
     result.into_extern_result(&engine.as_ref())
 }
@@ -119,13 +128,16 @@ pub unsafe extern "C" fn commit_range_builder_set_log_tail(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer.
+/// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
+/// the builder with the maximum catalog version applied.
 #[no_mangle]
-pub unsafe extern "C" fn commit_range_builder_set_max_catalog_version(
-    builder: &mut Handle<MutableFfiCommitRangeBuilder>,
+pub unsafe extern "C" fn commit_range_builder_with_max_catalog_version(
+    builder: Handle<ExclusiveCommitRangeBuilder>,
     max_catalog_version: Version,
-) {
-    unsafe { builder.as_mut() }.max_catalog_version = Some(max_catalog_version);
+) -> Handle<ExclusiveCommitRangeBuilder> {
+    let mut builder = unsafe { builder.into_inner() };
+    builder.max_catalog_version = Some(max_catalog_version);
+    builder.into()
 }
 
 /// Consume the builder and return a [`CommitRange`]. After calling, the builder pointer is no
@@ -139,7 +151,7 @@ pub unsafe extern "C" fn commit_range_builder_set_max_catalog_version(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_builder_build(
-    builder: Handle<MutableFfiCommitRangeBuilder>,
+    builder: Handle<ExclusiveCommitRangeBuilder>,
 ) -> ExternResult<Handle<SharedCommitRange>> {
     let builder_box = unsafe { builder.into_inner() };
     let engine = builder_box.engine.clone();
@@ -161,7 +173,7 @@ fn commit_range_builder_build_impl(
     } else if let Some(max_catalog_version) = builder.max_catalog_version {
         kernel_builder = kernel_builder.with_log_tail(builder.log_tail, max_catalog_version);
     } else {
-        return Err(Error::MaxCatalogVersion(
+        return Err(KernelError::MaxCatalogVersion(
             "Max catalog version is required when providing staged commits.".to_string(),
         ));
     }
@@ -175,7 +187,7 @@ fn commit_range_builder_build_impl(
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
-pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<MutableFfiCommitRangeBuilder>) {
+pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<ExclusiveCommitRangeBuilder>) {
     builder.drop_handle();
 }
 
@@ -337,7 +349,7 @@ impl FfiCommitActionsIterator {
     fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
-            .map_err(|_| Error::generic("poisoned commit-actions iterator mutex"))
+            .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
     }
 }
 
@@ -482,10 +494,10 @@ mod tests {
     use super::*;
     use crate::engine_data::engine_data_length;
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
-        build_snapshot, ok_or_panic,
+        build_snapshot, error_only_engine_handle, ok_or_panic,
     };
     use crate::log_path::{FfiLogPath, LogPathArray};
     use crate::{
@@ -521,14 +533,14 @@ mod tests {
         end_version: u64,
         engine: Handle<SharedExternEngine>,
     ) -> Handle<SharedCommitRange> {
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
                 start_version,
                 engine,
             ))
         };
-        unsafe { commit_range_builder_set_end_version(&mut builder, end_version) };
+        let builder = unsafe { commit_range_builder_with_end_version(builder, end_version) };
         unsafe { ok_or_panic(commit_range_builder_build(builder)) }
     }
 
@@ -570,16 +582,18 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root) = setup_engine_with_commits(3).await;
 
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
                 0,
                 engine.shallow_copy(),
             ))
         };
-        if let Some(end_version) = builder_end_version {
-            unsafe { commit_range_builder_set_end_version(&mut builder, end_version) };
-        }
+        let builder = if let Some(end_version) = builder_end_version {
+            unsafe { commit_range_builder_with_end_version(builder, end_version) }
+        } else {
+            builder
+        };
         let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
 
         assert_eq!(unsafe { range.as_ref() }.start_version(), 0);
@@ -597,7 +611,7 @@ mod tests {
     async fn test_commit_range_builder_accepts_catalog_log_tail(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
                 0,
@@ -613,9 +627,8 @@ mod tests {
             len: paths.len(),
         };
 
-        unsafe {
-            ok_or_panic(commit_range_builder_set_log_tail(&mut builder, log_tail, 1));
-        }
+        let builder =
+            unsafe { ok_or_panic(commit_range_builder_with_log_tail(builder, log_tail, 1)) };
         let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
         assert_eq!(unsafe { range.as_ref() }.end_version(), 1);
 
@@ -624,11 +637,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn commit_range_builder_with_log_tail_invalid_slice_consumes_builder() {
+        let engine = error_only_engine_handle();
+        let table_root = "memory:///test_table/";
+        let builder = unsafe {
+            ok_or_panic(commit_range_builder_for(
+                kernel_string_slice!(table_root),
+                0,
+                engine.shallow_copy(),
+            ))
+        };
+        let log_tail = LogPathArray {
+            ptr: std::ptr::null(),
+            len: 1,
+        };
+
+        let result = unsafe { commit_range_builder_with_log_tail(builder, log_tail, 0) };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::GenericError,
+            Some("Generic delta kernel error: slice pointer is null with length 1"),
+        );
+
+        unsafe { free_engine(engine) }
+        // No builder cleanup: the call consumes it on error, which Miri's leak check verifies.
+    }
+
     #[tokio::test]
     async fn test_commit_range_builder_rejects_non_contiguous_catalog_log_tail(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root) = setup_engine_with_commits(0).await;
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
                 0,
@@ -647,13 +687,12 @@ mod tests {
             len: paths.len(),
         };
 
-        unsafe {
-            ok_or_panic(commit_range_builder_set_log_tail(&mut builder, log_tail, 3));
-        }
+        let builder =
+            unsafe { ok_or_panic(commit_range_builder_with_log_tail(builder, log_tail, 3)) };
         let result = unsafe { commit_range_builder_build(builder) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidLogSegment,
+            FFIKernelError::InvalidLogSegment,
             Some("Log tail versions 1 and 3 are not contiguous"),
         );
 
@@ -665,14 +704,14 @@ mod tests {
     async fn test_commit_range_builder_max_catalog_version_bounds_filesystem(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, table_root) = setup_engine_with_commits(3).await;
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
                 0,
                 engine.shallow_copy(),
             ))
         };
-        unsafe { commit_range_builder_set_max_catalog_version(&mut builder, 1) };
+        let builder = unsafe { commit_range_builder_with_max_catalog_version(builder, 1) };
         let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
         assert_eq!(unsafe { range.as_ref() }.end_version(), 1);
 
@@ -692,7 +731,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             result,
-            KernelError::InvalidTableLocationError,
+            FFIKernelError::InvalidTableLocationError,
             None,
         );
 
@@ -718,9 +757,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_build_errors_on_missing_start_version(
+    async fn test_commit_range_builder_build_errors_on_empty_range(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Table has only v=0, but we request a range starting at v=5.
+        // Table has only v=0, but we request a range starting at v=5: nothing at all is
+        // available in [5, latest], so this is EmptyLog, not MissingVersion -- the latter is
+        // reserved for a range where something was found, just not starting at v=5.
         let (engine, table_root) = setup_engine_with_commits(0).await;
 
         let builder = unsafe {
@@ -733,9 +774,45 @@ mod tests {
         let result = unsafe { commit_range_builder_build(builder) };
         assert_extern_result_error_with_message(
             result,
-            KernelError::MissingVersionError,
-            Some("Table version 5 is missing or unavailable for this log operation."),
+            FFIKernelError::EmptyLogError,
+            Some("No table version found."),
         );
+
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_commit_range_builder_build_errors_on_start_version_not_found(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Non-contiguous log: v0 and v2 exist, v1 does not. Requesting start=1 is unavailable but a
+        // later version remains -> StartVersionNotFound, distinct from EmptyLog.
+        let table_root = "memory:///snf_table/";
+        let storage = Arc::new(InMemory::new());
+        for version in [0u64, 2] {
+            add_commit(
+                table_root,
+                storage.as_ref(),
+                version,
+                actions_to_string(vec![TestAction::Metadata]),
+            )
+            .await
+            .unwrap();
+        }
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            allocate_err,
+        );
+
+        let builder = unsafe {
+            ok_or_panic(commit_range_builder_for(
+                kernel_string_slice!(table_root),
+                1,
+                engine.shallow_copy(),
+            ))
+        };
+        let result = unsafe { commit_range_builder_build(builder) };
+        assert_extern_result_error_with_message(result, FFIKernelError::StartVersionNotFound, None);
 
         unsafe { free_engine(engine) }
         Ok(())
@@ -810,7 +887,7 @@ mod tests {
                 unsafe { free_commit_actions_iter(iter) }
             }
             None => {
-                assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+                assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
             }
         }
 
@@ -836,7 +913,7 @@ mod tests {
                 0,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }

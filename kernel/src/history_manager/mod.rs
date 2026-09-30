@@ -35,7 +35,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error as DeltaError, Version};
+use crate::{DeltaResult, Engine, KernelError as DeltaError, Version};
 
 pub(crate) mod search;
 
@@ -759,8 +759,8 @@ fn get_earliest_published_commit_version(
 /// - Propagate any error from listing the log directory.
 /// - [`LogHistoryError::NoCommitsFound`] if the log contains no commit files at all
 /// (empty directory, or only checkpoint files) -- unless `earliest_ratified_commit_version`
-/// is `Some(0)`, in which case it returns a generic [`Error`](crate::Error) flagging the
-/// broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
+/// is `Some(0)`, in which case it returns a generic [`KernelError`](crate::KernelError) flagging
+/// the broken CCv2 invariant (ratified commit 0 with no published filesystem commit).
 /// - [`LogHistoryError::NoRecreatableCommit`] if commits exist but neither
 /// `00...00.json` nor a complete checkpoint that anchors the smallest commit is present.
 #[tracing::instrument(skip(engine), err, ret)]
@@ -1637,7 +1637,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::Error::LogHistory(ref e))
+                Err(crate::KernelError::LogHistory(ref e))
                     if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
             ),
             "{res:?}"
@@ -1664,7 +1664,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::Error::LogHistory(ref e))
+                Err(crate::KernelError::LogHistory(ref e))
                     if matches!(**e, LogHistoryError::EmptyTimestampRange { between_version: 0, .. })
             ),
             "{res:?}"

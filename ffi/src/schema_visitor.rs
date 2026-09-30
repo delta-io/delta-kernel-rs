@@ -28,7 +28,9 @@ use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
-use delta_kernel::{DeltaResult, Error};
+#[cfg(feature = "geo-type-in-dev")]
+use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+use delta_kernel::{DeltaResult, KernelError};
 use tracing::warn;
 
 use crate::scan::{CMetadataMap, CMetadataValueKind};
@@ -99,7 +101,7 @@ fn visit_engine_metadata(
 
     let mut state = CMetadataMap::default();
     if !(engine_metadata.visitor)(engine_metadata.metadata, &mut state) {
-        return Err(Error::schema("Engine metadata visitor failed"));
+        return Err(KernelError::schema("Engine metadata visitor failed"));
     }
 
     Ok(state.into_values())
@@ -118,7 +120,7 @@ fn visit_metadata_value_impl(
         CMetadataValueKind::MetadataString => MetadataValue::String(value.to_owned()),
         CMetadataValueKind::MetadataBoolean => {
             MetadataValue::Boolean(value.parse().map_err(|_| {
-                Error::schema("Invalid Boolean metadata value: expected true or false")
+                KernelError::schema("Invalid Boolean metadata value: expected true or false")
             })?)
         }
         CMetadataValueKind::MetadataJson => serde_json::from_str(value)?,
@@ -138,16 +140,16 @@ pub fn extract_kernel_schema(
     let schema_element = state
         .elements
         .take(schema_id)
-        .ok_or_else(|| Error::schema("Nonexistent id passed to extract_kernel_schema"))?;
+        .ok_or_else(|| KernelError::schema("Nonexistent id passed to extract_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
-        return Err(Error::schema(
+        return Err(KernelError::schema(
             "Final returned id was not a struct, schema is invalid",
         ));
     };
     if !state.elements.is_empty() {
         warn!("Didn't consume all visited fields, schema is invalid.");
-        Err(Error::schema(
+        Err(KernelError::schema(
             "Didn't consume all visited fields, schema is invalid.",
         ))
     } else {
@@ -523,6 +525,107 @@ pub unsafe extern "C" fn visit_field_void(
         .into_extern_result(&allocate_error)
 }
 
+/// Visit a geometry field with the given coordinate reference system.
+///
+/// Returns an error if the field name or CRS is invalid UTF-8, or if the CRS is not in
+/// `AUTHORITY:CODE` form.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, valid `name` and `crs` slices, and
+/// `allocate_error` function pointer, all valid for the duration of this call. When non-null,
+/// `metadata` must point to a valid descriptor and callback.
+#[cfg(feature = "geo-type-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_geometry(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    crs: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_geometry_impl(state, name_str, crs, nullable, metadata)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn visit_field_geometry_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    crs: DeltaResult<&str>,
+    nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
+) -> DeltaResult<usize> {
+    let geometry = GeometryType::try_new(crs?)?;
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::Geometry(Box::new(geometry)),
+        nullable,
+        metadata,
+    )
+}
+
+/// Visit a geography field with the given coordinate reference system and edge interpolation
+/// algorithm.
+///
+/// Returns an error if the field name, CRS, or algorithm is invalid UTF-8, if the CRS is not in
+/// `AUTHORITY:CODE` form, or if the algorithm is not a recognized Delta protocol token.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, valid `name`, `crs`, and `algorithm`
+/// slices, and `allocate_error` function pointer, all valid for the duration of this call. When
+/// non-null, `metadata` must point to a valid descriptor and callback.
+#[cfg(feature = "geo-type-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_geography(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    crs: KernelStringSlice,
+    algorithm: KernelStringSlice,
+    nullable: bool,
+    metadata: *const EngineMetadata,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
+    let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
+    let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
+    visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+fn visit_field_geography_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: DeltaResult<&str>,
+    crs: DeltaResult<&str>,
+    algorithm: DeltaResult<&str>,
+    nullable: bool,
+    metadata: DeltaResult<HashMap<String, MetadataValue>>,
+) -> DeltaResult<usize> {
+    let algorithm = algorithm?
+        .parse::<EdgeInterpolationAlgorithm>()
+        .map_err(|err| {
+            KernelError::invalid_geo_params(format!(
+                "Invalid geography edge interpolation algorithm: {err}"
+            ))
+        })?;
+    let geography = GeographyType::try_new(crs?, algorithm)?;
+    visit_field_primitive_impl(
+        state,
+        name,
+        PrimitiveType::Geography(Box::new(geography)),
+        nullable,
+        metadata,
+    )
+}
+
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
 /// precision and scale.
 ///
@@ -595,7 +698,7 @@ pub unsafe extern "C" fn visit_field_struct(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
@@ -611,8 +714,9 @@ fn create_struct_data_type(
     let field_vec = field_ids
         .iter()
         .map(|&field_id| {
-            unwrap_field(state, field_id)
-                .ok_or_else(|| Error::generic(format!("Invalid field ID {field_id} in struct")))
+            unwrap_field(state, field_id).ok_or_else(|| {
+                KernelError::generic(format!("Invalid field ID {field_id} in struct"))
+            })
         })
         .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -669,7 +773,7 @@ fn visit_field_array_impl(
     let name_str = name?.to_string();
     let metadata = metadata?;
     let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
-        Error::generic(format!(
+        KernelError::generic(format!(
             "Invalid element type ID {element_type_id} for array"
         ))
     })?;
@@ -725,15 +829,17 @@ fn visit_field_map_impl(
     let name_str = name?.to_string();
     let metadata = metadata?;
 
-    let key_field = unwrap_field(state, key_type_id)
-        .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
+    let key_field = unwrap_field(state, key_type_id).ok_or_else(|| {
+        KernelError::generic(format!("Invalid key type ID {key_type_id} for map"))
+    })?;
 
     if key_field.nullable {
-        return Err(Error::generic("Delta Map keys may not be nullable"));
+        return Err(KernelError::generic("Delta Map keys may not be nullable"));
     }
 
-    let value_field = unwrap_field(state, value_type_id)
-        .ok_or_else(|| Error::generic(format!("Invalid value type ID {value_type_id} for map")))?;
+    let value_field = unwrap_field(state, value_type_id).ok_or_else(|| {
+        KernelError::generic(format!("Invalid value type ID {value_type_id} for map"))
+    })?;
 
     let map_type = MapType::new(
         key_field.data_type,
@@ -791,7 +897,7 @@ fn create_variant_data_type(
     let Some(DataType::Struct(variant_struct)) =
         state.elements.take(struct_type_id).map(|f| f.data_type)
     else {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "Invalid variant struct ID {struct_type_id} - must be DataType::Struct"
         )));
     };
@@ -807,7 +913,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
+    use crate::error::{EngineError, FFIKernelError};
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic,
     };
@@ -888,7 +994,7 @@ mod tests {
             )
         };
 
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         assert!(state.elements.is_empty());
     }
 
@@ -913,37 +1019,45 @@ mod tests {
     #[case(
         CMetadataValueKind::MetadataNumber,
         "9223372036854775808",
-        KernelError::ParseIntError
+        FFIKernelError::ParseIntError
     )]
     #[case(
         CMetadataValueKind::MetadataNumber,
         "-9223372036854775809",
-        KernelError::ParseIntError
+        FFIKernelError::ParseIntError
     )]
-    #[case(CMetadataValueKind::MetadataNumber, "1.5", KernelError::ParseIntError)]
-    #[case(CMetadataValueKind::MetadataNumber, "", KernelError::ParseIntError)]
+    #[case(
+        CMetadataValueKind::MetadataNumber,
+        "1.5",
+        FFIKernelError::ParseIntError
+    )]
+    #[case(CMetadataValueKind::MetadataNumber, "", FFIKernelError::ParseIntError)]
     #[case(
         CMetadataValueKind::MetadataNumber,
         "not-a-number",
-        KernelError::ParseIntError
+        FFIKernelError::ParseIntError
     )]
-    #[case(CMetadataValueKind::MetadataBoolean, "TRUE", KernelError::SchemaError)]
-    #[case(CMetadataValueKind::MetadataBoolean, "1", KernelError::SchemaError)]
+    #[case(
+        CMetadataValueKind::MetadataBoolean,
+        "TRUE",
+        FFIKernelError::SchemaError
+    )]
+    #[case(CMetadataValueKind::MetadataBoolean, "1", FFIKernelError::SchemaError)]
     #[case(
         CMetadataValueKind::MetadataBoolean,
         "false ",
-        KernelError::SchemaError
+        FFIKernelError::SchemaError
     )]
-    #[case(CMetadataValueKind::MetadataBoolean, "", KernelError::SchemaError)]
+    #[case(CMetadataValueKind::MetadataBoolean, "", FFIKernelError::SchemaError)]
     #[case(
         CMetadataValueKind::MetadataJson,
         "not-json",
-        KernelError::MalformedJsonError
+        FFIKernelError::MalformedJsonError
     )]
     fn metadata_value_rejects_invalid_text_without_inserting_value(
         #[case] kind: CMetadataValueKind,
         #[case] value: &str,
-        #[case] expected_error: KernelError,
+        #[case] expected_error: FFIKernelError,
     ) {
         let mut state = CMetadataMap::default();
         let result = unsafe {
@@ -987,7 +1101,7 @@ mod tests {
             visit_metadata_value(&mut state, key, kind, value, allocate_err)
         };
 
-        assert_extern_result_error_with_message(result, KernelError::Utf8Error, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::Utf8Error, None);
         assert!(state.into_values().is_empty());
     }
 
@@ -1021,7 +1135,7 @@ mod tests {
             )
         };
 
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         assert_eq!(
             state.into_values().get("key"),
             Some(&MetadataValue::Number(1))
@@ -1349,6 +1463,98 @@ mod tests {
         assert_field_metadata!(interval_day_time, "interval_day_time");
         assert_field_metadata!(void, "void");
         assert_field_metadata!(decimal, "decimal", 10, 2);
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            assert_field_metadata!(
+                geometry,
+                "geometry",
+                KernelStringSlice::new_unsafe("OGC:CRS84")
+            );
+            assert_field_metadata!(
+                geography,
+                "geography",
+                KernelStringSlice::new_unsafe("OGC:CRS84"),
+                KernelStringSlice::new_unsafe("spherical")
+            );
+        }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case::bad_geometry_crs("geom", "EPSG:4326 ", None)]
+    #[case::bad_geography_crs("geog", "EPSG:4326 ", Some("spherical"))]
+    #[case::bad_geography_algorithm("geog", "OGC:CRS84", Some("not-an-algorithm"))]
+    fn invalid_geo_field_parameters_return_recoverable_errors_without_inserting_fields(
+        #[case] name: &str,
+        #[case] crs: &str,
+        #[case] algorithm: Option<&str>,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let result = match algorithm {
+            None => unsafe {
+                visit_field_geometry(
+                    &mut state,
+                    KernelStringSlice::new_unsafe(name),
+                    KernelStringSlice::new_unsafe(crs),
+                    true,
+                    null(),
+                    allocate_err,
+                )
+            },
+            Some(algorithm) => unsafe {
+                visit_field_geography(
+                    &mut state,
+                    KernelStringSlice::new_unsafe(name),
+                    KernelStringSlice::new_unsafe(crs),
+                    KernelStringSlice::new_unsafe(algorithm),
+                    true,
+                    null(),
+                    allocate_err,
+                )
+            },
+        };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::InvalidGeoParamsError,
+            None,
+        );
+        assert!(state.elements.is_empty());
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn state_remains_usable_after_a_rejected_geo_field() {
+        let mut state = KernelSchemaVisitorState::default();
+
+        let result = unsafe {
+            visit_field_geography(
+                &mut state,
+                KernelStringSlice::new_unsafe("geog"),
+                KernelStringSlice::new_unsafe("OGC:CRS84"),
+                KernelStringSlice::new_unsafe("not-an-algorithm"),
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::InvalidGeoParamsError,
+            None,
+        );
+        assert!(state.elements.is_empty());
+
+        let valid = visit_field!(
+            geography,
+            state,
+            "geog",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            KernelStringSlice::new_unsafe("spherical"),
+            true,
+            null()
+        );
+        let field = unwrap_field(&mut state, valid).unwrap();
+        assert_eq!(field.name(), "geog");
     }
 
     #[test]
@@ -1462,7 +1668,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let parent = visit_struct_field!(state, "parent", false, [child], null());
 
         let element = visit_field!(string, state, "element", true, null());
@@ -1476,7 +1682,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let array = visit_array_field!(state, "array", false, element, null());
 
         let key = visit_field!(string, state, "key", false, null());
@@ -1492,7 +1698,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let map = visit_map_field!(state, "map", false, key, value, null());
 
         let child = visit_field!(binary, state, "value", false, null());
@@ -1507,7 +1713,7 @@ mod tests {
                 allocate_err,
             )
         };
-        assert_extern_result_error_with_message(result, KernelError::SchemaError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::SchemaError, None);
         let variant = visit_field!(variant, state, "variant", variant_struct, false, null());
 
         let schema_id = visit_struct_field!(
@@ -1600,6 +1806,8 @@ mod tests {
         //   col_map: map<string, long>,
         //   col_struct: struct<inner: string>,
         //   col_variant: variant<metadata: binary, value: binary>
+        //   col_geometry: geometry(OGC:CRS84),
+        //   col_geography: geography(OGC:CRS84, spherical)
         // >
 
         let mut state = KernelSchemaVisitorState::default();
@@ -1665,6 +1873,25 @@ mod tests {
 
         // Create variant<metadata: binary, value: binary>
         let col_variant = visit_variant_field!(state, "col_variant", false, null());
+        #[cfg(feature = "geo-type-in-dev")]
+        let col_geometry = visit_field!(
+            geometry,
+            state,
+            "col_geometry",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            false,
+            null()
+        );
+        #[cfg(feature = "geo-type-in-dev")]
+        let col_geography = visit_field!(
+            geography,
+            state,
+            "col_geography",
+            KernelStringSlice::new_unsafe("OGC:CRS84"),
+            KernelStringSlice::new_unsafe("spherical"),
+            false,
+            null()
+        );
 
         // Build the final schema
         let all_columns = [
@@ -1688,6 +1915,10 @@ mod tests {
             col_map,
             col_struct,
             col_variant,
+            #[cfg(feature = "geo-type-in-dev")]
+            col_geometry,
+            #[cfg(feature = "geo-type-in-dev")]
+            col_geography,
         ];
         let schema_id = ok_or_panic(unsafe {
             visit_field_struct(
@@ -1704,7 +1935,11 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 20);
+        #[cfg(feature = "geo-type-in-dev")]
+        let expected_len = 22;
+        #[cfg(not(feature = "geo-type-in-dev"))]
+        let expected_len = 20;
+        assert_eq!(fields.len(), expected_len);
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -1769,6 +2004,26 @@ mod tests {
             variant_fields[1].data_type(),
             &DataType::Primitive(PrimitiveType::Binary)
         );
+
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            assert_eq!(fields[20].name(), "col_geometry");
+            let DataType::Primitive(PrimitiveType::Geometry(geometry_type)) =
+                fields[20].data_type()
+            else {
+                panic!("Field col_geometry is not a geometry type");
+            };
+            assert_eq!(geometry_type.crs(), "OGC:CRS84");
+
+            assert_eq!(fields[21].name(), "col_geography");
+            let DataType::Primitive(PrimitiveType::Geography(geography_type)) =
+                fields[21].data_type()
+            else {
+                panic!("Field col_geography is not a geography type");
+            };
+            assert_eq!(geography_type.crs(), "OGC:CRS84");
+            assert_eq!(geography_type.algorithm().to_string(), "spherical");
+        }
     }
 
     #[test]
@@ -2236,7 +2491,7 @@ mod tests {
         // expect errors.
         #[no_mangle]
         extern "C" fn ensure_map_err(
-            _etype: KernelError,
+            _etype: FFIKernelError,
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {
