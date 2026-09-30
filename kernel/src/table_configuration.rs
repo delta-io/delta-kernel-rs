@@ -536,6 +536,18 @@ impl TableConfiguration {
         self.has_column_with_default
     }
 
+    /// The table's CHECK constraints, read from the `delta.constraints.*` metadata configuration.
+    /// Empty when the table declares none. This does not check the `checkConstraints` feature: a
+    /// table that declares constraints without supporting it is rejected for writes by
+    /// [`ensure_write_supported`](Self::ensure_write_supported).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        crate::check_constraints::CheckConstraints::from_parsed(
+            &self.table_properties().check_constraints,
+            &self.logical_schema,
+        )
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -1015,6 +1027,28 @@ mod test {
         assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
     }
 
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[test]
+    fn check_constraints_read_from_configuration_regardless_of_feature() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties([
+                ("delta.constraints.positive", "amount > 0"),
+                ("delta.constraints.named", "name = 'a'"),
+            ])
+            .build();
+        let mut discovered: Vec<_> = table_config
+            .check_constraints()
+            .iter()
+            .map(|c| (c.name().to_string(), c.raw_sql().to_string()))
+            .collect();
+        discovered.sort();
+        let expected = [
+            ("named".to_string(), "name = 'a'".to_string()),
+            ("positive".to_string(), "amount > 0".to_string()),
+        ];
+        assert_eq!(discovered, expected);
+    }
+
     #[rstest]
     #[case::table_features_without_feature(MockProtocolBuilder::new().build(), true)]
     #[case::table_features_with_feature(
@@ -1025,7 +1059,7 @@ mod test {
     )]
     #[case::legacy_writer_below_min_version(MockProtocolBuilder::new().with_versions(1, 2).build(), true)]
     #[case::legacy_writer_at_min_version(MockProtocolBuilder::new().with_versions(1, 3).build(), false)]
-    fn table_with_check_constraints_rejects_writes_and_allows_reads(
+    fn write_support_for_table_with_check_constraints(
         #[case] protocol: Protocol,
         #[case] malformed: bool,
     ) {
@@ -1035,10 +1069,16 @@ mod test {
             .build();
 
         let write = table_config.ensure_operation_supported(Operation::Write);
-        let rejected_as_malformed = matches!(write, Err(Error::InvalidProtocol(_)));
-        let rejected_as_unsupported = matches!(write, Err(Error::Unsupported(_)));
-        assert_eq!(rejected_as_malformed, malformed);
-        assert_eq!(rejected_as_unsupported, !malformed);
+        if malformed {
+            let rejected_as_malformed = matches!(write, Err(Error::InvalidProtocol(_)));
+            assert!(rejected_as_malformed);
+        } else if cfg!(feature = "check-constraints-in-dev") {
+            let write_supported = write.is_ok();
+            assert!(write_supported);
+        } else {
+            let rejected_as_unsupported = matches!(write, Err(Error::Unsupported(_)));
+            assert!(rejected_as_unsupported);
+        }
 
         let read_supported = table_config
             .ensure_operation_supported(Operation::Scan)

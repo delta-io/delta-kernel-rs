@@ -418,6 +418,38 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     }
 }
 
+/// True for a `delta.constraints.<name>` CHECK-constraint property, which CREATE TABLE accepts
+/// (auto-enabling the `checkConstraints` writer feature via [`maybe_enable_check_constraints`]).
+/// Always false without the `check-constraints-in-dev` cargo feature, so those keys are rejected
+/// like any other unlisted `delta.*` property.
+#[cfg(feature = "check-constraints-in-dev")]
+fn is_check_constraint_property(key: &str) -> bool {
+    key.strip_prefix(crate::table_properties::CHECK_CONSTRAINT_PREFIX)
+        .is_some_and(|name| !name.is_empty())
+}
+
+#[cfg(not(feature = "check-constraints-in-dev"))]
+fn is_check_constraint_property(_key: &str) -> bool {
+    false
+}
+
+/// Auto-enables the `checkConstraints` writer feature when the table declares at least one
+/// `delta.constraints.<name>` property.
+#[cfg(feature = "check-constraints-in-dev")]
+fn maybe_enable_check_constraints(validated: &mut ValidatedTableProperties) {
+    if validated
+        .properties
+        .keys()
+        .any(|key| is_check_constraint_property(key))
+    {
+        add_feature_to_lists(
+            TableFeature::CheckConstraints,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Auto-enables allowed property-driven features from the table properties (see
 /// [`auto_enable_property_driven_features`]).
 fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
@@ -775,6 +807,7 @@ fn validate_extract_table_features_and_properties(
     for key in properties.keys() {
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
+            && !is_check_constraint_property(key)
         {
             return Err(Error::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
@@ -1016,6 +1049,9 @@ impl CreateTableTransactionBuilder {
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
 
+        #[cfg(feature = "check-constraints-in-dev")]
+        maybe_enable_check_constraints(&mut validated);
+
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
@@ -1121,6 +1157,18 @@ mod tests {
             builder.table_properties.get("key1"),
             Some(&"value1".to_string())
         );
+    }
+
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[rstest]
+    #[case::named("delta.constraints.positive", true)]
+    #[case::bare_prefix_without_name("delta.constraints.", false)]
+    #[case::unrelated_property("delta.appendOnly", false)]
+    fn is_check_constraint_property_requires_nonempty_name(
+        #[case] key: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_check_constraint_property(key), expected);
     }
 
     #[test]
