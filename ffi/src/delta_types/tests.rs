@@ -441,10 +441,19 @@ fn typed_crc_accepts_full_kernel_state() {
         },
         ..empty_crc()
     };
-    assert!(unsafe { indeterminate.try_to_kernel() }
-        .unwrap()
-        .file_stats()
-        .is_none());
+    let indeterminate = unsafe { indeterminate.try_to_kernel() }.unwrap();
+    assert!(indeterminate.file_stats().is_none());
+    let failure = match indeterminate.file_stats_state() {
+        FileStatsState::Indeterminate(failure) => failure,
+        state => panic!("expected indeterminate state, got {state:?}"),
+    };
+    assert!(failure
+        .to_string()
+        .contains("originating cause unavailable in the supplied CRC state"));
+    let message = serde_json::to_string(&indeterminate)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("originating cause unavailable in the supplied CRC state"));
 }
 
 #[test]

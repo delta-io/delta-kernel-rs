@@ -19,13 +19,7 @@ use crate::{DeltaResult, Engine, KernelError};
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
-    require!(
-        crc.file_stats_state.is_complete(),
-        KernelError::ChecksumWriteUnsupported(format!(
-            "Cannot write CRC file with {:?} file stats",
-            crc.file_stats_state
-        ))
-    );
+    crc.file_stats_state.stats_for_write(crc.version)?;
     // If ICT is enabled, the CRC must carry an ICT value.
     let ict_enabled = crc
         .metadata
@@ -240,7 +234,7 @@ mod tests {
     fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
         let (engine, crc_path) = writer_test_env(0);
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
-        crc.file_stats_state = FileStatsState::Indeterminate;
+        crc.file_stats_state = FileStatsState::indeterminate();
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(
             result,

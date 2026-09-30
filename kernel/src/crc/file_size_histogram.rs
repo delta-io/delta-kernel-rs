@@ -227,6 +227,32 @@ impl FileSizeHistogram {
         Ok(())
     }
 
+    /// Accumulates `delta` into a signed intermediate histogram. Returns an error for mismatched
+    /// boundaries or array lengths; negative intermediate bins are permitted during reverse replay.
+    pub(crate) fn accumulate_delta(&mut self, delta: &Self) -> DeltaResult<()> {
+        require!(
+            self.sorted_bin_boundaries == delta.sorted_bin_boundaries,
+            KernelError::internal_error("Cannot add histograms with different bin boundaries")
+        );
+        let len = self.sorted_bin_boundaries.len();
+        require!(
+            [
+                self.file_counts.len(),
+                self.total_bytes.len(),
+                delta.file_counts.len(),
+                delta.total_bytes.len()
+            ]
+            .into_iter()
+            .all(|length| length == len),
+            KernelError::internal_error("Cannot add histograms with different array lengths")
+        );
+        for i in 0..len {
+            self.file_counts[i] += delta.file_counts[i];
+            self.total_bytes[i] += delta.total_bytes[i];
+        }
+        Ok(())
+    }
+
     /// Applies a delta histogram element-wise to this histogram. Both must have the same bin
     /// boundaries.
     ///
@@ -237,31 +263,9 @@ impl FileSizeHistogram {
         &self,
         delta: &FileSizeHistogram,
     ) -> DeltaResult<FileSizeHistogram> {
-        require!(
-            self.sorted_bin_boundaries == delta.sorted_bin_boundaries,
-            KernelError::internal_error("Cannot add histograms with different bin boundaries")
-        );
-        let len = self.sorted_bin_boundaries.len();
-        let mut file_counts = Vec::with_capacity(len);
-        let mut total_bytes = Vec::with_capacity(len);
-        for i in 0..len {
-            let count = self.file_counts[i] + delta.file_counts[i];
-            let bytes = self.total_bytes[i] + delta.total_bytes[i];
-            require!(
-                count >= 0 && bytes >= 0,
-                KernelError::internal_error(format!(
-                    "Merge would result in negative counts or bytes at bin {}",
-                    i
-                ))
-            );
-            file_counts.push(count);
-            total_bytes.push(bytes);
-        }
-        Ok(FileSizeHistogram {
-            sorted_bin_boundaries: self.sorted_bin_boundaries.clone(),
-            file_counts,
-            total_bytes,
-        })
+        let mut merged = self.clone();
+        merged.accumulate_delta(delta)?;
+        merged.check_non_negative()
     }
 
     /// Checks that all bins have non-negative file counts and total bytes.
@@ -289,6 +293,24 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+
+    #[test]
+    fn signed_delta_merge_allows_negative_bins_and_rejects_mismatched_shapes() {
+        let mut delta =
+            FileSizeHistogram::create_empty_with_boundaries(vec![0, 200, 1000]).unwrap();
+        delta.remove(500).unwrap();
+        let mut older =
+            FileSizeHistogram::create_empty_with_boundaries(vec![0, 200, 1000]).unwrap();
+        older.insert(100).unwrap();
+        delta.accumulate_delta(&older).unwrap();
+        assert_eq!(delta.file_counts(), &[1, -1, 0]);
+        assert_eq!(delta.total_bytes(), &[100, -500, 0]);
+        assert!(delta
+            .accumulate_delta(&FileSizeHistogram::create_default())
+            .is_err());
+        older.file_counts.pop();
+        assert!(delta.accumulate_delta(&older).is_err());
+    }
 
     // ===== Construction =====
 

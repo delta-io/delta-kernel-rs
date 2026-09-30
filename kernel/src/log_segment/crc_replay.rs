@@ -14,6 +14,7 @@ use std::collections::hash_map::Entry;
 use std::sync::{Arc, LazyLock};
 
 use tracing::{instrument, warn};
+use url::Url;
 
 use super::LogSegment;
 use crate::actions::visitors::{
@@ -24,8 +25,9 @@ use crate::actions::{
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
 use crate::crc::{
-    is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
-    FileSizeHistogram, FileStatsDelta,
+    classify_file_stats_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
+    FileSizeHistogram, FileStatsDelta, FileStatsFailure, FileStatsFailureReason,
+    FileStatsOperation, FileStatsSource, FileStatsValidity,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
@@ -175,7 +177,10 @@ impl LogSegment {
             .actions;
         for batch in batches {
             let batch = batch?;
-            let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
+            let mut visitor = CheckpointCrcVisitor {
+                acc: &mut acc,
+                version,
+            };
             visitor.visit_rows_of(batch.actions())?;
         }
         Ok(acc.into_crc_delta().into_complete_crc(version))
@@ -283,7 +288,7 @@ impl LogSegment {
 
         // Run the per-commit invariant on the final (oldest) commit; no successor batch
         // will trigger it.
-        acc.process_commit_file_end();
+        acc.process_commit_file_end()?;
 
         Ok(acc.into_crc_delta())
     }
@@ -300,31 +305,40 @@ impl LogSegment {
 struct CrcReplayAccumulator {
     delta: CrcDelta,
 
-    /// True while the visitor is still on the newest commit. Used to gate ICT capture
-    /// (only the newest commit contributes to [`CrcDelta::in_commit_timestamp`]). Cannot
-    /// be derived from `current_file_url` alone, since after the first batch the URL is
-    /// `Some` but we're still on the newest commit until a transition.
+    /// Only the newest commit contributes to [`CrcDelta::in_commit_timestamp`].
     is_first_commit: bool,
 
-    /// URL of the commit file currently being processed. Drives commit-boundary detection:
-    /// a different URL on a later batch means we've moved to an older commit.
-    current_file_url: Option<String>,
+    current_commit: PendingCommit,
+}
 
-    /// True if the current commit had at least one add/remove row. Combined with
-    /// `current_commit_saw_safe_op` for the per-commit invariant check.
-    current_commit_saw_file_action: bool,
+/// Commit-local aggregates remain provisional until all batches, including commitInfo, are read.
+#[derive(Default)]
+struct PendingCommit {
+    source: Option<FileStatsSource>,
+    operation: Option<String>,
+    saw_file_action: bool,
+    adds: FileStatsDelta,
+    failure: Option<FileStatsFailureReason>,
+}
 
-    /// True if the current commit had a commitInfo row whose `operation` was in the
-    /// [`is_incremental_safe_operation`] safelist. If false at commit end and the commit
-    /// had file actions, we can't trust the file-stats delta and mark it unsafe.
-    current_commit_saw_safe_op: bool,
+impl PendingCommit {
+    fn policy(&self) -> Option<FileStatsOperation> {
+        self.operation.as_deref().map(classify_file_stats_operation)
+    }
 }
 
 impl CrcReplayAccumulator {
     fn new(seed_histogram: Option<FileSizeHistogram>) -> Self {
         Self {
+            current_commit: PendingCommit {
+                adds: FileStatsDelta {
+                    net_histogram: seed_histogram.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             delta: CrcDelta {
-                is_incremental_safe: true,
+                file_stats_validity: FileStatsValidity::Valid,
                 file_stats: FileStatsDelta {
                     net_histogram: seed_histogram,
                     ..Default::default()
@@ -332,55 +346,72 @@ impl CrcReplayAccumulator {
                 ..Default::default()
             },
             is_first_commit: true,
-            current_file_url: None,
-            current_commit_saw_file_action: false,
-            current_commit_saw_safe_op: false,
         }
     }
 
-    fn process_batch_start(&mut self, batch_file_url: &str) {
-        if self.current_file_url.as_deref() == Some(batch_file_url) {
-            return; // same file, still inside the current commit
-        }
-        if self.current_file_url.is_some() {
-            // commit boundary: finalize the previous one, drop "newest" status
-            self.process_commit_file_end();
+    fn process_batch_start(&mut self, batch_file_url: &str) -> DeltaResult<()> {
+        if let Some(FileStatsSource::Commit { location, .. }) = &self.current_commit.source {
+            if location == batch_file_url {
+                return Ok(());
+            }
+            self.process_commit_file_end()?;
             self.is_first_commit = false;
         }
-        self.current_file_url = Some(batch_file_url.to_owned());
+        let commit = ParsedLogPath::parse_commit(Url::parse(batch_file_url)?)?;
+        self.current_commit.source = Some(FileStatsSource::Commit {
+            version: commit.version,
+            location: batch_file_url.to_owned(),
+        });
+        if self.delta.file_stats_validity != FileStatsValidity::Valid {
+            return Ok(());
+        }
+        self.current_commit.adds.net_histogram = self
+            .delta
+            .file_stats
+            .net_histogram
+            .as_ref()
+            .map(|histogram| {
+                FileSizeHistogram::create_empty_with_boundaries(
+                    histogram.sorted_bin_boundaries().to_vec(),
+                )
+            })
+            .transpose()?;
+        Ok(())
     }
 
-    fn process_commit_file_end(&mut self) {
-        // `is_incremental_safe` is one-way; once false, this check has nothing to set.
-        if !self.delta.is_incremental_safe {
-            return;
+    fn process_commit_file_end(&mut self) -> DeltaResult<()> {
+        let pending = std::mem::take(&mut self.current_commit);
+        if self.delta.file_stats_validity != FileStatsValidity::Valid {
+            return Ok(());
         }
-        // File actions without a safe-classified operation: we can't trust file stats.
-        // Covers both "no commitInfo at all" and "commitInfo with no `operation` field".
-        if self.current_commit_saw_file_action && !self.current_commit_saw_safe_op {
-            warn!(
-                "CRC reverse-replay: commit at {} carried file actions but no safe-classified \
-                 operation; defaulting to non-incremental-safe",
-                self.current_file_url.as_deref().unwrap_or("?")
-            );
-            self.delta.is_incremental_safe = false;
+        let policy = pending.policy();
+        let failure = pending.failure.or(match policy {
+            Some(FileStatsOperation::Unsupported) => {
+                Some(FileStatsFailureReason::UnsupportedOperation)
+            }
+            None if pending.saw_file_action => Some(FileStatsFailureReason::MissingOperation),
+            _ => None,
+        });
+        if let Some(reason) = failure {
+            let failure = FileStatsFailure {
+                source: pending.source.unwrap_or(FileStatsSource::Unspecified),
+                operation: pending.operation,
+                reason,
+            };
+            warn!("CRC reverse-replay: {failure}");
+            self.delta.file_stats_validity = FileStatsValidity::Invalid(failure);
+        } else if policy == Some(FileStatsOperation::CountAdds) {
+            self.delta.file_stats.merge(&pending.adds)?;
         }
-        self.current_commit_saw_file_action = false;
-        self.current_commit_saw_safe_op = false;
+        Ok(())
     }
 
-    // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
-
-    /// Called by the visitor once per commitInfo row (gated on operation or ict being
-    /// present). Handles both pieces: `operation` drives per-commit safety classification,
-    /// `ict` is captured into the delta from the newest commit only.
     fn on_commit_info(&mut self, operation: Option<&str>, ict: Option<i64>) {
-        if let Some(op) = operation {
-            if is_incremental_safe_operation(op) {
-                self.current_commit_saw_safe_op = true;
-            } else {
-                warn!("CRC reverse-replay: non-incremental op {op}");
-                self.delta.is_incremental_safe = false;
+        if let Some(operation) = operation {
+            // An unsupported operation remains unsupported even if another commitInfo follows it.
+            let unsupported = self.current_commit.policy() == Some(FileStatsOperation::Unsupported);
+            if !unsupported {
+                self.current_commit.operation = Some(operation.to_owned());
             }
         }
         if self.is_first_commit {
@@ -388,54 +419,67 @@ impl CrcReplayAccumulator {
         }
     }
 
-    fn on_add(&mut self, size: i64) -> DeltaResult<()> {
-        self.current_commit_saw_file_action = true;
-        // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
-        // file-stats state to `Indeterminate` and discard the accumulated file stats and
-        // histogram. Stop accumulating; further math is wasted work.
-        if !self.delta.is_incremental_safe {
-            return Ok(());
-        }
+    fn on_commit_add(&mut self, size: i64) -> DeltaResult<()> {
+        self.current_commit.saw_file_action = true;
         if size < 0 {
-            warn!("CRC reverse-replay: add action has negative size {size}");
-            self.delta.is_incremental_safe = false;
-            return Ok(());
-        }
-        let fs = &mut self.delta.file_stats;
-        fs.gross_add_files += 1;
-        fs.gross_add_bytes += size_to_u64(size)?;
-        if let Some(hist) = fs.net_histogram.as_mut() {
-            hist.insert(size)?;
+            self.current_commit
+                .failure
+                .get_or_insert(FileStatsFailureReason::NegativeAddSize { size });
+        } else if self.delta.file_stats_validity == FileStatsValidity::Valid
+            && self.current_commit.failure.is_none()
+            && !matches!(
+                self.current_commit.policy(),
+                Some(FileStatsOperation::IgnoreAdds | FileStatsOperation::Unsupported)
+            )
+        {
+            self.current_commit.adds.add(size)?;
         }
         Ok(())
     }
 
-    /// `size = None` means the remove row had a path but no size, which makes incremental
-    /// tracking impossible.
+    fn on_checkpoint_add(&mut self, size: i64, version: Version) -> DeltaResult<()> {
+        if self.delta.file_stats_validity != FileStatsValidity::Valid {
+            return Ok(());
+        }
+        if size < 0 {
+            self.delta.file_stats_validity = FileStatsValidity::Invalid(FileStatsFailure {
+                source: FileStatsSource::Checkpoint { version },
+                operation: None,
+                reason: FileStatsFailureReason::NegativeAddSize { size },
+            });
+        } else {
+            self.delta.file_stats.add(size)?;
+        }
+        Ok(())
+    }
+
     fn on_remove(&mut self, path: &str, size: Option<i64>) -> DeltaResult<()> {
-        self.current_commit_saw_file_action = true;
-        // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
-        // file-stats state to `Indeterminate` and discard the accumulated file stats and
-        // histogram. Stop accumulating; further math is wasted work.
-        if !self.delta.is_incremental_safe {
+        self.current_commit.saw_file_action = true;
+        if self.delta.file_stats_validity != FileStatsValidity::Valid
+            || self.current_commit.failure.is_some()
+        {
             return Ok(());
         }
         match size {
-            Some(s) if s < 0 => {
-                warn!("CRC reverse-replay: remove action at {path} has negative size {s}");
-                self.delta.is_incremental_safe = false;
+            Some(size) if size < 0 => {
+                self.current_commit.failure = Some(FileStatsFailureReason::NegativeRemoveSize {
+                    path: path.to_owned(),
+                    size,
+                });
             }
-            Some(s) => {
+            Some(size) if self.current_commit.policy() != Some(FileStatsOperation::Unsupported) => {
                 let fs = &mut self.delta.file_stats;
                 fs.gross_remove_files += 1;
-                fs.gross_remove_bytes += size_to_u64(s)?;
-                if let Some(hist) = fs.net_histogram.as_mut() {
-                    hist.remove(s)?;
+                fs.gross_remove_bytes += size_to_u64(size)?;
+                if let Some(histogram) = &mut fs.net_histogram {
+                    histogram.remove(size)?;
                 }
             }
+            Some(_) => {}
             None => {
-                warn!("CRC reverse-replay: remove action at {path} has missing size");
-                self.delta.is_incremental_safe = false;
+                self.current_commit.failure = Some(FileStatsFailureReason::MissingRemoveSize {
+                    path: path.to_owned(),
+                });
             }
         }
         Ok(())
@@ -460,19 +504,13 @@ impl CrcReplayAccumulator {
         }
     }
 
-    /// Apply the shared columns (`shared`, laid out by [`shared_columns`] then the protocol and
-    /// metadata leaves) from row `i` to the delta. Each visitor reads its source-specific columns
-    /// (commit: `_file`/commitInfo/remove) and passes the trailing shared slice here so the shared
-    /// leaves live in one place.
+    /// Apply non-file actions from row `i`. Each visitor handles Add sizes separately because
+    /// checkpoint Adds count directly and commit Adds depend on the operation.
     fn apply_shared_columns<'a>(
         &mut self,
         i: usize,
         shared: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<()> {
-        // `add.size` (required) marks an Add row.
-        if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
-            self.on_add(size)?;
-        }
         if let Some(domain) = shared[SHARED_COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")? {
             let configuration: String =
                 shared[SHARED_COL_DM_CONFIG].get(i, "domainMetadata.configuration")?;
@@ -613,7 +651,7 @@ impl RowVisitor for CommitCrcVisitor<'_> {
         // `_file` is constant across all rows of a batch per the JsonHandler contract. Read
         // once from row 0 and signal a potential file (commit) transition.
         let file_url: String = getters[COL_FILE].get(0, "_file")?;
-        self.acc.process_batch_start(&file_url);
+        self.acc.process_batch_start(&file_url)?;
 
         for i in 0..row_count {
             let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
@@ -629,8 +667,11 @@ impl RowVisitor for CommitCrcVisitor<'_> {
                 self.acc.on_remove(&path, remove_size)?;
             }
 
-            self.acc
-                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])?;
+            let shared = &getters[N_CRC_SPECIFIC_COLS..];
+            if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
+                self.acc.on_commit_add(size)?;
+            }
+            self.acc.apply_shared_columns(i, shared)?;
         }
         Ok(())
     }
@@ -657,6 +698,7 @@ static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// Pulls leaf values from a checkpoint batch into the shared [`CrcReplayAccumulator`].
 struct CheckpointCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
+    version: Version,
 }
 
 impl RowVisitor for CheckpointCrcVisitor<'_> {
@@ -669,6 +711,9 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
         for i in 0..row_count {
+            if let Some(size) = getters[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
+                self.acc.on_checkpoint_add(size, self.version)?;
+            }
             self.acc.apply_shared_columns(i, getters)?;
         }
         Ok(())
@@ -692,97 +737,232 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
-    // ===== Unit tests on `on_*` methods =====
-
-    // ===== commitInfo =====
-
     #[rstest::rstest]
-    #[case::safe("WRITE", true)]
-    #[case::streaming_update("STREAMING UPDATE", true)]
-    #[case::unsafe_op("ANALYZE STATS", false)]
-    fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
+    #[case("WRITE", true)]
+    #[case("STREAMING UPDATE", true)]
+    #[case("COMPUTE STATS", true)]
+    #[case("UNKNOWN OPERATION", false)]
+    fn commit_operation_is_classified_at_finalization(#[case] op: &str, #[case] valid: bool) {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_commit_info(Some(op), None);
-        assert_eq!(acc.current_commit_saw_safe_op, is_safe);
-        assert_eq!(acc.delta.is_incremental_safe, is_safe);
+        acc.process_commit_file_end().unwrap();
+        assert_eq!(
+            acc.delta.file_stats_validity == FileStatsValidity::Valid,
+            valid
+        );
+    }
+
+    #[rstest::rstest]
+    fn known_non_counting_operations_skip_discarded_arithmetic(
+        #[values("COMPUTE STATS", "UNKNOWN OPERATION")] operation: &str,
+        #[values(false, true)] track_histogram: bool,
+    ) {
+        let histogram = track_histogram.then(FileSizeHistogram::create_default);
+        let mut acc = CrcReplayAccumulator::new(histogram.clone());
+        acc.on_commit_info(Some(operation), None);
+        for _ in 0..3 {
+            acc.on_commit_add(i64::MAX).unwrap();
+            if operation == "UNKNOWN OPERATION" {
+                acc.on_remove("p", Some(i64::MAX)).unwrap();
+            }
+        }
+        acc.process_commit_file_end().unwrap();
+        assert_eq!(acc.delta.file_stats.gross_add_bytes, 0);
+        assert_eq!(acc.delta.file_stats.gross_remove_bytes, 0);
+        assert_eq!(acc.delta.file_stats.net_histogram, histogram);
+        assert_eq!(
+            acc.delta.file_stats_validity == FileStatsValidity::Valid,
+            operation == "COMPUTE STATS"
+        );
     }
 
     #[test]
-    fn on_commit_info_ict_only_no_operation_does_not_mark_saw_safe_op() {
+    fn ict_only_commit_without_file_actions_is_valid() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_commit_info(None, Some(1234));
-        assert!(!acc.current_commit_saw_safe_op);
-        assert!(acc.delta.is_incremental_safe);
+        acc.process_commit_file_end().unwrap();
+        assert_eq!(acc.delta.file_stats_validity, FileStatsValidity::Valid);
         assert_eq!(acc.delta.in_commit_timestamp, Some(1234));
     }
 
-    #[test]
-    fn on_commit_info_captures_ict_only_on_first_commit() {
+    #[rstest::rstest]
+    fn newest_commit_ict_is_preserved(#[values(None, Some(2000))] newest_ict: Option<i64>) {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v2.json");
-        acc.on_commit_info(Some("WRITE"), Some(2000));
-        assert_eq!(acc.delta.in_commit_timestamp, Some(2000));
-        acc.process_batch_start("v1.json");
+        acc.process_batch_start("memory:///_delta_log/00000000000000000002.json")
+            .unwrap();
+        acc.on_commit_info(Some("COMPUTE STATS"), newest_ict);
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
         acc.on_commit_info(Some("WRITE"), Some(1000));
-        assert_eq!(acc.delta.in_commit_timestamp, Some(2000));
+        assert_eq!(acc.delta.in_commit_timestamp, newest_ict);
+    }
+
+    #[rstest::rstest]
+    #[case::add(None, Some(-1), "add action has negative size -1")]
+    #[case::remove_negative(Some("p"), Some(-2), "remove action for \"p\" has negative size -2")]
+    #[case::remove_missing(Some("p"), None, "remove action for \"p\" has no size")]
+    fn invalid_size_retains_late_operation_and_source(
+        #[case] remove_path: Option<&str>,
+        #[case] size: Option<i64>,
+        #[case] reason: &str,
+        #[values("WRITE", "COMPUTE STATS", "UNKNOWN OPERATION")] operation: &str,
+        #[values(false, true)] operation_first: bool,
+    ) {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        let location = "memory:///_delta_log/00000000000000000039.json";
+        acc.process_batch_start(location).unwrap();
+        if operation_first {
+            acc.on_commit_info(Some(operation), None);
+        }
+        if let Some(path) = remove_path {
+            acc.on_remove(path, size).unwrap();
+        } else {
+            acc.on_commit_add(size.unwrap()).unwrap();
+        }
+        acc.process_batch_start(location).unwrap();
+        acc.on_commit_info(Some(operation), None);
+        acc.process_commit_file_end().unwrap();
+        let FileStatsValidity::Invalid(failure) = acc.delta.file_stats_validity else {
+            panic!("expected invalid file statistics");
+        };
+        let message = failure.to_string();
+        for expected in ["commit version 39", location, operation, reason] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[rstest::rstest]
+    fn stats_readds_preserve_histogram_and_count_removes(
+        #[values(false, true)] track_histogram: bool,
+        #[values(false, true)] custom_boundaries: bool,
+        #[values(false, true)] remove: bool,
+    ) {
+        let histogram = if custom_boundaries {
+            FileSizeHistogram::create_empty_with_boundaries(vec![0, 200, 1000]).unwrap()
+        } else {
+            FileSizeHistogram::create_default()
+        };
+        let mut acc = CrcReplayAccumulator::new(track_histogram.then_some(histogram.clone()));
+        let mut expected = histogram;
+        if remove {
+            acc.on_remove("a", Some(100)).unwrap();
+            expected.remove(100).unwrap();
+        }
+        acc.on_commit_add(100).unwrap();
+        acc.on_commit_add(20000).unwrap();
+        acc.on_commit_info(Some("COMPUTE STATS"), None);
+        acc.process_commit_file_end().unwrap();
+        assert_eq!(acc.delta.file_stats_validity, FileStatsValidity::Valid);
+        assert_eq!(
+            acc.delta.file_stats.net_files(),
+            if remove { -1 } else { 0 }
+        );
+        assert_eq!(
+            acc.delta.file_stats.net_bytes(),
+            if remove { -100 } else { 0 }
+        );
+        assert_eq!(
+            acc.delta.file_stats.net_histogram,
+            track_histogram.then_some(expected)
+        );
     }
 
     #[test]
-    fn on_commit_info_first_commit_none_ict_does_not_get_overwritten_by_older() {
+    fn unknown_operation_cannot_be_reset_by_another_commit_info() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v2.json");
+        acc.on_commit_info(Some("UNKNOWN OPERATION"), None);
         acc.on_commit_info(Some("WRITE"), None);
-        assert_eq!(acc.delta.in_commit_timestamp, None);
-        acc.process_batch_start("v1.json");
-        acc.on_commit_info(Some("WRITE"), Some(1000));
-        assert_eq!(acc.delta.in_commit_timestamp, None);
+        acc.process_commit_file_end().unwrap();
+        let FileStatsValidity::Invalid(failure) = acc.delta.file_stats_validity else {
+            panic!("expected invalid file statistics");
+        };
+        assert_eq!(failure.operation.as_deref(), Some("UNKNOWN OPERATION"));
     }
 
-    // ===== add =====
-
     #[test]
-    fn on_add_increments_files_and_bytes() {
+    fn checkpoint_failure_retains_checkpoint_version_without_operation() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_add(100).unwrap();
-        acc.on_add(200).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files(), 2);
-        assert_eq!(acc.delta.file_stats.net_bytes(), 300);
-        assert!(acc.delta.is_incremental_safe);
+        acc.on_checkpoint_add(-1, 38).unwrap();
+        let FileStatsValidity::Invalid(failure) = acc.delta.file_stats_validity else {
+            panic!("expected invalid file statistics");
+        };
+        assert_eq!(failure.source, FileStatsSource::Checkpoint { version: 38 });
+        assert_eq!(failure.operation, None);
+        assert!(failure
+            .to_string()
+            .contains("add action has negative size -1"));
     }
 
-    #[test]
-    fn on_add_negative_size_trips_is_incremental_safe() {
-        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
-        acc.on_add(-1).unwrap();
-        assert!(!acc.delta.is_incremental_safe);
-        assert!(acc.current_commit_saw_file_action);
-    }
-
-    // ===== remove =====
-
-    #[test]
-    fn on_remove_with_size_decrements_files_and_bytes() {
+    #[rstest::rstest]
+    fn first_finalized_failure_survives_other_commits(#[values(false, true)] newest_fails: bool) {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_remove("p", Some(50)).unwrap();
-        assert_eq!(acc.delta.file_stats.net_files(), -1);
-        assert_eq!(acc.delta.file_stats.net_bytes(), -50);
-        assert!(acc.delta.is_incremental_safe);
+        for version in (1..=3).rev() {
+            let location = format!("memory:///_delta_log/{version:020}.json");
+            acc.process_batch_start(&location).unwrap();
+            let operation = if version == 2 {
+                "COMPUTE STATS"
+            } else if version == 1 || newest_fails {
+                "UNKNOWN OPERATION"
+            } else {
+                "WRITE"
+            };
+            acc.on_commit_add(100).unwrap();
+            acc.on_commit_info(Some(operation), None);
+        }
+        acc.process_commit_file_end().unwrap();
+        let FileStatsValidity::Invalid(failure) = acc.delta.file_stats_validity else {
+            panic!("expected invalid file statistics");
+        };
+        let version = if newest_fails { 3 } else { 1 };
+        assert_eq!(
+            failure.source,
+            FileStatsSource::Commit {
+                version,
+                location: format!("memory:///_delta_log/{version:020}.json"),
+            }
+        );
+        assert_eq!(failure.operation.as_deref(), Some("UNKNOWN OPERATION"));
+        assert!(acc.current_commit.operation.is_none());
     }
 
     #[test]
-    fn on_remove_missing_size_trips_is_incremental_safe() {
+    fn empty_batch_preserves_pending_adds_and_late_operation() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_remove("p", None).unwrap();
-        assert!(!acc.delta.is_incremental_safe);
-        assert!(acc.current_commit_saw_file_action);
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
+        acc.on_commit_add(100).unwrap();
+        let mut visitor = CommitCrcVisitor { acc: &mut acc };
+        let (names, _) = visitor.selected_column_names_and_types();
+        let getters: Vec<&dyn GetData<'_>> = vec![&(); names.len()];
+        visitor.visit(0, &getters).unwrap();
+        acc.on_commit_info(Some("WRITE"), None);
+        acc.process_commit_file_end().unwrap();
+        assert_eq!(acc.delta.file_stats_validity, FileStatsValidity::Valid);
+        assert_eq!(acc.delta.file_stats.net_bytes(), 100);
+        assert_eq!(acc.delta.file_stats.net_files(), 1);
     }
 
     #[test]
-    fn on_remove_negative_size_trips_is_incremental_safe() {
-        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
-        acc.on_remove("p", Some(-1)).unwrap();
-        assert!(!acc.delta.is_incremental_safe);
-        assert!(acc.current_commit_saw_file_action);
+    fn staged_commit_source_preserves_version_and_url() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        let location = concat!(
+            "memory:///_delta_log/_staged_commits/",
+            "00000000000000000039.00000000-0000-0000-0000-000000000000.json"
+        );
+        acc.process_batch_start(location).unwrap();
+        acc.on_remove("part-a", None).unwrap();
+        acc.on_commit_info(Some("DELETE"), None);
+        acc.process_commit_file_end().unwrap();
+        let FileStatsValidity::Invalid(failure) = acc.delta.file_stats_validity else {
+            panic!("expected invalid file statistics");
+        };
+        assert_eq!(
+            failure.source,
+            FileStatsSource::Commit {
+                version: 39,
+                location: location.into()
+            }
+        );
     }
 
     // ===== domainMetadata =====
@@ -819,7 +999,9 @@ mod tests {
     fn accumulator_with_seed_histogram_inserts_into_seeded_bin() {
         let seed = FileSizeHistogram::create_empty_with_boundaries(vec![0, 200, 1000]).unwrap();
         let mut acc = CrcReplayAccumulator::new(Some(seed));
-        acc.on_add(150).unwrap();
+        acc.on_commit_add(150).unwrap();
+        acc.on_commit_info(Some("WRITE"), None);
+        acc.process_commit_file_end().unwrap();
         let hist = acc.delta.file_stats.net_histogram.as_ref().unwrap();
         assert_eq!(hist.sorted_bin_boundaries(), &[0, 200, 1000]);
         assert_eq!(hist.file_counts()[0], 1);
@@ -829,14 +1011,16 @@ mod tests {
     #[test]
     fn accumulator_with_no_seed_histogram_keeps_delta_histogram_none() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_add(150).unwrap();
+        acc.on_commit_add(150).unwrap();
         assert!(acc.delta.file_stats.net_histogram.is_none());
     }
 
     #[test]
     fn into_crc_delta_transfers_accumulated_state() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_add(42).unwrap();
+        acc.on_commit_add(42).unwrap();
+        acc.on_commit_info(Some("WRITE"), None);
+        acc.process_commit_file_end().unwrap();
         let delta = acc.into_crc_delta();
         assert_eq!(delta.file_stats.net_files(), 1);
         assert_eq!(delta.file_stats.net_bytes(), 42);
@@ -856,7 +1040,10 @@ mod tests {
     #[test]
     fn checkpoint_visitor_schema_length_matches_column_indices() {
         let mut acc = CrcReplayAccumulator::new(None);
-        let visitor = CheckpointCrcVisitor { acc: &mut acc };
+        let visitor = CheckpointCrcVisitor {
+            acc: &mut acc,
+            version: 0,
+        };
         let (names, types) = visitor.selected_column_names_and_types();
         let expected = N_SHARED_SINGLE_LEAF_COLS
             + PROTOCOL_LEAVES.as_ref().0.len()
@@ -874,48 +1061,58 @@ mod tests {
     fn per_commit_invariant_holds_when_file_action_and_commit_info_split_across_batches_of_one_file(
     ) {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v1.json");
-        acc.on_add(0).unwrap();
-        acc.process_batch_start("v1.json");
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
+        acc.on_commit_add(0).unwrap();
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
         acc.on_commit_info(Some("WRITE"), None);
-        acc.process_commit_file_end();
-        assert!(acc.delta.is_incremental_safe);
+        acc.process_commit_file_end().unwrap();
+        assert_eq!(acc.delta.file_stats_validity, FileStatsValidity::Valid);
     }
 
     #[test]
     fn per_commit_invariant_trips_when_file_action_has_no_safe_op_across_batches() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v1.json");
-        acc.on_add(0).unwrap();
-        acc.process_batch_start("v1.json");
-        acc.process_commit_file_end();
-        assert!(!acc.delta.is_incremental_safe);
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
+        acc.on_commit_add(0).unwrap();
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
+        acc.process_commit_file_end().unwrap();
+        assert_ne!(acc.delta.file_stats_validity, FileStatsValidity::Valid);
     }
 
     #[test]
     fn per_commit_invariant_trips_when_file_action_has_commit_info_but_no_operation() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v1.json");
-        acc.on_add(100).unwrap();
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
+        acc.on_commit_add(100).unwrap();
         acc.on_commit_info(None, Some(42));
-        acc.process_commit_file_end();
-        assert!(!acc.delta.is_incremental_safe);
+        acc.process_commit_file_end().unwrap();
+        assert_ne!(acc.delta.file_stats_validity, FileStatsValidity::Valid);
     }
 
     #[test]
     fn is_first_commit_stays_true_across_batches_of_same_file() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v2.json");
-        acc.process_batch_start("v2.json");
-        acc.process_batch_start("v2.json");
+        acc.process_batch_start("memory:///_delta_log/00000000000000000002.json")
+            .unwrap();
+        acc.process_batch_start("memory:///_delta_log/00000000000000000002.json")
+            .unwrap();
+        acc.process_batch_start("memory:///_delta_log/00000000000000000002.json")
+            .unwrap();
         assert!(acc.is_first_commit);
     }
 
     #[test]
     fn is_first_commit_becomes_false_after_file_transition() {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.process_batch_start("v2.json");
-        acc.process_batch_start("v1.json");
+        acc.process_batch_start("memory:///_delta_log/00000000000000000002.json")
+            .unwrap();
+        acc.process_batch_start("memory:///_delta_log/00000000000000000001.json")
+            .unwrap();
         assert!(!acc.is_first_commit);
     }
 

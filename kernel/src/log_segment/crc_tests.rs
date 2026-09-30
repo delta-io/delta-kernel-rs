@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rstest::rstest;
 use serde_json::{json, Value};
-use test_utils::delta_path_for_version;
+use test_utils::{add_commit, delta_path_for_version};
 use url::Url;
 
 use super::LogSegment;
@@ -1108,7 +1108,7 @@ async fn test_adds_and_removes_accumulate() {
 // Three distinct ways a single commit can lose incremental safety.
 #[rstest]
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
-#[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
+#[case::add_with_unsafe_op(vec![commit_info("UNKNOWN OPERATION", None), add("a", 100)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
 #[tokio::test]
 async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
@@ -1383,4 +1383,149 @@ async fn test_incremental_build_from_reads_protocol_from_crc(
         &expected_protocol,
         "protocol_change@{protocol_change_version} crc={crc_version:?} mode={mode:?}"
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn compute_stats_replay_preserves_adjacent_writes_and_other_actions(
+    #[values(0, 1, 2)] operation_position: usize,
+    #[values(false, true)] data_change: bool,
+) -> DeltaResult<()> {
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store.clone());
+    let root = "memory:///";
+    let mut rewritten = vec![add("a", 100), add("b", 20000)];
+    for action in &mut rewritten {
+        action["add"]["dataChange"] = json!(data_change);
+        action["add"]["stats"] = json!(r#"{"numRecords":1}"#);
+    }
+    rewritten.insert(operation_position, commit_info("COMPUTE STATS", None));
+    rewritten.extend([
+        protocol(protocol_b()),
+        metadata(metadata_b()),
+        domain_metadata("stats-domain", "updated"),
+        set_txn("stats-app", 3, None),
+    ]);
+    for (version, actions) in [
+        (
+            0,
+            vec![
+                commit_info("CREATE TABLE", None),
+                protocol(protocol_a()),
+                metadata(metadata_a()),
+                add("a", 100),
+                add("b", 20000),
+            ],
+        ),
+        (1, rewritten.clone()),
+        (2, vec![commit_info("WRITE", None), add("c", 50)]),
+        (3, rewritten),
+        (4, vec![remove("c", Some(50)), commit_info("DELETE", None)]),
+    ] {
+        add_commit(
+            root,
+            store.as_ref(),
+            version,
+            actions
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await
+        .unwrap();
+    }
+    let base = Crc::try_from_json_bytes(
+        crc_json(&protocol_a(), &metadata_a(), None, &[100, 20000])
+            .to_string()
+            .as_bytes(),
+        0,
+    )?;
+    for (version, sizes) in [
+        (1, vec![100, 20000]),
+        (3, vec![100, 20000, 50]),
+        (4, vec![100, 20000]),
+    ] {
+        let segment = LogSegment::for_snapshot_impl(
+            engine.storage_handler().as_ref(),
+            Url::parse("memory:///_delta_log/").unwrap(),
+            vec![],
+            None,
+            Some(version),
+            None,
+        )?;
+        let advanced = segment.build_crc_from_base(&engine, &base)?;
+        let mut expected_histogram = FileSizeHistogram::create_default();
+        for size in &sizes {
+            expected_histogram.insert(*size)?;
+        }
+        let stats = advanced.file_stats().unwrap();
+        assert_eq!(advanced.version, version);
+        assert_eq!(stats.num_files(), sizes.len() as i64);
+        assert_eq!(stats.table_size_bytes(), sizes.iter().sum::<i64>());
+        assert_eq!(stats.file_size_histogram(), Some(&expected_histogram));
+        assert_eq!(advanced.metadata, metadata_b());
+        assert_eq!(advanced.protocol, protocol_b());
+        assert_eq!(
+            advanced.domain_metadata_state.expect_partial()["stats-domain"].configuration(),
+            "updated"
+        );
+        assert_eq!(
+            advanced.set_transaction_state.expect_partial()["stats-app"].version,
+            3
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_checkpoint_add_retains_source_through_checksum_rejection() {
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store.clone());
+    let actions = [
+        protocol(protocol_a()),
+        metadata(metadata_a()),
+        add("bad", -1),
+        json!({"checkpointMetadata": {"version": 38}}),
+    ];
+    put(
+        &store,
+        38,
+        "checkpoint.00000000-0000-0000-0000-000000000000.json",
+        &actions
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .await;
+    let segment = LogSegment::for_snapshot_impl(
+        engine.storage_handler().as_ref(),
+        Url::parse("memory:///_delta_log/").unwrap(),
+        vec![],
+        None,
+        Some(38),
+        None,
+    )
+    .unwrap();
+    let crc = segment.build_crc_from_checkpoint(&engine).unwrap().unwrap();
+    let error = crate::crc::try_write_crc_file(
+        &engine,
+        &Url::parse("memory:///_delta_log/00000000000000000038.crc").unwrap(),
+        &crc,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::KernelError::ChecksumWriteUnsupported(_)
+    ));
+    let message = error.to_string();
+    for expected in [
+        "version 38",
+        "checkpoint version 38",
+        "add action has negative size -1",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(!message.contains("operation"));
 }

@@ -31,13 +31,16 @@ use delta_kernel_derive::internal_api;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
-pub(crate) use file_stats::{is_incremental_safe_operation, size_to_u64, FileStatsDelta};
+pub(crate) use file_stats::{
+    classify_file_stats_operation, size_to_u64, FileStatsDelta, FileStatsOperation,
+};
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
-pub use state::{DomainMetadataState, FileStatsState, SetTransactionState};
+pub use state::{DomainMetadataState, FileStatsFailure, FileStatsState, SetTransactionState};
+pub(crate) use state::{FileStatsFailureReason, FileStatsSource, FileStatsValidity};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
@@ -321,12 +324,7 @@ impl TryFrom<&Crc> for CrcRaw {
     type Error = KernelError;
     fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
         crc.validate()?;
-        let FileStatsState::Complete(stats) = &crc.file_stats_state else {
-            return Err(KernelError::ChecksumWriteUnsupported(format!(
-                "Cannot serialize CRC with {:?} file stats",
-                crc.file_stats_state
-            )));
-        };
+        let stats = crc.file_stats_state.stats_for_write(crc.version)?;
         Ok(CrcRaw {
             txn_id: None,
             table_size_bytes: stats.table_size_bytes,
@@ -1367,7 +1365,7 @@ mod tests {
             0,
             Default::default(),
             valid_protocol(),
-            FileStatsState::Indeterminate,
+            FileStatsState::indeterminate(),
             None,
             Default::default(),
             Default::default(),
@@ -1670,12 +1668,12 @@ mod tests {
     #[test]
     fn ser_indeterminate_file_stats_returns_error() {
         let crc = Crc {
-            file_stats_state: FileStatsState::Indeterminate,
+            file_stats_state: FileStatsState::indeterminate(),
             ..Default::default()
         };
         let err = serde_json::to_string(&crc).unwrap_err().to_string();
         assert!(
-            err.contains("Cannot serialize CRC"),
+            err.contains("originating cause unavailable in the supplied CRC state"),
             "expected serialize-rejection error, got: {err}"
         );
     }
@@ -1683,7 +1681,7 @@ mod tests {
     #[test]
     fn try_from_ref_indeterminate_returns_checksum_write_unsupported() {
         let crc = Crc {
-            file_stats_state: FileStatsState::Indeterminate,
+            file_stats_state: FileStatsState::indeterminate(),
             ..Default::default()
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();

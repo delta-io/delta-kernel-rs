@@ -29,8 +29,8 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, begin_transaction, copy_directory, insert_data, test_table_setup,
-    test_table_setup_mt,
+    add_commit, begin_transaction, copy_directory, create_default_engine_with_batch, insert_data,
+    read_actions_from_commit, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -628,9 +628,9 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
-    // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
+    // ===== WHEN: Commit a non-incremental operation (UNKNOWN OPERATION) =====
     let committed = begin_transaction(snapshot_v1.clone(), engine.as_ref())?
-        .with_operation("ANALYZE STATS".to_string())
+        .with_operation("UNKNOWN OPERATION".to_string())
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1091,16 +1091,32 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
     let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
     // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
     begin_transaction(snap, engine.as_ref())?
-        .with_operation("ANALYZE STATS".to_string())
+        .with_operation("UNKNOWN OPERATION".to_string())
         .commit(engine.as_ref())?
         .unwrap_committed();
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh.crc_at_version().is_none());
+    let error = fresh
+        .write_checksum(&NoParquetReadsEngine {
+            inner: engine.clone(),
+        })
+        .unwrap_err();
     assert!(matches!(
-        fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        error,
+        delta_kernel::KernelError::ChecksumWriteUnsupported(_)
     ));
+    let message = error.to_string();
+    for expected in [
+        "version 2",
+        "checkpoint 1",
+        "commit version 2",
+        "00000000000000000002.json",
+        "UNKNOWN OPERATION",
+        "unsupported operation",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
 
     Ok(())
 }
@@ -2169,7 +2185,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         committed.post_commit_snapshot().unwrap().clone()
     } else {
         let committed = begin_transaction(fresh_v1, engine.as_ref())?
-            .with_operation("ANALYZE STATS".to_string())
+            .with_operation("UNKNOWN OPERATION".to_string())
             .commit(engine.as_ref())?
             .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
@@ -2435,9 +2451,9 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
     .await?
     .unwrap_post_commit_snapshot();
 
-    // ===== WHEN: a non-incremental operation (ANALYZE STATS) commits at v2 =====
+    // ===== WHEN: a non-incremental operation (UNKNOWN OPERATION) commits at v2 =====
     begin_transaction(snap, engine.as_ref())?
-        .with_operation("ANALYZE STATS".to_string())
+        .with_operation("UNKNOWN OPERATION".to_string())
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -2802,5 +2818,261 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaR
     }))
     .is_err());
 
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsCrcRoot {
+    Disk,
+    OnDemand,
+    InMemory,
+    Checkpoint,
+    History,
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn compute_stats_preserves_crc_across_roots_and_refreshes_scan_statistics(
+    #[values(
+        StatsCrcRoot::Disk,
+        StatsCrcRoot::OnDemand,
+        StatsCrcRoot::InMemory,
+        StatsCrcRoot::Checkpoint,
+        StatsCrcRoot::History
+    )]
+    root: StatsCrcRoot,
+    #[values(0, 1, 2)] operation_position: usize,
+    #[values(1, 2, 100)] batch_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let mut base = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "Test/1.0",
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    for values in [vec![1, 2, 3], vec![4, 5, 6]] {
+        base = insert_data(base, &engine, vec![Arc::new(Int32Array::from(values))])
+            .await?
+            .unwrap_post_commit_snapshot();
+    }
+    let expected = base.get_file_stats_if_present().unwrap();
+    match root {
+        StatsCrcRoot::Disk | StatsCrcRoot::OnDemand => {
+            base.write_checksum(engine.as_ref())?;
+        }
+        StatsCrcRoot::Checkpoint => {
+            base = base.checkpoint(engine.as_ref(), None)?.1;
+        }
+        _ => {}
+    }
+    let adds: Vec<_> = [1, 2]
+        .into_iter()
+        .flat_map(|version| read_actions_from_commit(&table_url, version, "add").unwrap())
+        .collect();
+    // Missing statistics are valid. Recomputing them must affect normal Add reconciliation.
+    for version in [3, 4] {
+        let mut actions = Vec::new();
+        for (index, add) in adds.iter().enumerate() {
+            let mut add = add.clone();
+            if version == 3 {
+                add.as_object_mut().unwrap().remove("stats");
+            } else {
+                add["stats"] = serde_json::json!(serde_json::json!({
+                    "numRecords": 3,
+                    "minValues": {"id": index * 3 + 1},
+                    "maxValues": {"id": index * 3 + 3},
+                    "nullCount": {"id": 0}
+                })
+                .to_string());
+            }
+            add["dataChange"] = serde_json::json!(false);
+            actions.push(serde_json::json!({"add": add}));
+        }
+        actions.insert(
+            operation_position,
+            serde_json::json!({"commitInfo": {"operation": "COMPUTE STATS"}}),
+        );
+        add_commit(
+            table_url.as_str(),
+            &LocalFileSystem::new(),
+            version,
+            actions
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await?;
+    }
+    let replay_engine = create_default_engine_with_batch(&table_url, Some(batch_size))?;
+    let replay = if root == StatsCrcRoot::OnDemand {
+        IncrementalReplay::Disabled
+    } else {
+        IncrementalReplay::Unlimited
+    };
+    let snapshot = if root == StatsCrcRoot::InMemory {
+        Snapshot::builder_from(base)
+            .with_incremental_crc_replay(replay)
+            .build(replay_engine.as_ref())?
+    } else {
+        Snapshot::builder_for(&table_path)
+            .with_incremental_crc_replay(replay)
+            .build(replay_engine.as_ref())?
+    };
+    if matches!(root, StatsCrcRoot::Disk | StatsCrcRoot::InMemory) {
+        assert_eq!(snapshot.get_file_stats_if_present(), Some(expected.clone()));
+    }
+    let (result, written) = snapshot.write_checksum(replay_engine.as_ref())?;
+    assert_eq!(result, ChecksumWriteResult::Written);
+    assert_eq!(written.crc_at_version().unwrap().version, 4);
+    assert_eq!(written.get_file_stats_if_present(), Some(expected.clone()));
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.get_file_stats_if_present(), Some(expected.clone()));
+
+    for (version, expected_records) in [(3, None), (4, Some(3))] {
+        let snapshot = Snapshot::builder_for(&table_path)
+            .at_version(version)
+            .build(engine.as_ref())?;
+        let scan = snapshot.clone().scan_builder().build()?;
+        let mut records = Vec::new();
+        for batch in scan.scan_metadata(engine.as_ref())? {
+            records = batch?.visit_scan_files(records, |records, file| {
+                records.push(file.stats.map(|stats| stats.num_records));
+            })?;
+        }
+        assert_eq!(records, vec![expected_records; 2]);
+        assert_eq!(
+            snapshot
+                .write_checksum(engine.as_ref())?
+                .1
+                .get_file_stats_if_present(),
+            Some(expected.clone())
+        );
+    }
+    let mut transaction =
+        begin_transaction(written.clone(), engine.as_ref())?.with_operation("DELETE".into());
+    for batch in written
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+    {
+        transaction.remove_files(batch?.scan_files);
+    }
+    let removed = transaction
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let disk = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(
+        removed.get_file_stats_if_present(),
+        disk.get_file_stats_if_present()
+    );
+    let stats = disk.get_file_stats_if_present().unwrap();
+    assert_eq!(stats.num_files(), 0);
+    assert_eq!(stats.table_size_bytes(), 0);
+    assert!(stats
+        .file_size_histogram()
+        .unwrap()
+        .file_counts()
+        .iter()
+        .all(|count| *count == 0));
+    assert!(stats
+        .file_size_histogram()
+        .unwrap()
+        .total_bytes()
+        .iter()
+        .all(|bytes| *bytes == 0));
+    Ok(())
+}
+
+#[rstest]
+#[case::unknown_operation(
+    r#"{"commitInfo":{"operation":"RESTORE"}}"#,
+    "RESTORE",
+    "unsupported operation"
+)]
+#[case::missing_operation(
+    r#"{"add":{"path":"part-a","size":100}}"#,
+    "commitInfo.operation is missing",
+    "commitInfo.operation is missing"
+)]
+#[case::missing_remove_size(
+    r#"{"remove":{"path":"part-a"}}
+{"commitInfo":{"operation":"DELETE"}}"#,
+    "DELETE",
+    "has no size"
+)]
+#[case::negative_remove(
+    r#"{"remove":{"path":"part-a","size":-2}}
+{"commitInfo":{"operation":"DELETE"}}"#,
+    "DELETE",
+    "negative size -2"
+)]
+#[case::negative_add(
+    r#"{"add":{"path":"part-a","size":-1}}
+{"commitInfo":{"operation":"COMPUTE STATS"}}"#,
+    "COMPUTE STATS",
+    "negative size -1"
+)]
+#[tokio::test]
+async fn crc_failure_survives_snapshot_updates_without_log_reads(
+    #[case] actions: &str,
+    #[case] operation: &str,
+    #[case] reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, table_path, _) = test_table_setup()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let engine = create_default_engine_with_batch(&table_url, Some(1))?;
+    let base = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    add_commit(
+        table_url.as_str(),
+        &LocalFileSystem::new(),
+        1,
+        actions.to_owned(),
+    )
+    .await?;
+    let failed = Snapshot::builder_from(base)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert!(failed
+        .crc_at_version()
+        .unwrap()
+        .file_stats_state()
+        .is_indeterminate());
+    let committed = begin_transaction(failed.clone(), engine.as_ref())?
+        .with_operation("WRITE".into())
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let updated = Snapshot::builder_from(failed)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    for snapshot in [committed, updated] {
+        let error = snapshot.write_checksum(&FailingEngine).unwrap_err();
+        assert!(matches!(
+            error,
+            delta_kernel::KernelError::ChecksumWriteUnsupported(_)
+        ));
+        let message = error.to_string();
+        for expected in [
+            "version 2",
+            "commit version 1",
+            "00000000000000000001.json",
+            operation,
+            reason,
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        if actions.contains("remove") {
+            assert!(message.contains("part-a"), "{message}");
+        }
+    }
     Ok(())
 }

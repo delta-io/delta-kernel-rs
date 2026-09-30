@@ -188,6 +188,10 @@ fn with_engine_info_impl(
 /// commit and visible to anyone who describes the table history. This CONSUMES the transaction
 /// handle and returns a new handle for the updated transaction.
 ///
+/// With `COMPUTE STATS`, every Add must refresh statistics for an existing logical file,
+/// preserving its path, deletion vector, and size. Kernel trusts the operation name and
+/// excludes these Adds from CRC file statistics.
+///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle. CONSUMES the transaction handle.

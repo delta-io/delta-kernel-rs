@@ -17,7 +17,10 @@ use crate::actions::{
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
+use crate::crc::{
+    classify_file_stats_operation, CrcDelta, FileStatsDelta, FileStatsFailure,
+    FileStatsFailureReason, FileStatsOperation, FileStatsSource, FileStatsValidity,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -579,8 +582,13 @@ impl<S> Transaction<S> {
                     prepare_duration,
                     committer_duration,
                 );
-                let crc_delta =
-                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
+                let crc_delta = self.build_crc_delta(
+                    file_stats,
+                    in_commit_timestamp,
+                    dm_changes,
+                    commit_version,
+                    &file_meta,
+                )?;
                 Ok(CommitResult::Committed(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
@@ -1449,6 +1457,8 @@ impl<S> Transaction<S> {
         file_stats: FileStatsDelta,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
+        commit_version: Version,
+        file_meta: &FileMeta,
     ) -> DeltaResult<CrcDelta> {
         // TODO: drop these conversions by migrating the upstream chain
         //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
@@ -1463,15 +1473,34 @@ impl<S> Transaction<S> {
             .iter()
             .map(|txn| (txn.app_id.clone(), txn.clone()))
             .collect();
-        // Although `remove.size` is optional per the Delta protocol, the kernel write path
-        // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
-        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
-        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
-        // present, and only operation classification can flip `is_incremental_safe`.
-        let is_incremental_safe = self
-            .operation
-            .as_deref()
-            .is_some_and(is_incremental_safe_operation);
+        let policy = self.operation.as_deref().map(classify_file_stats_operation);
+        let file_stats_validity = match policy {
+            Some(FileStatsOperation::CountAdds | FileStatsOperation::IgnoreAdds) => {
+                FileStatsValidity::Valid
+            }
+            _ => FileStatsValidity::Invalid(FileStatsFailure {
+                source: FileStatsSource::Commit {
+                    version: commit_version,
+                    location: file_meta.location.to_string(),
+                },
+                operation: self.operation.clone(),
+                reason: if policy.is_some() {
+                    FileStatsFailureReason::UnsupportedOperation
+                } else {
+                    FileStatsFailureReason::MissingOperation
+                },
+            }),
+        };
+        // Gross action metrics use the original delta; CRC statistics ignore statistics re-adds.
+        let file_stats = if policy == Some(FileStatsOperation::IgnoreAdds) {
+            let boundaries = file_stats
+                .net_histogram
+                .as_ref()
+                .map(|h| h.sorted_bin_boundaries());
+            FileStatsDelta::try_compute_for_txn(&[], &self.remove_files_metadata, boundaries)?
+        } else {
+            file_stats
+        };
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1483,7 +1512,7 @@ impl<S> Transaction<S> {
             domain_metadata,
             set_transactions,
             in_commit_timestamp,
-            is_incremental_safe,
+            file_stats_validity,
         })
     }
 
