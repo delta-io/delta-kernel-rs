@@ -32,15 +32,22 @@ fn table_path(catalog: &str, schema: &str, table: &str) -> String {
     )
 }
 
-/// An HTTP client for interacting with the Unity Catalog API.
+/// Connector-facing HTTP client for the Unity Catalog Delta-Tables API.
+///
+/// A connector calls this directly for the read and setup path: loading a table, vending storage
+/// credentials, the config handshake, table and staging-table creation, and metrics reporting.
+/// Cheap to clone.
+///
+/// Committing a new version is a separate path: it goes through the `UpdateTableClient` trait
+/// (implemented by `UCUpdateTableRestClient`), which the kernel committer drives.
 #[derive(Debug, Clone)]
-pub struct UCClient {
+pub struct UCDeltaTableClient {
     http_client: reqwest::Client,
     config: ClientConfig,
     base_url: Url,
 }
 
-impl UCClient {
+impl UCDeltaTableClient {
     /// Create a new client from [ClientConfig].
     pub fn new(config: ClientConfig) -> Result<Self> {
         Ok(Self {
