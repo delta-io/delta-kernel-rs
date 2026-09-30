@@ -2336,7 +2336,7 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
 #[case::no_column_mapping(None)]
 #[case::name_column_mapping(Some("name"))]
 #[case::id_column_mapping(Some("id"))]
-fn snapshot_expected_stats_schemas_match_scan_output(#[case] column_mapping_mode: Option<&str>) {
+fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mode: Option<&str>) {
     let table_root = "memory:///expected-stats-schemas/";
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
@@ -2359,17 +2359,16 @@ fn snapshot_expected_stats_schemas_match_scan_output(#[case] column_mapping_mode
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let extra_indexed_columns = vec![column_name!("value"), column_name!("unresolvable_extra")];
-    let expected = snapshot
-        .expected_stats_schemas(&extra_indexed_columns)
-        .unwrap()
-        .expect("stats should include indexed data columns");
-    let scan = snapshot
+    let builder = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all_struct_with_extra_indexed(
             extra_indexed_columns,
-        ))
-        .build()
-        .unwrap();
+        ));
+    let expected = builder
+        .stats_output_schemas()
+        .unwrap()
+        .expect("stats should include indexed data columns");
+    let scan = builder.build().unwrap();
 
     assert_eq!(
         scan.physical_stats_output_schema.as_ref(),
@@ -2407,7 +2406,7 @@ fn snapshot_expected_stats_schemas_match_scan_output(#[case] column_mapping_mode
 }
 
 #[test]
-fn snapshot_expected_stats_schemas_returns_none_without_data_columns() {
+fn scan_builder_stats_output_schemas_returns_none_without_data_columns() {
     let table_root = "memory:///expected-stats-schemas-empty/";
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
@@ -2423,14 +2422,14 @@ fn snapshot_expected_stats_schemas_returns_none_without_data_columns() {
     .unwrap()
     .unwrap_committed();
 
-    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-    assert!(snapshot.expected_stats_schemas(&[]).unwrap().is_none());
-
-    let scan = snapshot
+    let builder = Snapshot::builder_for(table_root)
+        .build(&engine)
+        .unwrap()
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
-        .build()
-        .unwrap();
+        .with_stats(StatsOptions::all_struct());
+    assert!(builder.stats_output_schemas().unwrap().is_none());
+
+    let scan = builder.build().unwrap();
     assert!(scan.physical_stats_output_schema.is_none());
 }
 
@@ -2438,7 +2437,7 @@ fn snapshot_expected_stats_schemas_returns_none_without_data_columns() {
 #[case::no_column_mapping(None)]
 #[case::name_column_mapping(Some("name"))]
 #[case::id_column_mapping(Some("id"))]
-fn snapshot_expected_stats_schemas_respect_explicit_columns_and_partitions(
+fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
     #[case] column_mapping_mode: Option<&str>,
 ) {
     let table_root = "memory:///expected-stats-schemas-explicit/";
@@ -2468,17 +2467,16 @@ fn snapshot_expected_stats_schemas_respect_explicit_columns_and_partitions(
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let extra_indexed_columns = vec![column_name!("other")];
-    let expected = snapshot
-        .expected_stats_schemas(&extra_indexed_columns)
-        .unwrap()
-        .expect("explicit and extra stats columns should be selected");
-    let scan = snapshot
+    let builder = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all_struct_with_extra_indexed(
             extra_indexed_columns,
-        ))
-        .build()
-        .unwrap();
+        ));
+    let expected = builder
+        .stats_output_schemas()
+        .unwrap()
+        .expect("explicit and extra stats columns should be selected");
+    let scan = builder.build().unwrap();
 
     assert_eq!(
         scan.physical_stats_output_schema.as_ref(),
@@ -2493,6 +2491,82 @@ fn snapshot_expected_stats_schemas_respect_explicit_columns_and_partitions(
     let info = stats_struct_field(null_count, "info");
     assert!(info.field("name").is_some());
     assert!(info.field("age").is_none());
+}
+
+#[rstest]
+#[case::no_column_mapping(None)]
+#[case::name_column_mapping(Some("name"))]
+#[case::id_column_mapping(Some("id"))]
+fn scan_builder_stats_output_schemas_follow_struct_columns(
+    #[case] column_mapping_mode: Option<&str>,
+) {
+    let table_root = format!(
+        "memory:///selected-stats-schemas-{}/",
+        column_mapping_mode.unwrap_or("none")
+    );
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
+    let mut create_builder = create_table(&table_root, schema, "DefaultEngine");
+    if let Some(mode) = column_mapping_mode {
+        create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    create_builder
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_root).build(&engine).unwrap();
+    let builder = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(col!("id").gt(lit(400i64))))
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("name")]));
+
+    let schemas = builder
+        .stats_output_schemas()
+        .unwrap()
+        .expect("the requested column should produce structured statistics");
+    let logical_min_values = stats_struct_field(&schemas.logical, MIN_VALUES);
+    assert!(logical_min_values.field("name").is_some());
+    assert!(logical_min_values.field("id").is_none());
+    let physical_min_values = stats_struct_field(&schemas.physical, MIN_VALUES);
+    if column_mapping_mode.is_some() {
+        assert!(physical_min_values
+            .fields()
+            .all(|field| field.name().starts_with("col-")));
+    } else {
+        assert_eq!(physical_min_values, logical_min_values);
+    }
+
+    let scan = builder.build().unwrap();
+    assert_eq!(
+        scan.physical_stats_output_schema.as_ref(),
+        Some(&schemas.physical)
+    );
+}
+
+#[rstest]
+#[case::json_only(StatsOptions::json_only())]
+#[case::none(StatsOptions::none())]
+#[case::empty_columns(StatsOptions::struct_columns(Vec::new()))]
+fn scan_builder_stats_output_schemas_returns_none_without_struct_output(
+    #[case] stats: StatsOptions,
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let builder = Snapshot::builder_for(url)
+        .build(&engine)
+        .unwrap()
+        .scan_builder()
+        .with_stats(stats);
+
+    assert!(builder.stats_output_schemas().unwrap().is_none());
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.

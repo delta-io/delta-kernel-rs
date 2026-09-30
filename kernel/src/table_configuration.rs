@@ -16,11 +16,12 @@ use delta_kernel_derive::internal_api;
 use tracing::warn;
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{Metadata, Protocol, NULL_COUNT};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+use crate::scan::StatsOutputSchemas;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
@@ -41,19 +42,6 @@ use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, KernelError, Version};
-
-/// Aligned logical and physical schemas for structured file statistics.
-///
-/// The schemas have the same shape and field order. They differ only in the names of table
-/// columns when column mapping is enabled. All field metadata is removed.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct ExpectedStatsSchemas {
-    /// Schema using logical table column names.
-    pub logical: SchemaRef,
-    /// Schema using physical column names as encoded in Delta statistics.
-    pub physical: SchemaRef,
-}
 
 /// Information about in-commit timestamp enablement state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,19 +310,22 @@ impl TableConfiguration {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
-    /// Generates aligned logical and physical schemas for structured file statistics.
-    ///
-    /// `extra_indexed_columns` use logical table column names. Resolvable columns are always
-    /// included, even when they fall outside the configured indexed-column set. Unresolvable
-    /// columns are omitted with a warning.
-    pub(crate) fn build_expected_stats_schemas(
+    /// Builds the structured statistics schemas for all indexed and extra-indexed columns.
+    pub(crate) fn build_indexed_stats_output_schemas(
         &self,
         extra_indexed_columns: &[ColumnName],
-    ) -> DeltaResult<Option<ExpectedStatsSchemas>> {
-        let logical_schema = self.logical_schema_without_partition_columns();
+    ) -> DeltaResult<Option<StatsOutputSchemas>> {
+        let logical_data_schema = self.logical_schema_without_partition_columns();
+        let logical_schema = self.logical_schema();
         let column_mapping_mode = self.column_mapping_mode();
         let required_logical_columns: Vec<_> = extra_indexed_columns
             .iter()
+            .filter(|column| {
+                column
+                    .path()
+                    .first()
+                    .is_some_and(|name| !self.logical_partition_columns().contains(name))
+            })
             .filter_map(|logical_column| {
                 get_any_level_column_physical_name(
                     &logical_schema,
@@ -360,13 +351,25 @@ impl TableConfiguration {
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
         };
         let logical_columns = stats_column_names(
-            &logical_schema,
+            &logical_data_schema,
             &logical_config,
             Some(&required_logical_columns),
         );
+
+        self.build_selected_stats_output_schemas(&logical_columns)
+    }
+
+    /// Builds the structured statistics schemas for explicitly selected logical columns.
+    pub(crate) fn build_selected_stats_output_schemas(
+        &self,
+        logical_columns: &[ColumnName],
+    ) -> DeltaResult<Option<StatsOutputSchemas>> {
         if logical_columns.is_empty() {
             return Ok(None);
         }
+
+        let logical_schema = self.logical_schema();
+        let column_mapping_mode = self.column_mapping_mode();
 
         let physical_columns = logical_columns
             .iter()
@@ -379,13 +382,20 @@ impl TableConfiguration {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        let logical = build_stats_schema_for_columns(&logical_schema, &logical_columns)?;
+        let logical = build_stats_schema_for_columns(
+            &self.logical_schema_without_partition_columns(),
+            logical_columns,
+        )?;
         let physical = build_stats_schema_for_columns(
             &self.physical_data_schema_without_partition_columns(),
             &physical_columns,
         )?;
 
-        Ok(Some(ExpectedStatsSchemas { logical, physical }))
+        if logical.field(NULL_COUNT).is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(StatsOutputSchemas { logical, physical }))
     }
 
     /// Generates the expected physical schema for file statistics.

@@ -75,6 +75,19 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
     (&ADD_FIELD),
 };
 
+/// Logical and physical schemas for the structured statistics emitted by a scan.
+///
+/// The schemas have the same shape and field order. They differ only in table column names when
+/// column mapping is enabled. Field metadata is removed from both schemas.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StatsOutputSchemas {
+    /// Schema using logical table column names.
+    pub logical: SchemaRef,
+    /// Schema using physical table column names.
+    pub physical: SchemaRef,
+}
+
 /// Initial checkpoint projection without JSON `add.stats`.
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -356,6 +369,20 @@ impl ScanBuilder {
         self
     }
 
+    /// Returns the logical and physical schemas for structured statistics emitted by this scan.
+    ///
+    /// The result reflects the current [`StatsOptions`]. It is `None` when structured statistics
+    /// are disabled or no data columns are selected. Predicate-only statistics used internally
+    /// for data skipping are not included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a column requested through [`StatsOptions::struct_columns`] cannot be
+    /// resolved, or when the selected fields cannot form a valid statistics schema.
+    pub fn stats_output_schemas(&self) -> DeltaResult<Option<StatsOutputSchemas>> {
+        build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
     /// the caller's own request or operation id. An empty id is treated as unset. When unset,
     /// behavior is unchanged.
@@ -459,11 +486,9 @@ impl ScanBuilder {
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
 
-        let physical_stats_output_schema = build_physical_stats_output_schema(
-            self.snapshot.table_configuration(),
-            &state_info,
-            &self.stats,
-        )?;
+        let stats_output_schemas =
+            build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)?;
+        let physical_stats_output_schema = stats_output_schemas.map(|schemas| schemas.physical);
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
@@ -744,40 +769,19 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
-/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
-///
-/// For example, if the caller requests `[a, b]` and the predicate references `c`,
-/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
-/// Returns `None` when no struct stats are requested. `Columns` names were already resolved
-/// strictly into `StateInfo::requested_physical_stats_columns` when the `StateInfo` was built.
-fn build_physical_stats_output_schema(
+fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
-    state_info: &StateInfo,
     stats: &StatsOptions,
-) -> DeltaResult<Option<SchemaRef>> {
+) -> DeltaResult<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::AllIndexed { .. } => Ok(state_info.physical_stats_schema.clone()),
-        StructStats::Columns { .. } => {
-            // The requested columns are also the output filter, so the emitted schema contains
-            // exactly those columns.
-            let requested = &state_info.requested_physical_stats_columns;
-            if requested.is_empty() {
-                return Ok(None);
-            }
-            let stats_schema = table_configuration
-                .build_expected_physical_stats_schema(Some(requested), Some(requested))?;
-            Ok(stats_schema_with_data_columns(stats_schema))
+        StructStats::AllIndexed { extra_indexed } => {
+            table_configuration.build_indexed_stats_output_schemas(extra_indexed)
+        }
+        StructStats::Columns { requested } => {
+            table_configuration.build_selected_stats_output_schemas(requested)
         }
     }
-}
-
-/// Returns `schema` only when it contains stats for at least one data column.
-///
-/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
-/// only when at least one data column survives stats filtering.
-fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
-    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {
