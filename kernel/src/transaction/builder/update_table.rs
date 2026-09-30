@@ -334,6 +334,7 @@ mod tests {
 
     use rstest::rstest;
 
+    use crate::arrow::array::{ArrayRef, Int32Array};
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
@@ -591,13 +592,19 @@ mod tests {
     }
 
     #[rstest]
-    fn alter_table_infers_data_change_after_actions_are_staged(
-        #[values(
-            StagedFileAction::Add,
-            StagedFileAction::Remove,
-            StagedFileAction::DeletionVectorUpdate
-        )]
-        action: StagedFileAction,
+    #[case::selected_add(StagedFileAction::Add, 1, true, true)]
+    #[case::empty_add(StagedFileAction::Add, 0, true, false)]
+    #[case::selected_remove(StagedFileAction::Remove, 1, true, true)]
+    #[case::empty_remove(StagedFileAction::Remove, 0, true, false)]
+    #[case::unselected_remove(StagedFileAction::Remove, 1, false, false)]
+    #[case::selected_dv_update(StagedFileAction::DeletionVectorUpdate, 1, true, true)]
+    #[case::empty_dv_update(StagedFileAction::DeletionVectorUpdate, 0, true, false)]
+    #[case::unselected_dv_update(StagedFileAction::DeletionVectorUpdate, 1, false, false)]
+    fn alter_table_infers_data_change_from_effective_file_actions(
+        #[case] action: StagedFileAction,
+        #[case] row_count: usize,
+        #[case] select_rows: bool,
+        #[case] expected_data_change: bool,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut transaction = snapshot
@@ -610,21 +617,30 @@ mod tests {
         assert!(!transaction.data_change);
 
         let data = || {
-            Box::new(ArrowEngineData::new(RecordBatch::new_empty(Arc::new(
-                ArrowSchema::empty(),
-            ))))
+            let values = Arc::new(Int32Array::from_iter_values(0..row_count as i32)) as ArrayRef;
+            Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter([("value", values)]).unwrap(),
+            ))
         };
         match action {
             StagedFileAction::Add => transaction.add_files_metadata.push(data()),
-            StagedFileAction::Remove => transaction
-                .remove_files_metadata
-                .push(crate::FilteredEngineData::with_all_rows_selected(data())),
-            StagedFileAction::DeletionVectorUpdate => transaction
-                .dv_matched_files
-                .push(crate::FilteredEngineData::with_all_rows_selected(data())),
+            StagedFileAction::Remove | StagedFileAction::DeletionVectorUpdate => {
+                let data = if select_rows {
+                    crate::FilteredEngineData::with_all_rows_selected(data())
+                } else {
+                    crate::FilteredEngineData::try_new(data(), vec![false; row_count])?
+                };
+                match action {
+                    StagedFileAction::Remove => transaction.remove_files_metadata.push(data),
+                    StagedFileAction::DeletionVectorUpdate => {
+                        transaction.dv_matched_files.push(data)
+                    }
+                    StagedFileAction::Add => unreachable!(),
+                }
+            }
         }
         transaction.resolve_data_change();
-        assert!(transaction.data_change);
+        assert_eq!(transaction.data_change, expected_data_change);
         Ok(())
     }
 

@@ -560,355 +560,6 @@ impl<S> Transaction<S> {
         Ok(self)
     }
 
-    /// Determines the commit type based on whether this is a create-table operation and whether
-    /// the table is catalog-managed.
-    fn determine_commit_type(
-        is_create: bool,
-        table_config: &crate::table_configuration::TableConfiguration,
-    ) -> CommitType {
-        let is_catalog_managed = table_config.is_catalog_managed();
-
-        // TODO: Handle UpgradeToCatalogManaged and DowngradeToPathBased when ALTER TABLE
-        // SET TBLPROPERTIES is supported.
-        match (is_create, is_catalog_managed) {
-            (true, true) => CommitType::CatalogManagedCreate,
-            (true, false) => CommitType::PathBasedCreate,
-            (false, true) => CommitType::CatalogManagedWrite,
-            (false, false) => CommitType::PathBasedWrite,
-        }
-    }
-
-    /// Validates that the committer type matches the commit type. A catalog committer must be
-    /// used for catalog-managed operations, and a non-catalog committer for path-based operations.
-    fn validate_commit_type(is_catalog_committer: bool, commit_type: &CommitType) -> Result<()> {
-        match (
-            is_catalog_committer,
-            commit_type.requires_catalog_committer(),
-        ) {
-            (true, true) | (false, false) => Ok(()),
-            (false, true) => Err(KernelError::generic(
-                "This table is catalog-managed and requires a catalog committer. \
-                 Pass one to the transaction builder's build method.",
-            )),
-            (true, false) => Err(KernelError::generic(
-                "This table is path-based and cannot be committed to with a catalog committer.",
-            )),
-        }
-    }
-
-    /// Builds the [`CommitMetadata`] for this transaction. Determines the commit type,
-    /// validates the committer, and assembles the protocol/metadata state.
-    fn create_commit_metadata(
-        &self,
-        commit_version: Version,
-        in_commit_timestamp: Option<i64>,
-        new_protocol: Option<Protocol>,
-        new_metadata: Option<Metadata>,
-        domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
-    ) -> Result<CommitMetadata> {
-        let log_root = LogRoot::new(self.effective_table_config.table_root().clone())?;
-        let is_create = self.is_create_table();
-        let commit_type = Self::determine_commit_type(is_create, &self.effective_table_config);
-        Self::validate_commit_type(self.committer.is_catalog_committer(), &commit_type)?;
-        // For create-table: previous P&M is None (no prior table), new P&M is set.
-        // For existing table with metadata change: previous P&M is from snapshot, new P&M
-        // is from effective config.
-        // For existing table without metadata change: previous P&M is from snapshot, new is None.
-        let (read_protocol, read_metadata, max_published_version) = if is_create {
-            (None, None, None)
-        } else {
-            let snap = self.read_snapshot()?;
-            let read_config = snap.table_configuration();
-            (
-                Some(read_config.protocol().clone()),
-                Some(read_config.metadata().clone()),
-                snap.log_segment().listed.max_published_version,
-            )
-        };
-        let protocol_metadata = CommitProtocolMetadata::try_new(
-            read_protocol,
-            read_metadata,
-            new_protocol,
-            new_metadata,
-        )?;
-        Ok(CommitMetadata::new(
-            log_root,
-            commit_version,
-            commit_type,
-            in_commit_timestamp.unwrap_or(self.commit_timestamp),
-            max_published_version,
-            protocol_metadata,
-            domain_metadata_changes,
-        ))
-    }
-
-    /// Validate that the transaction is eligible to be marked as a blind append.
-    ///
-    /// Note: Domain metadata additions/removals are allowed; blind append only constrains
-    /// data-file operations and read predicates. Conflict resolution determines whether
-    /// metadata changes are problematic.
-    fn validate_blind_append_semantics(&self) -> Result<()> {
-        if !self.is_blind_append {
-            return Ok(());
-        }
-        require!(
-            !self.is_create_table(),
-            KernelError::invalid_transaction_state(
-                "Blind append is not supported for create-table transactions",
-            )
-        );
-        require!(
-            !self.add_files_metadata.is_empty(),
-            KernelError::invalid_transaction_state(
-                "Blind append requires at least one added data file"
-            )
-        );
-        require!(
-            self.data_change,
-            KernelError::invalid_transaction_state("Blind append requires data_change to be true")
-        );
-        require!(
-            self.remove_files_metadata.is_empty(),
-            KernelError::invalid_transaction_state("Blind append cannot remove files")
-        );
-        require!(
-            self.dv_matched_files.is_empty(),
-            KernelError::invalid_transaction_state("Blind append cannot update deletion vectors")
-        );
-
-        Ok(())
-    }
-
-    /// Validate the staged manifest write, if any. A root-manifest-file commit must carry no data
-    /// file actions; a manifest (content-tree) commit cannot be committed yet (its write path is
-    /// not built). The `adaptiveMetadata-preview` feature and root/commit mutual exclusion are
-    /// enforced when staging, so they need no check here.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn validate_manifest_write_semantics(&self) -> Result<()> {
-        match &self.manifest_write {
-            Some(ManifestWrite::RootFile(_)) => {
-                require!(
-                    !self.has_data_file_actions(),
-                    KernelError::generic("root manifest file commit cannot include file actions")
-                );
-            }
-            Some(ManifestWrite::Commit(_)) => {
-                return Err(KernelError::unsupported(
-                    "committing a manifest commit is not yet supported",
-                ));
-            }
-            None => {}
-        }
-        Ok(())
-    }
-
-    /// Builds the `checkpoint` action committing the configured root manifest file, or `None` if
-    /// this transaction has none.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn generate_checkpoint_action(
-        &self,
-        engine: &dyn Engine,
-        commit_version: Version,
-        dm_changes: &[DomainMetadata],
-    ) -> Result<Option<Box<dyn EngineData>>> {
-        let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
-            return Ok(None);
-        };
-        let action = root_manifest_file.compute_checkpoint_action(
-            engine,
-            commit_version,
-            &self.effective_table_config,
-            dm_changes,
-            &self.set_transactions,
-        )?;
-        Ok(Some(action.into_engine_data(engine)?))
-    }
-
-    // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
-    fn validate_append_only_semantics(&self) -> Result<()> {
-        if !self.data_change
-            || !self
-                .effective_table_config
-                .is_feature_enabled(&TableFeature::AppendOnly)
-        {
-            return Ok(());
-        }
-
-        let removes_data = self
-            .remove_files_metadata
-            .iter()
-            .chain(&self.dv_matched_files)
-            .any(HasSelectionVector::has_selected_rows);
-        require!(
-            !removes_data,
-            KernelError::invalid_transaction_state(
-                "Append-only tables cannot remove files or update deletion vectors when data_change is true",
-            )
-        );
-        Ok(())
-    }
-
-    /// Reject data file writes (add/remove/DV) against an empty-schema table.
-    /// CREATE TABLE and metadata-only commits are exempt.
-    fn ensure_schema_non_empty_for_data_writes(&self) -> Result<()> {
-        if self.is_create_table() {
-            return Ok(());
-        }
-        if self.has_data_file_actions() {
-            self.ensure_schema_non_empty_for_write_state()?;
-        }
-        Ok(())
-    }
-
-    /// Reject write-state creation on empty-schema tables, so engines fail before staging any
-    /// parquet. CREATE TABLE is exempt.
-    fn ensure_schema_non_empty_for_write_state(&self) -> Result<()> {
-        if self.is_create_table() {
-            return Ok(());
-        }
-        if self.effective_table_config.logical_schema().num_fields() == 0 {
-            return Err(KernelError::generic(
-                "Cannot write data files to a Delta table with empty schema; \
-                 use `snapshot.transaction_builder()` with `UpdateTableOperation::AlterTable` and \
-                 `add_column(...)` to add at least one column before writing data",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Rejects write-state creation when a table declares column defaults and the connector has
-    /// not acknowledged handling them.
-    fn ensure_column_defaults_acknowledged(&self) -> Result<()> {
-        require!(
-            self.column_defaults_acknowledged
-                || !self
-                    .effective_table_config
-                    .is_feature_enabled(&TableFeature::AllowColumnDefaults)
-                || !self.effective_table_config.has_column_with_default(),
-            KernelError::invalid_transaction_state(
-                "Writing data to a table with column defaults requires calling \
-                 Transaction::ack_column_defaults() first",
-            )
-        );
-        Ok(())
-    }
-
-    fn ensure_row_tracking_preservation_acknowledged(&self) -> Result<()> {
-        if !self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::RowTracking)
-        {
-            return Ok(());
-        }
-        require!(
-            self.row_tracking_preservation_acknowledged,
-            KernelError::invalid_transaction_state(
-                "Data manipulation on a table with Row Tracking enabled requires preserving stable \
-                 Row IDs for copied or updated rows and stable Row Commit Versions for copied \
-                 rows. See Transaction::ack_row_tracking_preservation() for more details",
-            )
-        );
-        Ok(())
-    }
-
-    /// Returns true if this is a create-table transaction.
-    /// A create-table transaction has no read snapshot (no pre-existing table).
-    fn is_create_table(&self) -> bool {
-        self.read_snapshot_opt.is_none()
-    }
-
-    pub(super) fn resolve_data_change(&mut self) {
-        if self.infer_data_change {
-            self.data_change = match self.operation.as_ref() {
-                Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)) => {
-                    self.has_data_file_actions()
-                }
-                _ => true,
-            };
-        }
-    }
-
-    fn validate_operation_compatibility(&self) -> Result<()> {
-        if let Some(operation) = &self.operation {
-            operation
-                .validate()
-                .map_err(KernelError::invalid_transaction_state)?;
-        }
-        match (self.is_create_table(), self.operation.as_ref()) {
-            (true, Some(CommitOperation::CreateTable)) => Ok(()),
-            (false, Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)))
-                if !self.should_emit_metadata =>
-            {
-                Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
-                ))
-            }
-            (false, Some(CommitOperation::UpdateTable(_))) => Ok(()),
-            (true, _) => Err(KernelError::invalid_transaction_state(
-                "create-table transactions must use the CREATE TABLE operation",
-            )),
-            (false, Some(CommitOperation::CreateTable)) => {
-                Err(KernelError::invalid_transaction_state(
-                    "CREATE TABLE cannot use an update-table transaction",
-                ))
-            }
-            (false, _) => Ok(()),
-        }
-    }
-
-    /// True iff this transaction stages any data-file action (add, remove, or DV update).
-    fn has_data_file_actions(&self) -> bool {
-        !self.add_files_metadata.is_empty()
-            || !self.remove_files_metadata.is_empty()
-            || !self.dv_matched_files.is_empty()
-    }
-
-    // Returns the read snapshot. Returns an error if this is a create-table transaction.
-    // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
-    fn read_snapshot(&self) -> Result<&Snapshot> {
-        self.read_snapshot_opt.as_deref().ok_or_else(|| {
-            KernelError::internal_error("read_snapshot() called on create-table transaction")
-        })
-    }
-
-    /// Computes the in-commit timestamp for this transaction if ICT is enabled.
-    /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
-    /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
-    /// property must also be `true` (`is_feature_enabled`).
-    fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> Result<Option<i64>> {
-        let has_ict = self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::InCommitTimestamp);
-
-        if !has_ict {
-            return Ok(None);
-        }
-
-        if self.is_create_table() {
-            // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
-            return Ok(Some(self.commit_timestamp));
-        }
-
-        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
-        // must be the larger of:
-        // - The time at which the writer attempted the commit
-        // - One millisecond later than the previous commit's inCommitTimestamp
-        Ok(self
-            .read_snapshot()?
-            .get_in_commit_timestamp(engine)?
-            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
-    }
-
-    /// Returns the commit version for this transaction.
-    /// For existing table transactions, this is snapshot.version() + 1.
-    /// For create-table transactions, this is 0.
-    fn get_commit_version(&self) -> Version {
-        match &self.read_snapshot_opt {
-            Some(snap) => snap.version() + 1,
-            None => 0,
-        }
-    }
-
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
     /// information about a Parquet write operation back to Kernel.
     ///
@@ -1211,7 +862,7 @@ impl<S> Transaction<S> {
             )
         );
         require!(
-            !self.add_files_metadata.is_empty(),
+            self.has_add_file_actions(),
             KernelError::invalid_transaction_state(
                 "Blind append requires at least one added data file"
             )
@@ -1221,11 +872,11 @@ impl<S> Transaction<S> {
             KernelError::invalid_transaction_state("Blind append requires data_change to be true")
         );
         require!(
-            self.remove_files_metadata.is_empty(),
+            !self.has_remove_file_actions(),
             KernelError::invalid_transaction_state("Blind append cannot remove files")
         );
         require!(
-            self.dv_matched_files.is_empty(),
+            !self.has_dv_update_actions(),
             KernelError::invalid_transaction_state("Blind append cannot update deletion vectors")
         );
 
@@ -1367,7 +1018,7 @@ impl<S> Transaction<S> {
     pub(super) fn resolve_data_change(&mut self) {
         if self.infer_data_change {
             self.data_change = match self.operation.as_ref() {
-                Some(Operation::UpdateTable(UpdateTableOperation::AlterTable)) => {
+                Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)) => {
                     self.has_data_file_actions()
                 }
                 _ => true,
@@ -1382,30 +1033,49 @@ impl<S> Transaction<S> {
                 .map_err(KernelError::invalid_transaction_state)?;
         }
         match (self.is_create_table(), self.operation.as_ref()) {
-            (true, Some(Operation::CreateTable)) => Ok(()),
-            (false, Some(Operation::UpdateTable(UpdateTableOperation::AlterTable)))
+            (true, Some(CommitOperation::CreateTable)) => Ok(()),
+            (false, Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)))
                 if !self.should_emit_metadata =>
             {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ))
             }
-            (false, Some(Operation::UpdateTable(_))) => Ok(()),
+            (false, Some(CommitOperation::UpdateTable(_))) => Ok(()),
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),
-            (false, Some(Operation::CreateTable)) => Err(KernelError::invalid_transaction_state(
+            (false, Some(CommitOperation::CreateTable)) => Err(KernelError::invalid_transaction_state(
                 "CREATE TABLE cannot use an update-table transaction",
             )),
             (false, _) => Ok(()),
         }
     }
 
-    /// True iff this transaction stages any data-file action (add, remove, or DV update).
+    /// True iff this transaction emits at least one add-file action.
+    fn has_add_file_actions(&self) -> bool {
+        self.add_files_metadata.iter().any(|data| !data.is_empty())
+    }
+
+    /// True iff this transaction emits at least one remove-file action.
+    fn has_remove_file_actions(&self) -> bool {
+        self.remove_files_metadata
+            .iter()
+            .any(HasSelectionVector::has_selected_rows)
+    }
+
+    /// True iff this transaction emits at least one deletion-vector update.
+    fn has_dv_update_actions(&self) -> bool {
+        self.dv_matched_files
+            .iter()
+            .any(HasSelectionVector::has_selected_rows)
+    }
+
+    /// True iff this transaction emits any data-file action (add, remove, or DV update).
     fn has_data_file_actions(&self) -> bool {
-        !self.add_files_metadata.is_empty()
-            || !self.remove_files_metadata.is_empty()
-            || !self.dv_matched_files.is_empty()
+        self.has_add_file_actions()
+            || self.has_remove_file_actions()
+            || self.has_dv_update_actions()
     }
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
@@ -1465,7 +1135,7 @@ impl<S> Transaction<S> {
     fn validate_commit(&self) -> KernelResult<()> {
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
-        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
+        if self.has_remove_file_actions() || self.has_dv_update_actions() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
             self.ensure_row_tracking_preservation_acknowledged()?;
@@ -1494,7 +1164,7 @@ impl<S> Transaction<S> {
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
-        if !self.add_files_metadata.is_empty() {
+        if self.has_add_file_actions() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
@@ -1503,8 +1173,8 @@ impl<S> Transaction<S> {
         // update rows require a `cdc` file, but Kernel does not currently support writing CDC
         // files.
         if !self.is_create_table()
-            && !self.add_files_metadata.is_empty()
-            && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
+            && self.has_add_file_actions()
+            && (self.has_remove_file_actions() || self.has_dv_update_actions())
             && self.data_change
         {
             let cdf_enabled = self
