@@ -4,15 +4,17 @@
 
 use delta_kernel::check_constraints::TableWriteExpressions;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{schema_ref, SchemaRef};
+use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
 use delta_kernel::transaction::create_table::{
     create_table as kernel_create_table, CreateTableTransaction,
 };
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use rstest::rstest;
+use serde_json::json;
 use test_utils::{
-    create_add_files_metadata, read_actions_from_commit, test_table_setup, test_table_setup_mt,
+    add_commit, create_add_files_metadata, engine_store_setup, read_actions_from_commit,
+    test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -76,6 +78,42 @@ fn assert_gate_error<T: std::fmt::Debug>(result: DeltaResult<T>) {
         is_gate_error,
         "expected the acknowledgement gate error, got: {err:?}"
     );
+}
+
+/// Writes version 0 of an in-memory table by hand, listing `writer_features` in the protocol and
+/// declaring `constraints`, for combinations CREATE TABLE cannot produce.
+async fn write_table_with_protocol(
+    table_name: &str,
+    writer_features: &[&str],
+    constraints: &[(&str, &str)],
+) -> Result<(Url, impl Engine), Box<dyn std::error::Error>> {
+    let (store, engine, table_url) = engine_store_setup(table_name, None);
+    let configuration: serde_json::Map<String, serde_json::Value> = constraints
+        .iter()
+        .map(|(name, sql)| (format!("delta.constraints.{name}"), json!(sql)))
+        .collect();
+    let protocol = json!({"protocol": {
+        "minReaderVersion": 3,
+        "minWriterVersion": 7,
+        "readerFeatures": [],
+        "writerFeatures": writer_features,
+    }});
+    let metadata = json!({"metaData": {
+        "id": "test-id",
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": serde_json::to_string(test_schema().as_ref())?,
+        "partitionColumns": [],
+        "configuration": configuration,
+        "createdTime": 1_700_000_000_000_i64,
+    }});
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        0,
+        format!("{protocol}\n{metadata}\n"),
+    )
+    .await?;
+    Ok((table_url, engine))
 }
 
 #[rstest]
@@ -283,5 +321,103 @@ async fn discovers_constraints_after_checkpoint() -> Result<(), Box<dyn std::err
     let mut txn = reloaded.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     stage_one_file(&mut txn)?;
     assert_gate_error(txn.commit(engine.as_ref()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn acknowledgement_survives_later_builder_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let table_url = create_constrained_table(
+        engine.as_ref(),
+        &table_path,
+        &[("positive_amount", "amount > 0")],
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    txn.ack_check_constraints();
+    let mut txn = txn
+        .with_operation("WRITE".to_string())
+        .with_engine_info("Test/1.0");
+    stage_one_file(&mut txn)?;
+    txn.commit(engine.as_ref())?.unwrap_committed();
+    Ok(())
+}
+
+#[tokio::test]
+async fn data_commit_needs_no_acknowledgement_when_feature_listed_without_constraints(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table_url, engine) =
+        write_table_with_protocol("feature_without_constraints", &["checkConstraints"], &[])
+            .await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+    let discovered = snapshot.check_constraints();
+    assert!(discovered.is_empty());
+
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    stage_one_file(&mut txn)?;
+    txn.commit(&engine)?.unwrap_committed();
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_with_constraints_but_without_feature_is_readable_but_not_writable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table_url, engine) = write_table_with_protocol(
+        "constraints_without_feature",
+        &[],
+        &[("positive_amount", "amount > 0")],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+    let discovered: Vec<_> = snapshot
+        .check_constraints()
+        .iter()
+        .map(|c| c.raw_sql().to_string())
+        .collect();
+    assert_eq!(discovered, ["amount > 0".to_string()]);
+
+    let result = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine);
+    let rejected_as_malformed = matches!(result, Err(Error::InvalidProtocol(_)));
+    assert!(rejected_as_malformed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_rejects_constraint_with_empty_name() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let result = build_create_txn(engine.as_ref(), &table_path, &[("", "amount > 0")]);
+    let rejected = matches!(result, Err(Error::Generic(_)));
+    assert!(rejected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_on_constrained_table_needs_no_acknowledgement(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let table_url = create_constrained_table(
+        engine.as_ref(),
+        &table_path,
+        &[("positive_amount", "amount > 0")],
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let altered = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("note", DataType::STRING))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let discovered: Vec<_> = altered
+        .check_constraints()
+        .iter()
+        .map(|c| c.raw_sql().to_string())
+        .collect();
+    assert_eq!(discovered, ["amount > 0".to_string()]);
     Ok(())
 }
