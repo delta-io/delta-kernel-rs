@@ -42,8 +42,8 @@ impl TableWriteExpressions for Snapshot {
 /// One CHECK constraint: its name, the raw SQL stored under `delta.constraints.<name>`, and the
 /// logical schema of the table that declares it.
 ///
-/// Two constraints are equal when their name and raw SQL match. The schema is not part of the
-/// constraint's identity.
+/// Two constraints are equal when their names match case-insensitively and their raw SQL matches.
+/// The schema is not part of the constraint's identity.
 #[derive(Debug, Clone)]
 pub struct CheckConstraint {
     name: String,
@@ -55,7 +55,7 @@ pub struct CheckConstraint {
 
 impl PartialEq for CheckConstraint {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.raw_sql == other.raw_sql
+        self.name.eq_ignore_ascii_case(&other.name) && self.raw_sql == other.raw_sql
     }
 }
 
@@ -159,5 +159,17 @@ mod tests {
         let with_other_schema =
             CheckConstraints::from_parsed(&entries, &schema_ref! { nullable "amount": LONG });
         assert_eq!(with_table_schema[0], with_other_schema[0]);
+    }
+
+    #[test]
+    fn equality_folds_name_case_but_not_raw_sql() {
+        let schema = test_schema();
+        let lower = CheckConstraints::from_parsed(&parsed(&[("positive", "amount > 0")]), &schema);
+        let upper = CheckConstraints::from_parsed(&parsed(&[("POSITIVE", "amount > 0")]), &schema);
+        assert_eq!(lower[0], upper[0]);
+
+        let other_sql =
+            CheckConstraints::from_parsed(&parsed(&[("positive", "amount > 1")]), &schema);
+        assert_ne!(lower[0], other_sql[0]);
     }
 }
