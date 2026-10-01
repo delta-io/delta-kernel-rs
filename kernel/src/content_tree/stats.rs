@@ -330,9 +330,6 @@ fn leaf_stats_field(
         DataType::Primitive(_) => build_stats_struct(base_stats_id, field.data_type(), categories),
         // A variant's inner fields carry no field IDs, so the base stats ID covers the whole
         // variant and its bounds are typed as an unshredded variant regardless of shredding.
-        //
-        // TODO: kernel does not yet plumb variant min/max bounds through (see
-        // `MinMaxStatsTransform`), so they carry only counts; the projection drops their bounds.
         DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
         }
@@ -710,11 +707,8 @@ fn build_amt_flat_stats_expr<'a>(
 }
 
 /// Builds one leaf's AMT stats struct expression, filling each sub-field of `stats_struct` from the
-/// Delta stats under `stats_col`. `leaf_type` drives the `tight_bounds` rule; `path` locates the
-/// leaf's Delta bounds/counts at `<stats_col>.<category>.<path>`. The projection guarantees a Delta
-/// source for every bound/count sub-field present; `tight_bounds` reads the file value only when
-/// `tight_bounds_present`, and sub-fields with no Delta source (`nan_value_count`,
-/// `avg_value_size_in_bytes`) become typed nulls.
+/// leaf's Delta stats under `stats_col` at `path`. `leaf_type` drives the `tight_bounds` rule, and
+/// `tight_bounds_present` whether the file carries `tightBounds`.
 fn build_leaf_pivot_expr(
     stats_struct: &StructType,
     leaf_type: &DataType,
@@ -1936,46 +1930,22 @@ mod tests {
     }
 
     /// The expected pivoted batch for `table` given the Delta `stats` shape: a single
-    /// [`CONTENT_STATS_FIELD_NAME`] column assembled from each named leaf's sub-field values and
-    /// materialized through [`EvaluationHandler::create_many`] for an [`assert_batch_matches`]
-    /// comparison against the pivot output. The AMT schema is [`projected_stats_schema`] for
-    /// `stats`, so `leaves` must name every surviving leaf; each unlisted sub-field defaults to a
-    /// typed null.
-    fn expected_pivot(
+    /// [`CONTENT_STATS_FIELD_NAME`] column holding `content_stats`, typed by
+    /// [`projected_stats_schema`] for `stats` so field IDs match the pivot output and materialized
+    /// through [`EvaluationHandler::create_many`] for an [`assert_batch_matches`] comparison.
+    ///
+    /// Build `content_stats` directly with [`struct_scalar`]: its leaves and each leaf's sub-fields
+    /// must match the projected schema's shape (order and types), since struct values are appended
+    /// positionally -- leaf and sub-field names are cosmetic.
+    fn expected_batch(
         table: &StructType,
         stats: &Scalar,
-        leaves: &[(&str, Vec<(&str, Scalar)>)],
+        content_stats: Scalar,
     ) -> Box<dyn EngineData> {
         let DataType::Struct(delta) = stats.data_type() else {
             panic!("stats must be a struct");
         };
         let amt = projected_stats_schema(table, &delta).expect("projected stats schema");
-        let leaf_scalar = |leaf_field: &StructField| {
-            let DataType::Struct(stats) = leaf_field.data_type() else {
-                panic!("AMT leaf must be a struct");
-            };
-            let subs = &leaves
-                .iter()
-                .find(|(name, _)| leaf_field.name() == name)
-                .expect("expected value for every AMT leaf")
-                .1;
-            let values = stats
-                .fields()
-                .map(|f| {
-                    subs.iter()
-                        .find(|(name, _)| f.name() == name)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_else(|| Scalar::Null(f.data_type().clone()))
-                })
-                .collect();
-            let fields = stats.fields().cloned().collect();
-            Scalar::Struct(StructData::try_new(fields, values).expect("leaf stats"))
-        };
-        let leaf_values = amt.fields().map(leaf_scalar).collect();
-        let content_stats = Scalar::Struct(
-            StructData::try_new(amt.fields().cloned().collect(), leaf_values)
-                .expect("content_stats"),
-        );
         let output_schema =
             StructType::new_unchecked([StructField::nullable(CONTENT_STATS_FIELD_NAME, amt)]);
         SyncEngine::new()
@@ -2005,20 +1975,43 @@ mod tests {
     fn pivot_expression_renames_stats_column_to_content_stats() {
         let table = pivot_table_schema();
         // Only nullCount is declared, so the projected output carries just the count sub-fields.
-        let known_stats = delta_stats(Some(stat_cols(["id", "name"])), None, None);
+        let stats = struct_scalar(&[
+            (NUM_RECORDS, 10i64.into()),
+            (
+                NULL_COUNT,
+                struct_scalar(&[("id", 0i64.into()), ("name", 2i64.into())]),
+            ),
+        ]);
+        let DataType::Struct(delta) = stats.data_type() else {
+            panic!("stats must be a struct");
+        };
         let input_schema =
-            StructType::new_unchecked([StructField::nullable("stats", known_stats.clone())]);
+            StructType::new_unchecked([StructField::nullable("stats", stats.data_type())]);
         let (output_schema, expr) =
-            build_delta_to_amt_pivot_expression(&table, "stats", &input_schema, &known_stats)
+            build_delta_to_amt_pivot_expression(&table, "stats", &input_schema, &delta)
                 .expect("pivot expr");
         // The Delta stats column is renamed to `content_stats`, typed as the projected stats
-        // schema.
-        let expected = StructType::new_unchecked([StructField::nullable(
+        // schema, via an in-place struct patch.
+        let expected_schema = StructType::new_unchecked([StructField::nullable(
             CONTENT_STATS_FIELD_NAME,
-            projected_stats_schema(&table, &known_stats).expect("projected stats schema"),
+            projected_stats_schema(&table, &delta).expect("projected stats schema"),
         )]);
-        assert_eq!(output_schema.as_ref(), &expected);
+        assert_eq!(output_schema.as_ref(), &expected_schema);
         assert!(matches!(expr.as_ref(), Expression::StructPatch(_)));
+
+        // Evaluating that expression yields a `content_stats` column carrying the mapped counts.
+        let actual = run_pivot(&table, &stats).expect("pivot ok");
+        let content_stats = struct_scalar(&[
+            (
+                "id",
+                struct_scalar(&[(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 0i64.into())]),
+            ),
+            (
+                "name",
+                struct_scalar(&[(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 2i64.into())]),
+            ),
+        ]);
+        assert_batch_matches(actual, expected_batch(&table, &stats, content_stats));
     }
 
     /// End-to-end `tight_bounds` by leaf type with the file's `tightBounds = true`: types whose
@@ -2035,28 +2028,32 @@ mod tests {
     #[case::long(DataType::LONG, true)]
     fn pivot_tight_bounds_by_leaf_type(#[case] leaf_type: DataType, #[case] expected_tight: bool) {
         let table = StructType::new_unchecked([field_with_id("c", leaf_type.clone(), true, 0)]);
-        // `c` needs a bounds category for a `tight_bounds` sub-field and nullCount for
-        // `value_count`.
+        // `c` has a bounds category (for a `tight_bounds` sub-field) and nullCount (for the
+        // counts); its min cell is null.
         let stats = struct_scalar(&[
             (NUM_RECORDS, 4i64.into()),
             (DELTA_TIGHT_BOUNDS, true.into()),
-            (MIN_VALUES, struct_scalar(&[("c", Scalar::Null(leaf_type))])),
+            (
+                MIN_VALUES,
+                struct_scalar(&[("c", Scalar::Null(leaf_type.clone()))]),
+            ),
             (NULL_COUNT, struct_scalar(&[("c", 0i64.into())])),
         ]);
         let actual = run_pivot(&table, &stats).expect("pivot ok");
-        let expected = expected_pivot(
-            &table,
-            &stats,
-            &[(
-                "c",
-                vec![
-                    (TIGHT_BOUNDS, expected_tight.into()),
-                    (VALUE_COUNT, 4i64.into()),
-                    (NULL_VALUE_COUNT, 0i64.into()),
-                ],
-            )],
-        );
-        assert_batch_matches(actual, expected);
+
+        // Projected `c`: null lower_bound, tight_bounds, counts; float/double also carry a null
+        // nan_value_count.
+        let mut c = vec![
+            (LOWER_BOUND, Scalar::Null(leaf_type.clone())),
+            (TIGHT_BOUNDS, expected_tight.into()),
+            (VALUE_COUNT, 4i64.into()),
+            (NULL_VALUE_COUNT, 0i64.into()),
+        ];
+        if leaf_type == DataType::FLOAT || leaf_type == DataType::DOUBLE {
+            c.push((NAN_VALUE_COUNT, Scalar::Null(DataType::LONG)));
+        }
+        let content_stats = struct_scalar(&[("c", struct_scalar(&c))]);
+        assert_batch_matches(actual, expected_batch(&table, &stats, content_stats));
     }
 
     /// Round-trips the flat two-column table. `tight_input` is the file's `tightBounds` (`None`
@@ -2098,23 +2095,33 @@ mod tests {
         let stats = struct_scalar(&entries);
         let actual = run_pivot(&table, &stats).expect("pivot ok");
 
-        // Without min/max, leaves carry only the counts (no bounds, no tight_bounds).
-        let mut id = vec![(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 0i64.into())];
-        let mut name = vec![(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 2i64.into())];
-        if min_max {
-            id.extend([
-                (TIGHT_BOUNDS, true.into()),
-                (LOWER_BOUND, 1i32.into()),
-                (UPPER_BOUND, 5i32.into()),
-            ]);
-            name.extend([
-                (TIGHT_BOUNDS, false.into()),
-                (LOWER_BOUND, "aaa".into()),
-                (UPPER_BOUND, "zzz".into()),
-            ]);
-        }
-        let expected = expected_pivot(&table, &stats, &[("id", id), ("name", name)]);
-        assert_batch_matches(actual, expected);
+        // With min/max each leaf carries bounds + tight_bounds + counts; without, only the counts.
+        let (id, name) = if min_max {
+            (
+                vec![
+                    (LOWER_BOUND, 1i32.into()),
+                    (UPPER_BOUND, 5i32.into()),
+                    (TIGHT_BOUNDS, true.into()),
+                    (VALUE_COUNT, 10i64.into()),
+                    (NULL_VALUE_COUNT, 0i64.into()),
+                ],
+                vec![
+                    (LOWER_BOUND, "aaa".into()),
+                    (UPPER_BOUND, "zzz".into()),
+                    (TIGHT_BOUNDS, false.into()),
+                    (VALUE_COUNT, 10i64.into()),
+                    (NULL_VALUE_COUNT, 2i64.into()),
+                ],
+            )
+        } else {
+            (
+                vec![(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 0i64.into())],
+                vec![(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 2i64.into())],
+            )
+        };
+        let content_stats =
+            struct_scalar(&[("id", struct_scalar(&id)), ("name", struct_scalar(&name))]);
+        assert_batch_matches(actual, expected_batch(&table, &stats, content_stats));
     }
 
     #[test]
@@ -2139,21 +2146,18 @@ mod tests {
             (NULL_COUNT, nest(1i64.into())),
         ]);
         let actual = run_pivot(&table, &stats).expect("pivot ok");
-        let expected = expected_pivot(
-            &table,
-            &stats,
-            &[(
-                "a.b.c",
-                vec![
-                    (LOWER_BOUND, 2i32.into()),
-                    (UPPER_BOUND, 9i32.into()),
-                    (TIGHT_BOUNDS, true.into()),
-                    (VALUE_COUNT, 7i64.into()),
-                    (NULL_VALUE_COUNT, 1i64.into()),
-                ],
-            )],
-        );
-        assert_batch_matches(actual, expected);
+        // The flat leaf carries bounds + tight_bounds + counts.
+        let content_stats = struct_scalar(&[(
+            "a_b_c",
+            struct_scalar(&[
+                (LOWER_BOUND, 2i32.into()),
+                (UPPER_BOUND, 9i32.into()),
+                (TIGHT_BOUNDS, true.into()),
+                (VALUE_COUNT, 7i64.into()),
+                (NULL_VALUE_COUNT, 1i64.into()),
+            ]),
+        )]);
+        assert_batch_matches(actual, expected_batch(&table, &stats, content_stats));
     }
 
     #[test]
@@ -2172,21 +2176,18 @@ mod tests {
             ),
         ]);
         let actual = run_pivot(&table, &stats).expect("variant table must not be dropped");
-        let expected = expected_pivot(
-            &table,
-            &stats,
-            &[
-                (
-                    "id",
-                    vec![(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 0i64.into())],
-                ),
-                (
-                    "v",
-                    vec![(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 3i64.into())],
-                ),
-            ],
-        );
-        assert_batch_matches(actual, expected);
+        // With nullCount the sole category, both leaves project to just the counts.
+        let content_stats = struct_scalar(&[
+            (
+                "id",
+                struct_scalar(&[(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 0i64.into())]),
+            ),
+            (
+                "v",
+                struct_scalar(&[(VALUE_COUNT, 10i64.into()), (NULL_VALUE_COUNT, 3i64.into())]),
+            ),
+        ]);
+        assert_batch_matches(actual, expected_batch(&table, &stats, content_stats));
     }
 
     #[test]
