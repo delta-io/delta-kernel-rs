@@ -72,52 +72,67 @@ impl Scan {
         let add_field = self.normalized_add_field()?;
         let (output_expr, output_schema) = self.metadata_output_projection(&add_field)?;
 
-        let commit_actions = self.commit_arm()?.try_fold_with(prune, |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        })?;
+        let commit_actions = self
+            .commit_arm()?
+            .try_fold_with(prune, |p, prune| {
+                // We filter so that:
+                // * All remove actions are kept
+                // * Add actions that do not match the partition pruning or stats predicate are
+                //   removed.
+                //
+                // NOTE: It is important that add actions are filtered by the partition predicate
+                // because partition filtering may not be applied on data rows. On the other
+                // hand, failing to skip based on data columns is safe because the data
+                // predicate will also be evaluated on data rows. Thus it is crucial that we
+                // partition prune adds here.
+                //
+                // NOTE: It is not safe to prune remove actions using the partition filter. This is
+                // because a NULL result for `remove.partitionValues.partCol` may be due to
+                // `remove.partitionValues` being NULL, or it may be from `partCol` being
+                // NULL. Thus, we simply do not prune removes.
+                p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+            })
+            .map_err(crate::Error::into_kernel_error)?;
 
-        let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
-            // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
-            // file; winning adds pass through unchanged while winning removes produce NULL. Non-
-            // file actions have NULL FILE_ACTION_KEY and map to their own NULL group.
-            a.max_non_null_by(
-                column_name!(ADD_NAME),
-                column_name!(FILE_ACTION_KEY),
-                column_name!(VERSION),
-            )
-        })?;
+        let deduped_commit = commit_actions
+            .aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
+                // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a
+                // given file; winning adds pass through unchanged while winning
+                // removes produce NULL. Non- file actions have NULL FILE_ACTION_KEY
+                // and map to their own NULL group.
+                a.max_non_null_by(
+                    column_name!(ADD_NAME),
+                    column_name!(FILE_ACTION_KEY),
+                    column_name!(VERSION),
+                )
+            })
+            .map_err(crate::Error::into_kernel_error)?;
 
         let checkpoint_adds = self
             .checkpoint_arm(shape)?
-            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))
+            .map_err(crate::Error::into_kernel_error)?;
 
         let checkpoint_live_adds = checkpoint_adds
             .anti_join(
                 deduped_commit.clone(),
                 [column_name!(FILE_ACTION_KEY)],
                 [column_name!(FILE_ACTION_KEY)],
-            )?
-            .project(output_expr.clone(), output_schema.clone())?;
+            )
+            .map_err(crate::Error::into_kernel_error)?
+            .project(output_expr.clone(), output_schema.clone())
+            .map_err(crate::Error::into_kernel_error)?;
 
         let commit_live_adds = deduped_commit
-            .filter(col!("add").is_not_null())?
-            .project(output_expr, output_schema)?;
+            .filter(col!("add").is_not_null())
+            .map_err(crate::Error::into_kernel_error)?
+            .project(output_expr, output_schema)
+            .map_err(crate::Error::into_kernel_error)?;
 
-        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
+        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])
+            .map_err(crate::Error::into_kernel_error)?
+            .build_opt()
+            .map_err(crate::Error::into_kernel_error)
     }
 
     /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
@@ -167,16 +182,19 @@ impl Scan {
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the manifest.
-                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root)
+                        .map_err(crate::Error::Kernel),
                 }
             }
             (CheckpointType::None, _) | (_, None) => {
                 PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
             }
-        }?;
+        }
+        .map_err(crate::Error::into_kernel_error)?;
 
         actions
-            .filter(col!("add.path").is_not_null())?
+            .filter(col!("add.path").is_not_null())
+            .map_err(crate::Error::into_kernel_error)?
             .project_patch(|patch| {
                 patch
                     .with_parsed_add_stats(physical_stats)
@@ -190,6 +208,7 @@ impl Scan {
                         file_action_key_expr(|col| joined_column_expr!("add", col)),
                     )
             })
+            .map_err(crate::Error::into_kernel_error)
     }
 
     /// Build the normalized commit JSON arm.
@@ -210,11 +229,13 @@ impl Scan {
     fn commit_arm(&self) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-        PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
+        PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))
+            .map_err(crate::Error::into_kernel_error)?
             .filter(Predicate::or(
                 col!("add.path").is_not_null(),
                 col!("remove.path").is_not_null(),
-            ))?
+            ))
+            .map_err(crate::Error::into_kernel_error)?
             .project_patch(|patch| {
                 // Commits never carry source-native parsed columns, so normalize from the raw
                 // encodings.
@@ -237,6 +258,7 @@ impl Scan {
                         }),
                     )
             })
+            .map_err(crate::Error::into_kernel_error)
     }
 
     fn normalized_add_field(&self) -> KernelResult<StructField> {
@@ -252,7 +274,12 @@ impl Scan {
                     schema.as_ref().clone(),
                 ))
             });
-        Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
+        Ok(StructField::nullable(
+            ADD_NAME,
+            patch
+                .build(&ADD_SCHEMA)
+                .map_err(crate::Error::into_kernel_error)?,
+        ))
     }
 
     /// Builds the output projection for requested stats and partition values. The base of this
@@ -337,7 +364,9 @@ impl Scan {
             (None, false) => projection,
         };
 
-        let (add_schema, add_expr) = projection.build()?;
+        let (add_schema, add_expr) = projection
+            .build()
+            .map_err(crate::Error::into_kernel_error)?;
         let schema = schema_ref! { nullable ADD_NAME: (add_schema.as_ref().clone()) };
         Ok((Arc::new(Expr::struct_from([add_expr])), schema))
     }
@@ -372,8 +401,10 @@ fn sidecar_actions(
         FileType::Json => PlanBuilder::scan_json,
         FileType::Parquet => PlanBuilder::scan_parquet,
     };
-    let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
-        .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())?
+    let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())
+        .map_err(crate::Error::into_kernel_error)?
+        .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())
+        .map_err(crate::Error::into_kernel_error)?
         .project(
             Expr::struct_from([
                 col!(SIDECAR_NAME, FILE_PATH),
@@ -382,7 +413,8 @@ fn sidecar_actions(
                 col!(VERSION),
             ]),
             SIDECAR_FILE_META_SCHEMA.clone(),
-        )?;
+        )
+        .map_err(crate::Error::into_kernel_error)?;
 
     let dynamic_scan = DynamicScan::try_new(
         &SIDECAR_FILE_META_SCHEMA,
@@ -394,9 +426,12 @@ fn sidecar_actions(
         column_name!(FILE_SIZE),
         column_name!(FILE_MOD),
         None,
-    )?;
+    )
+    .map_err(crate::Error::into_kernel_error)?;
 
-    sidecar_files.dynamic_scan(dynamic_scan)
+    sidecar_files
+        .dynamic_scan(dynamic_scan)
+        .map_err(crate::Error::into_kernel_error)
 }
 
 // === Helpers ===
@@ -427,7 +462,7 @@ fn parquet_read_schema(
             ))
         });
     Ok(schema_ref! {
-        nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
+        nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA).map_err(crate::Error::into_kernel_error)?),
         nullable VERSION: LONG,
     })
 }
@@ -585,7 +620,8 @@ mod tests {
             .with_partition_columns(["p"])
             .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .with_table_root("memory:///")
-            .try_build()?;
+            .try_build()
+            .map_err(crate::Error::Kernel)?;
         Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))
     }
 
@@ -723,13 +759,25 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(add), Arc::new(Int64Array::from(vec![0i64]))],
-        )?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
 
         let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, None)?;
-        writer.write(&batch)?;
-        writer.close()?;
-        futures::executor::block_on(store.put(&Path::from(path), buf.into()))?;
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .write(&batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .close()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        futures::executor::block_on(store.put(&Path::from(path), buf.into()))
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         Ok(())
     }
 
@@ -776,7 +824,10 @@ mod tests {
             Some(checkpoint_path(file_type)),
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&shape)
+            .map_err(crate::Error::Kernel)?
+            .expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
@@ -806,12 +857,15 @@ mod tests {
             .build()?;
         let shape = CheckpointShape {
             checkpoint_type,
-            leaf_checkpoint_schema: Some(parquet_read_schema(
-                parsed_stats.as_ref(),
-                parsed_partitions.as_ref(),
-            )?),
+            leaf_checkpoint_schema: Some(
+                parquet_read_schema(parsed_stats.as_ref(), parsed_partitions.as_ref())
+                    .map_err(crate::Error::Kernel)?,
+            ),
         };
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&shape)
+            .map_err(crate::Error::Kernel)?
+            .expect("non-empty");
 
         let checkpoint_schema = plan
             .nodes
@@ -866,7 +920,8 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint())?
+            .build_metadata_scan_plan(&no_checkpoint())
+            .map_err(crate::Error::Kernel)?
             .expect("non-empty");
         assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
         Ok(())
@@ -884,7 +939,10 @@ mod tests {
     ) -> Result<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&shape)
+            .map_err(crate::Error::Kernel)?
+            .expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
         Ok(())
     }
@@ -893,7 +951,10 @@ mod tests {
     fn metadata_plan_empty_is_none() -> Result<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        assert!(scan.build_metadata_scan_plan(&no_checkpoint())?.is_none());
+        assert!(scan
+            .build_metadata_scan_plan(&no_checkpoint())
+            .map_err(crate::Error::Kernel)?
+            .is_none());
         Ok(())
     }
 
@@ -909,7 +970,8 @@ mod tests {
             PhysicalPredicate::StaticSkipAll
         );
         assert!(scan
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))
+            .map_err(crate::Error::Kernel)?
             .is_none());
         Ok(())
     }
@@ -926,7 +988,7 @@ mod tests {
 "#
                     .into(),
                 )
-                .await?;
+                .await.map_err(crate::KernelError::from).map_err(crate::Error::Kernel)?;
             store
                 .put(
                     &Path::from("_delta_log/00000000000000000001.json"),
@@ -934,7 +996,9 @@ mod tests {
 "#
                     .into(),
                 )
-                .await?;
+                .await
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?;
             Result::<()>::Ok(())
         })?;
 
@@ -948,7 +1012,8 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint())?
+            .build_metadata_scan_plan(&no_checkpoint())
+            .map_err(crate::Error::Kernel)?
             .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
@@ -1004,7 +1069,8 @@ mod tests {
             .build()?;
         let plan = scan
             // Leaf with no compatible parsed stats -> parse add.stats instead.
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))
+            .map_err(crate::Error::Kernel)?
             .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
@@ -1013,9 +1079,17 @@ mod tests {
             .unwrap()
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?;
-        let actual_rows = batches.try_fold(0, |rows, batch| {
-            Ok::<_, crate::KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
-        })?;
+        let actual_rows = batches
+            .try_fold(0, |rows, batch| {
+                Ok::<_, crate::KernelError>(
+                    rows + batch
+                        .map_err(crate::Error::into_kernel_error)?
+                        .try_into_record_batch()
+                        .map_err(crate::Error::into_kernel_error)?
+                        .num_rows(),
+                )
+            })
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(actual_rows, expected_rows);
         Ok(())
     }

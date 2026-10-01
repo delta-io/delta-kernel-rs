@@ -1184,8 +1184,8 @@ async fn scan_with_replace_table_schema_change(
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
     assert!(matches!(
-        error.downcast_ref::<KernelError>(),
-        Some(KernelError::ParseError(_, _))
+        error.downcast_ref::<delta_kernel::Error>(),
+        Some(delta_kernel::Error::Kernel(KernelError::ParseError(_, _)))
     ));
     Ok(())
 }

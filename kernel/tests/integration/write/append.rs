@@ -216,9 +216,17 @@ async fn test_append_partitioned(
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> Result<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                Arc::new(
+                    data_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::KernelError::from)
+                        .map_err(delta_kernel::Error::Kernel)?,
+                ),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],
-            )?;
+            )
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         let partition_vals = vec!["a", "b"];
@@ -362,9 +370,17 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> Result<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                Arc::new(
+                    data_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::KernelError::from)
+                        .map_err(delta_kernel::Error::Kernel)?,
+                ),
                 vec![Arc::new(StringArray::from(data.to_vec()))],
-            )?;
+            )
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
 
@@ -384,8 +400,10 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
-            Err(KernelError::Backtraced { source, .. })
+            Err(delta_kernel::Error::Kernel(KernelError::Arrow(
+                ArrowError::InvalidArgumentError(_),
+            ))) => true,
+            Err(delta_kernel::Error::Kernel(KernelError::Backtraced { source, .. }))
                 if matches!(
                     &*source,
                     KernelError::Arrow(ArrowError::InvalidArgumentError(_))
@@ -519,7 +537,9 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         let data = RecordBatch::try_new(
             data_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1]))],
-        )?;
+        )
+        .map_err(delta_kernel::KernelError::from)
+        .map_err(delta_kernel::Error::Kernel)?;
         futures::executor::block_on(engine.write_parquet(&ArrowEngineData::new(data), &wc))
     };
 

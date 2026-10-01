@@ -276,7 +276,8 @@ impl KernelStringSlice {
                 self.len
             )));
         }
-        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }?;
+        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         Ok(value.to_string())
     }
 
@@ -437,7 +438,9 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
     /// valid utf8 bytes.
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> Result<Self> {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        Ok(std::str::from_utf8(slice)?)
+        std::str::from_utf8(slice)
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)
     }
 }
 
@@ -476,7 +479,8 @@ pub unsafe extern "C" fn allocate_kernel_string(
 fn allocate_kernel_string_impl(
     kernel_str: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveRustString>> {
-    let s = unsafe { String::try_from_slice(&kernel_str) }?;
+    let s = unsafe { String::try_from_slice(&kernel_str) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(s).into())
 }
 
@@ -797,8 +801,9 @@ impl ExternEngine for ExternEngineVtable {
 ///
 /// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> KernelResult<Url> {
-    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
-    delta_kernel::try_parse_uri(path)
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    delta_kernel::try_parse_uri(path).map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// How [`FfiEngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
@@ -938,8 +943,10 @@ fn builder_with_option_impl(
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> KernelResult<()> {
-    let key = unsafe { String::try_from_slice(&key) }?;
-    let value = unsafe { String::try_from_slice(&value) }?;
+    let key =
+        unsafe { String::try_from_slice(&key) }.map_err(delta_kernel::Error::into_kernel_error)?;
+    let value = unsafe { String::try_from_slice(&value) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     builder.set_option(key, value);
     Ok(())
 }
@@ -1141,7 +1148,9 @@ fn get_default_engine_impl(
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
     let store = match object_store_backend {
-        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
+        ObjectStoreBackend::UrlScheme => {
+            store_from_url_opts(&url, options).map_err(delta_kernel::Error::into_kernel_error)?
+        }
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
@@ -1180,7 +1189,8 @@ pub(crate) fn build_engine_from_store(
         let executor = TokioMultiThreadExecutor::new_owned_runtime(
             config.worker_threads,
             config.max_blocking_threads,
-        )?;
+        )
+        .map_err(delta_kernel::Error::into_kernel_error)?;
         let builder = DefaultEngineBuilder::new(store).with_task_executor(Arc::new(executor));
         Arc::new(apply_io_config(builder, &io_config).build())
     } else {
@@ -1498,7 +1508,9 @@ fn snapshot_builder_build_impl(
         if let Some(snapshot_hint) = snapshot_hint {
             builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
-        builder.build(engine)
+        builder
+            .build(engine)
+            .map_err(delta_kernel::Error::into_kernel_error)
     }
 
     let snapshot = match source {
@@ -1804,6 +1816,7 @@ fn get_earliest_commit_impl(
         earliest_ratified_commit_version.into(),
         commit_type.into(),
     )
+    .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe

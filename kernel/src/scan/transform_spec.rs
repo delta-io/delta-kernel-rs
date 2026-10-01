@@ -221,7 +221,9 @@ pub(crate) fn get_transform_expr(
         }
     }
 
-    Ok(Arc::new(Expression::struct_patch(patch)?))
+    Ok(Arc::new(
+        Expression::struct_patch(patch).map_err(crate::Error::into_kernel_error)?,
+    ))
 }
 
 // Adapter that converts the insert_after option into a method call on the patch.
@@ -249,7 +251,9 @@ pub(crate) fn parse_partition_value_raw(
         (Some(v), Some(primitive)) if v.is_empty() => Ok(primitive
             .empty_string_partition_cast()
             .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
-        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
+        (Some(v), Some(primitive)) => primitive
+            .parse_scalar(v)
+            .map_err(crate::Error::into_kernel_error),
         (Some(_), None) => Err(KernelError::generic(format!(
             "Unexpected partition column type: {data_type:?}"
         ))),
@@ -707,7 +711,8 @@ mod tests {
                 default_row_commit_version: Some(5),
                 ..Default::default()
             },
-        )?;
+        )
+        .map_err(crate::Error::Kernel)?;
         let Expression::StructPatch(patch) = expression.as_ref() else {
             panic!("Expected StructPatch expression");
         };

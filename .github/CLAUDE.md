@@ -68,6 +68,13 @@ run: |
     echo "Comment: $COMMENT_BODY"
 ```
 
+## Error API checks
+
+Result-type changes must cover public trait implementations and lazy iterator items, including
+`internal-api` interfaces. Validate the no-default-feature aliases as well as the all-features
+workspace build. DataFusion and the Arrow compatibility tests have separate workspaces and need
+their own checks.
+
 ## Release tooling checks
 
 The `release-tooling` job in `build.yml` fetches full history and tags because release branches

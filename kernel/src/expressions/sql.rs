@@ -14,7 +14,7 @@
 
 use crate::expressions::{lit, null_lit, Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
-use crate::{KernelError, KernelResult};
+use crate::{Error, KernelError, KernelResult};
 
 #[cfg(feature = "check-constraints-in-dev")]
 mod parser;
@@ -74,7 +74,9 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> KernelResult
         PrimitiveType::Float | PrimitiveType::Double => {
             parse_double_or_float(primitive, trimmed, sql)?
         }
-        _ => primitive.parse_scalar(trimmed)?,
+        _ => primitive
+            .parse_scalar(trimmed)
+            .map_err(Error::into_kernel_error)?,
     };
     Ok(lit(scalar))
 }
@@ -100,7 +102,9 @@ fn parse_binary_literal(trimmed: &str) -> KernelResult<Scalar> {
 /// `DATE` keyword is optional and may have 0 or more whitespace before the apostrophe.
 fn parse_date_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar> {
     let raw = unwrap_quoted_body(trimmed, &["DATE"], &PrimitiveType::Date, sql)?;
-    PrimitiveType::Date.parse_scalar(&raw)
+    PrimitiveType::Date
+        .parse_scalar(&raw)
+        .map_err(Error::into_kernel_error)
 }
 
 /// Parse a zoneless (wall-clock) `Scalar::TimestampNtz` from a trimmed string.
@@ -116,7 +120,9 @@ fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar>
         &PrimitiveType::TimestampNtz,
         sql,
     )?;
-    PrimitiveType::TimestampNtz.parse_scalar(&raw)
+    PrimitiveType::TimestampNtz
+        .parse_scalar(&raw)
+        .map_err(Error::into_kernel_error)
 }
 
 /// Parse a `Scalar::Timestamp` (local-time-zone) from a trimmed string in ISO 8601 / RFC 3339 form
@@ -135,7 +141,9 @@ fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar>
         sql,
     )?;
     require_utc_z_suffix(&raw, sql)?;
-    PrimitiveType::Timestamp.parse_scalar(&raw)
+    PrimitiveType::Timestamp
+        .parse_scalar(&raw)
+        .map_err(Error::into_kernel_error)
 }
 
 /// Strip the typed-literal keyword prefix, if any, and return the inner literal value, unquoted and
@@ -213,7 +221,9 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Ker
             .map_err(|_| KernelError::generic(format!("invalid FLOAT literal: {sql}")))?;
         Scalar::Float(value as f32)
     } else {
-        primitive.parse_scalar(raw)?
+        primitive
+            .parse_scalar(raw)
+            .map_err(Error::into_kernel_error)?
     };
     // Negative zero: `+ 0.0` folds a plain `-0.0` to `+0.0` (a no-op for every other value);
     // exponent forms keep their sign, so skip them.

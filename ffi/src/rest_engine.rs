@@ -264,7 +264,7 @@ pub(crate) fn rest_endpoint_config_from_c(
 
 fn copy_optional_string(slice: &KernelStringSlice) -> KernelResult<String> {
     // SAFETY: caller keeps slice memory valid until `builder_with_rest_object_store` returns.
-    unsafe { String::try_from_slice(slice) }
+    unsafe { String::try_from_slice(slice).map_err(delta_kernel::Error::into_kernel_error) }
 }
 
 fn copy_required_string(slice: &KernelStringSlice, field: &str) -> KernelResult<String> {

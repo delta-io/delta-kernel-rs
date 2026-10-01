@@ -145,19 +145,22 @@ mod tests {
     fn test_deleted_file_retention_timestamp_with_time() -> Result<()> {
         // Test with default retention (7 days)
         let reference_time = Duration::from_secs(1_000_000_000);
-        let result = deleted_file_retention_timestamp_with_time(None, reference_time)?;
+        let result = deleted_file_retention_timestamp_with_time(None, reference_time)
+            .map_err(crate::Error::Kernel)?;
         let expected = 1_000_000_000_000 - (7 * 24 * 60 * 60 * 1000);
         assert_eq!(result, expected);
 
         // Test with custom retention (1 day)
         let retention = Duration::from_secs(24 * 60 * 60); // 1 day
-        let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time)?;
+        let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time)
+            .map_err(crate::Error::Kernel)?;
         let expected = 1_000_000_000_000 - (24 * 60 * 60 * 1000); // 1 day in milliseconds
         assert_eq!(result, expected);
 
         // Test with zero retention
         let retention = Duration::from_secs(0);
-        let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time)?;
+        let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time)
+            .map_err(crate::Error::Kernel)?;
         let expected = 1_000_000_000_000; // Same as reference time
         assert_eq!(result, expected);
 
@@ -195,7 +198,8 @@ mod tests {
     fn test_calculate_transaction_expiration_timestamp() -> Result<()> {
         // No set_transaction_retention_duration
         let properties = TableProperties::default();
-        let result = calculate_transaction_expiration_timestamp(&properties)?;
+        let result = calculate_transaction_expiration_timestamp(&properties)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(result, None);
 
         // Test with set_transaction_retention_duration
@@ -203,7 +207,8 @@ mod tests {
             set_transaction_retention_duration: Some(Duration::from_secs(3600)), // 1 hour
             ..Default::default()
         };
-        let result = calculate_transaction_expiration_timestamp(&properties)?;
+        let result = calculate_transaction_expiration_timestamp(&properties)
+            .map_err(crate::Error::Kernel)?;
         assert!(result.is_some());
 
         // The result should be current time minus 1 hour (approximately)
@@ -251,7 +256,9 @@ mod tests {
         // Test with default retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);
-        let result = calculator.deleted_file_retention_timestamp()?;
+        let result = calculator
+            .deleted_file_retention_timestamp()
+            .map_err(crate::Error::Kernel)?;
 
         // Should be current time minus 7 days (approximately)
         let now_ms = crate::utils::current_time_ms().unwrap();
@@ -266,7 +273,9 @@ mod tests {
             ..Default::default()
         };
         let calculator = MockRetentionCalculator::new(properties);
-        let result = calculator.deleted_file_retention_timestamp()?;
+        let result = calculator
+            .deleted_file_retention_timestamp()
+            .map_err(crate::Error::Kernel)?;
 
         let thirty_minutes_ms = 30 * 60 * 1000;
         assert!(result < now_ms);
@@ -280,7 +289,9 @@ mod tests {
         // Test with no transaction retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);
-        let result = calculator.get_transaction_expiration_timestamp()?;
+        let result = calculator
+            .get_transaction_expiration_timestamp()
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(result, None);
 
         // Test with transaction retention
@@ -289,7 +300,9 @@ mod tests {
             ..Default::default()
         };
         let calculator = MockRetentionCalculator::new(properties);
-        let result = calculator.get_transaction_expiration_timestamp()?;
+        let result = calculator
+            .get_transaction_expiration_timestamp()
+            .map_err(crate::Error::Kernel)?;
         assert!(result.is_some());
 
         let timestamp = result.unwrap();

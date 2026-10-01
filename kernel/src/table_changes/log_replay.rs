@@ -200,13 +200,16 @@ impl LogReplayScanner {
                 slice::from_ref(&commit_file.location),
                 visitor_schema,
                 None, // not safe to apply data skipping yet
-            )?
+            )
+            .map_err(crate::Error::into_kernel_error)?
             .peekable();
 
         let mut in_commit_timestamp_opt = None;
         if let Some(Ok(actions)) = action_iter.peek() {
             let mut visitor = InCommitTimestampVisitor::default();
-            visitor.visit_rows_of(actions.as_ref())?;
+            visitor
+                .visit_rows_of(actions.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
             in_commit_timestamp_opt = visitor.in_commit_timestamp;
         }
 
@@ -215,7 +218,7 @@ impl LogReplayScanner {
         let mut has_cdc_action = false;
 
         for actions in action_iter {
-            let actions = actions?;
+            let actions = actions.map_err(crate::Error::into_kernel_error)?;
 
             let mut visitor = PreparePhaseVisitor {
                 add_paths: &mut add_paths,
@@ -223,15 +226,20 @@ impl LogReplayScanner {
                 has_cdc_action: &mut has_cdc_action,
                 mode,
             };
-            visitor.visit_rows_of(actions.as_ref())?;
+            visitor
+                .visit_rows_of(actions.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
 
-            let metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            let metadata_opt = Metadata::try_new_from_data(actions.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
             let has_metadata_update = metadata_opt.is_some();
             let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             let has_protocol_update = protocol_opt.is_some();
 
             if let Some(ref metadata) = metadata_opt {
-                let schema = metadata.parse_schema()?;
+                let schema = metadata
+                    .parse_schema()
+                    .map_err(crate::Error::into_kernel_error)?;
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
@@ -281,6 +289,7 @@ impl LogReplayScanner {
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
+                    .map_err(crate::Error::into_kernel_error)
                     .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
             }
         }
@@ -343,23 +352,25 @@ impl LogReplayScanner {
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&commit_file.location),
-            schema.clone(),
-            None,
-        )?;
+        let action_iter = engine
+            .json_handler()
+            .read_json_files(slice::from_ref(&commit_file.location), schema.clone(), None)
+            .map_err(crate::Error::into_kernel_error)?;
         let commit_version = commit_file
             .version
             .try_into()
             .map_err(|_| KernelError::generic("Failed to convert commit version to i64"))?;
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            schema,
-            Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
-            cdf_scan_row_schema().into(),
-        )?;
+        let evaluator = engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                schema,
+                Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
+                cdf_scan_row_schema().into(),
+            )
+            .map_err(crate::Error::into_kernel_error)?;
 
         let result = action_iter.map(move |actions| -> KernelResult<_> {
-            let actions = actions?;
+            let actions = actions.map_err(crate::Error::into_kernel_error)?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector
@@ -371,8 +382,12 @@ impl LogReplayScanner {
 
             let mut visitor =
                 FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
-            visitor.visit_rows_of(actions.as_ref())?;
-            let scan_metadata = evaluator.evaluate(actions.as_ref())?;
+            visitor
+                .visit_rows_of(actions.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
+            let scan_metadata = evaluator
+                .evaluate(actions.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
             Ok(TableChangesScanMetadata {
                 scan_metadata,
                 selection_vector: visitor.selection_vector,
@@ -436,10 +451,10 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 11,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             if let Some(path) = getters[0].get_str(i, "add.path")? {
@@ -450,7 +465,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             } else if let Some(path) = getters[2].get_str(i, "remove.path")? {
                 // If no data was changed, we must ignore that action
                 if !*self.has_cdc_action && getters[3].get(i, "remove.dataChange")? {
-                    let deletion_vector = visit_deletion_vector_at(i, &getters[4..=8])?;
+                    let deletion_vector = visit_deletion_vector_at(i, &getters[4..=8])
+                        .map_err(crate::Error::Kernel)?;
                     self.remove_dvs
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
@@ -515,10 +531,10 @@ impl RowVisitor for FileActionSelectionVisitor<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 5,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of FileActionSelectionVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for i in 0..row_count {

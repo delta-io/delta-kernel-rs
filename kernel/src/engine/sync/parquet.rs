@@ -34,7 +34,8 @@ pub(super) fn try_create_from_parquet(
     file_location: String,
 ) -> KernelResult<impl Iterator<Item = KernelResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
-    let (requested_ordering, mask) = parquet_read_plan(&schema, &metadata)?;
+    let (requested_ordering, mask) =
+        parquet_read_plan(&schema, &metadata).map_err(crate::Error::into_kernel_error)?;
 
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
@@ -45,16 +46,20 @@ pub(super) fn try_create_from_parquet(
             builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
         });
 
-    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+    let mut row_indexes = row_indexes
+        .map(|rb| rb.build())
+        .transpose()
+        .map_err(crate::Error::into_kernel_error)?;
     let stream = builder.build()?;
     Ok(stream.map(move |rbr| {
         fixup_parquet_read(
-            rbr?,
+            rbr.map_err(crate::KernelError::from)?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
             Some(&schema),
         )
+        .map_err(crate::Error::into_kernel_error)
     }))
 }
 
@@ -72,7 +77,10 @@ impl ParquetHandler for SyncParquetHandler {
             predicate,
             try_create_from_parquet,
         );
-        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
+        Ok(Box::new(iter.map(|data| {
+            data.map(|data| Box::new(data) as _)
+                .map_err(crate::Error::Kernel)
+        })))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -89,9 +97,12 @@ impl ParquetHandler for SyncParquetHandler {
         location: Url,
         mut data: ResultIteratorStatic<Box<dyn EngineData>>,
     ) -> Result<FileSize> {
-        let first_batch = data.next().ok_or_else(|| {
-            crate::KernelError::generic("Cannot write parquet file with empty data iterator")
-        })??;
+        let first_batch = data
+            .next()
+            .ok_or_else(|| {
+                crate::KernelError::generic("Cannot write parquet file with empty data iterator")
+            })
+            .map_err(crate::Error::Kernel)??;
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
@@ -100,23 +111,35 @@ impl ParquetHandler for SyncParquetHandler {
             &mut buf,
             first_record_batch.schema(),
             writer_options(),
-        )?;
-        writer.write(&first_record_batch)?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
+        writer
+            .write(&first_record_batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         for result in data {
             let engine_data = result?;
             let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
-            writer.write(&batch)?;
+            writer
+                .write(&batch)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?;
         }
-        writer.close()?; // writer must be closed to write the footer
+        writer
+            .close()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?; // writer must be closed to write the footer
         let size_in_bytes = buf.len() as u64;
 
-        put_bytes(self.store.as_ref(), &location, buf.into(), true)?;
+        put_bytes(self.store.as_ref(), &location, buf.into(), true)
+            .map_err(crate::Error::Kernel)?;
         Ok(size_in_bytes)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
-        parquet_footer(self.store.as_ref(), file)
+        parquet_footer(self.store.as_ref(), file).map_err(crate::Error::Kernel)
     }
 }
 

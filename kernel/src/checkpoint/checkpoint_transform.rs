@@ -21,7 +21,7 @@ use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, 
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult};
+use crate::{Error, KernelError, KernelResult};
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
@@ -126,7 +126,7 @@ pub(crate) fn build_checkpoint_transform(
         }
     }
 
-    patch_builder.build()
+    patch_builder.build().map_err(Error::into_kernel_error)
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -172,6 +172,7 @@ pub(crate) fn build_checkpoint_read_schema(
                 )
             })
             .build(add_struct)
+            .map_err(Error::into_kernel_error)
     })
 }
 
@@ -268,7 +269,8 @@ fn transform_add_schema(
         .with_metadata(add_field.metadata.clone());
     let new_schema = SchemaStructPatchBuilder::new()
         .replace(ADD_NAME, new_add_field)
-        .build(base_schema)?;
+        .build(base_schema)
+        .map_err(Error::into_kernel_error)?;
 
     Ok(Arc::new(new_schema))
 }

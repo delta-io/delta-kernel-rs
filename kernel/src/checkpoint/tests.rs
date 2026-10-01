@@ -47,7 +47,8 @@ fn test_deleted_file_retention_timestamp(
     let reference_time_secs = 10_000;
     let reference_time = Duration::from_secs(reference_time_secs);
 
-    let result = deleted_file_retention_timestamp_with_time(retention, reference_time)?;
+    let result = deleted_file_retention_timestamp_with_time(retention, reference_time)
+        .map_err(crate::Error::Kernel)?;
     assert_eq!(result, expected_timestamp);
 
     Ok(())
@@ -92,16 +93,20 @@ async fn test_create_checkpoint_metadata_batch() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let snapshot_version = snapshot.version();
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Use V2 schema for the checkpoint metadata batch
-    let checkpoint_batch =
-        writer.create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)?;
+    let checkpoint_batch = writer
+        .create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)
+        .map_err(crate::Error::Kernel)?;
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
     // Verify the underlying EngineData contains the expected fields
@@ -173,7 +178,8 @@ fn test_create_last_checkpoint_data() -> Result<()> {
         total_actions_counter,
         add_actions_counter,
         size_in_bytes,
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
 
     // Verify the underlying EngineData contains the expected `LastCheckpointInfo` schema and data
     let arrow_engine_data = ArrowEngineData::try_from_engine_data(last_checkpoint_batch)?;
@@ -309,8 +315,11 @@ fn try_finalize_checkpoint(
         state,
         metadata.size,
         0, /* num_sidecars */
-    )?;
-    writer.finalize(engine, &last_checkpoint_stats)
+    )
+    .map_err(crate::Error::into_kernel_error)?;
+    writer
+        .finalize(engine, &last_checkpoint_stats)
+        .map_err(crate::Error::into_kernel_error)
 }
 
 /// Helper to verify the contents of the `_last_checkpoint` file
@@ -354,7 +363,8 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
         vec![create_add_action_with_stats("fake_path_1", 10)],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // 2nd commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
@@ -365,7 +375,8 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // 3rd commit: metadata & protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -374,16 +385,21 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
         vec![create_metadata_action(), create_basic_protocol_action()],
         2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
         writer.checkpoint_path()?,
-        Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")?
+        Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?
     );
 
     let result = writer.checkpoint_data(&engine)?;
@@ -403,17 +419,21 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
     let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
+        location: Url::parse("memory:///fake_path_2")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?,
         last_modified: 0,
         size: size_in_bytes,
     };
-    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter).map_err(crate::Error::Kernel)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
     // - numOfAddFiles: 1 add file from 2nd commit (fake_path_2)
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes).await?;
+    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     Ok(())
 }
@@ -433,7 +453,8 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
         vec![create_basic_protocol_action(), create_metadata_action()],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // 2nd commit (version 1) - add actions
     write_commit_to_store(
@@ -444,9 +465,12 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     // Specify version 0 for checkpoint
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
@@ -456,7 +480,9 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
         writer.checkpoint_path()?,
-        Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?
+        Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?
     );
 
     let result = writer.checkpoint_data(&engine)?;
@@ -471,17 +497,21 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
     let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
+        location: Url::parse("memory:///fake_path_2")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?,
         last_modified: 0,
         size: size_in_bytes,
     };
-    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter).map_err(crate::Error::Kernel)?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
     // - numOfAddFiles: no add files in version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes).await?;
+    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     Ok(())
 }
@@ -497,9 +527,12 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
         vec![create_basic_protocol_action(), create_metadata_action()],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
@@ -590,7 +623,8 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // 2nd commit: metadata & protocol actions
     // Protocol action includes the v2Checkpoint reader/writer feature.
@@ -602,16 +636,21 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
         writer.checkpoint_path()?,
-        Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")?
+        Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?
     );
 
     let result = writer.checkpoint_data(&engine)?;
@@ -636,17 +675,21 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
     // Finalize and verify checkpoint metadata
     let size_in_bytes = 10;
     let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
+        location: Url::parse("memory:///fake_path_2")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?,
         last_modified: 0,
         size: size_in_bytes,
     };
-    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter).map_err(crate::Error::Kernel)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
     // - numOfAddFiles: 1 add file from version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes).await?;
+    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     Ok(())
 }
@@ -668,7 +711,8 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // staged commit
     let staged_commit_path = Path::from(
@@ -683,9 +727,11 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
         .await
         .unwrap();
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let staged_commit = FileMeta {
-        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")?,
+        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json").map_err(crate::KernelError::from).map_err(crate::Error::Kernel)?,
         last_modified: 0,
         size: 100,
     };
@@ -696,7 +742,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::KernelError::UnpublishedVersion(1)
+        crate::Error::Kernel(crate::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }
@@ -725,7 +771,8 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         vec![create_metadata_action(), create_basic_protocol_action()],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Version 1: add 3 files
     write_commit_to_store(
@@ -737,7 +784,8 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Version 2: add 2 more files, remove 1
     write_commit_to_store(
@@ -749,7 +797,8 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         ],
         2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Version 3: add 1 file, remove 2
     write_commit_to_store(
@@ -761,7 +810,8 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         ],
         3,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Version 4: add 2 files
     write_commit_to_store(
@@ -772,17 +822,27 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         ],
         4,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
     snapshot.checkpoint(&engine, None)?;
 
     // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
-    let checkpoint_size = store.head(&checkpoint_path).await?.size;
-    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
+    let checkpoint_size = store
+        .head(&checkpoint_path)
+        .await
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .size;
+    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     // Version 5: add 2 files, remove 1
     write_commit_to_store(
@@ -794,10 +854,13 @@ async fn test_snapshot_checkpoint() -> Result<()> {
         ],
         5,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Version 6: add 1 file
-    write_commit_to_store(&store, vec![create_add_action("file11.parquet")], 6).await?;
+    write_commit_to_store(&store, vec![create_add_action("file11.parquet")], 6)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
@@ -805,8 +868,15 @@ async fn test_snapshot_checkpoint() -> Result<()> {
 
     // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
-    let checkpoint_size = store.head(&checkpoint_path).await?.size;
-    assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size).await?;
+    let checkpoint_size = store
+        .head(&checkpoint_path)
+        .await
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .size;
+    assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     Ok(())
 }
@@ -971,7 +1041,9 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let _ = create_table(
         table_root.as_str(),
         schema_ref! { nullable "value": INTEGER },
@@ -988,7 +1060,8 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
     )
     .await
-    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
+    .map_err(|err| crate::KernelError::generic(err.to_string()))
+    .map_err(crate::Error::Kernel)?;
 
     // Version 2
     add_commit(
@@ -998,27 +1071,36 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
     )
     .await
-    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
+    .map_err(|err| crate::KernelError::generic(err.to_string()))
+    .map_err(crate::Error::Kernel)?;
 
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
     assert_eq!(snapshot_v2.version(), 2);
     snapshot_v2.checkpoint(&engine, None)?;
-    let last_checkpoint = read_last_checkpoint_file(&store).await?;
+    let last_checkpoint = read_last_checkpoint_file(&store)
+        .await
+        .map_err(crate::Error::Kernel)?;
     let size_in_bytes = last_checkpoint
         .get("sizeInBytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            crate::KernelError::generic("missing or invalid sizeInBytes in _last_checkpoint")
+            crate::Error::Kernel(crate::KernelError::generic(
+                "missing or invalid sizeInBytes in _last_checkpoint",
+            ))
         })?;
-    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     // Time-travel to version 1 and writing a checkpoint should not override _last_checkpoint
     let snapshot_v1 = Snapshot::builder_for(table_root)
         .at_version(1)
         .build(&engine)?;
     snapshot_v1.checkpoint(&engine, None)?;
-    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes)
+        .await
+        .map_err(crate::Error::Kernel)
 }
 
 /// Helper to create metadata action with specific stats settings
@@ -1131,7 +1213,9 @@ async fn test_stats_config_round_trip(
 ) -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
 
     // Commit 0: protocol + metadata with initial settings
     write_commit_to_store(
@@ -1142,7 +1226,8 @@ async fn test_stats_config_round_trip(
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Commit 1: add action with JSON stats
     write_commit_to_store(
@@ -1150,7 +1235,8 @@ async fn test_stats_config_round_trip(
         vec![create_add_action_with_stats("file1.parquet", 100)],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Write checkpoint 1 to parquet with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -1162,7 +1248,8 @@ async fn test_stats_config_round_trip(
         vec![create_metadata_with_stats_config(json2, struct2)],
         2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Build snapshot that reads from checkpoint 1 + commit 2.
     // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
@@ -1175,7 +1262,8 @@ async fn test_stats_config_round_trip(
     let first_batch = result2.next().expect("should have at least one batch")?;
     let data = first_batch.apply_selection_vector()?;
     let record_batch = data.try_into_record_batch()?;
-    verify_checkpoint_schema(&record_batch.schema(), json2, struct2)?;
+    verify_checkpoint_schema(&record_batch.schema(), json2, struct2)
+        .map_err(crate::Error::Kernel)?;
 
     // Consume remaining batches (verifies COALESCE doesn't error)
     for batch in result2 {
@@ -1198,7 +1286,9 @@ async fn test_stats_config_round_trip_partitioned(
 ) -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
 
     // Commit 0: protocol + partitioned metadata with initial settings
     write_commit_to_store(
@@ -1213,7 +1303,8 @@ async fn test_stats_config_round_trip_partitioned(
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Commit 1: add action with partition values and JSON stats
     let mut add = Add {
@@ -1226,7 +1317,9 @@ async fn test_stats_config_round_trip_partitioned(
     };
     add.partition_values
         .insert("category".into(), "books".into());
-    write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
+    write_commit_to_store(&store, vec![Action::Add(add)], 1)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
     // Write checkpoint 1 with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -1242,7 +1335,8 @@ async fn test_stats_config_round_trip_partitioned(
         )],
         2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Build snapshot that reads from checkpoint 1 + commit 2
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
@@ -1263,7 +1357,8 @@ async fn test_stats_config_round_trip_partitioned(
         json2,
         struct2,
         struct2, // partitionValues_parsed present iff writeStatsAsStruct=true
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
 
     // When writeStatsAsStruct=true, verify partitionValues_parsed contains correct values
     if struct2 {
@@ -1347,10 +1442,12 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await.map_err(crate::Error::Kernel)?;
 
     // Checkpoint version 0: stats_parsed nullCount fields are plain Int64 (no metadata)
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     Snapshot::builder_for(table_root.clone())
         .build(&engine)?
         .checkpoint(&engine, None)?;
@@ -1370,7 +1467,8 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
         )],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Checkpoint version 1: the add from checkpoint 0 has stats_parsed with nullCount fields
     // lacking metadata. Ensure our checkpointing drops the new metadata for the stats fields and

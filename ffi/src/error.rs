@@ -1,5 +1,5 @@
 use delta_kernel::snapshot::SnapshotHintError;
-use delta_kernel::{KernelError, Result};
+use delta_kernel::{Error, KernelError, KernelResult, Result};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -255,11 +255,35 @@ impl<T> IntoExternResult<T> for Result<T> {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
                 let msg = format!("{err}");
-                let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
-                ExternResult::Err(err)
+                let etype = match err {
+                    Error::Kernel(error) => FFIKernelError::from(error),
+                    _ => FFIKernelError::UnknownError,
+                };
+                unsafe { allocate_extern_error(etype, msg, alloc) }
             }
         }
     }
+}
+
+impl<T> IntoExternResult<T> for KernelResult<T> {
+    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
+        match self {
+            Ok(ok) => ExternResult::Ok(ok),
+            Err(err) => {
+                let msg = format!("{err}");
+                unsafe { allocate_extern_error(FFIKernelError::from(err), msg, alloc) }
+            }
+        }
+    }
+}
+
+unsafe fn allocate_extern_error<T>(
+    etype: FFIKernelError,
+    message: String,
+    alloc: &dyn AllocateError,
+) -> ExternResult<T> {
+    let error = unsafe { alloc.allocate_error(etype, kernel_string_slice!(message)) };
+    ExternResult::Err(error)
 }
 
 /// An error that can be returned from engine-side execution (e.g during an upcall).
@@ -515,6 +539,35 @@ mod error_code_tests {
 
         let err: KernelError = exec_error(FFIKernelError::MaxCatalogVersionError, "invalid").into();
         assert!(matches!(err, KernelError::MaxCatalogVersion(message) if message == "invalid"));
+    }
+}
+
+#[cfg(test)]
+mod extern_result_tests {
+    use super::*;
+    use crate::ffi_test_utils::{allocate_err, recover_error};
+
+    #[test]
+    fn kernel_and_public_results_preserve_ffi_error_code_and_message() {
+        let allocator: AllocateErrorFn = allocate_err;
+        let message = "same kernel failure";
+        let public_result: Result<()> = Err(Error::Kernel(KernelError::generic(message)));
+        let kernel_result: KernelResult<()> = Err(KernelError::generic(message));
+
+        let public_error = unsafe { public_result.into_extern_result(&allocator) };
+        let kernel_error = unsafe { kernel_result.into_extern_result(&allocator) };
+        let public_error = match public_error {
+            ExternResult::Err(error) => unsafe { recover_error(error) },
+            ExternResult::Ok(()) => panic!("expected a public result error"),
+        };
+        let kernel_error = match kernel_error {
+            ExternResult::Err(error) => unsafe { recover_error(error) },
+            ExternResult::Ok(()) => panic!("expected a kernel result error"),
+        };
+
+        assert_eq!(public_error.etype, kernel_error.etype);
+        assert_eq!(public_error.message, kernel_error.message);
+        assert_eq!(public_error.etype, FFIKernelError::GenericError);
     }
 }
 

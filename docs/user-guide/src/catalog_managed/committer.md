@@ -167,8 +167,8 @@ shape:
 
 Map your catalog's "another writer won this version" error to `CommitResponse::Conflict { version:
 commit_metadata.version() }` rather than propagating it as an `Err`. Return other errors as
-`Err(...)`. Kernel classifies only `KernelError::IOError` as retryable (surfaced as
-`CommitResult::Retryable`); return `IOError` for transient storage failures and other variants for
+`Err(...)`. Kernel classifies only `Error::Kernel(KernelError::IOError(_))` as retryable (surfaced as
+`CommitResult::Retryable`); wrap transient storage failures in that variant and use other variants for
 everything else. Do not disguise non-I/O errors as `IOError` to opt into retry semantics.
 
 ### Step 3: Mark as catalog committer
@@ -191,7 +191,7 @@ Kernel passes the commits to publish as a contiguous ascending batch via
   already copied some entries.
 
 ```rust,ignore
-use delta_kernel::KernelError;
+use delta_kernel::{Error, KernelError};
 
 fn publish(
     &self,
@@ -202,7 +202,7 @@ fn publish(
         let src = catalog_commit.location();            // _staged_commits/<v>.<uuid>.json
         let dest = catalog_commit.published_location(); // _delta_log/<v>.json
         match engine.storage_handler().copy_atomic(src, dest) {
-            Ok(()) | Err(KernelError::FileAlreadyExists(_)) => (), // already published
+            Ok(()) | Err(Error::Kernel(KernelError::FileAlreadyExists(_))) => (), // already published
             Err(e) => return Err(e),
         }
     }
@@ -219,7 +219,7 @@ catalog's client type and fill in the ratification logic:
 // Imports elided for brevity. In addition to the ones below, you will need
 // Committer, CommitMetadata, CommitResponse, PublishMetadata, Result,
 // FilteredEngineData, and Engine from delta_kernel.
-use delta_kernel::{KernelError, FileMeta};
+use delta_kernel::{Error, KernelError, FileMeta};
 
 pub struct MyCatalogCommitter {
     catalog_client: Arc<MyCatalogClient>,
@@ -273,7 +273,7 @@ impl Committer for MyCatalogCommitter {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
-                Ok(()) | Err(KernelError::FileAlreadyExists(_)) => (),
+                Ok(()) | Err(Error::Kernel(KernelError::FileAlreadyExists(_))) => (),
                 Err(e) => return Err(e),
             }
         }

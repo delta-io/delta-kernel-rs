@@ -48,9 +48,11 @@ the storage backend from the URL scheme:
 # use url::Url;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::Result;
+# use delta_kernel::{Error, KernelError, Result};
 # fn main() -> Result<()> {
-let url = Url::parse("file:///path/to/table")?;
+let url = Url::parse("file:///path/to/table")
+    .map_err(KernelError::from)
+    .map_err(Error::Kernel)?;
 let store = store_from_url(&url)?;
 let engine = DefaultEngine::builder(store).build();
 # Ok(())
@@ -70,9 +72,11 @@ To pass provider-specific options (credentials, region, endpoint, etc.), use
 # use url::Url;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url_opts;
-# use delta_kernel::Result;
+# use delta_kernel::{Error, KernelError, Result};
 # fn main() -> Result<()> {
-let url = Url::parse("s3://my-bucket/path/to/table")?;
+let url = Url::parse("s3://my-bucket/path/to/table")
+    .map_err(KernelError::from)
+    .map_err(Error::Kernel)?;
 let options = HashMap::from([
     ("region", "us-west-2"),
     ("access_key_id", "AKIA..."),

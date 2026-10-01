@@ -10,7 +10,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{Engine, KernelError, KernelResult, Result, SnapshotRef, Version};
+use crate::{Engine, Error, KernelError, KernelResult, Result, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -99,10 +99,10 @@ impl LogCompactionWriter {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
-            return Err(KernelError::generic(format!(
+            return Err(Error::Kernel(KernelError::generic(format!(
                 "End version {} exceeds snapshot version {}",
                 self.end_version, snapshot_end_version
-            )));
+            ))));
         }
 
         // Create a log segment specifically for the compaction range
@@ -118,13 +118,16 @@ impl LogCompactionWriter {
         let actions_iter =
             compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
 
-        let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
+        let min_file_retention_timestamp_millis = self
+            .deleted_file_retention_timestamp()
+            .map_err(Error::Kernel)?;
 
         // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
         let processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,
-            self.get_transaction_expiration_timestamp()?,
+            self.get_transaction_expiration_timestamp()
+                .map_err(Error::Kernel)?,
         );
 
         // Process actions using the same iterator pattern as checkpoints
@@ -132,6 +135,8 @@ impl LogCompactionWriter {
         let result_iter = processor.process_actions_iter(actions_iter);
 
         // Wrap the iterator to track action counts lazily
-        Ok(ActionReconciliationIterator::new(Box::new(result_iter)))
+        Ok(ActionReconciliationIterator::new(Box::new(
+            result_iter.map(|batch| batch.map_err(Error::into_kernel_error)),
+        )))
     }
 }

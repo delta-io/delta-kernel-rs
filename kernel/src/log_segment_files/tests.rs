@@ -1816,7 +1816,10 @@ impl StorageHandler for FiniteListingHandler {
         let iter = (0..self.count as u64).map(move |version| {
             pulled.fetch_add(1, Ordering::Relaxed);
             Ok(FileMeta::new(
-                log_root.join(&format!("{version:020}.json"))?,
+                log_root
+                    .join(&format!("{version:020}.json"))
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?,
                 version as i64,
                 1,
             ))
@@ -1870,7 +1873,10 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
 
     let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
-    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::Cancelled))
+    ));
     assert_eq!(pulled.load(Ordering::Relaxed), 0);
 }
 
@@ -1891,7 +1897,10 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 
     token.cancel();
 
-    assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        iter.next(),
+        Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+    ));
     // The listing stopped early rather than draining all 100 entries.
     assert!(pulled.load(Ordering::Relaxed) < 100);
 }

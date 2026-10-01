@@ -165,9 +165,11 @@ mod tests {
             _data: ResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
         ) -> Result<FileSize> {
-            self.write_size.ok_or_else(|| {
-                crate::KernelError::generic("StubJsonHandler does not support writes")
-            })
+            self.write_size
+                .ok_or_else(|| {
+                    crate::KernelError::generic("StubJsonHandler does not support writes")
+                })
+                .map_err(crate::Error::Kernel)
         }
     }
 

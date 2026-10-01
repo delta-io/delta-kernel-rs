@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path as ObjectPath;
 use delta_kernel::object_store::ObjectStore;
-use delta_kernel::{Engine, KernelError, Snapshot, Version};
+use delta_kernel::{Engine, Error, KernelError, Snapshot, Version};
 use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -18,6 +18,12 @@ pub enum AssertionError {
 
     #[error("Kernel error: {0}")]
     KernelError(#[from] KernelError),
+}
+
+impl From<Error> for AssertionError {
+    fn from(error: Error) -> Self {
+        Self::KernelError(error.into_kernel_error())
+    }
 }
 
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
 use delta_kernel::{
-    KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult, Result,
+    Error, KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult, Result,
+    ResultIteratorStatic,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
@@ -65,26 +66,37 @@ impl PlanExecutor for FfiPlanExecutor {
 
         let mut out = EngineExecResult::Uninit;
         (self.callback)(self.context, plan_proto_slice, &mut out);
-        let plan_result =
-            match out {
-                EngineExecResult::Success(plan) => plan,
-                EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(KernelError::internal_error(
+        let plan_result = match out {
+            EngineExecResult::Success(plan) => plan,
+            EngineExecResult::Failure(err) => return Err(Error::Kernel(err.into())),
+            EngineExecResult::Uninit => {
+                return Err(Error::Kernel(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
-                )),
-            };
+                )))
+            }
+        };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
-            CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiEngineDataIter::new(it)))),
-            CPlanResult::FileMeta(it) => {
-                Ok(PlanResult::FileMeta(Box::new(FfiFileMetaIter::new(it))))
+            CPlanResult::Data(it) => Ok(PlanResult::Data(map_kernel_errors(
+                FfiEngineDataIter::new(it),
+            ))),
+            CPlanResult::FileMeta(it) => Ok(PlanResult::FileMeta(map_kernel_errors(
+                FfiFileMetaIter::new(it),
+            ))),
+            CPlanResult::Bytes(it) => {
+                Ok(PlanResult::Bytes(map_kernel_errors(FfiBytesIter::new(it))))
             }
-            CPlanResult::Bytes(it) => Ok(PlanResult::Bytes(Box::new(FfiBytesIter::new(it)))),
-            CPlanResult::ParquetFooter(footer) => {
-                Ok(PlanResult::ParquetFooter(decode_parquet_footer(footer)?))
-            }
+            CPlanResult::ParquetFooter(footer) => Ok(PlanResult::ParquetFooter(
+                decode_parquet_footer(footer).map_err(Error::Kernel)?,
+            )),
         }
     }
+}
+
+fn map_kernel_errors<T: Send + 'static>(
+    iter: impl Iterator<Item = KernelResult<T>> + Send + 'static,
+) -> ResultIteratorStatic<T> {
+    Box::new(iter.map(|item| item.map_err(Error::Kernel)))
 }
 
 /// Convert a [`CParquetFooter`] into a kernel [`ParquetFooter`].
@@ -98,7 +110,8 @@ fn decode_parquet_footer(footer: CParquetFooter) -> KernelResult<ParquetFooter> 
     let bytes = *unsafe { schema_proto.into_inner() };
     let proto =
         proto_schema::StructType::decode(bytes.as_slice()).map_err(KernelError::generic_err)?;
-    let schema = Arc::new(StructType::try_from(proto)?);
+    let schema =
+        Arc::new(StructType::try_from(proto).map_err(delta_kernel::Error::into_kernel_error)?);
     Ok(ParquetFooter { schema })
 }
 
@@ -200,7 +213,7 @@ mod tests {
             panic!("execute_op should surface the engine failure");
         };
         assert!(
-            matches!(err, KernelError::Unsupported(ref msg) if msg == "kaboom"),
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Unsupported(ref msg)) if msg == "kaboom"),
             "expected KernelError::Unsupported(\"kaboom\"), got {err:?}"
         );
     }
@@ -318,7 +331,10 @@ mod tests {
             panic!("invalid schema proto bytes should fail to decode");
         };
         assert!(
-            matches!(err, KernelError::GenericError { .. }),
+            matches!(
+                err,
+                delta_kernel::Error::Kernel(KernelError::GenericError { .. })
+            ),
             "expected a proto decode error, got {err:?}"
         );
     }

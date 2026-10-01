@@ -102,7 +102,7 @@ pub unsafe extern "C" fn write_state_decode(
     let engine = unsafe { engine.as_ref() };
     let encoded = unsafe { encoded.try_as_slice() };
     encoded
-        .and_then(WriteState::decode)
+        .and_then(|bytes| WriteState::decode(bytes).map_err(delta_kernel::Error::into_kernel_error))
         .map(Into::into)
         .into_extern_result(&engine)
 }
@@ -338,10 +338,12 @@ pub unsafe extern "C" fn get_partitioned_write_context(
     let engine = unsafe { engine.as_ref() };
     partitioned_write_context_impl(
         |pv| {
-            txn.write_state()?
+            txn.write_state()
+                .map_err(delta_kernel::Error::into_kernel_error)?
                 .write_context_builder()
                 .with_partition_values(pv)
                 .build()
+                .map_err(delta_kernel::Error::into_kernel_error)
         },
         *partition_values,
     )
@@ -366,10 +368,12 @@ pub unsafe extern "C" fn create_table_get_partitioned_write_context(
     let engine = unsafe { engine.as_ref() };
     partitioned_write_context_impl(
         |pv| {
-            txn.write_state()?
+            txn.write_state()
+                .map_err(delta_kernel::Error::into_kernel_error)?
                 .write_context_builder()
                 .with_partition_values(pv)
                 .build()
+                .map_err(delta_kernel::Error::into_kernel_error)
         },
         *partition_values,
     )
@@ -547,7 +551,10 @@ pub unsafe extern "C" fn resolve_file_path(
 ) -> ExternResult<NullableCvoid> {
     let write_context = unsafe { write_context.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    let file_url: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&file_url) };
+    let file_url: KernelResult<&str> = unsafe {
+        TryFromStringSlice::try_from_slice(&file_url)
+            .map_err(delta_kernel::Error::into_kernel_error)
+    };
     resolve_file_path_impl(write_context, file_url)
         .map(|path| allocate_fn(kernel_string_slice!(path)))
         .into_extern_result(&engine)
@@ -560,5 +567,7 @@ fn resolve_file_path_impl(
     let url = Url::parse(file_url?).map_err(|e| {
         KernelError::generic(format!("invalid file URL passed to resolve_file_path: {e}"))
     })?;
-    write_context.resolve_file_path(&url)
+    write_context
+        .resolve_file_path(&url)
+        .map_err(delta_kernel::Error::into_kernel_error)
 }

@@ -239,7 +239,9 @@ impl LastCheckpointHint {
     ) -> Result<Self> {
         let checkpoint_schema = checkpoint_schema
             .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
-            .transpose()?;
+            .transpose()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         Ok(Self {
             version,
             size,
@@ -331,7 +333,10 @@ impl LastCheckpointHint {
     /// Returns the path of the `_last_checkpoint` file given the log root of a table.
     #[internal_api]
     pub(crate) fn path(log_root: &Url) -> Result<Url> {
-        Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
+        log_root
+            .join(LAST_CHECKPOINT_FILE_NAME)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)
     }
 
     /// Try reading the `_last_checkpoint` file.
@@ -353,9 +358,10 @@ impl LastCheckpointHint {
         log_root: &Url,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Option<LastCheckpointHint>> {
-        let file_path = Self::path(log_root)?;
+        let file_path = Self::path(log_root).map_err(crate::Error::into_kernel_error)?;
         match storage
-            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
+            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())
+            .map_err(crate::Error::into_kernel_error)?
             .next()
         {
             Some(Ok(data)) => {
@@ -380,11 +386,11 @@ impl LastCheckpointHint {
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(KernelError::FileNotFound(_))) => {
+            Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(crate::Error::into_kernel_error(err)),
             None => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)
@@ -1164,10 +1170,11 @@ mod tests {
             config: expected_config,
         } = expected;
 
-        let (engine, snapshot, _tempdir) = load_test_table(table)?;
+        let (engine, snapshot, _tempdir) = load_test_table(table).map_err(crate::Error::Kernel)?;
         let seg = snapshot.log_segment();
         let hint =
-            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root, None)?
+            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root, None)
+                .map_err(crate::Error::Kernel)?
                 .expect("table has a _last_checkpoint");
         let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 

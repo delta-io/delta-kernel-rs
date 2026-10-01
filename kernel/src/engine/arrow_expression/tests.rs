@@ -675,7 +675,10 @@ impl OpaqueLessThanOp {
         };
 
         let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::INTEGER));
-        Ok(op_fn(&eval(left)?, &eval(right)?)?)
+        Ok(op_fn(
+            &eval(left).map_err(crate::Error::into_kernel_error)?,
+            &eval(right).map_err(crate::Error::into_kernel_error)?,
+        )?)
     }
 }
 
@@ -699,7 +702,9 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         result_type: Option<&KernelDataType>,
     ) -> Result<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
-        let result = self.eval_pred(args, batch, false)?;
+        let result = self
+            .eval_pred(args, batch, false)
+            .map_err(crate::Error::Kernel)?;
         Ok(Arc::new(result))
     }
 }
@@ -716,6 +721,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         inverted: bool,
     ) -> Result<BooleanArray> {
         self.eval_pred(args, batch, inverted)
+            .map_err(crate::Error::Kernel)
     }
 
     fn eval_pred_scalar(

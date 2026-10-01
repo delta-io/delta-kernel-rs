@@ -363,10 +363,13 @@ pub(crate) mod adaptive_metadata_fixtures {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test")
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?;
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .map_err(crate::Error::into_kernel_error)?
+            .commit(&engine)
+            .map_err(crate::Error::into_kernel_error)?;
         let table_root = Snapshot::builder_for("memory:///")
-            .build(&engine)?
+            .build(&engine)
+            .map_err(crate::Error::into_kernel_error)?
             .table_root()
             .clone();
         Ok((engine, table_root))
@@ -381,11 +384,14 @@ pub(crate) mod adaptive_metadata_fixtures {
     ) -> KernelResult<()> {
         let filtered = FilteredEngineData::with_all_rows_selected(data);
         let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
-        engine.json_handler().write_json_file(
-            &commit_path.location,
-            Box::new(iter::once(Ok(filtered))),
-            false,
-        )?;
+        engine
+            .json_handler()
+            .write_json_file(
+                &commit_path.location,
+                Box::new(iter::once(Ok(filtered))),
+                false,
+            )
+            .map_err(crate::Error::into_kernel_error)?;
         Ok(())
     }
 }
@@ -534,10 +540,11 @@ impl MockTableConfigurationBuilder {
         let schema = self
             .schema
             .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });
-        let metadata =
-            Metadata::try_new(None, None, schema, self.partition_columns, 0, self.props)?;
+        let metadata = Metadata::try_new(None, None, schema, self.partition_columns, 0, self.props)
+            .map_err(crate::Error::into_kernel_error)?;
 
         TableConfiguration::try_new(metadata, self.protocol, self.table_root, self.version)
+            .map_err(crate::Error::into_kernel_error)
     }
 }
 
@@ -1183,7 +1190,8 @@ pub(crate) fn setup_column_mapping_txn(
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine")
         .with_table_properties([("delta.columnMapping.mode", mode_str)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .map_err(crate::Error::into_kernel_error)?;
     Ok((engine, txn))
 }
 
@@ -1301,7 +1309,9 @@ pub(crate) fn load_test_table(
         .map_err(|_| KernelError::generic("Failed to create URL from path"))?;
 
     let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(url)
+        .build(engine.as_ref())
+        .map_err(crate::Error::into_kernel_error)?;
     Ok((engine, snapshot, tempdir))
 }
 

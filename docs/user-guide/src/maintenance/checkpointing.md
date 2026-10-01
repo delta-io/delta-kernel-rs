@@ -98,7 +98,8 @@ let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 // 6. Build LastCheckpointHintStats from the now-exhausted iterator state.
 //    Use 0 for num_sidecars on V1 checkpoints or V2 checkpoints without sidecars.
 let state = Arc::into_inner(state)
-    .ok_or_else(|| KernelError::internal_error("checkpoint state Arc still has other references"))?;
+    .ok_or_else(|| KernelError::internal_error("checkpoint state Arc still has other references"))
+    .map_err(delta_kernel::Error::Kernel)?;
 let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
     state,
     file_meta.size,

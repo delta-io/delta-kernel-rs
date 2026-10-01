@@ -64,13 +64,18 @@ pub(crate) trait Deduplicator {
         getters: &[&'a dyn GetData<'a>],
         dv_start_index: usize,
     ) -> KernelResult<Option<String>> {
-        let Some(storage_type) =
-            getters[dv_start_index].get_opt(i, "deletionVector.storageType")?
+        let Some(storage_type) = getters[dv_start_index]
+            .get_opt(i, "deletionVector.storageType")
+            .map_err(crate::Error::into_kernel_error)?
         else {
             return Ok(None);
         };
-        let path_or_inline = getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
-        let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
+        let path_or_inline = getters[dv_start_index + 1]
+            .get(i, "deletionVector.pathOrInlineDv")
+            .map_err(crate::Error::into_kernel_error)?;
+        let offset = getters[dv_start_index + 2]
+            .get_opt(i, "deletionVector.offset")
+            .map_err(crate::Error::into_kernel_error)?;
 
         Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
             storage_type,
@@ -120,11 +125,17 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
         getters: &[&'b dyn GetData<'b>],
         _skip_removes: bool,
     ) -> KernelResult<Option<FileActionInfo>> {
-        let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? else {
+        let Some(path) = getters[self.add_path_index]
+            .get_str(i, "add.path")
+            .map_err(crate::Error::into_kernel_error)?
+        else {
             return Ok(None);
         };
         let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
-        let size = match getters[self.add_size_index].get_long(i, "add.size")? {
+        let size = match getters[self.add_size_index]
+            .get_long(i, "add.size")
+            .map_err(crate::Error::into_kernel_error)?
+        {
             Some(s) => u64::try_from(s).unwrap_or_else(|e| {
                 warn!("Could not convert add.size {s} to u64: {e}");
                 0

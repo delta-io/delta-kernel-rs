@@ -256,24 +256,33 @@ impl PartialOrd for FileMeta {
 }
 
 impl TryFrom<DirEntry> for FileMeta {
-    type Error = KernelError;
+    type Error = Error;
 
     fn try_from(ent: DirEntry) -> Result<FileMeta> {
-        let metadata = ent.metadata()?;
+        let metadata = ent
+            .metadata()
+            .map_err(KernelError::from)
+            .map_err(Error::Kernel)?;
         let last_modified = metadata
-            .modified()?
+            .modified()
+            .map_err(KernelError::from)
+            .map_err(Error::Kernel)?
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|_| {
-                KernelError::generic("Failed to convert file timestamp to milliseconds")
-            })?;
+            .map_err(|_| KernelError::generic("Failed to convert file timestamp to milliseconds"))
+            .map_err(Error::Kernel)?;
         let location = Url::from_file_path(ent.path())
-            .map_err(|_| KernelError::generic(format!("Invalid path: {:?}", ent.path())))?;
-        let last_modified = last_modified.as_millis().try_into().map_err(|_| {
-            KernelError::generic(format!(
-                "Failed to convert file modification time {:?} into i64",
-                last_modified.as_millis()
-            ))
-        })?;
+            .map_err(|_| KernelError::generic(format!("Invalid path: {:?}", ent.path())))
+            .map_err(Error::Kernel)?;
+        let last_modified = last_modified
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                KernelError::generic(format!(
+                    "Failed to convert file modification time {:?} into i64",
+                    last_modified.as_millis()
+                ))
+            })
+            .map_err(Error::Kernel)?;
         Ok(FileMeta {
             location,
             last_modified,
@@ -541,6 +550,7 @@ pub(crate) fn create_row(
     engine
         .evaluation_handler()
         .create_many(schema, vec![vec![value]])
+        .map_err(Error::into_kernel_error)
 }
 
 /// Provides file system related functionalities to Delta Kernel.
@@ -578,9 +588,13 @@ pub trait StorageHandler: AsAny {
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> Result<ResultIteratorStatic<FileMeta>> {
-        check_cancelled(cancellation_token.as_ref())?;
+        check_cancelled(cancellation_token.as_ref()).map_err(Error::Kernel)?;
         let iter = self.list_from(path)?;
-        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
+        Ok(Box::new(CancellableIterator::new(
+            iter,
+            cancellation_token,
+            Error::Kernel,
+        )))
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -599,24 +613,29 @@ pub trait StorageHandler: AsAny {
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> Result<ResultIteratorStatic<Bytes>> {
-        check_cancelled(cancellation_token.as_ref())?;
+        check_cancelled(cancellation_token.as_ref()).map_err(Error::Kernel)?;
         let iter = self.read_files(files)?;
-        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
+        Ok(Box::new(CancellableIterator::new(
+            iter,
+            cancellation_token,
+            Error::Kernel,
+        )))
     }
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
-    /// it must return Err(KernelError::FileAlreadyExists).
+    /// it must return `Err(Error::Kernel(KernelError::FileAlreadyExists))`.
     fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()>;
 
     /// Write data to the specified path.
     ///
     /// If `overwrite` is false and the file already exists, this must return
-    /// `Err(KernelError::FileAlreadyExists)`.
+    /// `Err(Error::Kernel(KernelError::FileAlreadyExists))`.
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()>;
 
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
-    /// If the file does not exist, this must return an `Err` with [`KernelError::FileNotFound`].
+    /// If the file does not exist, this must return [`Error::Kernel`] wrapping
+    /// [`KernelError::FileNotFound`].
     fn head(&self, path: &Url) -> Result<FileMeta>;
 
     /// Delete the file at the given path.
@@ -690,9 +709,13 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> Result<FileDataReadResultIterator> {
-        check_cancelled(cancellation_token.as_ref())?;
+        check_cancelled(cancellation_token.as_ref()).map_err(Error::Kernel)?;
         let iter = self.read_json_files(files, physical_schema, predicate)?;
-        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
+        Ok(Box::new(CancellableIterator::new(
+            iter,
+            cancellation_token,
+            Error::Kernel,
+        )))
     }
 
     /// Atomically (!) write a single JSON file. Each selected row of the input data must be
@@ -940,9 +963,13 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> Result<FileDataReadResultIterator> {
-        check_cancelled(cancellation_token.as_ref())?;
+        check_cancelled(cancellation_token.as_ref()).map_err(Error::Kernel)?;
         let iter = self.read_parquet_files(files, physical_schema, predicate)?;
-        Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
+        Ok(Box::new(CancellableIterator::new(
+            iter,
+            cancellation_token,
+            Error::Kernel,
+        )))
     }
 
     /// Write data to a Parquet file at the specified URL.
@@ -1037,7 +1064,7 @@ pub trait ParquetHandler: AsAny {
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> Result<ParquetFooter> {
-        check_cancelled(cancellation_token.as_ref())?;
+        check_cancelled(cancellation_token.as_ref()).map_err(Error::Kernel)?;
         self.read_parquet_footer(file)
     }
 }
@@ -1077,6 +1104,7 @@ pub trait Engine: AsAny {
     fn require_plan_executor(&self) -> Result<Arc<dyn PlanExecutor>> {
         self.plan_executor()
             .ok_or_else(|| KernelError::unsupported("this engine does not provide a PlanExecutor"))
+            .map_err(Error::Kernel)
     }
 }
 

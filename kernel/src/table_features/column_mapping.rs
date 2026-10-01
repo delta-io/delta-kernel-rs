@@ -19,7 +19,7 @@ use crate::schema::{
 };
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{KernelError, KernelResult, Result};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub(crate) fn column_mapping_mode(
 /// ]}
 /// ```
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> Result<()> {
-    MakePhysical::validate_schema_column_mapping(mode, schema)
+    MakePhysical::validate_schema_column_mapping(mode, schema).map_err(Error::Kernel)
 }
 
 /// How to treat a stale `delta.columnMapping.*` annotation found on a field while column mapping
@@ -420,14 +420,14 @@ pub(crate) fn assign_column_mapping_metadata(
     // align with delta-spark's behavior.
     let new_fields: Vec<StructField> = schema
         .fields()
-        .map(|field| try_assign_flat_column_mapping_info(field, max_id))
+        .map(|field| try_assign_flat_column_mapping_info(field, max_id).map_err(Error::Kernel))
         .collect::<Result<Vec<_>>>()?;
     let with_flat_cm_info = StructType::try_new(new_fields)?;
     if !assign_nested_field_ids {
         return Ok(with_flat_cm_info);
     }
     // Then populate `delta.columnMapping.nested.ids` per StructField.
-    assign_nested_cm_ids(&with_flat_cm_info, max_id)
+    assign_nested_cm_ids(&with_flat_cm_info, max_id).map_err(Error::Kernel)
 }
 
 /// JSON object holding [`ColumnMetadataKey::ColumnMappingNestedIds`] entries for an Array/Map
@@ -565,7 +565,8 @@ fn flat_cm_info_for_nested_data_type(
         DataType::Struct(inner) => {
             let new_inner = assign_column_mapping_metadata(
                 inner, max_id, /* assign_nested_field_ids */ false,
-            )?;
+            )
+            .map_err(Error::into_kernel_error)?;
             Ok(DataType::from(new_inner))
         }
         DataType::Array(array_type) => {
@@ -660,7 +661,7 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
             Ok(new_field)
         })
         .collect::<KernelResult<Vec<_>>>()?;
-    StructType::try_new(new_fields)
+    StructType::try_new(new_fields).map_err(Error::into_kernel_error)
 }
 
 // Get the physical name for a field. Error if the field is missing the physical name annotation.
@@ -853,18 +854,18 @@ pub(crate) fn get_any_level_column_physical_name(
         .map(|field| -> Result<String> {
             if column_mapping_mode != ColumnMappingMode::None {
                 if !field.has_physical_name_annotation() {
-                    return Err(KernelError::Schema(format!(
+                    return Err(Error::Kernel(KernelError::Schema(format!(
                         "Column mapping is enabled but field '{}' lacks the {} annotation",
                         field.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
-                    )));
+                    ))));
                 }
                 if !field.has_id_annotation() {
-                    return Err(KernelError::Schema(format!(
+                    return Err(Error::Kernel(KernelError::Schema(format!(
                         "Column mapping is enabled but field '{}' lacks the {} annotation",
                         field.name,
                         ColumnMetadataKey::ColumnMappingId.as_ref()
-                    )));
+                    ))));
                 }
             }
 

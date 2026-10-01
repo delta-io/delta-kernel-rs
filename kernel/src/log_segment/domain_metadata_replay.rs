@@ -110,7 +110,9 @@ impl LogSegment {
         // are forced to replay the entire log.
         for actions in self.read_domain_metadata_batches(engine)? {
             let domain_metadatas = actions?.actions;
-            visitor.visit_rows_of(domain_metadatas.as_ref())?;
+            visitor
+                .visit_rows_of(domain_metadatas.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
             // if all requested domains have been found, terminate early
             if visitor.filter_found() {
                 break;
@@ -125,6 +127,8 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+            .map_err(crate::Error::into_kernel_error)
+            .map(|actions| actions.map(|item| item.map_err(crate::Error::into_kernel_error)))
     }
 }
 

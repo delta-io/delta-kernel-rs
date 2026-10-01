@@ -50,13 +50,14 @@ pub trait StorageHandler {
   `/`, list all files in that directory. Otherwise, list files lexicographically greater than
   the given path in the same directory.
 
-- **`copy_atomic`**: Must fail with `KernelError::FileAlreadyExists` if the destination exists.
+- **`copy_atomic`**: Must fail with `Error::Kernel(KernelError::FileAlreadyExists(_))` if the
+  destination exists.
   This is used for commit publishing in catalog-managed tables.
 
 - **`put`**: Writes raw bytes to the given path. If `overwrite` is false and the file already
-  exists, must fail with `KernelError::FileAlreadyExists`.
+  exists, must fail with `Error::Kernel(KernelError::FileAlreadyExists(_))`.
 
-- **`head`**: Must return `KernelError::FileNotFound` if the file doesn't exist.
+- **`head`**: Must return `Error::Kernel(KernelError::FileNotFound(_))` if the file doesn't exist.
 
 - **`read_files`**: Each `FileSlice` is a `(Url, Option<Range<u64>>)`. When the range is
   `None`, read the entire file.
@@ -210,7 +211,7 @@ fn read_parquet_files_with_cancellation(
 ) -> Result<FileDataReadResultIterator> {
     // Kick off the async read as usual, then poll the read future and the token's
     // `cancelled_future()` together. If cancellation wins the race, drop the in-flight
-    // work and yield `Err(KernelError::Cancelled)` as the iterator's terminal item.
+    // work and yield `Err(Error::Kernel(KernelError::Cancelled))` as the terminal item.
 }
 ```
 

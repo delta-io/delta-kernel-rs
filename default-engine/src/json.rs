@@ -98,9 +98,13 @@ async fn read_json_files_impl(
 
     // Build Arrow schema from only the real JSON columns, omitting any metadata columns
     // (e.g. FilePath) that the JSON reader cannot populate from the file content.
-    let json_arrow_schema = Arc::new(json_arrow_schema(&physical_schema)?);
+    let json_arrow_schema = Arc::new(
+        json_arrow_schema(&physical_schema).map_err(delta_kernel::Error::into_kernel_error)?,
+    );
     // Build the reorder index vec once; apply it to every batch via reorder_struct_array.
-    let reorder_indices: Arc<[_]> = build_json_reorder_indices(&physical_schema)?.into();
+    let reorder_indices: Arc<[_]> = build_json_reorder_indices(&physical_schema)
+        .map_err(delta_kernel::Error::into_kernel_error)?
+        .into();
 
     // An iterator of futures that open each file and post-process each resulting batch.
     let file_futures = files.into_iter().map(move |file| {
@@ -112,7 +116,10 @@ async fn read_json_files_impl(
             let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
             let tagged = batch_stream
-                .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
+                .map(move |result| {
+                    fixup_json_read(result?, &reorder_indices, &file_path)
+                        .map_err(delta_kernel::Error::into_kernel_error)
+                })
                 .boxed();
             Ok::<_, KernelError>(tagged)
         }
@@ -186,10 +193,15 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.batch_size.get(),
             self.buffer_size.get(),
         );
-        super::stream_future_to_cancellable_iter(
+        let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
             future,
             cancellation_token,
+        )
+        .map_err(delta_kernel::Error::Kernel)?;
+        Ok(
+            Box::new(iter.map(|item| item.map_err(delta_kernel::Error::Kernel)))
+                as FileDataReadResultIterator,
         )
     }
 
@@ -200,12 +212,14 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         data: ResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> Result<FileSize> {
-        self.task_executor.block_on(write_json_file_impl(
-            self.store.clone(),
-            path.clone(),
-            to_json_bytes(data)?,
-            overwrite,
-        ))
+        self.task_executor
+            .block_on(write_json_file_impl(
+                self.store.clone(),
+                path.clone(),
+                to_json_bytes(data)?,
+                overwrite,
+            ))
+            .map_err(delta_kernel::Error::Kernel)
     }
 }
 
@@ -859,20 +873,31 @@ mod tests {
             DataType::Utf8,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 
     // Helper function to read JSON file asynchronously
     async fn read_json_file(store: &Arc<InMemory>, path: &Path) -> Result<Vec<serde_json::Value>> {
-        let content = store.get(path).await?;
-        let file_bytes = content.bytes().await?;
-        let file_string =
-            String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
+        let content = store
+            .get(path)
+            .await
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
+        let file_bytes = content
+            .bytes()
+            .await
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
+        let file_string = String::from_utf8(file_bytes.to_vec())
+            .map_err(|e| object_store::Error::Generic {
                 store: "memory",
                 source: Box::new(e),
-            })?;
+            })
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
         let json: Vec<_> = serde_json::Deserializer::from_str(&file_string)
             .into_iter::<serde_json::Value>()
             .flatten()
@@ -894,7 +919,9 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
-        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
+        let path = Url::parse("memory:///test/data/00000000000000000001.json")
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
         // First write with no existing file
@@ -924,7 +951,7 @@ mod tests {
         } else {
             // Verify the second write fails with FileAlreadyExists error
             match result {
-                Err(KernelError::FileAlreadyExists(err_path)) => {
+                Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(err_path))) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
                 _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),

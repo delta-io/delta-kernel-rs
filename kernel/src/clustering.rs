@@ -15,7 +15,7 @@ use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::schema::{DataType, StructType};
-use crate::{KernelError, KernelResult};
+use crate::{Error, KernelError, KernelResult};
 
 /// Domain metadata structure for clustering columns.
 ///
@@ -100,7 +100,7 @@ pub(crate) fn validate_clustering_columns(
             )));
         }
 
-        let field = schema.field_at(col)?;
+        let field = schema.field_at(col).map_err(Error::into_kernel_error)?;
         match field.data_type() {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {

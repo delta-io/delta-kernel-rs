@@ -9,7 +9,7 @@ use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, FileMeta, KernelResult, Version};
+use crate::{version_as_i64, Engine, Error, FileMeta, KernelResult, Version};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -142,7 +142,9 @@ impl RootManifestFile {
                 );
                 domain_metadata
             }
-            _ => snapshot.get_domain_metadatas_internal(engine, None)?,
+            _ => snapshot
+                .get_domain_metadatas_internal(engine, None)
+                .map_err(Error::into_kernel_error)?,
         };
         let transactions = match &checkpoint_action {
             Some(checkpoint) if !transactions_complete_in_crc => checkpoint
@@ -206,7 +208,7 @@ mod tests {
 
     #[test]
     fn compute_checkpoint_action_builds_a_self_contained_action() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
             &table_root,
@@ -220,13 +222,15 @@ mod tests {
             "{}".to_string(),
         )];
         let set_transactions = vec![SetTransaction::new("app-1".to_string(), 1, Some(0))];
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            1,
-            snapshot.table_configuration(),
-            &dm_changes,
-            &set_transactions,
-        )?;
+        let checkpoint = manifest
+            .compute_checkpoint_action(
+                &engine,
+                1,
+                snapshot.table_configuration(),
+                &dm_changes,
+                &set_transactions,
+            )
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(checkpoint.version(), 1);
         assert_eq!(checkpoint.path(), manifest.file.location.as_str());
@@ -246,9 +250,11 @@ mod tests {
     #[test]
     fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot(
     ) -> Result<()> {
-        let (engine, table_root) = setup_table()?;
-        let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
+        let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)
+            .map_err(crate::Error::Kernel)?;
+        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)
+            .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 1);
@@ -259,29 +265,29 @@ mod tests {
             snapshot.clone(),
         );
 
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            2,
-            snapshot.table_configuration(),
-            &[],
-            &[],
-        )?;
+        let checkpoint = manifest
+            .compute_checkpoint_action(&engine, 2, snapshot.table_configuration(), &[], &[])
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(checkpoint.path(), manifest.file.location.as_str());
         Ok(())
     }
 
     #[test]
     fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
-        let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
+        let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)
+            .map_err(crate::Error::Kernel)?;
+        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)
+            .map_err(crate::Error::Kernel)?;
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
         write_commit(
             &engine,
             &table_root,
             2,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 2);
@@ -305,14 +311,15 @@ mod tests {
 
     #[test]
     fn compute_checkpoint_action_prunes_expired_transactions() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let expired = SetTransaction::new("app-1".to_string(), 5, Some(0));
         write_commit(
             &engine,
             &table_root,
             1,
-            create_row(&engine, LOG_TXN_SCHEMA.clone(), expired)?,
-        )?;
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), expired).map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(&table_root, "metadata/root-v2.parquet", 1024, snapshot);
@@ -323,14 +330,16 @@ mod tests {
             )])
             .build();
 
-        let checkpoint = manifest.compute_checkpoint_action(&engine, 2, &table_config, &[], &[])?;
+        let checkpoint = manifest
+            .compute_checkpoint_action(&engine, 2, &table_config, &[], &[])
+            .map_err(crate::Error::Kernel)?;
         assert!(checkpoint.transactions.is_empty());
         Ok(())
     }
 
     #[test]
     fn compute_checkpoint_action_new_change_wins() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         let old_domain_metadata = DomainMetadata::new("test.domain".to_string(), "old".to_string());
@@ -340,13 +349,17 @@ mod tests {
                 &engine,
                 LOG_DOMAIN_METADATA_SCHEMA.clone(),
                 old_domain_metadata,
-            )?,
-        )?;
+            )
+            .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let old_transaction = SetTransaction::new("app-1".to_string(), 1, None);
         write(
             2,
-            create_row(&engine, LOG_TXN_SCHEMA.clone(), old_transaction)?,
-        )?;
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), old_transaction)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
@@ -358,13 +371,15 @@ mod tests {
 
         let new_domain_metadata = DomainMetadata::new("test.domain".to_string(), "new".to_string());
         let new_transaction = SetTransaction::new("app-1".to_string(), 2, None);
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            3,
-            snapshot.table_configuration(),
-            std::slice::from_ref(&new_domain_metadata),
-            std::slice::from_ref(&new_transaction),
-        )?;
+        let checkpoint = manifest
+            .compute_checkpoint_action(
+                &engine,
+                3,
+                snapshot.table_configuration(),
+                std::slice::from_ref(&new_domain_metadata),
+                std::slice::from_ref(&new_transaction),
+            )
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(checkpoint.domain_metadata, vec![new_domain_metadata]);
         assert_eq!(checkpoint.transactions, vec![new_transaction]);
@@ -380,7 +395,8 @@ mod tests {
             .commit(&engine)?;
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 
-        let file = manifest_file("s3://bucket/metadata/root-v1.parquet", 1024)?;
+        let file = manifest_file("s3://bucket/metadata/root-v1.parquet", 1024)
+            .map_err(crate::Error::Kernel)?;
         let manifest = RootManifestFile::new(file.clone(), snapshot);
         assert_eq!(manifest.file, file);
         Ok(())
@@ -390,19 +406,23 @@ mod tests {
     // from before it are ignored.
     #[test]
     fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         let stale_domain = DomainMetadata::new("stale.domain".to_string(), "{}".to_string());
         write(
             1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), stale_domain)?,
-        )?;
+            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), stale_domain)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let stale_transaction = SetTransaction::new("stale-app".to_string(), 5, None);
         write(
             2,
-            create_row(&engine, LOG_TXN_SCHEMA.clone(), stale_transaction)?,
-        )?;
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), stale_transaction)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let checkpoint = CheckpointAction::new(
             3,
@@ -415,7 +435,7 @@ mod tests {
                 "{}".to_string(),
             )],
         );
-        write(3, checkpoint.into_engine_data(&engine)?)?;
+        write(3, checkpoint.into_engine_data(&engine)?).map_err(crate::Error::Kernel)?;
 
         let manifest = root_manifest(
             &table_root,
@@ -423,8 +443,9 @@ mod tests {
             1024,
             Snapshot::builder_for(table_root.clone()).build(&engine)?,
         );
-        let (domain_metadata, transactions, existing_checkpoint) =
-            manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) = manifest
+            .scan_non_content_metadata(&engine)
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(domain_metadata.keys().collect::<Vec<_>>(), ["ckpt.domain"]);
         assert_eq!(transactions.keys().collect::<Vec<_>>(), ["ckpt-app"]);
@@ -437,19 +458,27 @@ mod tests {
     // checkpoint from those older log entries.
     #[test]
     fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         let domain_metadata = DomainMetadata::new("dropped.domain".to_string(), "{}".to_string());
         write(
             1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let transaction = SetTransaction::new("dropped-app".to_string(), 5, None);
-        write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        write(
+            2,
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         // Complete checkpoint at the tip that omits both.
-        let existing = minimal_checkpoint_action("metadata/root-v3.parquet", 3)?;
-        write(3, existing.into_engine_data(&engine)?)?;
+        let existing = minimal_checkpoint_action("metadata/root-v3.parquet", 3)
+            .map_err(crate::Error::Kernel)?;
+        write(3, existing.into_engine_data(&engine)?).map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert_eq!(snapshot.version(), 3);
@@ -460,13 +489,9 @@ mod tests {
             snapshot.clone(),
         );
 
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            4,
-            snapshot.table_configuration(),
-            &[],
-            &[],
-        )?;
+        let checkpoint = manifest
+            .compute_checkpoint_action(&engine, 4, snapshot.table_configuration(), &[], &[])
+            .map_err(crate::Error::Kernel)?;
         assert!(checkpoint.domain_metadata.is_empty());
         assert!(checkpoint.transactions.is_empty());
         Ok(())
@@ -476,7 +501,7 @@ mod tests {
     // yet; replacing it would drop that state, so the commit is refused.
     #[test]
     fn compute_checkpoint_action_rejects_a_checkpoint_that_spills_to_sidecars() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let mut existing = CheckpointAction::new(
             1,
@@ -494,7 +519,8 @@ mod tests {
         };
         existing.txn_sidecars = vec![sidecar()];
         existing.domain_metadata_sidecars = vec![sidecar()];
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)
+            .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
@@ -517,7 +543,7 @@ mod tests {
 
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         // Checksum validation checks protocol continuity, so this uses the table's real
@@ -531,22 +557,30 @@ mod tests {
             vec![],
             vec![],
         );
-        write(1, checkpoint.into_engine_data(&engine)?)?;
+        write(1, checkpoint.into_engine_data(&engine)?).map_err(crate::Error::Kernel)?;
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
         write(
             2,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(3, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        write(
+            3,
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let (_, snapshot) = snapshot.write_checksum(&engine)?;
         assert!(snapshot.crc_at_version().is_some());
 
         let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
-        let (domain_metadata, transactions, existing_checkpoint) =
-            manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) = manifest
+            .scan_non_content_metadata(&engine)
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(domain_metadata.len(), 1);
         assert!(domain_metadata.contains_key("test.domain"));
@@ -558,24 +592,32 @@ mod tests {
 
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
         write(
             1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        write(
+            2,
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let (_, snapshot) = snapshot.write_checksum(&engine)?;
         assert!(snapshot.crc_at_version().is_some());
 
         let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
-        let (domain_metadata, transactions, existing_checkpoint) =
-            manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) = manifest
+            .scan_non_content_metadata(&engine)
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(domain_metadata.len(), 1);
         assert!(domain_metadata.contains_key("test.domain"));
@@ -594,7 +636,7 @@ mod tests {
         #[case] dm_changes: Vec<DomainMetadata>,
         #[case] domain_kept: bool,
     ) -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let config = Snapshot::builder_for(table_root.clone())
             .build(&engine)?
             .table_configuration()
@@ -610,7 +652,8 @@ mod tests {
                 "{}".to_string(),
             )],
         );
-        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
+        write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)
+            .map_err(crate::Error::Kernel)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         assert!(snapshot.crc_at_version().is_none());
@@ -621,13 +664,9 @@ mod tests {
             2048,
             snapshot.clone(),
         );
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            2,
-            snapshot.table_configuration(),
-            &dm_changes,
-            &[],
-        )?;
+        let checkpoint = manifest
+            .compute_checkpoint_action(&engine, 2, snapshot.table_configuration(), &dm_changes, &[])
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(
             checkpoint
@@ -642,16 +681,23 @@ mod tests {
 
     #[test]
     fn scan_non_content_metadata_scans_past_a_partial_crc() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
         write(
             1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
         let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        write(
+            2,
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)
+                .map_err(crate::Error::Kernel)?,
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let built = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let crc = Arc::new(Crc {
@@ -666,7 +712,8 @@ mod tests {
             Some(crc),
             true,
             false,
-        )?;
+        )
+        .map_err(crate::Error::Kernel)?;
         assert!(snapshot.crc_at_version().is_some());
 
         let manifest = root_manifest(
@@ -675,8 +722,9 @@ mod tests {
             1024,
             Arc::new(snapshot),
         );
-        let (domain_metadata, transactions, existing_checkpoint) =
-            manifest.scan_non_content_metadata(&engine)?;
+        let (domain_metadata, transactions, existing_checkpoint) = manifest
+            .scan_non_content_metadata(&engine)
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(domain_metadata.len(), 1);
         assert!(domain_metadata.contains_key("test.domain"));

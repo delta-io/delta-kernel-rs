@@ -89,7 +89,14 @@ pub unsafe extern "C" fn partition_value_map_insert_string(
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let value = unsafe { String::try_from_slice(&value) };
-    partition_value_map_insert_impl(map, name, value.map(Scalar::from)).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        value
+            .map(Scalar::from)
+            .map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert an `integer` (32-bit) partition value under `name`.
@@ -107,7 +114,12 @@ pub unsafe extern "C" fn partition_value_map_insert_int(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `long` (64-bit) partition value under `name`.
@@ -125,7 +137,12 @@ pub unsafe extern "C" fn partition_value_map_insert_long(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `short` (16-bit) partition value under `name`.
@@ -143,7 +160,12 @@ pub unsafe extern "C" fn partition_value_map_insert_short(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `byte` (8-bit) partition value under `name`.
@@ -161,7 +183,12 @@ pub unsafe extern "C" fn partition_value_map_insert_byte(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `float` (32-bit) partition value under `name`.
@@ -179,7 +206,12 @@ pub unsafe extern "C" fn partition_value_map_insert_float(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `double` (64-bit) partition value under `name`.
@@ -197,7 +229,12 @@ pub unsafe extern "C" fn partition_value_map_insert_double(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `boolean` partition value under `name`.
@@ -215,7 +252,12 @@ pub unsafe extern "C" fn partition_value_map_insert_bool(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::from(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::from(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `date` partition value (`value` = days since the Unix epoch) under `name`.
@@ -233,7 +275,12 @@ pub unsafe extern "C" fn partition_value_map_insert_date(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::Date(value))).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::Date(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `timestamp` partition value (`value` = microseconds since the Unix epoch, UTC) under
@@ -252,8 +299,12 @@ pub unsafe extern "C" fn partition_value_map_insert_timestamp(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::Timestamp(value)))
-        .into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::Timestamp(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `timestamp_ntz` partition value (`value` = microseconds since the Unix epoch, no
@@ -272,8 +323,12 @@ pub unsafe extern "C" fn partition_value_map_insert_timestamp_ntz(
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::TimestampNtz(value)))
-        .into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::TimestampNtz(value)),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `binary` partition value under `name`, copying `len` bytes from `value`.
@@ -299,8 +354,12 @@ pub unsafe extern "C" fn partition_value_map_insert_binary(
     } else {
         unsafe { std::slice::from_raw_parts(value, len) }
     };
-    partition_value_map_insert_impl(map, name, Ok(Scalar::Binary(bytes.to_vec())))
-        .into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Ok(Scalar::Binary(bytes.to_vec())),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a `decimal` partition value under `name`. The unscaled 128-bit value is supplied as two
@@ -324,8 +383,12 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let value = ((value_hi as i128) << 64) | (value_lo as i128);
-    partition_value_map_insert_impl(map, name, Scalar::decimal(value, precision, scale))
-        .into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        Scalar::decimal(value, precision, scale).map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Insert a typed `null` partition value under `name`. The `type_tag` identifies the column's
@@ -355,7 +418,12 @@ pub unsafe extern "C" fn partition_value_map_insert_null(
     let scalar = NullTypeTag::try_from(type_tag)
         .and_then(|tag| tag.to_data_type(precision, scale))
         .map(Scalar::Null);
-    partition_value_map_insert_impl(map, name, scalar).into_extern_result(&engine)
+    partition_value_map_insert_impl(
+        map,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        scalar,
+    )
+    .into_extern_result(&engine)
 }
 
 #[cfg(test)]
@@ -409,7 +477,11 @@ mod tests {
             inner: HashMap::new(),
         };
         // precision 0 is invalid for a decimal.
-        let result = partition_value_map_insert_impl(&mut map, Ok("d"), Scalar::decimal(1, 0, 0));
+        let result = partition_value_map_insert_impl(
+            &mut map,
+            Ok("d"),
+            Scalar::decimal(1, 0, 0).map_err(delta_kernel::Error::into_kernel_error),
+        );
         assert!(result.is_err());
         assert!(map.inner.is_empty());
     }

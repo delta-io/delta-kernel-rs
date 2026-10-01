@@ -108,7 +108,7 @@ pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 fn block_on_sync<F, Fut, T>(make_fut: F) -> KernelResult<T>
 where
     F: FnOnce() -> Fut + Send,
-    Fut: std::future::Future<Output = Result<T>>,
+    Fut: std::future::Future<Output = KernelResult<T>>,
     T: Send,
 {
     std::thread::scope(|s| {
@@ -1263,7 +1263,7 @@ impl TestTableBuilder {
     /// checkpoints.
     pub fn build(self) -> Result<TestTable> {
         validate_log_state(&self.log_state);
-        block_on_sync(|| self.build_async())
+        block_on_sync(|| self.build_async()).map_err(delta_kernel::Error::Kernel)
     }
 
     async fn build_async(self) -> KernelResult<TestTable> {
@@ -1327,8 +1327,10 @@ impl TestTableBuilder {
         let mut stale_hint_bytes: Option<Vec<u8>> = None;
 
         let mut snapshot = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .map_err(delta_kernel::Error::into_kernel_error)?
+            .commit(engine.as_ref())
+            .map_err(delta_kernel::Error::into_kernel_error)?
             .unwrap_post_commit_snapshot();
 
         let crcs_at = self.log_state.crcs_at();
@@ -1336,7 +1338,9 @@ impl TestTableBuilder {
             write_crc(&snapshot, engine.as_ref())?;
         }
         if checkpoints_at.contains(&0) {
-            snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+            snapshot
+                .checkpoint(engine.as_ref(), spec.as_ref())
+                .map_err(delta_kernel::Error::into_kernel_error)?;
             if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
                 stale_hint_bytes = Some(read_hint_bytes(&store, &resolved_hint_path).await?);
             }
@@ -1359,7 +1363,9 @@ impl TestTableBuilder {
                 write_crc(&snapshot, engine.as_ref())?;
             }
             if checkpoints_at.contains(&v) {
-                snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+                snapshot
+                    .checkpoint(engine.as_ref(), spec.as_ref())
+                    .map_err(delta_kernel::Error::into_kernel_error)?;
                 if hint_state == LastCheckpointHintState::Stale && stale_hint_bytes.is_none() {
                     stale_hint_bytes = Some(read_hint_bytes(&store, &resolved_hint_path).await?);
                 }
@@ -1425,7 +1431,9 @@ impl TestTableBuilder {
 /// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
 /// that version cannot already exist on disk.
 fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> KernelResult<()> {
-    let (result, _) = snapshot.write_checksum(engine)?;
+    let (result, _) = snapshot
+        .write_checksum(engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     assert_eq!(
         result,
         ChecksumWriteResult::Written,
@@ -1454,10 +1462,13 @@ async fn write_data_commit<E: TaskExecutor>(
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction(Box::new(FileSystemCommitter::new()), engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
-    let write_state = txn.write_state()?;
+    let write_state = txn
+        .write_state()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
 
@@ -1487,7 +1498,10 @@ async fn write_data_commit<E: TaskExecutor>(
             .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
-            write_state.write_context_builder().build()?
+            write_state
+                .write_context_builder()
+                .build()
+                .map_err(delta_kernel::Error::into_kernel_error)?
         } else {
             let partition_values = generate_partition_values(
                 logical_schema.as_ref(),
@@ -1497,16 +1511,19 @@ async fn write_data_commit<E: TaskExecutor>(
             write_state
                 .write_context_builder()
                 .with_partition_values(partition_values)
-                .build()?
+                .build()
+                .map_err(delta_kernel::Error::into_kernel_error)?
         };
 
         let add_files = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
-            .await?;
+            .await
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         txn.add_files(add_files);
     }
 
     txn.commit(engine)
+        .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// Generate a single column of data based on its Arrow type.
@@ -2025,6 +2042,7 @@ mod tests {
                 .await
                 .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
         })
+        .map_err(delta_kernel::Error::Kernel)
     }
 
     /// Verifies every common table config builds successfully.
@@ -2629,7 +2647,7 @@ mod tests {
     async fn try_read_json(
         store: &DynObjectStore,
         path: &Path,
-    ) -> Result<Option<serde_json::Value>> {
+    ) -> KernelResult<Option<serde_json::Value>> {
         let bytes = match store.get(path).await {
             Ok(r) => r.bytes().await.map_err(delta_kernel::KernelError::from)?,
             Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
@@ -2655,6 +2673,7 @@ mod tests {
                 None => Ok(None),
             }
         })
+        .map_err(delta_kernel::Error::Kernel)
     }
 
     /// Read and parse a CRC file at `version`. Errors if the file is absent.
@@ -2666,6 +2685,7 @@ mod tests {
                 delta_kernel::KernelError::generic(format!("CRC at v={version} missing"))
             })
         })
+        .map_err(delta_kernel::Error::Kernel)
     }
 
     /// Helper: list filenames (basenames only) directly under `_delta_log/` in
@@ -2690,5 +2710,6 @@ mod tests {
                 .filter_map(|m| m.location.filename().map(|s| s.to_string()))
                 .collect())
         })
+        .map_err(delta_kernel::Error::Kernel)
     }
 }

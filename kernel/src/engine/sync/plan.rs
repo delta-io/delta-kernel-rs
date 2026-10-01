@@ -80,8 +80,8 @@ impl Default for SyncPlanExecutor {
 impl PlanExecutor for SyncPlanExecutor {
     fn execute_op(&self, op: Operation) -> Result<PlanResult> {
         match op {
-            Operation::IoOperation(io_op) => self.execute_io(io_op),
-            Operation::QueryPlan(query) => self.execute_query(query),
+            Operation::IoOperation(io_op) => self.execute_io(io_op).map_err(crate::Error::Kernel),
+            Operation::QueryPlan(query) => self.execute_query(query).map_err(crate::Error::Kernel),
         }
     }
 }
@@ -93,14 +93,22 @@ impl SyncPlanExecutor {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<Result<FileMeta>> = self
+                    .storage
+                    .list_from(&url)
+                    .map_err(crate::Error::into_kernel_error)?
+                    .collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<KernelResult<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<Result<Bytes>> = self
+                    .storage
+                    .read_files(files)
+                    .map_err(crate::Error::into_kernel_error)?
+                    .collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {
@@ -108,18 +116,25 @@ impl SyncPlanExecutor {
                 data,
                 overwrite,
             } => {
-                self.storage.put(&url, data, overwrite)?;
+                self.storage
+                    .put(&url, data, overwrite)
+                    .map_err(crate::Error::into_kernel_error)?;
                 Ok(PlanResult::Unit)
             }
             IoOperation::HeadFile { url } => {
-                let meta = self.storage.head(&url)?;
+                let meta = self
+                    .storage
+                    .head(&url)
+                    .map_err(crate::Error::into_kernel_error)?;
                 Ok(PlanResult::FileMeta(Box::new(std::iter::once(Ok(meta)))))
             }
             IoOperation::AtomicCopy {
                 source,
                 destination,
             } => {
-                self.storage.copy_atomic(&source, &destination)?;
+                self.storage
+                    .copy_atomic(&source, &destination)
+                    .map_err(crate::Error::into_kernel_error)?;
                 Ok(PlanResult::Unit)
             }
             IoOperation::ParquetFooter { file } => {
@@ -202,7 +217,8 @@ impl SyncPlanExecutor {
             .fields()
             .filter(|f| !file_constant_columns.contains(f.name()))
             .cloned();
-        let read_schema = Arc::new(StructType::try_new(read_fields)?);
+        let read_schema =
+            Arc::new(StructType::try_new(read_fields).map_err(crate::Error::into_kernel_error)?);
         let output_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
 
         let store = self.storage.store();
@@ -266,21 +282,24 @@ fn dynamic_scan_files(
 ) -> KernelResult<Vec<ScanFile>> {
     let mut files = Vec::new();
     for batch in input {
-        let path = extract_column(batch, dynamic_scan.path_column.path())?;
+        let path = extract_column(batch, dynamic_scan.path_column.path())
+            .map_err(crate::Error::into_kernel_error)?;
         let path = path.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
             KernelError::generic(format!(
                 "Expected STRING Load path, got {:?}",
                 path.data_type()
             ))
         })?;
-        let size = extract_column(batch, dynamic_scan.file_size_column.path())?;
+        let size = extract_column(batch, dynamic_scan.file_size_column.path())
+            .map_err(crate::Error::into_kernel_error)?;
         let size = size.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
             KernelError::generic(format!(
                 "Expected LONG Load file size, got {:?}",
                 size.data_type()
             ))
         })?;
-        let last_modified = extract_column_ref(batch, dynamic_scan.last_modified_column.path())?;
+        let last_modified = extract_column_ref(batch, dynamic_scan.last_modified_column.path())
+            .map_err(crate::Error::into_kernel_error)?;
         let last_modified = last_modified
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -293,10 +312,11 @@ fn dynamic_scan_files(
         let dv = match &dynamic_scan.dv_column {
             Some(dv_column) => {
                 let dv_path = dv_column.path();
-                let dv = extract_column(batch, dv_path)?;
+                let dv = extract_column(batch, dv_path).map_err(crate::Error::into_kernel_error)?;
                 let dv_ancestors: Vec<_> = (1..dv_path.len())
                     .map(|len| extract_column(batch, &dv_path[..len]))
-                    .try_collect()?;
+                    .try_collect()
+                    .map_err(crate::Error::into_kernel_error)?;
                 Some((dv, dv_ancestors))
             }
             None => None,
@@ -337,7 +357,14 @@ fn dynamic_scan_files(
             let file_constants = dynamic_scan
                 .file_constant_columns
                 .iter()
-                .map(|name| scalar_value(extract_column(batch, &[name])?.as_ref(), row))
+                .map(|name| {
+                    scalar_value(
+                        extract_column(batch, &[name])
+                            .map_err(crate::Error::into_kernel_error)?
+                            .as_ref(),
+                        row,
+                    )
+                })
                 .try_collect()?;
             files.push(ScanFile {
                 meta: FileMeta {
@@ -357,17 +384,21 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> KernelResult<Vec<Rec
         return Ok(vec![]);
     };
     let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
-    let evaluator = ArrowEvaluationHandler.new_expression_evaluator(
-        input_schema,
-        project.expr,
-        project.schema.as_ref().clone().into(),
-    )?;
+    let evaluator = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            input_schema,
+            project.expr,
+            project.schema.as_ref().clone().into(),
+        )
+        .map_err(crate::Error::into_kernel_error)?;
     input
         .iter()
         .map(|batch| {
             evaluator
-                .evaluate(&ArrowEngineData::new(batch.clone()))?
+                .evaluate(&ArrowEngineData::new(batch.clone()))
+                .map_err(crate::Error::into_kernel_error)?
                 .try_into_record_batch()
+                .map_err(crate::Error::into_kernel_error)
         })
         .collect()
 }
@@ -377,13 +408,17 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> KernelResult<V
         return Ok(vec![]);
     };
     let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
-    let evaluator = ArrowEvaluationHandler.new_predicate_evaluator(input_schema, predicate)?;
+    let evaluator = ArrowEvaluationHandler
+        .new_predicate_evaluator(input_schema, predicate)
+        .map_err(crate::Error::into_kernel_error)?;
     input
         .iter()
         .map(|batch| {
             let mask = evaluator
-                .evaluate(&ArrowEngineData::new(batch.clone()))?
-                .try_into_record_batch()?;
+                .evaluate(&ArrowEngineData::new(batch.clone()))
+                .map_err(crate::Error::into_kernel_error)?
+                .try_into_record_batch()
+                .map_err(crate::Error::into_kernel_error)?;
             let mask = mask
                 .column(0)
                 .as_any()
@@ -432,7 +467,9 @@ fn splice_file_constants(
         .fields()
         .map(
             |field| match file_constant_columns.iter().position(|c| c == field.name()) {
-                Some(slot) => constants[slot].to_array(rows),
+                Some(slot) => constants[slot]
+                    .to_array(rows)
+                    .map_err(crate::Error::into_kernel_error),
                 None => read_columns.next().ok_or_else(|| {
                     KernelError::generic("scan output has fewer columns than schema")
                 }),
@@ -455,7 +492,8 @@ pub(super) fn encode_keys_as_rows(
     let arrays: Vec<_> = columns
         .iter()
         .map(|name| extract_column(batch, name))
-        .try_collect()?;
+        .try_collect()
+        .map_err(crate::Error::into_kernel_error)?;
     // Constructing RowConverter requires a `SortField`. We initialize default, unsorted field for
     // each column.
     let sort_fields = arrays
@@ -494,10 +532,13 @@ fn values_to_record_batch(values: Values) -> KernelResult<RecordBatch> {
         .enumerate()
         .map(|(col, field)| -> KernelResult<ArrayRef> {
             let element_type = ArrayType::new(field.data_type().clone(), true);
-            let column = ArrayData::try_new(element_type, rows.iter().map(|row| row[col].clone()))?;
+            let column = ArrayData::try_new(element_type, rows.iter().map(|row| row[col].clone()))
+                .map_err(crate::Error::into_kernel_error)?;
             // This produces a single array row. The array contains n elements, one for each
             // attribute of the column.
-            let list = Scalar::Array(column).to_array(1)?;
+            let list = Scalar::Array(column)
+                .to_array(1)
+                .map_err(crate::Error::into_kernel_error)?;
             let list = list.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
                 KernelError::generic("Values: Scalar::Array did not lower to a ListArray")
             })?;
@@ -526,8 +567,10 @@ mod tests {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
-        )])?;
-        let keys = encode_keys_as_rows(&batch, &[])?;
+        )])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
+        let keys = encode_keys_as_rows(&batch, &[]).map_err(crate::Error::Kernel)?;
         assert_eq!(keys.len(), 3);
         assert!(keys.iter().all(|key| key == &keys[0]));
         Ok(())
@@ -584,7 +627,7 @@ mod tests {
             dv_column: Some(column_name!("dv")),
         };
 
-        dynamic_scan_files(&dynamic_scan, &[input])
+        dynamic_scan_files(&dynamic_scan, &[input]).map_err(crate::Error::Kernel)
     }
 
     #[test]

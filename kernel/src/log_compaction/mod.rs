@@ -32,7 +32,7 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use delta_kernel::{ActionReconciliationIterator, LogCompactionWriter};
-//! # use delta_kernel::{Engine, Snapshot, Result, KernelError, FileMeta};
+//! # use delta_kernel::{Engine, Snapshot, Error, KernelError, Result, FileMeta};
 //! # use url::Url;
 //!
 //! // Engine-specific function to write compaction data
@@ -43,7 +43,9 @@
 //!
 //! # fn example(engine: &dyn Engine) -> Result<()> {
 //! // Create a snapshot for the table
-//! let table_root = Url::parse("file:///path/to/table")?;
+//! let table_root = Url::parse("file:///path/to/table")
+//!     .map_err(KernelError::from)
+//!     .map_err(Error::Kernel)?;
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20

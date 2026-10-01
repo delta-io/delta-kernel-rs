@@ -256,7 +256,9 @@ unsafe fn visit_expression_column_impl(
     let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
     let fields = slices
         .iter()
-        .map(|slice| unsafe { String::try_from_slice(slice) })
+        .map(|slice| {
+            unsafe { String::try_from_slice(slice) }.map_err(delta_kernel::Error::into_kernel_error)
+        })
         .collect::<KernelResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
         return Err(delta_kernel::KernelError::generic(
@@ -293,7 +295,11 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    visit_expression_literal_string_impl(
+        state,
+        value.map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&allocate_error)
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -447,7 +453,8 @@ fn visit_expression_literal_decimal_impl(
 ) -> KernelResult<usize> {
     // Reconstruct the i128 from two u64 parts
     let value = ((value_hi as i128) << 64) | (value_lo as i128);
-    let decimal = Scalar::decimal(value, precision, scale)?;
+    let decimal =
+        Scalar::decimal(value, precision, scale).map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(wrap_expression(state, lit(decimal)))
 }
 
@@ -599,9 +606,10 @@ impl NullTypeTag {
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
             Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
-            Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
-                precision, scale,
-            )?)),
+            Self::Decimal => Ok(DataType::Primitive(
+                PrimitiveType::decimal(precision, scale)
+                    .map_err(delta_kernel::Error::into_kernel_error)?,
+            )),
             Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
                 "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
                  from a type tag. Use opaque expressions or a schema visitor instead.",
@@ -808,7 +816,12 @@ pub unsafe extern "C" fn visit_predicate_opaque(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
-    visit_predicate_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+    visit_predicate_opaque_impl(
+        state,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        children,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_predicate_opaque_impl(
@@ -854,8 +867,13 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     let name = unsafe { String::try_from_slice(&name) };
     // Wrap immediately so free_state fires exactly once on every exit path.
     let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
-    visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
-        .into_extern_result(&allocate_error)
+    visit_predicate_opaque_with_eval_impl(
+        state,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        children,
+        callbacks,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "default-engine-base")]

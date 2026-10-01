@@ -8,7 +8,7 @@ use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::{KernelError, KernelResult};
+use crate::{Error, KernelError, KernelResult};
 
 /// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
 const PATH: usize = 0;
@@ -53,20 +53,25 @@ impl Validation for AddFileRequiredFields {
         getters: &[&'a dyn GetData<'a>],
     ) -> KernelResult<()> {
         let path: &str = getters[PATH]
-            .get_opt(row, "path")?
+            .get_opt(row, "path")
+            .map_err(Error::into_kernel_error)?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
         if path.is_empty() {
             return Err(KernelError::generic("AddFile path must not be empty"));
         }
 
         let partition_values = validate_required_field_exist(
-            getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
+            getters[PARTITION_VALUES]
+                .get_map(row, "partitionValues")
+                .map_err(Error::into_kernel_error)?,
             path,
             "partitionValues",
         )?;
         validate_partition_keys(path, partition_values, &self.physical_partition_columns)?;
         let size = validate_required_field_exist::<i64>(
-            getters[SIZE].get_opt(row, "size")?,
+            getters[SIZE]
+                .get_opt(row, "size")
+                .map_err(Error::into_kernel_error)?,
             path,
             "size",
         )?;
@@ -76,7 +81,9 @@ impl Validation for AddFileRequiredFields {
             )));
         }
         validate_required_field_exist::<i64>(
-            getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
+            getters[MODIFICATION_TIME]
+                .get_opt(row, "modificationTime")
+                .map_err(Error::into_kernel_error)?,
             path,
             "modificationTime",
         )?;

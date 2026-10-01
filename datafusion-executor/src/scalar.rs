@@ -46,15 +46,21 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> Result<DFScalarValue> {
         KernelScalar::Decimal(d) => {
             DFScalarValue::Decimal128(Some(d.bits()), d.precision(), d.scale() as i8)
         }
-        KernelScalar::Struct(data) => struct_to_df_scalar(data)?,
-        KernelScalar::Array(data) => array_to_df_scalar(data)?,
-        KernelScalar::Map(data) => map_to_df_scalar(data)?,
-        KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
-            return Err(KernelError::unsupported(
-                "interval scalars are not supported in the DataFusion executor",
-            ))
+        KernelScalar::Struct(data) => {
+            struct_to_df_scalar(data).map_err(delta_kernel::Error::Kernel)?
         }
-        KernelScalar::Null(data_type) => datatype_to_df_null_scalar(data_type)?,
+        KernelScalar::Array(data) => {
+            array_to_df_scalar(data).map_err(delta_kernel::Error::Kernel)?
+        }
+        KernelScalar::Map(data) => map_to_df_scalar(data).map_err(delta_kernel::Error::Kernel)?,
+        KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
+            return Err(delta_kernel::Error::Kernel(KernelError::unsupported(
+                "interval scalars are not supported in the DataFusion executor",
+            )))
+        }
+        KernelScalar::Null(data_type) => {
+            datatype_to_df_null_scalar(data_type).map_err(delta_kernel::Error::Kernel)?
+        }
     })
 }
 
@@ -66,8 +72,11 @@ fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> KernelResult<DFScal
 
 /// Builds a `DFScalarValue::List` holding a single list row of the converted elements.
 fn array_to_df_scalar(data: &KernelArrayData) -> KernelResult<DFScalarValue> {
-    let elements: KernelResult<Vec<DFScalarValue>> =
-        data.array_elements().iter().map(to_df_scalar).collect();
+    let elements: KernelResult<Vec<DFScalarValue>> = data
+        .array_elements()
+        .iter()
+        .map(|scalar| to_df_scalar(scalar).map_err(delta_kernel::Error::into_kernel_error))
+        .collect();
     // Name the list's element field from kernel's own ArrayType->Arrow conversion
     let element_field: ArrowField = data.array_type().try_into_arrow()?;
     let element_array = df_scalars_to_arrow_array(elements?, element_field.data_type())?;
@@ -82,7 +91,10 @@ fn struct_to_df_scalar(data: &KernelStructData) -> KernelResult<DFScalarValue> {
     let mut builder = ScalarStructBuilder::new();
     for (field, value) in data.fields().iter().zip(data.values()) {
         let arrow_field: ArrowField = field.try_into_arrow()?;
-        builder = builder.with_scalar(arrow_field, to_df_scalar(value)?);
+        builder = builder.with_scalar(
+            arrow_field,
+            to_df_scalar(value).map_err(delta_kernel::Error::into_kernel_error)?,
+        );
     }
     builder.build().map_err(KernelError::generic_err)
 }
@@ -103,7 +115,12 @@ fn map_to_df_scalar(data: &KernelMapData) -> KernelResult<DFScalarValue> {
     let pairs = data.pairs();
     let converted: KernelResult<(Vec<DFScalarValue>, Vec<DFScalarValue>)> = pairs
         .iter()
-        .map(|(key, value)| Ok((to_df_scalar(key)?, to_df_scalar(value)?)))
+        .map(|(key, value)| {
+            Ok((
+                to_df_scalar(key).map_err(delta_kernel::Error::into_kernel_error)?,
+                to_df_scalar(value).map_err(delta_kernel::Error::into_kernel_error)?,
+            ))
+        })
         .collect();
     let (keys, values) = converted?;
     let key_array = df_scalars_to_arrow_array(keys, key_field.data_type())?;

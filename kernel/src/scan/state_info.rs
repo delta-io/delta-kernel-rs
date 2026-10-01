@@ -347,7 +347,10 @@ fn resolve_physical_columns_strict(
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
         .iter()
-        .map(|col| get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode))
+        .map(|col| {
+            get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                .map_err(crate::Error::into_kernel_error)
+        })
         .collect()
 }
 
@@ -478,7 +481,9 @@ impl StateInfo {
                         // note that RowIndex and FilePath are handled in the parquet reader so we
                         // just add them as if they're normal physical
                         // columns
-                        let physical_field = logical_field.make_physical(column_mapping_mode)?;
+                        let physical_field = logical_field
+                            .make_physical(column_mapping_mode)
+                            .map_err(crate::Error::into_kernel_error)?;
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
@@ -497,7 +502,8 @@ impl StateInfo {
             }
         }
 
-        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+        let physical_schema =
+            Arc::new(StructType::try_new(read_fields).map_err(crate::Error::into_kernel_error)?);
 
         // Logical column names referenced by the predicate. Fed into the stats schema
         // build below and into the dropped-refs observability log.
@@ -828,7 +834,7 @@ pub(crate) mod tests {
                 builder.with_protocol(MockProtocolBuilder::new().with_features(features).build())
             }
         };
-        let table_configuration = builder.try_build()?;
+        let table_configuration = builder.try_build().map_err(crate::Error::Kernel)?;
 
         let mut schema = schema;
         for (name, spec) in metadata_cols.into_iter() {
@@ -848,6 +854,7 @@ pub(crate) mod tests {
             &partition_values,
             (),
         )
+        .map_err(crate::Error::Kernel)
     }
 
     pub(crate) fn assert_transform_spec(

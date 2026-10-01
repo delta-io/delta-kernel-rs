@@ -7,7 +7,7 @@ use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{create_row, Engine, KernelResult};
+use crate::{create_row, Engine, Error, KernelResult};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -176,7 +176,8 @@ impl<S> Transaction<S> {
             .collect();
         let existing_domains = self
             .read_snapshot()?
-            .get_domain_metadatas_internal(engine, Some(&domains))?;
+            .get_domain_metadatas_internal(engine, Some(&domains))
+            .map_err(Error::into_kernel_error)?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
@@ -226,7 +227,8 @@ impl<S> Transaction<S> {
                     Some(metadata) => metadata.high_water_mark(),
                     None => self
                         .read_snapshot()?
-                        .get_row_tracking_high_water_mark(engine)?
+                        .get_row_tracking_high_water_mark(engine)
+                        .map_err(Error::into_kernel_error)?
                         .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
                 };
                 if provided < calculated {
@@ -243,7 +245,8 @@ impl<S> Transaction<S> {
         // Generate the single row-tracking domain action, if any.
         let row_tracking_domain_action = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
-            .transpose()?
+            .transpose()
+            .map_err(Error::into_kernel_error)?
             .into_iter();
 
         // Chain all domain actions: system domains, row tracking, user domains, removals

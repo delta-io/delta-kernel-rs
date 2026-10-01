@@ -40,7 +40,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result, Version};
+use crate::{Error, KernelError, KernelResult, Result, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -326,6 +326,7 @@ impl TableConfiguration {
     ) -> Result<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+            .map_err(Error::Kernel)
     }
 
     /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
@@ -354,7 +355,11 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let physical_schema = Arc::new(
+            logical_schema
+                .make_physical(column_mapping_mode)
+                .map_err(Error::into_kernel_error)?,
+        );
         let partition_columns: HashSet<&str> = metadata
             .partition_columns()
             .iter()
@@ -456,6 +461,7 @@ impl TableConfiguration {
             table_configuration.table_root.clone(),
             new_version,
         )
+        .map_err(Error::into_kernel_error)
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
@@ -554,7 +560,8 @@ impl TableConfiguration {
                         )
                     })
             })
-            .collect::<KernelResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(Error::into_kernel_error)?;
 
         self.build_stats_output_schemas_for_resolved_columns(
             &logical_columns,
@@ -590,7 +597,8 @@ impl TableConfiguration {
                     column_mapping_mode,
                 )
             })
-            .collect::<KernelResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(Error::into_kernel_error)?;
 
         self.build_stats_output_schemas_for_resolved_columns(
             logical_columns,
@@ -1004,16 +1012,18 @@ impl TableConfiguration {
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> Result<()> {
         match operation {
             Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
-                self.ensure_read_supported(operation)
+                self.ensure_read_supported(operation).map_err(Error::Kernel)
             }
-            Operation::Write => self.ensure_write_supported(),
+            Operation::Write => self.ensure_write_supported().map_err(Error::Kernel),
         }
     }
 
     /// Ensures Kernel supports both scanning and writing this table.
     pub(crate) fn ensure_read_write_supported(&self) -> KernelResult<()> {
-        self.ensure_operation_supported(Operation::Scan)?;
+        self.ensure_operation_supported(Operation::Scan)
+            .map_err(Error::into_kernel_error)?;
         self.ensure_operation_supported(Operation::Write)
+            .map_err(Error::into_kernel_error)
     }
 
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)

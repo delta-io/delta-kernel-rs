@@ -192,12 +192,16 @@ impl<T: ListLikeArray> StructListAccessor for T {
         visitor: &mut dyn RowVisitor,
     ) -> Result<()> {
         let offsets = self.row_offsets(row_index);
-        let sliced = struct_elements(self, "struct-list")?.slice(offsets.start, offsets.len());
+        let sliced = struct_elements(self, "struct-list")
+            .map_err(crate::Error::Kernel)?
+            .slice(offsets.start, offsets.len());
         // is_nullable means nulls may be present; a null element struct can't round-trip via
         // RecordBatch.
         require!(
             !sliced.is_nullable(),
-            KernelError::invalid_struct_data("array<struct> elements are nullable; cannot visit")
+            crate::Error::Kernel(KernelError::invalid_struct_data(
+                "array<struct> elements are nullable; cannot visit"
+            ))
         );
         ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
     }
@@ -205,27 +209,27 @@ impl<T: ListLikeArray> StructListAccessor for T {
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListArray<OffsetSize> {
     fn get_list(&'a self, row_index: usize, field_name: &str) -> Result<Option<ListItem<'a>>> {
-        get_list_item(self, row_index, field_name)
+        get_list_item(self, row_index, field_name).map_err(crate::Error::Kernel)
     }
     fn get_struct_list(
         &'a self,
         row_index: usize,
         field_name: &str,
     ) -> Result<Option<StructList<'a>>> {
-        get_struct_list_item(self, row_index, field_name)
+        get_struct_list_item(self, row_index, field_name).map_err(crate::Error::Kernel)
     }
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListViewArray<OffsetSize> {
     fn get_list(&'a self, row_index: usize, field_name: &str) -> Result<Option<ListItem<'a>>> {
-        get_list_item(self, row_index, field_name)
+        get_list_item(self, row_index, field_name).map_err(crate::Error::Kernel)
     }
     fn get_struct_list(
         &'a self,
         row_index: usize,
         field_name: &str,
     ) -> Result<Option<StructList<'a>>> {
-        get_struct_list_item(self, row_index, field_name)
+        get_struct_list_item(self, row_index, field_name).map_err(crate::Error::Kernel)
     }
 }
 
@@ -234,16 +238,20 @@ impl<'a> GetData<'a> for MapArray {
         if !self.is_valid(row_index) {
             return Ok(None);
         }
-        let keys = as_string_accessor(self.keys().as_ref()).ok_or_else(|| {
-            KernelError::unexpected_column_type(format!(
-                "{field_name}: map keys are not a supported string type"
-            ))
-        })?;
-        let values = as_string_accessor(self.values().as_ref()).ok_or_else(|| {
-            KernelError::unexpected_column_type(format!(
-                "{field_name}: map values are not a supported string type"
-            ))
-        })?;
+        let keys = as_string_accessor(self.keys().as_ref())
+            .ok_or_else(|| {
+                KernelError::unexpected_column_type(format!(
+                    "{field_name}: map keys are not a supported string type"
+                ))
+            })
+            .map_err(crate::Error::Kernel)?;
+        let values = as_string_accessor(self.values().as_ref())
+            .ok_or_else(|| {
+                KernelError::unexpected_column_type(format!(
+                    "{field_name}: map values are not a supported string type"
+                ))
+            })
+            .map_err(crate::Error::Kernel)?;
         let start = self.offsets()[row_index] as usize;
         let end = self.offsets()[row_index + 1] as usize;
         Ok(Some(MapItem::new(keys, values, start..end)))
@@ -277,7 +285,8 @@ fn validate_and_get_physical_index(
 /// by runtime downcasting of the values array.
 impl<'a> GetData<'a> for RunArray<Int64Type> {
     fn get_str(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a str>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)
+            .map_err(crate::Error::Kernel)?;
         let values = self
             .values()
             .as_any()
@@ -287,13 +296,15 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
                     "Expected StringArray values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
-            })?;
+            })
+            .map_err(crate::Error::Kernel)?;
 
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
     fn get_int(&'a self, row_index: usize, field_name: &str) -> Result<Option<i32>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)
+            .map_err(crate::Error::Kernel)?;
         let values = self
             .values()
             .as_primitive_opt::<Int32Type>()
@@ -302,13 +313,15 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
                     "Expected Int32Array values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
-            })?;
+            })
+            .map_err(crate::Error::Kernel)?;
 
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
     fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)
+            .map_err(crate::Error::Kernel)?;
         let values = self
             .values()
             .as_primitive_opt::<Int64Type>()
@@ -317,25 +330,32 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
                     "Expected Int64Array values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
-            })?;
+            })
+            .map_err(crate::Error::Kernel)?;
 
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
     fn get_bool(&'a self, row_index: usize, field_name: &str) -> Result<Option<bool>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
-        let values = self.values().as_boolean_opt().ok_or_else(|| {
-            KernelError::generic(format!(
-                "Expected BooleanArray values in RunArray, got {:?}",
-                self.values().data_type()
-            ))
-        })?;
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)
+            .map_err(crate::Error::Kernel)?;
+        let values = self
+            .values()
+            .as_boolean_opt()
+            .ok_or_else(|| {
+                KernelError::generic(format!(
+                    "Expected BooleanArray values in RunArray, got {:?}",
+                    self.values().data_type()
+                ))
+            })
+            .map_err(crate::Error::Kernel)?;
 
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
     fn get_binary(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a [u8]>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)
+            .map_err(crate::Error::Kernel)?;
         let values = self
             .values()
             .as_any()
@@ -345,7 +365,8 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
                     "Expected BinaryArray values in RunArray, got {:?}",
                     self.values().data_type()
                 ))
-            })?;
+            })
+            .map_err(crate::Error::Kernel)?;
 
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
@@ -578,7 +599,10 @@ mod tests {
             .unwrap()
             .visit_with(&mut visitor)
             .expect_err("a null element struct cannot be visited");
-        assert!(matches!(err, KernelError::InvalidStructData(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidStructData(_))
+        ));
     }
 
     #[test]

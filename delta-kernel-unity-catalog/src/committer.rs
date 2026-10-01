@@ -5,7 +5,7 @@ use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult, Result,
+    Engine, Error, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult, Result,
     ResultIterator,
 };
 use tracing::{debug, info};
@@ -145,7 +145,9 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             commit_metadata.version()
         );
         self.validate_catalog_managed_state(commit_metadata)?;
-        let published_commit_path = commit_metadata.published_commit_path()?;
+        let published_commit_path = commit_metadata
+            .published_commit_path()
+            .map_err(Error::into_kernel_error)?;
         match engine.json_handler().write_json_file(
             &published_commit_path,
             Box::new(actions),
@@ -160,11 +162,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(DeltaError::FileAlreadyExists(_)) => {
+            Err(Error::Kernel(DeltaError::FileAlreadyExists(_))) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into_kernel_error()),
         }
     }
 
@@ -185,12 +187,18 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         );
         self.validate_catalog_managed_state(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
-        let staged_commit_path = commit_metadata.staged_commit_path()?;
+        let staged_commit_path = commit_metadata
+            .staged_commit_path()
+            .map_err(Error::into_kernel_error)?;
         engine
             .json_handler()
-            .write_json_file(&staged_commit_path, Box::new(actions), false)?;
+            .write_json_file(&staged_commit_path, Box::new(actions), false)
+            .map_err(Error::into_kernel_error)?;
 
-        let committed = engine.storage_handler().head(&staged_commit_path)?;
+        let committed = engine
+            .storage_handler()
+            .head(&staged_commit_path)
+            .map_err(Error::into_kernel_error)?;
         debug!("wrote staged commit file: {:?}", committed);
 
         let mut updates = vec![DeltaTableUpdate::AddCommit {
@@ -267,9 +275,12 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         commit_metadata: CommitMetadata,
     ) -> Result<CommitResponse> {
         if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
+            return self
+                .commit_version_0(engine, actions, &commit_metadata)
+                .map_err(Error::Kernel);
         }
         self.commit_version_non_zero(engine, actions, commit_metadata)
+            .map_err(Error::Kernel)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -286,7 +297,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
+                Err(Error::Kernel(DeltaError::FileAlreadyExists(_))) => (),
                 Err(e) => return Err(e),
             }
         }

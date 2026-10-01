@@ -19,7 +19,7 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::FoldWithOption as _;
-use crate::KernelResult;
+use crate::{Error, KernelResult};
 
 /// A schema evolution operation to be applied to a table.
 ///
@@ -203,7 +203,8 @@ pub(crate) fn apply_schema_operations(
                 };
                 let parent_path = parent.as_ref().map_or(&[][..], ColumnName::path);
                 add_field(
-                    root.struct_at_path(parent_path)?,
+                    root.struct_at_path(parent_path)
+                        .map_err(Error::into_kernel_error)?,
                     field,
                     ColumnName::new(parent_path).to_string(),
                 )?;
@@ -213,7 +214,12 @@ pub(crate) fn apply_schema_operations(
                     .path()
                     .split_last()
                     .ok_or_else(|| KernelError::generic("empty column path"))?;
-                set_field_nullable(root.struct_at_path(parent)?, leaf).map_err(|e| {
+                set_field_nullable(
+                    root.struct_at_path(parent)
+                        .map_err(Error::into_kernel_error)?,
+                    leaf,
+                )
+                .map_err(|e| {
                     KernelError::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
             }

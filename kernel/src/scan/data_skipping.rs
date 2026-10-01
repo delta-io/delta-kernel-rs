@@ -373,7 +373,10 @@ impl DataSkippingFilter {
         let start_time = Instant::now();
         let batch_len = batch.len();
 
-        let file_stats = self.stats_evaluator.evaluate(batch)?;
+        let file_stats = self
+            .stats_evaluator
+            .evaluate(batch)
+            .map_err(crate::Error::into_kernel_error)?;
         require!(
             file_stats.len() == batch_len,
             KernelError::internal_error(format!(
@@ -383,7 +386,10 @@ impl DataSkippingFilter {
             ))
         );
 
-        let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
+        let skipping_predicate = self
+            .skipping_evaluator
+            .evaluate(&*file_stats)
+            .map_err(crate::Error::into_kernel_error)?;
         require!(
             skipping_predicate.len() == batch_len,
             KernelError::internal_error(format!(
@@ -395,7 +401,8 @@ impl DataSkippingFilter {
 
         let selection_vector = self
             .filter_evaluator
-            .evaluate(skipping_predicate.as_ref())?;
+            .evaluate(skipping_predicate.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
         debug_assert_eq!(selection_vector.len(), batch_len);
         require!(
             selection_vector.len() == batch_len,
@@ -407,7 +414,9 @@ impl DataSkippingFilter {
         );
 
         let mut visitor = SelectionVectorVisitor::default();
-        visitor.visit_rows_of(selection_vector.as_ref())?;
+        visitor
+            .visit_rows_of(selection_vector.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
 
         if visitor.num_filtered > 0 {
             debug!(

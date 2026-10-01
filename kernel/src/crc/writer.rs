@@ -5,7 +5,7 @@ use url::Url;
 use super::Crc;
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult};
+use crate::{Engine, Error, KernelError, KernelResult};
 
 /// Serialize and write a CRC file to storage.
 ///
@@ -44,6 +44,7 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
     engine
         .storage_handler()
         .put(path, data.into(), false /* overwrite */)
+        .map_err(Error::into_kernel_error)
 }
 
 #[cfg(test)]

@@ -56,10 +56,10 @@ impl ParquetHandler for PlanBasedParquetHandler {
         data: ResultIteratorStatic<Box<dyn EngineData>>,
     ) -> Result<FileSize> {
         let Some(fallback) = &self.fallback else {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "PlanBasedParquetHandler does not support write_parquet_file yet, and no fallback \
                  handler is configured",
-            ));
+            )));
         };
         debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
         fallback.write_parquet_file(location, data)

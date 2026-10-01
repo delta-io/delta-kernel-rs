@@ -24,7 +24,7 @@ use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{FileMeta, KernelResult};
+use crate::{Error, FileMeta, KernelResult};
 
 /// Topology of a checkpoint: where the `add` / `remove` actions live.
 #[derive(Clone, Debug, PartialEq)]
@@ -268,7 +268,10 @@ impl CheckpointShape {
     err
 )]
 fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> KernelResult<SchemaRef> {
-    Ok(exec.read_parquet_footer(file)?.schema)
+    Ok(exec
+        .read_parquet_footer(file)
+        .map_err(Error::into_kernel_error)?
+        .schema)
 }
 
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's
@@ -290,14 +293,23 @@ fn collect_single_sidecar(
     let plan = match file_format {
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
-    }?
-    .filter(col!(SIDECAR_NAME, "path").is_not_null())?
-    .build()?;
-    let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
+    }
+    .map_err(Error::into_kernel_error)?
+    .filter(col!(SIDECAR_NAME, "path").is_not_null())
+    .map_err(Error::into_kernel_error)?
+    .build()
+    .map_err(Error::into_kernel_error)?;
+    let data = exec
+        .execute_op(Operation::QueryPlan(plan))
+        .map_err(Error::into_kernel_error)?
+        .into_data()
+        .map_err(Error::into_kernel_error)?;
 
     let mut visitor = SidecarVisitor::default();
     for batch in data {
-        visitor.visit_rows_of(batch?.as_ref())?;
+        visitor
+            .visit_rows_of(batch.map_err(Error::into_kernel_error)?.as_ref())
+            .map_err(Error::into_kernel_error)?;
         if !visitor.sidecars.is_empty() {
             break;
         }

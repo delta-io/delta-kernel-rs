@@ -139,7 +139,8 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> KernelResult<Recor
         .iter()
         .map(|arg| match arg {
             Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
-            _ => evaluate_expression(arg, batch, None),
+            _ => evaluate_expression(arg, batch, None)
+                .map_err(delta_kernel::Error::into_kernel_error),
         })
         .collect::<KernelResult<_>>()?;
 
@@ -207,7 +208,9 @@ fn rewrite_stat_arg(
 fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> KernelResult<ArrayRef> {
     let arrays: Vec<ArrayRef> = fields
         .iter()
-        .map(|f| evaluate_expression(f, batch, None))
+        .map(|f| {
+            evaluate_expression(f, batch, None).map_err(delta_kernel::Error::into_kernel_error)
+        })
         .collect::<KernelResult<_>>()?;
     let arrow_fields: Fields = arrays
         .iter()
@@ -266,7 +269,8 @@ fn call_eval_pred(
     inverted: bool,
 ) -> KernelResult<BooleanArray> {
     let num_rows = args_batch.num_rows();
-    let args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
+    let args_ffi = ArrowFFIData::try_from_record_batch(args_batch)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     // The args batch transfers to the engine by value; the engine owns it and must release it (by
     // importing via `from_ffi`, or otherwise) on every path. The result uses the out-pointer
@@ -323,7 +327,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
                 );
                 return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(delta_kernel::Error::Kernel(e)),
         };
         // The StatsMode rewrite records inversion on the op (the stats predicate is then evaluated
         // non-inverted by kernel); RowMode carries it via the eval-time flag. XOR composes both.
@@ -335,6 +339,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
             self.mode,
             inverted,
         )
+        .map_err(delta_kernel::Error::Kernel)
     }
 
     fn eval_pred_scalar(

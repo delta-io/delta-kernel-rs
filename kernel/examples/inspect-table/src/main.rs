@@ -117,9 +117,11 @@ impl RowVisitor for LogVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let expected = NAMES_AND_TYPES.as_ref().0.len();
         if getters.len() != expected {
-            return Err(KernelError::InternalError(format!(
-                "Wrong number of LogVisitor getters: {}, expected {expected}",
-                getters.len()
+            return Err(delta_kernel::Error::Kernel(KernelError::InternalError(
+                format!(
+                    "Wrong number of LogVisitor getters: {}, expected {expected}",
+                    getters.len()
+                ),
             )));
         }
         let (add_start, add_end) = self.offsets[ADD_NAME];
@@ -198,9 +200,13 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
 fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
-    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
-    let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let engine = common::get_engine(&url, &cli.location_args)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let snapshot = Snapshot::builder_for(url)
+        .build(&engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     match cli.command {
         Commands::TableVersion => {
@@ -213,22 +219,35 @@ fn try_main() -> KernelResult<()> {
             println!("{:#?}", snapshot.schema());
         }
         Commands::ScanMetadata => {
-            let scan = ScanBuilder::new(snapshot).build()?;
-            let scan_metadata_iter = scan.scan_metadata(&engine)?;
+            let scan = ScanBuilder::new(snapshot)
+                .build()
+                .map_err(delta_kernel::Error::into_kernel_error)?;
+            let scan_metadata_iter = scan
+                .scan_metadata(&engine)
+                .map_err(delta_kernel::Error::into_kernel_error)?;
             for res in scan_metadata_iter {
-                let scan_metadata = res?;
-                scan_metadata.visit_scan_files((), print_scan_file)?;
+                let scan_metadata = res.map_err(delta_kernel::Error::into_kernel_error)?;
+                scan_metadata
+                    .visit_scan_files((), print_scan_file)
+                    .map_err(delta_kernel::Error::into_kernel_error)?;
             }
         }
         Commands::Actions { oldest_first } => {
             let actions_schema = get_all_actions_schema();
             let actions = snapshot
                 .log_segment()
-                .read_actions(&engine, actions_schema.clone())?;
+                .read_actions(&engine, actions_schema.clone())
+                .map_err(delta_kernel::Error::into_kernel_error)?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {
-                visitor.visit_rows_of(action?.actions())?;
+                visitor
+                    .visit_rows_of(
+                        action
+                            .map_err(delta_kernel::Error::into_kernel_error)?
+                            .actions(),
+                    )
+                    .map_err(delta_kernel::Error::into_kernel_error)?;
             }
 
             if oldest_first {
