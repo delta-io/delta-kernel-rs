@@ -230,6 +230,9 @@ struct ReadIoConfig {
     buffer_size: Option<NonZero<usize>>,
     /// Maximum number of rows per yielded batch. See [`DefaultEngineBuilder::with_batch_size`].
     batch_size: Option<NonZero<usize>>,
+    /// Number of ordered JSON file chunks to parse concurrently. `None` means no parallelism.
+    /// See [`DefaultEngineBuilder::with_parallel_chunks`].
+    parallel_chunks: Option<NonZero<usize>>,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -288,6 +291,21 @@ impl<E> DefaultEngineBuilder<E> {
         self.io_config.batch_size = Some(batch_size);
         self
     }
+
+    /// Set the number of ordered JSON file chunks to parse concurrently.
+    ///
+    /// `None` (the default) means no parallelism. `Some(n)` splits the
+    /// file list into up to n chunks (fewer when there are fewer files than n),
+    /// parses them concurrently, and concatenates results in the proper order.
+    ///
+    /// Chunk tasks are spawned on the current Tokio runtime. Real speedup needs a
+    /// multi-thread executor ([`executor::tokio::TokioMultiThreadExecutor`]). The
+    /// default [`executor::tokio::TokioBackgroundExecutor`] is single-threaded, so
+    /// chunks share one thread.
+    pub fn with_parallel_chunks(mut self, parallel_chunks: Option<NonZero<usize>>) -> Self {
+        self.io_config.parallel_chunks = parallel_chunks;
+        self
+    }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
@@ -323,7 +341,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
         let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
-            .with_batch_size(batch_size);
+            .with_batch_size(batch_size)
+            .with_parallel_chunks(io_config.parallel_chunks);
         let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);
@@ -523,6 +542,7 @@ mod tests {
             .with_task_executor(executor)
             .with_buffer_size(NonZero::new(4).unwrap())
             .with_batch_size(NonZero::new(8).unwrap())
+            .with_parallel_chunks(NonZero::new(4))
             .build();
         test_arrow_engine(&engine, &url);
     }
