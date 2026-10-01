@@ -293,21 +293,22 @@ into the final `commitInfo` action.
 Kernel reserves certain fields and overrides them regardless of what you provide. Do not set
 these fields in your custom commit info:
 
-| Field | Meaning | Default when not supplied |
-|-------|---------|---------------------------|
+| Field | Meaning | Value written by Kernel |
+|-------|---------|-------------------------|
 | `timestamp` | The transaction's commit timestamp | Current time when the transaction is created |
-| `inCommitTimestamp` | The table's in-commit timestamp | Omitted unless the table enables in-commit timestamps |
-| `operation` | The operation name | `UNKNOWN` for existing-table transactions; fixed for create and alter transactions |
-| `operationParameters` | Operation parameters (if any) | `{}` |
-| `operationMetrics` | Operation metrics (if any) | Omitted; an explicitly empty map is written as `{}` |
+| `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled; omitted otherwise |
+| `operation` | The operation name | The value from `with_operation()`; defaults to `UNKNOWN` for existing-table transactions and is fixed for create and alter transactions |
+| `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`; defaults to `{}` |
+| `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`; omitted when unset, while an explicitly empty map is written as `{}` |
 | `kernelVersion` | The Kernel library version | Current Kernel version |
-| `isBlindAppend` | Whether the commit is a blind append | Omitted (`false`) |
-| `engineInfo` | The engine identifier | Omitted for existing and alter transactions; create uses its required engine identifier |
+| `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`; omitted (`false`) otherwise |
+| `engineInfo` | The engine identifier | The value from `with_engine_info()`; omitted for existing and alter transactions when unset, while create uses its required engine identifier |
 | `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
 Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and
-`with_operation_metrics()` to set those fields. Each setter replaces the complete map. Fields with
-names that do not collide are preserved as-is.
+`with_operation_metrics()` to set those fields. Each setter replaces the complete map. A `None`
+value is written as `null`. If a key appears more than once, the last value wins. Fields with names
+that do not collide are preserved as-is.
 
 ## After committing
 

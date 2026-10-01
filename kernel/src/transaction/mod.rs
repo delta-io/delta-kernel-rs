@@ -668,6 +668,9 @@ impl<S> Transaction<S> {
 
     /// Set `CommitInfo.operationParameters` for this transaction.
     ///
+    /// Common parameters include the write `mode`, `partitionBy` columns, and the `predicate` used
+    /// by update or delete operations.
+    ///
     /// Present values must already be stringified as expected in table history. Kernel writes the
     /// map as-is without interpreting or validating its keys; `None` writes a null map value.
     /// Kernel ignores `operationParameters` supplied through [`Transaction::with_commit_info`],
@@ -684,6 +687,8 @@ impl<S> Transaction<S> {
     }
 
     /// Set `CommitInfo.operationMetrics` for this transaction.
+    ///
+    /// Common metrics include `numFiles`, `numOutputRows`, `numOutputBytes`, and `executionTimeMs`.
     ///
     /// Present values must already be stringified as expected in table history. Kernel writes the
     /// map as-is without interpreting or validating its keys; `None` writes a null map value.
@@ -723,6 +728,9 @@ impl<S> Transaction<S> {
     /// - `isBlindAppend`
     /// - `engineInfo`
     /// - `txnId`
+    ///
+    /// Use [`Transaction::with_operation_parameters`] and
+    /// [`Transaction::with_operation_metrics`] to set the operation maps.
     ///
     /// Kernel merges the following field if it is set:
     ///

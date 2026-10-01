@@ -162,16 +162,35 @@ async fn test_commit_info_with_operation_maps() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum EmptyOperationMap {
+    Parameters,
+    Metrics,
+}
+
+#[rstest]
+#[case::parameters(EmptyOperationMap::Parameters, "operationParameters")]
+#[case::metrics(EmptyOperationMap::Metrics, "operationMetrics")]
 #[tokio::test]
-async fn test_commit_info_with_empty_operation_metrics() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_commit_info_with_empty_operation_map(
+    #[case] operation_map: EmptyOperationMap,
+    #[case] field_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
     let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
-            .with_operation_metrics(std::iter::empty::<(&str, Option<&str>)>());
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
+        let txn = match operation_map {
+            EmptyOperationMap::Parameters => {
+                txn.with_operation_parameters(std::iter::empty::<(&str, Option<&str>)>())
+            }
+            EmptyOperationMap::Metrics => {
+                txn.with_operation_metrics(std::iter::empty::<(&str, Option<&str>)>())
+            }
+        };
 
         let _ = txn.commit(&engine)?;
 
@@ -182,7 +201,7 @@ async fn test_commit_info_with_empty_operation_metrics() -> Result<(), Box<dyn s
             .await?;
         let parsed: serde_json::Value = serde_json::from_slice(&commit.bytes().await?)?;
 
-        assert_eq!(parsed["commitInfo"]["operationMetrics"], json!({}));
+        assert_eq!(parsed["commitInfo"][field_name], json!({}));
     }
     Ok(())
 }
@@ -201,7 +220,7 @@ enum OperationMapSetters {
 #[case::before_commit_info(OperationMapSetters::BeforeCommitInfo)]
 #[case::after_commit_info(OperationMapSetters::AfterCommitInfo)]
 #[tokio::test]
-async fn test_commit_info_merges_custom_fields_and_overrides_operation_maps(
+async fn test_commit_info_merges_custom_fields_and_ignores_reserved_fields(
     #[case] setters: OperationMapSetters,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -226,9 +245,9 @@ async fn test_commit_info_merges_custom_fields_and_overrides_operation_maps(
         // Build engine_commit_info with:
         //   - "myApp"           : engine-only field, must pass through unchanged.
         //   - "myVersion"       : engine-only field, must pass through unchanged.
-        //   - "operation"       : overlapping with CommitInfo; kernel must override with "WRITE".
-        //   - "operationParameters": overlapping with CommitInfo; the typed setter must override.
-        //   - "operationMetrics": overlapping with CommitInfo; the typed setter must override.
+        //   - "operation"       : reserved field that Kernel ignores in favor of "WRITE".
+        //   - "operationParameters": reserved field controlled by the typed setter.
+        //   - "operationMetrics": reserved field controlled by the typed setter.
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("myApp", ArrowDataType::Utf8, false),
             Field::new("myVersion", ArrowDataType::Utf8, false),
@@ -296,14 +315,14 @@ async fn test_commit_info_merges_custom_fields_and_overrides_operation_maps(
         // Zero out non-deterministic fields for stable comparison.
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
-        // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
-        // omitted from the JSON -- consistent with how the Delta log serializes optional fields.
         let (operation_parameters, operation_metrics) = match setters {
             OperationMapSetters::Unset => (json!({}), None),
             OperationMapSetters::BeforeCommitInfo | OperationMapSetters::AfterCommitInfo => {
                 (json!({"mode": "Append"}), Some(json!({"numFiles": "3"})))
             }
         };
+        // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
+        // omitted from the JSON, consistent with how the Delta log serializes optional fields.
         let mut expected_commit_info = json!({
             "myApp": "spark",
             "myVersion": "3.5.0",

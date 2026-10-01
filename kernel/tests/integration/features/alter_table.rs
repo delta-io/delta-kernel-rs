@@ -18,10 +18,11 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
+use serde_json::json;
 use test_utils::{
     add_commit, assert_result_error_with_message, column_mapping_fixtures as fixtures,
     create_table as create_test_table, create_table_and_load_snapshot, engine_store_setup,
-    test_table_setup, test_table_setup_mt, write_batch_to_table,
+    read_actions_from_commit, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -153,6 +154,36 @@ async fn add_column_validates_cdf_physical_column_names(
             expected_physical_name.as_ref()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let table_url = snapshot.table_root().clone();
+
+    snapshot
+        .alter_table()
+        .add_column(StructField::nullable("added", DataType::STRING))
+        .build(engine.as_ref(), committer())?
+        .with_operation_parameters([("columns", Some(r#"["added"]"#))])
+        .with_operation_metrics([("numAddedColumns", Some("1"))])
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let commit_infos = read_actions_from_commit(&table_url, 1, "commitInfo")?;
+    assert_eq!(commit_infos.len(), 1);
+    assert_eq!(
+        commit_infos[0]["operationParameters"],
+        json!({"columns": "[\"added\"]"})
+    );
+    assert_eq!(
+        commit_infos[0]["operationMetrics"],
+        json!({"numAddedColumns": "1"})
+    );
     Ok(())
 }
 
