@@ -3718,7 +3718,7 @@ mod tests {
         };
         assert_extern_result_error_with_message(
             invalid_snapshot,
-            FFIKernelError::GenericError,
+            FFIKernelError::MaxCatalogVersionError,
             Some(concat!(
                 "Max catalog version error: Max catalog version is required when providing ",
                 "staged commits. ",
@@ -3742,6 +3742,64 @@ mod tests {
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::catalog_managed_without_max_catalog_version(
+        true,
+        None,
+        concat!(
+            "Max catalog version error: Max catalog version is required when loading a ",
+            "catalog-managed table. Use with_max_catalog_version()."
+        )
+    )]
+    #[case::non_catalog_managed_with_max_catalog_version(
+        false,
+        Some(0),
+        concat!(
+            "Max catalog version error: Max catalog version 0 must not be set for a ",
+            "non-catalog-managed table"
+        )
+    )]
+    #[tokio::test]
+    async fn test_snapshot_catalog_managed_mode_mismatch_returns_typed_error(
+        #[case] catalog_managed: bool,
+        #[case] max_catalog_version: Option<Version>,
+        #[case] expected_message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        let actions = if catalog_managed {
+            actions_to_string_catalog_managed(vec![TestAction::Metadata])
+        } else {
+            actions_to_string(vec![TestAction::Metadata])
+        };
+        add_commit(table_root, storage.as_ref(), 0, actions).await?;
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            allocate_err,
+        );
+
+        let result = unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ));
+            let builder = if let Some(max_catalog_version) = max_catalog_version {
+                snapshot_builder_with_max_catalog_version(builder, max_catalog_version)
+            } else {
+                builder
+            };
+            snapshot_builder_build(builder)
+        };
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::MaxCatalogVersionError,
+            Some(expected_message),
+        );
+
         unsafe { free_engine(engine) }
         Ok(())
     }

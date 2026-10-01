@@ -79,6 +79,7 @@ pub enum FFIKernelError {
     InvalidSnapshotHint = 50,
     StartVersionNotFound = 51,
     InvalidGeoParamsError = 52,
+    MaxCatalogVersionError = 53,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -92,7 +93,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::Extract(..) => FFIKernelError::ExtractError,
             KernelError::Generic(_) => FFIKernelError::GenericError,
             KernelError::GenericError { .. } => FFIKernelError::GenericError,
-            KernelError::MaxCatalogVersion(_) => FFIKernelError::GenericError,
+            KernelError::MaxCatalogVersion(_) => FFIKernelError::MaxCatalogVersionError,
             KernelError::LogTailVersionsNotContiguous { .. } => FFIKernelError::InvalidLogSegment,
             KernelError::IOError(_) => FFIKernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
@@ -317,6 +318,7 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
             FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::MaxCatalogVersionError => KernelError::MaxCatalogVersion(message),
             FFIKernelError::InternalError => KernelError::InternalError(message),
             FFIKernelError::FileNotFoundError => KernelError::FileNotFound(message),
             FFIKernelError::MissingColumnError => KernelError::MissingColumn(message),
@@ -501,6 +503,18 @@ mod error_code_tests {
 
         let err: KernelError = exec_error(FFIKernelError::InvalidGeoParamsError, "invalid").into();
         assert!(matches!(err, KernelError::InvalidGeoParams(message) if message == "invalid"));
+    }
+
+    #[test]
+    fn max_catalog_version_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::MaxCatalogVersion("invalid".to_string())),
+            FFIKernelError::MaxCatalogVersionError
+        );
+        assert_eq!(FFIKernelError::MaxCatalogVersionError as i32, 53);
+
+        let err: KernelError = exec_error(FFIKernelError::MaxCatalogVersionError, "invalid").into();
+        assert!(matches!(err, KernelError::MaxCatalogVersion(message) if message == "invalid"));
     }
 }
 
