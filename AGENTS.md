@@ -94,7 +94,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   are blocked with the cargo feature off), the internal SQL tokenizer and single-comparison parser
   (compiled but not yet wired into discovery), raw-SQL constraint discovery (the `check_constraints`
   module and the `TableWriteExpressions` trait on `Snapshot`/`Transaction`), CREATE TABLE
-  auto-enablement from `delta.constraints.*` properties, and the acknowledgement gates (on a
+  auto-enablement from `delta.constraints.*` properties, ALTER TABLE `add_check_constraint` /
+  `drop_check_constraint` (adding enables the feature), and the acknowledgement gates (on a
   constrained table, `Transaction::write_state` and any data-adding or constraint-introducing commit
   require `Transaction::ack_check_constraints`). Discovery exposes each constraint's raw SQL
   verbatim, so kernel does not parse or evaluate constraint SQL, and parsing and enforcement are the

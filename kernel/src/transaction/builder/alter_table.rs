@@ -1,4 +1,4 @@
-//! Builder for ALTER TABLE (schema evolution) transactions.
+//! Builder for ALTER TABLE transactions: schema evolution and CHECK-constraint changes.
 //!
 //! This module contains [`AlterTableTransactionBuilder`], which uses a type-state pattern to
 //! enforce valid operation chaining at compile time.
@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::check_constraints::{apply_check_constraint_operations, CheckConstraintOperation};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
@@ -70,6 +72,8 @@ mod sealed {
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
+    #[cfg(feature = "check-constraints-in-dev")]
+    check_constraint_operations: Vec<CheckConstraintOperation>,
     correlation_id: Option<Arc<str>>,
     // PhantomType marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
@@ -87,6 +91,8 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraint_operations: self.check_constraint_operations,
             correlation_id: self.correlation_id,
             _state: PhantomType::default(),
         }
@@ -106,6 +112,8 @@ impl AlterTableTransactionBuilder<Ready> {
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraint_operations: Vec::new(),
             correlation_id: None,
             _state: PhantomType::default(),
         }
@@ -137,6 +145,46 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         self.transition()
     }
 
+    /// Add a CHECK constraint, stored under `delta.constraints.<name>` with `raw_sql` as its
+    /// expression. The name is stored lowercased. Kernel does not parse or evaluate `raw_sql`.
+    ///
+    /// The name must be non-empty and must not match an existing constraint case-insensitively,
+    /// and the expression must be non-empty. Adding the first constraint enables the
+    /// `checkConstraints` writer feature. Committing requires
+    /// [`ack_check_constraints`](crate::transaction::Transaction::ack_check_constraints): the
+    /// connector must verify that every existing row satisfies the new constraint.
+    ///
+    /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn add_check_constraint(
+        mut self,
+        name: impl Into<String>,
+        raw_sql: impl Into<String>,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.check_constraint_operations
+            .push(CheckConstraintOperation::Add {
+                name: name.into(),
+                raw_sql: raw_sql.into(),
+            });
+        self.transition()
+    }
+
+    /// Drop the CHECK constraint whose name matches `name` case-insensitively. Dropping a
+    /// constraint needs no acknowledgement, and the `checkConstraints` feature stays in the
+    /// protocol.
+    ///
+    /// The constraint must exist. This is validated during
+    /// [`build()`](AlterTableTransactionBuilder::build).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn drop_check_constraint(
+        mut self,
+        name: impl Into<String>,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.check_constraint_operations
+            .push(CheckConstraintOperation::Drop { name: name.into() });
+        self.transition()
+    }
+
     /// Add a new column or nested field to the table schema.
     ///
     /// `parent` identifies the struct that will contain `field`. An empty parent targets the
@@ -164,14 +212,15 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
 }
 
 impl AlterTableTransactionBuilder<Modifying> {
-    /// Validate and apply schema operations, then build the [`AlterTableTransaction`].
+    /// Validate and apply the queued operations, then build the [`AlterTableTransaction`].
     ///
     /// This method:
     /// 1. Validates the table supports writes
-    /// 2. Applies each operation sequentially against the evolving schema
+    /// 2. Applies each schema operation sequentially against the evolving schema
     /// 3. Constructs new Metadata action with evolved schema
-    /// 4. Builds the evolved table configuration
-    /// 5. Creates the transaction
+    /// 4. Applies each CHECK-constraint operation, in order, after all schema operations
+    /// 5. Builds the evolved table configuration
+    /// 6. Creates the transaction
     ///
     /// # Errors
     ///
@@ -211,6 +260,18 @@ impl AlterTableTransactionBuilder<Modifying> {
         table_config.ensure_operation_supported(Operation::Write)?;
 
         let evolved_table_config = evolve_table_config(table_config, self.operations)?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        let evolved_table_config = if self.check_constraint_operations.is_empty() {
+            evolved_table_config
+        } else {
+            let evolved_table_config = apply_check_constraint_operations(
+                &evolved_table_config,
+                self.check_constraint_operations,
+            )?;
+            // Adding a constraint can enable `checkConstraints` and so change the protocol.
+            evolved_table_config.ensure_operation_supported(Operation::Write)?;
+            evolved_table_config
+        };
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
