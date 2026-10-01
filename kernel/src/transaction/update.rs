@@ -153,6 +153,10 @@ impl Transaction {
 
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
+    ///
+    /// With `COMPUTE STATS`, every Add must refresh statistics for an existing logical file,
+    /// preserving its path, deletion vector, and size. Kernel trusts the operation name and
+    /// excludes these Adds from CRC file statistics.
     pub fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
         self

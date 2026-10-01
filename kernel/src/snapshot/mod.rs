@@ -20,7 +20,7 @@ use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERI
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
-    SetTransactionState,
+    FileStatsValidity, SetTransactionState,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
@@ -1090,10 +1090,10 @@ impl Snapshot {
     ///
     /// - If Kernel does not support reading or writing the table.
     /// - [`KernelError::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if
-    ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
-    ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
-    ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
-    ///   `inCommitTimestampOpt` is absent.
+    ///   the resolved CRC's file statistics are indeterminate, or if
+    ///   `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
+    ///   Indeterminate-statistics errors retain the originating source, reason, and operation when
+    ///   known. `COMPUTE STATS` re-adds preserve aggregate file statistics.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
@@ -1203,10 +1203,12 @@ impl Snapshot {
                 checkpoint_version,
                 Some(FileSizeHistogram::create_default()),
             )?;
-            require!(
-                delta.is_incremental_safe,
-                unresolved_crc("commits after the checkpoint are not incremental-safe")
-            );
+            if let FileStatsValidity::Invalid(failure) = &delta.file_stats_validity {
+                return Err(KernelError::ChecksumWriteUnsupported(format!(
+                    "Cannot resolve a CRC to write for version {end}: commits after checkpoint \
+                     {checkpoint_version} have indeterminate file statistics; {failure}"
+                )));
+            }
             let base = log_segment
                 .build_crc_from_checkpoint(engine)?
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;

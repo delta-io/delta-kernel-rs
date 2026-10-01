@@ -86,7 +86,7 @@ fn test_cross_product_read_write(
 
 /// Write a CRC for `snap` and assert the exact outcome. A CRC can be written for virtually any
 /// table state; the only cases that block it are a missing remove `size` or a non-incremental
-/// operation (e.g. ANALYZE STATS) in the replayed commits, which force `Indeterminate` file
+/// operation (e.g. UNKNOWN OPERATION) in the replayed commits, which force `Indeterminate` file
 /// stats. The sweep exercises neither, so the write succeeds unless a CRC already exists at this
 /// version, which is exactly known from the sweep.
 fn write_and_assert_checksum(

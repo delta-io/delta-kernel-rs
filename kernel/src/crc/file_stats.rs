@@ -117,17 +117,52 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
     "CREATE OR REPLACE TABLE AS SELECT",
 ];
 
-/// Returns `true` if the given operation can be safely tracked by incremental file stats.
-///
-/// Incremental-safe operations produce add/remove actions whose net counts give correct file
-/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
-/// re-adds existing files with updated statistics; naively counting those adds would
-/// double-count file stats.
-pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
-    INCREMENTAL_SAFE_OPS.contains(&operation)
+/// How an operation contributes Add actions to incremental CRC statistics. Removes always count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileStatsOperation {
+    CountAdds,
+    IgnoreAdds,
+    Unsupported,
+}
+
+/// Classifies the on-disk operation name. `COMPUTE STATS` re-emits existing files with refreshed
+/// statistics, preserving file counts, bytes, and histogram bins. Unknown names are unsupported.
+pub(crate) fn classify_file_stats_operation(operation: &str) -> FileStatsOperation {
+    if operation == "COMPUTE STATS" {
+        FileStatsOperation::IgnoreAdds
+    } else if INCREMENTAL_SAFE_OPS.contains(&operation) {
+        FileStatsOperation::CountAdds
+    } else {
+        FileStatsOperation::Unsupported
+    }
 }
 
 impl FileStatsDelta {
+    /// Accumulates an Add's size, rejecting negative sizes.
+    pub(crate) fn add(&mut self, size: i64) -> DeltaResult<()> {
+        let bytes = size_to_u64(size)?;
+        if let Some(histogram) = &mut self.net_histogram {
+            histogram.insert(size)?;
+        }
+        self.gross_add_files += 1;
+        self.gross_add_bytes += bytes;
+        Ok(())
+    }
+
+    /// Merges signed changes from `other`, rejecting incompatible histogram boundaries or lengths.
+    /// Histogram tracking is retained only when both deltas have a histogram.
+    pub(crate) fn merge(&mut self, other: &Self) -> DeltaResult<()> {
+        match (&mut self.net_histogram, &other.net_histogram) {
+            (Some(histogram), Some(other)) => histogram.accumulate_delta(other)?,
+            _ => self.net_histogram = None,
+        }
+        self.gross_add_files += other.gross_add_files;
+        self.gross_add_bytes += other.gross_add_bytes;
+        self.gross_remove_files += other.gross_remove_files;
+        self.gross_remove_bytes += other.gross_remove_bytes;
+        Ok(())
+    }
+
     /// Net change in file count (added minus removed).
     pub(crate) fn net_files(&self) -> i64 {
         self.gross_add_files as i64 - self.gross_remove_files as i64

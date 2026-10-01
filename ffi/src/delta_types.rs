@@ -701,7 +701,7 @@ impl FfiFileStatsState {
                     histogram,
                 )
             }?)),
-            FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate),
+            FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::indeterminate()),
         }
     }
 }

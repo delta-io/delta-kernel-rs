@@ -10,6 +10,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
+use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -376,5 +377,83 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
 
     let success = reporter.take_success();
     assert_eq!(success.num_dv_updates, 2);
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compute_stats_preserves_crc_and_gross_commit_metrics(
+    #[values(false, true)] data_change: bool,
+    #[values(false, true)] removes_only: bool,
+) -> DeltaResult<()> {
+    let (_temp, table_path, engine) = test_table_setup_mt()?;
+    let base = create_table(&table_path, simple_schema(), "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let mut transaction = begin_transaction(base, engine.as_ref())?.with_operation("WRITE".into());
+    let files = vec![
+        ("a.parquet", 100, 1000, Some(3)),
+        ("b.parquet", 20000, 1000, Some(3)),
+    ];
+    transaction.add_files(
+        create_add_files_metadata(transaction.add_files_schema(), files.clone())
+            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?,
+    );
+    let base = transaction
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    base.write_checksum(engine.as_ref())?;
+    let expected = base.get_file_stats_if_present().unwrap();
+    let removals = if removes_only {
+        get_scan_files(base.clone(), engine.as_ref())?
+    } else {
+        vec![]
+    };
+    let reporter = Arc::new(LastCommitSuccess::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let mut transaction = begin_transaction(base, engine.as_ref())?
+        .with_operation("COMPUTE STATS".into())
+        .with_data_change(data_change);
+    if removes_only {
+        for batch in removals {
+            transaction.remove_files(batch);
+        }
+    } else {
+        transaction.add_files(
+            create_add_files_metadata(transaction.add_files_schema(), files)
+                .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?,
+        );
+    }
+    let post_commit = transaction
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let post_stats = post_commit.get_file_stats_if_present().unwrap();
+    if removes_only {
+        assert_eq!(post_stats.num_files(), 0);
+        assert_eq!(post_stats.table_size_bytes(), 0);
+        let histogram = post_stats.file_size_histogram().unwrap();
+        assert!(histogram.file_counts().iter().all(|count| *count == 0));
+        assert!(histogram.total_bytes().iter().all(|bytes| *bytes == 0));
+    } else {
+        assert_eq!(post_stats, expected);
+    }
+    let success = reporter.take_success();
+    assert_eq!(success.num_add_files, if removes_only { 0 } else { 2 });
+    assert_eq!(
+        success.add_files_bytes,
+        if removes_only { 0 } else { 20100 }
+    );
+    assert_eq!(success.num_remove_files, if removes_only { 2 } else { 0 });
+    assert_eq!(
+        success.remove_files_bytes,
+        if removes_only { 20100 } else { 0 }
+    );
+    assert_eq!(success.operation.as_deref(), Some("COMPUTE STATS"));
+    let disk = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(disk.get_file_stats_if_present(), Some(post_stats));
+    assert_eq!(disk.version(), post_commit.version());
     Ok(())
 }

@@ -11,12 +11,13 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::fmt;
 
 use delta_kernel_derive::internal_api;
 
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
-use crate::{DeltaResult, KernelError};
+use crate::{DeltaResult, KernelError, Version};
 
 /// The state of file statistics for a CRC.
 ///
@@ -33,14 +34,18 @@ pub enum FileStatsState {
     /// replay produced one), `None` when the source lacked one. Safe to write to disk (with or
     /// without histogram).
     Complete(FileStats),
-    /// File stats cannot be determined incrementally. Reasons include a non-incremental
-    /// operation (like `ANALYZE STATS`) that re-adds files without corresponding removes,
-    /// or a remove action with a missing `size` field. A full add/remove reconciliation pass
-    /// can recover `Complete`.
-    Indeterminate,
+    /// File statistics cannot be determined incrementally. The retained failure identifies the
+    /// source and reason; applying further deltas preserves that failure.
+    Indeterminate(FileStatsFailure),
 }
 
 impl FileStatsState {
+    /// Creates indeterminate state when the caller has no originating failure information.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn indeterminate() -> Self {
+        Self::Indeterminate(FileStatsFailure::unspecified())
+    }
+
     /// Returns absolute file stats only when `Complete`. Returns `None` for `Indeterminate`.
     pub fn file_stats(&self) -> Option<&FileStats> {
         match self {
@@ -52,6 +57,7 @@ impl FileStatsState {
     /// Returns `true` if file stats are known-correct absolute totals. Also gates whether
     /// the CRC is safe to write to disk: only `Complete` CRCs have well-defined on-disk
     /// representations.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub fn is_complete(&self) -> bool {
         matches!(self, Self::Complete(_))
     }
@@ -60,7 +66,108 @@ impl FileStatsState {
     /// add/remove reconciliation pass to recover.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn is_indeterminate(&self) -> bool {
-        self == &Self::Indeterminate
+        matches!(self, Self::Indeterminate(_))
+    }
+
+    /// Returns complete statistics, or a checksum-write error containing the retained cause and
+    /// the requested CRC `version`.
+    pub(crate) fn stats_for_write(&self, version: Version) -> DeltaResult<&FileStats> {
+        match self {
+            Self::Complete(stats) => Ok(stats),
+            Self::Indeterminate(failure) => Err(KernelError::ChecksumWriteUnsupported(format!(
+                "Cannot write CRC file for version {version}: file statistics are indeterminate; \
+                 {failure}"
+            ))),
+        }
+    }
+}
+
+/// A retained explanation of why incremental CRC file statistics are indeterminate.
+///
+/// Display includes the originating commit or checkpoint and operation when known. The cause
+/// remains attached to the CRC when subsequent commits advance its version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStatsFailure {
+    pub(crate) source: FileStatsSource,
+    pub(crate) operation: Option<String>,
+    pub(crate) reason: FileStatsFailureReason,
+}
+
+impl fmt::Display for FileStatsFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.source {
+            FileStatsSource::Commit { version, location } => {
+                write!(f, "commit version {version} ({location})")?;
+            }
+            FileStatsSource::Checkpoint { version } => write!(f, "checkpoint version {version}")?,
+            FileStatsSource::Unspecified => write!(f, "originating source unavailable")?,
+        }
+        if let Some(operation) = &self.operation {
+            write!(f, ", operation {operation:?}")?;
+        }
+        write!(f, ": ")?;
+        match &self.reason {
+            FileStatsFailureReason::UnsupportedOperation => {
+                write!(f, "unsupported operation for incremental file statistics")
+            }
+            FileStatsFailureReason::MissingOperation => {
+                write!(f, "commitInfo.operation is missing")
+            }
+            FileStatsFailureReason::MissingRemoveSize { path } => {
+                write!(f, "remove action for {path:?} has no size")
+            }
+            FileStatsFailureReason::NegativeAddSize { size } => {
+                write!(f, "add action has negative size {size}")
+            }
+            FileStatsFailureReason::NegativeRemoveSize { path, size } => {
+                write!(f, "remove action for {path:?} has negative size {size}")
+            }
+            FileStatsFailureReason::Unspecified => {
+                write!(f, "originating cause unavailable in the supplied CRC state")
+            }
+        }
+    }
+}
+
+impl FileStatsFailure {
+    fn unspecified() -> Self {
+        Self {
+            source: FileStatsSource::Unspecified,
+            operation: None,
+            reason: FileStatsFailureReason::Unspecified,
+        }
+    }
+}
+
+/// Origin of the actions that made file statistics indeterminate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileStatsSource {
+    Commit { version: Version, location: String },
+    Checkpoint { version: Version },
+    Unspecified,
+}
+
+/// Reason incremental file statistics cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileStatsFailureReason {
+    UnsupportedOperation,
+    MissingOperation,
+    MissingRemoveSize { path: String },
+    NegativeAddSize { size: i64 },
+    NegativeRemoveSize { path: String, size: i64 },
+    Unspecified,
+}
+
+/// Whether a file-statistics delta can advance a complete CRC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileStatsValidity {
+    Valid,
+    Invalid(FileStatsFailure),
+}
+
+impl Default for FileStatsValidity {
+    fn default() -> Self {
+        Self::Invalid(FileStatsFailure::unspecified())
     }
 }
 
@@ -283,7 +390,7 @@ mod tests {
 
     #[test]
     fn indeterminate_returns_none_for_file_stats() {
-        assert!(FileStatsState::Indeterminate.file_stats().is_none());
+        assert!(FileStatsState::indeterminate().file_stats().is_none());
     }
 
     #[test]
@@ -292,7 +399,7 @@ mod tests {
         assert!(complete.is_complete());
         assert!(!complete.is_indeterminate());
 
-        let indet = FileStatsState::Indeterminate;
+        let indet = FileStatsState::indeterminate();
         assert!(!indet.is_complete());
         assert!(indet.is_indeterminate());
     }

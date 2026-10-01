@@ -10,7 +10,8 @@ use tracing::warn;
 
 use super::file_stats::FileStatsDelta;
 use super::{
-    Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
+    Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, FileStatsValidity,
+    SetTransactionState,
 };
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::Version;
@@ -31,11 +32,9 @@ pub(crate) struct CrcDelta {
     /// In-commit timestamp at `Y`. Replaces the base's ICT unconditionally
     /// (whether `Some` or `None`).
     pub(crate) in_commit_timestamp: Option<i64>,
-    /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
-    /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
-    /// `false` whenever they observe a signal that makes incremental tracking unsound (for
-    /// example, a non-incremental operation such as `ANALYZE STATS`).
-    pub(crate) is_incremental_safe: bool,
+    /// Validity of the effective file-statistics delta, including a retained failure cause.
+    /// Producers must explicitly initialize valid deltas; the default is indeterminate.
+    pub(crate) file_stats_validity: FileStatsValidity,
 }
 
 impl CrcDelta {
@@ -45,8 +44,8 @@ impl CrcDelta {
     ///
     /// Because the delta covers the whole table, the resulting domain-metadata and
     /// set-transaction states are [`Complete`](DomainMetadataState::Complete) (authoritative).
-    /// If the file-stats portion is not incremental-safe, file stats are
-    /// [`Indeterminate`](FileStatsState::Indeterminate).
+    /// Invalid file-statistics deltas produce [`Indeterminate`](FileStatsState::Indeterminate)
+    /// state with the originating failure. `COMPUTE STATS` deltas exclude Add contributions.
     ///
     /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
     pub(crate) fn into_complete_crc(self, version: Version) -> Option<Crc> {
@@ -60,24 +59,21 @@ impl CrcDelta {
                 .collect(),
         );
         let set_transaction_state = SetTransactionState::Complete(self.set_transactions);
-        let file_stats_state = if self.is_incremental_safe {
-            FileStatsState::Complete(FileStats {
+        let file_stats_state = match self.file_stats_validity {
+            FileStatsValidity::Valid => FileStatsState::Complete(FileStats {
                 num_files: self.file_stats.net_files(),
                 table_size_bytes: self.file_stats.net_bytes(),
-                // The delta IS the full table histogram. Validate that all bins are non-negative
-                // (a real table can't have negative file counts). If validation fails, drop the
-                // histogram.
+                // A full-history delta is an absolute histogram, so every bin must be nonnegative.
                 file_size_histogram: self.file_stats.net_histogram.and_then(|delta| {
                     delta
                         .check_non_negative()
                         .inspect_err(|e| {
-                            warn!("Non-negative file count check failed, dropping file size histogram: {e}");
+                            warn!("Dropping invalid file size histogram: {e}");
                         })
                         .ok()
                 }),
-            })
-        } else {
-            FileStatsState::Indeterminate
+            }),
+            FileStatsValidity::Invalid(failure) => FileStatsState::Indeterminate(failure),
         };
         Some(Crc {
             version,
@@ -140,7 +136,7 @@ impl Crc {
         self.file_stats_state = transition_file_stats(
             &self.file_stats_state,
             &delta.file_stats,
-            delta.is_incremental_safe,
+            &delta.file_stats_validity,
         );
 
         // These fields describe one exact table version and are not maintained by incremental
@@ -177,25 +173,25 @@ pub(crate) fn merge_domain_metadata(
 fn transition_file_stats(
     current: &FileStatsState,
     delta: &FileStatsDelta,
-    is_incremental_safe: bool,
+    validity: &FileStatsValidity,
 ) -> FileStatsState {
-    match current {
-        // Indeterminate is terminal in incremental replay. A future full add/remove dedup
-        // pass could recover Complete.
-        FileStatsState::Indeterminate => FileStatsState::Indeterminate,
-        // A non-incremental delta makes incremental tracking impossible; a full
-        // reconciliation can recover.
-        _ if !is_incremental_safe => FileStatsState::Indeterminate,
-        FileStatsState::Complete(stats) => FileStatsState::Complete(FileStats {
-            // Counts and bytes have no non-negative check.
-            num_files: stats.num_files + delta.net_files(),
-            table_size_bytes: stats.table_size_bytes + delta.net_bytes(),
-            // Histogram: per-bin merge; drop on failure. See `merge_histogram`.
-            file_size_histogram: merge_histogram(
-                stats.file_size_histogram.as_ref(),
-                delta.net_histogram.as_ref(),
-            ),
-        }),
+    match (current, validity) {
+        (FileStatsState::Indeterminate(failure), _) => {
+            FileStatsState::Indeterminate(failure.clone())
+        }
+        (_, FileStatsValidity::Invalid(failure)) => FileStatsState::Indeterminate(failure.clone()),
+        (FileStatsState::Complete(stats), FileStatsValidity::Valid) => {
+            FileStatsState::Complete(FileStats {
+                // Counts and bytes have no non-negative check.
+                num_files: stats.num_files + delta.net_files(),
+                table_size_bytes: stats.table_size_bytes + delta.net_bytes(),
+                // Histogram: per-bin merge; drop on failure. See `merge_histogram`.
+                file_size_histogram: merge_histogram(
+                    stats.file_size_histogram.as_ref(),
+                    delta.net_histogram.as_ref(),
+                ),
+            })
+        }
     }
 }
 
@@ -227,8 +223,8 @@ mod tests {
     use super::*;
     use crate::actions::{Add, DomainMetadata, Metadata, Protocol};
     use crate::crc::{
-        is_incremental_safe_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
-        SetTransactionState,
+        classify_file_stats_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
+        FileStatsOperation, SetTransactionState,
     };
 
     fn base_crc() -> Crc {
@@ -278,7 +274,7 @@ mod tests {
                 gross_add_bytes: add_bytes,
                 ..Default::default()
             },
-            is_incremental_safe: true,
+            file_stats_validity: FileStatsValidity::Valid,
             ..Default::default()
         }
     }
@@ -290,12 +286,12 @@ mod tests {
                 gross_remove_bytes: remove_bytes,
                 ..Default::default()
             },
-            is_incremental_safe: true,
+            file_stats_validity: FileStatsValidity::Valid,
             ..Default::default()
         }
     }
 
-    // ===== is_incremental_safe tests =====
+    // ===== Operation policy =====
 
     #[test]
     fn test_incremental_safe_operations() {
@@ -313,7 +309,7 @@ mod tests {
             "CREATE OR REPLACE TABLE AS SELECT",
         ] {
             assert!(
-                is_incremental_safe_operation(op),
+                classify_file_stats_operation(op) == FileStatsOperation::CountAdds,
                 "{op} should be incremental-safe"
             );
         }
@@ -321,8 +317,83 @@ mod tests {
 
     #[test]
     fn test_non_incremental_safe_operations() {
-        assert!(!is_incremental_safe_operation("ANALYZE STATS"));
-        assert!(!is_incremental_safe_operation("UNKNOWN"));
+        assert!(classify_file_stats_operation("ANALYZE STATS") == FileStatsOperation::Unsupported);
+        assert!(classify_file_stats_operation("UNKNOWN") == FileStatsOperation::Unsupported);
+    }
+
+    #[test]
+    fn compute_stats_ignores_adds() {
+        assert_eq!(
+            classify_file_stats_operation("COMPUTE STATS"),
+            FileStatsOperation::IgnoreAdds
+        );
+    }
+
+    #[rstest]
+    fn original_failure_survives_conversion_apply_and_serialization(
+        #[values(false, true)] complete_history: bool,
+        #[values(false, true)] next_delta_invalid: bool,
+    ) {
+        let failure = crate::crc::FileStatsFailure {
+            source: crate::crc::FileStatsSource::Commit {
+                version: 39,
+                location: "memory:///_delta_log/00000000000000000039.json".into(),
+            },
+            operation: Some("DELETE".into()),
+            reason: crate::crc::FileStatsFailureReason::MissingRemoveSize {
+                path: "part-a".into(),
+            },
+        };
+        let delta = CrcDelta {
+            protocol: Some(base_crc().protocol),
+            metadata: Some(base_crc().metadata),
+            file_stats_validity: FileStatsValidity::Invalid(failure.clone()),
+            ..Default::default()
+        };
+        let crc = if complete_history {
+            delta.into_complete_crc(39).unwrap()
+        } else {
+            base_crc().apply(delta, 39)
+        };
+        let next = CrcDelta {
+            file_stats_validity: if next_delta_invalid {
+                FileStatsValidity::default()
+            } else {
+                FileStatsValidity::Valid
+            },
+            ..Default::default()
+        };
+        let advanced = crc.apply(next, 42);
+        assert_eq!(advanced.version, 42);
+        assert_eq!(
+            advanced.file_stats_state,
+            FileStatsState::Indeterminate(failure)
+        );
+        let error = super::super::CrcRaw::try_from(&advanced).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::KernelError::ChecksumWriteUnsupported(_)
+        ));
+        let serialized_error = serde_json::to_string(&advanced).unwrap_err().to_string();
+        for message in [error.to_string(), serialized_error] {
+            for expected in [
+                "version 42",
+                "commit version 39",
+                "DELETE",
+                "part-a",
+                "has no size",
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_delta_is_indeterminate() {
+        assert!(matches!(
+            CrcDelta::default().file_stats_validity,
+            FileStatsValidity::Invalid(_)
+        ));
     }
 
     // ===== Crc deserialized from CRC file (default state) =====
@@ -385,7 +456,7 @@ mod tests {
     #[test]
     fn test_apply_not_incremental_safe_transitions_to_indeterminate() {
         let unsafe_change = CrcDelta {
-            is_incremental_safe: false,
+            file_stats_validity: FileStatsValidity::default(),
             ..add_files_delta(1, 100)
         };
         let crc = base_crc().apply(unsafe_change, 1);
@@ -395,7 +466,7 @@ mod tests {
     #[test]
     fn test_indeterminate_stays_indeterminate() {
         let unsafe_change = CrcDelta {
-            is_incremental_safe: false,
+            file_stats_validity: FileStatsValidity::default(),
             ..add_files_delta(1, 100)
         };
         let crc = base_crc().apply(unsafe_change, 1);
@@ -587,7 +658,7 @@ mod tests {
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
-            is_incremental_safe: false,
+            file_stats_validity: FileStatsValidity::default(),
             ..add_files_delta(5, 1000)
         };
         let crc = delta.into_complete_crc(7).unwrap();
@@ -692,7 +763,7 @@ mod tests {
                 gross_remove_bytes: remove_sizes.iter().sum::<i64>() as u64,
                 net_histogram: Some(hist),
             },
-            is_incremental_safe: true,
+            file_stats_validity: FileStatsValidity::Valid,
             ..Default::default()
         }
     }
@@ -751,7 +822,7 @@ mod tests {
                 net_histogram: None,
                 ..Default::default()
             },
-            is_incremental_safe: true,
+            file_stats_validity: FileStatsValidity::Valid,
             ..Default::default()
         };
         let crc = base.apply(delta, 1);
@@ -765,7 +836,7 @@ mod tests {
     #[test]
     fn apply_drops_histogram_on_indeterminate() {
         let unsafe_delta = CrcDelta {
-            is_incremental_safe: false,
+            file_stats_validity: FileStatsValidity::default(),
             ..add_files_delta(1, 100)
         };
         let crc = base_crc_with_histogram(&[100, 200]).apply(unsafe_delta, 1);
@@ -786,7 +857,7 @@ mod tests {
                 net_histogram: Some(delta_hist),
                 ..Default::default()
             },
-            is_incremental_safe: true,
+            file_stats_validity: FileStatsValidity::Valid,
             ..Default::default()
         };
         let crc = delta.into_complete_crc(0).unwrap();
@@ -843,7 +914,7 @@ mod tests {
                 gross_remove_bytes: 150,
                 net_histogram: Some(delta_hist),
             },
-            is_incremental_safe: true,
+            file_stats_validity: FileStatsValidity::Valid,
             ..Default::default()
         };
 
