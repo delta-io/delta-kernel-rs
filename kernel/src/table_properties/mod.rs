@@ -30,6 +30,14 @@ pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
 /// `delta.constraints.<name>`.
 pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
 
+/// Returns the constraint name for a `delta.constraints.<name>` configuration key, or `None` for
+/// any other key (including a bare prefix with an empty name). The prefix is matched
+/// case-insensitively. The name keeps the case it was written with.
+pub(crate) fn strip_check_constraint_prefix(key: &str) -> Option<&str> {
+    let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
+    (prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) && !name.is_empty()).then_some(name)
+}
+
 // Table property key constants
 pub(crate) const APPEND_ONLY: &str = "delta.appendOnly";
 pub(crate) const AUTO_COMPACT: &str = "delta.autoOptimize.autoCompact";

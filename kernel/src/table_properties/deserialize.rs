@@ -107,8 +107,8 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         // A property key with a variable `<name>` suffix is a prefix family rather than a fixed
         // key, so it is matched by prefix in a guard here instead of a single constant arm. For
         // example, `delta.constraints.<name>` records a CHECK constraint.
-        _ if strip_constraint_prefix(k).is_some() => {
-            let name = strip_constraint_prefix(k)?;
+        _ if strip_check_constraint_prefix(k).is_some() => {
+            let name = strip_check_constraint_prefix(k)?;
             props
                 .check_constraints
                 .insert(name.to_string(), v.to_string());
@@ -116,14 +116,6 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         _ => return None,
     }
     Some(())
-}
-
-/// Returns the constraint name for a `delta.constraints.<name>` configuration key, or `None` for
-/// any other key (including a bare prefix with an empty name). The prefix is matched
-/// case-insensitively. The name keeps the case it was written with.
-fn strip_constraint_prefix(key: &str) -> Option<&str> {
-    let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
-    (prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) && !name.is_empty()).then_some(name)
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
