@@ -113,6 +113,35 @@ impl EnsureDataTypes {
             (&DataType::Variant(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
+            // A file is physically a struct, matched by name, exactly like a variant.
+            (DataType::File(file_fields), ArrowDataType::Struct(arrow_fields)) => {
+                require!(arrow_fields.len() == file_fields.num_fields(), {
+                    let unexpected = arrow_fields
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .filter(|name| file_fields.field(name).is_none())
+                        .join(", ");
+                    make_arrow_error(format!(
+                        "File struct has {} fields, expected {} (unexpected: [{unexpected}])",
+                        arrow_fields.len(),
+                        file_fields.num_fields(),
+                    ))
+                });
+                for kernel_field in file_fields.fields() {
+                    let Some(arrow_field) = arrow_fields
+                        .iter()
+                        .find(|arrow_field| arrow_field.name() == &kernel_field.name)
+                    else {
+                        return Err(make_arrow_error(format!(
+                            "File struct is missing field `{}`",
+                            kernel_field.name
+                        )));
+                    };
+                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                }
+                Ok(DataTypeCompat::Nested)
+            }
+            (&DataType::File(_), _) => check_cast_compat(kernel_type.try_into_arrow()?, arrow_type),
             // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
             // excludes Boolean, the string and binary variants, and Null -- even though
             // kernel models all of these as `PrimitiveType` variants. Match them
