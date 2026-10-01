@@ -1,4 +1,7 @@
-//! Resolution of AMT paths (relative vs absolute) against the table root.
+//! Resolution of AMT paths (relative vs absolute) against a table root, per the Iceberg V4
+//! [relative paths specification].
+//!
+//! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
 use url::Url;
 
@@ -40,8 +43,10 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
 /// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
 /// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
 ///
+/// A path without a scheme is relative (per the Iceberg V4 path spec).
+///
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn has_scheme(location: &str) -> bool {
+pub(crate) fn has_scheme(location: &str) -> bool {
     for (position, ch) in location.char_indices() {
         if ch == ':' {
             return position > 0;
