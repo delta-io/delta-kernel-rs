@@ -16,7 +16,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{Engine, EngineData, ExpressionRef, KernelError, Result};
+use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq, From)]
@@ -61,7 +61,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> Result<Option<RoaringTreemap>> {
+    ) -> KernelResult<Option<RoaringTreemap>> {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {

@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// Projects a nested struct to `schema` while preserving a null source struct.
 ///
@@ -161,7 +161,7 @@ pub struct StructPatchBuilder<Item> {
     root: StructPatchNode<Item>,
     /// The first error produced by a builder call, surfaced by `build`. Once set, later calls are
     /// skipped so the original (most relevant) error is preserved.
-    error: Result<()>,
+    error: KernelResult<()>,
 }
 
 /// The patch builder internally represents the in-progress patch specification as a tree of struct
@@ -404,7 +404,7 @@ impl<Item> StructPatchBuilder<Item> {
     fn apply_at(
         mut self,
         struct_path: impl CollectInto<ColumnName>,
-        op: impl FnOnce(&mut StructPatchNode<Item>) -> Result<()>,
+        op: impl FnOnce(&mut StructPatchNode<Item>) -> KernelResult<()>,
     ) -> Self {
         if self.error.is_ok() {
             let path = struct_path.collect_into();
@@ -416,7 +416,7 @@ impl<Item> StructPatchBuilder<Item> {
     fn begin_build(
         self,
         input_schema: &StructType,
-    ) -> Result<(StructPatchNode<Item>, Option<ColumnName>, &StructType)> {
+    ) -> KernelResult<(StructPatchNode<Item>, Option<ColumnName>, &StructType)> {
         self.error?;
         let source_schema = resolve_input_schema(input_schema, self.input_path.as_ref())?;
         Ok((self.root, self.input_path, source_schema))
@@ -425,7 +425,11 @@ impl<Item> StructPatchBuilder<Item> {
 
 impl<Item> StructPatchNode<Item> {
     /// Records an item to insert immediately after the named input field.
-    fn insert_after(&mut self, field_name: impl Into<String>, item: impl Into<Item>) -> Result<()> {
+    fn insert_after(
+        &mut self,
+        field_name: impl Into<String>,
+        item: impl Into<Item>,
+    ) -> KernelResult<()> {
         let entry = self.field_patch_mut(field_name.into(), |field_name, entry| {
             if entry.action.is_optional_drop() {
                 return Err(KernelError::generic(format!(
@@ -440,7 +444,7 @@ impl<Item> StructPatchNode<Item> {
 
     /// Records a drop of the named input field. `optional` tolerates an absent field at evaluation
     /// time, but cannot combine with insertions after that field.
-    fn drop(&mut self, field_name: impl Into<String>, optional: bool) -> Result<()> {
+    fn drop(&mut self, field_name: impl Into<String>, optional: bool) -> KernelResult<()> {
         self.set_action(field_name, FieldPatchOp::Drop { optional })
     }
 
@@ -450,7 +454,7 @@ impl<Item> StructPatchNode<Item> {
         &mut self,
         field_name: impl Into<String>,
         action: FieldPatchOp<Item>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let entry = self.field_patch_mut(field_name.into(), |field_name, entry| {
             if !entry.action.is_keep() {
                 return Err(KernelError::generic(format!(
@@ -468,7 +472,7 @@ impl<Item> StructPatchNode<Item> {
         Ok(())
     }
 
-    fn child_at_mut(&mut self, path: &[String]) -> Result<&mut Self> {
+    fn child_at_mut(&mut self, path: &[String]) -> KernelResult<&mut Self> {
         let Some((field_name, remaining)) = path.split_first() else {
             return Ok(self);
         };
@@ -492,8 +496,8 @@ impl<Item> StructPatchNode<Item> {
     fn field_patch_mut(
         &mut self,
         field_name: String,
-        validate_existing: impl FnOnce(&str, &FieldPatchNode<Item>) -> Result<()>,
-    ) -> Result<&mut FieldPatchNode<Item>> {
+        validate_existing: impl FnOnce(&str, &FieldPatchNode<Item>) -> KernelResult<()>,
+    ) -> KernelResult<&mut FieldPatchNode<Item>> {
         match self.fields.entry(field_name) {
             hash_map::Entry::Vacant(entry) => Ok(entry.insert(FieldPatchNode::default())),
             hash_map::Entry::Occupied(entry) => {
@@ -508,7 +512,7 @@ impl<Item> StructPatchNode<Item> {
 fn resolve_input_schema<'a>(
     input_schema: &'a StructType,
     input_path: Option<&ColumnName>,
-) -> Result<&'a StructType> {
+) -> KernelResult<&'a StructType> {
     let input_path = match input_path {
         Some(input_path) if !input_path.path().is_empty() => input_path,
         _ => return Ok(input_schema),
@@ -662,7 +666,7 @@ impl SchemaPatchItem for ProjectionItem {
 fn schema_walk<Item: SchemaPatchItem>(
     node: StructPatchNode<Item>,
     input_schema: &StructType,
-) -> Result<Vec<StructField>> {
+) -> KernelResult<Vec<StructField>> {
     let mut fields = node.fields;
     let mut output: Vec<_> = Item::into_fields(node.prepended_fields).collect();
     output.reserve(input_schema.num_fields() + fields.len());
@@ -737,7 +741,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         &self,
         struct_path: &ColumnName,
         field_name: &str,
-    ) -> Result<StructField> {
+    ) -> KernelResult<StructField> {
         let field_path: ColumnName = [
             self.inner.input_path.clone().unwrap_or_default(),
             struct_path.clone(),

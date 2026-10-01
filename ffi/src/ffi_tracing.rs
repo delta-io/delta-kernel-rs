@@ -21,7 +21,7 @@ use delta_kernel::metrics::{
     FrameReporter, FrameReporterLayer, MetricEvent as KernelMetricEvent, MetricsReporter,
     ReportGeneratorLayer,
 };
-use delta_kernel::{KernelError, Result};
+use delta_kernel::{KernelError, KernelResult};
 use tracing::field::{Field as TracingField, Visit};
 use tracing::{error, Event as TracingEvent, Subscriber};
 use tracing_core::Dispatch;
@@ -247,7 +247,7 @@ pub unsafe extern "C" fn enable_formatted_log_line_tracing(
 
 // utility code below for setting up the tracing subscriber for events
 
-fn set_global_default(dispatch: tracing_core::Dispatch) -> Result<()> {
+fn set_global_default(dispatch: tracing_core::Dispatch) -> KernelResult<()> {
     tracing_core::dispatcher::set_global_default(dispatch).map_err(|_| {
         KernelError::generic(
             "Unable to set global default subscriber. Trying to set more than once?",
@@ -528,7 +528,7 @@ impl GlobalTracingState {
 
     /// If the global subscriber hasn't been installed yet, this installs it and sets up all the
     /// tracing layers. When called again, this is a no-op.
-    fn ensure_installed(&mut self) -> Result<()> {
+    fn ensure_installed(&mut self) -> KernelResult<()> {
         if self.installed {
             return Ok(());
         }
@@ -564,7 +564,7 @@ impl GlobalTracingState {
     }
 
     /// Make `layer` the active logging layer and set its level filter.
-    fn reload_logging(&self, layer: BoxedLayer, max_level: Level) -> Result<()> {
+    fn reload_logging(&self, layer: BoxedLayer, max_level: Level) -> KernelResult<()> {
         let reload_err =
             |e| KernelError::generic(format!("Unable to reload logging subscriber: {e}"));
         self.logging_layer
@@ -583,7 +583,7 @@ impl GlobalTracingState {
         &mut self,
         callback: TracingEventFn,
         max_level: Level,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         if !max_level.is_valid() {
             return Err(KernelError::generic("max_level out of range"));
         }
@@ -601,7 +601,7 @@ impl GlobalTracingState {
         with_time: bool,
         with_level: bool,
         with_target: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         if !max_level.is_valid() {
             return Err(KernelError::generic("max_level out of range"));
         }
@@ -613,7 +613,7 @@ impl GlobalTracingState {
 
     /// Set the metrics callback and turn the metrics slot's filter on. Metric spans are emitted at
     /// `INFO`.
-    fn register_metrics_callback(&mut self, callback: MetricsEventFn) -> Result<()> {
+    fn register_metrics_callback(&mut self, callback: MetricsEventFn) -> KernelResult<()> {
         self.ensure_installed()?;
         *self.metrics_callback.lock().map_err(|_| {
             KernelError::generic("Failed to lock metrics callback (mutex poisoned).")
@@ -626,7 +626,7 @@ impl GlobalTracingState {
     }
 
     /// Registers the frame callback and enables spans containing the `enable_call_frame` field.
-    fn register_frame_callback(&mut self, callback: FrameEventFn) -> Result<()> {
+    fn register_frame_callback(&mut self, callback: FrameEventFn) -> KernelResult<()> {
         self.ensure_installed()?;
         self.frame_callback
             .set(callback)
@@ -642,7 +642,7 @@ impl GlobalTracingState {
 static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
     LazyLock::new(|| Mutex::new(GlobalTracingState::uninitialized()));
 
-fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> Result<()> {
+fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> KernelResult<()> {
     let mut state = TRACING_STATE
         .lock()
         .map_err(|_e| KernelError::generic("Poisoned mutex while setting up event subscriber"))?;
@@ -657,7 +657,7 @@ fn setup_log_line_subscriber(
     with_time: bool,
     with_level: bool,
     with_target: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let mut state = TRACING_STATE.lock().map_err(|_e| {
         KernelError::generic("Poisoned mutex while setting up log_line_subscriber")
     })?;
@@ -686,7 +686,7 @@ pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> b
     setup_metrics_reporter(callback).is_ok()
 }
 
-fn setup_metrics_reporter(callback: MetricsEventFn) -> Result<()> {
+fn setup_metrics_reporter(callback: MetricsEventFn) -> KernelResult<()> {
     let mut state = TRACING_STATE
         .lock()
         .map_err(|_e| KernelError::generic("Poisoned mutex while setting up metrics reporter"))?;

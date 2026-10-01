@@ -44,6 +44,7 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::KernelResult;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -124,7 +125,7 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
     nullability_predicate: Option<&ExpressionRef>,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
         return Err(KernelError::generic(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
@@ -176,7 +177,7 @@ fn evaluate_struct_patch_expression(
     patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     let mut used_field_patches = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
@@ -433,7 +434,7 @@ fn evaluate_array_expression(
     exprs: &[Expression],
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     let num_rows = batch.num_rows();
 
     let array_type = match result_type {
@@ -541,7 +542,7 @@ fn cast_list_elements(
     vals: &Arc<dyn Array>,
     field: &Arc<ArrowField>,
     dir: ViewCast,
-) -> Result<Arc<dyn Array>> {
+) -> KernelResult<Arc<dyn Array>> {
     let to_type = match dir {
         ViewCast::ToView => match field.data_type() {
             ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
@@ -579,7 +580,7 @@ fn cast_list_elements(
 /// This function converts ArrowView types to their non-view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -596,7 +597,7 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>
 /// This function converts  Arrow types to their Arrow view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -949,7 +950,7 @@ fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
     timestamp_timezone: TimestampTimezone,
-) -> Result<Option<Scalar>> {
+) -> KernelResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
@@ -992,7 +993,7 @@ fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
     timestamp_timezone: TimestampTimezone,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     let map_array = map_arr
         .as_any()
         .downcast_ref::<MapArray>()
@@ -1107,7 +1108,7 @@ fn evaluate_map_to_struct(
     )?)
 }
 
-fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> Result<ArrayRef> {
+fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> KernelResult<ArrayRef> {
     if let Some(expected) = expected {
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
     }

@@ -41,7 +41,7 @@ use crate::log_replay::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, Result, ResultIteratorStatic};
+use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -129,13 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: ResultIteratorStatic<ActionReconciliationBatch>,
+    inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: ResultIteratorStatic<ActionReconciliationBatch>) -> Self {
+    pub(crate) fn new(inner: KernelResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
@@ -150,8 +150,8 @@ impl ActionReconciliationIterator {
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
-        batch: Option<Result<ActionReconciliationBatch>>,
-    ) -> Option<Result<FilteredEngineData>> {
+        batch: Option<KernelResult<ActionReconciliationBatch>>,
+    ) -> Option<KernelResult<FilteredEngineData>> {
         let Some(batch) = batch else {
             self.state.is_exhausted.store(true, Ordering::Release);
             return None;
@@ -415,7 +415,11 @@ impl ActionReconciliationVisitor<'_> {
     /// - If deletion_timestamp <= minimum_file_retention_timestamp: Expired (exclude)
     /// - If deletion_timestamp > minimum_file_retention_timestamp: Valid (include)
     /// - If deletion_timestamp is missing: Defaults to 0, treated as expired (exclude)
-    fn is_expired_tombstone<'a>(&self, i: usize, getter: &'a dyn GetData<'a>) -> Result<bool> {
+    fn is_expired_tombstone<'a>(
+        &self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> KernelResult<bool> {
         // Ideally this should never be zero, but we are following the same behavior as Delta
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
@@ -440,7 +444,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // Extract the file action and handle errors immediately
         let Some(FileActionInfo {
             key: file_key,
@@ -475,7 +479,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // minReaderVersion is a required field, so we check for its presence to determine if this
         // is a protocol action. Only return the first (newest) protocol action we see,
         // ignoring other types
@@ -497,7 +501,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // id is a required field, so we check for its presence to determine if this is a metadata
         // action. Only return the first (newest) metadata action we see, ignoring other
         // types
@@ -519,7 +523,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(i, Self::TXN_APP_ID.name)?
         else {
             return Ok(None); // Not a txn action, continue checking other types
@@ -559,7 +563,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         let Some(domain) = getters[Self::DOMAIN_METADATA_DOMAIN.index]
             .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)?
         else {
@@ -605,7 +609,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<bool> {
+    ) -> KernelResult<bool> {
         let is_valid = if let Some(result) = self.check_file_action(i, getters)? {
             result
         } else if let Some(result) = self.check_txn_action(i, getters)? {

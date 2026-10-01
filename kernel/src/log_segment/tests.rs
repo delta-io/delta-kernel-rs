@@ -52,9 +52,9 @@ use crate::unit_test_utils::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Snapshot;
 use crate::{
-    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, ParquetFooter,
-    ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic, RowVisitor,
-    StorageHandler,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
+    ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic,
+    RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -67,7 +67,7 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> Result<Option<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send>> {
+) -> KernelResult<Option<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
     visitor.visit_rows_of(batch)?;
@@ -151,7 +151,7 @@ async fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
-) -> Result<()> {
+) -> KernelResult<()> {
     write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
@@ -161,7 +161,7 @@ pub(crate) async fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data).await
 }
@@ -172,11 +172,11 @@ async fn write_multi_row_group_parquet_to_store(
     store: &Arc<InMemory>,
     row_groups: Vec<Box<dyn EngineData>>,
     path: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let batches = row_groups
         .into_iter()
         .map(ArrowEngineData::try_from_engine_data)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     let schema = batches
         .first()
         .ok_or_else(|| KernelError::internal_error("at least one row group is required"))?
@@ -197,8 +197,8 @@ async fn write_multi_row_group_parquet_to_store(
 
 /// Returns the materialized row count and sorted paths of all materialized Add actions.
 fn collect_materialized_adds(
-    actions: impl Iterator<Item = Result<ActionsBatch>>,
-) -> Result<(usize, Vec<String>)> {
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+) -> KernelResult<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
     for batch in actions {
@@ -215,7 +215,7 @@ fn collect_materialized_adds(
 fn collect_projected_adds(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> Result<(usize, Vec<String>)> {
+) -> KernelResult<(usize, Vec<String>)> {
     let actions = log_segment
         .read_actions_with_projected_checkpoint_actions(
             engine,
@@ -267,7 +267,7 @@ async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> Result<FileMeta> {
+) -> KernelResult<FileMeta> {
     let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path.clone(), data).await?;
     let size = get_file_size(store, &path).await;
@@ -285,7 +285,7 @@ async fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let json_lines: Vec<String> = actions
         .into_iter()
         .map(|action| serde_json::to_string(&action).expect("action to string"))
@@ -3756,7 +3756,7 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 fn create_checkpoint_file_schema_with_stats_parsed(
     min_values_fields: Vec<StructField>,
     include_json_stats: bool,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let stats_parsed = StructField::nullable(
         "stats_parsed",
         schema! {

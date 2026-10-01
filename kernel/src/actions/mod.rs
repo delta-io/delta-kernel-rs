@@ -34,7 +34,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{create_row, Engine};
-use crate::{EngineData, FileMeta, FileSize, KernelError, Result, RowVisitor as _};
+use crate::{EngineData, FileMeta, FileSize, KernelError, KernelResult, Result, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -525,7 +525,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if schema serialization fails.
-    pub(crate) fn with_schema(self, schema: SchemaRef) -> Result<Self> {
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
             schema_string: serde_json::to_string(&schema)?,
             ..self
@@ -633,7 +633,7 @@ impl Protocol {
     pub(crate) fn try_new_modern(
         reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
         writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -644,7 +644,10 @@ impl Protocol {
 
     /// Try to create a new legacy Protocol instance with the given reader/writer versions
     #[cfg(test)]
-    pub(crate) fn try_new_legacy(min_reader_version: i32, min_writer_version: i32) -> Result<Self> {
+    pub(crate) fn try_new_legacy(
+        min_reader_version: i32,
+        min_writer_version: i32,
+    ) -> KernelResult<Self> {
         Self::try_new(
             min_reader_version,
             min_writer_version,
@@ -818,7 +821,7 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
@@ -1360,7 +1363,7 @@ impl LastManifestCommit {
     /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
     /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
     /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> KernelResult<()> {
         require!(
             self.content_root_version <= self.version,
             KernelError::generic(format!(
@@ -1534,7 +1537,7 @@ impl<'de> Deserialize<'de> for CheckpointAction {
 /// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
 /// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> Result<Scalar> {
+fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
         .chain(sidecar.fields().iter().cloned());
@@ -1557,7 +1560,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> Result<Scalar> {
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> Result<Scalar> {
+fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
@@ -1585,7 +1588,7 @@ impl CheckpointAction {
     /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
     /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
     /// hence a fallible method rather than an infallible `From`.
-    fn try_into_scalar(self) -> Result<Scalar> {
+    fn try_into_scalar(self) -> KernelResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1752,7 +1755,7 @@ impl CheckpointAction {
     /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
     /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
     /// can never be written in a shape the reader would reject.
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> KernelResult<()> {
         require!(
             self.content_root.version <= self.version,
             KernelError::generic(format!(
@@ -1838,7 +1841,7 @@ pub(crate) struct Sidecar {
 
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
 /// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> Result<FileSize> {
+fn to_file_size(bytes: i64, context: &str) -> KernelResult<FileSize> {
     bytes.try_into().map_err(|_| {
         KernelError::generic(format!(
             "Failed to convert {context} size {bytes} to FileSize"
@@ -1868,7 +1871,7 @@ impl Sidecar {
     ///
     /// This helper first builds the URL by joining the provided log_root with
     /// the "_sidecars/" folder and the given sidecar path.
-    pub(crate) fn to_filemeta(&self, log_root: &Url) -> Result<FileMeta> {
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> KernelResult<FileMeta> {
         Ok(FileMeta {
             location: log_root.join("_sidecars/")?.join(&self.path)?,
             last_modified: self.modification_time,

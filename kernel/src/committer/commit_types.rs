@@ -8,7 +8,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{Result, Version};
+use crate::{KernelResult, Result, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -70,7 +70,7 @@ impl CommitProtocolMetadata {
         read_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         if read_protocol.is_some() != read_metadata.is_some() {
             return Err(crate::KernelError::generic(
                 "read_protocol and read_metadata must both be present or both be absent",

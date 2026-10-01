@@ -20,7 +20,7 @@ use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, PredicateRef, Result, Snapshot};
+use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -29,7 +29,7 @@ fn normalized_metadata_batch(
     json_stats: Option<ArrayRef>,
     stats_parsed: Option<ArrayRef>,
     partitions_parsed: Option<ArrayRef>,
-) -> Result<RecordBatch> {
+) -> KernelResult<RecordBatch> {
     let mut columns = vec![
         ("path", field("path")),
         ("size", field("size")),
@@ -55,7 +55,7 @@ fn normalized_metadata_batch(
     Ok(RecordBatch::try_from_iter(columns)?)
 }
 
-fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> Result<Vec<RecordBatch>> {
+fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<RecordBatch>> {
     let mut batches = vec![];
     for metadata in scan.scan_metadata(engine)? {
         let (data, selection) = metadata?.scan_files.into_parts();
@@ -91,7 +91,7 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> Result<Vec<RecordBatc
     Ok(batches)
 }
 
-fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> Result<Vec<RecordBatch>> {
+fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<RecordBatch>> {
     let Some(plan) = scan.declarative_metadata_scan_plan(engine)? else {
         return Ok(vec![]);
     };
@@ -135,8 +135,8 @@ fn assert_metadata_eq(
     actual: &[RecordBatch],
     expected: &[RecordBatch],
     context: &str,
-) -> Result<()> {
-    fn sorted_pretty_lines(batches: &[RecordBatch]) -> Result<Vec<String>> {
+) -> KernelResult<()> {
+    fn sorted_pretty_lines(batches: &[RecordBatch]) -> KernelResult<Vec<String>> {
         let formatted = pretty_format_batches(batches)?.to_string();
         let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
         let len = lines.len();
@@ -155,7 +155,7 @@ fn assert_metadata_eq(
     Ok(())
 }
 
-fn without_columns(batches: &[RecordBatch], excluded: &[&str]) -> Result<Vec<RecordBatch>> {
+fn without_columns(batches: &[RecordBatch], excluded: &[&str]) -> KernelResult<Vec<RecordBatch>> {
     batches
         .iter()
         .map(|batch| {
@@ -680,7 +680,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
-) -> Result<()> {
+) -> KernelResult<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
     let table = TestTableBuilder::new()
@@ -1045,7 +1045,7 @@ fn assert_declarative_metadata_matches_imperative(
     features: FeatureSet,
     predicate: Pred,
     expected_count: usize,
-) -> Result<()> {
+) -> KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)

@@ -46,7 +46,7 @@ use crate::table_features::{
 };
 use crate::transaction::{CreateTable, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
-use crate::Result;
+use crate::KernelResult;
 
 /// A type alias for create-table transactions.
 ///
@@ -147,7 +147,7 @@ impl CreateTableTransaction {
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
         correlation_id: Option<Arc<str>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         validate_iceberg_compat_if_needed(
             &effective_table_config,
             &V2_VALIDATOR,

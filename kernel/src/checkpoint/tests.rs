@@ -31,7 +31,7 @@ use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
-use crate::{FileMeta, LogPath, Result, Snapshot};
+use crate::{FileMeta, KernelResult, LogPath, Result, Snapshot};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -222,7 +222,7 @@ pub(super) async fn write_commit_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     version: u64,
-) -> Result<()> {
+) -> KernelResult<()> {
     let json_lines: Vec<String> = actions
         .into_iter()
         .map(|action| serde_json::to_string(&action).expect("action to string"))
@@ -301,7 +301,7 @@ fn try_finalize_checkpoint(
     engine: &dyn crate::Engine,
     metadata: &FileMeta,
     data_iter: ActionReconciliationIterator,
-) -> Result<()> {
+) -> KernelResult<()> {
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
@@ -320,7 +320,7 @@ async fn assert_last_checkpoint_contents(
     expected_size: u64,
     expected_num_add_files: u64,
     expected_size_in_bytes: u64,
-) -> Result<()> {
+) -> KernelResult<()> {
     let last_checkpoint_data = read_last_checkpoint_file(store).await?;
     let expected_data = json!({
         "version": expected_version,
@@ -333,7 +333,7 @@ async fn assert_last_checkpoint_contents(
 }
 
 /// Reads the `_last_checkpoint` file from storage
-async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> Result<Value> {
+async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> KernelResult<Value> {
     let path = Path::from("_delta_log/_last_checkpoint");
     let data = store.get(&path).await?;
     let byte_data = data.bytes().await?;
@@ -1072,7 +1072,7 @@ fn verify_checkpoint_schema(
     schema: &Schema,
     expect_stats: bool,
     expect_stats_parsed: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     verify_checkpoint_schema_with_partitions(schema, expect_stats, expect_stats_parsed, false)
 }
 
@@ -1082,7 +1082,7 @@ fn verify_checkpoint_schema_with_partitions(
     expect_stats: bool,
     expect_stats_parsed: bool,
     expect_partition_values_parsed: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let add_field = schema
         .field_with_name("add")
         .expect("schema should have 'add' field");

@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{EngineData, KernelError, Result, RowVisitor};
+use crate::{EngineData, KernelError, KernelResult, Result, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -158,7 +158,7 @@ impl FileStatsDelta {
         add_files_metadata: &[Box<dyn EngineData>],
         remove_files_metadata: &[FilteredEngineData],
         bin_boundaries: Option<&[i64]>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let mut histogram = match bin_boundaries {
             Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
             None => FileSizeHistogram::create_default(),
@@ -199,7 +199,7 @@ impl FileStatsDelta {
 
 /// Read a file `size` (a non-negative byte count stored as `i64`) as `u64`, erroring on a
 /// negative size (corrupt input).
-pub(crate) fn size_to_u64(size: i64) -> Result<u64> {
+pub(crate) fn size_to_u64(size: i64) -> KernelResult<u64> {
     u64::try_from(size).map_err(|_| {
         KernelError::internal_error(format!("File size must be non-negative, got {size}"))
     })

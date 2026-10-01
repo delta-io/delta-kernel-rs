@@ -26,7 +26,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{schema, schema_ref, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{Engine, EngineData, Result, Snapshot};
+use crate::{Engine, EngineData, KernelResult, Result, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -42,7 +42,7 @@ fn generate_checkpoint_parts(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
-) -> Result<CheckpointParts> {
+) -> KernelResult<CheckpointParts> {
     let data_iter = writer.checkpoint_data(engine)?;
     let iter_state = data_iter.state();
     let output_schema = writer.output_schema.clone();

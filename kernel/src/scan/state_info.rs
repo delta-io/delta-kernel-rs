@@ -14,7 +14,7 @@ use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, Struc
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
-use crate::{KernelError, PredicateRef, Result, StructField};
+use crate::{KernelError, KernelResult, PredicateRef, StructField};
 
 /// Resolved physical statistics schemas for a scan.
 ///
@@ -35,7 +35,7 @@ pub(crate) struct ResolvedPhysicalStatsSchemas {
 
 impl ResolvedPhysicalStatsSchemas {
     /// Resolves the stats schemas and validates that every output field is read.
-    fn try_new(read: Option<SchemaRef>, output: Option<SchemaRef>) -> Result<Option<Self>> {
+    fn try_new(read: Option<SchemaRef>, output: Option<SchemaRef>) -> KernelResult<Option<Self>> {
         match (read, output) {
             (None, None) => Ok(None),
             (Some(read), output) => {
@@ -50,7 +50,7 @@ impl ResolvedPhysicalStatsSchemas {
     }
 
     /// Validates that every output field is present and compatible in the read schema.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> KernelResult<()> {
         if let Some(output) = &self.output {
             validate_stats_output_schema(&self.read, output, "")?;
         }
@@ -62,7 +62,7 @@ fn validate_stats_output_schema(
     read: &StructType,
     output: &StructType,
     parent: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     for output_field in output.fields() {
         let path = if parent.is_empty() {
             output_field.name().to_string()
@@ -166,7 +166,7 @@ struct MetadataInfo<'a> {
 fn validate_metadata_columns<'a>(
     logical_schema: &'a SchemaRef,
     table_configuration: &'a TableConfiguration,
-) -> Result<MetadataInfo<'a>> {
+) -> KernelResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
     let partition_columns = table_configuration.logical_partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
@@ -233,7 +233,7 @@ fn build_data_skipping_schemas(
     predicate_column_names_logical: &[ColumnName],
     requested_physical_stats_columns: Option<&[ColumnName]>,
     table_configuration: &TableConfiguration,
-) -> Result<(Option<SchemaRef>, Option<SchemaRef>)> {
+) -> KernelResult<(Option<SchemaRef>, Option<SchemaRef>)> {
     // Narrow the table's typed partition schema to the columns the predicate references. The
     // DataSkippingFilter only needs partition columns that appear in the predicate, and the
     // shared helper forces every field nullable (MapToStruct can yield null for a missing key).
@@ -260,7 +260,7 @@ fn build_data_skipping_schemas(
     // `nullCount` whenever it emits min/max; this check relies on that implementation property.
     let build_stats_schema = |required: Option<&[ColumnName]>,
                               requested: Option<&[ColumnName]>|
-     -> Result<Option<SchemaRef>> {
+     -> KernelResult<Option<SchemaRef>> {
         let stats_schema = table_configuration
             .stats_schema_builder()
             .with_required_physical_columns(required)
@@ -342,7 +342,7 @@ fn resolve_physical_columns_with_warnings(
 fn resolve_physical_columns_strict(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
-) -> Result<Vec<ColumnName>> {
+) -> KernelResult<Vec<ColumnName>> {
     let logical_schema = table_configuration.logical_schema();
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
@@ -386,7 +386,7 @@ impl StateInfo {
         stats: &StatsOptions,
         partition_values: &PartitionValuesOptions,
         classifier: C,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
@@ -684,6 +684,7 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
+    use crate::Result;
 
     #[test]
     fn stats_schemas_can_both_be_absent() {

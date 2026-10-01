@@ -18,8 +18,8 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 use crate::{
-    EngineData, FileDataReadResultIterator, FileMeta, FileSize, ParquetFooter, ParquetHandler,
-    PredicateRef, Result, ResultIteratorStatic,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult, ParquetFooter,
+    ParquetHandler, PredicateRef, Result, ResultIteratorStatic,
 };
 
 #[derive(Constructor)]
@@ -32,7 +32,7 @@ pub(super) fn try_create_from_parquet(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
-) -> Result<impl Iterator<Item = Result<ArrowEngineData>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
     let (requested_ordering, mask) = parquet_read_plan(&schema, &metadata)?;
 
@@ -124,7 +124,7 @@ impl ParquetHandler for SyncParquetHandler {
 pub(super) fn parquet_footer(
     store: Option<&Arc<DynObjectStore>>,
     file: &FileMeta,
-) -> Result<ParquetFooter> {
+) -> KernelResult<ParquetFooter> {
     let data = get_bytes(store, &file.location)?;
     let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
     let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);

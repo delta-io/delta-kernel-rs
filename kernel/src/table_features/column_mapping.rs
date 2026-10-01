@@ -19,7 +19,7 @@ use crate::schema::{
 };
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -47,7 +47,7 @@ pub(crate) const MAX_COLUMN_MAPPING_ID: i64 = i32::MAX as i64;
 /// that want to add context (e.g. the offending field name or table-property name) wrap with
 /// `.map_err(|e| KernelError::schema(format!("Field '{name}': {e}")))?` -- matching the kernel
 /// convention used by sibling validators in `schema/validation.rs`.
-pub(crate) fn validate_column_mapping_id(id: i64) -> Result<()> {
+pub(crate) fn validate_column_mapping_id(id: i64) -> KernelResult<()> {
     if (0..=MAX_COLUMN_MAPPING_ID).contains(&id) {
         return Ok(());
     }
@@ -198,7 +198,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     parent_field_logical_path: &[&'a str],
     seen_ids: Option<&mut HashMap<i64, &'a str>>,
     current_field_siblings: Option<&mut HashMap<&'a str, &'a str>>,
-) -> Result<(&'a str, Option<i64>)> {
+) -> KernelResult<(&'a str, Option<i64>)> {
     let logical_field_path = || {
         ColumnName::new(
             parent_field_logical_path
@@ -324,7 +324,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
 /// Returns `ColumnMappingMode::None` if the property is not set.
 pub(crate) fn get_column_mapping_mode_from_properties(
     properties: &HashMap<String, String>,
-) -> Result<ColumnMappingMode> {
+) -> KernelResult<ColumnMappingMode> {
     match properties.get(COLUMN_MAPPING_MODE) {
         Some(mode_str) => mode_str.parse::<ColumnMappingMode>().map_err(|_| {
             KernelError::generic(format!(
@@ -446,7 +446,7 @@ type NestedFieldIds = serde_json::Map<String, serde_json::Value>;
 /// quintillion) is over four billion times the protocol-permitted maximum and points at a bug
 /// in the connector's id allocator rather than legitimate id exhaustion. The error message
 /// reflects that diagnosis.
-fn next_column_mapping_id(max_id: &mut i64) -> Result<i64> {
+fn next_column_mapping_id(max_id: &mut i64) -> KernelResult<i64> {
     let next = max_id.checked_add(1).ok_or_else(|| {
         KernelError::generic(format!(
             "Cannot allocate column mapping id: `max_id + 1` overflows `i64` \
@@ -491,7 +491,7 @@ fn next_column_mapping_id(max_id: &mut i64) -> Result<i64> {
 pub(crate) fn try_assign_flat_column_mapping_info(
     field: &StructField,
     max_id: &mut i64,
-) -> Result<StructField> {
+) -> KernelResult<StructField> {
     for key in [
         ColumnMetadataKey::ColumnMappingNestedIds,
         ColumnMetadataKey::ParquetFieldNestedIds,
@@ -557,7 +557,10 @@ pub(crate) fn try_assign_flat_column_mapping_info(
 }
 
 /// Process nested data types to assign flat column mapping metadata to any nested struct fields.
-fn flat_cm_info_for_nested_data_type(data_type: &DataType, max_id: &mut i64) -> Result<DataType> {
+fn flat_cm_info_for_nested_data_type(
+    data_type: &DataType,
+    max_id: &mut i64,
+) -> KernelResult<DataType> {
     match data_type {
         DataType::Struct(inner) => {
             let new_inner = assign_column_mapping_metadata(
@@ -604,13 +607,13 @@ fn flat_cm_info_for_nested_data_type(data_type: &DataType, max_id: &mut i64) -> 
 ///   "<phys>.value":       4
 /// }
 /// ```
-fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> Result<StructType> {
+fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<StructType> {
     fn walk(
         data_type: &DataType,
         max_id: &mut i64,
         path: &str,
         nested_ids: &mut NestedFieldIds,
-    ) -> Result<DataType> {
+    ) -> KernelResult<DataType> {
         match data_type {
             DataType::Struct(inner) => Ok(DataType::from(assign_nested_cm_ids(inner, max_id)?)),
             DataType::Array(array_type) => {
@@ -656,12 +659,12 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> Result<StructT
             }
             Ok(new_field)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     StructType::try_new(new_fields)
 }
 
 // Get the physical name for a field. Error if the field is missing the physical name annotation.
-fn expect_physical_name(field: &StructField) -> Result<String> {
+fn expect_physical_name(field: &StructField) -> KernelResult<String> {
     match field
         .metadata
         .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
@@ -881,7 +884,7 @@ pub(crate) fn physical_to_logical_column_name_and_type(
     logical_schema: &StructType,
     physical_col: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
-) -> Result<(ColumnName, DataType)> {
+) -> KernelResult<(ColumnName, DataType)> {
     let mut fields = vec![];
     logical_schema.visit_fields_of_path_by(
         physical_col,

@@ -31,7 +31,7 @@ use crate::unit_test_utils::{
     assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
     MockTableConfigurationBuilder,
 };
-use crate::{Engine, KernelError, Predicate, Result, Version};
+use crate::{Engine, KernelError, KernelResult, Predicate, Result, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -68,7 +68,7 @@ fn execute_row_tracking(
     engine: Arc<dyn Engine>,
     mock_table: &LocalMockTable,
     end_schema: SchemaRef,
-) -> Result<Vec<TableChangesScanMetadata>> {
+) -> KernelResult<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = row_tracking_table_config(table_root_url, get_schema());
@@ -109,7 +109,7 @@ fn execute_table_changes(
     mock_table: &LocalMockTable,
     start_version: Version,
     end_version: Option<Version>,
-) -> Result<Vec<TableChangesScanMetadata>> {
+) -> KernelResult<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(
         engine.as_ref(),
         mock_table.table_root(),
@@ -151,7 +151,7 @@ fn get_segment(
     path: &Path,
     start_version: Version,
     end_version: impl Into<Option<Version>>,
-) -> Result<Vec<ParsedLogPath>> {
+) -> KernelResult<Vec<ParsedLogPath>> {
     let table_root = url::Url::from_directory_path(path).unwrap();
     let log_root = table_root.join("_delta_log/")?;
     let log_segment = LogSegment::for_table_changes(
@@ -163,7 +163,7 @@ fn get_segment(
     Ok(log_segment.listed.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl Iterator<Item = Result<TableChangesScanMetadata>>) -> Vec<bool> {
+fn result_to_sv(iter: impl Iterator<Item = KernelResult<TableChangesScanMetadata>>) -> Vec<bool> {
     iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
@@ -590,7 +590,7 @@ async fn incompatible_schemas_fail() {
 
         let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_config = get_default_table_config(&table_root_url);
-        let res: Result<Vec<_>> =
+        let res: KernelResult<Vec<_>> =
             table_changes_action_iter(engine, &table_config, commits, cdf_schema, None)
                 .unwrap()
                 .try_collect();
@@ -661,7 +661,7 @@ async fn incompatible_schemas_fail() {
 async fn test_schema_evolution(
     initial_schema: SchemaRef,
     evolved_schema: SchemaRef,
-) -> Result<Vec<TableChangesScanMetadata>> {
+) -> KernelResult<Vec<TableChangesScanMetadata>> {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 

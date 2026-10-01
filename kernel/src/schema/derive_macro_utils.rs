@@ -10,7 +10,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{Scalar, StructData};
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -165,7 +165,7 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
-    pub(crate) fn try_new(data: StructData, expected: StructType) -> Result<Self> {
+    pub(crate) fn try_new(data: StructData, expected: StructType) -> KernelResult<Self> {
         let (actual_fields, values) = data.into_parts();
         require!(
             actual_fields.len() == values.len(),
@@ -202,7 +202,7 @@ impl StructDataFields {
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
-    ) -> Result<T> {
+    ) -> KernelResult<T> {
         let expected = self.expected.field(field_name).ok_or_else(|| {
             KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
@@ -237,7 +237,7 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
-    pub(crate) fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> KernelResult<()> {
         if self.fields.is_empty() {
             return Ok(());
         }

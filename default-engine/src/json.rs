@@ -21,7 +21,7 @@ use delta_kernel::object_store::{
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler,
-    KernelError, PredicateRef, Result, ResultIterator,
+    KernelError, KernelResult, PredicateRef, Result, ResultIterator,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -91,7 +91,7 @@ async fn read_json_files_impl(
     _predicate: Option<PredicateRef>,
     batch_size: usize,
     buffer_size: usize,
-) -> Result<BoxStream<'static, Result<Box<dyn EngineData>>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
@@ -134,7 +134,7 @@ async fn write_json_file_impl(
     path: Url,
     buffer: Vec<u8>,
     overwrite: bool,
-) -> Result<FileSize> {
+) -> KernelResult<FileSize> {
     let size = buffer.len() as FileSize;
     let put_mode = if overwrite {
         PutMode::Overwrite
@@ -215,7 +215,7 @@ async fn open_json_file(
     schema: ArrowSchemaRef,
     batch_size: usize,
     file_meta: FileMeta,
-) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
     let path = Path::from_url_path(file_meta.location.path())?;
     let result = store.get(&path).await?;
     let builder = ReaderBuilder::new(schema)

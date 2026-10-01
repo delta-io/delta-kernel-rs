@@ -17,7 +17,7 @@ use tracing::warn;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::FileActionKey;
-use crate::Result;
+use crate::KernelResult;
 
 /// Information we want to return to the add-dedup about file related actions
 pub(crate) struct FileActionInfo {
@@ -40,7 +40,7 @@ pub(crate) trait Deduplicator {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> Result<Option<FileActionInfo>>;
+    ) -> KernelResult<Option<FileActionInfo>>;
 
     /// Checks if this file has been seen. When `is_log_batch() = true`, updates the hashmap
     /// to track new files. Returns `true` if the file should be filtered out.
@@ -63,7 +63,7 @@ pub(crate) trait Deduplicator {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         dv_start_index: usize,
-    ) -> Result<Option<String>> {
+    ) -> KernelResult<Option<String>> {
         let Some(storage_type) =
             getters[dv_start_index].get_opt(i, "deletionVector.storageType")?
         else {
@@ -102,7 +102,7 @@ impl<'a> CheckpointDeduplicator<'a> {
         add_path_index: usize,
         add_size_index: usize,
         add_dv_start_index: usize,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Ok(CheckpointDeduplicator {
             seen_file_keys,
             add_path_index,
@@ -119,7 +119,7 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
         i: usize,
         getters: &[&'b dyn GetData<'b>],
         _skip_removes: bool,
-    ) -> Result<Option<FileActionInfo>> {
+    ) -> KernelResult<Option<FileActionInfo>> {
         let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? else {
             return Ok(None);
         };
