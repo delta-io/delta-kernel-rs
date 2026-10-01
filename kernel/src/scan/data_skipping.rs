@@ -263,7 +263,7 @@ impl DataSkippingFilter {
             .cloned()
             .collect();
         let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
-        let physical_stats_schema = table_configuration
+        let physical_stats_read_schema = table_configuration
             .build_expected_physical_stats_schema(None, Some(&predicate_refs))
             .ok()?;
         let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
@@ -273,7 +273,7 @@ impl DataSkippingFilter {
         // `add.path IS NOT NULL` (raw batches keep the nested layout).
         let stats_expr = Arc::new(Expr::parse_json(
             col!("add.stats"),
-            physical_stats_schema.clone(),
+            physical_stats_read_schema.clone(),
         ));
         let partition_expr = Arc::new(Expr::map_to_struct(
             col!("add.partitionValues"),
@@ -283,7 +283,7 @@ impl DataSkippingFilter {
         Self::new(
             engine,
             Some(physical_predicate),
-            Some(&physical_stats_schema),
+            Some(&physical_stats_read_schema),
             stats_expr,
             partition_schema.as_ref(),
             partition_expr,
@@ -306,7 +306,7 @@ impl DataSkippingFilter {
     /// `DataSkippingPredicateCreator`. Partition values are similarly wrapped under
     /// `partitionValues_parsed` when present.
     fn build_unified_schema_and_expr(
-        physical_stats_schema: Option<&SchemaRef>,
+        physical_stats_read_schema: Option<&SchemaRef>,
         stats_expr: ExpressionRef,
         physical_partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
@@ -336,7 +336,7 @@ impl DataSkippingFilter {
         // true for Add rows and false for Remove/non-file rows) so that predicates can guard
         // against filtering Remove rows: partition predicates and opaque-predicate rewrites are
         // wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
-        let unified_schema = match (physical_stats_schema, physical_partition_schema) {
+        let unified_schema = match (physical_stats_read_schema, physical_partition_schema) {
             (Some(stats), Some(ps)) => schema_ref! {
                 nullable "stats_parsed": (stats.as_ref().clone()),
                 nullable "partitionValues_parsed": (ps.as_ref().clone()),
@@ -354,7 +354,7 @@ impl DataSkippingFilter {
         };
 
         let unified_expr = match (
-            physical_stats_schema.is_some(),
+            physical_stats_read_schema.is_some(),
             physical_partition_schema.is_some(),
         ) {
             (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr, is_add_expr])),
@@ -538,8 +538,8 @@ struct DataSkippingColumns<'a> {
     physical_partition_columns: &'a HashSet<ColumnName>,
     /// Physical leaf paths whose stats are present in `stats_parsed` (honors
     /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
-    /// columns). Must match the column set used to build `physical_stats_schema`; otherwise the
-    /// rewritten predicate references columns absent from the unified schema.
+    /// columns). Must match the column set used to build `physical_stats_read_schema`; otherwise
+    /// the rewritten predicate references columns absent from the unified schema.
     physical_stats_columns: &'a HashSet<ColumnName>,
 }
 

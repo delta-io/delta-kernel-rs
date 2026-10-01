@@ -822,11 +822,11 @@ impl Scan {
 
     fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
         let skip_stats = self.skip_stats();
-        // `physical_stats_schema` is the typed shape this scan can consume, not evidence that the
+        // The read schema is the typed shape this scan can consume, not evidence that the
         // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
         // restores `add.stats` before opening the reader when the structured field is incompatible.
         let can_replace_json_with_structured_stats =
-            !self.stats.synthesize_json && self.state_info.physical_stats_schema.is_some();
+            !self.stats.synthesize_json && self.state_info.physical_stats_read_schema.is_some();
         let checkpoint_schema = if skip_stats || can_replace_json_with_structured_stats {
             CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
@@ -840,12 +840,16 @@ impl Scan {
         };
         // Discovery uses this schema to augment the checkpoint projection, so `none()` must
         // suppress it as well as the initial JSON stats field.
-        let physical_stats_schema = if skip_stats {
+        let physical_stats_read_schema = if skip_stats {
             None
         } else {
-            self.state_info.physical_stats_schema.as_deref()
+            self.state_info.physical_stats_read_schema.as_deref()
         };
-        (checkpoint_schema, meta_predicate, physical_stats_schema)
+        (
+            checkpoint_schema,
+            meta_predicate,
+            physical_stats_read_schema,
+        )
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
@@ -1066,14 +1070,14 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+        let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            physical_stats_schema,
+            physical_stats_read_schema,
             None,
             self.cancellation_token.as_ref(),
         )?;
@@ -1168,7 +1172,7 @@ impl Scan {
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_schema.is_some()
+        let needs_leaf_schema = self.state_info.physical_stats_read_schema.is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
@@ -1185,7 +1189,7 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+        let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
@@ -1196,7 +1200,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                physical_stats_schema,
+                physical_stats_read_schema,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
@@ -1226,7 +1230,7 @@ impl Scan {
         // Skipping needs either data-column stats or partition values to rewrite against; a
         // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
         // unpartitioned table has no partition schema.
-        if self.state_info.physical_stats_schema.is_none()
+        if self.state_info.physical_stats_read_schema.is_none()
             && self.state_info.physical_partition_schema.is_none()
         {
             return None;

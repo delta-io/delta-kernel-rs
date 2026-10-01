@@ -140,7 +140,7 @@ impl Scan {
     /// fields above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
-        let physical_stats = self.state_info.physical_stats_schema.as_ref();
+        let physical_stats = self.state_info.physical_stats_read_schema.as_ref();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
         let source_physical_stats =
             physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
@@ -219,7 +219,7 @@ impl Scan {
                 // Commits never carry source-native parsed columns, so normalize from the raw
                 // encodings.
                 patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_schema.as_ref())
+                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema.as_ref())
                     .with_parsed_add_partition_values(
                         self.state_info.physical_partition_schema.as_ref(),
                     )
@@ -240,10 +240,10 @@ impl Scan {
     }
 
     fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_schema = self.state_info.physical_stats_schema.as_ref();
+        let physical_stats_read_schema = self.state_info.physical_stats_read_schema.as_ref();
         let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
         let patch = SchemaStructPatchBuilder::new()
-            .fold_with(physical_stats_schema, |patch, schema| {
+            .fold_with(physical_stats_read_schema, |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
             })
             .fold_with(physical_partition_schema, |patch, schema| {
@@ -743,7 +743,7 @@ mod tests {
             .build()
             .unwrap()
             .state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .clone()
             .expect("stats schema")
     }

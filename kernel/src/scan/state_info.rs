@@ -29,11 +29,13 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
-    /// Physical stats schema for reading/parsing stats from checkpoint files.
-    /// Used to construct checkpoint read schema with stats_parsed.
-    pub(crate) physical_stats_schema: Option<SchemaRef>,
-    /// Physical stats schema exposed to the scan consumer. Predicate-only fields present in
-    /// `physical_stats_schema` are excluded.
+    /// Physical stats schema Kernel reads and parses for data skipping. It includes stats
+    /// requested by the consumer and any additional stats needed by the skipping predicate.
+    /// For example, when the consumer requests `name` stats and the predicate is `id > 400`, this
+    /// schema contains `id` and `name`, while `physical_stats_output_schema` contains only `name`.
+    pub(crate) physical_stats_read_schema: Option<SchemaRef>,
+    /// Physical stats schema exposed to the scan consumer. Predicate-only fields present in the
+    /// read schema are excluded.
     pub(crate) physical_stats_output_schema: Option<SchemaRef>,
     /// Physical partition schema with native types for `partitionValues_parsed`. Fields use
     /// physical column names (for column mapping) and are always nullable. Present when the
@@ -486,7 +488,7 @@ impl StateInfo {
                 None
             };
 
-        let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
+        let (physical_stats_read_schema, predicate_partition_schema) = build_data_skipping_schemas(
             &stats.struct_stats,
             &physical_predicate,
             &predicate_column_names,
@@ -524,7 +526,7 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
-            physical_stats_schema,
+            physical_stats_read_schema,
             physical_stats_output_schema: None,
             physical_partition_schema,
             eligible_physical_stats_columns,
@@ -544,7 +546,7 @@ impl StateInfo {
     /// hashbrown doubling events for medium/large tables while staying cheap
     /// for small ones.
     pub(crate) fn dedup_capacity_hint(&self) -> usize {
-        if self.physical_stats_schema.is_some() {
+        if self.physical_stats_read_schema.is_some() {
             4096
         } else {
             512
@@ -1215,10 +1217,10 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // physical_stats_schema should be set (from expected_stats_schema)
+        // The stats read schema should be set from expected_stats_schema.
         assert!(
-            state_info.physical_stats_schema.is_some(),
-            "physical_stats_schema should be Some when AllColumns is set"
+            state_info.physical_stats_read_schema.is_some(),
+            "physical_stats_read_schema should be Some when AllColumns is set"
         );
         // physical_predicate should still be active for data skipping
         assert!(
@@ -1256,7 +1258,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .expect("should have physical stats schema");
 
         let min_values = stats_schema
@@ -1304,7 +1306,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .expect("should have physical stats schema");
 
         // Check that minValues/maxValues only contain 'value', not 'id'
@@ -1462,7 +1464,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .expect("should have physical stats schema");
 
         assert_stats_leaves(
@@ -1572,9 +1574,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(
-            state_info.physical_stats_schema.is_none(),
+            state_info.physical_stats_read_schema.is_none(),
             "Predicate on a past-cap column should produce no stats schema, got {:?}",
-            state_info.physical_stats_schema
+            state_info.physical_stats_read_schema
         );
         assert!(
             matches!(state_info.physical_predicate, PhysicalPredicate::Some(_, _)),
@@ -1601,7 +1603,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .as_ref()
             .expect("should have stats schema (indexed arm survives)");
         // c0 (indexed) survives; c4 (past cap) is dropped.
@@ -1631,7 +1633,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        assert!(state_info.physical_stats_schema.is_none());
+        assert!(state_info.physical_stats_read_schema.is_none());
         assert!(!state_info.eligible_physical_stats_columns.is_empty());
         assert!(!state_info
             .eligible_physical_stats_columns
@@ -1690,7 +1692,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .as_ref()
             .expect("indexed arm survives");
         for stats_field in [MIN_VALUES, MAX_VALUES] {
@@ -1826,7 +1828,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .as_ref()
             .expect("stats schema present");
         assert_stats_leaves(stats_schema, present, absent);
@@ -1848,7 +1850,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .as_ref()
             .expect("stats schema present because c4 is extra_indexed");
         assert_stats_leaves(stats_schema, &["c4"], &[]);
@@ -1878,7 +1880,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .as_ref()
             .expect("stats schema present");
         for stats_field in [MIN_VALUES, MAX_VALUES] {
@@ -1960,7 +1962,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema
             .as_ref()
             .expect("stats schema present");
         assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);

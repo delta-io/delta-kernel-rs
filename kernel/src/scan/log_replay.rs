@@ -73,8 +73,9 @@ struct InternalScanState {
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
-    /// Physical stats schema for reading/parsing stats from checkpoint files
-    physical_stats_schema: Option<SchemaRef>,
+    /// Physical stats schema Kernel reads and parses. It contains consumer-requested stats and
+    /// any additional stats needed by the skipping predicate.
+    physical_stats_read_schema: Option<SchemaRef>,
     /// Physical stats schema returned to the scan consumer.
     #[serde(default)]
     physical_stats_output_schema: Option<SchemaRef>,
@@ -85,7 +86,7 @@ struct InternalScanState {
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
     /// Physical leaf paths eligible for data skipping. Carried alongside
-    /// `physical_stats_schema` so the distributed `DataSkippingFilter` rebuilds the same
+    /// `physical_stats_read_schema` so the distributed `DataSkippingFilter` rebuilds the same
     /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
     /// an empty set drops every data-column reference, which means no skipping but is
     /// still correct.
@@ -272,7 +273,7 @@ impl ScanLogReplayProcessor {
         let stats_schema_for_transform = if skip_stats {
             None
         } else {
-            state_info.physical_stats_schema.clone()
+            state_info.physical_stats_read_schema.clone()
         };
 
         // The partition schema feeds two consumers: the DataSkippingFilter (predicate
@@ -395,7 +396,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
-            physical_stats_schema,
+            physical_stats_read_schema,
             physical_stats_output_schema,
             physical_partition_schema,
             eligible_physical_stats_columns,
@@ -417,7 +418,7 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             column_mapping_mode,
-            physical_stats_schema,
+            physical_stats_read_schema,
             physical_stats_output_schema,
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
@@ -481,7 +482,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
-            physical_stats_schema: internal_state.physical_stats_schema,
+            physical_stats_read_schema: internal_state.physical_stats_read_schema,
             physical_stats_output_schema: internal_state.physical_stats_output_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
             eligible_physical_stats_columns: internal_state.eligible_physical_stats_columns,
@@ -892,8 +893,8 @@ fn build_stats_output_projection(
 /// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
-/// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
-///   names), or None if stats should not be included in output.
+/// - `physical_stats_read_schema`: Schema for parsing stats from JSON for data skipping and
+///   structured output, or None if structured stats are not needed.
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
 ///   `synthesize_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))`
 ///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
@@ -909,11 +910,11 @@ fn build_stats_output_projection(
 ///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
 ///   the `partitionValues` string map.
 ///
-/// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
+/// The transform includes `stats_parsed` only when `physical_stats_read_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
 /// Stats are output using physical column names.
 fn get_add_transform_expr(
-    physical_stats_schema: Option<SchemaRef>,
+    physical_stats_read_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
     synthesize_json: bool,
@@ -950,8 +951,8 @@ fn get_add_transform_expr(
         ])),
     ];
 
-    // Add stats_parsed when stats output is requested (using physical column names)
-    if let Some(stats_schema) = physical_stats_schema {
+    // Add stats_parsed when needed for data skipping or connector output.
+    if let Some(stats_schema) = physical_stats_read_schema {
         let stats_parsed_expr = if has_stats_parsed {
             // Checkpoint has stats_parsed column - read directly
             col!("add.stats_parsed")
@@ -1448,7 +1449,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
+            physical_stats_read_schema: None,
             physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
@@ -1834,7 +1835,7 @@ mod tests {
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
                 column_mapping_mode: mode,
-                physical_stats_schema: None,
+                physical_stats_read_schema: None,
                 physical_stats_output_schema: None,
                 physical_partition_schema: None,
                 eligible_physical_stats_columns: HashSet::new(),
@@ -1872,7 +1873,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
+            physical_stats_read_schema: None,
             physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
@@ -1906,7 +1907,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
+            physical_stats_read_schema: None,
             physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
@@ -1940,7 +1941,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
+            physical_stats_read_schema: None,
             physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
@@ -1990,7 +1991,7 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
+            physical_stats_read_schema: None,
             physical_stats_output_schema: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
@@ -2024,7 +2025,7 @@ mod tests {
             predicate_schema: None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_schema: None,
+            physical_stats_read_schema: None,
             physical_stats_output_schema: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
