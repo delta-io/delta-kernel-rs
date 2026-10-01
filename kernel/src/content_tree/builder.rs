@@ -2,8 +2,9 @@
 //!
 //! Translates Delta file write-metadata into content-tree entry [`EngineData`] -- the columnar
 //! form of an AMT root manifest. This is the minimal blind-append path: it produces `Data`
-//! entries only, with deletion vectors, tags, and leaf-manifest information left null, and
-//! statistics and partition values omitted from the schema.
+//! entries only, leaving content statistics, partition values, deletion vectors, tags, and
+//! leaf-manifest information null in the output. The narrowed input it reads carries only
+//! `stats.numRecords` and no partition values.
 
 use std::sync::{Arc, LazyLock};
 
@@ -85,7 +86,7 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// Each input row is a newly added file, producing an [`TrackingStatus::Added`] `Data` entry
 /// (`fileFormat` parquet, `formatVersion` 4, `specId` 0 -- unpartitioned tables only). Both
 /// `sequenceNumber` and `fileSequenceNumber` take the input `defaultRowCommitVersion`; remaining
-/// entry fields are null, and statistics and partition values are omitted from the output schema.
+/// entry fields (including content statistics and partition values) are left null in the output.
 ///
 /// This path is only valid for AMT tables, which always have row tracking enabled, so every input
 /// row carries an assigned `baseRowId` and `defaultRowCommitVersion`.
@@ -507,8 +508,7 @@ mod tests {
     fn convert_append_metadata_to_entry_batch_empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
         let input = write_metadata_input(&engine, &[]);
-        let out =
-            convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0, &[]).unwrap();
+        let out = convert_append_metadata_to_entry_batch(&engine, input.as_ref(), 0, &[]).unwrap();
         assert_eq!(out.len(), 0);
     }
 }

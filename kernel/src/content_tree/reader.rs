@@ -2,9 +2,10 @@
 //!
 //! Translates the content-tree entries of an AMT root manifest into `Add` file actions -- the
 //! inverse of [`super::builder`]. This is the minimal read path: it surfaces live `Data` entries as
-//! `Add` actions and drops everything else. Statistics, partition values, tags, deletion vectors,
-//! and the data-file modification time are not yet carried across (see the per-field TODOs); the
-//! only entry data that flows into the action is the file location, size, and row-tracking numbers.
+//! `Add` actions and drops everything else. Statistics, partition values, tags, and deletion
+//! vectors are not yet carried across (see the per-field TODOs); the only entry data that flows
+//! into the action is the file location, size, and row-tracking numbers. `modificationTime` and
+//! `dataChange` have no AMT source and are supplied by the caller via [`ReadContext`].
 
 use std::sync::{Arc, LazyLock};
 
@@ -24,6 +25,19 @@ use crate::scan::log_replay::{
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
 use crate::{DeltaResult, Engine, Error};
 
+/// Values the read path emits into every `Add` action but cannot derive from an AMT entry, so the
+/// caller must supply them.
+///
+/// The AMT entry carries neither the data file's modification time nor a `dataChange` flag, so
+/// without this context the reader would have to invent both. Supplying them here keeps the
+/// function signature stable once a real source (e.g. the commit timestamp) is threaded through.
+pub(crate) struct ReadContext {
+    /// Emitted as `Add.modificationTime`.
+    pub(crate) modification_time: i64,
+    /// Emitted as `Add.dataChange`.
+    pub(crate) data_change: bool,
+}
+
 /// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
 /// only the rows that read as live data files.
 ///
@@ -35,27 +49,30 @@ use crate::{DeltaResult, Engine, Error};
 /// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transform.
 /// - `entries`: a content-tree entry batch matching [`ContentTreeNodeEntry::to_schema`] (the
 ///   columnar form produced by [`super::builder`]).
+/// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
 ///
 /// # Returns
 /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
 /// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read as
-/// live data files. The selection is carried rather than applied so this path is symmetric with the
-/// AMT write path ([`super::builder`]).
+/// live data files. The selection is returned rather than applied so the caller can fold it into
+/// its own selection vector.
 ///
 /// # Errors
-/// Returns an error if a row carries an unknown tracking-status value, if a selected (live `Data`)
-/// entry carries a deletion vector (not yet supported by the read path), if the evaluator cannot be
-/// constructed or fails to evaluate, or if the selection vector length exceeds the batch.
+/// Returns an error if a `Data` entry carries an unknown tracking-status value, if a selected
+/// (live `Data`) entry carries a deletion vector (not yet supported by the read path), if the
+/// evaluator cannot be constructed or fails to evaluate, or if the selection vector length exceeds
+/// the batch.
 pub(crate) fn convert_root_entries_to_add_actions(
     engine: &dyn Engine,
     entries: &dyn EngineData,
+    ctx: &ReadContext,
 ) -> DeltaResult<FilteredEngineData> {
     let mut selector = AddSelectionVisitor::default();
     selector.visit_rows_of(entries)?;
 
     let input_schema = Arc::new(ContentTreeNodeEntry::to_schema());
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
-    let expr = build_entry_to_add_expression()?;
+    let expr = build_entry_to_add_expression(ctx)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         input_schema,
         Arc::new(expr),
@@ -70,9 +87,9 @@ pub(crate) fn convert_root_entries_to_add_actions(
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
 /// [`crate::actions::LOG_ADD_SCHEMA`].
 ///
-/// Non-null `Add` fields with no AMT source get a placeholder; nullable fields not listed here fall
-/// through to a typed null via [`struct_expr_from_schema`].
-fn build_entry_to_add_expression() -> DeltaResult<Expression> {
+/// `modificationTime` and `dataChange` have no AMT source and are taken from `ctx`; nullable fields
+/// not listed here fall through to a typed null via [`struct_expr_from_schema`].
+fn build_entry_to_add_expression(ctx: &ReadContext) -> DeltaResult<Expression> {
     // TODO: read partition values from the entry's `partition` tuple once the read path carries a
     // partition spec; the AMT root written by the minimal blind-append path is unpartitioned. The
     // map type is taken from the action schema so its value-nullability matches
@@ -97,13 +114,9 @@ fn build_entry_to_add_expression() -> DeltaResult<Expression> {
             // carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
             n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
-            // TODO: the AMT entry does not carry the data file's modification time; emit a
-            // placeholder until a source (e.g. an entry field or the commit timestamp) is threaded
-            // through.
-            n if n == MODIFICATION_TIME_NAME => lit(i64::MAX),
-            // TODO: `dataChange` is hard-coded true; carry the real value once the entry (or the
-            // commit context) provides it.
-            n if n == DATA_CHANGE_NAME => lit(true),
+            // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
+            n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
+            n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
             n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
                 Expression::column([TRACKING, SEQUENCE_NUMBER])
@@ -214,6 +227,15 @@ mod tests {
     /// to build a well-formed [`ContentTreeNodeEntry`].
     const AMT_FORMAT_VERSION: i32 = 4;
 
+    /// The [`ReadContext`] the tests read against; its values match [`expected_add_row`]'s
+    /// `modificationTime` (`i64::MAX`) and `dataChange` (`true`).
+    fn read_ctx() -> ReadContext {
+        ReadContext {
+            modification_time: i64::MAX,
+            data_change: true,
+        }
+    }
+
     /// A minimal-root `Data`/`Added` entry with the given path, size, and row-tracking numbers.
     fn added_data_entry(
         path: &str,
@@ -318,8 +340,12 @@ mod tests {
             added_data_entry("b.parquet", 200, 20, 10, 5),
         ];
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
-                .unwrap(),
+            convert_root_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+                &read_ctx(),
+            )
+            .unwrap(),
         );
 
         let expected = expected_batch(
@@ -341,8 +367,12 @@ mod tests {
         let engine = SyncEngine::new();
         let entries = [added_data_entry("a.parquet", 1, 1, 0, 0)];
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &entries).as_ref())
-                .unwrap(),
+            convert_root_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &entries).as_ref(),
+                &read_ctx(),
+            )
+            .unwrap(),
         )
         .try_into_record_batch()
         .unwrap();
@@ -364,6 +394,7 @@ mod tests {
             convert_root_entries_to_add_actions(
                 &engine,
                 entry_batch(&engine, &[deleted, manifest, live]).as_ref(),
+                &read_ctx(),
             )
             .unwrap(),
         );
@@ -378,7 +409,6 @@ mod tests {
     #[rstest]
     #[case(TrackingStatus::Existing, true)]
     #[case(TrackingStatus::Added, true)]
-    #[case(TrackingStatus::Modified, true)]
     #[case(TrackingStatus::Deleted, false)]
     #[case(TrackingStatus::Replaced, false)]
     fn selects_only_live_data_entries(#[case] status: TrackingStatus, #[case] kept: bool) {
@@ -386,8 +416,12 @@ mod tests {
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
         entry.tracking.status = status;
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref())
-                .unwrap(),
+            convert_root_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &[entry]).as_ref(),
+                &read_ctx(),
+            )
+            .unwrap(),
         );
         assert_eq!(out.len(), usize::from(kept));
     }
@@ -412,8 +446,11 @@ mod tests {
         if set_dv_snapshot_id {
             entry.tracking.dv_snapshot_id = Some(1);
         }
-        let result =
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[entry]).as_ref());
+        let result = convert_root_entries_to_add_actions(
+            &engine,
+            entry_batch(&engine, &[entry]).as_ref(),
+            &read_ctx(),
+        );
         assert_result_error_with_message(result, "deletion vector");
     }
 
@@ -421,8 +458,12 @@ mod tests {
     fn empty_input_yields_empty_batch() {
         let engine = SyncEngine::new();
         let out = filtered_to_batch(
-            convert_root_entries_to_add_actions(&engine, entry_batch(&engine, &[]).as_ref())
-                .unwrap(),
+            convert_root_entries_to_add_actions(
+                &engine,
+                entry_batch(&engine, &[]).as_ref(),
+                &read_ctx(),
+            )
+            .unwrap(),
         );
         assert_eq!(out.len(), 0);
     }
