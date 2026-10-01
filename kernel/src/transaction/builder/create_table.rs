@@ -424,8 +424,7 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
 /// like any other unlisted `delta.*` property.
 #[cfg(feature = "check-constraints-in-dev")]
 fn is_check_constraint_property(key: &str) -> bool {
-    key.strip_prefix(crate::table_properties::CHECK_CONSTRAINT_PREFIX)
-        .is_some_and(|name| !name.is_empty())
+    crate::table_properties::strip_check_constraint_prefix(key).is_some()
 }
 
 #[cfg(not(feature = "check-constraints-in-dev"))]
@@ -1162,6 +1161,7 @@ mod tests {
     #[cfg(feature = "check-constraints-in-dev")]
     #[rstest]
     #[case::named("delta.constraints.positive", true)]
+    #[case::uppercase_prefix("DELTA.CONSTRAINTS.positive", true)]
     #[case::bare_prefix_without_name("delta.constraints.", false)]
     #[case::unrelated_property("delta.appendOnly", false)]
     fn is_check_constraint_property_requires_nonempty_name(
