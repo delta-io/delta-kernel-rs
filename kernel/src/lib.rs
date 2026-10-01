@@ -85,6 +85,8 @@ use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod amt_path_util;
 pub mod cancellation;
 pub mod checkpoint;
 pub mod commit_range;

@@ -15,7 +15,7 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::resolve_amt_location;
+use crate::amt_path_util::resolve_amt_location;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
