@@ -55,7 +55,7 @@ pub struct CheckConstraint {
 
 impl PartialEq for CheckConstraint {
     fn eq(&self, other: &Self) -> bool {
-        self.name.eq_ignore_ascii_case(&other.name) && self.raw_sql == other.raw_sql
+        self.name.to_lowercase() == other.name.to_lowercase() && self.raw_sql == other.raw_sql
     }
 }
 
@@ -171,5 +171,11 @@ mod tests {
         let other_sql =
             CheckConstraints::from_parsed(&parsed(&[("positive", "amount > 1")]), &schema);
         assert_ne!(lower[0], other_sql[0]);
+
+        let non_ascii_lower =
+            CheckConstraints::from_parsed(&parsed(&[("\u{e4}", "amount > 0")]), &schema);
+        let non_ascii_upper =
+            CheckConstraints::from_parsed(&parsed(&[("\u{c4}", "amount > 0")]), &schema);
+        assert_eq!(non_ascii_lower[0], non_ascii_upper[0]);
     }
 }
