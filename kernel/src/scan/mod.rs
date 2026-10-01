@@ -47,7 +47,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, Result, ResultIteratorStatic, SnapshotRef, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, ResultIteratorStatic,
+    SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -578,7 +579,7 @@ impl PhysicalPredicate {
         predicate: &Predicate,
         logical_schema: &Schema,
         column_mapping_mode: ColumnMappingMode,
-    ) -> Result<PhysicalPredicate> {
+    ) -> KernelResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
@@ -786,7 +787,7 @@ impl ScanMetadata {
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
@@ -817,7 +818,7 @@ pub struct Scan {
 fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
-) -> Result<Option<StatsOutputSchemas>> {
+) -> KernelResult<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
         StructStats::AllIndexed { extra_indexed } => table_configuration
@@ -1132,9 +1133,9 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = Result<ActionsBatch>> + Send,
+            impl Iterator<Item = KernelResult<ActionsBatch>> + Send,
         >,
-    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>> + Send> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1212,7 +1213,9 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> Result<ActionsWithCheckpointInfo<impl Iterator<Item = Result<ActionsBatch>> + Send>> {
+    ) -> KernelResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
+    > {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
@@ -1438,7 +1441,7 @@ impl Scan {
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> Result<_> {
+            .map(move |scan_file| -> KernelResult<_> {
                 let scan_file = scan_file?;
                 let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
@@ -1482,7 +1485,7 @@ impl Scan {
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> Result<_> {
+                Ok(read_result_iter.map(move |read_result| -> KernelResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(

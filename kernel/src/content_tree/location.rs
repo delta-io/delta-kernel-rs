@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
@@ -15,7 +15,7 @@ use crate::{KernelError, Result};
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
-pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> Result<Url> {
+pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult<Url> {
     if has_scheme(path) {
         // A URI scheme means the path is absolute and used as-is.
         Url::parse(path).map_err(|e| {

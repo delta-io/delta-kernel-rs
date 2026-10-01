@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::{Result, ResultIterator};
+use delta_kernel::{KernelResult, Result, ResultIterator};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -234,7 +234,7 @@ fn get_uc_committer_impl(
     catalog: KernelStringSlice,
     schema: KernelStringSlice,
     table_name: KernelStringSlice,
-) -> Result<Handle<MutableCommitter>> {
+) -> KernelResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
     let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
     let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }?;

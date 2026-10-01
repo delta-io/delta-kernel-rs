@@ -36,7 +36,7 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, Result, RowVisitor, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Result, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -71,7 +71,7 @@ impl LogSegment {
         engine: &dyn Engine,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
-    ) -> Result<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
+    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
@@ -126,7 +126,11 @@ impl LogSegment {
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn build_crc_from_base(&self, engine: &dyn Engine, base_crc: &Crc) -> Result<Crc> {
+    pub(crate) fn build_crc_from_base(
+        &self,
+        engine: &dyn Engine,
+        base_crc: &Crc,
+    ) -> KernelResult<Crc> {
         let seed_histogram = base_crc
             .file_stats()
             .and_then(|s| s.file_size_histogram())
@@ -148,7 +152,10 @@ impl LogSegment {
     /// [`Complete`](DomainMetadataState::Complete) since a checkpoint is authoritative.
     /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
     /// caller sets the ICT on the returned CRC afterward.
-    pub(crate) fn build_crc_from_checkpoint(&self, engine: &dyn Engine) -> Result<Option<Crc>> {
+    pub(crate) fn build_crc_from_checkpoint(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
@@ -180,7 +187,10 @@ impl LogSegment {
     ///
     /// Returns `None` if protocol or metadata could not be recovered. File stats degrade to
     /// [`Indeterminate`](FileStatsState::Indeterminate) if the replay is not incremental-safe.
-    pub(crate) fn build_crc_from_version_zero(&self, engine: &dyn Engine) -> Result<Option<Crc>> {
+    pub(crate) fn build_crc_from_version_zero(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
             KernelError::internal_error(
@@ -212,7 +222,7 @@ impl LogSegment {
         engine: &dyn Engine,
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> Result<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         require!(
             base_version < self.end_version,
             KernelError::internal_error(format!(
@@ -252,7 +262,7 @@ impl LogSegment {
         engine: &dyn Engine,
         ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> Result<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         // Replay newest-first: ICT capture reads from the newest commit only.
         let locations: Vec<FileMeta> = ascending_commits
             .rev()
@@ -378,7 +388,7 @@ impl CrcReplayAccumulator {
         }
     }
 
-    fn on_add(&mut self, size: i64) -> Result<()> {
+    fn on_add(&mut self, size: i64) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -402,7 +412,7 @@ impl CrcReplayAccumulator {
 
     /// `size = None` means the remove row had a path but no size, which makes incremental
     /// tracking impossible.
-    fn on_remove(&mut self, path: &str, size: Option<i64>) -> Result<()> {
+    fn on_remove(&mut self, path: &str, size: Option<i64>) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -454,7 +464,11 @@ impl CrcReplayAccumulator {
     /// metadata leaves) from row `i` to the delta. Each visitor reads its source-specific columns
     /// (commit: `_file`/commitInfo/remove) and passes the trailing shared slice here so the shared
     /// leaves live in one place.
-    fn apply_shared_columns<'a>(&mut self, i: usize, shared: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn apply_shared_columns<'a>(
+        &mut self,
+        i: usize,
+        shared: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
         // `add.size` (required) marks an Add row.
         if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
             self.on_add(size)?;
@@ -541,7 +555,7 @@ fn check_visitor_getters(
     getters: &[&dyn GetData<'_>],
     n_fixed: usize,
     visitor_name: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
     let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
     require!(

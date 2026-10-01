@@ -35,7 +35,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
-use crate::{Engine, KernelError as DeltaError, Result, Version};
+use crate::{Engine, KernelError as DeltaError, KernelResult, Result, Version};
 
 pub(crate) mod search;
 
@@ -717,7 +717,7 @@ fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-) -> Result<Version> {
+) -> KernelResult<Version> {
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
     list_delta_log_from_storage(
         engine.storage_handler().as_ref(),
@@ -768,7 +768,7 @@ fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-) -> Result<Version> {
+) -> KernelResult<Version> {
     let mut last_complete_checkpoint: Option<Version> = None;
     // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
     // checkpoint completeness.

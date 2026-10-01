@@ -10,13 +10,13 @@ use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, Result, ResultIteratorStatic, RowVisitor};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
-    actions: ResultIteratorStatic<ActionsBatch>,
+    actions: KernelResultIteratorStatic<ActionsBatch>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
@@ -41,7 +41,7 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
         read_schema: SchemaRef,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
@@ -73,7 +73,7 @@ impl CheckpointManifestReader {
     /// Extract the sidecars from the manifest file if there were any.
     /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
-    pub(crate) fn extract_sidecars(self) -> Result<Vec<FileMeta>> {
+    pub(crate) fn extract_sidecars(self) -> KernelResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
             KernelError::generic(format!(
@@ -94,7 +94,7 @@ impl CheckpointManifestReader {
 }
 
 impl Iterator for CheckpointManifestReader {
-    type Item = Result<ActionsBatch>;
+    type Item = KernelResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let Some(result) = self.actions.next() else {
@@ -121,7 +121,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
-    use crate::SnapshotRef;
+    use crate::{Result, SnapshotRef};
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(

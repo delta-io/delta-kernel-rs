@@ -17,7 +17,7 @@ use crate::schema::{
     MapType, PrimitiveType, StructField, StructType,
 };
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
 ///
@@ -430,7 +430,7 @@ impl Scalar {
     }
 
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
-    pub(crate) fn timestamp_from_millis(millis: i64) -> Result<Self> {
+    pub(crate) fn timestamp_from_millis(millis: i64) -> KernelResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(KernelError::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
@@ -963,14 +963,14 @@ impl PrimitiveType {
         &self,
         raw: &str,
         f: impl FnOnce(T) -> Scalar,
-    ) -> Result<Scalar, KernelError> {
+    ) -> KernelResult<Scalar> {
         match raw.parse() {
             Ok(val) => Ok(f(val)),
             Err(..) => Err(self.parse_error(raw)),
         }
     }
 
-    fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, KernelError> {
+    fn parse_decimal(raw: &str, dtype: DecimalType) -> KernelResult<Scalar> {
         let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent

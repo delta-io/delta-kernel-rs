@@ -26,7 +26,7 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
 use delta_kernel::schema::DataType;
-use delta_kernel::{KernelError, Predicate, Result};
+use delta_kernel::{KernelError, KernelResult, Predicate, Result};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::engine_data::ArrowFFIData;
@@ -120,7 +120,7 @@ impl Eq for FfiOpaquePredicateOp {}
 ///
 /// `Expression::Struct` args (produced by the stats-mode rewrite) get a dedicated path because
 /// kernel's evaluator needs a `DataType::Struct` result type to name fields, which we don't have.
-fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> Result<RecordBatch> {
+fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> KernelResult<RecordBatch> {
     // Zero-arg ops (e.g. NOW(), RAND()): empty-schema batch with explicit row count so the
     // engine knows how many rows to emit.
     if args.is_empty() {
@@ -141,7 +141,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> Result<RecordBatch
             Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
             _ => evaluate_expression(arg, batch, None),
         })
-        .collect::<Result<_>>()?;
+        .collect::<KernelResult<_>>()?;
 
     let fields: Vec<Field> = arrays
         .iter()
@@ -204,11 +204,11 @@ fn rewrite_stat_arg(
 /// (`minValues.<col>`, `maxValues.<col>`, nullcount, rowcount); evaluating them against the stats
 /// batch resolves each to the actual per-file values. The results are packed into a `StructArray`
 /// with positional field names (`f0`, `f1`, ...) since the engine reads the struct by index.
-fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> Result<ArrayRef> {
+fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> KernelResult<ArrayRef> {
     let arrays: Vec<ArrayRef> = fields
         .iter()
         .map(|f| evaluate_expression(f, batch, None))
-        .collect::<Result<_>>()?;
+        .collect::<KernelResult<_>>()?;
     let arrow_fields: Fields = arrays
         .iter()
         .enumerate()
@@ -221,7 +221,7 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> Result<
 
 /// Import an engine-produced `ArrowFFIData` into an `ArrayRef`, consuming the Arrow C Data
 /// Interface handles.
-fn import_ffi_array(ffi: ArrowFFIData) -> Result<ArrayRef> {
+fn import_ffi_array(ffi: ArrowFFIData) -> KernelResult<ArrayRef> {
     // A released (empty) array means the engine reported success without populating the result
     // slot. This check is load-bearing: `from_ffi` asserts on the empty structs' null pointers,
     // and kernel must never panic -- so reject the unpopulated case with an error up front.
@@ -240,7 +240,7 @@ fn import_ffi_array(ffi: ArrowFFIData) -> Result<ArrayRef> {
     Ok(make_array(array_data))
 }
 
-fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> Result<BooleanArray> {
+fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> KernelResult<BooleanArray> {
     if arr.len() != expected_rows {
         return Err(KernelError::Generic(format!(
             "opaque predicate eval_pred returned {} rows, expected {expected_rows}",
@@ -264,7 +264,7 @@ fn call_eval_pred(
     args_batch: RecordBatch,
     mode: EvalMode,
     inverted: bool,
-) -> Result<BooleanArray> {
+) -> KernelResult<BooleanArray> {
     let num_rows = args_batch.num_rows();
     let args_ffi = ArrowFFIData::try_from_record_batch(args_batch)?;
 

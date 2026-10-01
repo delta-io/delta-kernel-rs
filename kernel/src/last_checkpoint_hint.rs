@@ -17,7 +17,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{FileMeta, KernelError, Result, StorageHandler, Version};
+use crate::{FileMeta, KernelError, KernelResult, Result, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -352,7 +352,7 @@ impl LastCheckpointHint {
         storage: &dyn StorageHandler,
         log_root: &Url,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Option<LastCheckpointHint>> {
+    ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         match storage
             .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?

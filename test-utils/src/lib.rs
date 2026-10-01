@@ -203,7 +203,8 @@ use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
-    LogPath, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIterator, Snapshot,
+    KernelResult, LogPath, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIterator,
+    Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -449,7 +450,10 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-pub(crate) fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> Result<Path> {
+pub(crate) fn resolve_table_path(
+    table_root: impl AsRef<str>,
+    relative: &Path,
+) -> KernelResult<Path> {
     let url = try_parse_uri(table_root)?;
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }

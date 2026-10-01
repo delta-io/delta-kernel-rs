@@ -21,7 +21,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri, PhantomType};
-use crate::{Engine, KernelError, Result, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
 #[doc(hidden)]
@@ -227,7 +227,7 @@ impl IncrementalReplay {
         self,
         crc_version: Version,
         target_version: Version,
-    ) -> Result<bool> {
+    ) -> KernelResult<bool> {
         let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
             KernelError::internal_error(format!(
                 "CRC version {crc_version} is ahead of target version {target_version}"
@@ -554,7 +554,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
         snapshot_hint: Box<SnapshotHint>,
-    ) -> Result<SnapshotRef> {
+    ) -> KernelResult<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
             incremental_replay.is_disabled(),
@@ -691,7 +691,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_snapshot_hint_paths(
         log_segment_files: &LogSegmentFiles,
         log_root: &url::Url,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let log_root = log_root.as_str();
         if let Some(path) = log_segment_files
             .iter_all_paths()
@@ -713,7 +713,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
     }
 
@@ -722,7 +722,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let is_catalog_managed = snapshot.table_configuration().is_catalog_managed();
 
         require!(

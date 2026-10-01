@@ -10,7 +10,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{Engine, KernelError, Result, SnapshotRef, Version};
+use crate::{Engine, KernelError, KernelResult, Result, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -57,7 +57,7 @@ impl LogCompactionWriter {
         _snapshot: SnapshotRef,
         _start_version: Version,
         _end_version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Err(KernelError::unsupported(
             "Log compaction is not currently supported",
         ))

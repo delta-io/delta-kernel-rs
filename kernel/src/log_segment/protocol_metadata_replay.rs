@@ -35,7 +35,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{Engine, EngineData, KernelError, Result, Version};
+use crate::{Engine, EngineData, KernelError, KernelResult, Result, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -48,7 +48,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> Result<(Metadata, Protocol, ProtocolMetadataSource)> {
+    ) -> KernelResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
             (None, Some(_), _) => Err(KernelError::MissingMetadata),
@@ -71,7 +71,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> Result<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
+    ) -> KernelResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
@@ -144,7 +144,7 @@ impl LogSegment {
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> Result<PmCandidate> {
+    fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
@@ -154,7 +154,7 @@ impl LogSegment {
 
     /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
-    fn build_pm_plan(&self) -> Result<Plan> {
+    fn build_pm_plan(&self) -> KernelResult<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -229,7 +229,7 @@ impl LogSegment {
     fn read_pm_batches_via_plan(
         &self,
         executor: &dyn PlanExecutor,
-    ) -> Result<impl Iterator<Item = Result<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
@@ -253,7 +253,7 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> Result<impl Iterator<Item = Result<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -308,8 +308,8 @@ struct VersionedBatch {
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
-    batches: impl Iterator<Item = Result<VersionedBatch>>,
-) -> Result<PmCandidate> {
+    batches: impl Iterator<Item = KernelResult<VersionedBatch>>,
+) -> KernelResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
     for batch in batches {
@@ -331,7 +331,7 @@ fn resolve_pm_batches(
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
-fn batch_version(data: &dyn EngineData) -> Result<Version> {
+fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
     #[derive(Default)]
     struct FilePathVisitor {
         file: Option<String>,
@@ -407,7 +407,7 @@ fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
-) -> Result<PmCandidate> {
+) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
     let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
@@ -423,7 +423,7 @@ fn pm_candidate(
 
 /// The Protocol and Metadata nested in `batch`'s `checkpoint` action, at the action's own
 /// `checkpointMetadata.version`.
-fn checkpoint_pm(batch: &ActionsBatch) -> Result<Option<(i64, Protocol, Metadata)>> {
+fn checkpoint_pm(batch: &ActionsBatch) -> KernelResult<Option<(i64, Protocol, Metadata)>> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
         if !batch.is_log_batch {
@@ -450,7 +450,9 @@ fn checkpoint_pm(batch: &ActionsBatch) -> Result<Option<(i64, Protocol, Metadata
 
 /// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
 #[cfg(feature = "declarative-plans")]
-fn pm_versions_from_plan_output(actions: &dyn EngineData) -> Result<(Option<i64>, Option<i64>)> {
+fn pm_versions_from_plan_output(
+    actions: &dyn EngineData,
+) -> KernelResult<(Option<i64>, Option<i64>)> {
     #[derive(Default)]
     struct PmVersionsVisitor {
         protocol: Option<i64>,

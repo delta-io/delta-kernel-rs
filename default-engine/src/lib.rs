@@ -19,7 +19,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, Engine, EngineData, EvaluationHandler, JsonHandler, KernelError,
-    ParquetHandler, Result, ResultIteratorStatic, StorageHandler,
+    KernelResult, KernelResultIteratorStatic, ParquetHandler, Result, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -53,8 +53,8 @@ pub mod storage;
 /// Delta Kernel's synchronous handler traits.
 pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = Result<BoxStream<'static, T>>> + Send + 'static,
-) -> Result<Box<dyn Iterator<Item = T> + Send>> {
+    stream_future: impl Future<Output = KernelResult<BoxStream<'static, T>>> + Send + 'static,
+) -> KernelResult<Box<dyn Iterator<Item = T> + Send>> {
     Ok(Box::new(BlockingStreamIterator {
         stream: Some(task_executor.block_on(stream_future)?),
         task_executor,
@@ -65,13 +65,15 @@ pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor
 /// token. When the token fires, the iterator yields a single `Err(KernelError::Cancelled)` and then
 /// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
 ///
-/// Restricted to `Result` streams so cancellation can be surfaced as an item. With a `None`
+/// Restricted to `KernelResult` streams so cancellation can be surfaced as an item. With a `None`
 /// token, behavior is identical to [`stream_future_to_iter`].
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = Result<BoxStream<'static, Result<U>>>> + Send + 'static,
+    stream_future: impl Future<Output = KernelResult<BoxStream<'static, KernelResult<U>>>>
+        + Send
+        + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> Result<ResultIteratorStatic<U>> {
+) -> KernelResult<KernelResultIteratorStatic<U>> {
     let Some(token) = cancellation_token else {
         return stream_future_to_iter(task_executor, stream_future);
     };
@@ -138,13 +140,13 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 /// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
 /// terminal `Err(KernelError::Cancelled)`.
 struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
-    stream: Option<BoxStream<'static, Result<U>>>,
+    stream: Option<BoxStream<'static, KernelResult<U>>>,
     task_executor: Arc<E>,
     token: CancellationTokenRef,
 }
 
 impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
-    type Item = Result<U>;
+    type Item = KernelResult<U>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut stream = self.stream.take()?;

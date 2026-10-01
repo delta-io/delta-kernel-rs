@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{EngineData, Result};
+use crate::{EngineData, KernelResult, Result};
 
 pub(crate) mod deduplicator;
 
@@ -138,7 +138,7 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> Result<Option<FileActionInfo>> {
+    ) -> KernelResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
             let size = match getters[self.add_size_index].get_long(i, "add.size")? {
