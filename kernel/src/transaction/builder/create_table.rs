@@ -46,7 +46,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, KernelError, StorageHandler};
+use crate::{Engine, KernelError, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -152,10 +152,10 @@ fn ensure_table_does_not_exist(
     storage: &dyn StorageHandler,
     delta_log_url: &Url,
     table_path: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     match storage.list_from(delta_log_url) {
         Ok(mut files) => {
-            // files.next() returns Option<DeltaResult<FileMeta>>
+            // files.next() returns Option<Result<FileMeta>>
             // - Some(Ok(_)) means a file exists -> table exists
             // - Some(Err(FileNotFound)) means path doesn't exist -> OK for new table
             // - Some(Err(other)) means real error -> propagate
@@ -214,7 +214,7 @@ fn validate_clustering_and_make_domain_metadata(
     logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
     writer_features: &mut Vec<TableFeature>,
-) -> DeltaResult<DomainMetadata> {
+) -> Result<DomainMetadata> {
     validate_clustering_columns(logical_schema, logical_columns)?;
 
     // Add required features
@@ -258,10 +258,7 @@ struct DataLayoutResult {
 /// 4. Of a supported primitive type (Struct, Array, and Map are rejected because the Delta protocol
 ///    does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
-fn validate_partition_columns(
-    schema: &StructType,
-    partition_columns: &[ColumnName],
-) -> DeltaResult<()> {
+fn validate_partition_columns(schema: &StructType, partition_columns: &[ColumnName]) -> Result<()> {
     if partition_columns.is_empty() {
         return Err(KernelError::generic(
             "Partitioning requires at least one column",
@@ -320,7 +317,7 @@ fn apply_data_layout(
     effective_schema: &SchemaRef,
     column_mapping_mode: ColumnMappingMode,
     validated: &mut ValidatedTableProperties,
-) -> DeltaResult<DataLayoutResult> {
+) -> Result<DataLayoutResult> {
     match data_layout {
         DataLayout::None => Ok(DataLayoutResult::default()),
 
@@ -466,9 +463,7 @@ fn maybe_set_materialized_row_tracking_column_name_properties(
 
 /// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
 /// feature to the protocol and sets the enablement property if not already present.
-fn maybe_enable_ict_for_catalog_managed(
-    validated: &mut ValidatedTableProperties,
-) -> DeltaResult<()> {
+fn maybe_enable_ict_for_catalog_managed(validated: &mut ValidatedTableProperties) -> Result<()> {
     let has_catalog_managed = validated
         .writer_features
         .contains(&TableFeature::CatalogManaged);
@@ -515,7 +510,7 @@ fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTablePropertie
 fn require_iceberg_compat_column_mapping(
     validated: &mut ValidatedTableProperties,
     feature_name: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     match validated
         .properties
         .get(COLUMN_MAPPING_MODE)
@@ -546,7 +541,7 @@ fn require_iceberg_compat_column_mapping(
 ///     `delta.enableDeletionVectors` is `true`.
 fn maybe_enable_iceberg_compat_v2_dependencies(
     validated: &mut ValidatedTableProperties,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let enabled = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2);
     if !enabled
         && !validated
@@ -593,7 +588,7 @@ fn maybe_enable_iceberg_compat_v2_dependencies(
 ///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV2` is `true`.
 fn maybe_enable_iceberg_compat_v3_dependencies(
     validated: &mut ValidatedTableProperties,
-) -> DeltaResult<()> {
+) -> Result<()> {
     if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3) {
         return Ok(());
     }
@@ -660,7 +655,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
 fn maybe_apply_column_mapping_for_table_create(
     schema: &SchemaRef,
     validated: &mut ValidatedTableProperties,
-) -> DeltaResult<(SchemaRef, ColumnMappingMode)> {
+) -> Result<(SchemaRef, ColumnMappingMode)> {
     let column_mapping_mode = get_column_mapping_mode_from_properties(&validated.properties)?;
 
     let effective_schema = match column_mapping_mode {
@@ -716,7 +711,7 @@ fn maybe_apply_column_mapping_for_table_create(
 /// called after validation.
 fn validate_extract_table_features_and_properties(
     properties: HashMap<String, String>,
-) -> DeltaResult<ValidatedTableProperties> {
+) -> Result<ValidatedTableProperties> {
     let mut reader_features = Vec::new();
     let mut writer_features = Vec::new();
 
@@ -842,7 +837,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::transaction::create_table::create_table;
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
-    /// # fn example() -> delta_kernel::DeltaResult<()> {
+    /// # fn example() -> delta_kernel::Result<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])?);
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_table_properties([
@@ -886,7 +881,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::transaction::data_layout::DataLayout;
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
-    /// # fn example() -> delta_kernel::DeltaResult<()> {
+    /// # fn example() -> delta_kernel::Result<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![
     /// #     StructField::nullable("id", DataType::INTEGER),
     /// #     StructField::nullable("date", DataType::STRING),
@@ -950,7 +945,7 @@ impl CreateTableTransactionBuilder {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> DeltaResult<CreateTableTransaction> {
+    ) -> Result<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 

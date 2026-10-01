@@ -35,7 +35,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{DeltaResult, Engine, EngineData, KernelError, Version};
+use crate::{Engine, EngineData, KernelError, Result, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -48,7 +48,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
+    ) -> Result<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
             (None, Some(_), _) => Err(KernelError::MissingMetadata),
@@ -71,7 +71,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
+    ) -> Result<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
@@ -144,7 +144,7 @@ impl LogSegment {
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> DeltaResult<PmCandidate> {
+    fn replay_for_pm(&self, engine: &dyn Engine) -> Result<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
@@ -154,7 +154,7 @@ impl LogSegment {
 
     /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
-    fn build_pm_plan(&self) -> DeltaResult<Plan> {
+    fn build_pm_plan(&self) -> Result<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -229,7 +229,7 @@ impl LogSegment {
     fn read_pm_batches_via_plan(
         &self,
         executor: &dyn PlanExecutor,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+    ) -> Result<impl Iterator<Item = Result<VersionedBatch>> + Send> {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
@@ -253,7 +253,7 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+    ) -> Result<impl Iterator<Item = Result<VersionedBatch>> + Send> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -308,8 +308,8 @@ struct VersionedBatch {
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
-    batches: impl Iterator<Item = DeltaResult<VersionedBatch>>,
-) -> DeltaResult<PmCandidate> {
+    batches: impl Iterator<Item = Result<VersionedBatch>>,
+) -> Result<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
     for batch in batches {
@@ -331,7 +331,7 @@ fn resolve_pm_batches(
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
-fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
+fn batch_version(data: &dyn EngineData) -> Result<Version> {
     #[derive(Default)]
     struct FilePathVisitor {
         file: Option<String>,
@@ -342,11 +342,7 @@ fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
                 LazyLock::new(|| (vec![column_name!("_file")], vec![DataType::STRING]).into());
             NAMES_AND_TYPES.as_ref()
         }
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
             if self.file.is_none() && row_count > 0 {
                 self.file = getters[0].get_opt(0, "_file")?;
             }
@@ -411,7 +407,7 @@ fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
-) -> DeltaResult<PmCandidate> {
+) -> Result<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
     let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
@@ -427,7 +423,7 @@ fn pm_candidate(
 
 /// The Protocol and Metadata nested in `batch`'s `checkpoint` action, at the action's own
 /// `checkpointMetadata.version`.
-fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Metadata)>> {
+fn checkpoint_pm(batch: &ActionsBatch) -> Result<Option<(i64, Protocol, Metadata)>> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
         if !batch.is_log_batch {
@@ -454,9 +450,7 @@ fn checkpoint_pm(batch: &ActionsBatch) -> DeltaResult<Option<(i64, Protocol, Met
 
 /// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
 #[cfg(feature = "declarative-plans")]
-fn pm_versions_from_plan_output(
-    actions: &dyn EngineData,
-) -> DeltaResult<(Option<i64>, Option<i64>)> {
+fn pm_versions_from_plan_output(actions: &dyn EngineData) -> Result<(Option<i64>, Option<i64>)> {
     #[derive(Default)]
     struct PmVersionsVisitor {
         protocol: Option<i64>,
@@ -476,11 +470,7 @@ fn pm_versions_from_plan_output(
             });
             NAMES_AND_TYPES.as_ref()
         }
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
             if row_count > 0 {
                 self.protocol = getters[0].get_opt(0, "protocol_version")?;
                 self.metadata = getters[1].get_opt(0, "metadata_version")?;
@@ -513,14 +503,14 @@ mod tests {
     use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
-    use crate::{DeltaResult, KernelError};
+    use crate::{KernelError, Result};
 
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
 
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
-        fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
+        fn execute_op(&self, _op: Operation) -> Result<PlanResult> {
             Err(KernelError::generic("plan executor deliberately failed"))
         }
     }

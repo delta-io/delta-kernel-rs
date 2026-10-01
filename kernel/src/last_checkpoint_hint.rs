@@ -17,7 +17,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, FileMeta, KernelError, StorageHandler, Version};
+use crate::{FileMeta, KernelError, Result, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -236,7 +236,7 @@ impl LastCheckpointHint {
         checksum: Option<String>,
         tags: Option<HashMap<String, String>>,
         v2_checkpoint: Option<LastCheckpointV2>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let checkpoint_schema = checkpoint_schema
             .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
             .transpose()?;
@@ -330,7 +330,7 @@ impl LastCheckpointHint {
 
     /// Returns the path of the `_last_checkpoint` file given the log root of a table.
     #[internal_api]
-    pub(crate) fn path(log_root: &Url) -> DeltaResult<Url> {
+    pub(crate) fn path(log_root: &Url) -> Result<Url> {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }
 
@@ -352,7 +352,7 @@ impl LastCheckpointHint {
         storage: &dyn StorageHandler,
         log_root: &Url,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> DeltaResult<Option<LastCheckpointHint>> {
+    ) -> Result<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         match storage
             .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
@@ -436,7 +436,7 @@ mod tests {
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
-    use crate::DeltaResultIteratorStatic;
+    use crate::ResultIteratorStatic;
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
@@ -772,7 +772,7 @@ mod tests {
     /// cover.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn checkpoint_action_cross_serializes_between_log_and_hint() -> DeltaResult<()> {
+    fn checkpoint_action_cross_serializes_between_log_and_hint() -> Result<()> {
         use crate::actions::ContentRoot;
         use crate::engine::sync::SyncEngine;
         use crate::engine::to_json_bytes;
@@ -1151,7 +1151,7 @@ mod tests {
         created_time: 1739313200623,
         config: &[("delta.checkpointPolicy", "v2")],
     })]
-    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> DeltaResult<()> {
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> Result<()> {
         use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {
@@ -1313,25 +1313,25 @@ mod tests {
     struct NoIoStorageHandler;
 
     impl StorageHandler for NoIoStorageHandler {
-        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
             panic!("list_from should not be called");
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called");
         }
-        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> Result<()> {
             panic!("put should not be called");
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
             panic!("copy_atomic should not be called");
         }
-        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        fn head(&self, _path: &Url) -> Result<FileMeta> {
             panic!("head should not be called");
         }
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> Result<()> {
             panic!("delete should not be called");
         }
     }

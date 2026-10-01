@@ -64,7 +64,7 @@ use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, Engine, KernelError, Version};
+use crate::{Engine, KernelError, Result, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
@@ -133,7 +133,7 @@ impl CommitRange {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitAction>> + Send> {
+    ) -> Result<impl Iterator<Item = Result<CommitAction>> + Send> {
         if actions.is_empty() {
             return Err(KernelError::generic(
                 "at least one DeltaAction must be requested",
@@ -206,7 +206,7 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> DeltaResult<CommitAction> {
+    fn try_advance(&mut self, log_path: ParsedLogPath) -> Result<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
             self.engine.as_ref(),
@@ -248,7 +248,7 @@ fn with_version_context(version: Version, err: KernelError) -> KernelError {
 }
 
 impl Iterator for CommitActionsIterator {
-    type Item = DeltaResult<CommitAction>;
+    type Item = Result<CommitAction>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
@@ -364,7 +364,7 @@ mod tests {
         let collected = range
             .commits(engine, Some(anchor_snapshot), &actions)
             .unwrap()
-            .collect::<DeltaResult<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()
             .unwrap();
 
         assert_eq!(collected.len(), 2, "yield one CommitAction per commit");
@@ -677,7 +677,7 @@ mod tests {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         for commit_res in range.commits(engine.clone(), start_snapshot, actions)? {
             let commit = commit_res?;
             for batch_res in commit.get_actions(engine.as_ref())? {
@@ -876,7 +876,7 @@ mod tests {
     fn collect_adds_and_removes(
         commit: &CommitAction,
         engine: &dyn Engine,
-    ) -> DeltaResult<(Vec<Add>, Vec<Remove>)> {
+    ) -> Result<(Vec<Add>, Vec<Remove>)> {
         let mut add_visitor = AddVisitor::default();
         let mut remove_visitor = RemoveVisitor::default();
         for batch_res in commit.get_actions(engine)? {

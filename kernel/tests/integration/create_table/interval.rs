@@ -5,14 +5,14 @@ use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{schema_ref, DataType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use test_utils::test_table_setup;
 
 #[rstest::rstest]
 fn test_create_table_rejects_interval_clustering(
     #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
     #[values(false, true)] nested: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let (schema, clustering_column) = if nested {
         (
@@ -80,7 +80,7 @@ mod supported {
         )
             -> SchemaRef,
         #[values("none", "name", "id")] cm_mode: &str,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let schema = make_schema(interval);
 

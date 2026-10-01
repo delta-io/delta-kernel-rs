@@ -15,7 +15,7 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
@@ -31,7 +31,7 @@ impl OpaqueExpressionOp for OpaqueTestOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expr],
-    ) -> DeltaResult<Scalar> {
+    ) -> Result<Scalar> {
         unimplemented!()
     }
 }
@@ -47,7 +47,7 @@ impl OpaquePredicateOp for OpaqueTestOp {
         _evaluator: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expr],
         _inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> Result<Option<bool>> {
         unimplemented!()
     }
 

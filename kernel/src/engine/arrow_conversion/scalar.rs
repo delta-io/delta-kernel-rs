@@ -22,7 +22,7 @@ use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use crate::expressions::Scalar;
 use crate::schema::DataType;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// Extracts a primitive kernel [`Scalar`] from the given row of an Arrow array.
 ///
@@ -38,7 +38,7 @@ use crate::{DeltaResult, KernelError};
 /// - The Arrow data type is not a supported primitive type (e.g., Struct, List, Map)
 /// - The Arrow data type is a `Timestamp` with a non-microsecond time unit
 /// - The decimal precision/scale is invalid
-pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResult<Scalar> {
+pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Scalar> {
     if row_idx >= array.len() {
         return Err(KernelError::generic(format!(
             "row index {row_idx} out of bounds for array of length {}",
@@ -131,7 +131,7 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
 /// `arrow_conversion` because this function has different requirements: we accept any
 /// timezone annotation (not just UTC) and reject types like UInt*, Utf8View, Date64
 /// that `TryFromArrow` supports but are not valid for direct scalar extraction.
-fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<DataType> {
+fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> Result<DataType> {
     match arrow_type {
         ArrowDataType::Int8 => Ok(DataType::BYTE),
         ArrowDataType::Int16 => Ok(DataType::SHORT),

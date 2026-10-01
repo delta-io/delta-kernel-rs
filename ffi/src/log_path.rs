@@ -1,6 +1,6 @@
 //! FFI interface for LogPath.
 
-use delta_kernel::{DeltaResult, FileMeta, LogPath};
+use delta_kernel::{FileMeta, LogPath, Result};
 use url::Url;
 
 use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice};
@@ -14,7 +14,7 @@ impl LogPathArray {
     /// # Safety
     /// The ptr must point to `len` valid FfiLogPath elements, and those elements
     /// must remain valid for the duration of this call
-    pub(crate) unsafe fn log_paths(&self) -> DeltaResult<Vec<LogPath>> {
+    pub(crate) unsafe fn log_paths(&self) -> Result<Vec<LogPath>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|ffi_path| unsafe { ffi_path.log_path() })
@@ -63,7 +63,7 @@ impl FfiLogPath {
     /// # Safety
     ///
     /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
-    unsafe fn log_path(&self) -> DeltaResult<LogPath> {
+    unsafe fn log_path(&self) -> Result<LogPath> {
         let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
         let url = Url::parse(location_str)?;
         let file_meta = FileMeta {

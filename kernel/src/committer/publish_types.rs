@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
-use crate::{DeltaResult, FileMeta, KernelError, Version};
+use crate::{FileMeta, KernelError, Result, Version};
 
 /// A catalog commit that has been ratified by the catalog but not yet published to the Delta log.
 ///
@@ -27,7 +27,7 @@ impl CatalogCommit {
     pub(crate) fn try_new(
         log_root: &Url,
         catalog_commit: &ParsedLogPath<FileMeta>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         require!(
             catalog_commit.file_type == LogPathFileType::StagedCommit,
             KernelError::Generic(format!(
@@ -98,7 +98,7 @@ impl PublishMetadata {
     pub fn try_new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         Self::validate_contiguous(&commits_to_publish)?;
         Self::validate_end_version(&commits_to_publish, publish_to_version)?;
         Ok(Self {
@@ -117,7 +117,7 @@ impl PublishMetadata {
         &self.commits_to_publish
     }
 
-    fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> DeltaResult<()> {
+    fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> Result<()> {
         commits_to_publish
             .windows(2)
             .all(|c| c[0].version() + 1 == c[1].version())
@@ -136,7 +136,7 @@ impl PublishMetadata {
     fn validate_end_version(
         commits_to_publish: &[CatalogCommit],
         publish_to_version: Version,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         match commits_to_publish.last().map(|c| c.version()) {
             Some(v) if v == publish_to_version => Ok(()),
             Some(v) => Err(KernelError::Generic(format!(

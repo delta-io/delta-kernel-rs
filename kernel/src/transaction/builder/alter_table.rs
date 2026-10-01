@@ -36,7 +36,7 @@ use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::PhantomType;
-use crate::{DeltaResult, Engine, KernelError};
+use crate::{Engine, KernelError, Result};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -186,7 +186,7 @@ impl AlterTableTransactionBuilder<Modifying> {
         self,
         _engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> DeltaResult<AlterTableTransaction> {
+    ) -> Result<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // kernel doesn't currently support altering tables with these features
         let unsupported_iceberg_compat =

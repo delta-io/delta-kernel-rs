@@ -23,7 +23,7 @@ use crate::schema::SchemaRef;
 pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::CollectInto;
-use crate::{DataType, DeltaResult, DynPartialEq, KernelError};
+use crate::{DataType, DynPartialEq, KernelError, Result};
 
 mod column_names;
 mod scalars;
@@ -228,7 +228,7 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
         &self,
         eval_expr: &ScalarExpressionEvaluator<'_>,
         exprs: &[Expression],
-    ) -> DeltaResult<Scalar>;
+    ) -> Result<Scalar>;
 }
 
 /// An opaque predicate operation (ie defined and implemented by the engine).
@@ -254,7 +254,7 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
         eval_pred: &DirectPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
-    ) -> DeltaResult<Option<bool>>;
+    ) -> Result<Option<bool>>;
 
     /// Evaluates this (possibly inverted) opaque predicate for data skipping on behalf of a
     /// [`DirectDataSkippingPredicateEvaluator`], e.g. for parquet row group skipping.
@@ -861,7 +861,7 @@ impl Expression {
     /// # Errors
     ///
     /// Returns an error if the supplied patch builder contains conflicting operations.
-    pub fn struct_patch<P>(patch: P) -> DeltaResult<Self>
+    pub fn struct_patch<P>(patch: P) -> Result<Self>
     where
         P: TryInto<ExpressionStructPatch>,
         KernelError: From<P::Error>,
@@ -1888,7 +1888,7 @@ mod tests {
         #[test]
         fn test_opaque_expression_serialize_fails() {
             use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
-            use crate::DeltaResult;
+            use crate::Result;
 
             #[derive(Debug, PartialEq)]
             struct TestOpaqueExprOp;
@@ -1901,7 +1901,7 @@ mod tests {
                     &self,
                     _eval_expr: &ScalarExpressionEvaluator<'_>,
                     _exprs: &[Expression],
-                ) -> DeltaResult<Scalar> {
+                ) -> Result<Scalar> {
                     Ok(Scalar::Integer(0))
                 }
             }
@@ -1918,7 +1918,7 @@ mod tests {
                 DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
                 IndirectDataSkippingPredicateEvaluator,
             };
-            use crate::DeltaResult;
+            use crate::Result;
 
             #[derive(Debug, PartialEq)]
             struct TestOpaquePredOp;
@@ -1933,7 +1933,7 @@ mod tests {
                     _eval_pred: &DirectPredicateEvaluator<'_>,
                     _exprs: &[Expression],
                     _inverted: bool,
-                ) -> DeltaResult<Option<bool>> {
+                ) -> Result<Option<bool>> {
                     Ok(Some(true))
                 }
                 fn eval_as_data_skipping_predicate(

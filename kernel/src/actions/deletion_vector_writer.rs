@@ -11,7 +11,7 @@ use roaring::RoaringTreemap;
 use crate::actions::deletion_vector::{
     create_dv_crc32, DeletionVectorDescriptor, DeletionVectorPath, DeletionVectorStorageType,
 };
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// A trait that allows engines to provide deletion vectors in various formats.
 ///
@@ -55,7 +55,7 @@ pub trait DeletionVector: Sized {
     /// it may be overridden for more efficient serialization if the implementation already has the
     /// data in a suitable format. But generally, only do this if you fully understand the the
     /// format requirements.
-    fn serialize(self) -> DeltaResult<Bytes> {
+    fn serialize(self) -> Result<Bytes> {
         let treemap: RoaringTreemap = self.into_iter().collect();
         let mut serialized = Vec::new();
         treemap.serialize_into(&mut serialized).map_err(|e| {
@@ -160,7 +160,7 @@ impl DeletionVector for KernelDeletionVector {
     }
 
     /// Optimized serialization that directly serializes the internal RoaringTreemap.
-    fn serialize(self) -> DeltaResult<Bytes> {
+    fn serialize(self) -> Result<Bytes> {
         let mut serialized = Vec::new();
         self.dv.serialize_into(&mut serialized).map_err(|e| {
             KernelError::generic(format!("Failed to serialize deletion vector: {e}"))
@@ -263,7 +263,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     pub fn write_deletion_vector(
         &mut self,
         deletion_vector: impl DeletionVector,
-    ) -> DeltaResult<DeletionVectorWriteResult> {
+    ) -> Result<DeletionVectorWriteResult> {
         // Serialize first so a failure leaves the writer state and output untouched.
         let cardinality = deletion_vector.cardinality();
         let serialized = deletion_vector.serialize()?;
@@ -354,7 +354,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     /// writer.finalize()?;
     /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```
-    pub fn finalize(self) -> DeltaResult<()> {
+    pub fn finalize(self) -> Result<()> {
         // Note: Currently this method only flushes the writer, but is kept as an explicit API
         // for future-proofing. If we need to support formats that require footers (e.g., Puffin
         // files or new DV file formats), this provides a consistent place to add that logic

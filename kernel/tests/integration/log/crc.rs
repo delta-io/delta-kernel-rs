@@ -21,9 +21,9 @@ use delta_kernel::transaction::Transaction;
 #[cfg(feature = "internal-api")]
 use delta_kernel::LogPath;
 use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
-    FileDataReadResultIterator, FileMeta, FileSize, FileStats, JsonHandler, ParquetFooter,
-    ParquetHandler, PredicateRef, StorageHandler, Version,
+    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
+    FileStats, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Result,
+    ResultIteratorStatic, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -39,7 +39,7 @@ use url::Url;
 // ============================================================================
 
 #[tokio::test]
-async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
+async fn test_get_file_stats_from_crc() -> Result<()> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     let table_root = url::Url::from_directory_path(path).unwrap();
 
@@ -58,7 +58,7 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
+async fn test_get_file_stats_no_crc() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -81,7 +81,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -> DeltaResult<()> {
+async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -> Result<()> {
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -121,7 +121,7 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
 // ============================================================================
 
 #[tokio::test]
-async fn test_get_all_files_from_crc() -> DeltaResult<()> {
+async fn test_get_all_files_from_crc() -> Result<()> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     let table_root = url::Url::from_directory_path(path).unwrap();
 
@@ -141,7 +141,7 @@ async fn test_get_all_files_from_crc() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_get_all_files_no_crc() -> DeltaResult<()> {
+async fn test_get_all_files_no_crc() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -164,7 +164,7 @@ async fn test_get_all_files_no_crc() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> DeltaResult<()> {
+async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> Result<()> {
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -202,7 +202,7 @@ async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> DeltaRes
 
 #[cfg(feature = "internal-api")]
 #[test]
-fn test_get_all_files_preserved_via_snapshot_hint() -> DeltaResult<()> {
+fn test_get_all_files_preserved_via_snapshot_hint() -> Result<()> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     let table_root = url::Url::from_directory_path(path).unwrap();
 
@@ -220,7 +220,7 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> DeltaResult<()> {
         .chain(listed.checkpoint_parts.iter())
         .chain(listed.latest_crc_file.iter())
         .map(|path| LogPath::try_new(path.location.clone()))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let hint = SnapshotHint::try_new(
         snapshot.version(),
         log_paths,
@@ -266,7 +266,7 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
     #[case] checkpoint_version: Option<Version>,
     #[case] crc_version: Option<Version>,
     #[case] expected_num_files: Option<i64>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     // ===== GIVEN: v0 (0 files, crc on disk), then five WRITE inserts (one file each) to v5 =====
@@ -333,7 +333,7 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
 // An unreadable CRC at the snapshot version must not break loading: the snapshot falls back
 // to log replay for P&M and exposes no CRC.
 #[tokio::test]
-async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> DeltaResult<()> {
+async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -359,7 +359,7 @@ async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> DeltaResult<()>
 // ============================================================================
 
 #[tokio::test]
-async fn test_crc_returns_resolved_crc_at_snapshot_version() -> DeltaResult<()> {
+async fn test_crc_returns_resolved_crc_at_snapshot_version() -> Result<()> {
     // ===== GIVEN =====
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     let table_root = url::Url::from_directory_path(path).unwrap();
@@ -393,7 +393,7 @@ async fn test_crc_returns_resolved_crc_at_snapshot_version() -> DeltaResult<()> 
 }
 
 #[tokio::test]
-async fn test_crc_returns_none_when_no_crc() -> DeltaResult<()> {
+async fn test_crc_returns_none_when_no_crc() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -418,7 +418,7 @@ async fn test_crc_returns_none_when_no_crc() -> DeltaResult<()> {
 fn create_table_and_commit(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
-) -> DeltaResult<delta_kernel::transaction::CommittedTransaction> {
+) -> Result<delta_kernel::transaction::CommittedTransaction> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let txn = create_table(table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
@@ -429,7 +429,7 @@ fn create_table_and_commit(
 }
 
 #[tokio::test]
-async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
+async fn test_create_table_produces_post_commit_crc() -> Result<()> {
     // ===== GIVEN / WHEN: Create the table =====
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
@@ -456,7 +456,7 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
     #[case] use_post_commit_snapshot: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let create_committed = create_table_and_commit(&table_path, engine.as_ref())?;
 
@@ -513,7 +513,7 @@ fn write_and_verify_crc(
 }
 
 #[tokio::test]
-async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<()> {
+async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create the table =====
@@ -571,7 +571,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
 }
 
 #[tokio::test]
-async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()> {
+async fn test_post_commit_crc_tracks_domain_metadata_changes() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== WHEN: CREATE TABLE with zip -> zap0 =====
@@ -614,8 +614,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
 }
 
 #[tokio::test]
-async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate() -> DeltaResult<()>
-{
+async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create table (v0) and insert data (v1) =====
@@ -648,7 +647,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
 // ============================================================================
 
 #[tokio::test]
-async fn test_write_checksum_success_simple() -> DeltaResult<()> {
+async fn test_write_checksum_success_simple() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot = committed.post_commit_snapshot().unwrap();
@@ -669,7 +668,7 @@ async fn test_write_checksum_success_simple() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_write_checksum_double_write_returns_already_exists(
     #[case] reload_snapshot: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot = committed.post_commit_snapshot().unwrap();
@@ -719,7 +718,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
     )]
     root: WriteRoot,
     #[values(false, true)] ict_enabled: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     // === Create the table with domain metadata (and optionally ICT) enabled ===
@@ -855,7 +854,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
 /// would pass even if retention regressed to a full discard, so this drives the retained base
 /// through the observable write path.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_disabled_load_retains_stale_crc_as_base() -> DeltaResult<()> {
+async fn test_disabled_load_retains_stale_crc_as_base() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     // crc-full has a CRC at version 0.
     let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
@@ -896,7 +895,7 @@ async fn test_disabled_load_retains_stale_crc_as_base() -> DeltaResult<()> {
 /// them; resolution must fall back to the checkpoint root instead of erroring on a missing commit.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_checkpoint(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     copy_directory(&source_path, _temp_dir.path()).unwrap();
@@ -935,7 +934,7 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
 async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
-) -> DeltaResult<SnapshotRef> {
+) -> Result<SnapshotRef> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -984,7 +983,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
 /// commit 2, erroring on the missing commit. The below-checkpoint base must be skipped, so the
 /// build falls back to log replay.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_incremental_unlimited_skips_below_checkpoint_base() -> DeltaResult<()> {
+async fn test_incremental_unlimited_skips_below_checkpoint_base() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
 
@@ -1001,8 +1000,7 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> DeltaResult
 /// newly-listed checkpoint, `write_checksum` must skip that below-checkpoint base and resolve from
 /// the checkpoint root rather than erroring on the commits the checkpoint subsumed.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves(
-) -> DeltaResult<()> {
+async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
 
@@ -1031,7 +1029,7 @@ async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolve
 /// ICT read error propagates instead of being laundered into a generic "CRC unresolved" error.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -1072,8 +1070,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported(
-) -> DeltaResult<()> {
+async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -1106,7 +1103,7 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
 }
 
 #[tokio::test]
-async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> DeltaResult<()> {
+async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
@@ -1144,7 +1141,7 @@ async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> Delt
 // When an incremental snapshot update picks up a CRC file at the new version from the new log
 // segment, that CRC is resolved and stored on the resulting snapshot.
 #[tokio::test]
-async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
+async fn test_incremental_snapshot_preserves_loaded_crc() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create table at v0 and write its CRC to disk
@@ -1199,7 +1196,7 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
 // The old segment's CRC file is preserved on the combined segment, but with the default
 // (disabled) replay budget the v0 CRC is not advanced to v1, so the snapshot carries no CRC.
 #[tokio::test]
-async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
+async fn test_incremental_snapshot_old_crc_no_new_crc() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create table at v0 and write CRC to disk
@@ -1252,7 +1249,7 @@ async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_write_checksum_with_no_dms_writes_empty_list(
     #[case] dm_supported: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     use std::collections::HashMap;
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -1309,7 +1306,7 @@ impl Engine for FailingEngine {
 }
 
 #[tokio::test]
-async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()> {
+async fn test_get_domain_metadata_with_crc_skips_log_replay() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: CREATE TABLE with zip -> zap0 (and clustering DM from create_table_and_commit)
@@ -1398,7 +1395,7 @@ fn strip_field_from_crc(table_path: &str, version: Version, field: &str) {
 }
 
 #[tokio::test]
-async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResult<()> {
+async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: CREATE TABLE with zip -> zap0 (post-commit writes CRC with full DM).
@@ -1476,7 +1473,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
 /// correctly tracked in the CRC across commits, round-trip through write/reload, and that
 /// the CRC fast path (no log replay) works for set transaction queries.
 #[tokio::test]
-async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
+async fn test_set_transaction_crc_tracking_and_fast_path() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // -- v0: CREATE TABLE (no set transactions) --
@@ -1590,7 +1587,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> DeltaResult<()> {
+async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: CREATE TABLE. v1: commit with v1-app=1, then write CRC to disk.
@@ -1679,7 +1676,7 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Delt
 async fn test_set_txn_expiration_via_crc_fast_path(
     #[case] retention: Option<&str>,
     #[case] expected: Option<i64>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
 
@@ -1726,7 +1723,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 /// transaction whose `lastUpdated` is older than retention must return `None` via the fast path,
 /// without falling through to log replay.
 #[tokio::test]
-async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaResult<()> {
+async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": INTEGER };
 
@@ -1783,7 +1780,7 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaR
 /// Verifies that a set transaction with null `last_updated` never expires, even with the most
 /// aggressive retention ("interval 0 seconds").
 #[tokio::test]
-async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaResult<()> {
+async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: create table with aggressive retention
@@ -1825,7 +1822,7 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
 // newest yields None, it does NOT fall back to an older non-expired txn. Uses non-monotonic
 // lastUpdated (v1 far-future, v2 tiny) so the newest-by-log-order txn (v2) is the expired one.
 #[tokio::test]
-async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> DeltaResult<()> {
+async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -1945,7 +1942,7 @@ const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW
 /// - v2: insert large file (>= 8KB, bin 1+) -> files span two bins
 /// - v3: remove all files, delete parquet from disk -> histogram returns to all zeros
 #[tokio::test]
-async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResult<()> {
+async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": INTEGER,
@@ -2050,7 +2047,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
 /// post-commit CRC is computed by applying the v2 delta to the deserialized v1 CRC, testing
 /// that the in-memory chain works with a disk-loaded base.
 #[tokio::test]
-async fn test_file_histogram_survives_disk_round_trip_then_delta_merge() -> DeltaResult<()> {
+async fn test_file_histogram_survives_disk_round_trip_then_delta_merge() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot_v0 = committed.post_commit_snapshot().unwrap();
@@ -2134,7 +2131,7 @@ fn rewrite_crc_with_custom_bins(table_path: &str, version: u64, file_sizes: &[i6
 async fn test_file_histogram_with_bin_type_and_operation_type(
     #[values(true, false)] use_custom_bins: bool,
     #[values(true, false)] incremental: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: table with 1 file at v1 and CRC on disk =====
@@ -2223,7 +2220,7 @@ async fn commit_with_dm_and_txn<E: TaskExecutor>(
     snapshot: SnapshotRef,
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
-) -> DeltaResult<SnapshotRef> {
+) -> Result<SnapshotRef> {
     commit_data(snapshot, engine, v, |txn| {
         txn.with_domain_metadata("domain".to_string(), format!("value_{v}"))
             .with_transaction_id("app".to_string(), v)
@@ -2238,7 +2235,7 @@ async fn commit_data<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
     customize: impl FnOnce(Transaction) -> Transaction,
-) -> DeltaResult<SnapshotRef> {
+) -> Result<SnapshotRef> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
@@ -2275,7 +2272,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     )]
     crc_staleness: CrcStaleness,
     #[values(false, true)] crc_missing_opt_fields: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     const CHECKPOINT_VERSION: i64 = 10;
     const LATEST_VERSION: i64 = 20;
     let crc_version = match crc_staleness {
@@ -2418,7 +2415,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 }
 
 #[tokio::test]
-async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> DeltaResult<()> {
+async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: a CRC at v0 (made stale by an insert at v1) =====
@@ -2462,7 +2459,7 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
 }
 
 #[tokio::test]
-async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() -> DeltaResult<()> {
+async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
@@ -2513,19 +2510,19 @@ impl ParquetHandler for NoParquetReadsHandler {
         _files: &[FileMeta],
         _physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         panic!("read_parquet_files called: the checkpoint must not be read on the rooted path");
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 }
@@ -2557,7 +2554,7 @@ impl Engine for NoParquetReadsEngine {
 async fn setup_stale_crc_dm_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
@@ -2624,7 +2621,7 @@ enum Query {
 ]))]
 #[case::unfiltered(Query::All)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> DeltaResult<()> {
+async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_stale_crc_dm_table(&engine, &table_path).await?;
 
@@ -2665,7 +2662,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Del
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaResult<()> {
+async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_stale_crc_dm_table(&engine, &table_path).await?;
 
@@ -2713,7 +2710,7 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaRe
 async fn setup_stale_crc_txn_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -2751,7 +2748,7 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
 async fn test_txn_query_rooted_in_stale_complete_crc(
     #[case] app_id: &str,
     #[case] expected: Option<i64>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_stale_crc_txn_table(&engine, &table_path).await?;
 
@@ -2770,7 +2767,7 @@ async fn test_txn_query_rooted_in_stale_complete_crc(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaResult<()> {
+async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_stale_crc_txn_table(&engine, &table_path).await?;
 

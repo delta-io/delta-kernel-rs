@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::{DeltaResult, Engine, KernelError, Snapshot};
+use delta_kernel::{Engine, KernelError, Result, Snapshot};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
 };
@@ -116,7 +116,7 @@ pub fn build_uc_create_table_request(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     table_name: impl Into<String>,
-) -> DeltaResult<CreateTableRequest> {
+) -> Result<CreateTableRequest> {
     if snapshot.version() != 0 {
         return Err(KernelError::generic(format!(
             "build_uc_create_table_request is only valid for version 0 (table creation) \

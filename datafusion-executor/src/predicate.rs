@@ -14,7 +14,7 @@ use delta_kernel::expressions::{
     UnaryPredicateOp as KernelUnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, StructType};
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{Result, KernelError};
 
 use crate::expression::to_df_expr;
 use crate::scalar::to_df_scalar;
@@ -30,7 +30,7 @@ use crate::scalar::to_df_scalar;
 pub fn to_df_predicate_expr(
     pred: &KernelPredicate,
     input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
+) -> Result<DFExpr> {
     match pred {
         KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema, None),
         KernelPredicate::Not(inner) => {
@@ -55,7 +55,7 @@ pub fn to_df_predicate_expr(
 fn unary_to_df_predicate_expr(
     unary: &KernelUnaryPredicate,
     input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
+) -> Result<DFExpr> {
     let expr = to_df_expr(&unary.expr, input_schema, None)?;
     match unary.op {
         KernelUnaryPredicateOp::IsNull => Ok(DFExpr::IsNull(Box::new(expr))),
@@ -66,7 +66,7 @@ fn unary_to_df_predicate_expr(
 fn binary_to_df_predicate_expr(
     binary: &KernelBinaryPredicate,
     input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
+) -> Result<DFExpr> {
     let op = match binary.op {
         KernelBinaryPredicateOp::In => {
             return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema)
@@ -110,7 +110,7 @@ fn in_to_df_predicate_expr(
     value: &KernelExpression,
     list: &KernelExpression,
     input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
+) -> Result<DFExpr> {
     // Kernel's Arrow evaluator accepts `IN` only with a literal left operand (a column left
     // operand errors), so reject anything else to match it exactly.
     let KernelExpression::Literal(_) = value else {
@@ -134,12 +134,12 @@ fn in_to_df_predicate_expr(
 /// Builds `value IN (<elements>)` from a literal array. Null elements stay in the list: they can
 /// never match under logical equality, and the caller's `IS TRUE` collapses the null they would
 /// otherwise contribute down to false.
-fn in_list_expr(value: DFExpr, array: &KernelArrayData) -> DeltaResult<DFExpr> {
+fn in_list_expr(value: DFExpr, array: &KernelArrayData) -> Result<DFExpr> {
     let elements: Vec<DFExpr> = array
         .array_elements()
         .iter()
         .map(|scalar| Ok(lit(to_df_scalar(scalar)?)))
-        .collect::<DeltaResult<_>>()?;
+        .collect::<Result<_>>()?;
     let in_expr = DFExpr::InList(InList::new(Box::new(value), elements, false));
     Ok(in_expr)
 }
@@ -155,7 +155,7 @@ fn array_has_expr(
     column: &KernelExpression,
     name: &KernelColumnName,
     input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
+) -> Result<DFExpr> {
     let DataType::Array(_) = input_schema.field_at(name)?.data_type else {
         return Err(KernelError::unsupported(
             "converting an IN predicate against a column requires an array-typed column",
@@ -169,8 +169,8 @@ fn array_has_expr(
 fn junction_to_df_predicate_expr(
     junction: &KernelJunctionPredicate,
     input_schema: &StructType,
-) -> DeltaResult<DFExpr> {
-    let preds: DeltaResult<Vec<DFExpr>> = junction
+) -> Result<DFExpr> {
+    let preds: Result<Vec<DFExpr>> = junction
         .preds
         .iter()
         .map(|pred| to_df_predicate_expr(pred, input_schema))

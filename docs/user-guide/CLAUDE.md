@@ -14,7 +14,7 @@ Headings:   sentence case (exception: type names like "The Engine trait")
 Dashes:     never use "--" in prose; restructure into two sentences
 Code:       MUST compile via mdbook test
 Output:     MUST show expected output after code that produces it
-Errors:     prefer ? over .unwrap(); hidden boilerplate returns DeltaResult
+Errors:     prefer ? over .unwrap(); hidden boilerplate returns Result
 Terms:      Snapshot, Scan, Transaction, Engine, connector, predicate
 Dataset:    Alice/30/Seattle, Bob/25/Portland, Carol/35/Denver
 Links:      relative paths, link first occurrence per section only
@@ -260,7 +260,7 @@ MUST NOT:
 - SHOULD: number the steps in comments (`// 1. Parse the table`,
   `// 2. Build engine`) for longer examples, matching the prose breakdown.
 - For **error handling**, MUST use `?` over `.unwrap()`. Hidden boilerplate
-  should include a `main()` returning `DeltaResult<()>` (or
+  should include a `main()` returning `Result<()>` (or
   `Result<(), Box<dyn std::error::Error>>` when mixing error types). Readers
   copy examples verbatim. `.unwrap()` in examples teaches destructive habits.
 - For **async examples**, include `tokio` in the hidden boilerplate

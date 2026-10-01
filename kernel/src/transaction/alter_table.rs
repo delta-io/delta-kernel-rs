@@ -14,7 +14,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{AlterTable, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
-use crate::DeltaResult;
+use crate::Result;
 
 /// A type alias for alter-table transactions.
 ///
@@ -39,7 +39,7 @@ impl AlterTableTransaction {
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
         correlation_id: Option<Arc<str>>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let span = tracing::info_span!(
             "txn",
             path = %read_snapshot.table_root(),

@@ -7,7 +7,7 @@ use crate::log_segment::{
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, KernelError, LogPath, Version};
+use crate::{Engine, KernelError, LogPath, Result, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -90,7 +90,7 @@ impl CommitRangeBuilder {
     /// the earliest still-available version) if the requested start is unavailable but later
     /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
     /// all, and a generic error if the resolved version range is invalid (start > end).
-    pub fn build(&self, engine: &dyn Engine) -> DeltaResult<CommitRange> {
+    pub fn build(&self, engine: &dyn Engine) -> Result<CommitRange> {
         let table_root = Self::parse_table_root(&self.table_root)?;
         let log_root = table_root.join("_delta_log/")?;
 
@@ -158,7 +158,7 @@ impl CommitRangeBuilder {
         })
     }
 
-    fn validate_catalog_managed_inputs(&self, log_tail: &[ParsedLogPath]) -> DeltaResult<()> {
+    fn validate_catalog_managed_inputs(&self, log_tail: &[ParsedLogPath]) -> Result<()> {
         if let Some(max_catalog_version) = self.max_catalog_version {
             require!(
                 self.start_version <= max_catalog_version,
@@ -178,7 +178,7 @@ impl CommitRangeBuilder {
     }
 
     /// Parse the stored table-root string into a [`Url`].
-    fn parse_table_root(table_root: &str) -> DeltaResult<Url> {
+    fn parse_table_root(table_root: &str) -> Result<Url> {
         crate::utils::try_parse_uri(table_root)
     }
 }
@@ -193,7 +193,7 @@ pub enum CommitOrdering {
     DescendingOrder,
 }
 
-fn validate_version_range(start: Version, end: Version) -> DeltaResult<()> {
+fn validate_version_range(start: Version, end: Version) -> Result<()> {
     if start > end {
         return Err(KernelError::generic(format!(
             "start_version ({start}) must be <= end_version ({end})",
@@ -207,7 +207,7 @@ fn validate_number_of_commit_files(
     start: Version,
     end: Version,
     commit_file_count: usize,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let expected = end - start + 1;
     let actual = commit_file_count as u64;
     if expected != actual {
@@ -228,35 +228,35 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
     use crate::utils::FoldWithOption as _;
-    use crate::{DeltaResultIteratorStatic, Engine, FileMeta, LogPath, Snapshot, StorageHandler};
+    use crate::{Engine, FileMeta, LogPath, ResultIteratorStatic, Snapshot, StorageHandler};
 
     struct NoIoStorageHandler;
 
     impl StorageHandler for NoIoStorageHandler {
-        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
             panic!("snapshot-based commit ranges must not list storage");
         }
 
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
             panic!("commit range construction must not read files");
         }
 
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
             panic!("unexpected copy");
         }
 
-        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> Result<()> {
             panic!("unexpected write");
         }
 
-        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        fn head(&self, _path: &Url) -> Result<FileMeta> {
             panic!("unexpected head");
         }
 
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> Result<()> {
             panic!("unexpected delete");
         }
     }

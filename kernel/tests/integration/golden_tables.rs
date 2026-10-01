@@ -18,7 +18,7 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{Result, Snapshot};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -30,7 +30,7 @@ use url::Url;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 #[allow(deprecated)]
-async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
+async fn read_expected(path: &Path) -> Result<RecordBatch> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
     let mut batches = vec![];
@@ -55,7 +55,7 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
 }
 
 // copied from DAT
-fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
+fn sort_record_batch(batch: RecordBatch) -> Result<RecordBatch> {
     if batch.num_rows() < 2 {
         // 0 or 1 rows doesn't need sorting
         return Ok(batch);

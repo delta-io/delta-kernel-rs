@@ -39,11 +39,11 @@
 //! # use delta_kernel::Engine;
 //! # use delta_kernel::Snapshot;
 //! # use delta_kernel::SnapshotRef;
-//! # use delta_kernel::DeltaResult;
+//! # use delta_kernel::Result;
 //! # use delta_kernel::KernelError;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> Result<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -125,8 +125,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta,
-    KernelError, Version,
+    version_as_i64, Engine, EngineData, FileMeta, KernelError, Result, ResultIteratorStatic,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -194,7 +194,7 @@ impl LastCheckpointHintStats {
         state: ActionReconciliationIteratorState,
         size_in_bytes: u64,
         num_sidecars: u64,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         if !state.is_exhausted() {
             return Err(KernelError::checkpoint_write(
                 "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
@@ -369,7 +369,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> Result<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;
@@ -411,7 +411,7 @@ impl CheckpointWriter {
     ///
     /// For example, if the table root is `s3://bucket/path` and the version is `10`,
     /// the checkpoint path will be: `s3://bucket/path/00000000000000000010.checkpoint.parquet`
-    pub fn checkpoint_path(&self) -> DeltaResult<Url> {
+    pub fn checkpoint_path(&self) -> Result<Url> {
         ParsedLogPath::new_classic_parquet_checkpoint(
             self.snapshot.table_root(),
             self.snapshot.version(),
@@ -452,10 +452,7 @@ impl CheckpointWriter {
     // 3. Reads actions from the log segment and deduplicates via reconciliation
     // 4. Applies stats transforms (COALESCE/drop) to each reconciled batch
     // 5. Chains the checkpoint metadata action for V2 checkpoints
-    pub fn checkpoint_data(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<ActionReconciliationIterator> {
+    pub fn checkpoint_data(&self, engine: &dyn Engine) -> Result<ActionReconciliationIterator> {
         // Read actions from log segment
         let actions = self
             .snapshot
@@ -521,7 +518,7 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -561,7 +558,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
-    ) -> DeltaResult<WrittenCheckpointInfo> {
+    ) -> Result<WrittenCheckpointInfo> {
         let data_iter = self.checkpoint_data(engine)?;
         let iter_state = data_iter.state();
 
@@ -614,7 +611,7 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: DeltaResultIteratorStatic<Box<dyn EngineData>> =
+        let main_data: ResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         let main_size = engine
             .parquet_handler()
@@ -641,7 +638,7 @@ impl CheckpointWriter {
     pub(crate) fn write_checkpoint_without_sidecars(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<WrittenCheckpointInfo> {
+    ) -> Result<WrittenCheckpointInfo> {
         let checkpoint_path = self.checkpoint_path()?;
         let data_iter = self.checkpoint_data(engine)?;
         let state = data_iter.state();
@@ -684,7 +681,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
         schema: &SchemaRef,
-    ) -> DeltaResult<ActionReconciliationBatch> {
+    ) -> Result<ActionReconciliationBatch> {
         // Build the checkpointMetadata struct value. `tags` is left unset (null) since kernel
         // does not currently emit checkpoint tags.
         let checkpoint_metadata_value: Scalar = CheckpointMetadata {
@@ -721,7 +718,7 @@ impl CheckpointWriter {
     fn checkpoint_schema_context(
         snapshot: &SnapshotRef,
         engine: &dyn Engine,
-    ) -> DeltaResult<CheckpointSchemaContext> {
+    ) -> Result<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
         let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
 
@@ -783,7 +780,7 @@ pub(crate) fn create_last_checkpoint_data(
     actions_counter: i64,
     add_actions_counter: i64,
     size_in_bytes: i64,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> Result<Box<dyn EngineData>> {
     engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
         vec![vec![
@@ -803,7 +800,7 @@ fn write_single_sidecar(
     file_actions_per_sidecar_hint: usize,
     table_root: &Url,
     version: Version,
-) -> DeltaResult<Option<(String, FileMeta)>> {
+) -> Result<Option<(String, FileMeta)>> {
     let mut iter =
         SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
     if iter.peek().is_none() {
@@ -821,7 +818,7 @@ fn write_single_sidecar(
 /// Verifies that the size the parquet writer reported matches the size the storage layer reports
 /// via `head`, guarding against a truncated or partially-written file. `path` names the file in
 /// the error message.
-fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> DeltaResult<()> {
+fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> Result<()> {
     if written_size != observed_size {
         return Err(KernelError::generic(format!(
             "parquet file size mismatch at {path}: writer reported {written_size} bytes, \
@@ -838,7 +835,7 @@ fn build_written_checkpoint_info(
     written_size: u64,
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
-) -> DeltaResult<WrittenCheckpointInfo> {
+) -> Result<WrittenCheckpointInfo> {
     let file_meta = engine.storage_handler().head(checkpoint_path)?;
     verify_written_size(checkpoint_path, written_size, file_meta.size)?;
     let total_size_in_bytes = file_meta

@@ -52,8 +52,8 @@ use crate::unit_test_utils::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Snapshot;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    FileSize, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, ParquetFooter,
+    ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic, RowVisitor,
     StorageHandler,
 };
 
@@ -67,7 +67,7 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+) -> Result<Option<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
     visitor.visit_rows_of(batch)?;
@@ -151,7 +151,7 @@ async fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
@@ -161,7 +161,7 @@ pub(crate) async fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data).await
 }
@@ -172,11 +172,11 @@ async fn write_multi_row_group_parquet_to_store(
     store: &Arc<InMemory>,
     row_groups: Vec<Box<dyn EngineData>>,
     path: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let batches = row_groups
         .into_iter()
         .map(ArrowEngineData::try_from_engine_data)
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let schema = batches
         .first()
         .ok_or_else(|| KernelError::internal_error("at least one row group is required"))?
@@ -197,8 +197,8 @@ async fn write_multi_row_group_parquet_to_store(
 
 /// Returns the materialized row count and sorted paths of all materialized Add actions.
 fn collect_materialized_adds(
-    actions: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-) -> DeltaResult<(usize, Vec<String>)> {
+    actions: impl Iterator<Item = Result<ActionsBatch>>,
+) -> Result<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
     for batch in actions {
@@ -215,7 +215,7 @@ fn collect_materialized_adds(
 fn collect_projected_adds(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<(usize, Vec<String>)> {
+) -> Result<(usize, Vec<String>)> {
     let actions = log_segment
         .read_actions_with_projected_checkpoint_actions(
             engine,
@@ -238,19 +238,19 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         self.0.read_parquet_files(files, physical_schema, None)
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         self.0.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         self.0.read_parquet_footer(file)
     }
 }
@@ -267,7 +267,7 @@ async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<FileMeta> {
+) -> Result<FileMeta> {
     let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path.clone(), data).await?;
     let size = get_file_size(store, &path).await;
@@ -285,7 +285,7 @@ async fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let json_lines: Vec<String> = actions
         .into_iter()
         .map(|action| serde_json::to_string(&action).expect("action to string"))
@@ -1119,7 +1119,7 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
 fn test_sidecar_to_filemeta_valid_paths(
     #[case] input_path: &str,
     #[case] expected_url: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
     let sidecar = Sidecar {
         path: expected_url.to_string(),
@@ -1138,7 +1138,7 @@ fn test_sidecar_to_filemeta_valid_paths(
 }
 
 #[test]
-fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
+fn test_checkpoint_batch_with_no_sidecars_returns_none() -> Result<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
@@ -1160,7 +1160,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
+async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1208,7 +1208,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 }
 
 #[test]
-fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
+fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1238,7 +1238,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 }
 
 #[tokio::test]
-async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
+async fn test_reading_sidecar_files_with_predicate() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1279,7 +1279,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     add_checkpoint_to_store(
@@ -1334,7 +1334,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1413,7 +1413,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1498,7 +1498,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     #[case] expected_rows_after_pruning: usize,
     #[case] expected_add_paths: &[&str],
     #[values(false, true)] ignore_predicate: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
@@ -1556,7 +1556,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 /// `SyncJsonHandler` ignores the checkpoint predicate, so replay must tolerate the returned remove
 /// row while still surfacing the live Add.
 #[tokio::test]
-async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResult<()> {
+async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1612,7 +1612,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
 async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     #[case] ignore_predicate: bool,
     #[case] expected_materialized_rows: usize,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
@@ -1679,8 +1679,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
-) -> DeltaResult<()> {
+async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> Result<()>
+{
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1744,7 +1744,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 // - Each returned batch is correctly flagged with is_log_batch set to false
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1899,7 +1899,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
 }
 
 #[tokio::test]
-async fn test_list_log_files_with_version() -> DeltaResult<()> {
+async fn test_list_log_files_with_version() -> Result<()> {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -3240,7 +3240,7 @@ fn test_log_segment_checkpoint_gap_rejects_version_overflow() {
 /// doc promises. Real V2 fixtures only carry non-empty sidecar lists, so this synthetic case is the
 /// only place it is exercised.
 #[test]
-fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
+fn checkpoint_sidecars_distinguishes_empty_from_absent() -> Result<()> {
     let (_store, log_root) = new_in_memory_store();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
     let checkpoint_file = log_root.join(selected)?.to_string();
@@ -3356,7 +3356,7 @@ fn checkpoint_hint_sidecar_file_schema_resolution(
 async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] hint_version: u64,
     #[case] expect_hint_schema_used: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3437,7 +3437,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 #[tokio::test]
 async fn test_get_file_actions_schema_v2_identity_filter(
     #[case] identity_matches: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3500,7 +3500,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 #[case::with_hint(true)]
 #[case::without_hint(false)]
 #[tokio::test]
-async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
+async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3756,7 +3756,7 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 fn create_checkpoint_file_schema_with_stats_parsed(
     min_values_fields: Vec<StructField>,
     include_json_stats: bool,
-) -> DeltaResult<SchemaRef> {
+) -> Result<SchemaRef> {
     let stats_parsed = StructField::nullable(
         "stats_parsed",
         schema! {
@@ -3803,7 +3803,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     #[case] include_json_stats: bool,
     #[case] expect_parsed_stats: bool,
     #[case] expect_json_stats: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let checkpoint_schema = if include_parsed_stats {
@@ -4418,7 +4418,7 @@ fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<Arrow
 }
 
 #[tokio::test]
-async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResult<()> {
+async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -4511,7 +4511,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 }
 
 #[tokio::test]
-async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> DeltaResult<()> {
+async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -5407,7 +5407,7 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<()> {
+fn find_last_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot
@@ -5420,7 +5420,7 @@ fn find_last_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> DeltaResult<()> {
+fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,

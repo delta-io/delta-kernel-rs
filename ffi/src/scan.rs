@@ -9,9 +9,7 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, Expression, ExpressionRef, KernelError,
-};
+use delta_kernel::{Expression, ExpressionRef, KernelError, Result, ResultIteratorStatic};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
 use tracing::debug;
@@ -38,7 +36,7 @@ pub struct SharedScan;
 pub struct SharedScanMetadata;
 
 /// Boxed scan metadata iterator stored behind [`ScanMetadataIterator`]'s mutex.
-type ScanMetadataIter = DeltaResultIteratorStatic<ScanMetadata>;
+type ScanMetadataIter = ResultIteratorStatic<ScanMetadata>;
 
 /// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///
@@ -169,7 +167,7 @@ pub unsafe extern "C" fn selection_vector_from_scan_metadata(
 
 fn selection_vector_from_scan_metadata_impl(
     scan_metadata: &ScanMetadata,
-) -> DeltaResult<KernelBoolSlice> {
+) -> Result<KernelBoolSlice> {
     Ok(scan_metadata.scan_files.selection_vector().to_vec().into())
 }
 
@@ -206,7 +204,7 @@ pub unsafe extern "C" fn scan(
 /// construction failed, which would silently widen to a full scan if ignored.
 pub(crate) fn decode_engine_predicate(
     predicate: &mut EnginePredicate,
-) -> DeltaResult<delta_kernel::Predicate> {
+) -> Result<delta_kernel::Predicate> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
     unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
@@ -221,10 +219,7 @@ pub(crate) fn decode_engine_predicate(
 ///
 /// Returns an error if the engine's visitor fails to produce a valid predicate; see
 /// [`decode_engine_predicate`].
-fn apply_predicate(
-    builder: ScanBuilder,
-    predicate: &mut EnginePredicate,
-) -> DeltaResult<ScanBuilder> {
+fn apply_predicate(builder: ScanBuilder, predicate: &mut EnginePredicate) -> Result<ScanBuilder> {
     let predicate = decode_engine_predicate(predicate)?;
     debug!("Got predicate: {:#?}", predicate);
     Ok(builder.with_predicate(Some(Arc::new(predicate))))
@@ -233,7 +228,7 @@ fn apply_predicate(
 /// Decode an [`EngineSchema`] and apply it as a column projection to a [`ScanBuilder`].
 ///
 /// Returns an error if the schema visitor produces an invalid schema.
-fn apply_schema(builder: ScanBuilder, schema: &EngineSchema) -> DeltaResult<ScanBuilder> {
+fn apply_schema(builder: ScanBuilder, schema: &EngineSchema) -> Result<ScanBuilder> {
     let mut visitor_state = KernelSchemaVisitorState::default();
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
     let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
@@ -245,7 +240,7 @@ fn scan_impl(
     snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
     schema: Option<&EngineSchema>,
-) -> DeltaResult<Handle<SharedScan>> {
+) -> Result<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
     if let Some(predicate) = predicate {
         scan_builder = apply_predicate(scan_builder, predicate)?;
@@ -325,7 +320,7 @@ pub unsafe extern "C" fn scan_builder_with_schema(
 fn scan_builder_with_schema_impl(
     builder: Handle<ExclusiveScanBuilder>,
     schema: &EngineSchema,
-) -> DeltaResult<Handle<ExclusiveScanBuilder>> {
+) -> Result<Handle<ExclusiveScanBuilder>> {
     let builder = unsafe { builder.into_inner() };
     Ok(Box::new(apply_schema(*builder, schema)?).into())
 }
@@ -469,7 +464,7 @@ pub unsafe extern "C" fn scan_declarative_metadata_plan(
 fn scan_declarative_metadata_plan_impl(
     scan: &Scan,
     engine: &dyn delta_kernel::Engine,
-) -> DeltaResult<OptionalValue<crate::KernelOwnedBytes>> {
+) -> Result<OptionalValue<crate::KernelOwnedBytes>> {
     let plan = scan.declarative_metadata_scan_plan(engine)?;
     Ok(plan
         .map(|plan| {
@@ -499,7 +494,7 @@ pub struct ScanMetadataIterator {
 impl ScanMetadataIterator {
     /// Acquire the iterator's mutex, returning a guard the caller can drain. While the
     /// guard is alive, concurrent `scan_metadata_next` calls on the same handle block.
-    pub(crate) fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, ScanMetadataIter>> {
+    pub(crate) fn lock_iter(&self) -> Result<std::sync::MutexGuard<'_, ScanMetadataIter>> {
         self.data
             .lock()
             .map_err(|_| KernelError::generic("poisoned scan-metadata iterator mutex"))
@@ -535,7 +530,7 @@ pub unsafe extern "C" fn scan_metadata_iter_init(
 fn scan_metadata_iter_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
-) -> DeltaResult<Handle<SharedScanMetadataIterator>> {
+) -> Result<Handle<SharedScanMetadataIterator>> {
     let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
     let data = ScanMetadataIterator {
         data: Mutex::new(Box::new(scan_metadata)),
@@ -576,7 +571,7 @@ fn scan_metadata_next_impl(
         engine_context: NullableCvoid,
         scan_metadata: Handle<SharedScanMetadata>,
     ),
-) -> DeltaResult<bool> {
+) -> Result<bool> {
     let mut data = data.lock_iter()?;
     if let Some(scan_metadata) = data.next().transpose()? {
         (engine_visitor)(engine_context, Arc::new(scan_metadata).into());
@@ -670,7 +665,7 @@ fn get_from_string_map_impl(
     map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
-) -> DeltaResult<NullableCvoid> {
+) -> Result<NullableCvoid> {
     let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
     Ok(map
         .values
@@ -741,7 +736,7 @@ pub struct CMetadataMap {
 
 impl CMetadataMap {
     /// Insert a value without replacing an existing key.
-    pub(crate) fn insert(&mut self, key: String, value: MetadataValue) -> DeltaResult<()> {
+    pub(crate) fn insert(&mut self, key: String, value: MetadataValue) -> Result<()> {
         match self.values.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(value);
@@ -785,7 +780,7 @@ fn get_from_metadata_map_impl(
     key: KernelStringSlice,
     kind_out: *mut CMetadataValueKind,
     allocate_fn: AllocateStringFn,
-) -> DeltaResult<NullableCvoid> {
+) -> Result<NullableCvoid> {
     let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
     let Some(val) = map.values.get(string_key) else {
         return Ok(None);
@@ -915,8 +910,8 @@ pub unsafe extern "C" fn selection_vector_from_dv(
 fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: DeltaResult<Url>,
-) -> DeltaResult<KernelBoolSlice> {
+    root_url: Result<Url>,
+) -> Result<KernelBoolSlice> {
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
@@ -941,8 +936,8 @@ pub unsafe extern "C" fn row_indexes_from_dv(
 fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: DeltaResult<Url>,
-) -> DeltaResult<KernelRowIndexArray> {
+    root_url: Result<Url>,
+) -> Result<KernelRowIndexArray> {
     match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
@@ -1002,7 +997,7 @@ fn visit_scan_metadata_impl(
     scan_metadata: &ScanMetadata,
     engine_context: NullableCvoid,
     callback: CScanCallback,
-) -> DeltaResult<bool> {
+) -> Result<bool> {
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
@@ -1064,7 +1059,7 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn scan_metadata_next_arrow_impl(
     data: &ScanMetadataIterator,
-) -> DeltaResult<*mut ScanMetadataArrowResult> {
+) -> Result<*mut ScanMetadataArrowResult> {
     let mut iter = data
         .data
         .lock()

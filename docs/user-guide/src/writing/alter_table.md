@@ -47,8 +47,8 @@ column. The flow is:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
 # use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn example() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Load a snapshot of the existing table.

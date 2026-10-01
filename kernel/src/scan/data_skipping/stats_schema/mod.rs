@@ -12,7 +12,7 @@ use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::DeltaResult;
+use crate::Result;
 
 /// Generates the expected schema for file statistics.
 ///
@@ -135,7 +135,7 @@ pub(crate) fn expected_stats_schema(
     config: &StatsConfig<'_>,
     required_columns: Option<&[ColumnName]>,
     requested_columns: Option<&[ColumnName]>,
-) -> DeltaResult<Schema> {
+) -> Result<Schema> {
     let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
 

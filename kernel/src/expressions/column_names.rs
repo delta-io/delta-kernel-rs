@@ -7,7 +7,7 @@ use delta_kernel_derive::pub_macro;
 use derive_more::Deref;
 
 use crate::utils::CollectInto;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// A (possibly nested) column name.
 ///
@@ -63,7 +63,7 @@ impl ColumnName {
     ///     &[ColumnName::new(["a", "b"]), ColumnName::new(["c", "d , e", "f"])]
     /// );
     /// ```
-    pub fn parse_column_name_list(names: impl AsRef<str>) -> DeltaResult<Vec<ColumnName>> {
+    pub fn parse_column_name_list(names: impl AsRef<str>) -> Result<Vec<ColumnName>> {
         let names = names.as_ref();
         let chars = &mut names.chars().peekable();
 
@@ -270,7 +270,7 @@ fn drop_leading_whitespace(iter: &mut Peekable<impl Iterator<Item = char>>) {
 impl std::str::FromStr for ColumnName {
     type Err = KernelError;
 
-    fn from_str(s: &str) -> DeltaResult<Self> {
+    fn from_str(s: &str) -> Result<Self> {
         match parse_column_name(&mut s.chars().peekable())? {
             (_, FieldEnding::NextColumn) => {
                 Err(KernelError::generic("Trailing comma in column name"))
@@ -295,7 +295,7 @@ const FIELD_ESCAPE_CHAR: char = '`';
 const FIELD_SEPARATOR: char = '.';
 const COLUMN_SEPARATOR: char = ',';
 
-fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnding)> {
+fn parse_column_name(chars: &mut Chars<'_>) -> Result<(ColumnName, FieldEnding)> {
     // Ambiguous case: The empty string `""`could reasonably parse as either `ColumnName::new([""])`
     // or `ColumnName::new([])`. However, `ColumnName::new([""]).to_string()` is `"[]"` and
     // `ColumnName::new([]).to_string()` is `""`, so we choose the latter because it produces a
@@ -335,7 +335,7 @@ fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnd
 }
 
 /// Parses a simple field name, e.g. 'a.b.c'.
-fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
+fn parse_simple_field_name(chars: &mut Chars<'_>) -> Result<String> {
     let mut name = String::new();
     let mut first = true;
     while let Some(c) = chars.next_if(|c| is_simple_char(*c)) {
@@ -355,7 +355,7 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
 /// check-constraint tokenizer ([`crate::expressions::sql`]) so backtick-quoted column references
 /// parse identically.
 /// Examples: `col` -> col;  `ab `` -> ``ab``. Returns an error if there is no closing backtick.
-pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
+pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> Result<String> {
     let mut name = String::new();
     loop {
         match chars.next() {
@@ -683,7 +683,7 @@ mod test {
             ("a`.b``", None),
         ];
         for (input, expected_output) in cases {
-            let output: DeltaResult<ColumnName> = input.parse();
+            let output: Result<ColumnName> = input.parse();
             match (&output, &expected_output) {
                 (Ok(output), Some(expected_output)) => {
                     assert_eq!(output, expected_output, "from {input}")

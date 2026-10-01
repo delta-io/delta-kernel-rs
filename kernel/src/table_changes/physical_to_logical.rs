@@ -8,7 +8,7 @@ use crate::scan::transform_spec::{
     get_transform_expr, parse_partition_values, FileRowTrackingMetadata,
 };
 use crate::schema::{schema_ref, SchemaRef, StructType};
-use crate::{DeltaResult, ExpressionRef, KernelError};
+use crate::{ExpressionRef, KernelError, Result};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
 ///
@@ -17,7 +17,7 @@ use crate::{DeltaResult, ExpressionRef, KernelError};
 fn get_cdf_columns(
     logical_schema: &SchemaRef,
     scan_file: &CdfScanFile,
-) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
+) -> Result<impl Iterator<Item = (usize, (String, Scalar))>> {
     // Handle _change_type
     let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_field, &scan_file.scan_type) {
@@ -91,7 +91,7 @@ pub(crate) fn get_cdf_transform_expr(
     scan_file: &CdfScanFile,
     state_info: &StateInfo,
     physical_schema: &StructType,
-) -> DeltaResult<Option<ExpressionRef>> {
+) -> Result<Option<ExpressionRef>> {
     let mut partition_values = HashMap::new();
 
     // Get the transform spec from StateInfo (if present)

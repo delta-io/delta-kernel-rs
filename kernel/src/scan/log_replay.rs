@@ -31,7 +31,7 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{DeltaResult, Engine, ExpressionEvaluator, KernelError};
+use crate::{Engine, ExpressionEvaluator, KernelError, Result};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -214,7 +214,7 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
             engine,
@@ -246,7 +246,7 @@ impl ScanLogReplayProcessor {
         seen_file_keys: HashSet<FileActionKey>,
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
@@ -388,7 +388,7 @@ impl ScanLogReplayProcessor {
     /// undefined behaviour!
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+    pub(crate) fn into_serializable_state(self) -> Result<SerializableScanState> {
         let StateInfo {
             logical_schema,
             physical_schema,
@@ -455,7 +455,7 @@ impl ScanLogReplayProcessor {
     pub(crate) fn from_serializable_state(
         engine: &dyn Engine,
         state: SerializableScanState,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         // Deserialize internal state from json
         let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
             .map_err(KernelError::MalformedJson)?;
@@ -504,7 +504,7 @@ impl ScanLogReplayProcessor {
         &self,
         actions: &dyn EngineData,
         is_log_batch: bool,
-    ) -> DeltaResult<(Box<dyn EngineData>, Vec<bool>)> {
+    ) -> Result<(Box<dyn EngineData>, Vec<bool>)> {
         let transform = if is_log_batch {
             &self.commit_transform
         } else {
@@ -539,7 +539,7 @@ impl ScanLogReplayProcessor {
     fn project_stats_output(
         &self,
         transformed_actions: Box<dyn EngineData>,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> Result<Box<dyn EngineData>> {
         match &self.stats_output_projection {
             Some(projection) => projection.evaluate(transformed_actions.as_ref()),
             None => Ok(transformed_actions),
@@ -553,7 +553,7 @@ impl ScanLogReplayProcessor {
         dedup_selection: Vec<bool>,
         row_transform_exprs: Vec<Option<ExpressionRef>>,
         active_add_file_sizes: Vec<u64>,
-    ) -> DeltaResult<RetryTransformAndDataSkipOutput> {
+    ) -> Result<RetryTransformAndDataSkipOutput> {
         let row_transform_exprs = dedup_selection
             .iter()
             .enumerate()
@@ -580,7 +580,7 @@ impl ScanLogReplayProcessor {
         &self,
         selection_vector: &[bool],
         active_add_file_sizes: &[u64],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         require!(
             selection_vector.len() == active_add_file_sizes.len(),
             KernelError::internal_error(format!(
@@ -636,7 +636,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         row: usize,
         getters: &[&'b dyn GetData<'b>],
         selected: bool,
-    ) -> DeltaResult<bool> {
+    ) -> Result<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
         // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
@@ -770,7 +770,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         }
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
@@ -837,7 +837,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
-) -> DeltaResult<SchemaRef> {
+) -> Result<SchemaRef> {
     let needs_extra = stats_schema.is_some() || partition_schema.is_some();
     if !needs_extra {
         return Ok(SCAN_ROW_SCHEMA.clone());
@@ -864,7 +864,7 @@ fn build_stats_output_projection(
     engine: &dyn Engine,
     input_schema: SchemaRef,
     output_stats_schema: Option<&StructType>,
-) -> DeltaResult<Option<Arc<dyn ExpressionEvaluator>>> {
+) -> Result<Option<Arc<dyn ExpressionEvaluator>>> {
     let input_stats_schema =
         input_schema
             .field(STATS_PARSED_NAME)
@@ -1020,7 +1020,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1120,7 +1120,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1233,15 +1233,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+    action_iter: impl Iterator<Item = Result<ActionsBatch>>,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> DeltaResult<(
-    impl Iterator<Item = DeltaResult<ScanMetadata>>,
-    Arc<ScanMetrics>,
-)> {
+) -> Result<(impl Iterator<Item = Result<ScanMetadata>>, Arc<ScanMetrics>)> {
     let processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
@@ -1293,8 +1290,7 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
-        DeltaResult, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef,
-        KernelError,
+        EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError, Result,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -1306,7 +1302,7 @@ mod tests {
 
     impl ExpressionEvaluator for RetryOnceEvaluator {
         /// Delays each attempt for deterministic timing, then triggers exactly one retry.
-        fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>> {
             std::thread::sleep(self.delay);
             if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
                 Err(KernelError::ParseError(
@@ -1338,7 +1334,7 @@ mod tests {
             _evaluator: &DirectPredicateEvaluator<'_>,
             _exprs: &[Expr],
             _inverted: bool,
-        ) -> DeltaResult<Option<bool>> {
+        ) -> Result<Option<bool>> {
             unimplemented!()
         }
 
@@ -1615,9 +1611,7 @@ mod tests {
     #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
     #[case::enabled(RowTrackingState::Enabled)]
     #[case::suspended(RowTrackingState::Suspended)]
-    fn test_row_commit_version_patch(
-        #[case] row_tracking_state: RowTrackingState,
-    ) -> DeltaResult<()> {
+    fn test_row_commit_version_patch(#[case] row_tracking_state: RowTrackingState) -> Result<()> {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema,
