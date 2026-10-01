@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
-use super::state_info::StateInfo;
+use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
 use super::{project_nested_struct_to_schema, PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
@@ -73,12 +73,9 @@ struct InternalScanState {
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
-    /// Physical stats schema Kernel reads and parses. It contains consumer-requested stats and
-    /// any additional stats needed by the skipping predicate.
-    physical_stats_read_schema: Option<SchemaRef>,
-    /// Physical stats schema returned to the scan consumer.
+    /// Physical statistics schemas used internally and exposed to the scan consumer.
     #[serde(default)]
-    physical_stats_output_schema: Option<SchemaRef>,
+    physical_stats_schemas: Option<ResolvedPhysicalStatsSchemas>,
     #[serde(default)]
     stats_options: ScanStatsOptions,
     #[serde(default)]
@@ -86,10 +83,9 @@ struct InternalScanState {
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
     /// Physical leaf paths eligible for data skipping. Carried alongside
-    /// `physical_stats_read_schema` so the distributed `DataSkippingFilter` rebuilds the same
-    /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
-    /// an empty set drops every data-column reference, which means no skipping but is
-    /// still correct.
+    /// `physical_stats_schemas.read` so the distributed `DataSkippingFilter` rebuilds the same
+    /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable: an empty
+    /// set drops every data-column reference, which means no skipping but is still correct.
     #[serde(default)]
     eligible_physical_stats_columns: HashSet<ColumnName>,
     /// Caller-requested physical stats columns preserved across distributed log replay.
@@ -273,7 +269,7 @@ impl ScanLogReplayProcessor {
         let stats_schema_for_transform = if skip_stats {
             None
         } else {
-            state_info.physical_stats_read_schema.clone()
+            state_info.physical_stats_read_schema().cloned()
         };
 
         // The partition schema feeds two consumers: the DataSkippingFilter (predicate
@@ -294,7 +290,7 @@ impl ScanLogReplayProcessor {
         let stats_output_projection = build_stats_output_projection(
             engine,
             output_schema.clone(),
-            state_info.physical_stats_output_schema.as_deref(),
+            state_info.physical_stats_output_schema().map(AsRef::as_ref),
         )?;
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
@@ -396,8 +392,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
-            physical_stats_read_schema,
-            physical_stats_output_schema,
+            physical_stats_schemas,
             physical_partition_schema,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
@@ -418,8 +413,7 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             column_mapping_mode,
-            physical_stats_read_schema,
-            physical_stats_output_schema,
+            physical_stats_schemas,
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
@@ -482,8 +476,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
-            physical_stats_read_schema: internal_state.physical_stats_read_schema,
-            physical_stats_output_schema: internal_state.physical_stats_output_schema,
+            physical_stats_schemas: internal_state.physical_stats_schemas,
             physical_partition_schema: internal_state.physical_partition_schema,
             eligible_physical_stats_columns: internal_state.eligible_physical_stats_columns,
             requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
@@ -1449,8 +1442,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_read_schema: None,
-            physical_stats_output_schema: None,
+            physical_stats_schemas: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1835,8 +1827,7 @@ mod tests {
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
                 column_mapping_mode: mode,
-                physical_stats_read_schema: None,
-                physical_stats_output_schema: None,
+                physical_stats_schemas: None,
                 physical_partition_schema: None,
                 eligible_physical_stats_columns: HashSet::new(),
                 requested_physical_stats_columns: Vec::new(),
@@ -1873,8 +1864,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_read_schema: None,
-            physical_stats_output_schema: None,
+            physical_stats_schemas: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1907,8 +1897,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_read_schema: None,
-            physical_stats_output_schema: None,
+            physical_stats_schemas: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1941,8 +1930,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_read_schema: None,
-            physical_stats_output_schema: None,
+            physical_stats_schemas: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1991,8 +1979,7 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_read_schema: None,
-            physical_stats_output_schema: None,
+            physical_stats_schemas: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
@@ -2025,8 +2012,7 @@ mod tests {
             predicate_schema: None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
-            physical_stats_read_schema: None,
-            physical_stats_output_schema: None,
+            physical_stats_schemas: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,

@@ -27,7 +27,7 @@ use crate::schema::{
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, KernelError, PlanBuilder};
 
 // === Internal column names ===
@@ -140,7 +140,7 @@ impl Scan {
     /// fields above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
-        let physical_stats = self.state_info.physical_stats_read_schema.as_ref();
+        let physical_stats = self.state_info.physical_stats_read_schema();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
         let source_physical_stats =
             physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
@@ -219,7 +219,7 @@ impl Scan {
                 // Commits never carry source-native parsed columns, so normalize from the raw
                 // encodings.
                 patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema.as_ref())
+                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
                     .with_parsed_add_partition_values(
                         self.state_info.physical_partition_schema.as_ref(),
                     )
@@ -240,7 +240,7 @@ impl Scan {
     }
 
     fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_read_schema = self.state_info.physical_stats_read_schema.as_ref();
+        let physical_stats_read_schema = self.state_info.physical_stats_read_schema();
         let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
         let patch = SchemaStructPatchBuilder::new()
             .fold_with(physical_stats_read_schema, |patch, schema| {
@@ -301,7 +301,7 @@ impl Scan {
 
         // Parsed stats output.
         let projection = match (
-            self.state_info.physical_stats_output_schema.as_ref(),
+            self.state_info.physical_stats_output_schema(),
             has_stats_parsed,
         ) {
             (Some(physical_stats), _) => projection.replace(
@@ -743,8 +743,8 @@ mod tests {
             .build()
             .unwrap()
             .state_info
-            .physical_stats_read_schema
-            .clone()
+            .physical_stats_read_schema()
+            .cloned()
             .expect("stats schema")
     }
 

@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -490,8 +490,9 @@ impl ScanBuilder {
 
         let stats_output_schemas =
             build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)?;
-        state_info.physical_stats_output_schema =
-            stats_output_schemas.map(|schemas| schemas.physical);
+        state_info.set_physical_stats_output_schema(
+            stats_output_schemas.map(|schemas| schemas.physical),
+        )?;
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
@@ -769,7 +770,9 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
-/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct.
+/// Builds a nested projection for the requested schema.
+///
+/// The projected struct remains null when its source struct is null.
 pub(crate) fn project_nested_struct_to_schema(
     root: impl CollectInto<ColumnName>,
     schema: &StructType,
@@ -826,7 +829,7 @@ impl Scan {
         // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
         // restores `add.stats` before opening the reader when the structured field is incompatible.
         let can_replace_json_with_structured_stats =
-            !self.stats.synthesize_json && self.state_info.physical_stats_read_schema.is_some();
+            !self.stats.synthesize_json && self.state_info.physical_stats_read_schema().is_some();
         let checkpoint_schema = if skip_stats || can_replace_json_with_structured_stats {
             CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
@@ -843,7 +846,9 @@ impl Scan {
         let physical_stats_read_schema = if skip_stats {
             None
         } else {
-            self.state_info.physical_stats_read_schema.as_deref()
+            self.state_info
+                .physical_stats_read_schema()
+                .map(AsRef::as_ref)
         };
         (
             checkpoint_schema,
@@ -1172,7 +1177,7 @@ impl Scan {
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_read_schema.is_some()
+        let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
@@ -1230,7 +1235,7 @@ impl Scan {
         // Skipping needs either data-column stats or partition values to rewrite against; a
         // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
         // unpartitioned table has no partition schema.
-        if self.state_info.physical_stats_read_schema.is_none()
+        if self.state_info.physical_stats_read_schema().is_none()
             && self.state_info.physical_partition_schema.is_none()
         {
             return None;

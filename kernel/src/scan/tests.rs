@@ -2371,7 +2371,7 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
     let scan = builder.build().unwrap();
 
     assert_eq!(
-        scan.state_info.physical_stats_output_schema.as_ref(),
+        scan.state_info.physical_stats_output_schema(),
         Some(&expected.physical)
     );
 
@@ -2430,7 +2430,7 @@ fn scan_builder_stats_output_schemas_returns_none_without_data_columns() {
     assert!(builder.stats_output_schemas().unwrap().is_none());
 
     let scan = builder.build().unwrap();
-    assert!(scan.state_info.physical_stats_output_schema.is_none());
+    assert!(scan.state_info.physical_stats_output_schema().is_none());
 }
 
 #[rstest]
@@ -2479,7 +2479,7 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
     let scan = builder.build().unwrap();
 
     assert_eq!(
-        scan.state_info.physical_stats_output_schema.as_ref(),
+        scan.state_info.physical_stats_output_schema(),
         Some(&expected.physical)
     );
     assert_stats_schemas_aligned(&expected.logical, &expected.physical);
@@ -2545,7 +2545,7 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
 
     let scan = builder.build().unwrap();
     assert_eq!(
-        scan.state_info.physical_stats_output_schema.as_ref(),
+        scan.state_info.physical_stats_output_schema(),
         Some(&schemas.physical)
     );
 }
