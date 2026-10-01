@@ -2460,13 +2460,74 @@ fn test_validate_empty_log_segment(#[case] end_version: Option<Version>) {
 fn test_validate_listed_log_file_cached_fields_match_location() {
     let mut commit = create_log_path("file:///_delta_log/00000000000000000000.json");
     commit.version = 1;
-    let err = validate_log_path_fields(&LogSegmentFiles {
-        ascending_commit_files: vec![commit.clone()],
-        latest_commit_file: Some(commit),
-        ..Default::default()
-    })
+    let err = validate_log_path_fields(
+        LogSegmentFiles {
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        }
+        .iter_all_paths(),
+    )
     .unwrap_err();
     assert!(matches!(err, KernelError::InvalidLogPath(_)));
+}
+
+#[rstest]
+#[case::no_crc(None, Some(6), None, false)]
+#[case::target_crc(Some(6), Some(6), Some(6), false)]
+#[case::crc_at_checkpoint(None, Some(6), Some(5), false)]
+#[case::crc_below_checkpoint(None, Some(6), Some(4), false)]
+#[case::crc_above_endpoint(None, Some(6), Some(7), false)]
+#[case::missing_latest_commit(None, None, None, false)]
+#[case::stale_latest_commit(None, Some(5), None, false)]
+#[case::missing_target(Some(7), Some(6), None, false)]
+#[case::older_target(Some(5), Some(6), None, false)]
+#[case::crc_fields_mismatch(None, Some(6), Some(6), true)]
+fn test_unchanged_endpoint_validation_matches_constructor(
+    #[case] requested_version: Option<Version>,
+    #[case] latest_commit_version: Option<Version>,
+    #[case] crc_version: Option<Version>,
+    #[case] mismatched_crc_fields: bool,
+) {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let commit = create_log_path("file:///_delta_log/00000000000000000006.json");
+    let segment = LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![commit.clone()],
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000005.checkpoint.parquet",
+            )],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
+        log_root.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    let latest_commit = latest_commit_version
+        .map(|version| create_log_path(&format!("file:///_delta_log/{version:020}.json")));
+    let mut crc = crc_version
+        .map(|version| create_log_path(&format!("file:///_delta_log/{version:020}.crc")));
+    if mismatched_crc_fields {
+        crc.as_mut().unwrap().version += 1;
+    }
+    let expected = LogSegment::try_new(
+        LogSegmentFiles {
+            latest_commit_file: latest_commit.clone(),
+            latest_crc_file: crc.clone(),
+            ..segment.listed.clone()
+        },
+        log_root,
+        requested_version,
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string());
+    let actual = segment
+        .validate_unchanged_endpoint(requested_version, latest_commit.as_ref(), crc.as_ref())
+        .map_err(|error| error.to_string());
+    assert_eq!(actual, expected);
 }
 
 #[test]

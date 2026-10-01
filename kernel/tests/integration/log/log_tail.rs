@@ -3,6 +3,8 @@ use std::sync::Arc;
 use delta_kernel::commit_range::CommitRange;
 use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::{KernelError, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::{
@@ -437,6 +439,301 @@ async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
     assert_eq!(range.end_version(), 4);
     assert_eq!(reporter.list_calls.get(), 1);
 
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_snapshot_retains_cached_staged_commits(
+    #[values(false, true)] with_checkpoint: bool,
+    #[values(false, true)] full_tail: bool,
+    #[values(false, true)] ignore_checkpoints: bool,
+    #[values(IncrementalReplay::Disabled, IncrementalReplay::Unlimited)] replay: IncrementalReplay,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_incremental_snapshot_retains_staged_commits(
+        with_checkpoint,
+        full_tail,
+        ignore_checkpoints,
+        replay,
+        false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_snapshot_advances_checkpoint_retains_staged_predecessor(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_incremental_snapshot_retains_staged_commits(
+        true,
+        false,
+        false,
+        IncrementalReplay::Disabled,
+        true,
+    )
+    .await
+}
+
+async fn assert_incremental_snapshot_retains_staged_commits(
+    with_checkpoint: bool,
+    full_tail: bool,
+    ignore_checkpoints: bool,
+    replay: IncrementalReplay,
+    advance_checkpoint: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test_mt();
+    let table_root = table_url.as_str();
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+    )
+    .await?;
+    if with_checkpoint {
+        Snapshot::builder_for(table_root)
+            .with_max_catalog_version(0)
+            .build(engine.as_ref())?
+            .checkpoint(engine.as_ref(), None)?;
+    }
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("file_1.parquet".into())]),
+    )
+    .await?;
+    let staged_v2 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("file_2.parquet".into())]),
+    )
+    .await?;
+    let cached_snapshot = Snapshot::builder_for(table_root)
+        .with_max_catalog_version(2)
+        .with_log_tail(vec![create_log_path(&table_url, staged_v2.clone())])
+        .build(engine.as_ref())?;
+    assert_eq!(cached_snapshot.version(), 2);
+    assert_eq!(
+        cached_snapshot.log_segment().checkpoint_version,
+        with_checkpoint.then_some(0)
+    );
+    if advance_checkpoint {
+        Snapshot::builder_for(table_root)
+            .at_version(1)
+            .with_max_catalog_version(1)
+            .build(engine.as_ref())?
+            .checkpoint(engine.as_ref(), None)?;
+    }
+    let staged_v3 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        3,
+        actions_to_string(vec![TestAction::Add("file_3.parquet".into())]),
+    )
+    .await?;
+    let full_log_tail = vec![
+        create_log_path(&table_url, staged_v2.clone()),
+        create_log_path(&table_url, staged_v3.clone()),
+    ];
+    let cold_snapshot = Snapshot::builder_for(table_root)
+        .with_max_catalog_version(3)
+        .with_log_tail(full_log_tail.clone())
+        .build(engine.as_ref())?;
+    let reporter = Arc::new(CountingReporter::new());
+    let guard = install_thread_local_metrics_reporter(reporter.clone());
+    let mut builder = Snapshot::builder_from(cached_snapshot)
+        .with_max_catalog_version(3)
+        .with_log_tail(if full_tail {
+            full_log_tail
+        } else {
+            vec![create_log_path(&table_url, staged_v3.clone())]
+        })
+        .with_incremental_crc_replay(replay);
+    if ignore_checkpoints {
+        builder = builder.skip_new_checkpoints();
+    }
+    let refreshed = builder.build(engine.as_ref())?;
+    assert_eq!(reporter.list_calls.get(), 1);
+    drop(guard);
+
+    assert_eq!(refreshed.version(), 3);
+    assert_eq!(
+        refreshed.table_configuration(),
+        cold_snapshot.table_configuration()
+    );
+    assert_eq!(refreshed.schema(), cold_snapshot.schema());
+    let segment = refreshed.log_segment();
+    let expected_checkpoint = if advance_checkpoint {
+        Some(1)
+    } else {
+        with_checkpoint.then_some(0)
+    };
+    assert_eq!(segment.checkpoint_version, expected_checkpoint);
+    assert_eq!(segment.listed.max_published_version, Some(1));
+    let mut expected_paths = Vec::new();
+    if expected_checkpoint.is_none() {
+        expected_paths.push(table_url.join(delta_path_for_version(0, "json").as_ref())?);
+    }
+    if expected_checkpoint.is_none_or(|checkpoint| checkpoint < 1) {
+        expected_paths.push(table_url.join(delta_path_for_version(1, "json").as_ref())?);
+    }
+    expected_paths.extend([
+        table_url.join(staged_v2.as_ref())?,
+        table_url.join(staged_v3.as_ref())?,
+    ]);
+    assert_eq!(
+        segment
+            .listed
+            .ascending_commit_files
+            .iter()
+            .map(|file| file.location.location.clone())
+            .collect::<Vec<_>>(),
+        expected_paths
+    );
+    assert_eq!(
+        segment
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|file| &file.location.location),
+        Some(&table_url.join(staged_v3.as_ref())?)
+    );
+    for version in [2, 3] {
+        assert!(storage
+            .head(&delta_path_for_version(version, "json"))
+            .await
+            .is_err());
+    }
+    for snapshot in [refreshed, cold_snapshot] {
+        let scan = snapshot.scan_builder().build()?;
+        let mut paths = Vec::new();
+        for metadata in scan.scan_metadata(engine.as_ref())? {
+            paths = metadata?.visit_scan_files(paths, |paths, file| paths.push(file.path))?;
+        }
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["file_1.parquet", "file_2.parquet", "file_3.parquet"]
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::staged_suffix(false, false)]
+#[case::published_predecessors(true, false)]
+#[case::empty_catalog_tail(true, true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_snapshot_retains_staged_history_across_updates(
+    #[case] publish_predecessors: bool,
+    #[case] empty_tail: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test_mt();
+    let table_root = table_url.as_str();
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+    )
+    .await?;
+    Snapshot::builder_for(table_root)
+        .with_max_catalog_version(0)
+        .build(engine.as_ref())?
+        .checkpoint(engine.as_ref(), None)?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("file_1.parquet".into())]),
+    )
+    .await?;
+    let staged_v2 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("file_2.parquet".into())]),
+    )
+    .await?;
+    let mut snapshot = Snapshot::builder_for(table_root)
+        .with_max_catalog_version(2)
+        .with_log_tail(vec![create_log_path(&table_url, staged_v2.clone())])
+        .build(engine.as_ref())?;
+    let mut expected_paths = vec![
+        table_url.join(delta_path_for_version(1, "json").as_ref())?,
+        table_url.join(staged_v2.as_ref())?,
+    ];
+
+    for target in [3, 4, 6] {
+        let cached_version = snapshot.version();
+        let mut log_tail = Vec::new();
+        if publish_predecessors {
+            for version in 2..=cached_version {
+                add_commit(
+                    table_root,
+                    storage.as_ref(),
+                    version,
+                    actions_to_string(vec![TestAction::Add(format!("file_{version}.parquet"))]),
+                )
+                .await?;
+            }
+        }
+        for version in cached_version + 1..=target {
+            let actions =
+                actions_to_string(vec![TestAction::Add(format!("file_{version}.parquet"))]);
+            let path = if empty_tail {
+                add_commit(table_root, storage.as_ref(), version, actions).await?;
+                delta_path_for_version(version, "json")
+            } else {
+                let staged =
+                    add_staged_commit(table_root, storage.as_ref(), version, actions).await?;
+                log_tail.push(create_log_path(&table_url, staged.clone()));
+                staged
+            };
+            expected_paths.push(table_url.join(path.as_ref())?);
+        }
+        let reporter = Arc::new(CountingReporter::new());
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
+        snapshot = Snapshot::builder_from(snapshot)
+            .with_max_catalog_version(target)
+            .with_log_tail(log_tail)
+            .build(engine.as_ref())?;
+        assert_eq!(reporter.list_calls.get(), 1);
+        drop(guard);
+        assert_eq!(snapshot.version(), target);
+        assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+        assert_eq!(
+            snapshot.log_segment().listed.max_published_version,
+            Some(if empty_tail {
+                target
+            } else if publish_predecessors {
+                cached_version
+            } else {
+                1
+            })
+        );
+        assert_eq!(
+            snapshot
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .iter()
+                .map(|file| file.version)
+                .collect::<Vec<_>>(),
+            (1..=target).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            snapshot
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .iter()
+                .map(|file| file.location.location.clone())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+    }
     Ok(())
 }
 

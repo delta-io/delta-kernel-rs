@@ -491,10 +491,6 @@ impl LogSegmentFiles {
         &self.checkpoint_parts
     }
 
-    pub(crate) fn latest_commit_file(&self) -> &Option<ParsedLogPath> {
-        &self.latest_commit_file
-    }
-
     /// Iterator over every listed log path across all fields.
     pub(crate) fn iter_all_paths(&self) -> impl Iterator<Item = &ParsedLogPath> {
         self.ascending_commit_files
