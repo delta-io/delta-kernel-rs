@@ -347,8 +347,6 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .collect();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
-    // Imperative metadata exposes source and predicate stats even when they were not requested.
-    // Compare only the caller-requested stats after checking the declarative schema above.
     let parsed_stats_requested = match &struct_stats {
         StructStats::None => false,
         StructStats::Columns { requested } => !requested.is_empty(),
@@ -358,28 +356,13 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         let declarative_schema = actual.first().expect("declarative metadata").schema();
         let imperative_schema = expected.first().expect("imperative metadata").schema();
         assert!(declarative_schema.field_with_name(STATS_PARSED).is_err());
-        imperative_schema
-            .field_with_name(STATS_PARSED)
-            .expect("imperative predicate stats");
+        assert!(imperative_schema.field_with_name(STATS_PARSED).is_err());
     }
-    let ignored_stats = match (stats.synthesize_json, parsed_stats_requested) {
-        (true, true) => {
-            // Both representations were requested, so the outputs are directly comparable.
-            &[][..]
-        }
-        (true, false) => {
-            // Only JSON was requested; imperative metadata also exposes predicate stats.
-            &[STATS_PARSED][..]
-        }
-        (false, true) => {
-            // Only parsed stats were requested; imperative metadata also retains source JSON.
-            &[STATS][..]
-        }
-        (false, false) => {
-            // Neither representation was requested, but imperative metadata retains source JSON
-            // and predicate-required parsed stats.
-            &[STATS, STATS_PARSED][..]
-        }
+    let ignored_stats = if stats.synthesize_json {
+        &[][..]
+    } else {
+        // Imperative metadata retains source JSON when synthesis is disabled.
+        &[STATS][..]
     };
     assert_metadata_eq(
         &actual,

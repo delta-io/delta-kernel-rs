@@ -10,7 +10,7 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, Scan};
+use super::{project_nested_struct_to_schema, PhysicalPredicate, Scan};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
@@ -23,8 +23,7 @@ use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
-    lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType,
+    lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
@@ -301,7 +300,10 @@ impl Scan {
         };
 
         // Parsed stats output.
-        let projection = match (self.physical_stats_output_schema.as_ref(), has_stats_parsed) {
+        let projection = match (
+            self.state_info.physical_stats_output_schema.as_ref(),
+            has_stats_parsed,
+        ) {
             (Some(physical_stats), _) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),
@@ -507,26 +509,6 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             (Some(_), true) | (None, _) => self,
         }
     }
-}
-
-/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct. A direct
-/// column reference would retain fields not requested by the caller.
-fn project_nested_struct_to_schema(
-    root: impl CollectInto<ColumnName>,
-    schema: &StructType,
-) -> Expr {
-    let root = root.collect_into();
-    let fields = schema.fields().map(|field| {
-        let column = root.join(&ColumnName::new([field.name()]));
-        match field.data_type() {
-            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
-            _ => Expr::from(column),
-        }
-    });
-    Expr::struct_with_nullability_from(
-        fields,
-        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
-    )
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.

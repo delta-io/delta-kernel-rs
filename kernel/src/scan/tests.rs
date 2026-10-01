@@ -2159,21 +2159,21 @@ fn test_default_stats_options_no_struct_output() {
 )]
 #[case::id_predicate_not_requested(
     StatsOptions::struct_columns(vec![column_name!("name")]),
-    &["id", "name"],
+    &["name"],
     Some(col!("id").gt(lit(400i64))),
     "name",
     &[("name_401", "name_500"), ("name_501", "name_600")],
 )]
 #[case::salary_predicate_with_multiple_requested_columns(
     StatsOptions::struct_columns(vec![column_name!("id"), column_name!("name")]),
-    &["id", "name", "salary"],
+    &["id", "name"],
     Some(col!("salary").le(lit(70_000i64))),
     "id",
     &[("1", "100"), ("101", "200")],
 )]
 #[case::salary_requested_with_different_predicate_column(
     StatsOptions::struct_columns(vec![column_name!("salary")]),
-    &["id", "salary"],
+    &["salary"],
     Some(col!("id").gt(lit(500i64))),
     "salary",
     &[("100100", "110000")],
@@ -2371,7 +2371,7 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
     let scan = builder.build().unwrap();
 
     assert_eq!(
-        scan.physical_stats_output_schema.as_ref(),
+        scan.state_info.physical_stats_output_schema.as_ref(),
         Some(&expected.physical)
     );
 
@@ -2430,7 +2430,7 @@ fn scan_builder_stats_output_schemas_returns_none_without_data_columns() {
     assert!(builder.stats_output_schemas().unwrap().is_none());
 
     let scan = builder.build().unwrap();
-    assert!(scan.physical_stats_output_schema.is_none());
+    assert!(scan.state_info.physical_stats_output_schema.is_none());
 }
 
 #[rstest]
@@ -2479,7 +2479,7 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
     let scan = builder.build().unwrap();
 
     assert_eq!(
-        scan.physical_stats_output_schema.as_ref(),
+        scan.state_info.physical_stats_output_schema.as_ref(),
         Some(&expected.physical)
     );
     assert_stats_schemas_aligned(&expected.logical, &expected.physical);
@@ -2545,7 +2545,7 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
 
     let scan = builder.build().unwrap();
     assert_eq!(
-        scan.physical_stats_output_schema.as_ref(),
+        scan.state_info.physical_stats_output_schema.as_ref(),
         Some(&schemas.physical)
     );
 }

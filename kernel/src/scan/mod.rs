@@ -20,7 +20,9 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
+use crate::expressions::{
+    column_name, ColumnName, Expression as Expr, ExpressionRef, Predicate, PredicateRef,
+};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -45,7 +47,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{FoldWithOption as _, IteratorExt};
+use crate::utils::{CollectInto, FoldWithOption as _, IteratorExt};
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
     Version,
@@ -488,7 +490,8 @@ impl ScanBuilder {
 
         let stats_output_schemas =
             build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)?;
-        let physical_stats_output_schema = stats_output_schemas.map(|schemas| schemas.physical);
+        state_info.physical_stats_output_schema =
+            stats_output_schemas.map(|schemas| schemas.physical);
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
@@ -505,7 +508,6 @@ impl ScanBuilder {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
-            physical_stats_output_schema,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
@@ -760,13 +762,30 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
-    #[allow(dead_code)] // Only used when `declarative-plans` is enabled
-    physical_stats_output_schema: Option<SchemaRef>,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+}
+
+/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct.
+pub(crate) fn project_nested_struct_to_schema(
+    root: impl CollectInto<ColumnName>,
+    schema: &StructType,
+) -> Expr {
+    let root = root.collect_into();
+    let fields = schema.fields().map(|field| {
+        let column = root.join(&ColumnName::new([field.name()]));
+        match field.data_type() {
+            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
+            _ => Expr::from(column),
+        }
+    });
+    Expr::struct_with_nullability_from(
+        fields,
+        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
+    )
 }
 
 fn build_stats_output_schemas(

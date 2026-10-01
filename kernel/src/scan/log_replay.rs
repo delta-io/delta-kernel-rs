@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+use super::{project_nested_struct_to_schema, PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -28,6 +28,7 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, ExpressionEvaluator, KernelError};
@@ -74,6 +75,9 @@ struct InternalScanState {
     column_mapping_mode: ColumnMappingMode,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
+    /// Physical stats schema returned to the scan consumer.
+    #[serde(default)]
+    physical_stats_output_schema: Option<SchemaRef>,
     #[serde(default)]
     stats_options: ScanStatsOptions,
     #[serde(default)]
@@ -165,6 +169,8 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
+    /// Narrows `stats_parsed` to the fields requested by the scan consumer.
+    stats_output_projection: Option<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -284,6 +290,11 @@ impl ScanLogReplayProcessor {
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
         )?;
+        let stats_output_projection = build_stats_output_projection(
+            engine,
+            output_schema.clone(),
+            state_info.physical_stats_output_schema.as_deref(),
+        )?;
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
@@ -339,6 +350,7 @@ impl ScanLogReplayProcessor {
                 ),
                 output_schema.into(),
             )?,
+            stats_output_projection,
             seen_file_keys,
             state_info,
             stats_options,
@@ -384,6 +396,7 @@ impl ScanLogReplayProcessor {
             transform_spec,
             column_mapping_mode,
             physical_stats_schema,
+            physical_stats_output_schema,
             physical_partition_schema,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
@@ -405,6 +418,7 @@ impl ScanLogReplayProcessor {
             predicate_schema,
             column_mapping_mode,
             physical_stats_schema,
+            physical_stats_output_schema,
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
@@ -468,6 +482,7 @@ impl ScanLogReplayProcessor {
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
+            physical_stats_output_schema: internal_state.physical_stats_output_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
             eligible_physical_stats_columns: internal_state.eligible_physical_stats_columns,
             requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
@@ -519,6 +534,16 @@ impl ScanLogReplayProcessor {
             ))
         );
         Ok((transformed, selection_vector))
+    }
+
+    fn project_stats_output(
+        &self,
+        transformed_actions: Box<dyn EngineData>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        match &self.stats_output_projection {
+            Some(projection) => projection.evaluate(transformed_actions.as_ref()),
+            None => Ok(transformed_actions),
+        }
     }
 
     fn retry_transform_and_data_skip(
@@ -830,6 +855,40 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
+/// Builds a projection when the internal stats schema differs from the consumer-facing schema.
+fn build_stats_output_projection(
+    engine: &dyn Engine,
+    input_schema: SchemaRef,
+    output_stats_schema: Option<&StructType>,
+) -> DeltaResult<Option<Arc<dyn ExpressionEvaluator>>> {
+    let input_stats_schema =
+        input_schema
+            .field(STATS_PARSED_NAME)
+            .and_then(|field| match field.data_type() {
+                DataType::Struct(schema) => Some(schema.as_ref()),
+                _ => None,
+            });
+    if input_stats_schema == output_stats_schema {
+        return Ok(None);
+    }
+
+    let projection = ProjectionStructPatchBuilder::new(&input_schema);
+    let projection = match output_stats_schema {
+        Some(schema) => projection.replace(
+            STATS_PARSED_NAME,
+            StructField::nullable(STATS_PARSED_NAME, schema.clone()),
+            project_nested_struct_to_schema([STATS_PARSED_NAME], schema),
+        ),
+        None => projection.drop_if_exists(STATS_PARSED_NAME),
+    };
+    let (output_schema, expression) = projection.build()?;
+    Ok(Some(engine.evaluation_handler().new_expression_evaluator(
+        input_schema,
+        expression,
+        output_schema.into(),
+    )?))
+}
+
 /// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
@@ -1034,6 +1093,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
+        let transformed_actions = self.project_stats_output(transformed_actions)?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
@@ -1139,6 +1199,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             }
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
+        let transformed_actions = self.project_stats_output(transformed_actions)?;
         let scan_metadata =
             ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
@@ -1388,6 +1449,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1773,6 +1835,7 @@ mod tests {
                 transform_spec: None,
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
+                physical_stats_output_schema: None,
                 physical_partition_schema: None,
                 eligible_physical_stats_columns: HashSet::new(),
                 requested_physical_stats_columns: Vec::new(),
@@ -1810,6 +1873,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1843,6 +1907,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1876,6 +1941,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            physical_stats_output_schema: None,
             physical_partition_schema: None,
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
@@ -1925,6 +1991,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            physical_stats_output_schema: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
@@ -1958,6 +2025,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            physical_stats_output_schema: None,
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,

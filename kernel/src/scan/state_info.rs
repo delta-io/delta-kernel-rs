@@ -32,6 +32,9 @@ pub(crate) struct StateInfo {
     /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) physical_stats_schema: Option<SchemaRef>,
+    /// Physical stats schema exposed to the scan consumer. Predicate-only fields present in
+    /// `physical_stats_schema` are excluded.
+    pub(crate) physical_stats_output_schema: Option<SchemaRef>,
     /// Physical partition schema with native types for `partitionValues_parsed`. Fields use
     /// physical column names (for column mapping) and are always nullable. Present when the
     /// table has partition columns and either a predicate is provided (narrowed to
@@ -522,6 +525,7 @@ impl StateInfo {
             transform_spec,
             column_mapping_mode,
             physical_stats_schema,
+            physical_stats_output_schema: None,
             physical_partition_schema,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
