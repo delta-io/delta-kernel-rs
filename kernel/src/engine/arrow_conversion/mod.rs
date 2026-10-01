@@ -27,7 +27,7 @@ use crate::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::error::Error;
+use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
@@ -574,7 +574,8 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             ArrowDataType::Decimal128(p, s) => {
                 if *s < 0 {
                     return Err(ArrowError::from_external_error(
-                        Error::invalid_decimal("Negative scales are not supported in Delta").into(),
+                        KernelError::invalid_decimal("Negative scales are not supported in Delta")
+                            .into(),
                     ));
                 };
                 DataType::decimal(*p, *s as u8)
@@ -1048,16 +1049,14 @@ mod tests {
     /// value, the round-trip to kernel should succeed (one key is kept after translation).
     #[test]
     fn test_arrow_to_kernel_matching_field_ids_succeed() {
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
-            [
+        let arrow_field =
+            ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(HashMap::from([
                 (PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string()),
                 (
                     ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
                     "42".to_string(),
                 ),
-            ]
-            .into(),
-        );
+            ]));
         let kernel = StructField::try_from_arrow(&arrow_field).unwrap();
         // The two arrow keys collapse to a single kernel `parquet.field.id` entry whose value is
         // a `Number`.
@@ -1074,16 +1073,14 @@ mod tests {
     /// other.
     #[test]
     fn test_arrow_to_kernel_conflicting_field_ids_fail() {
-        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
-            [
+        let arrow_field =
+            ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(HashMap::from([
                 (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
                 (
                     ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
                     "2".to_string(),
                 ),
-            ]
-            .into(),
-        );
+            ]));
         assert_result_error_with_message(
             StructField::try_from_arrow(&arrow_field),
             "conflicting parquet field IDs",
@@ -1124,8 +1121,10 @@ mod tests {
     /// rather than silently being dropped.
     #[test]
     fn test_try_from_arrow_invalid_inner_field_id_errors() {
-        let element_field = ArrowField::new("element", ArrowDataType::Int32, true)
-            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "oops".to_string())].into());
+        let element_field =
+            ArrowField::new("element", ArrowDataType::Int32, true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "oops".to_string()),
+            ]));
         let list_field = ArrowField::new("arr", ArrowDataType::List(Arc::new(element_field)), true);
         assert_result_error_with_message(
             StructField::try_from_arrow(&list_field),
@@ -1178,8 +1177,9 @@ mod tests {
 
     fn arc_elem_with_id(id: i32) -> Arc<ArrowField> {
         Arc::new(
-            ArrowField::new("element", ArrowDataType::Int32, true)
-                .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())].into()),
+            ArrowField::new("element", ArrowDataType::Int32, true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string()),
+            ])),
         )
     }
 }

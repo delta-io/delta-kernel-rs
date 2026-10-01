@@ -5,7 +5,7 @@ use tracing::{info, instrument};
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
 use super::Committer;
-use crate::{DeltaResult, DeltaResultIterator, Engine, Error, FileMeta, FilteredEngineData};
+use crate::{DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData, KernelError};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -54,7 +54,7 @@ impl Committer for FileSystemCommitter {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(Error::FileAlreadyExists(_)) => {
+            Err(KernelError::FileAlreadyExists(_)) => {
                 info!(
                     conflicting_version = version,
                     "Filesystem commit conflict: target version already exists"
@@ -73,7 +73,7 @@ impl Committer for FileSystemCommitter {
     /// something has gone wrong upstream.
     fn publish(&self, _engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
         if !publish_metadata.commits_to_publish().is_empty() {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "The FilesystemCommitter does not support publishing catalog commits.",
             ));
         }
@@ -91,13 +91,13 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
+    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
-    use crate::IntoEngineData;
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -127,7 +127,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
+            crate::KernelError::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 
@@ -142,10 +142,7 @@ mod tests {
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
         let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let action = metadata
-            .clone()
-            .into_engine_data(LOG_METADATA_SCHEMA.clone(), &engine)
-            .unwrap();
+        let action = create_row(&engine, LOG_METADATA_SCHEMA.clone(), metadata.clone()).unwrap();
         let commit_metadata = CommitMetadata::new(
             log_root,
             1,

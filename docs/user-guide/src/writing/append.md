@@ -54,7 +54,12 @@ let write_context = write_state.write_context_builder().build()?;
 // 4. Write Parquet file(s)
 // Assumes the table schema is: name (STRING), age (INTEGER), city (STRING)
 let batch = RecordBatch::try_new(
-    Arc::new(write_context.logical_schema().as_ref().try_into_arrow()?),
+    Arc::new(
+        write_context
+            .logical_data_schema()
+            .as_ref()
+            .try_into_arrow()?,
+    ),
     vec![
         Arc::new(StringArray::from(vec!["Dave", "Eve", "Frank"])),
         Arc::new(Int32Array::from(vec![4, 5, 6])),
@@ -71,7 +76,7 @@ txn.add_files(file_metadata);
 
 // 6. Commit
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => eprintln!("commit did not succeed"),
@@ -103,6 +108,10 @@ The builder methods:
 
 ## WriteState and BoundWriteContext
 
+If the table declares column defaults, resolve any defaults your input needs and acknowledge them
+before requesting write state. See [Column defaults](./column_defaults.md) for both Kernel-parsed
+and connector-evaluated defaults.
+
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
 
@@ -119,6 +128,24 @@ let write_context = write_state
     .build()?;
 ```
 
+If the connector input data contains materialized Row IDs or Row Commit Versions, provide their
+logical column names to the builder:
+
+```rust,ignore
+use delta_kernel::transaction::RowTrackingMetadataColumns;
+
+let write_context = write_state
+    .write_context_builder()
+    .with_row_tracking_columns(RowTrackingMetadataColumns {
+        row_id_col_name: Some("row_id"),
+        row_commit_version_col_name: Some("row_commit_version"),
+    })
+    .build()?;
+```
+
+Kernel maps each provided logical row-tracking metadata column to the corresponding physical
+column configured on the table. Row Tracking must be enabled when these options are provided.
+
 For partitioned tables, see
 [Writing to Partitioned Tables](./partitioned_writes.md).
 
@@ -128,8 +155,8 @@ For partitioned tables, see
 |--------|---------|---------|
 | `table_root_dir()` | `&Url` | The table root URL |
 | `write_dir()` | `Url` | The URL for writing files |
-| `logical_schema()` | `&SchemaRef` | The schema your logical data should conform to |
-| `physical_schema()` | `&SchemaRef` | The schema for the on-disk physical data |
+| `logical_data_schema()` | `&SchemaRef` | The schema your connector input data must conform to when using this write context |
+| `physical_data_schema()` | `&SchemaRef` | The schema for the data written to Parquet |
 | `logical_to_physical()` | `ExpressionRef` | Expression that transforms logical data to physical |
 | `column_mapping_mode()` | `ColumnMappingMode` | The column mapping mode for this table |
 | `stats_columns()` | `&[ColumnName]` | Columns that should have statistics collected |
@@ -138,7 +165,7 @@ For partitioned tables, see
 ## Writing Parquet files
 
 Start with the logical `data: EngineData` you want to write. Its schema should conform to
-`write_context.logical_schema()`.
+`write_context.logical_data_schema()`.
 
 ### Using `DefaultEngine`
 
@@ -172,9 +199,9 @@ If you do not use `DefaultEngine`, write the files yourself. The expected flow i
 
 // 1. Transform logical data into physical data
 let evaluator = engine.evaluation_handler().new_expression_evaluator(
-    write_context.logical_schema().clone(),
+    write_context.logical_data_schema().clone(),
     write_context.logical_to_physical(),
-    write_context.physical_schema().clone().into(),
+    write_context.physical_data_schema().clone().into(),
 )?;
 let physical_data = evaluator.evaluate(data.as_ref())?;
 
@@ -197,7 +224,7 @@ You can call `add_files` multiple times to write multiple files in one transacti
 
 ```rust,ignore
 match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         println!("Committed version {}", committed.commit_version());
     }
     _ => {
@@ -207,10 +234,10 @@ match txn.commit(&engine)? {
 ```
 
 > [!NOTE]
-> `commit()` returns a `CommitResult` with three variants: `CommittedTransaction` on success,
-> `ConflictedTransaction` if another writer committed first, and `RetryableTransaction` for
-> transient IO errors. Automatic conflict resolution is not yet supported. A blind append to
-> a table with no concurrent writers always succeeds.
+> `commit()` returns a `CommitResult` with three variants: `Committed` on success, `Conflicted` if
+> another writer committed first, and `Retryable` for transient IO errors. Automatic conflict
+> resolution is not yet supported. A blind append to a table with no concurrent writers always
+> succeeds.
 
 ## Blind appends
 
@@ -286,7 +313,7 @@ snapshot and post-commit statistics:
 
 ```rust,ignore
 let committed = match txn.commit(&engine)? {
-    CommitResult::CommittedTransaction(c) => c,
+    CommitResult::Committed(c) => c,
     _ => panic!("unexpected result"),
 };
 

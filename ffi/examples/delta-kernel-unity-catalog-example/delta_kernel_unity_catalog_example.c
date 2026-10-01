@@ -171,10 +171,10 @@ int main(int argc, char* argv[])
 
     // Get the default engine
     KernelStringSlice table_path_slice = { .ptr = table_path, .len = strlen(table_path) };
-    ExternResultEngineBuilder engine_builder_res =
+    ExternResultHandleExclusiveEngineBuilder engine_builder_res =
         get_engine_builder(table_path_slice, allocate_error);
 
-    if (engine_builder_res.tag != OkEngineBuilder) {
+    if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);
         free_error((Error*)engine_builder_res.err);
         free_uc_committer(uc_committer);
@@ -182,7 +182,7 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    EngineBuilder* engine_builder = engine_builder_res.ok;
+    HandleExclusiveEngineBuilder engine_builder = engine_builder_res.ok;
     ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
 
     if (engine_res.tag != OkHandleSharedExternEngine) {
@@ -195,8 +195,8 @@ int main(int argc, char* argv[])
 
     SharedExternEngine* engine = engine_res.ok;
 
-    ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
-    if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+    ExternResultHandleExclusiveSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
+    if (snapshot_builder_res.tag != OkHandleExclusiveSnapshotBuilder) {
       print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
       free_error((Error*)snapshot_builder_res.err);
       free_engine(engine);
@@ -206,7 +206,8 @@ int main(int argc, char* argv[])
     }
     // The test table is catalog-managed, so we must set the max catalog version.
     // Version 0 is the only commit on disk (staged commits are not loaded here).
-    snapshot_builder_set_max_catalog_version(&snapshot_builder_res.ok, 0);
+    snapshot_builder_res.ok =
+        snapshot_builder_with_max_catalog_version(snapshot_builder_res.ok, 0);
     ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);

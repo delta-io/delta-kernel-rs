@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, MapArray, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, MapArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
@@ -236,18 +236,78 @@ async fn v3_invalid_type_change_blocks_writes_but_not_snapshot_loading() {
     );
 }
 
-#[rstest::rstest]
-#[case::missing_num_records(None/* num_records */, Err("'stats.numRecords' is required"))]
-#[case::with_num_records(Some(3), Ok(1))]
 #[tokio::test]
-async fn v3_commit_validates_num_records(
-    #[case] num_records: Option<i64>,
-    #[case] expected: Result<u64, &'static str>,
+async fn v2_and_deletion_vectors_active_blocks_writes() {
+    let (storage, engine) = make_default_engine_and_store();
+    let schema = schema! {
+        (StructField::nullable("id", DataType::INTEGER).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::from(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::from("col-1"),
+            ),
+        ])),
+    };
+    let schema_string = serde_json::to_string(&schema).unwrap();
+    let commit = [
+        serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping", "deletionVectors"],
+                "writerFeatures": ["icebergCompatV2", "columnMapping", "deletionVectors"],
+            }
+        }),
+        serde_json::json!({
+            "metaData": {
+                "id": "deadbeef-1234-5678-abcd-000000000003",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableIcebergCompatV2": "true",
+                    "delta.enableDeletionVectors": "true",
+                    "delta.columnMapping.mode": "name",
+                    "delta.columnMapping.maxColumnId": "1",
+                },
+                "createdTime": 1234567890000_i64,
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|action| serde_json::to_string(&action).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+    add_commit(TABLE_ROOT, storage.as_ref(), 0, commit)
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for(TABLE_ROOT)
+        .build(engine.as_ref())
+        .unwrap();
+    let err = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("icebergCompatV2") && err.contains("deletionVectors"),
+        "expected V2/deletion-vector conflict, got: {err}",
+    );
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn iceberg_compat_commit_validates_num_records(
+    #[values("delta.enableIcebergCompatV2", "delta.enableIcebergCompatV3")] feature_property: &str,
+    #[values(None, Some(3))] num_records: Option<i64>,
 ) {
     let (_, engine) = make_default_engine_and_store();
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
-        .with_table_properties([("delta.enableIcebergCompatV3", "true")])
+        .with_table_properties([(feature_property, "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap()
         .commit(engine.as_ref())
@@ -268,19 +328,85 @@ async fn v3_commit_validates_num_records(
     .unwrap();
     txn.add_files(add_files);
 
-    match expected {
-        Ok(expected_version) => {
-            let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
-            assert_eq!(committed.commit_version(), expected_version);
-        }
-        Err(needle) => {
-            let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
-            assert!(
-                err.contains(needle) && err.contains("part-fake.parquet"),
-                "expected error containing {needle:?} and 'part-fake.parquet', got: {err}",
-            );
-        }
+    if num_records.is_some() {
+        let committed = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
+        assert_eq!(committed.commit_version(), 1);
+    } else {
+        let err = txn.commit(engine.as_ref()).unwrap_err().to_string();
+        assert!(
+            err.contains("'stats.numRecords' is required") && err.contains("part-fake.parquet"),
+            "expected missing numRecords error for part-fake.parquet, got: {err}",
+        );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_partitioned_write_materializes_partition_and_nested_field_ids() {
+    let (_tmp_dir, table_path, _) = test_table_setup_mt().unwrap();
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+    let schema = schema_ref! {
+        nullable "region": STRING,
+        nullable "id": INTEGER,
+        nullable "data": { INTEGER => nullable [nullable INTEGER] },
+    };
+    let snapshot = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.enableIcebergCompatV2", "true")])
+        .with_data_layout(DataLayout::partitioned(["region"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(engine.as_ref())
+        .unwrap()
+        .unwrap_post_commit_snapshot();
+
+    let data_schema = schema! {
+        nullable "id": INTEGER,
+        nullable "data": { INTEGER => nullable [nullable INTEGER] },
+    };
+    let arrow_schema: ArrowSchema = (&data_schema).try_into_arrow().unwrap();
+    let data_type = arrow_schema.field_with_name("data").unwrap().data_type();
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow_schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            new_null_array(data_type, 3),
+        ],
+    )
+    .unwrap();
+    let partition_values =
+        HashMap::from([("region".to_string(), Scalar::String("west".to_string()))]);
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values)
+        .await
+        .unwrap();
+
+    let add_actions = read_add_infos(&snapshot, engine.as_ref()).unwrap();
+    assert_eq!(add_actions.len(), 1);
+    let parquet_url = table_url.join(&add_actions[0].path).unwrap();
+    let local_path = parquet_url.to_file_path().unwrap();
+    let parquet_ids = collect_all_parquet_field_ids(&local_path);
+    let logical_schema = snapshot.schema();
+    verify_column_mapping_ids_in_parquet(
+        logical_schema.as_ref(),
+        ColumnMappingMode::Name,
+        &parquet_ids,
+        &parquet_url,
+        6,
+    );
+
+    let region_physical =
+        get_top_level_physical_name(logical_schema.as_ref(), "region", ColumnMappingMode::Name);
+    let parquet_schema = read_parquet_root_schema(&local_path);
+    assert!(
+        find_top_level_field_in_parquet(&parquet_schema, &region_physical).is_some(),
+        "partition column `region` (physical {region_physical}) not materialized in {parquet_url}",
+    );
 }
 
 /// V3 partitioned end-to-end: create + 8 commits with a checkpoint in the middle, then validate

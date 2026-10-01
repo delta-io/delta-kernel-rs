@@ -5,12 +5,12 @@
 //! docs for why (expression-level functions fold into composite opaque predicates).
 use std::ffi::c_void;
 
-use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp};
-use delta_kernel::{Expression, Predicate};
+use delta_kernel::expressions::{MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp};
+use delta_kernel::{DeltaResult, Expression, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::handle::Handle;
-use crate::{kernel_string_slice, KernelStringSlice};
+use crate::{kernel_string_slice, KernelStringSlice, OptionalValue};
 
 pub mod engine_visitor;
 pub mod kernel_visitor;
@@ -29,6 +29,37 @@ pub struct SharedExpression;
 
 #[handle_descriptor(target=Predicate, mutable=false, sized=true)]
 pub struct SharedPredicate;
+
+/// Borrowed FFI representation of map-to-struct options.
+///
+/// Any string slice is valid only for the duration of the call or callback receiving this value.
+#[repr(C)]
+pub struct FfiMapToStructOptions {
+    /// Reader timezone for offset-less timestamps, or `None` for UTC.
+    pub timestamp_timezone: OptionalValue<KernelStringSlice>,
+}
+
+impl FfiMapToStructOptions {
+    pub(crate) fn from_kernel(options: &MapToStructOptions) -> Self {
+        let timestamp_timezone = options.timestamp_timezone();
+        Self {
+            timestamp_timezone: timestamp_timezone
+                .map(|timezone| kernel_string_slice!(timezone))
+                .into(),
+        }
+    }
+
+    unsafe fn try_to_kernel(&self) -> DeltaResult<MapToStructOptions> {
+        let timestamp_timezone = Option::<&KernelStringSlice>::from(&self.timestamp_timezone)
+            .map(|timezone| unsafe { timezone.try_to_string() })
+            .transpose()?;
+        Ok(
+            timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+                MapToStructOptions::default().with_timestamp_timezone(timezone)
+            }),
+        )
+    }
+}
 
 #[handle_descriptor(target=dyn OpaquePredicateOp, mutable=false, sized=false)]
 pub struct SharedOpaquePredicateOp;

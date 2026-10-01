@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
-use crate::actions::get_commit_schema;
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
@@ -135,7 +134,7 @@ pub(crate) fn add_batch_with_remove_and_partition(
 }
 
 // add batch with a `date` partition col
-pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
+pub(crate) fn add_batch_with_partition_col(output_schema: SchemaRef) -> Box<ArrowEngineData> {
     parse_batch(
         [
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
@@ -143,7 +142,7 @@ pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
         ],
-        get_commit_schema().clone(),
+        output_schema,
     )
 }
 

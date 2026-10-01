@@ -315,6 +315,10 @@ Keep this list updated when new protocol features are added to kernel.
   block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
   warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
+- **Keep tests with process-global state safe under concurrency:** `cargo test` runs tests as
+  parallel threads in one test binary, while nextest normally runs each test in a separate
+  process. Tests for global tracing subscribers and callbacks must not share capture buffers with
+  thread-local dispatch tests or assume no other thread can emit an event.
 
 ## Code Style
 
@@ -324,6 +328,10 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
   for patterns with bindings or guards. For example: `self == Variant` not
   `matches!(self, Variant)`.
+- Prefer `#[repr(C)]` enums for closed FFI choice sets instead of integer aliases and constants.
+  Add `cbindgen:prefix-with-name=true` so generated variants remain unambiguous. Use an integer
+  discriminator only when unknown values are intentionally recoverable, and validate them at the
+  boundary. Invalid enum tags are undefined behavior, so unsafe FFI APIs must require valid tags.
 - Prefer `StructField::nullable` / `StructField::not_null` over
   `StructField::new(name, type, bool)` when nullability is known at compile time.
   Reserve `StructField::new` for cases where nullability is a runtime value.
@@ -420,5 +428,5 @@ Read these when relevant to the task at hand:
 **Keeping docs current:** If you notice renamed structs, traits, functions, modules, crates, APIs,
 stale data flows, or wrong file paths in these docs,
 inform the user so they can be updated. After major changes, update this file,
-`CLAUDE/architecture.md`, `ffi/CLAUDE.md`, `.github/CLAUDE.md`, and any relevant
+`CLAUDE/architecture.md`, `ffi/AGENTS.md`, `.github/CLAUDE.md`, and any relevant
 `<crate>/CLAUDE.md` files.

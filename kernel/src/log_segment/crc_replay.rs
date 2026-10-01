@@ -36,7 +36,7 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
+use crate::{DeltaResult, Engine, FileMeta, KernelError, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -120,7 +120,12 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
-    #[instrument(name = "log_seg.build_crc_from_base", skip_all, err)]
+    #[instrument(
+        name = "log_seg.build_crc_from_base",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
@@ -154,8 +159,8 @@ impl LogSegment {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
-        // No commit boundaries here, so the delta stays incremental-safe. It covers the full
-        // table, which `into_complete_crc` turns into a Complete CRC.
+        // The checkpoint covers the full table, so `into_complete_crc` produces a Complete CRC.
+        // Invalid Add sizes mark replay unsafe and degrade its file stats to `Indeterminate`.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
@@ -188,21 +193,16 @@ impl LogSegment {
     ) -> DeltaResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
-            Error::internal_error("build_crc_from_version_zero called with a checkpoint present")
+            KernelError::internal_error(
+                "build_crc_from_version_zero called with a checkpoint present"
+            )
         );
         let Some(first) = self.listed.ascending_commit_files.first() else {
             return Ok(None);
         };
         // A log with no checkpoint must start at version 0; a higher first version means a table
         // truncated without a checkpoint.
-        require!(
-            first.version == 0,
-            Error::generic(format!(
-                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
-                 (expected 0); the log appears truncated without a checkpoint",
-                first.version
-            ))
-        );
+        require!(first.version == 0, KernelError::MissingVersion(0));
         let delta = self.replay_commits_into_crc_delta(
             engine,
             self.listed.ascending_commit_files.iter(),
@@ -225,7 +225,7 @@ impl LogSegment {
     ) -> DeltaResult<CrcDelta> {
         require!(
             base_version < self.end_version,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "build_crc_delta_from_base: base_version ({}) must be strictly less \
                  than end_version ({})",
                 base_version, self.end_version,
@@ -242,7 +242,7 @@ impl LogSegment {
         let first_above = deltas.first().map(|c| c.version);
         require!(
             first_above == Some(base_version + 1),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "build_crc_delta_from_base: segment is missing commit {} \
                  (lowest commit above base_version is {:?})",
                 base_version + 1,
@@ -396,10 +396,13 @@ impl CrcReplayAccumulator {
         if !self.delta.is_incremental_safe {
             return Ok(());
         }
+        if size < 0 {
+            warn!("CRC reverse-replay: add action has negative size {size}");
+            self.delta.is_incremental_safe = false;
+            return Ok(());
+        }
         let fs = &mut self.delta.file_stats;
         fs.gross_add_files += 1;
-        // TODO(#2676): a negative size errors here and fails the snapshot load; degrade to
-        //              Indeterminate instead, like a missing remove size.
         fs.gross_add_bytes += size_to_u64(size)?;
         if let Some(hist) = fs.net_histogram.as_mut() {
             hist.insert(size)?;
@@ -418,6 +421,10 @@ impl CrcReplayAccumulator {
             return Ok(());
         }
         match size {
+            Some(s) if s < 0 => {
+                warn!("CRC reverse-replay: remove action at {path} has negative size {s}");
+                self.delta.is_incremental_safe = false;
+            }
             Some(s) => {
                 let fs = &mut self.delta.file_stats;
                 fs.gross_remove_files += 1;
@@ -553,7 +560,7 @@ fn check_visitor_getters(
     let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
     require!(
         getters.len() == n_fixed + n_protocol_leaves + n_metadata_leaves,
-        Error::internal_error(format!(
+        KernelError::internal_error(format!(
             "Wrong number of {visitor_name} getters: {}",
             getters.len()
         ))
@@ -743,6 +750,14 @@ mod tests {
         assert!(acc.delta.is_incremental_safe);
     }
 
+    #[test]
+    fn on_add_negative_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        acc.on_add(-1).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
     // ===== remove =====
 
     #[test]
@@ -758,6 +773,14 @@ mod tests {
     fn on_remove_missing_size_trips_is_incremental_safe() {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.on_remove("p", None).unwrap();
+        assert!(!acc.delta.is_incremental_safe);
+        assert!(acc.current_commit_saw_file_action);
+    }
+
+    #[test]
+    fn on_remove_negative_size_trips_is_incremental_safe() {
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        acc.on_remove("p", Some(-1)).unwrap();
         assert!(!acc.delta.is_incremental_safe);
         assert!(acc.current_commit_saw_file_action);
     }
@@ -1064,9 +1087,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_result_error_with_message(
+        assert!(matches!(
             segment.build_crc_from_version_zero(&engine),
-            "log appears truncated without a checkpoint",
-        );
+            Err(KernelError::MissingVersion(0))
+        ));
     }
 }

@@ -34,12 +34,13 @@ use crate::table_features::{
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, IcebergCompatValidationContext, KernelSupport, Operation, TableFeature,
     LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V2_VALIDATOR,
+    V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{DeltaResult, Error, Version};
+use crate::{DeltaResult, KernelError, Version};
 
 /// Expected schema for file statistics, using physical column names.
 ///
@@ -79,13 +80,13 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(Error::generic(format!(
+            return Err(KernelError::generic(format!(
                 "Duplicate partition column: '{col}'"
             )));
         }
         require!(
             logical_schema.field(col).is_some(),
-            Error::generic(format!("Partition column '{col}' not found in schema"))
+            KernelError::generic(format!("Partition column '{col}' not found in schema"))
         );
     }
     Ok(())
@@ -221,7 +222,17 @@ impl TableConfiguration {
 
         validate_partition_columns(&table_config.metadata, &table_config.logical_schema)?;
 
-        // TODO(#3240): Validate row-tracking table configuration invariants here.
+        // The protocol does not define behavior when row tracking is both enabled and suspended.
+        // Although row tracking is a writer-only feature, Kernel scans can read stable row IDs and
+        // row commit versions. As a conservative choice, reject such tables for both reads and
+        // writes.
+        require!(
+            !(table_config.table_properties.enable_row_tracking == Some(true)
+                && table_config.is_row_tracking_suspended()),
+            KernelError::invalid_protocol(
+                "Row tracking cannot be enabled and suspended at the same time"
+            )
+        );
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
@@ -234,6 +245,11 @@ impl TableConfiguration {
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
+        validate_iceberg_compat_if_needed(
+            &table_config,
+            &V2_VALIDATOR,
+            IcebergCompatValidationContext::TableConfiguration,
+        )?;
         validate_iceberg_compat_if_needed(
             &table_config,
             &V3_VALIDATOR,
@@ -516,15 +532,17 @@ impl TableConfiguration {
     }
 
     /// Whether partition column values must be materialized into data files.
-    /// Returns true when either:
+    /// Returns true when:
     ///   * The [`MaterializePartitionColumns`] writer feature is enabled, or
-    ///   * [`IcebergCompatV3`] is enabled
+    ///   * [`IcebergCompatV2`] or [`IcebergCompatV3`] is enabled
     ///
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`IcebergCompatV2`]: crate::table_features::TableFeature::IcebergCompatV2
     /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
     pub(crate) fn should_materialize_partition_columns(&self) -> bool {
-        // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
+        // TODO(#1125): add IcebergCompatV1 here when it is supported.
         self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV2)
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
@@ -614,7 +632,7 @@ impl TableConfiguration {
                 FeatureRequirement::Supported(dep) => {
                     require!(
                         self.is_feature_supported(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be supported"
                         ))
                     );
@@ -622,7 +640,7 @@ impl TableConfiguration {
                 FeatureRequirement::Enabled(dep) => {
                     require!(
                         self.is_feature_enabled(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be enabled"
                         ))
                     );
@@ -630,7 +648,7 @@ impl TableConfiguration {
                 FeatureRequirement::NotSupported(dep) => {
                     require!(
                         !self.is_feature_supported(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be supported"
                         ))
                     );
@@ -638,7 +656,7 @@ impl TableConfiguration {
                 FeatureRequirement::NotEnabled(dep) => {
                     require!(
                         !self.is_feature_enabled(dep),
-                        Error::invalid_protocol(format!(
+                        KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be enabled"
                         ))
                     );
@@ -662,7 +680,7 @@ impl TableConfiguration {
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(Error::unsupported(format!(
+                return Err(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
                 )))
             }
@@ -707,12 +725,14 @@ impl TableConfiguration {
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
     /// the protocol's features are all supported for the requested operation type.
     ///
-    /// - For `Scan` and `Cdf` operations: checks reader version and reader features
+    /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
         match operation {
-            Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
+            Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
+                self.ensure_read_supported(operation)
+            }
             Operation::Write => self.ensure_write_supported(),
         }
     }
@@ -723,7 +743,7 @@ impl TableConfiguration {
         self.ensure_operation_supported(Operation::Write)
     }
 
-    /// Internal helper for read operations (Scan, Cdf)
+    /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
         check_reader_version_range(&self.protocol)?;
 
@@ -741,14 +761,14 @@ impl TableConfiguration {
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
+            KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_writer_version()
             ))
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(Error::unsupported(format!(
+            return Err(KernelError::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
             )));
@@ -764,7 +784,7 @@ impl TableConfiguration {
         if self.is_feature_supported(&TableFeature::Invariants)
             && schema_has_invariants(self.logical_schema.as_ref())
         {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Column invariants are not yet supported",
             ));
         }
@@ -795,10 +815,10 @@ impl TableConfiguration {
             (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled {
                 enablement: Some((version, timestamp)),
             }),
-            (Some(_), None) => Err(Error::generic(
+            (Some(_), None) => Err(KernelError::generic(
                 "In-commit timestamp enabled, but enablement timestamp is missing",
             )),
-            (None, Some(_)) => Err(Error::generic(
+            (None, Some(_)) => Err(KernelError::generic(
                 "In-commit timestamp enabled, but enablement version is missing",
             )),
             // If InCommitTimestamps was enabled at the beginning of the table's history,
@@ -819,15 +839,13 @@ impl TableConfiguration {
             .unwrap_or(false)
     }
 
-    /// Returns `true` if row tracking information should be written for this table.
+    /// Returns `true` if fresh Row IDs and fresh Row Commit Versions should be assigned for
+    /// this table.
     ///
-    /// Row tracking information should be written when:
+    /// Fresh Row IDs and fresh Row Commit Versions should be assigned when:
     /// - Row tracking is supported
     /// - Row tracking is not suspended
-    ///
-    /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
-    /// preserve row IDs and row commit versions yet.
-    pub(crate) fn should_write_row_tracking(&self) -> bool {
+    pub(crate) fn should_assign_fresh_row_tracking_metadata(&self) -> bool {
         self.is_feature_supported(&TableFeature::RowTracking) && !self.is_row_tracking_suspended()
     }
 
@@ -918,23 +936,13 @@ impl TableConfiguration {
     /// Returns true when the table requires every AddFile to carry a non-null
     /// `stats.numRecords`.
     pub(crate) fn requires_stats_num_records(&self) -> bool {
-        // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
-        self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+        self.is_feature_enabled(&TableFeature::IcebergCompatV2)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
-    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
-    /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
     pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
-        // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is
-        // technically redundant. Just be conservative here to check both.
-        if self.should_write_row_tracking() {
-            return Err(Error::unsupported(
-                "Remove actions are not yet supported on tables with rowTracking supported \
-                 and not suspended",
-            ));
-        }
         if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
@@ -961,7 +969,7 @@ mod test {
     use crate::table_properties::{
         TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-        ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
+        ENABLE_ROW_TRACKING,
     };
     use crate::unit_test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -970,7 +978,7 @@ mod test {
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
     };
-    use crate::Error;
+    use crate::KernelError;
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
@@ -1103,7 +1111,9 @@ mod test {
                     .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
                     .with_protocol(MockProtocolBuilder::new().with_versions(1, 8).build())
                     .build(),
-                Err(Error::unsupported("Unsupported minimum writer version 8")),
+                Err(KernelError::unsupported(
+                    "Unsupported minimum writer version 8",
+                )),
             ),
             // Column mapping is now supported for writes.
             (
@@ -1232,7 +1242,7 @@ mod test {
         assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(matches!(
             table_config.in_commit_timestamp_enablement(),
-            Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
+            Err(KernelError::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
         ));
     }
     #[test]
@@ -1481,7 +1491,13 @@ mod test {
             UnknownFeatureShape::ReaderWriter
         )]
         shape: UnknownFeatureShape,
-        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+        #[values(
+            Operation::SnapshotLoad,
+            Operation::Scan,
+            Operation::Cdf,
+            Operation::Write
+        )]
+        operation: Operation,
     ) {
         let (_, config) = create_unknown_feature_config(shape);
         let expected_ok = match shape {
@@ -1731,6 +1747,9 @@ mod test {
     #[test]
     fn test_ensure_operation_supported_reads() {
         let config = MockTableConfigurationBuilder::new().build();
+        assert!(config
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .is_ok());
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
@@ -1768,7 +1787,26 @@ mod test {
                 .build();
             assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
             assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+            assert!(config
+                .ensure_operation_supported(Operation::SnapshotLoad)
+                .is_ok());
         }
+    }
+
+    #[test]
+    fn snapshot_load_validates_reader_feature_requirements() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::CatalogManaged])
+                    .build(),
+            )
+            .build();
+
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::SnapshotLoad),
+            "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
+        );
     }
 
     #[test]
@@ -1815,10 +1853,15 @@ mod test {
 
     #[cfg(not(feature = "geo-type-in-dev"))]
     #[rstest]
-    #[case::scan(Operation::Scan)]
-    #[case::cdf(Operation::Cdf)]
-    #[case::write(Operation::Write)]
-    fn test_geospatial_not_supported_without_cargo_feature(#[case] operation: Operation) {
+    fn test_geospatial_not_supported_without_cargo_feature(
+        #[values(
+            Operation::SnapshotLoad,
+            Operation::Scan,
+            Operation::Cdf,
+            Operation::Write
+        )]
+        operation: Operation,
+    ) {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
@@ -1829,6 +1872,22 @@ mod test {
         assert_result_error_with_message(
             config.ensure_operation_supported(operation),
             "Feature 'geospatial' is not supported",
+        );
+    }
+
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    #[test]
+    fn snapshot_load_rejects_adaptive_metadata_without_cargo_feature() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AdaptiveMetadataPreview])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::SnapshotLoad),
+            "Feature 'adaptiveMetadata-preview' is not supported",
         );
     }
 
@@ -2727,6 +2786,13 @@ mod test {
         all_adaptive_metadata_deps(),
         Some("requires 'inCommitTimestamp' to be enabled")
     )]
+    // adaptiveMetadata and v2Checkpoint are mutually exclusive -> the NotSupported arm fires.
+    #[case::v2_checkpoint_supported_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        adaptive_metadata_deps_with(TableFeature::V2Checkpoint),
+        Some("requires 'v2Checkpoint' to not be supported")
+    )]
     fn test_adaptive_metadata_feature_requirements(
         #[case] props: Vec<(&str, &str)>,
         #[case] cm_mode: Option<ColumnMappingMode>,
@@ -2803,6 +2869,14 @@ mod test {
             .collect()
     }
 
+    /// The full set of adaptiveMetadata-preview dependencies plus `extra`, to drive the
+    /// "conflicting feature must not be supported" requirement checks.
+    fn adaptive_metadata_deps_with(extra: TableFeature) -> Vec<TableFeature> {
+        let mut deps = all_adaptive_metadata_deps();
+        deps.push(extra);
+        deps
+    }
+
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
     #[rstest]
     #[case::v1_rejects_v2(
@@ -2875,28 +2949,169 @@ mod test {
         );
     }
 
-    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
-    /// and not _suspended_, which is broader than _enabled_.
+    // V2's feature_requirements: ColumnMapping enabled, and V1/V3/DeletionVectors not enabled.
     #[rstest]
-    #[case::supported_only(&[], Some("rowTracking"))]
-    #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
-    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
-    fn test_validate_feature_support_for_remove_row_tracking(
+    #[case::column_mapping_not_supported(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        None,
+        vec![],
+        vec![TableFeature::IcebergCompatV2],
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    #[case::column_mapping_mode_none(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some(ColumnMappingMode::None),
+        vec![TableFeature::ColumnMapping],
+        vec![TableFeature::IcebergCompatV2, TableFeature::ColumnMapping],
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    #[case::with_iceberg_compat_v1_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true"), (ENABLE_ICEBERG_COMPAT_V1, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV2,
+            TableFeature::IcebergCompatV1,
+            TableFeature::ColumnMapping,
+        ],
+        Some("requires 'icebergCompatV1' to not be enabled"),
+    )]
+    #[case::with_iceberg_compat_v3_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV2,
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV3' to not be enabled"),
+    )]
+    #[case::with_deletion_vectors_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true"), (ENABLE_DELETION_VECTORS, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping, TableFeature::DeletionVectors],
+        vec![
+            TableFeature::IcebergCompatV2,
+            TableFeature::ColumnMapping,
+            TableFeature::DeletionVectors,
+        ],
+        Some("requires 'deletionVectors' to not be enabled"),
+    )]
+    #[case::all_satisfied_cm_name_mode(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![TableFeature::IcebergCompatV2, TableFeature::ColumnMapping],
+        None,
+    )]
+    #[case::all_satisfied_cm_id_mode(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true")],
+        Some(ColumnMappingMode::Id),
+        vec![TableFeature::ColumnMapping],
+        vec![TableFeature::IcebergCompatV2, TableFeature::ColumnMapping],
+        None,
+    )]
+    fn test_iceberg_compat_v2_feature_requirements(
         #[case] props: &[(&str, &str)],
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] reader_features: Vec<TableFeature>,
+        #[case] writer_features: Vec<TableFeature>,
         #[case] expected_error_substring: Option<&str>,
     ) {
         let config = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_for_column_mapping(cm_mode))
             .with_properties(props)
+            .with_column_mapping(cm_mode)
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_features([TableFeature::RowTracking])
+                    .with_reader_features(&reader_features)
+                    .with_writer_features(&writer_features)
+                    .build(),
+            )
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV2);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    /// A table that enables IcebergCompatV2 with a column whose type is outside V2's allow-list
+    #[test]
+    fn test_iceberg_compat_v2_rejects_unsupported_type_at_load() {
+        let result = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { nullable "maybe": VOID })
+            .with_properties([(ENABLE_ICEBERG_COMPAT_V2, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IcebergCompatV2])
+                    .build(),
+            )
+            .try_build();
+        assert_result_error_with_message(result, "does not support type");
+    }
+
+    /// IcebergCompatV2 implies partition-column materialization and the `numRecords` stat
+    /// requirement, matching V3.
+    #[test]
+    fn test_iceberg_compat_v2_implies_materialization_and_num_records() {
+        let v2 = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_flat_with_column_mapping())
+            .with_properties([(ENABLE_ICEBERG_COMPAT_V2, "true")])
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([TableFeature::ColumnMapping])
+                    .with_writer_features([
+                        TableFeature::IcebergCompatV2,
+                        TableFeature::ColumnMapping,
+                    ])
+                    .build(),
+            )
+            .build();
+        assert!(v2.should_materialize_partition_columns());
+        assert!(v2.requires_stats_num_records());
+
+        let plain = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_flat())
+            .build();
+        assert!(!plain.should_materialize_partition_columns());
+        assert!(!plain.requires_stats_num_records());
+    }
+
+    #[rstest]
+    #[case::iceberg_compat_v3_supported(&[], None)]
+    #[case::iceberg_compat_v3_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some("icebergCompatV3"),
+    )]
+    fn validate_feature_support_for_remove_respects_iceberg_compat_v3_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expected_error: Option<&str>,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IcebergCompatV3, TableFeature::RowTracking])
                     .build(),
             )
             .build();
         let result = config.validate_feature_support_for_remove();
-        match expected_error_substring {
-            Some(msg) => assert_result_error_with_message(result, msg),
-            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            assert!(result.is_ok(), "expected Ok, got {result:?}");
         }
     }
 }

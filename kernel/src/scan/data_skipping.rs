@@ -10,8 +10,8 @@ use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
     col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
-    Scalar,
+    ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
+    Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -22,7 +22,9 @@ use crate::scan::metrics::ScanMetrics;
 use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
+use crate::{
+    Engine, EngineData, ExpressionEvaluator, KernelError, PredicateEvaluator, RowVisitor as _,
+};
 
 pub(crate) mod stats_schema;
 #[cfg(test)]
@@ -273,7 +275,10 @@ impl DataSkippingFilter {
             col!("add.stats"),
             physical_stats_schema.clone(),
         ));
-        let partition_expr = Arc::new(Expr::map_to_struct(col!("add.partitionValues")));
+        let partition_expr = Arc::new(Expr::map_to_struct(
+            col!("add.partitionValues"),
+            MapToStructOptions::default(),
+        ));
         let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(
             engine,
@@ -370,7 +375,7 @@ impl DataSkippingFilter {
         let file_stats = self.stats_evaluator.evaluate(batch)?;
         require!(
             file_stats.len() == batch_len,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "stats evaluator output length {} != batch length {}",
                 file_stats.len(),
                 batch_len
@@ -380,7 +385,7 @@ impl DataSkippingFilter {
         let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
         require!(
             skipping_predicate.len() == batch_len,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "skipping evaluator output length {} != batch length {}",
                 skipping_predicate.len(),
                 batch_len
@@ -393,7 +398,7 @@ impl DataSkippingFilter {
         debug_assert_eq!(selection_vector.len(), batch_len);
         require!(
             selection_vector.len() == batch_len,
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "filter evaluator output length {} != batch length {}",
                 selection_vector.len(),
                 batch_len

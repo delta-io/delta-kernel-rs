@@ -5,23 +5,23 @@ use url::Url;
 use super::Crc;
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, KernelError};
 
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
+/// handler. Returns [`KernelError::ChecksumWriteUnsupported`] if:
 /// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
 ///   representation); or
 /// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
 ///
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
-/// `Err(Error::FileAlreadyExists)`.
+/// `Err(KernelError::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
-        Error::ChecksumWriteUnsupported(format!(
+        KernelError::ChecksumWriteUnsupported(format!(
             "Cannot write CRC file with {:?} file stats",
             crc.file_stats_state
         ))
@@ -31,11 +31,11 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         .metadata
         .configuration()
         .get(ENABLE_IN_COMMIT_TIMESTAMPS)
-        .is_some_and(|v| v == "true");
+        .is_some_and(|value| value == "true");
     let ict_value_present = crc.in_commit_timestamp_opt.is_some();
     require!(
         !ict_enabled || ict_value_present,
-        Error::ChecksumWriteUnsupported(
+        KernelError::ChecksumWriteUnsupported(
             "Cannot write CRC file: In-Commit Timestamps enabled but inCommitTimestampOpt is absent"
                 .to_string()
         )
@@ -233,7 +233,7 @@ mod tests {
 
         // Second write should fail (never overwrites)
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-        assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
+        assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
     }
 
     #[test]
@@ -242,7 +242,10 @@ mod tests {
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-        assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
+        assert!(matches!(
+            result,
+            Err(KernelError::ChecksumWriteUnsupported(_))
+        ));
     }
 
     #[rstest]
@@ -269,9 +272,21 @@ mod tests {
         } else {
             let err = result.unwrap_err();
             assert!(
-                matches!(err, Error::ChecksumWriteUnsupported(_)),
+                matches!(err, KernelError::ChecksumWriteUnsupported(_)),
                 "expected ChecksumWriteUnsupported, got: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_write_treats_ict_enablement_value_case_sensitively() {
+        let (engine, crc_path) = writer_test_env(0);
+        let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
+        crc.metadata = crc
+            .metadata
+            .with_configuration_entry(ENABLE_IN_COMMIT_TIMESTAMPS, "True");
+        crc.in_commit_timestamp_opt = None;
+
+        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
     }
 }

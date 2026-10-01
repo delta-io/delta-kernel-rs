@@ -244,7 +244,7 @@ pub async fn write_data_and_check_result_and_stats(
 
     // commit!
     match txn.commit(engine.as_ref())? {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
                 committed.post_commit_stats().commits_since_checkpoint,

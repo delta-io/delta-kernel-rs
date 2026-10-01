@@ -12,7 +12,9 @@ use crate::action_reconciliation::{
     ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
+use crate::arrow::array::{
+    create_array, Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray,
+};
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::checkpoint::{
     create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
@@ -51,6 +53,30 @@ fn test_deleted_file_retention_timestamp(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::equal_sizes(100, 100, true)]
+#[case::writer_reported_less(100, 200, false)]
+#[case::writer_reported_more(200, 100, false)]
+fn test_verify_written_size(
+    #[case] written_size: u64,
+    #[case] observed_size: u64,
+    #[case] expect_ok: bool,
+) {
+    let path = Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet").unwrap();
+    let result = super::verify_written_size(&path, written_size, observed_size);
+    if expect_ok {
+        assert!(
+            result.is_ok(),
+            "expected Ok for equal sizes, got {result:?}"
+        );
+    } else {
+        assert!(
+            matches!(result, Err(crate::KernelError::Generic(_))),
+            "expected KernelError::Generic for size mismatch, got {result:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
@@ -70,6 +96,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot_version = snapshot.version();
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Use V2 schema for the checkpoint metadata batch
@@ -99,6 +126,29 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     // Verify we have one row
     assert_eq!(record_batch.num_rows(), 1);
+
+    // Verify the checkpointMetadata action carries the expected tags and version
+    let checkpoint_metadata = record_batch
+        .column_by_name("checkpointMetadata")
+        .expect("Schema should have checkpointMetadata field")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("checkpointMetadata must be a struct");
+    let tags = checkpoint_metadata
+        .column_by_name("tags")
+        .expect("checkpointMetadata must carry a tags field");
+    assert!(
+        tags.as_any().downcast_ref::<MapArray>().is_some(),
+        "tags must be a map"
+    );
+    assert!(tags.is_null(0), "tags should be written null");
+    let version = checkpoint_metadata
+        .column_by_name("version")
+        .expect("checkpointMetadata must carry a version field")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("version must be an int64");
+    assert_eq!(version.value(0), snapshot_version as i64);
 
     // Verify action counts
     assert_eq!(checkpoint_batch.actions_count, 1);
@@ -646,7 +696,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::Error::Generic(e) if e == "Log segment is not published"
+        crate::KernelError::UnpublishedVersion(1)
     ));
     Ok(())
 }
@@ -939,7 +989,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
     )
     .await
-    .map_err(|err| crate::Error::generic(err.to_string()))?;
+    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
 
     // Version 2
     add_commit(
@@ -949,7 +999,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
     )
     .await
-    .map_err(|err| crate::Error::generic(err.to_string()))?;
+    .map_err(|err| crate::KernelError::generic(err.to_string()))?;
 
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -960,7 +1010,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         .get("sizeInBytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            crate::Error::generic("missing or invalid sizeInBytes in _last_checkpoint")
+            crate::KernelError::generic("missing or invalid sizeInBytes in _last_checkpoint")
         })?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
 

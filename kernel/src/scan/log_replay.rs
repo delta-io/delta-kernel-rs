@@ -12,8 +12,8 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
-    PredicateRef, UnaryExpressionOp,
+    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
+    MapToStructOptions, Predicate, PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -30,7 +30,7 @@ use crate::schema::{
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, ExpressionEvaluator, KernelError};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -144,7 +144,7 @@ pub struct SerializableScanState {
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
 ///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
 ///   is processed.
-/// - Parse-error fallback: If transformation and data skipping return [`Error::ParseError`],
+/// - Parse-error fallback: If transformation and data skipping return [`KernelError::ParseError`],
 ///   deduplicates the raw batch first, then retries transformation and data skipping on the
 ///   surviving actions.
 /// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
@@ -413,8 +413,9 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
         };
-        let internal_state_blob = serde_json::to_vec(&internal_state)
-            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
+        let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
+            KernelError::generic(format!("Failed to serialize internal state: {e}"))
+        })?;
 
         Ok(SerializableScanState {
             predicate,
@@ -444,14 +445,14 @@ impl ScanLogReplayProcessor {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         // Deserialize internal state from json
-        let internal_state: InternalScanState =
-            serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
+        let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
+            .map_err(KernelError::MalformedJson)?;
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
             Some(predicate) => {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
-                    return Err(Error::generic(
+                    return Err(KernelError::generic(
                         "Invalid serialized internal state. Expected predicate schema.",
                     ));
                 };
@@ -494,10 +495,14 @@ impl ScanLogReplayProcessor {
         } else {
             &self.checkpoint_transform
         };
-        let transformed = transform.evaluate(actions)?;
+        let start = std::time::Instant::now();
+        let transformed = transform.evaluate(actions);
+        self.metrics
+            .add_action_transform_time_ns(start.elapsed().as_nanos() as u64);
+        let transformed = transformed?;
         require!(
             transformed.len() == actions.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "transform output length {} != actions length {}",
                 transformed.len(),
                 actions.len()
@@ -507,7 +512,7 @@ impl ScanLogReplayProcessor {
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         require!(
             selection_vector.len() == actions.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "selection vector length {} != actions length {}",
                 selection_vector.len(),
                 actions.len()
@@ -553,7 +558,7 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<()> {
         require!(
             selection_vector.len() == active_add_file_sizes.len(),
-            Error::internal_error(format!(
+            KernelError::internal_error(format!(
                 "selection vector length {} != active Add file sizes length {}",
                 selection_vector.len(),
                 active_add_file_sizes.len()
@@ -747,7 +752,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let expected_getters = if is_log_batch { 12 } else { 8 };
         require!(
             getters.len() == expected_getters,
-            Error::InternalError(format!(
+            KernelError::InternalError(format!(
                 "Wrong number of AddRemoveDedupVisitor getters: {}",
                 getters.len()
             ))
@@ -906,7 +911,7 @@ fn get_add_transform_expr(
             col!("add.partitionValues_parsed")
         } else {
             // No native column (JSON commit): reconstruct from the string map.
-            Expression::map_to_struct(col!("add.partitionValues"))
+            Expression::map_to_struct(col!("add.partitionValues"), MapToStructOptions::default())
         };
         fields.push(Arc::new(pv_parsed_expr));
     }
@@ -946,6 +951,12 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
     // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
     // cannot easily be unified.
+    #[tracing::instrument(
+        name = "scan_log_replay.process_actions_batch",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -953,7 +964,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = actions_batch;
         require!(
             !is_log_batch,
-            Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
+            KernelError::generic(
+                "Parallel checkpoint processor may only be applied to checkpoint files"
+            )
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -967,7 +980,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err @ KernelError::ParseError(_, _)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1037,6 +1050,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     // probably also need to be applied to the other copy. The copy exists because
     // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
     // `&self`. Presently, the different in mutabilities cannot easily be unified.
+    #[tracing::instrument(
+        name = "scan_log_replay.process_actions_batch",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -1063,7 +1082,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err @ KernelError::ParseError(_, _)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1172,7 +1191,9 @@ pub(crate) fn scan_action_iter(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use rstest::rstest;
 
@@ -1180,7 +1201,6 @@ mod tests {
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
-    use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
@@ -1190,8 +1210,9 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::ActionsBatch;
+    use crate::log_replay::{ActionsBatch, LogReplayProcessor};
     use crate::log_segment::CheckpointReadInfo;
+    use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
         assert_transform_spec, get_simple_state_info, get_state_info, RowTrackingState,
@@ -1202,11 +1223,36 @@ mod tests {
         add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::PhysicalPredicate;
+    use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
     use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{DeltaResult, Expression as Expr, ExpressionRef};
+    use crate::{
+        DeltaResult, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef,
+        KernelError,
+    };
+
+    /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
+    struct RetryOnceEvaluator {
+        inner: Arc<dyn ExpressionEvaluator>,
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl ExpressionEvaluator for RetryOnceEvaluator {
+        /// Delays each attempt for deterministic timing, then triggers exactly one retry.
+        fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+            std::thread::sleep(self.delay);
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(KernelError::ParseError(
+                    "retry".to_string(),
+                    DataType::STRING,
+                ))
+            } else {
+                self.inner.evaluate(batch)
+            }
+        }
+    }
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
@@ -1271,7 +1317,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter() {
         run_with_validate_callback(
-            vec![add_batch_simple(get_commit_schema().clone())],
+            vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
@@ -1283,7 +1329,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
-            vec![add_batch_with_remove(get_commit_schema().clone())],
+            vec![add_batch_with_remove(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
@@ -1293,8 +1339,48 @@ mod tests {
     }
 
     #[test]
+    fn transform_metrics_include_failed_attempt_and_retry() {
+        // Build a normal replay processor so only the transform's retry behavior is replaced.
+        let engine = SyncEngine::new();
+        let schema = schema_ref! { nullable "value": INTEGER };
+        let mut processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(get_simple_state_info(schema, vec![]).unwrap()),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let delay = Duration::from_millis(5);
+        processor.commit_transform = Arc::new(RetryOnceEvaluator {
+            inner: processor.commit_transform.clone(),
+            calls: calls.clone(),
+            delay,
+        });
+
+        // Process one batch; the injected parse error must trigger one successful retry.
+        LogReplayProcessor::process_actions_batch(
+            &mut processor,
+            ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true),
+        )
+        .unwrap();
+
+        // Confirm both attempts ran and their deterministic delays were accumulated in the event.
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let event = processor.get_metrics().to_event(
+            MetricId::new(),
+            false,
+            None,
+            ScanType::Full,
+            Duration::ZERO,
+        );
+        assert!(event.action_transform_time >= delay * 2);
+    }
+
+    #[test]
     fn test_no_transforms() {
-        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let batch = vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())];
         let logical_schema = schema_ref! {};
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
@@ -1337,7 +1423,7 @@ mod tests {
         };
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
-        let batch = vec![add_batch_with_partition_col()];
+        let batch = vec![add_batch_with_partition_col(COMMIT_READ_SCHEMA.clone())];
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1420,7 +1506,7 @@ mod tests {
             "row_indexes_for_row_id_0",
         );
 
-        let batch = vec![add_batch_for_row_tracking(get_commit_schema().clone())];
+        let batch = vec![add_batch_for_row_tracking(COMMIT_READ_SCHEMA.clone())];
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1485,7 +1571,7 @@ mod tests {
             return Ok(());
         }
 
-        let batch = add_batch_for_row_tracking(get_commit_schema().clone());
+        let batch = add_batch_for_row_tracking(COMMIT_READ_SCHEMA.clone());
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             [Ok(ActionsBatch::new(batch, true))].into_iter(),
@@ -1930,7 +2016,7 @@ mod tests {
 
     #[test]
     fn test_scan_action_iter_with_skip_stats() {
-        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let batch = vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())];
         let schema: SchemaRef = schema_ref! {
             nullable "value": INTEGER,
             nullable "date": DATE,
@@ -2019,10 +2105,10 @@ mod tests {
         // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
         let batch = if with_partition {
             vec![add_batch_with_remove_and_partition(
-                get_commit_schema().clone(),
+                COMMIT_READ_SCHEMA.clone(),
             )]
         } else {
-            vec![add_batch_with_remove(get_commit_schema().clone())]
+            vec![add_batch_with_remove(COMMIT_READ_SCHEMA.clone())]
         };
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),

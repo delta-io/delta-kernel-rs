@@ -14,6 +14,7 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
+#[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -28,6 +29,7 @@ use test_utils::load_test_data;
 use url::Url;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
+#[allow(deprecated)]
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;

@@ -8,4 +8,4 @@ mod dv;
 mod iceberg_compat;
 mod interval;
 mod maintenance_ops;
-mod row_tracking;
+pub(crate) mod row_tracking;

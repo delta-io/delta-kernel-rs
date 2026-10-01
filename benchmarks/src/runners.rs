@@ -23,7 +23,7 @@ use delta_kernel_workloads::models::{
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
 use url::Url;
 
 use crate::registry::{ParallelScan, ReadConfig};
@@ -65,11 +65,11 @@ enum SnapshotStrategy {
     /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
     Standard { url: Url },
     /// Catalog-managed table: snapshot loaded via the UC Delta-Tables API. The three-part table
-    /// name is resolved via `UCClient::load_table`, whose response is turned into a snapshot
-    /// builder by `snapshot_builder_from_load_table`.
+    /// name is resolved via `UCDeltaTableClient::load_table`, whose response is turned into a
+    /// snapshot builder by `snapshot_builder_from_load_table`.
     CatalogManaged {
         table_name: String,
-        client: Box<UCClient>,
+        client: Box<UCDeltaTableClient>,
     },
 }
 
@@ -116,9 +116,10 @@ fn parse_three_part_name(name: &str) -> Result<(&str, &str, &str), Box<dyn std::
 
 /// Resolves the engine and snapshot strategy from a [`TableInfo`].
 ///
-/// For catalog-managed tables (`catalog_info` is present), credentials are vended via `UCClient`
-/// and the snapshot is loaded through the UC Delta-Tables API (`load_table`). For non-UC tables,
-/// the engine is built from env vars (`AWS_*` for S3, local filesystem otherwise).
+/// For catalog-managed tables (`catalog_info` is present), credentials are vended via
+/// `UCDeltaTableClient` and the snapshot is loaded through the UC Delta-Tables API (`load_table`).
+/// For non-UC tables, the engine is built from env vars (`AWS_*` for S3, local filesystem
+/// otherwise).
 fn resolve_snapshot_strategy(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -132,7 +133,7 @@ fn resolve_snapshot_strategy(
     let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
     let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
     let config = ClientConfig::build(&endpoint, &token).build()?;
-    let client = Box::new(UCClient::new(config)?);
+    let client = Box::new(UCDeltaTableClient::new(config)?);
 
     let (catalog, schema, table) = parse_three_part_name(&cm.table_name)?;
     let creds = runtime

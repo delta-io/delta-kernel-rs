@@ -75,6 +75,7 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
 /// Whether a table is path-based or catalog-managed.
 ///
 /// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum TableType {
     PathBased,
@@ -90,10 +91,23 @@ impl From<kernel::TableType> for TableType {
     }
 }
 
-/// The kind of log-segment load: a full listing from the base up to the target, or an incremental
-/// listing of the commits above an existing segment.
+/// How the snapshot was constructed.
 ///
 /// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum SnapshotLoadType {
+    Full = 0,
+    Incremental = 1,
+    /// Snapshot construction used complete caller-supplied state without engine log I/O.
+    SnapshotHint = 2,
+    Unknown = 3,
+}
+
+/// How the log segment and protocol/metadata state were loaded.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum LogSegmentLoadType {
     Full,
@@ -106,6 +120,17 @@ impl From<kernel::LogSegmentLoadType> for LogSegmentLoadType {
         match t {
             kernel::LogSegmentLoadType::Full => Self::Full,
             kernel::LogSegmentLoadType::Incremental => Self::Incremental,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<kernel::SnapshotLoadType> for SnapshotLoadType {
+    fn from(t: kernel::SnapshotLoadType) -> Self {
+        match t {
+            kernel::SnapshotLoadType::Full => Self::Full,
+            kernel::SnapshotLoadType::Incremental => Self::Incremental,
+            kernel::SnapshotLoadType::SnapshotHint => Self::SnapshotHint,
             _ => Self::Unknown,
         }
     }
@@ -188,7 +213,7 @@ pub struct SnapshotBuildSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
     pub version: u64,
     pub duration_ns: u64,
 }
@@ -199,7 +224,7 @@ pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
+    pub load_type: SnapshotLoadType,
 }
 
 /// A transaction was committed successfully. `operation` and `correlation_id` are slices into
@@ -289,6 +314,7 @@ pub struct ScanMetadataCompleted {
     pub num_predicate_filtered: u64,
     pub peak_hash_set_size: u64,
     pub dedup_visitor_time_ns: u64,
+    pub action_transform_time_ns: u64,
     pub predicate_eval_time_ns: u64,
 }
 
@@ -553,6 +579,7 @@ impl MetricEvent {
                 num_predicate_filtered,
                 peak_hash_set_size,
                 dedup_visitor_time,
+                action_transform_time,
                 predicate_eval_time,
             }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
                 operation_id: (*operation_id).into(),
@@ -569,6 +596,7 @@ impl MetricEvent {
                 num_predicate_filtered: *num_predicate_filtered,
                 peak_hash_set_size: *peak_hash_set_size as u64, // note usize -> u64 cast
                 dedup_visitor_time_ns: ns(*dedup_visitor_time),
+                action_transform_time_ns: ns(*action_transform_time),
                 predicate_eval_time_ns: ns(*predicate_eval_time),
             }),
             K::StorageListCompleted(kernel::StorageListCompleted {
@@ -608,6 +636,8 @@ pub(crate) fn with_ffi_event<R>(
 mod tests {
     use std::mem::discriminant;
     use std::time::Duration;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -727,7 +757,8 @@ mod tests {
             num_predicate_filtered: 37,
             peak_hash_set_size: 41,
             dedup_visitor_time: Duration::from_nanos(43),
-            predicate_eval_time: Duration::from_nanos(47),
+            action_transform_time: Duration::from_nanos(47),
+            predicate_eval_time: Duration::from_nanos(53),
         });
         with_ffi_event(&event, |ffi| {
             let MetricEvent::ScanMetadataCompleted(e) = ffi else {
@@ -752,7 +783,8 @@ mod tests {
             assert_eq!(e.num_predicate_filtered, 37);
             assert_eq!(e.peak_hash_set_size, 41);
             assert_eq!(e.dedup_visitor_time_ns, 43);
-            assert_eq!(e.predicate_eval_time_ns, 47);
+            assert_eq!(e.action_transform_time_ns, 47);
+            assert_eq!(e.predicate_eval_time_ns, 53);
         });
     }
 
@@ -773,8 +805,8 @@ mod tests {
                 panic!("expected ProtocolMetadataLoadSuccess");
             };
             assert_eq!(e.operation_id.bytes, id.as_bytes());
-            assert!(matches!(e.table_type, TableType::CatalogManaged));
-            assert!(matches!(e.load_type, LogSegmentLoadType::Incremental));
+            assert_eq!(e.table_type, TableType::CatalogManaged);
+            assert_eq!(e.load_type, LogSegmentLoadType::Incremental);
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "pm-req");
@@ -805,9 +837,9 @@ mod tests {
                 panic!("expected LogSegmentLoadSuccess");
             };
             assert_eq!(e.operation_id.bytes, id.as_bytes());
-            assert!(matches!(e.table_type, TableType::CatalogManaged));
+            assert_eq!(e.table_type, TableType::CatalogManaged);
             assert_eq!(e.duration_ns, 61);
-            assert!(matches!(e.load_type, LogSegmentLoadType::Full));
+            assert_eq!(e.load_type, LogSegmentLoadType::Full);
             assert_eq!(e.num_commit_files, 3);
             assert_eq!(e.num_checkpoint_files, 1);
             assert_eq!(e.num_compaction_files, 2);
@@ -817,6 +849,61 @@ mod tests {
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "req-42");
         });
+    }
+
+    #[test]
+    fn from_kernel_snapshot_hint_load_type_maps_to_appended_ffi_variant() {
+        let event = kernel::MetricEvent::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
+            operation_id: kernel::MetricId::new(),
+            correlation_id: None,
+            table_type: kernel::TableType::PathBased,
+            load_type: kernel::SnapshotLoadType::SnapshotHint,
+            version: 7,
+            duration: Duration::from_nanos(11),
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::SnapshotBuildSuccess(e) = ffi else {
+                panic!("expected SnapshotBuildSuccess");
+            };
+            assert_eq!(e.load_type, SnapshotLoadType::SnapshotHint);
+            assert_eq!(e.version, 7);
+        });
+    }
+
+    #[test]
+    fn from_kernel_snapshot_hint_failure_maps_to_appended_ffi_variant() {
+        let event = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+            operation_id: kernel::MetricId::new(),
+            correlation_id: None,
+            table_type: kernel::TableType::PathBased,
+            load_type: kernel::SnapshotLoadType::SnapshotHint,
+        });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::SnapshotBuildFailure(e) = ffi else {
+                panic!("expected SnapshotBuildFailure");
+            };
+            assert_eq!(e.load_type, SnapshotLoadType::SnapshotHint);
+        });
+    }
+
+    #[rstest]
+    #[case::full(kernel::SnapshotLoadType::Full, SnapshotLoadType::Full)]
+    #[case::incremental(kernel::SnapshotLoadType::Incremental, SnapshotLoadType::Incremental)]
+    #[case::snapshot_hint(kernel::SnapshotLoadType::SnapshotHint, SnapshotLoadType::SnapshotHint)]
+    #[case::unknown(kernel::SnapshotLoadType::Unknown, SnapshotLoadType::Unknown)]
+    fn kernel_snapshot_load_type_maps_to_ffi_variant(
+        #[case] source: kernel::SnapshotLoadType,
+        #[case] expected: SnapshotLoadType,
+    ) {
+        assert_eq!(SnapshotLoadType::from(source), expected);
+    }
+
+    #[test]
+    fn snapshot_load_type_discriminants_are_stable() {
+        assert_eq!(SnapshotLoadType::Full as i32, 0);
+        assert_eq!(SnapshotLoadType::Incremental as i32, 1);
+        assert_eq!(SnapshotLoadType::SnapshotHint as i32, 2);
+        assert_eq!(SnapshotLoadType::Unknown as i32, 3);
     }
 
     #[test]
@@ -836,7 +923,7 @@ mod tests {
             let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
                 panic!("expected LogSegmentLoadSuccess");
             };
-            assert!(matches!(e.table_type, TableType::PathBased));
+            assert_eq!(e.table_type, TableType::PathBased);
             assert!(!e.has_crc);
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };

@@ -10,6 +10,7 @@ mod common;
 mod create_table;
 mod cross_product;
 mod data_skipping;
+mod error;
 mod features;
 mod golden_tables;
 mod hdfs;

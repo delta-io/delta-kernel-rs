@@ -11,7 +11,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Ti
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -225,7 +225,7 @@ impl EnsureDataTypes {
         if matches!(self.mode, ValidationMode::Full)
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
-            Err(Error::Generic(format!(
+            Err(KernelError::Generic(format!(
                 "{desc} has nullability {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
             )))
         } else {
@@ -246,7 +246,7 @@ impl EnsureDataTypes {
         if matches!(self.mode, ValidationMode::Full)
             && !metadata_eq(&kernel_field.metadata, arrow_field.metadata())
         {
-            Err(Error::Generic(format!(
+            Err(KernelError::Generic(format!(
                 "Field {} has metadata {:?} in kernel and {:?} in arrow",
                 kernel_field.name,
                 kernel_field.metadata,
@@ -326,23 +326,22 @@ impl PartialEq<String> for MetadataValue {
     }
 }
 
-// allow for comparing our metadata maps to arrow ones. We can't implement PartialEq because both
-// are HashMaps which aren't defined in this crate
-fn metadata_eq(
+// Compare kernel metadata with Arrow's version-specific metadata container.
+fn metadata_eq<'a>(
     kernel_metadata: &HashMap<String, MetadataValue>,
-    arrow_metadata: &HashMap<String, String>,
+    arrow_metadata: impl IntoIterator<Item = (&'a String, &'a String)>,
 ) -> bool {
-    let kernel_len = kernel_metadata.len();
-    if kernel_len != arrow_metadata.len() {
-        return false;
+    let mut arrow_len = 0;
+    for (key, value) in arrow_metadata {
+        arrow_len += 1;
+        if !kernel_metadata
+            .get(key)
+            .is_some_and(|kernel_value| *kernel_value == *value)
+        {
+            return false;
+        }
     }
-    if kernel_len == 0 {
-        // lens are equal, so two empty maps are equal
-        return true;
-    }
-    kernel_metadata
-        .iter()
-        .all(|(key, value)| arrow_metadata.get(key).is_some_and(|v| *value == *v))
+    kernel_metadata.len() == arrow_len
 }
 
 #[cfg(test)]

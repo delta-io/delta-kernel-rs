@@ -1,23 +1,23 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use futures::StreamExt as _;
 use url::Url;
 
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{DeltaResult, DeltaResultIteratorStatic, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{
+    DeltaResult, DeltaResultIteratorStatic, FileMeta, FileSlice, KernelError, StorageHandler,
+};
 
+#[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
 }
 
 impl SyncStorageHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
-    }
-
     /// The backing store, or `None` for the per-URL [`LocalFileSystem`] fallback.
     ///
     /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
@@ -27,9 +27,9 @@ impl SyncStorageHandler {
     }
 }
 
-// This handler collects eagerly under `block_on`, so there is no in-flight I/O for a cancellation
-// token to interrupt. It deliberately does not override the `*_with_cancellation` methods: their
-// default up-front check is the only cancellation it can honor.
+// This handler collects eagerly under `block_on`, so it cannot interrupt that I/O after it starts.
+// It relies on the default `*_with_cancellation` methods to check before delegation and before
+// pulling the resulting in-memory iterator.
 impl StorageHandler for SyncStorageHandler {
     fn list_from(&self, url_path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
@@ -59,7 +59,7 @@ impl StorageHandler for SyncStorageHandler {
         let iter = metas.into_iter().map(move |meta| {
             let location = base_url
                 .join(meta.location.as_ref())
-                .map_err(|e| Error::generic(format!("Failed to construct URL: {e}")))?;
+                .map_err(|e| KernelError::generic(format!("Failed to construct URL: {e}")))?;
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -124,7 +124,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::utils::current_time_duration;
-    use crate::{Error, StorageHandler};
+    use crate::{KernelError, StorageHandler};
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
@@ -273,7 +273,7 @@ mod tests {
         let url = Url::from_file_path(tmp_dir.path().join("missing.json")).unwrap();
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            Error::FileNotFound(_)
+            KernelError::FileNotFound(_)
         ));
     }
 
@@ -312,7 +312,7 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from("second"), false)
             .unwrap_err();
-        assert!(matches!(err, Error::FileAlreadyExists(_)));
+        assert!(matches!(err, KernelError::FileAlreadyExists(_)));
 
         // With overwrite, it should succeed.
         storage
@@ -338,7 +338,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            Error::FileNotFound(_)
+            KernelError::FileNotFound(_)
         ));
     }
 
@@ -350,7 +350,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            Error::FileNotFound(_)
+            KernelError::FileNotFound(_)
         ));
         storage.delete(&url).unwrap();
     }

@@ -109,7 +109,7 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| Error::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine
@@ -308,23 +308,19 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // yields Err(Error::Cancelled) once the token fires
+    let metadata = metadata?; // may yield Err(KernelError::Cancelled) if cancellation stops replay
     // ... process the batch ...
 }
 ```
 
-Cancellation is cooperative and always visible as an error, so a cancelled scan can never be
-mistaken for a complete one:
+Cancellation is cooperative. Kernel passes the token to the Engine's
+[cancellation-aware operations](../connector/implementing_engine.md#cancellation-aware-reads),
+which prevent new I/O after detecting cancellation. An Engine may also interrupt I/O already in
+flight.
 
-- Kernel polls the token at each action-batch boundary, so replay stops between reads even if the
-  engine ignores the token.
-- If the engine implements the [cancellation-aware read
-  variants](../connector/implementing_engine.md#cancellation-aware-reads), an I/O already in flight
-  can be interrupted rather than running to completion — this is what lets a scan stuck on one slow
-  file read stop promptly.
-- Either way, the outcome surfaces as `Error::Cancelled`: either returned directly from
-  `scan_metadata()` (when the token is already cancelled before replay begins) or as the terminal
-  item of its iterator. It is never a short or empty result.
+Cancellation can race with successful completion. Work already initiated may complete and its
+results may still be returned. If cancellation stops replay before completion, it surfaces as
+`KernelError::Cancelled` rather than a partial result that appears complete.
 
 Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
 to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does

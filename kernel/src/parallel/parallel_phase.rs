@@ -663,6 +663,7 @@ mod tests {
 
         // Verify timing metrics are present and parseable (values may be 0 for fast operations)
         let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ns");
+        let _action_transform_time = extract_metric(sequential_logs, "action_transform_time_ns");
         let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ns");
 
         // Verify Parallel metrics if expected
@@ -695,6 +696,7 @@ mod tests {
 
                 // Verify timing metrics are present and parseable in parallel phase
                 let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ns");
+                let _action_transform_time = extract_metric(remaining, "action_transform_time_ns");
                 let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ns");
 
                 search_start = absolute_pos + 1;

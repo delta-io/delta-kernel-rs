@@ -10,7 +10,7 @@ use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData,
-    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    FileDataReadResultIterator, FileMeta, FileSize, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn ParquetHandler>` that emits a
@@ -88,7 +88,7 @@ impl ParquetHandler for MeteredParquetHandler {
         &self,
         location: url::Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
@@ -150,8 +150,8 @@ mod tests {
             &self,
             _location: Url,
             _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-        ) -> DeltaResult<()> {
-            Ok(())
+        ) -> DeltaResult<FileSize> {
+            Ok(0)
         }
 
         fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {

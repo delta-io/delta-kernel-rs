@@ -129,7 +129,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
     ];
     for batch in batches {
         let metadata = create_add_files_metadata(add_files_schema, batch)
-            .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         txn.add_files(metadata);
     }
     txn.commit(engine.as_ref())?.unwrap_committed();
@@ -253,7 +253,7 @@ async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
     let result = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))]).await?;
 
     // THEN the second commit conflicts and emits exactly one conflict metric.
-    assert!(matches!(result, CommitResult::ConflictedTransaction(_)));
+    assert!(matches!(result, CommitResult::Conflicted(_)));
     assert_eq!(reporter.transaction_commits.get(), 1);
     assert_eq!(reporter.commit_conflicts.get(), 1);
     assert_eq!(reporter.commit_errors.get(), 0);

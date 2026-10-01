@@ -18,6 +18,8 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::{col, Predicate};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
@@ -26,12 +28,14 @@ use crate::plans::ir::nodes::Agg;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
+#[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{DeltaResult, Engine, EngineData, Error, Version};
+use crate::{DeltaResult, Engine, EngineData, KernelError, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -47,9 +51,9 @@ impl LogSegment {
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(Error::MissingMetadata),
-            (Some(_), None, _) => Err(Error::MissingProtocol),
-            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
+            (None, Some(_), _) => Err(KernelError::MissingMetadata),
+            (Some(_), None, _) => Err(KernelError::MissingProtocol),
+            (None, None, _) => Err(KernelError::MissingMetadataAndProtocol),
         }
     }
 
@@ -62,7 +66,7 @@ impl LogSegment {
     ///
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
-    #[instrument(name = "log_seg.load_p_m", skip_all, err)]
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,
@@ -148,13 +152,9 @@ impl LogSegment {
         resolve_pm_batches(self.read_pm_batches(engine)?)
     }
 
-    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
-    /// its version.
+    /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
-    fn read_pm_batches_via_plan(
-        &self,
-        executor: &dyn PlanExecutor,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+    fn build_pm_plan(&self) -> DeltaResult<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -184,7 +184,18 @@ impl LogSegment {
             })
             .transpose()?;
 
-        let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+        // Required fields are non-null exactly when their Protocol or Metadata action is present.
+        // Filter on required leaf fields so readers can use row group skipping.
+        let relevant_action = Predicate::or(
+            col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
+            col!(METADATA_NAME, "id").is_not_null(),
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let relevant_action =
+            Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
+
+        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+            .filter(relevant_action)?
             .aggregate_ungrouped(|a| {
                 let protocol = || column_name!(PROTOCOL_NAME);
                 let metadata = || column_name!(METADATA_NAME);
@@ -209,7 +220,17 @@ impl LogSegment {
                 );
                 a
             })?
-            .build()?;
+            .build()
+    }
+
+    /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
+    /// its version.
+    #[cfg(feature = "declarative-plans")]
+    fn read_pm_batches_via_plan(
+        &self,
+        executor: &dyn PlanExecutor,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<VersionedBatch>> + Send> {
+        let plan = self.build_pm_plan()?;
 
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
@@ -258,8 +279,9 @@ impl LogSegment {
             let version = if batch.is_log_batch {
                 batch_version(batch.actions.as_ref())? as i64
             } else {
-                checkpoint_version
-                    .ok_or_else(|| Error::internal_error("checkpoint batch without a version"))?
+                checkpoint_version.ok_or_else(|| {
+                    KernelError::internal_error("checkpoint batch without a version")
+                })?
             };
             Ok(VersionedBatch {
                 protocol_version: Some(version),
@@ -335,12 +357,12 @@ fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
     visitor.visit_rows_of(data)?;
     let file = visitor
         .file
-        .ok_or_else(|| Error::internal_error("commit batch missing _file column"))?;
+        .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
-        .map_err(|e| Error::internal_error(format!("batch has invalid _file {file}: {e}")))?;
+        .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
     ParsedLogPath::try_from(url)?
         .map(|path| path.version)
-        .ok_or_else(|| Error::internal_error(format!("batch from non-log file {file}")))
+        .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
 
 /// Whether `winner` is set at a version at least `batch_version`.
@@ -484,10 +506,14 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
     #[cfg(feature = "declarative-plans")]
+    use crate::expressions::{col, Predicate};
+    #[cfg(feature = "declarative-plans")]
+    use crate::plans::ir::nodes::Operator;
+    #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
-    use crate::{DeltaResult, Error};
+    use crate::{DeltaResult, KernelError};
 
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
@@ -495,7 +521,7 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-            Err(Error::generic("plan executor deliberately failed"))
+            Err(KernelError::generic("plan executor deliberately failed"))
         }
     }
 
@@ -539,6 +565,35 @@ mod tests {
         // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
         // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
         assert_eq!(data.len(), 4);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
+    fn test_declarative_pm_plan_filters_irrelevant_actions() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .build(&SyncEngine::new())
+            .unwrap();
+        let plan = snapshot.log_segment().build_pm_plan().unwrap();
+
+        let filter = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::Filter(filter) => Some(filter),
+                _ => None,
+            })
+            .expect("P&M plan must filter irrelevant actions");
+
+        let expected = Predicate::or(
+            col!("protocol.minReaderVersion").is_not_null(),
+            col!("metaData.id").is_not_null(),
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expected = Predicate::or(expected, col!("checkpoint").is_not_null());
+        assert_eq!(filter.predicate.as_ref(), &expected);
     }
 
     // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the

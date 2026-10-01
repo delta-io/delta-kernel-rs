@@ -15,7 +15,7 @@ use delta_kernel::DeltaResult;
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
-use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
@@ -248,7 +248,7 @@ unsafe fn visit_expression_column_impl(
     parts_len: usize,
 ) -> DeltaResult<usize> {
     if parts_len == 0 {
-        return Err(delta_kernel::Error::generic(
+        return Err(delta_kernel::KernelError::generic(
             "column must have at least one field part",
         ));
     }
@@ -259,7 +259,7 @@ unsafe fn visit_expression_column_impl(
         .map(|slice| unsafe { String::try_from_slice(slice) })
         .collect::<DeltaResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
-        return Err(delta_kernel::Error::generic(
+        return Err(delta_kernel::KernelError::generic(
             "column field part must not be empty",
         ));
     }
@@ -507,7 +507,7 @@ pub(crate) enum NullTypeTag {
 }
 
 impl TryFrom<u8> for NullTypeTag {
-    type Error = delta_kernel::Error;
+    type Error = delta_kernel::KernelError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -527,7 +527,7 @@ impl TryFrom<u8> for NullTypeTag {
             13 => Ok(Self::IntervalYearMonth),
             14 => Ok(Self::IntervalDayTime),
             255 => Ok(Self::NonPrimitive),
-            other => Err(delta_kernel::Error::generic(format!(
+            other => Err(delta_kernel::KernelError::generic(format!(
                 "Unrecognized null type tag: {other}"
             ))),
         }
@@ -602,7 +602,7 @@ impl NullTypeTag {
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
                 precision, scale,
             )?)),
-            Self::NonPrimitive => Err(delta_kernel::Error::generic(
+            Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
                 "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
                  from a type tag. Use opaque expressions or a schema visitor instead.",
             )),
@@ -685,14 +685,29 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
-/// Visit a MapToStruct expression. The `child_expr` is the map expression.
+/// Builds a `MapToStruct` expression from its map child and options.
+///
+/// The options and any contained string are copied into the expression before this function
+/// returns.
+///
+/// Returns zero when `child_expr` is invalid or the timezone is not valid UTF-8.
+///
+/// # Safety
+///
+/// `options` must reference a valid [`FfiMapToStructOptions`] for this call. A configured timezone
+/// slice must point to its declared number of initialized bytes.
 #[no_mangle]
-pub extern "C" fn visit_expression_map_to_struct(
+pub unsafe extern "C" fn visit_expression_map_to_struct(
     state: &mut KernelExpressionVisitorState,
     child_expr: usize,
+    options: *const FfiMapToStructOptions,
 ) -> usize {
+    let options = unsafe { &*options };
+    let Ok(options) = (unsafe { options.try_to_kernel() }) else {
+        return 0;
+    };
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
-        wrap_expression(state, Expression::map_to_struct(expr))
+        wrap_expression(state, Expression::map_to_struct(expr, options))
     })
 }
 
@@ -718,7 +733,7 @@ fn visit_engine_expression_impl(
     let expr_id = (engine_expression.visitor)(engine_expression.expression, &mut visitor_state);
 
     let expr = unwrap_kernel_expression(&mut visitor_state, expr_id).ok_or_else(|| {
-        delta_kernel::Error::generic(format!(
+        delta_kernel::KernelError::generic(format!(
             "Invalid expression ID {expr_id} returned from engine visitor"
         ))
     })?;
@@ -748,7 +763,7 @@ fn visit_engine_predicate_impl(
     let pred_id = (engine_predicate.visitor)(engine_predicate.predicate, &mut visitor_state);
 
     let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
-        delta_kernel::Error::generic(format!(
+        delta_kernel::KernelError::generic(format!(
             "Invalid predicate ID {pred_id} returned from engine visitor"
         ))
     })?;
@@ -862,11 +877,56 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, Scalar};
+    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
     use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::FfiMapToStructOptions;
+
+    #[rstest]
+    #[case::default(None)]
+    #[case::configured(Some("America/Los_Angeles"))]
+    fn map_to_struct_preserves_options(#[case] timestamp_timezone: Option<&str>) {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let options = timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+            MapToStructOptions::default().with_timestamp_timezone(timezone)
+        });
+        let ffi_timezone = timestamp_timezone
+            .map(|timezone| crate::kernel_string_slice!(timezone))
+            .into();
+        let ffi_options = FfiMapToStructOptions {
+            timestamp_timezone: ffi_timezone,
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, &raw const ffi_options) };
+        let expression = unwrap_kernel_expression(&mut state, expression_id).unwrap();
+
+        assert_eq!(
+            expression,
+            Expression::map_to_struct(col!("partitionValues"), options)
+        );
+    }
+
+    #[test]
+    fn map_to_struct_rejects_invalid_timezone_utf8() {
+        let mut state = KernelExpressionVisitorState::default();
+        let child = wrap_expression(&mut state, col!("partitionValues"));
+        let invalid_utf8 = [0xff_u8];
+        let options = FfiMapToStructOptions {
+            timestamp_timezone: crate::OptionalValue::Some(KernelStringSlice {
+                ptr: invalid_utf8.as_ptr().cast(),
+                len: invalid_utf8.len(),
+            }),
+        };
+
+        let expression_id =
+            unsafe { visit_expression_map_to_struct(&mut state, child, &raw const options) };
+
+        assert_eq!(expression_id, 0);
+    }
 
     // ============================================================================
     // NullTypeTag::from_data_type
@@ -1127,18 +1187,18 @@ mod tests {
     #[rstest]
     #[case::no_parts(
         &[],
-        KernelError::GenericError,
+        FFIKernelError::GenericError,
         Some("Generic delta kernel error: column must have at least one field part")
     )]
     #[case::empty_part(
         &[&b"a"[..], &b""[..], &b"d"[..]],
-        KernelError::GenericError,
+        FFIKernelError::GenericError,
         Some("Generic delta kernel error: column field part must not be empty")
     )]
-    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], KernelError::Utf8Error, None)]
+    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], FFIKernelError::Utf8Error, None)]
     fn invalid_column_parts_are_rejected(
         #[case] raw_parts: &[&[u8]],
-        #[case] expected_error: KernelError,
+        #[case] expected_error: FFIKernelError,
         #[case] expected_message: Option<&str>,
     ) {
         let mut state = KernelExpressionVisitorState::default();
@@ -1241,7 +1301,7 @@ mod tests {
     // miri can validate the unsafe boundary, not just the `_impl` helpers above.
     // ============================================================================
 
-    use crate::error::KernelError;
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic,
     };

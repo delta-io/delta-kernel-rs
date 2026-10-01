@@ -11,7 +11,7 @@ use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
     Carrier,
 };
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, KernelError};
 
 /// Generic framework for recursive bottom-up transforms of expressions and predicates.
 ///
@@ -344,7 +344,8 @@ pub trait ExpressionTransform<'a> {
         expr: &'a MapToStructExpression,
     ) -> Self::Output<MapToStructExpression> {
         let nested = self.transform_expr(&expr.map_expr);
-        map_owned_or_else(expr, nested, MapToStructExpression::new)
+        let rebuild = |map_expr| MapToStructExpression::new(map_expr, expr.options.clone());
+        map_owned_or_else(expr, nested, rebuild)
     }
 
     /// Recursively transforms the child expression of a cast expression (unary).
@@ -494,7 +495,7 @@ impl ExpressionDepthChecker {
         if self.current_depth > self.max_depth_seen {
             self.max_depth_seen = self.current_depth;
             if self.current_depth > self.depth_limit {
-                return Err(Error::schema(format!(
+                return Err(KernelError::schema(format!(
                     "Max expression depth {} exceeded by {arg:?}",
                     self.depth_limit
                 )));
@@ -563,8 +564,8 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_name, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
-        OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
+        col, column_name, column_pred, lit, Expression, Expression as Expr, MapToStructOptions,
+        OpaqueExpressionOp, OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
         ScalarExpressionEvaluator, VariadicExpression,
     };
     use crate::kernel_predicates::{
@@ -875,6 +876,23 @@ mod tests {
             // Schema should be preserved
             assert_eq!(result_expr.output_schema, test_output_schema());
         }
+    }
+
+    #[test]
+    fn test_map_to_struct_options_survive_child_transform() {
+        let expr = Expr::map_to_struct(
+            col!("old_col"),
+            MapToStructOptions::default().with_timestamp_timezone("Europe/Berlin"),
+        );
+        let Expr::MapToStruct(transformed) = ColumnReplacer.transform_expr(&expr).into_owned()
+        else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(transformed.map_expr.as_ref(), &col!("new_col"));
+        assert_eq!(
+            transformed.options.timestamp_timezone(),
+            Some("Europe/Berlin")
+        );
     }
 
     #[test]

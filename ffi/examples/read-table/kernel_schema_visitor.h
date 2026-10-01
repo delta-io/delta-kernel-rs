@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <sys/time.h>
 
 /*
@@ -5,46 +6,124 @@
  * `KernelSchemaVisitor` in kernel parlance.
  */
 
+bool metadata_result_succeeded(ExternResultbool result)
+{
+  if (result.tag == Okbool) {
+    return result.ok;
+  }
+  print_error("Could not visit field metadata", (Error*)result.err);
+  free_error((Error*)result.err);
+  return false;
+}
+
+bool visit_schema_item_metadata(void* metadata, CMetadataMap* state)
+{
+  SchemaItem* item = metadata;
+  if (item->column_mapping_id) {
+    KernelStringSlice key = { "delta.columnMapping.id", strlen("delta.columnMapping.id") };
+    KernelStringSlice value = { item->column_mapping_id, strlen(item->column_mapping_id) };
+    if (!metadata_result_succeeded(
+          visit_metadata_value(state, key, MetadataNumber, value, allocate_error))) {
+      return false;
+    }
+  }
+  if (item->column_mapping_physical_name) {
+    KernelStringSlice key = {
+      "delta.columnMapping.physicalName", strlen("delta.columnMapping.physicalName")
+    };
+    KernelStringSlice value = {
+      item->column_mapping_physical_name, strlen(item->column_mapping_physical_name)
+    };
+    if (!metadata_result_succeeded(
+          visit_metadata_value(state, key, MetadataString, value, allocate_error))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+#ifdef DEFINE_GEO_TYPE_IN_DEV
+void trim_trailing_whitespace(char* s)
+{
+  size_t len = strlen(s);
+  while (len > 0 && isspace((unsigned char)s[len - 1])) {
+    s[--len] = '\0';
+  }
+}
+#endif
+
 // This function looks at tahe type field in the schema to figure out which visitor to call. It's a
 // bit gross as the schema code is string based, a real implementation would have a more robust way
 // to represent a schema.
 uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, CSchema *cschema) {
   print_diag("Visiting schema item %s (%s)\n", item->name, item->type);
   KernelStringSlice name = { item->name, strlen(item->name) };
+  EngineMetadata metadata = { item, visit_schema_item_metadata };
   ExternResultusize visit_res;
   if (strcmp(item->type, "string") == 0) {
-    visit_res = visit_field_string(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_string(state, name, item->is_nullable, &metadata, allocate_error);
+  } else if (strcmp(item->type, "void") == 0) {
+    visit_res = visit_field_void(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "integer") == 0) {
-    visit_res = visit_field_integer(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_integer(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "short") == 0) {
-    visit_res = visit_field_short(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_short(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "byte") == 0) {
-    visit_res = visit_field_byte(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_byte(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "long") == 0) {
-    visit_res = visit_field_long(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_long(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "float") == 0) {
-    visit_res = visit_field_float(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_float(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "double") == 0) {
-    visit_res = visit_field_double(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_double(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "boolean") == 0) {
-    visit_res = visit_field_boolean(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_boolean(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "binary") == 0) {
-    visit_res = visit_field_binary(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_binary(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "date") == 0) {
-    visit_res = visit_field_date(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_date(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "timestamp") == 0) {
-    visit_res = visit_field_timestamp(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_timestamp(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "timestamp_ntz") == 0) {
-    visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "interval year to month") == 0) {
-    visit_res = visit_field_interval_year_month(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_interval_year_month(state, name, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "interval day to second") == 0) {
-    visit_res = visit_field_interval_day_time(state, name, item->is_nullable, allocate_error);
+    visit_res = visit_field_interval_day_time(state, name, item->is_nullable, &metadata, allocate_error);
+#ifdef DEFINE_GEO_TYPE_IN_DEV
+  } else if (strncmp(item->type, "geometry", 8) == 0) {
+    char crs_buf[256];
+    int end_pos = -1;
+    int matched = sscanf(item->type, "geometry( %255[^)])%n", crs_buf, &end_pos);
+    if (matched != 1 || end_pos < 0 || item->type[end_pos] != '\0') {
+      printf("[ERROR] Invalid geometry type: %s\n", item->type);
+      return 0;
+    }
+    trim_trailing_whitespace(crs_buf);
+    KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
+    visit_res = visit_field_geometry(state, name, crs, item->is_nullable, &metadata, allocate_error);
+  } else if (strncmp(item->type, "geography", 9) == 0) {
+    char crs_buf[256];
+    char algorithm_buf[64];
+    int end_pos = -1;
+    int matched = sscanf(
+      item->type, "geography( %255[^,)], %63[^)])%n", crs_buf, algorithm_buf, &end_pos);
+    if (matched != 2 || end_pos < 0 || item->type[end_pos] != '\0') {
+      printf("[ERROR] Invalid geography type: %s\n", item->type);
+      return 0;
+    }
+    trim_trailing_whitespace(crs_buf);
+    trim_trailing_whitespace(algorithm_buf);
+    KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
+    KernelStringSlice algorithm = { algorithm_buf, strlen(algorithm_buf) };
+    visit_res = visit_field_geography(
+      state, name, crs, algorithm, item->is_nullable, &metadata, allocate_error);
+#endif
   } else if (strncmp(item->type, "decimal", 7) == 0) {
     unsigned int precision;
     int scale;
     sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
-    visit_res = visit_field_decimal(state, name, precision, scale, item->is_nullable, allocate_error);
+    visit_res = visit_field_decimal(state, name, precision, scale, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "array") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     // an array should always have 1 child
@@ -57,7 +136,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       // previous visit will have printed the issue
       return 0;
     }
-    visit_res = visit_field_array(state, name, child_visit_id, item->is_nullable, allocate_error);
+    visit_res = visit_field_array(state, name, child_visit_id, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "map") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     // an map should always have 2 children
@@ -75,7 +154,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       // previous visit will have printed the issue
       return 0;
     }
-    visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, item->is_nullable, allocate_error);
+    visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, item->is_nullable, &metadata, allocate_error);
   } else if (strcmp(item->type, "struct") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     uintptr_t child_visit_ids[child_list.len];
@@ -95,6 +174,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       child_visit_ids,
       child_list.len,
       item->is_nullable,
+      &metadata,
       allocate_error);
   } else {
     printf("[ERROR] Can't visit unknown type: %s\n", item->type);
@@ -168,6 +248,7 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
     cols,
     col_index,
     false,
+    NULL,
     allocate_error);
 
   if (visit_res.tag != Okusize) {

@@ -166,7 +166,7 @@ use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
-    CapturingReporter, CountingReporter, RelaxedCounter,
+    CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
 };
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
@@ -202,9 +202,9 @@ use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_colu
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
-    DeltaResultIterator, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    DeltaResultIterator, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
+    FilteredEngineData, JsonHandler, KernelError, LogPath, ParquetFooter, ParquetHandler,
+    PredicateRef, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -671,14 +671,15 @@ pub fn test_table_setup() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
 )> {
-    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
     let engine = create_default_engine(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -693,14 +694,15 @@ pub fn test_table_setup_mt() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
 )> {
-    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
     let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -745,8 +747,58 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        "name",
+    )
+    .await
+}
+
+/// Like [`create_table`], but writes `delta.columnMapping.mode` as `column_mapping_mode` instead
+/// of always `"name"`. No-op when `columnMapping` isn't in `reader_features`.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table_with_column_mapping_mode(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+    column_mapping_mode: &str,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_impl(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        column_mapping_mode,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_table_impl(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
+    column_mapping_mode: &str,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
 
@@ -764,13 +816,24 @@ pub async fn create_table(
         }
     }
 
+    // adaptiveMetadata auto-enables its dependencies (see `enable_adaptive_metadata_dependencies`)
+    // so callers can pass just `adaptiveMetadata-preview` and get a loadable table.
+    let enable_adaptive_metadata = reader_features.contains(&"adaptiveMetadata-preview")
+        || writer_features.contains(&"adaptiveMetadata-preview");
+    if enable_adaptive_metadata {
+        enable_adaptive_metadata_dependencies(&mut reader_features, &mut writer_features);
+    }
+
     // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
-    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
-    // `delta.columnMapping.maxColumnId` below.
+    // fails. Assign it here (with nested ids for iceberg v3 / adaptiveMetadata); `max_column_id`
+    // feeds `delta.columnMapping.maxColumnId` below.
     let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
         let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
-        let schema =
-            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        let schema = assign_column_mapping_metadata(
+            &schema,
+            &mut max_id,
+            enable_iceberg_compat_v3 || enable_adaptive_metadata,
+        )?;
         (Arc::new(schema), max_id)
     } else {
         (schema, 0i64)
@@ -799,7 +862,10 @@ pub async fn create_table(
         let mut config = serde_json::Map::new();
 
         if reader_features.contains(&"columnMapping") {
-            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.mode".to_string(),
+                json!(column_mapping_mode),
+            );
             config.insert(
                 "delta.columnMapping.maxColumnId".to_string(),
                 json!(max_column_id.to_string()),
@@ -901,6 +967,36 @@ pub async fn create_table(
     Ok(table_path)
 }
 
+/// Adds the features `adaptiveMetadata-preview` depends on to `reader_features` and
+/// `writer_features` (each only if not already present).
+///
+/// adaptiveMetadata requires column mapping (in `id` mode, set by the caller) plus RowTracking,
+/// DomainMetadata, DeletionVectors, and InCommitTimestamp. The ReaderWriter dependencies are
+/// mirrored into both feature lists; the writer-only dependencies are added to `writer_features`.
+fn enable_adaptive_metadata_dependencies<'a>(
+    reader_features: &mut Vec<&'a str>,
+    writer_features: &mut Vec<&'a str>,
+) {
+    // ReaderWriter features must appear in both reader and writer feature lists.
+    for f in [
+        "adaptiveMetadata-preview",
+        "columnMapping",
+        "deletionVectors",
+    ] {
+        if !reader_features.contains(&f) {
+            reader_features.push(f);
+        }
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
+    for f in ["rowTracking", "domainMetadata", "inCommitTimestamp"] {
+        if !writer_features.contains(&f) {
+            writer_features.push(f);
+        }
+    }
+}
+
 /// Returns a copy of `schema` with `CURRENT_DEFAULT` metadata attached to the named top-level
 /// fields.
 ///
@@ -925,7 +1021,7 @@ pub fn schema_with_column_defaults(
         })
         .collect();
     if !column_defaults.is_empty() {
-        return Err(Error::generic(format!(
+        return Err(KernelError::generic(format!(
             "column defaults reference unknown top-level columns: {:?}",
             column_defaults.into_keys().collect::<Vec<_>>()
         )));
@@ -1101,7 +1197,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
 ) -> DeltaResult<CommitResult> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
@@ -1543,7 +1639,7 @@ pub async fn write_batch_to_table(
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+        delta_kernel::transaction::CommitResult::Committed(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
             .clone()),
@@ -1761,7 +1857,7 @@ impl ParquetHandler for CapturingParquetHandler {
         &self,
         location: Url,
         data: FileDataReadResultIterator,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
@@ -2011,7 +2107,7 @@ pub fn remove_all_and_get_remove_actions(
         txn.remove_files(sm.scan_files);
     }
     let committed = match txn.commit(engine)? {
-        CommitResult::CommittedTransaction(c) => c,
+        CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
     read_actions_from_commit(table_url, committed.commit_version(), "remove")

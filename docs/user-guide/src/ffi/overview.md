@@ -25,9 +25,9 @@ cargo build -p delta_kernel_ffi --release
 |---------|---------|-------------|
 | `default-engine-rustls` | yes | Includes the `DefaultEngine` with rustls TLS |
 | `default-engine-native-tls` | no | Includes the `DefaultEngine` with native TLS (instead of rustls) |
-| `arrow` | yes | Enables Arrow integration (selects `arrow-59` by default) |
-| `arrow-59` | yes | Pin to Arrow 59 explicitly (enabled transitively by `arrow`) |
-| `arrow-58` | no | Pin to Arrow 58 explicitly |
+| `arrow` | yes | Enables Arrow integration (selects `arrow-60` by default) |
+| `arrow-60` | yes | Pin to Arrow 60 explicitly (enabled transitively by `arrow`) |
+| `arrow-59` | no | Pin to Arrow 59 explicitly |
 | `delta-kernel-unity-catalog` | no | Enables Unity Catalog integration for catalog-managed tables |
 | `tracing` | no | Enables tracing/logging support via `tracing-subscriber` |
 
@@ -40,7 +40,7 @@ cargo build -p delta_kernel_ffi --release
 Objects that cross the FFI boundary are wrapped in **handles**. These are opaque pointers
 that carry ownership semantics. There are two kinds:
 
-- **Mutable handles** (`Box`-like) represent exclusive ownership. Dropping the handle
+- **Exclusive handles** (`Box`-like) represent exclusive ownership. Dropping the handle
   drops the underlying object. These are neither `Copy` nor `Clone`.
 - **Shared handles** (`Arc`-like) represent shared ownership. Dropping the handle only
   drops the underlying object if it was the last reference.
@@ -60,7 +60,7 @@ is needed for reads):
 ```text
 get_default_engine()        ->  Handle<SharedExternEngine>
         |
-get_snapshot_builder()      ->  Handle<MutableFfiSnapshotBuilder>
+get_snapshot_builder()      ->  Handle<ExclusiveSnapshotBuilder>
         |
 snapshot_builder_build()    ->  Handle<SharedSnapshot>
         |
@@ -115,10 +115,14 @@ authoritative list and signatures, consult the generated
 | Function | Purpose |
 |----------|---------|
 | `get_default_engine` | Create an engine from a table path with default options |
-| `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
-| `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
-| `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
+| `get_engine_builder` / `builder_with_option` / `builder_build` | Create an engine with custom storage options |
+| `builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
+
+Builder `with_*` functions consume their input handle and return the updated handle on success.
+Replace the input handle with the result; on error, the builder has been dropped. `build` and
+`free` also consume the builder.
 
 **Snapshots**
 
@@ -126,9 +130,9 @@ authoritative list and signatures, consult the generated
 |----------|---------|
 | `get_snapshot_builder` | Create a snapshot builder from a table path |
 | `get_snapshot_builder_from` | Create a snapshot builder incrementally from an existing snapshot |
-| `snapshot_builder_set_version` | Pin the snapshot to a specific table version |
-| `snapshot_builder_set_log_tail` | Provide a log tail for catalog-managed tables |
-| `snapshot_builder_set_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
+| `snapshot_builder_with_version` | Pin the snapshot to a specific table version |
+| `snapshot_builder_with_log_tail` | Provide a log tail for catalog-managed tables |
+| `snapshot_builder_with_max_catalog_version` | Bound the snapshot to the version the catalog has ratified |
 | `snapshot_builder_build` | Consume the builder and produce the snapshot |
 | `free_snapshot_builder` / `free_snapshot` | Release snapshot-related handles |
 
@@ -161,6 +165,7 @@ engine-owned memory.
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
 | `visit_metadata` | Invoke a single callback with `(id, name, description, format_provider, has_created_time, created_time_ms)` |
+| `visit_metadata_format_options` | Iterate arbitrary format option key/value pairs from a `SharedMetadata` handle |
 | `visit_metadata_configuration` | Iterate the `configuration` key/value map (takes a snapshot handle, not a metadata handle) |
 | `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
 
@@ -170,14 +175,21 @@ See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
 The build-side counterpart to `visit_schema`: per-field callbacks that let the
 engine construct a Kernel `StructType` from its own type system (for example,
-to pass to `scan_builder_with_schema`).
+to pass to `scan_builder_with_schema`). Every field function takes a nullable
+`const EngineMetadata*` descriptor: an opaque engine-owned value plus a synchronous callback that
+inserts the field's metadata into a Kernel-owned `CMetadataMap`. A null descriptor means the field
+has no metadata. Kernel copies incoming keys and values; it doesn't retain the descriptor or
+borrowed slices. Don't retain the callback's state.
 
 | Function | Purpose |
 |----------|---------|
 | `visit_field_byte` / `visit_field_short` / `visit_field_integer` / `visit_field_long` / `visit_field_float` / `visit_field_double` / `visit_field_boolean` | Build a numeric or boolean primitive `StructField` |
+| `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
+| `visit_field_geometry` / `visit_field_geography` | Build a geospatial `StructField` (geometry with a CRS; geography with a CRS and edge-interpolation algorithm) |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
+| `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
 
 **Reading (scans)**
 
@@ -382,7 +394,7 @@ pattern is the same in every case:
 
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the
-call; copy them if you need to retain them beyond the callback.
+call. Copy them if you need to retain them beyond the callback.
 
 ## Error handling
 
@@ -405,7 +417,7 @@ callback to allocate error objects in your memory space whenever an operation fa
 Because the engine allocates these errors, the engine is also responsible for freeing
 them. Kernel returns the error pointer immediately and does not retain it.
 
-The `EngineError` struct contains a `KernelError` enum that classifies the error type
+The `EngineError` struct contains a `FFIKernelError` enum that classifies the error type
 (e.g., `GenericError`, `FileNotFoundError`, `InvalidUrlError`). The error message
 string passed to `allocate_error` is only valid for the duration of the callback, so
 you must copy it if you need to keep it.
@@ -432,7 +444,7 @@ ExternResultHandleSharedExternEngine engine_res =
     get_default_engine(table_path, allocate_error);
 
 // 2. Build a snapshot
-ExternResultHandleMutableFfiSnapshotBuilder builder_res =
+ExternResultHandleExclusiveSnapshotBuilder builder_res =
     get_snapshot_builder(table_path, engine);
 ExternResultHandleSharedSnapshot snap_res =
     snapshot_builder_build(builder);

@@ -277,8 +277,8 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     )
     .await?;
 
-    let CommitResult::CommittedTransaction(committed) = result else {
-        panic!("Expected CommittedTransaction");
+    let CommitResult::Committed(committed) = result else {
+        panic!("Expected Committed");
     };
 
     let snapshot = committed
@@ -1454,6 +1454,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         HashMap::from([(path, dv.clone())]),
         scan_files.into_iter().map(Ok),
     )?;
+    txn.ack_row_tracking_preservation();
     let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
 
     // === Step 4: Write a V2 sidecar checkpoint. ===

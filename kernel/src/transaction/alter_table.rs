@@ -6,7 +6,6 @@
 
 #![allow(unreachable_pub)]
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::committer::Committer;
@@ -14,7 +13,7 @@ use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{AlterTable, Transaction};
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, PhantomType};
 use crate::DeltaResult;
 
 /// A type alias for alter-table transactions.
@@ -65,9 +64,11 @@ impl AlterTableTransaction {
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: false,
             column_defaults_acknowledged: false,
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             // TODO(#2446): match delta-spark's per-op isBlindAppend policy
             // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for
@@ -75,8 +76,10 @@ impl AlterTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             num_dv_updates: 0,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            root_manifest_file: None,
             physical_clustering_columns: None,
-            _state: PhantomData,
+            _state: PhantomType::default(),
         })
     }
 }

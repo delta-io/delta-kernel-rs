@@ -2,6 +2,7 @@ use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use derive_more::Constructor;
 use url::Url;
 
 use super::{put_bytes, read_files_arrow};
@@ -15,18 +16,13 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FileSize, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
+    JsonHandler, KernelError, PredicateRef,
 };
 
+#[derive(Constructor)]
 pub(crate) struct SyncJsonHandler {
     store: Option<Arc<DynObjectStore>>,
-}
-
-impl SyncJsonHandler {
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        Self { store }
-    }
 }
 
 pub(super) fn try_create_from_json(
@@ -159,7 +155,7 @@ mod tests {
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
+            assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
         }
 
         Ok(())

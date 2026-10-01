@@ -35,7 +35,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
         .commit(engine.as_ref())?;
 
     let mut current_snapshot = match create_result {
-        CommitResult::CommittedTransaction(committed) => {
+        CommitResult::Committed(committed) => {
             assert_eq!(committed.commit_version(), 0);
             // CREATE TABLE is the first commit: 1 commit since last checkpoint/compaction
             assert_eq!(committed.post_commit_stats().commits_since_checkpoint, 1);
@@ -60,7 +60,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
             begin_transaction(current_snapshot.clone(), engine.as_ref())?.with_engine_info("test");
 
         match txn.commit(engine.as_ref())? {
-            CommitResult::CommittedTransaction(committed) => {
+            CommitResult::Committed(committed) => {
                 let post_snapshot = committed
                     .post_commit_snapshot()
                     .expect("should have post_commit_snapshot");

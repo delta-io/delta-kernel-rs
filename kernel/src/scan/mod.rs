@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -47,7 +47,7 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, FileMeta, SnapshotRef,
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
     Version,
 };
 
@@ -85,7 +85,21 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = La
         },
     }
 });
-
+static PARALLEL_CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&SIDECAR_FIELD),
+};
+static PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let add_schema = Add::to_schema();
+    schema_ref! {
+        nullable ADD_NAME: {
+            ..(add_schema.fields().filter(|f| f.name() != "stats")),
+        },
+        (&REMOVE_FIELD),
+        (&SIDECAR_FIELD),
+    }
+});
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
@@ -385,16 +399,13 @@ impl ScanBuilder {
     /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
     /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
     ///
-    /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
-    /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
-    /// On cancellation the scan surfaces [`Error::Cancelled`] -- either returned directly from
-    /// [`scan_metadata`](Scan::scan_metadata) when the token is already cancelled before replay
-    /// begins, or as the terminal item of its iterator -- never as a silent early `None`, so a
-    /// cancelled listing cannot be mistaken for a complete one. With no token the scan is not
-    /// cancellable.
+    /// Cancellation is cooperative: Kernel forwards the token (if any) to cancellation-aware
+    /// [`Engine`] operations, which own cancellation for their I/O and iterators. Work that
+    /// completes concurrently with cancellation may still succeed. Passing `None` means the scan
+    /// is not cancellable.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
-    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
     pub fn with_cancellation_token(
         mut self,
         token: impl Into<Option<CancellationTokenRef>>,
@@ -409,6 +420,7 @@ impl ScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
+    #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
     pub fn build(self) -> DeltaResult<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
@@ -418,7 +430,7 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(Error::generic(
+            return Err(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
             ));
@@ -452,6 +464,17 @@ impl ScanBuilder {
             &state_info,
             &self.stats,
         )?;
+
+        let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
+        if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
+            warn!(
+                snapshot_version = self.snapshot.version(),
+                checkpoint_version = ?self.snapshot.log_segment().checkpoint_version,
+                commits_since_checkpoint,
+                "Full scan may replay extra transaction-log commits because the snapshot was \
+                 built with skip_new_checkpoints()"
+            );
+        }
 
         Ok(Scan {
             snapshot: self.snapshot,
@@ -515,7 +538,7 @@ impl PhysicalPredicate {
             // clause has invalid column references. Data skipping is best-effort and the predicate
             // anyway needs to be evaluated against every row of data -- which is impossible if the
             // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
-            return Err(Error::missing_column(format!(
+            return Err(KernelError::missing_column(format!(
                 "Predicate references unknown column: {unresolved}"
             )));
         }
@@ -948,7 +971,7 @@ impl Scan {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
@@ -958,6 +981,8 @@ impl Scan {
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
         // back into shape as we read it from the log. Since it is already reconciled data,
         // we treat it as if it originated from a checkpoint.
+        // TODO(#3263): Existing data may contain `stats_parsed` and `partitionValues_parsed`;
+        // provide its full schema to the evaluator.
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
@@ -974,8 +999,14 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
+            // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
+            // consuming it.
+            let actions = CancellableIterator::new(
+                existing_data.into_iter().map(apply_transform),
+                self.cancellation_token.clone(),
+            );
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.into_iter().map(apply_transform),
+                actions,
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     has_partition_values_parsed: false,
@@ -1022,16 +1053,21 @@ impl Scan {
             meta_predicate,
             physical_stats_schema,
             None,
-            // The incremental path relies on the batch-boundary poll in `scan_metadata_inner`
-            // for cancellation; it does not thread the token into the engine reads here, so a
-            // read already in flight is not interrupted mid-I/O.
-            None,
+            self.cancellation_token.as_ref(),
         )?;
+        // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
+        // newly read action prefix.
+        let existing_actions = CancellableIterator::new(
+            existing_data.into_iter().map(apply_transform),
+            self.cancellation_token.clone(),
+        );
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result
-                .actions
-                .chain(existing_data.into_iter().map(apply_transform)),
-            checkpoint_info: result.checkpoint_info,
+            actions: result.actions.chain(existing_actions),
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: false,
+                has_partition_values_parsed: false,
+                checkpoint_read_schema: restored_add_schema().clone(),
+            },
         };
 
         Ok(Box::new(self.scan_metadata_inner(
@@ -1058,15 +1094,9 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
-                // Wrap the input iterator (not the shared `process_actions_iter`) so token
-                // polling stays scoped to scans.
-                let actions = CancellableIterator::new(
-                    actions_with_checkpoint_info.actions,
-                    self.cancellation_token.clone(),
-                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions,
+                    actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
@@ -1106,15 +1136,23 @@ impl Scan {
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
+    #[tracing::instrument(
+        name = "scan.declarative_metadata_scan_plan",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
-        // whether the checkpoint carries a compatible parsed-stats column.
+        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
+        // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
-        let shape = CheckpointShape::try_new(
-            plan_executor.as_ref(),
-            &self.snapshot,
-            self.state_info.physical_stats_schema.as_ref(),
-        )?;
+        let needs_leaf_schema = self.state_info.physical_stats_schema.is_some()
+            || self.state_info.physical_partition_schema.is_some();
+        let shape = if needs_leaf_schema {
+            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
+        } else {
+            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
+        };
         self.build_metadata_scan_plan(&shape)
     }
 
@@ -1267,7 +1305,7 @@ impl Scan {
         // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
         // not thread cancellation, so honoring a set token would require dropping it on the floor.
         if self.cancellation_token.is_some() {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \
                  use scan_metadata for a cancellable scan",
             ));
@@ -1276,14 +1314,14 @@ impl Scan {
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
         let checkpoint_read_schema = if self.skip_stats() {
-            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
+            PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
-            CHECKPOINT_READ_SCHEMA.clone()
+            PARALLEL_CHECKPOINT_READ_SCHEMA.clone()
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
-            checkpoint_read_schema,
+            checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),
@@ -1292,8 +1330,12 @@ impl Scan {
             self.stats_options(),
             self.partition_values_options(),
         )?;
-        let sequential =
-            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
+        let sequential = SequentialPhase::try_new(
+            processor,
+            self.snapshot.log_segment(),
+            engine.clone(),
+            checkpoint_read_schema,
+        )?;
 
         Ok(SequentialScanMetadata::new(
             sequential,
@@ -1315,7 +1357,7 @@ impl Scan {
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
-            return Err(Error::unsupported(
+            return Err(KernelError::unsupported(
                 "Scan::execute is not supported when the scan was built with \
                  without_row_transforms; use scan_metadata for listing and read data with your \
                  own reader",
@@ -1359,7 +1401,7 @@ impl Scan {
                 let meta = FileMeta {
                     last_modified: scan_file.modification_time,
                     size: scan_file.size.try_into().map_err(|_| {
-                        Error::generic("Unable to convert scan file size into FileSize")
+                        KernelError::generic("Unable to convert scan file size into FileSize")
                     })?,
                     location: file_path,
                 };
@@ -1383,7 +1425,7 @@ impl Scan {
                 // 0-row file from a buggy connector, so we conservatively allow it.
                 let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {
-                    return Err(Error::internal_error(format!(
+                    return Err(KernelError::internal_error(format!(
                         "ParquetHandler returned no data for file '{}'. This is likely a connector \
                          bug -- the handler's read_parquet_files must return at least one batch for \
                          each requested file that contains rows.",

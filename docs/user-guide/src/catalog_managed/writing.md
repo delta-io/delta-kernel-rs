@@ -109,7 +109,7 @@ snapshot** that reflects the newly committed state:
 use delta_kernel::transaction::CommitResult;
 
 match commit_result {
-    CommitResult::CommittedTransaction(committed) => {
+    CommitResult::Committed(committed) => {
         let version = committed.commit_version();
         // post_commit_snapshot() returns an Option. For catalog-managed
         // commits today, Kernel returns Some. The Option exists for
@@ -118,7 +118,7 @@ match commit_result {
         // problem surfaces loudly if the invariant ever changes.
         let post_commit = committed
             .post_commit_snapshot()
-            .ok_or_else(|| Error::generic("missing post-commit snapshot"))?;
+            .ok_or_else(|| KernelError::generic("missing post-commit snapshot"))?;
 
         // commit() consumed the Box<dyn Committer> from Phase 2. publish() only
         // needs &dyn Committer, so construct a fresh instance here. This moves
@@ -130,15 +130,15 @@ match commit_result {
         // Proceed to publish (Phase 4).
         let published_snapshot = post_commit.publish(&engine, &publish_committer)?;
     }
-    CommitResult::ConflictedTransaction(conflicted) => {
+    CommitResult::Conflicted(conflicted) => {
         // Another writer already committed at this version.
         // `conflicted.conflict_version()` returns the version this transaction
         // attempted. Rebase onto the new table state and retry.
     }
-    CommitResult::RetryableTransaction(retryable) => {
+    CommitResult::Retryable(retryable) => {
         // Transient I/O error. `retryable.error` gives the underlying cause;
         // `retryable.transaction` is the original transaction you can retry
-        // without rebasing. Kernel reaches this arm only for `Error::IOError`
+        // without rebasing. Kernel reaches this arm only for `KernelError::IOError`
         // variants; return other error kinds as-is rather than disguising
         // them as IOError to force retry.
     }

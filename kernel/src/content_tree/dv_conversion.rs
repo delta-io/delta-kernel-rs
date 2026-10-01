@@ -5,7 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
-use crate::{DeltaResult, EngineData, Error};
+use crate::{DeltaResult, EngineData, KernelError};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -32,7 +32,7 @@ pub(crate) fn extract_deletion_vector_content(
             dv.relative_path()?
         }
         DeletionVectorStorageType::Inline => {
-            return Err(Error::DeletionVector(
+            return Err(KernelError::DeletionVector(
                 "Inline deletion vectors are not supported. They must be persisted first."
                     .to_string(),
             ));
@@ -373,7 +373,7 @@ mod tests {
             let row = vec![self.root_scalar(dv_schema.clone(), dv)];
             SyncEngine::new()
                 .evaluation_handler()
-                .create_many(self.schema(dv_schema), &[row.as_slice()])
+                .create_many(self.schema(dv_schema), vec![row])
                 .unwrap()
         }
 
@@ -392,10 +392,9 @@ mod tests {
                     vec![self.root_scalar(dv_schema.clone(), scalar)]
                 })
                 .collect();
-            let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
             SyncEngine::new()
                 .evaluation_handler()
-                .create_many(self.schema(dv_schema), &row_refs)
+                .create_many(self.schema(dv_schema), rows)
                 .unwrap()
         }
 

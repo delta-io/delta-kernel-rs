@@ -158,6 +158,7 @@ parallel scan. It describes the corresponding log replay work:
 | `num_predicate_filtered` | Files eliminated by predicate evaluation (data skipping and partition pruning). |
 | `peak_hash_set_size` | Whole-scan high-water mark for the internal deduplication set. This value is retained across sequential and parallel phase events. |
 | `dedup_visitor_time_ns` | Nanoseconds spent in the deduplication visitor. |
+| `action_transform_time_ns` | Total nanoseconds spent transforming log actions into scan rows, including parsing JSON statistics into typed columns and retry attempts. Concurrent transforms contribute separately, so their total can exceed the wall-clock `duration`. |
 | `predicate_eval_time_ns` | Nanoseconds spent evaluating predicates. |
 
 #### The ScanType enum

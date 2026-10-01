@@ -218,10 +218,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     txn.add_files(add_metadata);
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(
-        commit_result,
-        CommitResult::CommittedTransaction(_)
-    ));
+    assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 3: Verify we can read all 20 rows before deletion
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -253,10 +250,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(
-        commit_result,
-        CommitResult::CommittedTransaction(_)
-    ));
+    assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 6: Verify first deletion - should have 17 rows (7 from file 1 + 10 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -308,10 +302,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
             .map(Ok),
     )?;
     let commit_result = txn.commit(engine.as_ref())?;
-    assert!(matches!(
-        commit_result,
-        CommitResult::CommittedTransaction(_)
-    ));
+    assert!(matches!(commit_result, CommitResult::Committed(_)));
 
     // Step 9: Verify final deletion - should have 14 rows (6 from file 1 + 8 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

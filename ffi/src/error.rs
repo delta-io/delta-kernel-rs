@@ -1,4 +1,5 @@
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::snapshot::SnapshotHintError;
+use delta_kernel::{DeltaResult, KernelError};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -20,8 +21,8 @@ use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelString
 #[repr(C)]
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
-pub enum KernelError {
-    UnknownError = 0, // catch-all for unrecognized kernel Error types
+pub enum FFIKernelError {
+    UnknownError = 0, // catch-all for unrecognized KernelError types
     FFIError = 1,     // errors encountered in the code layer that supports FFI
     #[cfg(feature = "default-engine-base")]
     ArrowError = 2,
@@ -66,83 +67,95 @@ pub enum KernelError {
     ChangeDataFeedUnsupported = 37,
     ChangeDataFeedIncompatibleSchema = 38,
     InvalidCheckpoint = 39,
-    LiteralExpressionTransformError = 40,
     CheckpointWriteError = 41,
     SchemaError = 42,
     LogHistoryError = 43,
     RowTrackingChangeFeedUnsupported = 44,
     CancelledError = 45,
     InvalidTransactionStateError = 46,
+    InvalidLogSegment = 47,
+    UnpublishedVersionError = 48,
+    EmptyLogError = 49,
+    InvalidSnapshotHint = 50,
+    StartVersionNotFound = 51,
+    InvalidGeoParamsError = 52,
 }
 
-impl From<Error> for KernelError {
-    fn from(e: Error) -> Self {
+impl From<KernelError> for FFIKernelError {
+    fn from(e: KernelError) -> Self {
         match e {
-            // NOTE: By definition, no kernel Error maps to FFIError
+            // NOTE: By definition, no KernelError maps to FFIError
             #[cfg(feature = "default-engine-base")]
-            Error::Arrow(_) => KernelError::ArrowError,
-            Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
-            Error::EngineDataType(_) => KernelError::EngineDataTypeError,
-            Error::Extract(..) => KernelError::ExtractError,
-            Error::Generic(_) => KernelError::GenericError,
-            Error::GenericError { .. } => KernelError::GenericError,
-            Error::MaxCatalogVersion(_) => KernelError::GenericError,
-            Error::LogTailVersionsNotContiguous { .. } => KernelError::GenericError,
-            Error::IOError(_) => KernelError::IOErrorError,
+            KernelError::Arrow(_) => FFIKernelError::ArrowError,
+            KernelError::CheckpointWrite(_) => FFIKernelError::CheckpointWriteError,
+            KernelError::EngineDataType(_) => FFIKernelError::EngineDataTypeError,
+            KernelError::Extract(..) => FFIKernelError::ExtractError,
+            KernelError::Generic(_) => FFIKernelError::GenericError,
+            KernelError::GenericError { .. } => FFIKernelError::GenericError,
+            KernelError::MaxCatalogVersion(_) => FFIKernelError::GenericError,
+            KernelError::LogTailVersionsNotContiguous { .. } => FFIKernelError::InvalidLogSegment,
+            KernelError::IOError(_) => FFIKernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
-            Error::Parquet(_) => KernelError::ParquetError,
+            KernelError::Parquet(_) => FFIKernelError::ParquetError,
             #[cfg(feature = "default-engine-base")]
-            Error::ObjectStore(_) => KernelError::ObjectStoreError,
+            KernelError::ObjectStore(_) => FFIKernelError::ObjectStoreError,
             #[cfg(feature = "default-engine-base")]
-            Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
+            KernelError::ObjectStorePath(_) => FFIKernelError::ObjectStorePathError,
             #[cfg(feature = "default-engine-base")]
-            Error::Reqwest(_) => KernelError::ReqwestError,
-            Error::FileNotFound(_) => KernelError::FileNotFoundError,
-            Error::MissingColumn(_) => KernelError::MissingColumnError,
-            Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
-            Error::MissingData(_) => KernelError::MissingDataError,
-            Error::MissingVersion => KernelError::MissingVersionError,
-            Error::DeletionVector(_) => KernelError::DeletionVectorError,
-            Error::InvalidUrl(_) => KernelError::InvalidUrlError,
-            Error::MalformedJson(_) => KernelError::MalformedJsonError,
-            Error::MissingMetadata => KernelError::MissingMetadataError,
-            Error::MissingProtocol => KernelError::MissingProtocolError,
-            Error::InvalidProtocol(_) => KernelError::InvalidProtocolError,
-            Error::MissingMetadataAndProtocol => KernelError::MissingMetadataAndProtocolError,
-            Error::ParseError(..) => KernelError::ParseError,
-            Error::JoinFailure(_) => KernelError::JoinFailureError,
-            Error::Utf8Error(_) => KernelError::Utf8Error,
-            Error::ParseIntError(_) => KernelError::ParseIntError,
-            Error::InvalidColumnMappingMode(_) => KernelError::InvalidColumnMappingModeError,
-            Error::InvalidTableLocation(_) => KernelError::InvalidTableLocationError,
-            Error::InvalidDecimal(_) => KernelError::InvalidDecimalError,
-            Error::InvalidStructData(_) => KernelError::InvalidStructDataError,
-            Error::InternalError(_) => KernelError::InternalError,
-            Error::Backtraced {
+            KernelError::Reqwest(_) => FFIKernelError::ReqwestError,
+            KernelError::FileNotFound(_) => FFIKernelError::FileNotFoundError,
+            KernelError::MissingColumn(_) => FFIKernelError::MissingColumnError,
+            KernelError::UnexpectedColumnType(_) => FFIKernelError::UnexpectedColumnTypeError,
+            KernelError::MissingData(_) => FFIKernelError::MissingDataError,
+            KernelError::EmptyLog => FFIKernelError::EmptyLogError,
+            KernelError::MissingVersion(_) => FFIKernelError::MissingVersionError,
+            KernelError::StartVersionNotFound { .. } => FFIKernelError::StartVersionNotFound,
+            KernelError::UnpublishedVersion(_) => FFIKernelError::UnpublishedVersionError,
+            KernelError::DeletionVector(_) => FFIKernelError::DeletionVectorError,
+            KernelError::InvalidUrl(_) => FFIKernelError::InvalidUrlError,
+            KernelError::MalformedJson(_) => FFIKernelError::MalformedJsonError,
+            KernelError::MissingMetadata => FFIKernelError::MissingMetadataError,
+            KernelError::MissingProtocol => FFIKernelError::MissingProtocolError,
+            KernelError::InvalidProtocol(_) => FFIKernelError::InvalidProtocolError,
+            KernelError::MissingMetadataAndProtocol => {
+                FFIKernelError::MissingMetadataAndProtocolError
+            }
+            KernelError::ParseError(..) => FFIKernelError::ParseError,
+            KernelError::JoinFailure(_) => FFIKernelError::JoinFailureError,
+            KernelError::Utf8Error(_) => FFIKernelError::Utf8Error,
+            KernelError::ParseIntError(_) => FFIKernelError::ParseIntError,
+            KernelError::InvalidColumnMappingMode(_) => {
+                FFIKernelError::InvalidColumnMappingModeError
+            }
+            KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
+            KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
+            KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
+            KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
+            KernelError::InternalError(_) => FFIKernelError::InternalError,
+            KernelError::Backtraced {
                 source,
                 backtrace: _,
             } => Self::from(*source),
-            Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
-            Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
-            Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
-            Error::Unsupported(_) => KernelError::UnsupportedError,
-            Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
-            Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
-            Error::RowTrackingChangeFeedUnsupported(_) => {
-                KernelError::RowTrackingChangeFeedUnsupported
+            KernelError::InvalidExpressionEvaluation(_) => FFIKernelError::InvalidExpression,
+            KernelError::InvalidLogPath(_) => FFIKernelError::InvalidLogPath,
+            KernelError::InvalidLogSegment(_) => FFIKernelError::InvalidLogSegment,
+            KernelError::SnapshotHint(_) => FFIKernelError::InvalidSnapshotHint,
+            KernelError::FileAlreadyExists(_) => FFIKernelError::FileAlreadyExists,
+            KernelError::Unsupported(_) => FFIKernelError::UnsupportedError,
+            KernelError::ParseIntervalError(_) => FFIKernelError::ParseIntervalError,
+            KernelError::ChangeDataFeedUnsupported(_) => FFIKernelError::ChangeDataFeedUnsupported,
+            KernelError::RowTrackingChangeFeedUnsupported(_) => {
+                FFIKernelError::RowTrackingChangeFeedUnsupported
             }
-            Error::ChangeDataFeedIncompatibleSchema(_, _) => {
-                KernelError::ChangeDataFeedIncompatibleSchema
+            KernelError::ChangeDataFeedIncompatibleSchema(_, _) => {
+                FFIKernelError::ChangeDataFeedIncompatibleSchema
             }
-            Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
-            Error::LiteralExpressionTransformError(_) => {
-                KernelError::LiteralExpressionTransformError
-            }
-            Error::Schema(_) => KernelError::SchemaError,
-            Error::InvalidTransactionState(_) => KernelError::InvalidTransactionStateError,
-            Error::LogHistory(_) => KernelError::LogHistoryError,
-            Error::Cancelled => KernelError::CancelledError,
-            _ => KernelError::UnknownError,
+            KernelError::InvalidCheckpoint(_) => FFIKernelError::InvalidCheckpoint,
+            KernelError::Schema(_) => FFIKernelError::SchemaError,
+            KernelError::InvalidTransactionState(_) => FFIKernelError::InvalidTransactionStateError,
+            KernelError::LogHistory(_) => FFIKernelError::LogHistoryError,
+            KernelError::Cancelled => FFIKernelError::CancelledError,
+            _ => FFIKernelError::UnknownError,
         }
     }
 }
@@ -155,7 +168,7 @@ impl From<Error> for KernelError {
 /// class.
 #[repr(C)]
 pub struct EngineError {
-    pub(crate) etype: KernelError,
+    pub(crate) etype: FFIKernelError,
 }
 
 /// Semantics: Kernel will always immediately return the leaked engine error to the engine (if it
@@ -167,7 +180,7 @@ pub enum ExternResult<T> {
 }
 
 pub type AllocateErrorFn =
-    extern "C" fn(etype: KernelError, msg: KernelStringSlice) -> *mut EngineError;
+    extern "C" fn(etype: FFIKernelError, msg: KernelStringSlice) -> *mut EngineError;
 
 impl<T> ExternResult<T> {
     pub fn is_ok(&self) -> bool {
@@ -193,14 +206,17 @@ pub trait AllocateError {
     ///
     /// The string slice must be valid until the call returns, and the error allocator must also be
     /// valid.
-    unsafe fn allocate_error(&self, etype: KernelError, msg: KernelStringSlice)
-        -> *mut EngineError;
+    unsafe fn allocate_error(
+        &self,
+        etype: FFIKernelError,
+        msg: KernelStringSlice,
+    ) -> *mut EngineError;
 }
 
 impl AllocateError for AllocateErrorFn {
     unsafe fn allocate_error(
         &self,
-        etype: KernelError,
+        etype: FFIKernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
         self(etype, msg)
@@ -215,7 +231,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
     /// In addition to the usual requirements, the engine handle must be valid.
     unsafe fn allocate_error(
         &self,
-        etype: KernelError,
+        etype: FFIKernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
         self.error_allocator().allocate_error(etype, msg)
@@ -255,9 +271,9 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
 /// can then take ownership and free it appropriately after receiving the error.
 #[repr(C)]
 pub struct EngineExecError {
-    // TODO: we re-use KernelError for convenience, but we should ideally split this into a
+    // TODO: we re-use FFIKernelError for convenience, but we should ideally split this into a
     // separate enum, containing only error types that make sense for the engine to return.
-    pub etype: KernelError,
+    pub etype: FFIKernelError,
     pub message: Handle<ExclusiveRustString>,
 }
 
@@ -277,20 +293,20 @@ pub enum EngineExecResult<T> {
     Uninit,
 }
 
-/// Maps the given KernelError code to the given Error variant. Logs a warning if the associated
-/// error message is non-empty. Useful for mapping kernel errors to error variants that don't
-/// carry a message, but for some reason the engine still provided one.
-fn messageless_error(code: KernelError, message: String, error: Error) -> Error {
+/// Maps the given FFIKernelError code to the given KernelError variant. Logs a warning if the
+/// associated error message is non-empty. Useful for mapping kernel errors to error variants that
+/// don't carry a message, but for some reason the engine still provided one.
+fn messageless_error(code: FFIKernelError, message: String, error: KernelError) -> KernelError {
     if !message.is_empty() {
         warn!("Discarding message for engine execution error ({code:?}): {message}");
     }
     error
 }
 
-impl From<EngineExecError> for Error {
-    /// Converts an [`EngineExecError`] into a [`delta_kernel::Error`], translating the
-    /// [`KernelError`] code back into its matching kernel error variant and consuming (and thereby
-    /// freeing) the message handle.
+impl From<EngineExecError> for KernelError {
+    /// Converts an [`EngineExecError`] into a [`delta_kernel::KernelError`], translating the
+    /// [`FFIKernelError`] code back into its matching kernel error variant and consuming (and
+    /// thereby freeing) the message handle.
     fn from(err: EngineExecError) -> Self {
         let EngineExecError { etype, message } = err;
         // SAFETY: `message` is an `ExclusiveRustString` handle that kernel owns and has not yet
@@ -298,71 +314,84 @@ impl From<EngineExecError> for Error {
         // consumed exactly once, here.
         let message = *unsafe { message.into_inner() };
         match etype {
-            KernelError::CheckpointWriteError => Error::CheckpointWrite(message),
-            KernelError::EngineDataTypeError => Error::EngineDataType(message),
-            KernelError::GenericError => Error::Generic(message),
-            KernelError::InternalError => Error::InternalError(message),
-            KernelError::FileNotFoundError => Error::FileNotFound(message),
-            KernelError::MissingColumnError => Error::MissingColumn(message),
-            KernelError::UnexpectedColumnTypeError => Error::UnexpectedColumnType(message),
-            KernelError::MissingDataError => Error::MissingData(message),
-            KernelError::DeletionVectorError => Error::DeletionVector(message),
-            KernelError::InvalidProtocolError => Error::InvalidProtocol(message),
-            KernelError::JoinFailureError => Error::JoinFailure(message),
-            KernelError::InvalidColumnMappingModeError => Error::InvalidColumnMappingMode(message),
-            KernelError::InvalidTableLocationError => Error::InvalidTableLocation(message),
-            KernelError::InvalidDecimalError => Error::InvalidDecimal(message),
-            KernelError::InvalidStructDataError => Error::InvalidStructData(message),
-            KernelError::InvalidExpression => Error::InvalidExpressionEvaluation(message),
-            KernelError::InvalidLogPath => Error::InvalidLogPath(message),
-            KernelError::FileAlreadyExists => Error::FileAlreadyExists(message),
-            KernelError::UnsupportedError => Error::Unsupported(message),
-            KernelError::InvalidCheckpoint => Error::InvalidCheckpoint(message),
-            KernelError::SchemaError => Error::Schema(message),
-            KernelError::InvalidTransactionStateError => Error::InvalidTransactionState(message),
-            code @ KernelError::MissingVersionError => {
-                messageless_error(code, message, Error::MissingVersion)
+            FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
+            FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
+            FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::InternalError => KernelError::InternalError(message),
+            FFIKernelError::FileNotFoundError => KernelError::FileNotFound(message),
+            FFIKernelError::MissingColumnError => KernelError::MissingColumn(message),
+            FFIKernelError::UnexpectedColumnTypeError => KernelError::UnexpectedColumnType(message),
+            FFIKernelError::MissingDataError => KernelError::MissingData(message),
+            FFIKernelError::DeletionVectorError => KernelError::DeletionVector(message),
+            FFIKernelError::InvalidProtocolError => KernelError::InvalidProtocol(message),
+            FFIKernelError::JoinFailureError => KernelError::JoinFailure(message),
+            FFIKernelError::InvalidColumnMappingModeError => {
+                KernelError::InvalidColumnMappingMode(message)
             }
-            code @ KernelError::MissingMetadataError => {
-                messageless_error(code, message, Error::MissingMetadata)
+            FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
+            FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
+            FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
+            FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
+            FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
+            FFIKernelError::InvalidLogPath => KernelError::InvalidLogPath(message),
+            FFIKernelError::InvalidLogSegment => KernelError::InvalidLogSegment(message),
+            FFIKernelError::InvalidSnapshotHint => SnapshotHintError::Connector {
+                message,
+                source: None,
             }
-            code @ KernelError::MissingProtocolError => {
-                messageless_error(code, message, Error::MissingProtocol)
+            .into(),
+            FFIKernelError::FileAlreadyExists => KernelError::FileAlreadyExists(message),
+            FFIKernelError::UnsupportedError => KernelError::Unsupported(message),
+            FFIKernelError::InvalidCheckpoint => KernelError::InvalidCheckpoint(message),
+            FFIKernelError::SchemaError => KernelError::Schema(message),
+            FFIKernelError::InvalidTransactionStateError => {
+                KernelError::InvalidTransactionState(message)
             }
-            code @ KernelError::MissingMetadataAndProtocolError => {
-                messageless_error(code, message, Error::MissingMetadataAndProtocol)
+            code @ FFIKernelError::EmptyLogError => {
+                messageless_error(code, message, KernelError::EmptyLog)
             }
-            code @ KernelError::CancelledError => {
-                messageless_error(code, message, Error::Cancelled)
+            code @ FFIKernelError::MissingMetadataError => {
+                messageless_error(code, message, KernelError::MissingMetadata)
+            }
+            code @ FFIKernelError::MissingProtocolError => {
+                messageless_error(code, message, KernelError::MissingProtocol)
+            }
+            code @ FFIKernelError::MissingMetadataAndProtocolError => {
+                messageless_error(code, message, KernelError::MissingMetadataAndProtocol)
+            }
+            code @ FFIKernelError::CancelledError => {
+                messageless_error(code, message, KernelError::Cancelled)
             }
 
             // These codes have no well-defined equivalent (e.g they wrap a foreign error type,
             // carry a non-string payload, etc), so just map them to a generic error and
             // preserve the code + message in the error string.
-            code @ (KernelError::UnknownError
-            | KernelError::FFIError
-            | KernelError::ExtractError
-            | KernelError::IOErrorError
-            | KernelError::InvalidUrlError
-            | KernelError::MalformedJsonError
-            | KernelError::ParseError
-            | KernelError::Utf8Error
-            | KernelError::ParseIntError
-            | KernelError::ParseIntervalError
-            | KernelError::ChangeDataFeedUnsupported
-            | KernelError::ChangeDataFeedIncompatibleSchema
-            | KernelError::RowTrackingChangeFeedUnsupported
-            | KernelError::LiteralExpressionTransformError
-            | KernelError::LogHistoryError) => {
-                Error::generic(format!("engine execution error ({code:?}): {message}"))
+            code @ (FFIKernelError::UnknownError
+            | FFIKernelError::FFIError
+            | FFIKernelError::ExtractError
+            | FFIKernelError::IOErrorError
+            | FFIKernelError::InvalidUrlError
+            | FFIKernelError::MalformedJsonError
+            | FFIKernelError::ParseError
+            | FFIKernelError::Utf8Error
+            | FFIKernelError::ParseIntError
+            | FFIKernelError::ParseIntervalError
+            | FFIKernelError::ChangeDataFeedUnsupported
+            | FFIKernelError::ChangeDataFeedIncompatibleSchema
+            | FFIKernelError::RowTrackingChangeFeedUnsupported
+            | FFIKernelError::LogHistoryError
+            | FFIKernelError::MissingVersionError
+            | FFIKernelError::UnpublishedVersionError
+            | FFIKernelError::StartVersionNotFound) => {
+                KernelError::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
-            code @ (KernelError::ArrowError
-            | KernelError::ParquetError
-            | KernelError::ObjectStoreError
-            | KernelError::ObjectStorePathError
-            | KernelError::ReqwestError) => {
-                Error::generic(format!("engine execution error ({code:?}): {message}"))
+            code @ (FFIKernelError::ArrowError
+            | FFIKernelError::ParquetError
+            | FFIKernelError::ObjectStoreError
+            | FFIKernelError::ObjectStorePathError
+            | FFIKernelError::ReqwestError) => {
+                KernelError::generic(format!("engine execution error ({code:?}): {message}"))
             }
         }
     }
@@ -372,13 +401,106 @@ impl From<EngineExecError> for Error {
 mod error_code_tests {
     use super::*;
 
+    fn exec_error(etype: FFIKernelError, message: &str) -> EngineExecError {
+        let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();
+        EngineExecError { etype, message }
+    }
+
     #[test]
     fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
         assert_eq!(
-            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
-            KernelError::RowTrackingChangeFeedUnsupported
+            FFIKernelError::from(KernelError::RowTrackingChangeFeedUnsupported(7)),
+            FFIKernelError::RowTrackingChangeFeedUnsupported
         );
-        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+        assert_eq!(FFIKernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+    }
+
+    #[test]
+    fn log_segment_errors_have_stable_ffi_mappings() {
+        let missing_version = KernelError::MissingVersion(7);
+        assert_eq!(
+            missing_version.to_string(),
+            "Table version 7 is missing or unavailable for this log operation."
+        );
+        assert_eq!(
+            FFIKernelError::from(missing_version),
+            FFIKernelError::MissingVersionError
+        );
+        assert_eq!(
+            FFIKernelError::from(KernelError::EmptyLog),
+            FFIKernelError::EmptyLogError
+        );
+        assert_eq!(
+            FFIKernelError::from(KernelError::UnpublishedVersion(7)),
+            FFIKernelError::UnpublishedVersionError
+        );
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidLogSegment("invalid".to_string())),
+            FFIKernelError::InvalidLogSegment
+        );
+        assert_eq!(
+            FFIKernelError::from(KernelError::LogTailVersionsNotContiguous {
+                first_version: 1,
+                second_version: 3,
+            }),
+            FFIKernelError::InvalidLogSegment
+        );
+        assert_eq!(FFIKernelError::InvalidLogSegment as i32, 47);
+        assert_eq!(FFIKernelError::UnpublishedVersionError as i32, 48);
+        assert_eq!(FFIKernelError::EmptyLogError as i32, 49);
+
+        let start_not_found = KernelError::StartVersionNotFound {
+            requested: 5,
+            earliest: 12,
+        };
+        assert_eq!(
+            start_not_found.to_string(),
+            "Start version 5 is not available; earliest available version is 12."
+        );
+        assert_eq!(
+            FFIKernelError::from(start_not_found),
+            FFIKernelError::StartVersionNotFound
+        );
+        assert_eq!(FFIKernelError::StartVersionNotFound as i32, 51);
+    }
+
+    #[test]
+    fn engine_log_segment_errors_use_supported_ffi_mappings() {
+        let missing_version: KernelError =
+            exec_error(FFIKernelError::MissingVersionError, "7").into();
+        assert!(matches!(
+            missing_version,
+            KernelError::Generic(message)
+                if message == "engine execution error (MissingVersionError): 7"
+        ));
+
+        let empty_log: KernelError = exec_error(FFIKernelError::EmptyLogError, "").into();
+        assert_eq!(empty_log.to_string(), "No table version found.");
+        assert!(matches!(empty_log, KernelError::EmptyLog));
+    }
+
+    #[test]
+    fn invalid_snapshot_hint_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::from(SnapshotHintError::Connector {
+                message: "invalid".to_string(),
+                source: None,
+            })),
+            FFIKernelError::InvalidSnapshotHint
+        );
+        assert_eq!(FFIKernelError::InvalidSnapshotHint as i32, 50);
+    }
+
+    #[test]
+    fn invalid_geo_params_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidGeoParams("invalid".to_string())),
+            FFIKernelError::InvalidGeoParamsError
+        );
+        assert_eq!(FFIKernelError::InvalidGeoParamsError as i32, 52);
+
+        let err: KernelError = exec_error(FFIKernelError::InvalidGeoParamsError, "invalid").into();
+        assert!(matches!(err, KernelError::InvalidGeoParams(message) if message == "invalid"));
     }
 }
 
@@ -388,34 +510,53 @@ mod tests {
 
     use super::*;
 
-    fn exec_error(etype: KernelError, message: &str) -> EngineExecError {
+    fn exec_error(etype: FFIKernelError, message: &str) -> EngineExecError {
         let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();
         EngineExecError { etype, message }
     }
 
-    /// Each code should translate into its matching kernel error variant (preserving the message),
-    /// unit variants drop the message, and unmapped codes fall back to a generic error that retains
-    /// both the original code and message.
+    /// Variants that cannot preserve their original message across FFI reconstruct from their
+    /// default `Display`; unmapped codes retain the original code and message.
     #[rstest]
-    #[case::file_not_found(KernelError::FileNotFoundError, "File not found: boom")]
-    #[case::schema(KernelError::SchemaError, "Schema error: boom")]
-    #[case::unsupported(KernelError::UnsupportedError, "Unsupported: boom")]
-    #[case::generic(KernelError::GenericError, "Generic delta kernel error: boom")]
-    #[case::invalid_expr(KernelError::InvalidExpression, "Invalid expression evaluation: boom")]
-    #[case::unit_missing_version(KernelError::MissingVersionError, "No table version found.")]
+    #[case::file_not_found(FFIKernelError::FileNotFoundError, "File not found: boom")]
+    #[case::schema(FFIKernelError::SchemaError, "Schema error: boom")]
+    #[case::unsupported(FFIKernelError::UnsupportedError, "Unsupported: boom")]
+    #[case::generic(FFIKernelError::GenericError, "Generic delta kernel error: boom")]
+    #[case::invalid_expr(
+        FFIKernelError::InvalidExpression,
+        "Invalid expression evaluation: boom"
+    )]
+    #[case::invalid_log_segment(FFIKernelError::InvalidLogSegment, "Invalid log segment: boom")]
+    #[case::empty_log(FFIKernelError::EmptyLogError, "No table version found.")]
+    #[case::invalid_snapshot_hint(
+        FFIKernelError::InvalidSnapshotHint,
+        "Invalid snapshot hint: boom"
+    )]
     #[case::fallback_io(
-        KernelError::IOErrorError,
+        FFIKernelError::IOErrorError,
         "Generic delta kernel error: engine execution error (IOErrorError): boom"
     )]
     #[case::fallback_row_tracking(
-        KernelError::RowTrackingChangeFeedUnsupported,
+        FFIKernelError::RowTrackingChangeFeedUnsupported,
         "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
     )]
+    #[case::fallback_missing_version(
+        FFIKernelError::MissingVersionError,
+        "Generic delta kernel error: engine execution error (MissingVersionError): boom"
+    )]
+    #[case::fallback_unpublished_version(
+        FFIKernelError::UnpublishedVersionError,
+        "Generic delta kernel error: engine execution error (UnpublishedVersionError): boom"
+    )]
+    #[case::fallback_start_version_not_found(
+        FFIKernelError::StartVersionNotFound,
+        "Generic delta kernel error: engine execution error (StartVersionNotFound): boom"
+    )]
     fn engine_exec_error_maps_kernel_error_code(
-        #[case] etype: KernelError,
+        #[case] etype: FFIKernelError,
         #[case] expected: &str,
     ) {
-        let err: Error = exec_error(etype, "boom").into();
+        let err: KernelError = exec_error(etype, "boom").into();
         assert_eq!(err.to_string(), expected);
     }
 }
