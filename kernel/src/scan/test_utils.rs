@@ -170,6 +170,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         requested_physical_stats_columns: Vec::new(),
         is_catalog_managed: false,
         skip_row_transforms: false,
+        table_root: None,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let (iter, _metrics) = scan_action_iter(

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{debug, enabled, warn, Level};
+use url::Url;
 
 use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
@@ -57,6 +58,10 @@ pub(crate) struct StateInfo {
     /// so the scan can still describe the transform structurally. Set by
     /// [`ScanBuilder::without_row_transforms`](crate::scan::ScanBuilder::without_row_transforms).
     pub(crate) skip_row_transforms: bool,
+    /// The table root, present (`Some`) iff adaptiveMetadata is enabled for the table. Threaded
+    /// into the deduplicator so it can normalize the deletion-vector identity under
+    /// adaptiveMetadata; `None` for ordinary tables.
+    pub(crate) table_root: Option<Url>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -530,6 +535,9 @@ impl StateInfo {
             requested_physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
             skip_row_transforms: false,
+            table_root: table_configuration
+                .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+                .then(|| table_configuration.table_root().clone()),
         })
     }
 

@@ -198,6 +198,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            table_root: None,
         }
     }
 
@@ -425,6 +426,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            table_root: None,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
