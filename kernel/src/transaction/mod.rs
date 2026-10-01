@@ -303,26 +303,6 @@ impl<S> TableWriteExpressions for Transaction<S> {
     }
 }
 
-#[cfg(feature = "check-constraints-in-dev")]
-impl<S> Transaction<S> {
-    /// Acknowledges that the connector enforces this table's CHECK constraints. Kernel never sees
-    /// row data, so it does not evaluate constraints: acknowledging without actually enforcing them
-    /// lets constraint-violating rows reach the table.
-    ///
-    /// Discover the constraints via [`TableWriteExpressions::check_constraints`] and enforce each
-    /// one's [`raw_sql`](crate::check_constraints::CheckConstraint::raw_sql). Every row written
-    /// must satisfy every constraint. When a commit introduces a constraint on a table that
-    /// already holds data, such as an ALTER TABLE that adds one, the connector must also verify
-    /// that every existing row satisfies it before committing.
-    ///
-    /// Without this acknowledgement on a constrained table,
-    /// [`write_state`](Transaction::write_state) fails, and [`commit`](Self::commit) fails
-    /// whenever the commit adds data files or introduces a constraint.
-    pub fn ack_check_constraints(&mut self) {
-        self.check_constraints_acknowledged = true;
-    }
-}
-
 /// Builds the projection for converting add file metadata into commit-ready Add actions.
 fn build_add_action_projection(
     input_schema: &StructType,
