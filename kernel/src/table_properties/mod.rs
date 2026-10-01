@@ -254,8 +254,7 @@ pub struct TableProperties {
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
     /// CHECK constraints declared on the table, keyed by name with the raw constraint SQL as the
-    /// value. The `delta.constraints.` prefix is matched case-insensitively. The name keeps its
-    /// original case.
+    /// value. Names keep the case they were written with but compare case-insensitively.
     pub(crate) check_constraints: HashMap<String, String>,
 
     /// any unrecognized properties are passed through and ignored by the parser
