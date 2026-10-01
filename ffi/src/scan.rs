@@ -2064,7 +2064,7 @@ mod visit_scan_metadata_tests {
 
     use std::ptr::NonNull;
 
-    use test_utils::{actions_to_string, TestAction};
+    use rstest::rstest;
 
     use super::{
         dv_info_has_vector, free_kernel_dv_info, free_scan, free_scan_metadata_iter, scan_builder,
@@ -2176,51 +2176,42 @@ mod visit_scan_metadata_tests {
         context.visited
     }
 
+    /// Each case lists the table's files as `(path, has_deletion_vector)`, when the callback stops
+    /// iteration, and the `(path, dv_info_has_vector)` pairs the engine is expected to see.
+    #[rstest]
+    #[case::callback_visits_every_file(
+        &[("a.parquet", false), ("b.parquet", false), ("c.parquet", false)],
+        None,
+        &[("a.parquet", false), ("b.parquet", false), ("c.parquet", false)],
+    )]
+    #[case::callback_returning_false_stops_iteration(
+        &[("a.parquet", false), ("b.parquet", false), ("c.parquet", false)],
+        Some(1),
+        &[("a.parquet", false)],
+    )]
+    #[case::dv_info_has_vector_reports_deletion_vector_presence(
+        &[("no_dv.parquet", false), ("with_dv.parquet", true)],
+        None,
+        &[("no_dv.parquet", false), ("with_dv.parquet", true)],
+    )]
     #[tokio::test]
-    async fn callback_visits_every_file() {
-        let commit_data = actions_to_string(vec![
-            TestAction::Metadata,
-            TestAction::Add("a.parquet".into()),
-            TestAction::Add("b.parquet".into()),
-            TestAction::Add("c.parquet".into()),
-        ]);
-        let visited = visit_scan_files(commit_data, None).await;
-        let paths: Vec<_> = visited.iter().map(|(path, _)| path.as_str()).collect();
-        assert_eq!(paths, ["a.parquet", "b.parquet", "c.parquet"]);
-    }
-
-    #[tokio::test]
-    async fn callback_returning_false_stops_iteration() {
-        let commit_data = actions_to_string(vec![
-            TestAction::Metadata,
-            TestAction::Add("a.parquet".into()),
-            TestAction::Add("b.parquet".into()),
-            TestAction::Add("c.parquet".into()),
-        ]);
-        let visited = visit_scan_files(commit_data, Some(1)).await;
-        let paths: Vec<_> = visited.iter().map(|(path, _)| path.as_str()).collect();
-        assert_eq!(
-            paths,
-            ["a.parquet"],
-            "iteration must stop after the first file"
-        );
-    }
-
-    #[tokio::test]
-    async fn dv_info_has_vector_reports_deletion_vector_presence() {
-        let commit_data = format!(
-            "{}\n{}\n{}",
-            METADATA_WITH_DVS,
-            add_action("no_dv.parquet", false),
-            add_action("with_dv.parquet", true),
-        );
-        let visited = visit_scan_files(commit_data, None).await;
-        assert_eq!(
-            visited,
-            [
-                ("no_dv.parquet".to_string(), false),
-                ("with_dv.parquet".to_string(), true),
-            ]
-        );
+    async fn visit_scan_metadata(
+        #[case] files: &[(&str, bool)],
+        #[case] stop_after: Option<usize>,
+        #[case] expected: &[(&str, bool)],
+    ) {
+        let adds = files
+            .iter()
+            .map(|&(path, with_dv)| add_action(path, with_dv));
+        let commit_data = std::iter::once(METADATA_WITH_DVS.to_string())
+            .chain(adds)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let visited = visit_scan_files(commit_data, stop_after).await;
+        let visited: Vec<_> = visited
+            .iter()
+            .map(|(path, has_vector)| (path.as_str(), *has_vector))
+            .collect();
+        assert_eq!(visited, expected);
     }
 }
