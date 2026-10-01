@@ -41,7 +41,7 @@ use crate::log_replay::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result};
+use crate::{Error, KernelError, KernelResult, KernelResultIteratorStatic, Result};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -182,6 +182,7 @@ impl Iterator for ActionReconciliationIterator {
     fn next(&mut self) -> Option<Self::Item> {
         let batch = self.inner.next();
         self.transform_batch(batch)
+            .map(|result| result.map_err(Error::Kernel))
     }
 }
 
@@ -424,7 +425,9 @@ impl ActionReconciliationVisitor<'_> {
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
         // will be excluded as it will be treated as expired.
-        let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
+        let deletion_timestamp = getter
+            .get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)
+            .map_err(crate::Error::into_kernel_error)?;
         let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
         Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
@@ -484,7 +487,8 @@ impl ActionReconciliationVisitor<'_> {
         // is a protocol action. Only return the first (newest) protocol action we see,
         // ignoring other types
         let result = getter
-            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)?
+            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)
+            .map_err(crate::Error::into_kernel_error)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_protocol, true));
         Ok(result)
@@ -506,7 +510,8 @@ impl ActionReconciliationVisitor<'_> {
         // action. Only return the first (newest) metadata action we see, ignoring other
         // types
         let result = getter
-            .get_str(i, Self::METADATA_ID.name)?
+            .get_str(i, Self::METADATA_ID.name)
+            .map_err(crate::Error::into_kernel_error)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_metadata, true));
         Ok(result)
@@ -524,7 +529,9 @@ impl ActionReconciliationVisitor<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
     ) -> KernelResult<Option<bool>> {
-        let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(i, Self::TXN_APP_ID.name)?
+        let Some(app_id) = getters[Self::TXN_APP_ID.index]
+            .get_str(i, Self::TXN_APP_ID.name)
+            .map_err(crate::Error::into_kernel_error)?
         else {
             return Ok(None); // Not a txn action, continue checking other types
         };
@@ -539,8 +546,9 @@ impl ActionReconciliationVisitor<'_> {
         // Exclude the winner when retention has expired it. A txn without last_updated never
         // expires (kept for backward compatibility).
         if let Some(retention_ts) = self.txn_expiration_timestamp {
-            if let Some(last_updated) =
-                getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
+            if let Some(last_updated) = getters[Self::TXN_LAST_UPDATED.index]
+                .get_opt(i, Self::TXN_LAST_UPDATED.name)
+                .map_err(crate::Error::into_kernel_error)?
             {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
@@ -565,7 +573,8 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> KernelResult<Option<bool>> {
         let Some(domain) = getters[Self::DOMAIN_METADATA_DOMAIN.index]
-            .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)?
+            .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)
+            .map_err(crate::Error::into_kernel_error)?
         else {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
@@ -580,7 +589,8 @@ impl ActionReconciliationVisitor<'_> {
 
         // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
         let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
-            .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
+            .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)
+            .map_err(crate::Error::into_kernel_error)?
             .unwrap_or(false);
         if removed {
             return Ok(Some(false));
@@ -677,14 +687,16 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 16,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for i in 0..row_count {
-            self.selection_vector[i] = self.is_valid_action(i, getters)?;
+            self.selection_vector[i] = self
+                .is_valid_action(i, getters)
+                .map_err(crate::Error::Kernel)?;
         }
         Ok(())
     }
@@ -1233,10 +1245,12 @@ mod tests {
         impl<'a> GetData<'a> for MockErrorGetData {
             fn get_str(&'a self, _: usize, field_name: &str) -> Result<Option<&'a str>> {
                 if field_name == self.error_on_field && self.error_type == "str" {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type str"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type str"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1244,10 +1258,12 @@ mod tests {
 
             fn get_int(&'a self, _: usize, field_name: &str) -> Result<Option<i32>> {
                 if field_name == self.error_on_field && self.error_type == "int" {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type i32"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type i32"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1272,10 +1288,12 @@ mod tests {
 
             fn get_long(&'a self, _: usize, field_name: &str) -> Result<Option<i64>> {
                 if field_name.contains(self.error_field) {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type i64"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type i64"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }

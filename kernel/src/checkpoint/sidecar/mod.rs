@@ -10,7 +10,7 @@ use crate::expressions::{
 };
 use crate::schema::{try_schema, DataType, SchemaRef, StructField};
 use crate::{
-    Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
+    Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
     KernelResult, PredicateEvaluator,
 };
 
@@ -88,15 +88,18 @@ pub(super) fn create_sidecar_action_batch(
                 .try_collect()?;
 
             let mut row = null_template.clone();
-            row[sidecar_col_idx] =
-                Scalar::Struct(StructData::try_new(sidecar_fields.clone(), values)?);
+            row[sidecar_col_idx] = Scalar::Struct(
+                StructData::try_new(sidecar_fields.clone(), values)
+                    .map_err(Error::into_kernel_error)?,
+            );
             Ok(row)
         })
         .try_collect()?;
 
     let batch = engine
         .evaluation_handler()
-        .create_many(checkpoint_data_schema.clone(), rows)?;
+        .create_many(checkpoint_data_schema.clone(), rows)
+        .map_err(Error::into_kernel_error)?;
     Ok(Some(batch))
 }
 
@@ -108,7 +111,10 @@ struct NonNullRowsPicker {
 
 impl NonNullRowsPicker {
     fn pick(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        let transformed = self.transform.evaluate(batch)?;
+        let transformed = self
+            .transform
+            .evaluate(batch)
+            .map_err(Error::into_kernel_error)?;
         filter_by_predicate(self.null_row_filter.as_ref(), transformed)
     }
 }
@@ -179,38 +185,50 @@ impl SidecarSplitter {
                 "Checkpoint data schema '{REMOVE_NAME}' field must be nullable"
             )));
         }
-        let sidecar_output_schema = Arc::new(try_schema! {
-            (add_field),
-            (remove_field),
-        }?);
+        let sidecar_output_schema = Arc::new(
+            try_schema! {
+                (add_field),
+                (remove_field),
+            }
+            .map_err(Error::into_kernel_error)?,
+        );
 
         // Sidecar projector: select only add/remove columns.
-        let file_action_projector = eval_handler.new_expression_evaluator(
-            checkpoint_data_schema.clone(),
-            Arc::new(Expression::struct_from([col!(ADD_NAME), col!(REMOVE_NAME)])),
-            sidecar_output_schema.clone().into(),
-        )?;
+        let file_action_projector = eval_handler
+            .new_expression_evaluator(
+                checkpoint_data_schema.clone(),
+                Arc::new(Expression::struct_from([col!(ADD_NAME), col!(REMOVE_NAME)])),
+                sidecar_output_schema.clone().into(),
+            )
+            .map_err(Error::into_kernel_error)?;
 
         // Filters out rows where both add and remove are null.
-        let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
-            sidecar_output_schema,
-            Arc::new(Predicate::or(
-                Predicate::is_not_null(col!(ADD_NAME)),
-                Predicate::is_not_null(col!(REMOVE_NAME)),
-            )),
-        )?;
+        let file_actions_null_row_filter = eval_handler
+            .new_predicate_evaluator(
+                sidecar_output_schema,
+                Arc::new(Predicate::or(
+                    Predicate::is_not_null(col!(ADD_NAME)),
+                    Predicate::is_not_null(col!(REMOVE_NAME)),
+                )),
+            )
+            .map_err(Error::into_kernel_error)?;
 
         // Nulls out add/remove instead of dropping them so the data schema stays the
         // same as checkpoint_data_schema (add/remove columns are already nullable).
-        let non_file_action_nullifier = eval_handler.new_expression_evaluator(
-            checkpoint_data_schema.clone(),
-            Arc::new(Expression::struct_patch(
-                ExpressionStructPatchBuilder::new()
-                    .replace(ADD_NAME, null_lit(add_field.data_type.clone()))
-                    .replace(REMOVE_NAME, null_lit(remove_field.data_type.clone())),
-            )?),
-            checkpoint_data_schema.clone().into(),
-        )?;
+        let non_file_action_nullifier = eval_handler
+            .new_expression_evaluator(
+                checkpoint_data_schema.clone(),
+                Arc::new(
+                    Expression::struct_patch(
+                        ExpressionStructPatchBuilder::new()
+                            .replace(ADD_NAME, null_lit(add_field.data_type.clone()))
+                            .replace(REMOVE_NAME, null_lit(remove_field.data_type.clone())),
+                    )
+                    .map_err(Error::into_kernel_error)?,
+                ),
+                checkpoint_data_schema.clone().into(),
+            )
+            .map_err(Error::into_kernel_error)?;
 
         // Filters out rows where all non-file-action columns are null.
         let non_file_actions_null_row_filter = {
@@ -220,7 +238,9 @@ impl SidecarSplitter {
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
                     .map(|f| Expression::column([&f.name]).is_not_null()),
             );
-            eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
+            eval_handler
+                .new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))
+                .map_err(Error::into_kernel_error)?
         };
 
         Ok(Self {
@@ -272,7 +292,10 @@ impl SidecarSplitter {
                 self.exhausted = true;
                 None
             })?;
-            let batch = match result.and_then(|f| f.apply_selection_vector()) {
+            let batch = match result
+                .map_err(Error::into_kernel_error)
+                .and_then(|f| f.apply_selection_vector().map_err(Error::into_kernel_error))
+            {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };

@@ -379,7 +379,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         write_context: &BoundWriteContext,
     ) -> Result<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
+        let input_schema = Schema::try_from_arrow(data.record_batch().schema())
+            .map_err(|error| delta_kernel::Error::Kernel(KernelError::from(error)))?;
         let output_schema = write_context.physical_data_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
@@ -410,7 +411,9 @@ pub fn build_add_file_metadata(
     write_context: &BoundWriteContext,
 ) -> Result<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
-    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
+    file_metadata
+        .as_record_batch(write_context.physical_partition_values(), &add_path)
+        .map_err(delta_kernel::Error::Kernel)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
@@ -589,8 +592,8 @@ mod tests {
 
         // 0, 1, then a pending tail that never resolves on its own.
         let make_stream = async move {
-            let head = stream::iter(vec![Ok(0i32), Ok(1i32)]);
-            let tail = stream::once(std::future::pending::<Result<i32>>());
+            let head = stream::iter(vec![Ok::<_, KernelError>(0i32), Ok(1i32)]);
+            let tail = stream::once(std::future::pending::<KernelResult<i32>>());
             Ok(head.chain(tail).boxed())
         };
         let mut iter = stream_future_to_cancellable_iter(executor, make_stream, Some(ct)).unwrap();

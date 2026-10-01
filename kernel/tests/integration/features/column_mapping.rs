@@ -238,7 +238,7 @@ async fn load_error(
     scenario: &str,
     reader_features: &[&str],
     writer_features: &[&str],
-) -> delta_kernel::KernelError {
+) -> delta_kernel::Error {
     let (store, engine, table_url) = engine_store_setup(scenario, None);
     setup_table(
         store.as_ref(),
@@ -272,7 +272,10 @@ async fn invalid_protocol_shapes_are_rejected(
     );
     let err = load_error(&scenario, reader_features, writer_features).await;
     assert!(
-        matches!(err, delta_kernel::KernelError::InvalidProtocol(_)),
+        matches!(
+            err,
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::InvalidProtocol(_))
+        ),
         "{err}"
     );
 }
@@ -300,7 +303,10 @@ async fn reader_v3_without_reader_features_is_rejected() {
         .build(&engine)
         .expect_err("expected snapshot load to fail");
     assert!(
-        matches!(err, delta_kernel::KernelError::InvalidProtocol(_)),
+        matches!(
+            err,
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::InvalidProtocol(_))
+        ),
         "{err}"
     );
 }

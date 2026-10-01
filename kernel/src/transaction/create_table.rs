@@ -106,6 +106,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use delta_kernel::committer::FileSystemCommitter;
 /// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 /// use test_utils::delta_kernel_default_engine::storage::store_from_url;
+/// use delta_kernel::{Error, KernelError};
 ///
 /// # fn main() -> delta_kernel::Result<()> {
 /// let schema = Arc::new(StructType::try_new([
@@ -113,7 +114,9 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///     StructField::nullable("name", DataType::STRING),
 /// ])?);
 ///
-/// let url = url::Url::parse("file:///tmp/my_table")?;
+/// let url = url::Url::parse("file:///tmp/my_table")
+///     .map_err(KernelError::from)
+///     .map_err(Error::Kernel)?;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")

@@ -129,33 +129,49 @@ pub fn get_engine(
     args: &LocationArgs,
 ) -> Result<DefaultEngine<TokioBackgroundExecutor>> {
     if args.env_creds {
-        let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
-            delta_kernel::KernelError::Generic(format!("Object store could not parse url: {e}"))
-        })?;
+        let (scheme, _path) = ObjectStoreScheme::parse(url)
+            .map_err(|e| {
+                delta_kernel::KernelError::Generic(format!("Object store could not parse url: {e}"))
+            })
+            .map_err(delta_kernel::Error::Kernel)?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
         let store: Arc<DynObjectStore> = match scheme {
-            AmazonS3 => Arc::new(AmazonS3Builder::from_env().with_url(url_str).build()?),
+            AmazonS3 => Arc::new(
+                AmazonS3Builder::from_env()
+                    .with_url(url_str)
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
+            ),
             GoogleCloudStorage => Arc::new(
                 GoogleCloudStorageBuilder::from_env()
                     .with_url(url_str)
-                    .build()?,
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
             ),
             MicrosoftAzure => Arc::new(
                 MicrosoftAzureBuilder::from_env()
                     .with_url(url_str)
-                    .build()?,
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
             ),
             Local | Memory | Http => {
-                return Err(delta_kernel::KernelError::Generic(format!(
-                    "Scheme {scheme:?} doesn't support getting credentials from environment"
-                )));
+                return Err(delta_kernel::Error::Kernel(
+                    delta_kernel::KernelError::Generic(format!(
+                        "Scheme {scheme:?} doesn't support getting credentials from environment"
+                    )),
+                ));
             }
             _ => {
                 // scheme is non-exhaustive
-                return Err(delta_kernel::KernelError::Generic(format!(
+                return Err(delta_kernel::Error::Kernel(
+                    delta_kernel::KernelError::Generic(format!(
                     "Unknown schema {scheme:?} doesn't support getting credentials from environment"
-                )));
+                )),
+                ));
             }
         };
         Ok(DefaultEngineBuilder::new(Arc::new(store)).build())

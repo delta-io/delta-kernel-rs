@@ -35,8 +35,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    Engine, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, Result, RowVisitor,
-    StorageHandler, Version,
+    Engine, Error, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, Result,
+    RowVisitor, StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -96,6 +96,11 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = Result<ActionsBat
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
+    pub checkpoint_info: CheckpointReadInfo,
+}
+
+pub(crate) struct KernelActionsWithCheckpointInfo<A: Iterator<Item = KernelResult<ActionsBatch>>> {
+    pub actions: A,
     pub checkpoint_info: CheckpointReadInfo,
 }
 
@@ -292,11 +297,13 @@ impl LogSegment {
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> Result<Self> {
-        validate_log_path_fields(&listed_files)?;
-        validate_compaction_files(&listed_files.ascending_compaction_files)?;
-        validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
-        validate_commit_file_types(&listed_files.ascending_commit_files)?;
-        validate_commit_files_sorted(&listed_files.ascending_commit_files)?;
+        validate_log_path_fields(&listed_files).map_err(Error::Kernel)?;
+        validate_compaction_files(&listed_files.ascending_compaction_files)
+            .map_err(Error::Kernel)?;
+        validate_checkpoint_parts(&listed_files.checkpoint_parts).map_err(Error::Kernel)?;
+        validate_commit_file_types(&listed_files.ascending_commit_files).map_err(Error::Kernel)?;
+        validate_commit_files_sorted(&listed_files.ascending_commit_files)
+            .map_err(Error::Kernel)?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -310,19 +317,23 @@ impl LogSegment {
                 None
             };
 
-        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)
+            .map_err(Error::Kernel)?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)
+            .map_err(Error::Kernel)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
             &listed_files.checkpoint_parts,
             end_version,
-        )?;
-        validate_latest_commit_file(&listed_files, effective_version)?;
+        )
+        .map_err(Error::Kernel)?;
+        validate_latest_commit_file(&listed_files, effective_version).map_err(Error::Kernel)?;
         validate_crc(
             listed_files.latest_crc_file.as_ref(),
             checkpoint_version,
             effective_version,
-        )?;
+        )
+        .map_err(Error::Kernel)?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -459,8 +470,9 @@ impl LogSegment {
                 cancellation_token,
             )
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build()
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context))
+            .map_err(Error::Kernel)?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -533,6 +545,7 @@ impl LogSegment {
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+            .map_err(Error::into_kernel_error)
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
@@ -548,6 +561,7 @@ impl LogSegment {
         end_version: impl Into<Option<Version>>,
     ) -> Result<Self> {
         Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+            .map_err(Error::Kernel)
     }
 
     /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
@@ -585,6 +599,7 @@ impl LogSegment {
             listed_files.ascending_commit_files().first(),
         )?;
         LogSegment::try_new(listed_files, log_root, end_version, None)
+            .map_err(Error::into_kernel_error)
     }
 
     #[allow(unused)]
@@ -636,6 +651,7 @@ impl LogSegment {
         commits.drain(..start_idx);
 
         LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
+            .map_err(Error::into_kernel_error)
     }
 
     /// Creates a new LogSegment with the given commit file added to the end.
@@ -839,17 +855,22 @@ impl LogSegment {
         let commit_stream =
             self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
 
-        let checkpoint_result = self.create_checkpoint_stream(
-            engine,
-            checkpoint_read_schema,
-            checkpoint_predicate,
-            stats_schema,
-            partition_schema,
-            cancellation_token,
-        )?;
+        let checkpoint_result = self
+            .create_checkpoint_stream(
+                engine,
+                checkpoint_read_schema,
+                checkpoint_predicate,
+                stats_schema,
+                partition_schema,
+                cancellation_token,
+            )
+            .map_err(Error::Kernel)?;
+        let checkpoint_actions = checkpoint_result
+            .actions
+            .map(|item| item.map_err(Error::Kernel));
 
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_result.actions),
+            actions: commit_stream.chain(checkpoint_actions),
             checkpoint_info: checkpoint_result.checkpoint_info,
         })
     }
@@ -888,9 +909,16 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<CheckpointAction>> {
-        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
-        for batch in self.read_actions(engine, schema)? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
+        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])
+            .map_err(Error::into_kernel_error)?
+            .into();
+        for batch in self
+            .read_actions(engine, schema)
+            .map_err(Error::into_kernel_error)?
+        {
+            let batch = batch.map_err(Error::into_kernel_error)?;
+            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch.actions())
+                .map_err(Error::into_kernel_error)?
             {
                 return Ok(Some(checkpoint));
             }
@@ -1122,7 +1150,8 @@ impl LogSegment {
     ) -> KernelResult<SchemaRef> {
         Ok(engine
             .parquet_handler()
-            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
+            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())
+            .map_err(Error::into_kernel_error)?
             .schema)
     }
 
@@ -1175,7 +1204,7 @@ impl LogSegment {
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
+        KernelActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
     > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
@@ -1275,14 +1304,15 @@ impl LogSegment {
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.listed.checkpoint_parts.first() {
-            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files_with_cancellation(
+            Some(parsed_log_path) if parsed_log_path.extension == "json" => engine
+                .json_handler()
+                .read_json_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
                     cancellation_token.cloned(),
-                )?
-            }
+                )
+                .map_err(Error::into_kernel_error)?,
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => engine
                 .parquet_handler()
                 .read_parquet_files_with_cancellation(
@@ -1290,7 +1320,8 @@ impl LogSegment {
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
                     cancellation_token.cloned(),
-                )?,
+                )
+                .map_err(Error::into_kernel_error)?,
             Some(parsed_log_path) => {
                 return Err(KernelError::invalid_checkpoint(format!(
                     "Unsupported checkpoint file type: {}",
@@ -1314,7 +1345,8 @@ impl LogSegment {
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate,
                     cancellation_token.cloned(),
-                )?
+                )
+                .map_err(Error::into_kernel_error)?
         } else {
             Box::new(std::iter::empty())
         };
@@ -1324,14 +1356,15 @@ impl LogSegment {
         // (true) or a checkpoint file (false).
         let actions_iter = actions
             .map_ok(|batch| ActionsBatch::new(batch, false))
-            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
+            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)))
+            .map(|item| item.map_err(Error::into_kernel_error));
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
-        Ok(ActionsWithCheckpointInfo {
+        Ok(KernelActionsWithCheckpointInfo {
             actions: actions_iter,
             checkpoint_info,
         })
@@ -1346,12 +1379,15 @@ impl LogSegment {
     ) -> KernelResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files_with_cancellation(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-                cancellation_token.cloned(),
-            )?,
+            "json" => engine
+                .json_handler()
+                .read_json_files_with_cancellation(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                    cancellation_token.cloned(),
+                )
+                .map_err(Error::into_kernel_error)?,
             "parquet" => engine
                 .parquet_handler()
                 .read_parquet_files_with_cancellation(
@@ -1359,15 +1395,18 @@ impl LogSegment {
                     Self::sidecar_read_schema(),
                     None,
                     cancellation_token.cloned(),
-                )?,
+                )
+                .map_err(Error::into_kernel_error)?,
             _ => return Ok(vec![]),
         };
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
         for batch_result in batches {
-            let batch = batch_result?;
-            visitor.visit_rows_of(batch.as_ref())?;
+            let batch = batch_result.map_err(Error::into_kernel_error)?;
+            visitor
+                .visit_rows_of(batch.as_ref())
+                .map_err(Error::into_kernel_error)?;
         }
 
         // Convert to FileMeta
@@ -1683,7 +1722,8 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> 
 
 fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> KernelResult<()> {
     for path in listed_files.iter_all_paths() {
-        let reparsed = ParsedLogPath::try_from(path.location.clone())?
+        let reparsed = ParsedLogPath::try_from(path.location.clone())
+            .map_err(Error::into_kernel_error)?
             .ok_or_else(|| KernelError::invalid_log_path(path.location.location.as_str()))?;
         require!(
             reparsed == *path,

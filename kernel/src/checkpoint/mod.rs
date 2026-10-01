@@ -41,6 +41,7 @@
 //! # use delta_kernel::SnapshotRef;
 //! # use delta_kernel::Result;
 //! # use delta_kernel::KernelError;
+//! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
 //! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> Result<FileMeta> {
@@ -70,7 +71,9 @@
 //!
 //! // Build the [`LastCheckpointHintStats`] from the exhausted iterator state
 //! let state = std::sync::Arc::into_inner(state)
-//!     .ok_or(KernelError::internal_error("checkpoint state Arc still has other references"))?;
+//!     .ok_or_else(|| Error::Kernel(KernelError::internal_error(
+//!         "checkpoint state Arc still has other references",
+//!     )))?;
 //! let last_checkpoint_stats =
 //!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
 //!         state,
@@ -81,7 +84,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, KernelError>(())
+//! # Ok::<_, Error>(())
 //! ```
 //!
 //! ## Warning
@@ -125,8 +128,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult,
-    KernelResultIteratorStatic, Result, Version,
+    version_as_i64, Engine, EngineData, Error, FileMeta, KernelError, KernelResult, Result, Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -196,17 +198,25 @@ impl LastCheckpointHintStats {
         num_sidecars: u64,
     ) -> Result<Self> {
         if !state.is_exhausted() {
-            return Err(KernelError::checkpoint_write(
+            return Err(Error::Kernel(KernelError::checkpoint_write(
                 "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
                  consumed and all data written to storage before finalizing",
-            ));
+            )));
         }
-        let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
-            KernelError::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
-        })?;
-        let num_sidecars_i64 = i64::try_from(num_sidecars).map_err(|e| {
-            KernelError::checkpoint_write(format!("num_sidecars {num_sidecars} exceeds i64: {e}"))
-        })?;
+        let size_in_bytes = i64::try_from(size_in_bytes)
+            .map_err(|e| {
+                KernelError::checkpoint_write(format!(
+                    "size_in_bytes {size_in_bytes} exceeds i64: {e}"
+                ))
+            })
+            .map_err(Error::Kernel)?;
+        let num_sidecars_i64 = i64::try_from(num_sidecars)
+            .map_err(|e| {
+                KernelError::checkpoint_write(format!(
+                    "num_sidecars {num_sidecars} exceeds i64: {e}"
+                ))
+            })
+            .map_err(Error::Kernel)?;
         let num_actions = state
             .actions_count()
             .checked_add(num_sidecars_i64)
@@ -215,7 +225,8 @@ impl LastCheckpointHintStats {
                     "checkpoint action count overflowed i64: {} + {num_sidecars}",
                     state.actions_count()
                 ))
-            })?;
+            })
+            .map_err(Error::Kernel)?;
         Ok(Self {
             num_actions,
             size_in_bytes,
@@ -417,6 +428,7 @@ impl CheckpointWriter {
             self.snapshot.version(),
         )
         .map(|parsed| parsed.location)
+        .map_err(Error::Kernel)
     }
 
     /// Returns the checkpoint data to be written to the checkpoint file.
@@ -441,7 +453,9 @@ impl CheckpointWriter {
     /// }
     /// drop(checkpoint_data);
     /// let state = Arc::into_inner(state)
-    ///     .ok_or(KernelError::internal_error("checkpoint state Arc still has other references"))?;
+    ///     .ok_or_else(|| Error::Kernel(KernelError::internal_error(
+    ///         "checkpoint state Arc still has other references",
+    ///     )))?;
     /// let last_checkpoint_stats =
     ///     LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, 0)?;
     /// writer.finalize(&engine, &last_checkpoint_stats)?;
@@ -461,8 +475,10 @@ impl CheckpointWriter {
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
-            self.deleted_file_retention_timestamp()?,
-            self.get_transaction_expiration_timestamp()?,
+            self.deleted_file_retention_timestamp()
+                .map_err(Error::Kernel)?,
+            self.get_transaction_expiration_timestamp()
+                .map_err(Error::Kernel)?,
         )
         .process_actions_iter(actions);
 
@@ -476,11 +492,14 @@ impl CheckpointWriter {
 
         // Apply stats transform to each reconciled batch
         let transformed = checkpoint_data.map(move |batch_result| {
-            let batch = batch_result?;
+            let batch = batch_result.map_err(Error::into_kernel_error)?;
             let (data, sv) = batch.filtered_data.into_parts();
-            let transformed = evaluator.evaluate(data.as_ref())?;
+            let transformed = evaluator
+                .evaluate(data.as_ref())
+                .map_err(Error::into_kernel_error)?;
             Ok(ActionReconciliationBatch {
-                filtered_data: FilteredEngineData::try_new(transformed, sv)?,
+                filtered_data: FilteredEngineData::try_new(transformed, sv)
+                    .map_err(Error::into_kernel_error)?,
                 actions_count: batch.actions_count,
                 add_actions_count: batch.add_actions_count,
             })
@@ -544,7 +563,8 @@ impl CheckpointWriter {
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
-        let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
+        let filtered_data =
+            FilteredEngineData::with_all_rows_selected(data.map_err(Error::Kernel)?);
         engine.json_handler().write_json_file(
             &last_checkpoint_path,
             Box::new(std::iter::once(Ok(filtered_data))),
@@ -559,7 +579,9 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let data_iter = self.checkpoint_data(engine)?;
+        let data_iter = self
+            .checkpoint_data(engine)
+            .map_err(Error::into_kernel_error)?;
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
@@ -610,12 +632,17 @@ impl CheckpointWriter {
             create_sidecar_action_batch(engine, &self.output_schema, &sidecar_metas)?;
 
         // Write main checkpoint file: non-file actions + sidecar references
-        let checkpoint_path = self.checkpoint_path()?;
-        let main_data: KernelResultIteratorStatic<Box<dyn EngineData>> =
-            Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
+        let checkpoint_path = self.checkpoint_path().map_err(Error::into_kernel_error)?;
+        let main_data: crate::ResultIteratorStatic<Box<dyn EngineData>> = Box::new(
+            non_file_batches
+                .into_iter()
+                .chain(sidecar_batch)
+                .map(Ok::<_, Error>),
+        );
         let main_size = engine
             .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+            .write_parquet_file(checkpoint_path.clone(), main_data)
+            .map_err(Error::into_kernel_error)?;
 
         // size_in_bytes covers the main checkpoint file plus all sidecar files.
         let sidecar_sizes_sum = sidecar_metas
@@ -639,13 +666,16 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let checkpoint_path = self.checkpoint_path()?;
-        let data_iter = self.checkpoint_data(engine)?;
+        let checkpoint_path = self.checkpoint_path().map_err(Error::into_kernel_error)?;
+        let data_iter = self
+            .checkpoint_data(engine)
+            .map_err(Error::into_kernel_error)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
         let main_size = engine
             .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
+            .map_err(Error::into_kernel_error)?;
 
         build_written_checkpoint_info(
             engine,
@@ -703,7 +733,8 @@ impl CheckpointWriter {
             .collect();
         let checkpoint_metadata_batch = engine
             .evaluation_handler()
-            .create_many(schema.clone(), vec![row])?;
+            .create_many(schema.clone(), vec![row])
+            .map_err(Error::into_kernel_error)?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
@@ -731,7 +762,9 @@ impl CheckpointWriter {
         };
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        let physical_clustering_columns = snapshot.get_physical_clustering_columns(engine)?;
+        let physical_clustering_columns = snapshot
+            .get_physical_clustering_columns(engine)
+            .map_err(Error::into_kernel_error)?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
@@ -781,16 +814,19 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> KernelResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_many(
-        LAST_CHECKPOINT_SCHEMA.clone(),
-        vec![vec![
-            version.into(),
-            actions_counter.into(),
-            None::<i64>.into(), // parts = None since we only support single-part checkpoints
-            size_in_bytes.into(),
-            add_actions_counter.into(),
-        ]],
-    )
+    engine
+        .evaluation_handler()
+        .create_many(
+            LAST_CHECKPOINT_SCHEMA.clone(),
+            vec![vec![
+                version.into(),
+                actions_counter.into(),
+                None::<i64>.into(), // parts = None since we only support single-part checkpoints
+                size_in_bytes.into(),
+                add_actions_counter.into(),
+            ]],
+        )
+        .map_err(Error::into_kernel_error)
 }
 
 /// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.
@@ -809,8 +845,15 @@ fn write_single_sidecar(
     let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
     let written_size = engine
         .parquet_handler()
-        .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
-    let meta = engine.storage_handler().head(&sidecar_url)?;
+        .write_parquet_file(
+            sidecar_url.clone(),
+            Box::new(iter.map(|batch| batch.map_err(Error::Kernel))),
+        )
+        .map_err(Error::into_kernel_error)?;
+    let meta = engine
+        .storage_handler()
+        .head(&sidecar_url)
+        .map_err(Error::into_kernel_error)?;
     verify_written_size(&sidecar_url, written_size, meta.size)?;
     Ok(Some((filename, meta)))
 }
@@ -836,7 +879,10 @@ fn build_written_checkpoint_info(
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
 ) -> KernelResult<WrittenCheckpointInfo> {
-    let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    let file_meta = engine
+        .storage_handler()
+        .head(checkpoint_path)
+        .map_err(Error::into_kernel_error)?;
     verify_written_size(checkpoint_path, written_size, file_meta.size)?;
     let total_size_in_bytes = file_meta
         .size
@@ -851,7 +897,8 @@ fn build_written_checkpoint_info(
         state,
         total_size_in_bytes,
         sidecar_count,
-    )?;
+    )
+    .map_err(Error::into_kernel_error)?;
     Ok(WrittenCheckpointInfo {
         file_meta,
         last_checkpoint_stats,

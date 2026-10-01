@@ -40,6 +40,10 @@ Fallible functions return `ExternResult` (tagged union of Ok/Err). The caller pr
 `allocate_error` callback when creating the engine; kernel calls this to allocate errors in
 the caller's memory space.
 
+Rust public APIs return `Result<T, Error>`; private FFI helpers can return `KernelResult<T>`.
+`IntoExternResult` accepts both, unpacking `Error::Kernel` without changing the FFI error code,
+rendered message, allocation callback, or ownership contract.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions

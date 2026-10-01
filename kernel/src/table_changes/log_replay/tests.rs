@@ -159,7 +159,8 @@ fn get_segment(
         log_root,
         start_version,
         end_version,
-    )?;
+    )
+    .map_err(crate::Error::into_kernel_error)?;
     Ok(log_segment.listed.ascending_commit_files)
 }
 
@@ -235,11 +236,14 @@ async fn cdf_not_enabled() {
     let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(crate::Error::Kernel(
+            KernelError::ChangeDataFeedUnsupported(_)
+        ))
     ));
 }
 
@@ -273,11 +277,14 @@ async fn unsupported_reader_feature() {
     let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(crate::Error::Kernel(
+            KernelError::ChangeDataFeedUnsupported(_)
+        ))
     ));
 }
 
@@ -350,7 +357,8 @@ async fn column_mapping_should_succeed() {
     let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, cm_schema, None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     // Column mapping with CDF should now succeed
     assert!(res.is_ok(), "CDF should now support column mapping");
@@ -1191,7 +1199,8 @@ async fn failing_protocol() {
     let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     assert_result_error_with_message(
         res,
@@ -1277,7 +1286,8 @@ async fn print_table_configuration() {
     let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     let log_output = tracing_guard.logs();
 
@@ -1342,7 +1352,8 @@ async fn print_table_info_post_phase1() {
     let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     let log_output = tracing_guard.logs();
 
@@ -1386,7 +1397,8 @@ async fn print_table_info_post_phase1_has_cdc() {
     let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     let log_output = tracing_guard.logs();
 
@@ -1441,7 +1453,8 @@ async fn print_table_info_post_phase1_has_dv() {
     let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
-            .try_collect();
+            .try_collect()
+            .map_err(crate::Error::Kernel);
 
     let log_output = tracing_guard.logs();
 

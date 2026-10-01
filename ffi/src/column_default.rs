@@ -82,7 +82,9 @@ fn visit_top_level_column_defaults_impl(
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
 ) -> KernelResult<usize> {
-    let defaults = txn.top_level_column_defaults()?;
+    let defaults = txn
+        .top_level_column_defaults()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     for (name, column_default) in &defaults {
         let name = name.as_str();
         let raw_sql = column_default.raw_sql();

@@ -13,7 +13,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::ColumnNamesAndTypes;
 use crate::utils::require;
-use crate::{KernelError, KernelResult};
+use crate::{Error, KernelError, KernelResult};
 
 const PATH: usize = 0;
 const SIZE: usize = 1;
@@ -36,6 +36,7 @@ static DV_MATCHED_FILE_COLUMNS: LazyLock<KernelResult<ColumnNamesAndTypes>> = La
             scan_row_schema()
                 .field_at(name)
                 .map(|field| field.data_type().clone())
+                .map_err(Error::into_kernel_error)
         })
         .collect::<KernelResult<Vec<_>>>()?;
     Ok((names, types).into())
@@ -52,7 +53,8 @@ impl Validation for DvMatchedFileRequiredFields {
         getters: &[&'a dyn GetData<'a>],
     ) -> KernelResult<()> {
         let path: &str = getters[PATH]
-            .get_opt(row, PATH_NAME)?
+            .get_opt(row, PATH_NAME)
+            .map_err(Error::into_kernel_error)?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
         require!(
             !path.is_empty(),
@@ -60,14 +62,18 @@ impl Validation for DvMatchedFileRequiredFields {
         );
 
         let partition_values = validate_required_field_exist(
-            getters[PARTITION_VALUES].get_map(row, PARTITION_VALUES_NAME)?,
+            getters[PARTITION_VALUES]
+                .get_map(row, PARTITION_VALUES_NAME)
+                .map_err(Error::into_kernel_error)?,
             path,
             PARTITION_VALUES_NAME,
         )?;
         validate_partition_keys(path, partition_values, &self.physical_partition_columns)?;
 
         let size = validate_required_field_exist::<i64>(
-            getters[SIZE].get_opt(row, SIZE_NAME)?,
+            getters[SIZE]
+                .get_opt(row, SIZE_NAME)
+                .map_err(Error::into_kernel_error)?,
             path,
             SIZE_NAME,
         )?;
@@ -78,7 +84,9 @@ impl Validation for DvMatchedFileRequiredFields {
             ))
         );
         validate_required_field_exist::<i64>(
-            getters[MODIFICATION_TIME].get_opt(row, MODIFICATION_TIME_NAME)?,
+            getters[MODIFICATION_TIME]
+                .get_opt(row, MODIFICATION_TIME_NAME)
+                .map_err(Error::into_kernel_error)?,
             path,
             MODIFICATION_TIME_NAME,
         )?;

@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveTransaction;
@@ -102,7 +102,7 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 impl TryFrom<c_int> for KernelDvStorageType {
     type Error = KernelError;
 
-    fn try_from(value: c_int) -> Result<Self> {
+    fn try_from(value: c_int) -> KernelResult<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn dv_descriptor_new(
     let result = KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
         dv_descriptor_new_impl(
             storage_type,
-            path,
+            path.map_err(delta_kernel::Error::into_kernel_error),
             has_offset,
             offset,
             size_in_bytes,
@@ -168,7 +168,8 @@ fn dv_descriptor_new_impl(
         has_offset.then_some(offset),
         size_in_bytes,
         cardinality,
-    )?;
+    )
+    .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(descriptor).into())
 }
 
@@ -197,9 +198,13 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     let engine_ref = unsafe { engine.as_ref() };
     let descriptor = unsafe { descriptor.into_inner() };
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    dv_descriptor_map_insert_impl(
+        map_ref,
+        path_result.map_err(delta_kernel::Error::into_kernel_error),
+        *descriptor,
+    )
+    .map(|_| true)
+    .into_extern_result(&engine_ref)
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -263,6 +268,7 @@ fn transaction_update_deletion_vectors_impl(
     let mut guard = scan_iter.lock_iter()?;
     let files_iter = Transaction::scan_metadata_to_engine_data(&mut **guard);
     txn.update_deletion_vectors(dv_map.inner, files_iter)
+        .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 #[cfg(test)]

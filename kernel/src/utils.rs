@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{KernelError, KernelResult, Result};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -72,31 +72,35 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
 #[internal_api]
 pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> Result<Url> {
     let uri = uri.as_ref();
-    let uri_type = resolve_uri_type(uri)?;
+    let uri_type = resolve_uri_type(uri).map_err(Error::Kernel)?;
     let url = match uri_type {
         UriType::LocalPath(path) => {
             if !path.exists() {
                 // When we support writes, create a directory if we can
-                return Err(KernelError::InvalidTableLocation(format!(
+                return Err(Error::Kernel(KernelError::InvalidTableLocation(format!(
                     "Path does not exist: {path:?}"
-                )));
+                ))));
             }
             if !path.is_dir() {
-                return Err(KernelError::InvalidTableLocation(format!(
+                return Err(Error::Kernel(KernelError::InvalidTableLocation(format!(
                     "{path:?} is not a directory"
-                )));
+                ))));
             }
-            let path = std::fs::canonicalize(path).map_err(|err| {
-                let msg = format!("Invalid table location: {uri} Error: {err:?}");
-                KernelError::InvalidTableLocation(msg)
-            })?;
-            Url::from_directory_path(path.clone()).map_err(|_| {
-                let msg = format!(
-                    "Could not construct a URL from canonicalized path: {path:?}.\n\
+            let path = std::fs::canonicalize(path)
+                .map_err(|err| {
+                    let msg = format!("Invalid table location: {uri} Error: {err:?}");
+                    KernelError::InvalidTableLocation(msg)
+                })
+                .map_err(Error::Kernel)?;
+            Url::from_directory_path(path.clone())
+                .map_err(|_| {
+                    let msg = format!(
+                        "Could not construct a URL from canonicalized path: {path:?}.\n\
                      Something must be very wrong with the table path."
-                );
-                KernelError::InvalidTableLocation(msg)
-            })?
+                    );
+                    KernelError::InvalidTableLocation(msg)
+                })
+                .map_err(Error::Kernel)?
         }
         UriType::Url(url) => url,
     };

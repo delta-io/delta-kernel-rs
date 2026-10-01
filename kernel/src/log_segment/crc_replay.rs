@@ -176,7 +176,9 @@ impl LogSegment {
         for batch in batches {
             let batch = batch?;
             let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
-            visitor.visit_rows_of(batch.actions())?;
+            visitor
+                .visit_rows_of(batch.actions())
+                .map_err(crate::Error::into_kernel_error)?;
         }
         Ok(acc.into_crc_delta().into_complete_crc(version))
     }
@@ -269,16 +271,22 @@ impl LogSegment {
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let batches =
-            engine
-                .json_handler()
-                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
+        let batches = engine
+            .json_handler()
+            .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)
+            .map_err(crate::Error::into_kernel_error)?;
 
         for batch_result in batches {
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
             let mut visitor = CommitCrcVisitor { acc: &mut acc };
-            visitor.visit_rows_of(batch_result?.as_ref())?;
+            visitor
+                .visit_rows_of(
+                    batch_result
+                        .map_err(crate::Error::into_kernel_error)?
+                        .as_ref(),
+                )
+                .map_err(crate::Error::into_kernel_error)?;
         }
 
         // Run the per-commit invariant on the final (oldest) commit; no successor batch
@@ -470,28 +478,45 @@ impl CrcReplayAccumulator {
         shared: &[&'a dyn GetData<'a>],
     ) -> KernelResult<()> {
         // `add.size` (required) marks an Add row.
-        if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
+        if let Some(size) = shared[SHARED_COL_ADD_SIZE]
+            .get_opt(i, "add.size")
+            .map_err(crate::Error::into_kernel_error)?
+        {
             self.on_add(size)?;
         }
-        if let Some(domain) = shared[SHARED_COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")? {
-            let configuration: String =
-                shared[SHARED_COL_DM_CONFIG].get(i, "domainMetadata.configuration")?;
-            let removed: bool = shared[SHARED_COL_DM_REMOVED].get(i, "domainMetadata.removed")?;
+        if let Some(domain) = shared[SHARED_COL_DM_DOMAIN]
+            .get_opt(i, "domainMetadata.domain")
+            .map_err(crate::Error::into_kernel_error)?
+        {
+            let configuration: String = shared[SHARED_COL_DM_CONFIG]
+                .get(i, "domainMetadata.configuration")
+                .map_err(crate::Error::into_kernel_error)?;
+            let removed: bool = shared[SHARED_COL_DM_REMOVED]
+                .get(i, "domainMetadata.removed")
+                .map_err(crate::Error::into_kernel_error)?;
             self.on_domain_metadata(domain, configuration, removed);
         }
-        if let Some(app_id) = shared[SHARED_COL_TXN_APP_ID].get_opt(i, "txn.appId")? {
-            let version: i64 = shared[SHARED_COL_TXN_VERSION].get(i, "txn.version")?;
-            let last_updated: Option<i64> =
-                shared[SHARED_COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
+        if let Some(app_id) = shared[SHARED_COL_TXN_APP_ID]
+            .get_opt(i, "txn.appId")
+            .map_err(crate::Error::into_kernel_error)?
+        {
+            let version: i64 = shared[SHARED_COL_TXN_VERSION]
+                .get(i, "txn.version")
+                .map_err(crate::Error::into_kernel_error)?;
+            let last_updated: Option<i64> = shared[SHARED_COL_TXN_LAST_UPDATED]
+                .get_opt(i, "txn.lastUpdated")
+                .map_err(crate::Error::into_kernel_error)?;
             self.on_set_transaction(app_id, version, last_updated);
         }
         let leaves = &shared[N_SHARED_SINGLE_LEAF_COLS..];
         let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
         if self.delta.protocol.is_none() {
-            self.delta.protocol = visit_protocol_at(i, &leaves[..n_protocol_leaves])?;
+            self.delta.protocol = visit_protocol_at(i, &leaves[..n_protocol_leaves])
+                .map_err(crate::Error::into_kernel_error)?;
         }
         if self.delta.metadata.is_none() {
-            self.delta.metadata = visit_metadata_at(i, &leaves[n_protocol_leaves..])?;
+            self.delta.metadata = visit_metadata_at(i, &leaves[n_protocol_leaves..])
+                .map_err(crate::Error::into_kernel_error)?;
         }
         Ok(())
     }
@@ -606,7 +631,8 @@ impl RowVisitor for CommitCrcVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
-        check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
+        check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")
+            .map_err(crate::Error::Kernel)?;
         if row_count == 0 {
             return Ok(());
         }
@@ -626,11 +652,14 @@ impl RowVisitor for CommitCrcVisitor<'_> {
             if let Some(path) = remove_path {
                 let remove_size: Option<i64> =
                     getters[COL_REMOVE_SIZE].get_opt(i, "remove.size")?;
-                self.acc.on_remove(&path, remove_size)?;
+                self.acc
+                    .on_remove(&path, remove_size)
+                    .map_err(crate::Error::Kernel)?;
             }
 
             self.acc
-                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])?;
+                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])
+                .map_err(crate::Error::Kernel)?;
         }
         Ok(())
     }
@@ -667,9 +696,12 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
-        check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
+        check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")
+            .map_err(crate::Error::Kernel)?;
         for i in 0..row_count {
-            self.acc.apply_shared_columns(i, getters)?;
+            self.acc
+                .apply_shared_columns(i, getters)
+                .map_err(crate::Error::Kernel)?;
         }
         Ok(())
     }

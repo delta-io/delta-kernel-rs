@@ -10,6 +10,7 @@
 //! cancellation instead of continuing past it. Kernel-provided iterators are not guaranteed to
 //! yield `None` after producing Some Err (including [`KernelError::Cancelled`]), nor are they
 //! required to surface cancellation more than once.
+//! Public results wrap cancellation in [`crate::Error::Kernel`].
 //!
 //! # Engine operation contract
 //!
@@ -109,37 +110,43 @@ pub trait CancellationToken: AsAny {
 /// Wraps a fallible iterator so that cancellation terminates it with a single
 /// [`KernelError::Cancelled`] rather than silent truncation.
 ///
-/// Before each pull, the token is polled: if cancelled, one `Err(KernelError::Cancelled)` is
-/// yielded and every subsequent call returns `None`. Any error or normal exhaustion also terminates
-/// the iterator. With no token, or before cancellation, inner items pass through unchanged.
-pub(crate) struct CancellableIterator<I> {
+/// Before each pull, the token is polled: if cancelled, `KernelError::Cancelled` is mapped into
+/// one error item and every subsequent call returns `None`. Any error or normal exhaustion also
+/// terminates the iterator. With no token, or before cancellation, inner items pass through
+/// unchanged.
+pub(crate) struct CancellableIterator<I, F> {
     inner: I,
     token: Option<CancellationTokenRef>,
+    map_cancellation: F,
     done: bool,
 }
 
-impl<I> CancellableIterator<I> {
-    pub(crate) fn new(inner: I, token: Option<CancellationTokenRef>) -> Self {
+impl<I, F> CancellableIterator<I, F> {
+    pub(crate) fn new(inner: I, token: Option<CancellationTokenRef>, map_cancellation: F) -> Self {
         Self {
             inner,
             token,
+            map_cancellation,
             done: false,
         }
     }
 }
 
-impl<I, T> Iterator for CancellableIterator<I>
+impl<I, T, E, F> Iterator for CancellableIterator<I, F>
 where
-    I: Iterator<Item = KernelResult<T>>,
+    I: Iterator<Item = std::result::Result<T, E>>,
+    F: FnMut(KernelError) -> E,
 {
-    type Item = KernelResult<T>;
+    type Item = std::result::Result<T, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
         let item = match self.token.as_ref() {
-            Some(token) if token.is_cancelled() => Some(Err(KernelError::Cancelled)),
+            Some(token) if token.is_cancelled() => {
+                Some(Err((self.map_cancellation)(KernelError::Cancelled)))
+            }
             _ => self.inner.next(),
         };
         self.done = !matches!(&item, Some(Ok(_)));
@@ -149,10 +156,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::convert::identity;
     use std::future::ready;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::Error;
 
     /// Minimal [`CancellationToken`] backed by an [`AtomicBool`], for tests.
     #[derive(Default)]
@@ -180,7 +190,7 @@ mod tests {
 
     #[test]
     fn no_token_passes_through_unchanged() {
-        let out: Vec<_> = CancellableIterator::new(ok_iter(3), None)
+        let out: Vec<_> = CancellableIterator::new(ok_iter(3), None, identity)
             .map(KernelResult::unwrap)
             .collect();
         assert_eq!(out, vec![0, 1, 2]);
@@ -189,7 +199,7 @@ mod tests {
     #[test]
     fn uncancelled_token_passes_through_unchanged() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
-        let out: Vec<_> = CancellableIterator::new(ok_iter(3), Some(token))
+        let out: Vec<_> = CancellableIterator::new(ok_iter(3), Some(token), identity)
             .map(KernelResult::unwrap)
             .collect();
         assert_eq!(out, vec![0, 1, 2]);
@@ -199,7 +209,8 @@ mod tests {
     fn pre_cancelled_yields_one_error_then_ends() {
         let token = Arc::new(TestToken::default());
         token.cancel();
-        let mut iter = CancellableIterator::new(ok_iter(3), Some(token as CancellationTokenRef));
+        let mut iter =
+            CancellableIterator::new(ok_iter(3), Some(token as CancellationTokenRef), identity);
         assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
         // Fused: never a `Some(Ok(..))` after cancellation, and no infinite error stream.
         assert!(iter.next().is_none());
@@ -210,7 +221,7 @@ mod tests {
     fn mid_stream_cancellation_yields_error_not_silent_truncation() {
         let token = Arc::new(TestToken::default());
         let ct: CancellationTokenRef = token.clone();
-        let mut iter = CancellableIterator::new(ok_iter(5), Some(ct));
+        let mut iter = CancellableIterator::new(ok_iter(5), Some(ct), identity);
         assert!(matches!(iter.next(), Some(Ok(0))));
         assert!(matches!(iter.next(), Some(Ok(1))));
         token.cancel();
@@ -224,11 +235,32 @@ mod tests {
     fn inner_error_terminates_iteration() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
         let inner = vec![Ok(0), Err(KernelError::generic("boom")), Ok(99)].into_iter();
-        let mut iter = CancellableIterator::new(inner, Some(token));
+        let mut iter = CancellableIterator::new(inner, Some(token), identity);
         assert!(matches!(iter.next(), Some(Ok(0))));
         assert!(matches!(iter.next(), Some(Err(KernelError::Generic(_)))));
         // Fused on the inner error: the trailing Ok is never yielded.
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn public_cancellation_is_lazy_and_does_not_pull_after_cancellation() {
+        let pulls = Cell::new(0);
+        let inner = std::iter::from_fn(|| {
+            pulls.set(pulls.get() + 1);
+            Some(Ok::<_, Error>(pulls.get()))
+        });
+        let token = Arc::new(TestToken::default());
+        let mut iter = CancellableIterator::new(inner, Some(token.clone()), Error::Kernel);
+        assert_eq!(pulls.get(), 0);
+        assert_eq!(iter.next().unwrap().unwrap(), 1);
+
+        token.cancel();
+        assert!(matches!(
+            iter.next(),
+            Some(Err(Error::Kernel(KernelError::Cancelled)))
+        ));
+        assert!(iter.next().is_none());
+        assert_eq!(pulls.get(), 1);
     }
 
     #[test]

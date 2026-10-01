@@ -140,8 +140,14 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         skip_removes: bool,
     ) -> KernelResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
-        if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
-            let size = match getters[self.add_size_index].get_long(i, "add.size")? {
+        if let Some(path) = getters[self.add_path_index]
+            .get_str(i, "add.path")
+            .map_err(crate::Error::into_kernel_error)?
+        {
+            let size = match getters[self.add_size_index]
+                .get_long(i, "add.size")
+                .map_err(crate::Error::into_kernel_error)?
+            {
                 Some(s) => u64::try_from(s).unwrap_or_else(|e| {
                     warn!("Could not convert add.size {s} to u64: {e}");
                     0
@@ -166,7 +172,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         }
 
         // Try to extract a remove action by the required path column
-        if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
+        if let Some(path) = getters[self.remove_path_index]
+            .get_str(i, "remove.path")
+            .map_err(crate::Error::into_kernel_error)?
+        {
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
             return Ok(Some(FileActionInfo {
                 key: FileActionKey::new(path, dv_unique_id),
@@ -345,7 +354,7 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// included. If no filter is provided, all rows are selected.
     fn build_selection_vector(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
         match self.data_skipping_filter() {
-            Some(filter) => filter.apply(batch),
+            Some(filter) => filter.apply(batch).map_err(crate::Error::Kernel),
             None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
         }
     }
@@ -410,7 +419,9 @@ mod tests {
     impl<'a> GetData<'a> for MockGetData {
         fn get_str(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a str>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::KernelError::Generic(error_msg.clone()));
+                return Err(crate::Error::Kernel(crate::KernelError::Generic(
+                    error_msg.clone(),
+                )));
             }
             Ok(self
                 .string_values
@@ -420,7 +431,9 @@ mod tests {
 
         fn get_int(&'a self, row_index: usize, field_name: &str) -> Result<Option<i32>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::KernelError::Generic(error_msg.clone()));
+                return Err(crate::Error::Kernel(crate::KernelError::Generic(
+                    error_msg.clone(),
+                )));
             }
             Ok(self
                 .int_values
@@ -430,7 +443,9 @@ mod tests {
 
         fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::KernelError::Generic(error_msg.clone()));
+                return Err(crate::Error::Kernel(crate::KernelError::Generic(
+                    error_msg.clone(),
+                )));
             }
             Ok(self
                 .long_values
@@ -494,7 +509,9 @@ mod tests {
             mock_add.add_long(0, "add.size", s);
         }
         let getters = create_getters_with_mocks(Some(&mock_add), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         let FileActionInfo { key, size, is_add } = result.unwrap();
         assert_eq!(key.path, "file1.parquet");
@@ -513,7 +530,9 @@ mod tests {
         let mut mock_remove = MockGetData::new();
         mock_remove.add_string(0, "remove.path", "file2.parquet");
         let getters = create_getters_with_mocks(None, Some(&mock_remove));
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -534,7 +553,9 @@ mod tests {
         mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
         mock_dv.add_int(0, "deletionVector.offset", 100);
         let getters = create_getters_with_mocks(Some(&mock_dv), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -558,12 +579,14 @@ mod tests {
 
         // With skip_removes=true, should return None
         assert!(deduplicator
-            .extract_file_action(0, &getters, true)?
+            .extract_file_action(0, &getters, true)
+            .map_err(crate::Error::Kernel)?
             .is_none());
 
         // With skip_removes=false, should return Some
         assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?
             .is_some());
 
         Ok(())
@@ -576,7 +599,8 @@ mod tests {
 
         let getters = create_getters_with_mocks(None, None);
         assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?
             .is_none());
 
         Ok(())
@@ -650,12 +674,15 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_add() -> Result<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let deduplicator =
+            CheckpointDeduplicator::try_new(&seen, 0, 2, 3).map_err(crate::Error::Kernel)?;
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
         let getters = create_getters_with_mocks(Some(&mock_add), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -669,7 +696,8 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_with_deletion_vector() -> Result<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
+        let deduplicator =
+            CheckpointDeduplicator::try_new(&seen, 0, 1, 2).map_err(crate::Error::Kernel)?;
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
@@ -677,7 +705,9 @@ mod tests {
         mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
         mock_dv.add_int(0, "deletionVector.offset", 100);
         let getters = create_getters_with_mocks(Some(&mock_dv), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -702,7 +732,8 @@ mod tests {
             Some("dv123".to_string()),
         ));
 
-        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let mut deduplicator =
+            CheckpointDeduplicator::try_new(&seen, 0, 2, 3).map_err(crate::Error::Kernel)?;
 
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);

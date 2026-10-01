@@ -20,7 +20,7 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResultIteratorStatic, Result};
+use crate::{Engine, Error, FileMeta, KernelError, KernelResultIteratorStatic, Result};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -106,18 +106,23 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         checkpoint_read_schema: SchemaRef,
     ) -> Result<Self> {
         let commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+            log_segment
+                .read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?
+                .map(|batch| batch.map_err(Error::into_kernel_error)),
         ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new(
-                engine,
-                single_part,
-                log_segment.log_root.clone(),
-                checkpoint_read_schema,
-            )?),
+            [single_part] => Some(
+                CheckpointManifestReader::try_new(
+                    engine,
+                    single_part,
+                    log_segment.log_root.clone(),
+                    checkpoint_read_schema,
+                )
+                .map_err(Error::Kernel)?,
+            ),
             _ => None,
         };
 
@@ -150,21 +155,21 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     #[internal_api]
     pub(crate) fn finish(self) -> Result<AfterSequential<P>> {
         if !self.is_finished {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Must exhaust iterator before calling finish()",
-            ));
+            )));
         }
 
         let parallel_files = match self.checkpoint_manifest_phase {
-            Some(manifest_reader) => manifest_reader.extract_sidecars()?,
+            Some(manifest_reader) => manifest_reader.extract_sidecars().map_err(Error::Kernel)?,
             None => {
                 let parts = self.checkpoint_parts;
                 require!(
                     parts.len() != 1,
-                    KernelError::generic(
+                    Error::Kernel(KernelError::generic(
                         "Invariant violation: If there is exactly one checkpoint part,
                         there must be a manifest reader"
-                    )
+                    ))
                 );
                 // If this is a multi-part checkpoint, use the checkpoint parts for parallel phase
                 parts
@@ -200,7 +205,11 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
+        Some(
+            result
+                .map_err(Error::Kernel)
+                .and_then(|batch| self.processor.process_actions_batch(batch)),
+        )
     }
 }
 
@@ -217,7 +226,8 @@ mod tests {
         expected_adds: &[&str],
         expected_sidecars: &[&str],
     ) -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table(table_name).map_err(crate::Error::Kernel)?;
 
         let scan = snapshot.scan_builder().with_stats(stats).build()?;
         let mut sequential = scan.parallel_scan_metadata(engine)?;
@@ -301,7 +311,8 @@ mod tests {
 
     #[test]
     fn test_sequential_finish_before_exhaustion_error() -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("table-without-dv-small").map_err(crate::Error::Kernel)?;
 
         let scan = snapshot.scan_builder().build()?;
         let sequential = scan.parallel_scan_metadata(engine)?;

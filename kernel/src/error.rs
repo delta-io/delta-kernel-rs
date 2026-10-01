@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
-#[cfg(feature = "default-engine-base")]
+#[cfg(feature = "need-arrow")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
@@ -21,6 +21,22 @@ pub enum Error {
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
     Kernel(KernelError),
+}
+
+impl Error {
+    /// Consumes this error and returns its underlying kernel error, preserving its payload.
+    #[delta_kernel_derive::internal_api]
+    pub(crate) fn into_kernel_error(self) -> KernelError {
+        match self {
+            Self::Kernel(error) => error,
+        }
+    }
+}
+
+impl From<Infallible> for Error {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -93,8 +109,8 @@ pub(crate) fn add_scalar_path_context(
     }
 }
 
-/// A [`std::result::Result`] that has the kernel [`KernelError`] as the error variant
-pub type Result<T, E = KernelError> = std::result::Result<T, E>;
+/// A result returned by a public kernel API, with [`Error`] as the default error type.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A result whose error is a [`KernelError`].
 pub type KernelResult<T> = std::result::Result<T, KernelError>;
@@ -234,7 +250,7 @@ pub enum KernelError {
     },
 
     /// An error performing operations on arrow data
-    #[cfg(feature = "default-engine-base")]
+    #[cfg(feature = "need-arrow")]
     #[error(transparent)]
     Arrow(ArrowError),
 
@@ -682,7 +698,7 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
-#[cfg(feature = "default-engine-base")]
+#[cfg(feature = "need-arrow")]
 impl From<ArrowError> for KernelError {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
@@ -706,5 +722,34 @@ impl From<object_store::Error> for KernelError {
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_kernel_error_preserves_source_and_backtrace_allocations() {
+        let source = Box::new(KernelError::generic_err(std::io::Error::other(
+            "read failed",
+        )));
+        let backtrace = Box::new(Backtrace::disabled());
+        let source_ptr = source.as_ref() as *const KernelError;
+        let backtrace_ptr = backtrace.as_ref() as *const Backtrace;
+        let error = Error::Kernel(KernelError::Backtraced { source, backtrace });
+
+        let KernelError::Backtraced { source, backtrace } = error.into_kernel_error() else {
+            panic!("expected the original backtraced error");
+        };
+        assert!(std::ptr::eq(source.as_ref(), source_ptr));
+        assert!(std::ptr::eq(backtrace.as_ref(), backtrace_ptr));
+        let KernelError::GenericError { source } = *source else {
+            panic!("expected the original foreign error");
+        };
+        assert_eq!(
+            source.downcast_ref::<std::io::Error>().unwrap().to_string(),
+            "read failed"
+        );
     }
 }

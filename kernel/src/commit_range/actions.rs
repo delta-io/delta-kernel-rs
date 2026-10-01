@@ -84,12 +84,15 @@ impl CommitAction {
         // Build the effective table configuration once (when both protocol and metadata are
         // known) and reuse it for both validation and timestamp resolution.
         let table_config = match (&this.protocol, &this.metadata) {
-            (Some(protocol), Some(metadata)) => Some(TableConfiguration::try_new(
-                metadata.clone(),
-                protocol.clone(),
-                this.table_root.clone(),
-                this.version(),
-            )?),
+            (Some(protocol), Some(metadata)) => Some(
+                TableConfiguration::try_new(
+                    metadata.clone(),
+                    protocol.clone(),
+                    this.table_root.clone(),
+                    this.version(),
+                )
+                .map_err(crate::Error::into_kernel_error)?,
+            ),
             _ => None,
         };
         this.protocol_validation(&table_config)?;
@@ -127,28 +130,34 @@ impl CommitAction {
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
     fn read_commit_header(&mut self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        let json_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
-            HEADER_READ_SCHEMA.clone(),
-            None,
-        )?;
+        let json_iter = engine
+            .json_handler()
+            .read_json_files(
+                slice::from_ref(&self.log_path.location),
+                HEADER_READ_SCHEMA.clone(),
+                None,
+            )
+            .map_err(crate::Error::into_kernel_error)?;
 
         let mut extracted_protocol: Option<Protocol> = None;
         let mut extracted_metadata: Option<Metadata> = None;
         let mut ict_visitor = InCommitTimestampVisitor::default();
         for (batch_index, batch_res) in json_iter.enumerate() {
-            let batch = batch_res?;
+            let batch = batch_res.map_err(crate::Error::into_kernel_error)?;
             // The protocol requires commitInfo to be the first action when in-commit timestamps
             // are enabled, so it lives in the first batch (the visitor inspects only its first
             // row). Visiting only that batch matches the `table_changes` reference behavior.
             if batch_index == 0 {
-                ict_visitor.visit_rows_of(batch.as_ref())?;
+                ict_visitor
+                    .visit_rows_of(batch.as_ref())
+                    .map_err(crate::Error::into_kernel_error)?;
             }
             if extracted_protocol.is_none() {
                 extracted_protocol = Protocol::try_new_from_data(batch.as_ref())?;
             }
             if extracted_metadata.is_none() {
-                extracted_metadata = Metadata::try_new_from_data(batch.as_ref())?;
+                extracted_metadata = Metadata::try_new_from_data(batch.as_ref())
+                    .map_err(crate::Error::into_kernel_error)?;
             }
             if extracted_protocol.is_some() && extracted_metadata.is_some() {
                 break;
@@ -206,7 +215,9 @@ impl CommitAction {
     /// (present iff both protocol and metadata are known at this commit).
     fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> KernelResult<()> {
         match (table_config, &self.protocol) {
-            (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
+            (Some(table_config), _) => table_config
+                .ensure_operation_supported(Operation::Scan)
+                .map_err(crate::Error::into_kernel_error),
             (None, Some(protocol)) => ensure_table_can_be_read(protocol),
             (None, None) => Ok(()),
         }

@@ -32,7 +32,13 @@ pub unsafe extern "C" fn get_domain_metadata(
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+    get_domain_metadata_impl(
+        snapshot,
+        domain.map_err(delta_kernel::Error::into_kernel_error),
+        engine,
+        allocate_fn,
+    )
+    .into_extern_result(&engine)
 }
 
 fn get_domain_metadata_impl(
@@ -42,7 +48,8 @@ fn get_domain_metadata_impl(
     allocate_fn: AllocateStringFn,
 ) -> KernelResult<NullableCvoid> {
     Ok(snapshot
-        .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
+        .get_domain_metadata(&domain?, extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
 
@@ -132,7 +139,10 @@ fn visit_clustering_columns_impl(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+    let Some(infos) = snapshot
+        .get_clustering_column_infos(extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -185,7 +195,9 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> KernelResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let res = snapshot
+        .get_all_domain_metadata(extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();

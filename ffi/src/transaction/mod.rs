@@ -90,10 +90,12 @@ fn transaction_impl(
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
-    let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(url?)
+        .build(engine.as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let committer = Box::new(FileSystemCommitter::new());
     let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
+    Ok(Box::new(transaction.map_err(delta_kernel::Error::into_kernel_error)?).into())
 }
 
 /// Start a transaction with a custom committer
@@ -121,7 +123,7 @@ fn transaction_with_committer_impl(
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let transaction = snapshot.transaction(committer, engine.as_ref());
-    Ok(Box::new(transaction?).into())
+    Ok(Box::new(transaction.map_err(delta_kernel::Error::into_kernel_error)?).into())
 }
 
 /// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
@@ -180,7 +182,8 @@ fn with_engine_info_impl(
     txn: Transaction,
     engine_info: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
+    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
 
@@ -206,7 +209,8 @@ fn with_operation_impl(
     txn: Transaction,
     operation: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }?;
+    let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(txn.with_operation(operation)).into())
 }
 
@@ -241,8 +245,10 @@ fn with_domain_metadata_impl(
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
 }
 
@@ -271,7 +277,8 @@ fn with_domain_metadata_removed_impl(
     txn: Transaction,
     domain: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
 }
 
@@ -304,7 +311,11 @@ fn with_row_tracking_high_water_mark_impl(
     txn: Transaction,
     high_water_mark: i64,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
-    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
+    Ok(Box::new(
+        txn.with_row_tracking_high_water_mark(high_water_mark)
+            .map_err(delta_kernel::Error::into_kernel_error)?,
+    )
+    .into())
 }
 
 /// Stages `file` to be committed as this transaction's root manifest.
@@ -329,7 +340,8 @@ fn with_root_manifest_file_impl(
     txn: Transaction,
     file: &FileMeta,
 ) -> KernelResult<Handle<ExclusiveTransaction>> {
-    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let location = Url::parse(path)?;
     let size = file
         .size
@@ -340,7 +352,11 @@ fn with_root_manifest_file_impl(
         last_modified: file.last_modified,
         size,
     };
-    Ok(Box::new(txn.with_root_manifest_file(delta_file)?).into())
+    Ok(Box::new(
+        txn.with_root_manifest_file(delta_file)
+            .map_err(delta_kernel::Error::into_kernel_error)?,
+    )
+    .into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains
@@ -390,8 +406,11 @@ pub unsafe extern "C" fn commit(
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    commit_result_to_committed_handle(
+        txn.commit(engine.as_ref())
+            .map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -428,7 +447,8 @@ fn create_table_with_engine_info_impl(
     txn: CreateTableTransaction,
     engine_info: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveCreateTransaction>> {
-    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
+    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
 
@@ -459,8 +479,10 @@ fn create_table_with_domain_metadata_impl(
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveCreateTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
 }
 
@@ -514,8 +536,11 @@ pub unsafe extern "C" fn create_table_commit(
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    commit_result_to_committed_handle(
+        txn.commit(engine.as_ref())
+            .map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -608,7 +633,9 @@ unsafe fn collect_create_table_columns(
     slices
         .iter()
         .map(|slice| {
-            unsafe { TryFromStringSlice::try_from_slice(slice) }.map(|s: &str| s.to_string())
+            unsafe { TryFromStringSlice::try_from_slice(slice) }
+                .map(|s: &str| s.to_string())
+                .map_err(delta_kernel::Error::into_kernel_error)
         })
         .collect()
 }
@@ -707,7 +734,12 @@ pub unsafe extern "C" fn get_create_table_builder(
     let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
     let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    get_create_table_builder_impl(path, schema, info).into_extern_result(&engine)
+    get_create_table_builder_impl(
+        path.map_err(delta_kernel::Error::into_kernel_error),
+        schema,
+        info.map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&engine)
 }
 
 fn get_create_table_builder_impl(
@@ -717,7 +749,8 @@ fn get_create_table_builder_impl(
 ) -> KernelResult<Handle<ExclusiveCreateTableBuilder>> {
     let mut visitor_state = KernelSchemaVisitorState::default();
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+    let schema = extract_kernel_schema(&mut visitor_state, schema_id)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let builder = delta_kernel::transaction::create_table::create_table(
         path?,
         Arc::new(schema),
@@ -747,7 +780,12 @@ pub unsafe extern "C" fn create_table_builder_with_table_property(
     let builder = unsafe { *builder.into_inner() };
     let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
     let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
-    create_table_builder_with_table_property_impl(builder, key, value).into_extern_result(&engine)
+    create_table_builder_with_table_property_impl(
+        builder,
+        key.map_err(delta_kernel::Error::into_kernel_error),
+        value.map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&engine)
 }
 
 fn create_table_builder_with_table_property_impl(
@@ -806,7 +844,9 @@ fn create_table_builder_build_impl(
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveCreateTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
+    let create_txn = builder
+        .build(engine.as_ref(), committer)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(create_txn).into())
 }
 
@@ -868,7 +908,8 @@ pub unsafe extern "C" fn remove_files(
         raw.iter().map(|&b| b != 0).collect()
     };
     let result: KernelResult<bool> = (|| {
-        let filtered = FilteredEngineData::try_new(data, sv)?;
+        let filtered = FilteredEngineData::try_new(data, sv)
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         txn.remove_files(filtered);
         Ok(true)
     })();
@@ -3170,8 +3211,13 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
-        let layout: Result<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
-        let result = create_table_builder_with_data_layout_impl(builder, layout);
+        let layout: Result<DataLayout> = Err(delta_kernel::Error::Kernel(
+            delta_kernel::KernelError::generic("bad column"),
+        ));
+        let result = create_table_builder_with_data_layout_impl(
+            builder,
+            layout.map_err(delta_kernel::Error::into_kernel_error),
+        );
         assert!(result.is_err());
         unsafe { free_engine(engine) };
     }
@@ -3900,7 +3946,7 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
+            .map(|r| r.map(|batch| batch.len()))
             .sum::<Result<_, _>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 

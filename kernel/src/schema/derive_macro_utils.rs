@@ -10,7 +10,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{Scalar, StructData};
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
 use crate::utils::require;
-use crate::{KernelError, KernelResult};
+use crate::{Error, KernelError, KernelResult};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -199,7 +199,7 @@ impl StructDataFields {
         Ok(Self { expected, fields })
     }
 
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
+    pub(crate) fn take_field<T: TryFrom<Scalar, Error = Error>>(
         &mut self,
         field_name: &str,
     ) -> KernelResult<T> {
@@ -233,7 +233,8 @@ impl StructDataFields {
             )
         );
 
-        T::try_from(value).map_err(|error| add_scalar_path_context(error, field_name))
+        T::try_from(value)
+            .map_err(|error| add_scalar_path_context(error.into_kernel_error(), field_name))
     }
 
     /// Verifies that every named field was consumed.

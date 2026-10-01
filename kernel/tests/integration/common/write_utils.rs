@@ -218,9 +218,17 @@ pub async fn write_data_and_check_result_and_stats(
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> Result<_> {
         let data = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
+            Arc::new(
+                schema
+                    .as_ref()
+                    .try_into_arrow()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
+            ),
             vec![Arc::new(Int32Array::from(data.to_vec()))],
-        )?;
+        )
+        .map_err(delta_kernel::KernelError::from)
+        .map_err(delta_kernel::Error::Kernel)?;
         Ok(Box::new(ArrowEngineData::new(data)))
     });
 

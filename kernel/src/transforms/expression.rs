@@ -11,7 +11,7 @@ use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
     Carrier,
 };
-use crate::{KernelError, KernelResult, Result};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// Generic framework for recursive bottom-up transforms of expressions and predicates.
 ///
@@ -488,7 +488,7 @@ impl ExpressionDepthChecker {
     // Triggers the requested recursion only doing so would not exceed the depth limit.
     fn depth_limited<'a, T: std::fmt::Debug + ToOwned + ?Sized>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> KernelResult<()>,
+        recurse: impl FnOnce(&mut Self, &'a T) -> Result<()>,
         arg: &'a T,
     ) -> KernelResult<()> {
         self.call_count += 1;
@@ -504,7 +504,7 @@ impl ExpressionDepthChecker {
         self.current_depth += 1;
         let result = recurse(self, arg);
         self.current_depth -= 1;
-        result
+        result.map_err(Error::into_kernel_error)
     }
 }
 
@@ -513,46 +513,57 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
     fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> Result<()> {
         self.depth_limited(Self::recurse_into_expr_cast, expr)
+            .map_err(Error::Kernel)
     }
 
     fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> Result<()> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
+            .map_err(Error::Kernel)
     }
 
     fn transform_expr_pred(&mut self, pred: &'a Predicate) -> Result<()> {
         self.depth_limited(Self::recurse_into_expr_pred, pred)
+            .map_err(Error::Kernel)
     }
 
     fn transform_pred_not(&mut self, pred: &'a Predicate) -> Result<()> {
         self.depth_limited(Self::recurse_into_pred_not, pred)
+            .map_err(Error::Kernel)
     }
 
     fn transform_pred_unary(&mut self, pred: &'a UnaryPredicate) -> Result<()> {
         self.depth_limited(Self::recurse_into_pred_unary, pred)
+            .map_err(Error::Kernel)
     }
 
     fn transform_expr_binary(&mut self, expr: &'a BinaryExpression) -> Result<()> {
         self.depth_limited(Self::recurse_into_expr_binary, expr)
+            .map_err(Error::Kernel)
     }
 
     fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> Result<()> {
         self.depth_limited(Self::recurse_into_pred_binary, pred)
+            .map_err(Error::Kernel)
     }
 
     fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> Result<()> {
         self.depth_limited(Self::recurse_into_pred_junction, pred)
+            .map_err(Error::Kernel)
     }
 
     fn transform_pred_opaque(&mut self, pred: &'a OpaquePredicate) -> Result<()> {
         self.depth_limited(Self::recurse_into_pred_opaque, pred)
+            .map_err(Error::Kernel)
     }
 
     fn transform_expr_opaque(&mut self, expr: &'a OpaqueExpression) -> Result<()> {
         self.depth_limited(Self::recurse_into_expr_opaque, expr)
+            .map_err(Error::Kernel)
     }
 
     fn transform_expr_map_to_struct(&mut self, expr: &'a MapToStructExpression) -> Result<()> {
         self.depth_limited(Self::recurse_into_expr_map_to_struct, expr)
+            .map_err(Error::Kernel)
     }
 }
 

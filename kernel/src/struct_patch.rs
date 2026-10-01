@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{KernelError, KernelResult, Result};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// Projects a nested struct to `schema` while preserving a null source struct.
 ///
@@ -517,7 +517,9 @@ fn resolve_input_schema<'a>(
         Some(input_path) if !input_path.path().is_empty() => input_path,
         _ => return Ok(input_schema),
     };
-    let field = input_schema.field_at(input_path)?;
+    let field = input_schema
+        .field_at(input_path)
+        .map_err(Error::into_kernel_error)?;
     let DataType::Struct(nested_schema) = field.data_type() else {
         return Err(KernelError::generic(format!(
             "Patching failed: input path '{input_path}' references a non-struct field"
@@ -537,13 +539,13 @@ impl StructPatchBuilder<ExpressionRef> {
     /// same field, or when a destructive operation on one field overlapped with an operation on a
     /// nested child field.
     pub fn build(self) -> Result<ExpressionStructPatch> {
-        self.error?;
+        self.error.map_err(Error::Kernel)?;
         Ok(self.root.to_expr_patch(self.input_path))
     }
 }
 
 impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
-    type Error = KernelError;
+    type Error = Error;
 
     fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> Result<Self> {
         builder.build()
@@ -633,8 +635,9 @@ impl StructPatchBuilder<StructField> {
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
     pub fn build(self, input_schema: &StructType) -> Result<StructType> {
-        let (root, _input_path, source_schema) = self.begin_build(input_schema)?;
-        StructType::try_new(schema_walk(root, source_schema)?)
+        let (root, _input_path, source_schema) =
+            self.begin_build(input_schema).map_err(Error::Kernel)?;
+        StructType::try_new(schema_walk(root, source_schema).map_err(Error::Kernel)?)
     }
 }
 
@@ -688,7 +691,7 @@ fn schema_walk<Item: SchemaPatchItem>(
                 let children = schema_walk(*node, nested_schema)?;
                 let field = StructField::new(
                     input_field.name(),
-                    StructType::try_new(children)?,
+                    StructType::try_new(children).map_err(Error::into_kernel_error)?,
                     input_field.nullable,
                 );
                 output.push(field.with_metadata(input_field.metadata.clone()));
@@ -749,7 +752,10 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         ]
         .into_iter()
         .collect();
-        let field = self.input_schema.field_at(&field_path)?;
+        let field = self
+            .input_schema
+            .field_at(&field_path)
+            .map_err(Error::into_kernel_error)?;
         Ok(field.clone())
     }
 
@@ -935,9 +941,12 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
     pub fn build(self) -> Result<(SchemaRef, ExpressionRef)> {
-        let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
+        let (root, input_path, source_schema) = self
+            .inner
+            .begin_build(self.input_schema)
+            .map_err(Error::Kernel)?;
         let patch = root.to_expr_patch(input_path);
-        let schema = StructType::try_new(schema_walk(root, source_schema)?)?;
+        let schema = StructType::try_new(schema_walk(root, source_schema).map_err(Error::Kernel)?)?;
         Ok((Arc::new(schema), Arc::new(Expression::StructPatch(patch))))
     }
 }

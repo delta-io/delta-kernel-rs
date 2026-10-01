@@ -201,7 +201,8 @@ impl RowIndexBuilder {
                                 ))
                             })
                     })
-                    .try_collect()?
+                    .try_collect()
+                    .map_err(crate::Error::Kernel)?
             }
             None => self.row_group_row_index_ranges,
         };
@@ -245,10 +246,11 @@ pub(crate) fn fixup_parquet_read(
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
 ) -> Result<ArrowEngineData> {
-    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
+    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)
+        .map_err(crate::Error::Kernel)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        apply_schema_to_struct(&data, schema)?
+        apply_schema_to_struct(&data, schema).map_err(crate::Error::Kernel)?
     } else {
         data
     };
@@ -697,7 +699,9 @@ fn get_indices(
                         &requested_field.data_type,
                         field.data_type(),
                         super::ensure_data_types::ValidationMode::TypesAndNames,
-                    )? {
+                    )
+                    .map_err(crate::Error::into_kernel_error)?
+                    {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
                         }
@@ -853,7 +857,8 @@ pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
     file_metadata: &ArrowReaderMetadata,
 ) -> Result<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
-    let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
+    let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())
+        .map_err(crate::Error::Kernel)?;
     let mask = generate_mask(file_metadata.parquet_schema(), &indices);
     Ok((reorder, mask))
 }
@@ -1228,7 +1233,8 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> Result<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
+    let result =
+        parse_json_impl(json_strings.column(0).as_ref(), schema).map_err(crate::Error::Kernel)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
@@ -1478,8 +1484,11 @@ fn cast_array_to_type(
 pub(crate) fn filter_to_record_batch(
     filtered_data: FilteredEngineData,
 ) -> KernelResult<RecordBatch> {
-    let filtered = filtered_data.apply_selection_vector()?;
-    let arrow_data = ArrowEngineData::try_from_engine_data(filtered)?;
+    let filtered = filtered_data
+        .apply_selection_vector()
+        .map_err(crate::Error::into_kernel_error)?;
+    let arrow_data =
+        ArrowEngineData::try_from_engine_data(filtered).map_err(crate::Error::into_kernel_error)?;
     Ok((*arrow_data).into())
 }
 
@@ -1544,10 +1553,16 @@ pub(crate) fn to_json_bytes(
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
-        let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch)?;
+        let batch = filter_to_record_batch(chunk?).map_err(crate::Error::Kernel)?;
+        writer
+            .write(&batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
     }
-    writer.finish()?;
+    writer
+        .finish()
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     Ok(writer.into_inner())
 }
 
@@ -1562,7 +1577,8 @@ pub(crate) fn fixup_json_read(
     reorder_indices: &[ReorderIndex],
     file_location: &str,
 ) -> Result<ArrowEngineData> {
-    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
+    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))
+        .map_err(crate::Error::Kernel)?;
     Ok(data.into())
 }
 
@@ -1599,7 +1615,12 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
     }
 
     for (output_pos, field, spec) in metadata_entries {
-        let field = Arc::new(field.try_into_arrow()?);
+        let field = Arc::new(
+            field
+                .try_into_arrow()
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
+        );
         let rindex = match spec {
             MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
             _ => ReorderIndex::missing(output_pos, field),
@@ -1619,7 +1640,9 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
 #[internal_api]
 pub(crate) fn json_arrow_schema(schema: &StructType) -> Result<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
-    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+    ArrowSchema::try_from_kernel(&json_fields)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)
 }
 
 #[cfg(test)]
@@ -3841,7 +3864,9 @@ mod tests {
         let data = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
-        )?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data))))?;
@@ -3865,7 +3890,9 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![
                 "row0", "row1", "row2", "row3",
             ]))],
-        )?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
 
         // Helper function to create EngineData from the same record batch
         let create_engine_data =

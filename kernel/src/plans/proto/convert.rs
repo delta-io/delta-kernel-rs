@@ -30,7 +30,7 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use crate::{FileMeta, FileSlice, KernelError, Result};
+use crate::{Error, FileMeta, FileSlice, KernelError, Result};
 
 // === Helpers ===
 
@@ -778,7 +778,7 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
 // === Schema from Proto ===
 
 impl TryFrom<proto_schema::StructType> for StructType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::StructType) -> Result<Self> {
         let fields = proto
             .fields
@@ -790,16 +790,17 @@ impl TryFrom<proto_schema::StructType> for StructType {
 }
 
 impl TryFrom<proto_schema::StructField> for StructField {
-    type Error = KernelError;
+    type Error = Error;
 
     fn try_from(proto: proto_schema::StructField) -> Result<Self> {
         let data_type = proto
             .data_type
-            .ok_or_else(|| KernelError::schema("StructField proto missing data_type"))?;
+            .ok_or_else(|| KernelError::schema("StructField proto missing data_type"))
+            .map_err(Error::Kernel)?;
         let metadata = proto
             .metadata
             .into_iter()
-            .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
+            .map(|(key, value)| Ok::<_, Error>((key, MetadataValue::try_from(value)?)))
             .collect::<Result<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
@@ -811,11 +812,12 @@ impl TryFrom<proto_schema::StructField> for StructField {
 }
 
 impl TryFrom<proto_schema::DataType> for DataType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::DataType) -> Result<Self> {
         let kind = proto
             .kind
-            .ok_or_else(|| KernelError::schema("DataType proto missing kind"))?;
+            .ok_or_else(|| KernelError::schema("DataType proto missing kind"))
+            .map_err(Error::Kernel)?;
         let data_type = match kind {
             DataTypeKind::Primitive(primitive) => DataType::Primitive(primitive.try_into()?),
             DataTypeKind::Array(array) => DataType::from(ArrayType::try_from(*array)?),
@@ -829,16 +831,19 @@ impl TryFrom<proto_schema::DataType> for DataType {
 }
 
 impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::PrimitiveType) -> Result<Self> {
         let kind = proto
             .kind
-            .ok_or_else(|| KernelError::schema("PrimitiveType proto missing kind"))?;
+            .ok_or_else(|| KernelError::schema("PrimitiveType proto missing kind"))
+            .map_err(Error::Kernel)?;
         let primitive = match kind {
             PrimitiveTypeKind::Simple(simple) => {
-                let simple = Simple::try_from(simple).map_err(|_| {
-                    KernelError::schema(format!("unknown SimplePrimitiveType value: {simple}"))
-                })?;
+                let simple = Simple::try_from(simple)
+                    .map_err(|_| {
+                        KernelError::schema(format!("unknown SimplePrimitiveType value: {simple}"))
+                    })
+                    .map_err(Error::Kernel)?;
                 match simple {
                     Simple::String => PrimitiveType::String,
                     Simple::Long => PrimitiveType::Long,
@@ -856,7 +861,9 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
                     Simple::Unspecified => {
-                        return Err(KernelError::schema("SimplePrimitiveType is unspecified"))
+                        return Err(Error::Kernel(KernelError::schema(
+                            "SimplePrimitiveType is unspecified",
+                        )))
                     }
                 }
             }
@@ -873,9 +880,9 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
             // them when the geo feature is enabled.
             #[cfg(not(feature = "geo-type-in-dev"))]
             PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
-                return Err(KernelError::schema(
+                return Err(Error::Kernel(KernelError::schema(
                     "geometry/geography types require the 'geo-type-in-dev' feature",
-                ))
+                )))
             }
         };
         Ok(primitive)
@@ -883,21 +890,25 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
 }
 
 impl TryFrom<proto_schema::DecimalType> for DecimalType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::DecimalType) -> Result<Self> {
-        let precision = u8::try_from(proto.precision).map_err(|_| {
-            KernelError::invalid_decimal(format!("precision out of range: {}", proto.precision))
-        })?;
-        let scale = u8::try_from(proto.scale).map_err(|_| {
-            KernelError::invalid_decimal(format!("scale out of range: {}", proto.scale))
-        })?;
+        let precision = u8::try_from(proto.precision)
+            .map_err(|_| {
+                KernelError::invalid_decimal(format!("precision out of range: {}", proto.precision))
+            })
+            .map_err(Error::Kernel)?;
+        let scale = u8::try_from(proto.scale)
+            .map_err(|_| {
+                KernelError::invalid_decimal(format!("scale out of range: {}", proto.scale))
+            })
+            .map_err(Error::Kernel)?;
         DecimalType::try_new(precision, scale)
     }
 }
 
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::GeometryType) -> Result<Self> {
         GeometryType::try_new(&proto.crs)
     }
@@ -905,7 +916,7 @@ impl TryFrom<proto_schema::GeometryType> for GeometryType {
 
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeographyType> for GeographyType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::GeographyType) -> Result<Self> {
         let algorithm = EdgeAlgo::try_from(proto.algorithm)
             .map_err(|_| {
@@ -913,7 +924,8 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
                     "unknown EdgeInterpolationAlgorithm value: {}",
                     proto.algorithm
                 ))
-            })?
+            })
+            .map_err(Error::Kernel)?
             .try_into()?;
         GeographyType::try_new(&proto.crs, algorithm)
     }
@@ -921,7 +933,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
 
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: EdgeAlgo) -> Result<Self> {
         let algorithm = match proto {
             EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
@@ -930,9 +942,9 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
             EdgeAlgo::Andoyer => EdgeInterpolationAlgorithm::Andoyer,
             EdgeAlgo::Karney => EdgeInterpolationAlgorithm::Karney,
             EdgeAlgo::Unspecified => {
-                return Err(KernelError::invalid_geo_params(
+                return Err(Error::Kernel(KernelError::invalid_geo_params(
                     "EdgeInterpolationAlgorithm is unspecified",
-                ))
+                )))
             }
         };
         Ok(algorithm)
@@ -940,11 +952,12 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
 }
 
 impl TryFrom<proto_schema::ArrayType> for ArrayType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::ArrayType) -> Result<Self> {
         let element_type = proto
             .element_type
-            .ok_or_else(|| KernelError::schema("ArrayType proto missing element_type"))?;
+            .ok_or_else(|| KernelError::schema("ArrayType proto missing element_type"))
+            .map_err(Error::Kernel)?;
         Ok(ArrayType::new(
             DataType::try_from(*element_type)?,
             proto.contains_null,
@@ -953,14 +966,16 @@ impl TryFrom<proto_schema::ArrayType> for ArrayType {
 }
 
 impl TryFrom<proto_schema::MapType> for MapType {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::MapType) -> Result<Self> {
         let key_type = proto
             .key_type
-            .ok_or_else(|| KernelError::schema("MapType proto missing key_type"))?;
+            .ok_or_else(|| KernelError::schema("MapType proto missing key_type"))
+            .map_err(Error::Kernel)?;
         let value_type = proto
             .value_type
-            .ok_or_else(|| KernelError::schema("MapType proto missing value_type"))?;
+            .ok_or_else(|| KernelError::schema("MapType proto missing value_type"))
+            .map_err(Error::Kernel)?;
         Ok(MapType::new(
             DataType::try_from(*key_type)?,
             DataType::try_from(*value_type)?,
@@ -970,18 +985,21 @@ impl TryFrom<proto_schema::MapType> for MapType {
 }
 
 impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
-    type Error = KernelError;
+    type Error = Error;
     fn try_from(proto: proto_schema::MetadataValue) -> Result<Self> {
         let value = proto
             .value
-            .ok_or_else(|| KernelError::schema("MetadataValue proto missing value"))?;
+            .ok_or_else(|| KernelError::schema("MetadataValue proto missing value"))
+            .map_err(Error::Kernel)?;
         let metadata = match value {
             MetadataValueKind::Number(n) => MetadataValue::Number(n),
             MetadataValueKind::String(s) => MetadataValue::String(s),
             MetadataValueKind::Boolean(b) => MetadataValue::Boolean(b),
-            MetadataValueKind::OtherJson(json) => {
-                MetadataValue::Other(serde_json::from_str(&json)?)
-            }
+            MetadataValueKind::OtherJson(json) => MetadataValue::Other(
+                serde_json::from_str(&json)
+                    .map_err(KernelError::from)
+                    .map_err(Error::Kernel)?,
+            ),
         };
         Ok(metadata)
     }

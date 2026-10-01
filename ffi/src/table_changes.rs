@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIteratorStatic, Version};
+use delta_kernel::{EngineData, KernelError, KernelResult, ResultIteratorStatic, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -80,7 +80,7 @@ fn table_changes_impl(
         start_version,
         end_version,
     );
-    Ok(Box::new(table_changes?).into())
+    Ok(Box::new(table_changes.map_err(delta_kernel::Error::into_kernel_error)?).into())
 }
 
 /// Drops table changes.
@@ -178,7 +178,12 @@ fn table_changes_scan_impl(
         debug!("Table changes got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
-    Ok(Arc::new(scan_builder.build()?).into())
+    Ok(Arc::new(
+        scan_builder
+            .build()
+            .map_err(delta_kernel::Error::into_kernel_error)?,
+    )
+    .into())
 }
 
 /// Drops a table changes scan.
@@ -233,7 +238,7 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<KernelResultIteratorStatic<Box<dyn EngineData>>>;
+type TableChangesData = Mutex<ResultIteratorStatic<Box<dyn EngineData>>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -271,7 +276,9 @@ fn table_changes_scan_execute_impl(
     table_changes_scan: &TableChangesScan,
     engine: Arc<dyn ExternEngine>,
 ) -> KernelResult<Handle<SharedScanTableChangesIterator>> {
-    let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
+    let table_changes_iter = table_changes_scan
+        .execute(engine.engine().clone())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let data = ScanTableChangesIterator {
         data: Mutex::new(Box::new(table_changes_iter)),
         engine: engine.clone(),
@@ -317,11 +324,17 @@ fn scan_table_changes_next_impl(
         .lock()
         .map_err(|_| KernelError::generic("poisoned scan table changes iterator mutex"))?;
 
-    let Some(data) = data.next().transpose()? else {
+    let Some(data) = data
+        .next()
+        .transpose()
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(std::ptr::null_mut());
     };
 
-    let record_batch = data.try_into_record_batch()?;
+    let record_batch = data
+        .try_into_record_batch()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();

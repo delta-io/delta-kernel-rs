@@ -170,7 +170,8 @@ impl LogSegment {
         };
 
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
-        let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())?;
+        let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())
+            .map_err(crate::Error::into_kernel_error)?;
 
         // A checkpoint's parts share one format; scan them with the matching operator.
         let checkpoint = self
@@ -182,7 +183,8 @@ impl LogSegment {
                 };
                 scan(checkpoint_files, &["version"], versioned_schema.clone())
             })
-            .transpose()?;
+            .transpose()
+            .map_err(crate::Error::into_kernel_error)?;
 
         // Required fields are non-null exactly when their Protocol or Metadata action is present.
         // Filter on required leaf fields so readers can use row group skipping.
@@ -194,8 +196,10 @@ impl LogSegment {
         let relevant_action =
             Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
 
-        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
-            .filter(relevant_action)?
+        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))
+            .map_err(crate::Error::into_kernel_error)?
+            .filter(relevant_action)
+            .map_err(crate::Error::into_kernel_error)?
             .aggregate_ungrouped(|a| {
                 let protocol = || column_name!(PROTOCOL_NAME);
                 let metadata = || column_name!(METADATA_NAME);
@@ -219,8 +223,10 @@ impl LogSegment {
                     version(),
                 );
                 a
-            })?
+            })
+            .map_err(crate::Error::into_kernel_error)?
             .build()
+            .map_err(crate::Error::into_kernel_error)
     }
 
     /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
@@ -233,11 +239,14 @@ impl LogSegment {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
+            .execute_op(Operation::QueryPlan(plan))
+            .map_err(crate::Error::into_kernel_error)?
+            .into_data()
+            .map_err(crate::Error::into_kernel_error)?
             .map(|batch| {
                 // Mark as a log batch so the checkpoint action is read from it.
-                let batch = ActionsBatch::new(batch?, true);
+                let batch =
+                    ActionsBatch::new(batch.map_err(crate::Error::into_kernel_error)?, true);
                 let (protocol_version, metadata_version) =
                     pm_versions_from_plan_output(batch.actions.as_ref())?;
                 Ok(VersionedBatch {
@@ -258,9 +267,10 @@ impl LogSegment {
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
             StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath);
-        let commit_schema = Arc::new(StructType::try_new(
-            commit_schema.fields().cloned().chain([file_column]),
-        )?);
+        let commit_schema = Arc::new(
+            StructType::try_new(commit_schema.fields().cloned().chain([file_column]))
+                .map_err(crate::Error::into_kernel_error)?,
+        );
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         let batches = self
             .read_actions_with_projected_checkpoint_actions(
@@ -271,10 +281,11 @@ impl LogSegment {
                 None,
                 None,
                 None,
-            )?
+            )
+            .map_err(crate::Error::into_kernel_error)?
             .actions;
         Ok(batches.map(move |batch| {
-            let batch = batch?;
+            let batch = batch.map_err(crate::Error::into_kernel_error)?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
             let version = if batch.is_log_batch {
                 batch_version(batch.actions.as_ref())? as i64
@@ -350,13 +361,16 @@ fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
         }
     }
     let mut visitor = FilePathVisitor::default();
-    visitor.visit_rows_of(data)?;
+    visitor
+        .visit_rows_of(data)
+        .map_err(crate::Error::into_kernel_error)?;
     let file = visitor
         .file
         .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
         .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
-    ParsedLogPath::try_from(url)?
+    ParsedLogPath::try_from(url)
+        .map_err(crate::Error::into_kernel_error)?
         .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
@@ -410,7 +424,8 @@ fn pm_candidate(
 ) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
-    let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
+    let metadata = metadata_version
+        .zip(Metadata::try_new_from_data(actions).map_err(crate::Error::into_kernel_error)?);
     let (checkpoint_protocol, checkpoint_metadata) = match checkpoint_pm(batch)? {
         Some((version, p, m)) => (Some((version, p)), Some((version, m))),
         None => (None, None),
@@ -430,7 +445,8 @@ fn checkpoint_pm(batch: &ActionsBatch) -> KernelResult<Option<(i64, Protocol, Me
             return Ok(None);
         }
 
-        let checkpoint = CheckpointAction::try_new_from_data(batch.actions.as_ref())?;
+        let checkpoint = CheckpointAction::try_new_from_data(batch.actions.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
 
         Ok(checkpoint.map(|checkpoint| {
             (
@@ -481,7 +497,9 @@ fn pm_versions_from_plan_output(
         }
     }
     let mut visitor = PmVersionsVisitor::default();
-    visitor.visit_rows_of(actions)?;
+    visitor
+        .visit_rows_of(actions)
+        .map_err(crate::Error::into_kernel_error)?;
     Ok((visitor.protocol, visitor.metadata))
 }
 
@@ -513,7 +531,9 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> Result<PlanResult> {
-            Err(KernelError::generic("plan executor deliberately failed"))
+            Err(crate::Error::Kernel(KernelError::generic(
+                "plan executor deliberately failed",
+            )))
         }
     }
 

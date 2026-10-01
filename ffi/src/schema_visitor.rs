@@ -87,9 +87,14 @@ pub unsafe extern "C" fn visit_metadata_value(
 ) -> ExternResult<bool> {
     let key = unsafe { TryFromStringSlice::try_from_slice(&key) };
     let value = unsafe { TryFromStringSlice::try_from_slice(&value) };
-    visit_metadata_value_impl(state, key, kind, value)
-        .map(|()| true)
-        .into_extern_result(&allocate_error)
+    visit_metadata_value_impl(
+        state,
+        key.map_err(delta_kernel::Error::into_kernel_error),
+        kind,
+        value.map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .map(|()| true)
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_engine_metadata(
@@ -140,18 +145,19 @@ pub fn extract_kernel_schema(
     let schema_element = state
         .elements
         .take(schema_id)
-        .ok_or_else(|| KernelError::schema("Nonexistent id passed to extract_kernel_schema"))?;
+        .ok_or_else(|| KernelError::schema("Nonexistent id passed to extract_kernel_schema"))
+        .map_err(delta_kernel::Error::Kernel)?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
-        return Err(KernelError::schema(
+        return Err(delta_kernel::Error::Kernel(KernelError::schema(
             "Final returned id was not a struct, schema is invalid",
-        ));
+        )));
     };
     if !state.elements.is_empty() {
         warn!("Didn't consume all visited fields, schema is invalid.");
-        Err(KernelError::schema(
+        Err(delta_kernel::Error::Kernel(KernelError::schema(
             "Didn't consume all visited fields, schema is invalid.",
-        ))
+        )))
     } else {
         Ok(*struct_type)
     }
@@ -203,8 +209,14 @@ pub unsafe extern "C" fn visit_field_string(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::String,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a long field. Long fields store 64-bit signed integers.
@@ -224,8 +236,14 @@ pub unsafe extern "C" fn visit_field_long(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Long,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit an integer field. Integer fields store 32-bit signed integers.
@@ -245,8 +263,14 @@ pub unsafe extern "C" fn visit_field_integer(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Integer,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a short field. Short fields store 16-bit signed integers.
@@ -266,8 +290,14 @@ pub unsafe extern "C" fn visit_field_short(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Short,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a byte field. Byte fields store 8-bit signed integers.
@@ -287,8 +317,14 @@ pub unsafe extern "C" fn visit_field_byte(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Byte,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a float field. Float fields store 32-bit floating point numbers.
@@ -308,8 +344,14 @@ pub unsafe extern "C" fn visit_field_float(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Float,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a double field. Double fields store 64-bit floating point numbers.
@@ -329,8 +371,14 @@ pub unsafe extern "C" fn visit_field_double(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Double,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a boolean field. Boolean fields store true/false values.
@@ -350,8 +398,14 @@ pub unsafe extern "C" fn visit_field_boolean(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Boolean,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a binary field. Binary fields store arbitrary byte arrays.
@@ -371,8 +425,14 @@ pub unsafe extern "C" fn visit_field_binary(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Binary,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a date field. Date fields store calendar dates without time information.
@@ -392,8 +452,14 @@ pub unsafe extern "C" fn visit_field_date(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Date,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
@@ -415,7 +481,7 @@ pub unsafe extern "C" fn visit_field_timestamp(
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
-        name_str,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
         PrimitiveType::Timestamp,
         nullable,
         metadata,
@@ -442,7 +508,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
-        name_str,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
         PrimitiveType::TimestampNtz,
         nullable,
         metadata,
@@ -469,7 +535,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
-        name_str,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
         PrimitiveType::IntervalYearMonth,
         nullable,
         metadata,
@@ -496,7 +562,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_primitive_impl(
         state,
-        name_str,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
         PrimitiveType::IntervalDayTime,
         nullable,
         metadata,
@@ -521,8 +587,14 @@ pub unsafe extern "C" fn visit_field_void(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_primitive_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        PrimitiveType::Void,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 /// Visit a geometry field with the given coordinate reference system.
@@ -548,19 +620,25 @@ pub unsafe extern "C" fn visit_field_geometry(
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_geometry_impl(state, name_str, crs, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_geometry_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        crs.map_err(delta_kernel::Error::into_kernel_error),
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geometry_impl(
     state: &mut KernelSchemaVisitorState,
-    name: Result<&str>,
-    crs: Result<&str>,
+    name: KernelResult<&str>,
+    crs: KernelResult<&str>,
     nullable: bool,
-    metadata: Result<HashMap<String, MetadataValue>>,
-) -> Result<usize> {
-    let geometry = GeometryType::try_new(crs?)?;
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
+    let geometry = GeometryType::try_new(crs?).map_err(delta_kernel::Error::into_kernel_error)?;
     visit_field_primitive_impl(
         state,
         name,
@@ -596,19 +674,26 @@ pub unsafe extern "C" fn visit_field_geography(
     let crs = unsafe { TryFromStringSlice::try_from_slice(&crs) };
     let algorithm = unsafe { TryFromStringSlice::try_from_slice(&algorithm) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_geography_impl(state, name_str, crs, algorithm, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_geography_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        crs.map_err(delta_kernel::Error::into_kernel_error),
+        algorithm.map_err(delta_kernel::Error::into_kernel_error),
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geography_impl(
     state: &mut KernelSchemaVisitorState,
-    name: Result<&str>,
-    crs: Result<&str>,
-    algorithm: Result<&str>,
+    name: KernelResult<&str>,
+    crs: KernelResult<&str>,
+    algorithm: KernelResult<&str>,
     nullable: bool,
-    metadata: Result<HashMap<String, MetadataValue>>,
-) -> Result<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let algorithm = algorithm?
         .parse::<EdgeInterpolationAlgorithm>()
         .map_err(|err| {
@@ -616,7 +701,8 @@ fn visit_field_geography_impl(
                 "Invalid geography edge interpolation algorithm: {err}"
             ))
         })?;
-    let geography = GeographyType::try_new(crs?, algorithm)?;
+    let geography =
+        GeographyType::try_new(crs?, algorithm).map_err(delta_kernel::Error::into_kernel_error)?;
     visit_field_primitive_impl(
         state,
         name,
@@ -646,8 +732,15 @@ pub unsafe extern "C" fn visit_field_decimal(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_decimal_impl(state, name_str, precision, scale, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_decimal_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        precision,
+        scale,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_field_decimal_impl(
@@ -661,7 +754,8 @@ fn visit_field_decimal_impl(
     let name_str = name?.to_string();
     let metadata = metadata?;
 
-    let decimal_type = DecimalType::try_new(precision, scale)?;
+    let decimal_type =
+        DecimalType::try_new(precision, scale).map_err(delta_kernel::Error::into_kernel_error)?;
     let field = StructField::new(
         name_str,
         DataType::Primitive(PrimitiveType::Decimal(decimal_type)),
@@ -698,7 +792,9 @@ pub unsafe extern "C" fn visit_field_struct(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: Result<&str, KernelError> = unsafe {
+        TryFromStringSlice::try_from_slice(&name).map_err(delta_kernel::Error::into_kernel_error)
+    };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
@@ -720,7 +816,8 @@ fn create_struct_data_type(
         })
         .collect::<KernelResult<Vec<_>>>()?;
 
-    let struct_type = StructType::try_new(field_vec)?;
+    let struct_type =
+        StructType::try_new(field_vec).map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(DataType::from(struct_type))
 }
 
@@ -759,8 +856,14 @@ pub unsafe extern "C" fn visit_field_array(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_array_impl(state, name_str, element_type_id, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_array_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        element_type_id,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_field_array_impl(
@@ -809,7 +912,7 @@ pub unsafe extern "C" fn visit_field_map(
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     visit_field_map_impl(
         state,
-        name_str,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
         key_type_id,
         value_type_id,
         nullable,
@@ -871,8 +974,14 @@ pub unsafe extern "C" fn visit_field_variant(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
-    visit_field_variant_impl(state, name_str, variant_struct_id, nullable, metadata)
-        .into_extern_result(&allocate_error)
+    visit_field_variant_impl(
+        state,
+        name_str.map_err(delta_kernel::Error::into_kernel_error),
+        variant_struct_id,
+        nullable,
+        metadata,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_field_variant_impl(

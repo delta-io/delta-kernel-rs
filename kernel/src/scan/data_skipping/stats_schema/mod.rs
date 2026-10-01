@@ -171,7 +171,7 @@ pub(crate) fn expected_stats_schema(
     // outdated due to deletion vectors (false)
     fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
 
-    StructType::try_new(fields)
+    StructType::try_new(fields).map_err(crate::Error::into_kernel_error)
 }
 
 /// Returns the column names that should have statistics collected.

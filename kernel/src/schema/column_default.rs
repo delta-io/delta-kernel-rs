@@ -22,7 +22,7 @@
 use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{KernelError, KernelResult, Result};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
 /// [`StructField`](crate::schema::StructField).
@@ -93,9 +93,9 @@ impl<'a> ColumnDefault<'a> {
         match &self.parsed_sql {
             None => Ok(None),
             Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
-            Some(other) => Err(KernelError::generic(format!(
+            Some(other) => Err(Error::Kernel(KernelError::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -156,7 +156,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         self.path.push(field.name().clone());
-        if let Some(column_default) = field.column_default()? {
+        if let Some(column_default) = field.column_default().map_err(Error::into_kernel_error)? {
             self.defaults.push((self.path.join("."), column_default));
         }
         let result = self.recurse_into_struct_field(field);

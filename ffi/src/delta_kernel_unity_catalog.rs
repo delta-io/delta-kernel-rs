@@ -191,7 +191,8 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                 delta_kernel::KernelError::generic(
                     "FFIUCCommitter can only be used with the default engine",
                 )
-            })?;
+            })
+            .map_err(delta_kernel::Error::Kernel)?;
         self.inner.commit(engine, actions, commit_metadata)
     }
 
@@ -236,10 +237,14 @@ fn get_uc_committer_impl(
     table_name: KernelStringSlice,
 ) -> KernelResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
-    let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
-    let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }?;
-    let schema_str: String = unsafe { TryFromStringSlice::try_from_slice(&schema) }?;
-    let table_name_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_name) }?;
+    let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let schema_str: String = unsafe { TryFromStringSlice::try_from_slice(&schema) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let table_name_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_name) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
         inner: UCCommitter::new(
             client,

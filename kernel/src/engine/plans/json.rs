@@ -66,10 +66,10 @@ impl JsonHandler for PlanBasedJsonHandler {
         overwrite: bool,
     ) -> Result<FileSize> {
         let Some(fallback) = &self.fallback else {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
                  handler is configured",
-            ));
+            )));
         };
         debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
         fallback.write_json_file(path, data, overwrite)

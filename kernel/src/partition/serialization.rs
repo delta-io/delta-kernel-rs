@@ -15,7 +15,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{DecimalData, Scalar};
-use crate::{KernelError, KernelResult, Result};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
 /// `NaiveDate::from_num_days_from_ce_opt`, which counts from 0001-01-01.
@@ -89,19 +89,19 @@ pub fn serialize_partition_value(value: &Scalar) -> Result<Option<String>> {
         Scalar::Long(v) => Ok(Some(v.to_string())),
         Scalar::Float(v) => Ok(Some(format_f32(*v))),
         Scalar::Double(v) => Ok(Some(format_f64(*v))),
-        Scalar::Date(days) => Ok(Some(format_date(*days)?)),
-        Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
-        Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
+        Scalar::Date(days) => Ok(Some(format_date(*days).map_err(Error::Kernel)?)),
+        Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us).map_err(Error::Kernel)?)),
+        Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us).map_err(Error::Kernel)?)),
         Scalar::IntervalYearMonth(months) => Ok(Some(format_year_month_interval(*months))),
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
-        Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
+        Scalar::Binary(b) => Ok(Some(format_binary(b).map_err(Error::Kernel)?)),
         Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => {
-            Err(KernelError::generic(format!(
+            Err(Error::Kernel(KernelError::generic(format!(
                 "cannot serialize partition value: type {:?} is not a valid partition column type",
                 value.data_type()
-            )))
+            ))))
         }
     }
 }

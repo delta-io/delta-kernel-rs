@@ -47,7 +47,9 @@ pub(crate) fn ensure_data_types(
     mode: ValidationMode,
 ) -> Result<DataTypeCompat> {
     let check = EnsureDataTypes { mode };
-    check.ensure_data_types(kernel_type, arrow_type)
+    check
+        .ensure_data_types(kernel_type, arrow_type)
+        .map_err(crate::Error::Kernel)
 }
 
 struct EnsureDataTypes {

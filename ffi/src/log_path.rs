@@ -64,13 +64,14 @@ impl FfiLogPath {
     ///
     /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
     unsafe fn log_path(&self) -> KernelResult<LogPath> {
-        let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
+        let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         let url = Url::parse(location_str)?;
         let file_meta = FileMeta {
             location: url,
             last_modified: self.last_modified,
             size: self.size,
         };
-        LogPath::try_new(file_meta)
+        LogPath::try_new(file_meta).map_err(delta_kernel::Error::into_kernel_error)
     }
 }

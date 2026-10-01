@@ -592,7 +592,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
 
 /// Helper to create a table with a given schema and attempt a commit with dummy add_files.
 /// Returns the commit error (panics if commit succeeds).
-async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
+async fn try_write_with_void_schema(schema: SchemaRef) -> delta_kernel::Error {
     let (store, engine, table_location) = engine_store_setup("void_write_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![])
         .await

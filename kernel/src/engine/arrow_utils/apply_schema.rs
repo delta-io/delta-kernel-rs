@@ -370,7 +370,8 @@ fn apply_schema_to_inner(
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         _ => {
-            ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
+            ensure_data_types(schema, array.data_type(), ValidationMode::Full)
+                .map_err(crate::Error::into_kernel_error)?;
             array.clone()
         }
     };

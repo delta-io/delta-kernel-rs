@@ -3,7 +3,7 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{Engine, KernelResult, RowVisitor as _, Version};
+use crate::{Engine, Error, KernelResult, RowVisitor as _, Version};
 
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
@@ -74,7 +74,9 @@ fn scan_application_transactions(
     // found. If all ids are requested then we are forced to replay the entire log.
     for maybe_data in replay_for_app_ids(log_segment, engine)? {
         let txns = maybe_data?.actions;
-        visitor.visit_rows_of(txns.as_ref())?;
+        visitor
+            .visit_rows_of(txns.as_ref())
+            .map_err(Error::into_kernel_error)?;
         // if a specific id is requested and a transaction was found, then return
         if application_id.is_some() && !visitor.set_transactions.is_empty() {
             break;
@@ -89,7 +91,10 @@ fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    Ok(log_segment
+        .read_actions(engine, LOG_TXN_SCHEMA.clone())
+        .map_err(Error::into_kernel_error)?
+        .map(|batch| batch.map_err(Error::into_kernel_error)))
 }
 
 #[cfg(test)]

@@ -445,6 +445,7 @@ impl FfiProtocol {
             reader_features,
             writer_features,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
@@ -528,6 +529,7 @@ impl FfiFileSizeHistogram {
             unsafe { self.file_counts.try_as_slice() }?.to_vec(),
             unsafe { self.total_bytes.try_as_slice() }?.to_vec(),
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
@@ -622,6 +624,7 @@ impl FfiLastCheckpoint {
             tags,
             v2_checkpoint,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
@@ -644,6 +647,7 @@ impl FfiDeletionVectorDescriptor {
             self.size_in_bytes,
             self.cardinality,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
@@ -689,18 +693,21 @@ impl FfiAddArray {
 impl FfiFileStatsState {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<FileStatsState> {
         match self.kind {
-            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(unsafe {
-                let histogram = self
-                    .file_size_histogram
-                    .as_ref()
-                    .map(|value| value.try_to_kernel())
-                    .transpose()?;
-                FileStats::try_new(
-                    self.file_stats.num_files,
-                    self.file_stats.table_size_bytes,
-                    histogram,
-                )
-            }?)),
+            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(
+                unsafe {
+                    let histogram = self
+                        .file_size_histogram
+                        .as_ref()
+                        .map(|value| value.try_to_kernel())
+                        .transpose()?;
+                    FileStats::try_new(
+                        self.file_stats.num_files,
+                        self.file_stats.table_size_bytes,
+                        histogram,
+                    )
+                }
+                .map_err(delta_kernel::Error::into_kernel_error)?,
+            )),
             FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate),
         }
     }
@@ -720,8 +727,10 @@ impl FfiSetTransactionState {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<SetTransactionState> {
         let transactions = unsafe { self.transactions.try_to_vec() }?;
         match self.kind {
-            FfiSetTransactionStateKind::Complete => SetTransactionState::try_complete(transactions),
-            FfiSetTransactionStateKind::Partial => SetTransactionState::try_partial(transactions),
+            FfiSetTransactionStateKind::Complete => SetTransactionState::try_complete(transactions)
+                .map_err(delta_kernel::Error::into_kernel_error),
+            FfiSetTransactionStateKind::Partial => SetTransactionState::try_partial(transactions)
+                .map_err(delta_kernel::Error::into_kernel_error),
         }
     }
 }
@@ -741,9 +750,11 @@ impl FfiDomainMetadataState {
         match self.kind {
             FfiDomainMetadataStateKind::Complete => {
                 DomainMetadataState::try_complete(domain_metadata)
+                    .map_err(delta_kernel::Error::into_kernel_error)
             }
             FfiDomainMetadataStateKind::Partial => {
                 DomainMetadataState::try_partial(domain_metadata)
+                    .map_err(delta_kernel::Error::into_kernel_error)
             }
         }
     }
@@ -754,6 +765,7 @@ impl FfiDeletedRecordCountsHistogram {
         DeletedRecordCountsHistogram::try_new(
             unsafe { self.deleted_record_counts.try_as_slice() }?.to_vec(),
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
@@ -785,6 +797,7 @@ impl FfiCrc {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             None,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 

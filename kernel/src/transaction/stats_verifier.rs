@@ -13,7 +13,7 @@ use crate::error::KernelError;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::{KernelResult, Result};
+use crate::{Error, KernelResult, Result};
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -43,7 +43,8 @@ impl StatsColumnVerifier {
         }
 
         for (col, data_type) in &self.required_columns {
-            self.verify_column(add_files, col, data_type)?;
+            self.verify_column(add_files, col, data_type)
+                .map_err(Error::Kernel)?;
         }
 
         Ok(())
@@ -78,7 +79,9 @@ impl StatsColumnVerifier {
                 missing_min: &mut missing_min,
                 missing_max: &mut missing_max,
             };
-            batch.visit_rows(&column_names, &mut visitor)?;
+            batch
+                .visit_rows(&column_names, &mut visitor)
+                .map_err(Error::into_kernel_error)?;
         }
 
         if !missing_null_count.is_empty() {
@@ -217,22 +220,54 @@ fn is_stat_present<'b>(
 ) -> KernelResult<bool> {
     let field_name = "stat";
     match data_type {
-        &DataType::BOOLEAN => Ok(getter.get_bool(row_idx, field_name)?.is_some()),
-        &DataType::BYTE => Ok(getter.get_byte(row_idx, field_name)?.is_some()),
-        &DataType::SHORT => Ok(getter.get_short(row_idx, field_name)?.is_some()),
-        &DataType::INTEGER => Ok(getter.get_int(row_idx, field_name)?.is_some()),
-        &DataType::LONG => Ok(getter.get_long(row_idx, field_name)?.is_some()),
-        &DataType::FLOAT => Ok(getter.get_float(row_idx, field_name)?.is_some()),
-        &DataType::DOUBLE => Ok(getter.get_double(row_idx, field_name)?.is_some()),
-        &DataType::DATE => Ok(getter.get_date(row_idx, field_name)?.is_some()),
-        &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
-            Ok(getter.get_timestamp(row_idx, field_name)?.is_some())
-        }
-        &DataType::STRING => Ok(getter.get_str(row_idx, field_name)?.is_some()),
-        &DataType::BINARY => Ok(getter.get_binary(row_idx, field_name)?.is_some()),
-        DataType::Primitive(PrimitiveType::Decimal(_)) => {
-            Ok(getter.get_decimal(row_idx, field_name)?.is_some())
-        }
+        &DataType::BOOLEAN => Ok(getter
+            .get_bool(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::BYTE => Ok(getter
+            .get_byte(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::SHORT => Ok(getter
+            .get_short(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::INTEGER => Ok(getter
+            .get_int(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::LONG => Ok(getter
+            .get_long(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::FLOAT => Ok(getter
+            .get_float(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::DOUBLE => Ok(getter
+            .get_double(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::DATE => Ok(getter
+            .get_date(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => Ok(getter
+            .get_timestamp(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::STRING => Ok(getter
+            .get_str(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        &DataType::BINARY => Ok(getter
+            .get_binary(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
+        DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(getter
+            .get_decimal(row_idx, field_name)
+            .map_err(Error::into_kernel_error)?
+            .is_some()),
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats presence check: {data_type}"
@@ -272,10 +307,10 @@ impl RowVisitor for ColumnStatsValidator<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 5,
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "Expected 5 getters for column stats validation, got {}",
                 getters.len()
-            ))
+            )))
         );
 
         for row_idx in 0..row_count {
@@ -290,10 +325,14 @@ impl RowVisitor for ColumnStatsValidator<'_> {
             if null_count.is_none() {
                 self.missing_null_count.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[3], row_idx, self.data_type)?) {
+            if !(all_null
+                || is_stat_present(getters[3], row_idx, self.data_type).map_err(Error::Kernel)?)
+            {
                 self.missing_min.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[4], row_idx, self.data_type)?) {
+            if !(all_null
+                || is_stat_present(getters[4], row_idx, self.data_type).map_err(Error::Kernel)?)
+            {
                 self.missing_max.push(path);
             }
         }
@@ -318,10 +357,10 @@ pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> R
         }
     }
     if let Some(path) = first_missing {
-        return Err(KernelError::stats_validation(format!(
+        return Err(Error::Kernel(KernelError::stats_validation(format!(
             "'stats.numRecords' is required for this table (see \
              `TableConfiguration::requires_stats_num_records`), but is missing for file '{path}'",
-        )));
+        ))));
     }
     Ok(())
 }
@@ -340,10 +379,10 @@ impl RowVisitor for NumRecordsValidator<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 2,
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "Expected 2 getters for numRecords validation, got {}",
                 getters.len()
-            ))
+            )))
         );
         for row_idx in 0..row_count {
             if getters[1].get_long(row_idx, NUM_RECORDS)?.is_none() {

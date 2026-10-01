@@ -618,7 +618,9 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
 }
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<String>> {
-    let scan_metadata_iter = scan.scan_metadata(engine)?;
+    let scan_metadata_iter = scan
+        .scan_metadata(engine)
+        .map_err(crate::Error::into_kernel_error)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());
         assert!(scan_file.dv_info.deletion_vector.is_none());
@@ -626,8 +628,10 @@ fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Strin
     }
     let mut files = vec![];
     for res in scan_metadata_iter {
-        let scan_metadata = res?;
-        files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
+        let scan_metadata = res.map_err(crate::Error::into_kernel_error)?;
+        files = scan_metadata
+            .visit_scan_files(files, scan_metadata_callback)
+            .map_err(crate::Error::into_kernel_error)?;
     }
     Ok(files)
 }
@@ -727,7 +731,10 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
         .unwrap();
 
     token.cancel();
-    assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        metadata.next(),
+        Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+    ));
 }
 
 // reading v0 with 3 files.
@@ -928,14 +935,16 @@ fn test_missing_column_row_group_skipping() {
 fn test_scan_with_checkpoint() -> Result<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
-    ))?;
+    ))
+    .map_err(crate::KernelError::from)
+    .map_err(crate::Error::Kernel)?;
 
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
 
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
     let scan = snapshot.scan_builder().build()?;
-    let files = get_files_for_scan(scan, &engine)?;
+    let files = get_files_for_scan(scan, &engine).map_err(crate::Error::Kernel)?;
     // test case:
     //
     // commit0:     P and M, no add/remove
