@@ -33,6 +33,13 @@ fn assert_aligned_data_matches(
     assert_data_matches(result, result_schema, expected)
 }
 
+/// Makes the expected Parquet data match Kernel's schema before comparing rows.
+///
+/// For example, the expected file may omit a `VOID` column because it contains only nulls. This
+/// function adds that column back as `[null, null, ...]`. The expected file may also store a Spark
+/// timestamp as timezone-free nanoseconds, while Kernel returns microseconds in UTC. This function
+/// converts that timestamp when no precision would be lost. It makes the same adjustments inside
+/// structs, lists, and maps, but rejects all other schema differences.
 fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let source_schema = batch.schema();
     require_matching_field_order(source_schema.fields(), schema.fields())?;
