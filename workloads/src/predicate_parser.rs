@@ -10,7 +10,7 @@
 //! - `BETWEEN ... AND ...`
 //! - Column references and literal values (integers, floats, strings, booleans)
 //! - Typed literals: `DATE'...'`, `TIMESTAMP'...'`, `TIMESTAMP_NTZ'...'`
-//! - Numeric literal casts to `BYTE`/`TINYINT`, `SHORT`/`SMALLINT`, and `FLOAT`
+//! - Numeric literal casts to integer types and `FLOAT`
 //!
 //! Unsupported (returns error): `LIKE`, function calls (`HEX`, `size`, `length`),
 //! `TIME '...'` typed literals.
@@ -41,6 +41,7 @@
 
 use std::borrow::Cow;
 
+use bigdecimal::BigDecimal;
 // Imports use a naming convention to distinguish kernel types from sqlparser types:
 // - K-prefix: Kernel types (KExpr, KPred, KBinOp, KPredOp)
 // - P-prefix: Parser/sqlparser types (PExpr, PBinOp, PUnaryOp, PVal)
@@ -138,8 +139,11 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
             expr, data_type, ..
         } => {
             let target = sql_cast_type(data_type)?;
-            let scalar = parse_numeric_cast_literal(expr, &target)?;
-            Some((lit(scalar), target))
+            if !is_numeric_literal(expr) {
+                return None;
+            }
+            let expr = check_expr(schema, &target, expr).ok()?;
+            Some((expr, target))
         }
         PExpr::Nested(inner) => synthesize_expr(schema, inner),
         PExpr::BinaryOp { left, op, right } => {
@@ -169,49 +173,15 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
     }
 }
 
-fn parse_numeric_cast_literal(expr: &PExpr, target: &DataType) -> Option<Scalar> {
-    match unwrap_nested(expr) {
-        PExpr::Value(value) => match &value.value {
-            PVal::Number(value, _) => parse_numeric_cast_value(value, target),
-            _ => None,
-        },
+fn is_numeric_literal(expr: &PExpr) -> bool {
+    match expr {
+        PExpr::Value(value) => matches!(value.value, PVal::Number(_, _)),
+        PExpr::Nested(inner) => is_numeric_literal(inner),
         PExpr::UnaryOp {
             op: PUnaryOp::Minus,
             expr: inner,
-        } => {
-            let inner = unwrap_nested(inner);
-            let PExpr::Value(value) = inner else {
-                return None;
-            };
-            let PVal::Number(value, _) = &value.value else {
-                return None;
-            };
-            parse_numeric_cast_value(&format!("-{value}"), target)
-        }
-        _ => None,
-    }
-}
-
-fn unwrap_nested(mut expr: &PExpr) -> &PExpr {
-    while let PExpr::Nested(inner) = expr {
-        expr = inner;
-    }
-    expr
-}
-
-fn parse_numeric_cast_value(value: &str, target: &DataType) -> Option<Scalar> {
-    let DataType::Primitive(target) = target else {
-        return None;
-    };
-    match target {
-        PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Float => {
-            let scalar = target.parse_scalar(value).ok()?;
-            match scalar {
-                Scalar::Float(value) if !value.is_finite() => None,
-                scalar => Some(scalar),
-            }
-        }
-        _ => None,
+        } => is_numeric_literal(inner),
+        _ => false,
     }
 }
 
@@ -219,11 +189,14 @@ fn sql_cast_type(data_type: &PDataType) -> Option<DataType> {
     match data_type {
         PDataType::TinyInt(None) => Some(DataType::BYTE),
         PDataType::SmallInt(None) => Some(DataType::SHORT),
+        PDataType::Int(None) | PDataType::Integer(None) => Some(DataType::INTEGER),
+        PDataType::BigInt(None) => Some(DataType::LONG),
         PDataType::Float(None) => Some(DataType::FLOAT),
         PDataType::Custom(name, modifiers) if modifiers.is_empty() && name.0.len() == 1 => {
             match name.0[0].as_ident()?.value.to_ascii_uppercase().as_str() {
                 "BYTE" => Some(DataType::BYTE),
                 "SHORT" => Some(DataType::SHORT),
+                "LONG" => Some(DataType::LONG),
                 _ => None,
             }
         }
@@ -238,14 +211,11 @@ fn check_expr(
     expr: &PExpr,
 ) -> Result<KExpr, Box<dyn std::error::Error>> {
     match expr {
-        PExpr::Value(v) => check_literal(expected_ty, &v.value, false),
+        PExpr::Value(_) => check_literal(expected_ty, expr, false),
         PExpr::UnaryOp {
             op: PUnaryOp::Minus,
             expr: inner,
-        } => match inner.as_ref() {
-            PExpr::Value(v) => check_literal(expected_ty, &v.value, true),
-            _ => Err(format!("Unsupported unary minus on: {expr}").into()),
-        },
+        } => check_literal(expected_ty, inner, true),
         // Typed literals like DATE'2024-01-01' and TIMESTAMP '2024-01-01 00:00:00'
         // Use expected_ty from column to parse with correct type (Timestamp vs TimestampNtz)
         PExpr::TypedString { value, .. } => {
@@ -274,26 +244,25 @@ fn check_expr(
     }
 }
 
-/// Checks a literal value against an expected type and converts it to that type.
+/// Checks a literal expression against an expected type and converts it to that type.
 /// Uses kernel's `PrimitiveType::parse_scalar` for parsing.
 fn check_literal(
     expected_ty: &DataType,
-    value: &PVal,
+    expr: &PExpr,
     is_negative: bool,
 ) -> Result<KExpr, Box<dyn std::error::Error>> {
+    let value = match expr {
+        PExpr::Nested(inner) => return check_literal(expected_ty, inner, is_negative),
+        PExpr::Value(value) => &value.value,
+        _ => return Err(format!("Unsupported literal: {expr}").into()),
+    };
+
     // Local import to avoid conflict with Scalar::* variants (Long, Integer, etc.) used in tests
     use PrimitiveType::*;
     match (expected_ty, value) {
         (DataType::Primitive(Decimal(dtype)), PVal::Number(n, _)) => {
             let sign = if is_negative { "-" } else { "" };
-            // Kernel's `parse_scalar` is intentionally strict: the text must match the declared
-            // storage format. SQL literals may omit trailing zeros, such as `1.5` for
-            // DECIMAL(10,2).
-            let raw = normalize_decimal_literal(n, dtype)?;
-            let raw = format!("{sign}{raw}");
-            let scalar = Decimal(*dtype)
-                .parse_scalar(&raw)
-                .map_err(|e| e.to_string())?;
+            let scalar = parse_decimal_literal(&format!("{sign}{n}"), dtype)?;
             Ok(lit(scalar))
         }
         // Numeric literals - only for numeric primitive types
@@ -303,6 +272,9 @@ fn check_literal(
         ) => {
             let raw = format!("{}{n}", if is_negative { "-" } else { "" });
             let scalar = prim.parse_scalar(&raw).map_err(|e| e.to_string())?;
+            if matches!(&scalar, Scalar::Float(value) if !value.is_finite()) {
+                return Err(format!("Non-finite float literal: {raw}").into());
+            }
             Ok(lit(scalar))
         }
 
@@ -338,71 +310,52 @@ fn check_literal(
     }
 }
 
-fn normalize_decimal_literal(value: &str, dtype: &DecimalType) -> Result<String, String> {
-    let (mantissa, exponent) = value
-        .split_once(['e', 'E'])
-        .map(|(mantissa, exponent)| {
-            exponent
-                .parse::<i32>()
-                .map(|exponent| (mantissa, exponent))
-                .map_err(|error| error.to_string())
-        })
-        .transpose()?
-        .unwrap_or((value, 0));
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let fraction = fraction.trim_end_matches('0');
-    let mut digits = format!("{whole}{fraction}");
-    let fractional_digits = i32::try_from(fraction.len()).map_err(|error| error.to_string())?;
-    let mut shifted_scale = fractional_digits
-        .checked_sub(exponent)
-        .ok_or_else(|| format!("Decimal exponent is out of range: {value}"))?;
-    let precision = usize::from(dtype.precision());
-    let scale = usize::from(dtype.scale());
+/// Converts a SQL decimal literal into a Kernel scalar without rounding.
+///
+/// For example, `1.5` has one digit after the decimal point, so its scale is one. A
+/// `DECIMAL(10,2)` needs a scale of two, so the equivalent unscaled value is `150`.
+fn parse_decimal_literal(value: &str, dtype: &DecimalType) -> Result<Scalar, String> {
+    let decimal = value
+        .parse::<BigDecimal>()
+        .map_err(|error| error.to_string())?;
+    if decimal == 0 {
+        return Scalar::decimal(0, dtype.precision(), dtype.scale())
+            .map_err(|error| error.to_string());
+    }
+    let target_scale = i64::from(dtype.scale());
+    let source_scale = decimal.fractional_digit_count();
+    let scale_difference = source_scale.abs_diff(target_scale);
 
-    while shifted_scale > 0 && digits.ends_with('0') {
-        digits.pop();
-        shifted_scale -= 1;
-    }
-    let significant_digits = digits.trim_start_matches('0').len();
-    if significant_digits == 0 {
-        return if scale == 0 {
-            Ok("0".to_string())
-        } else {
-            Ok(format!("0.{}", "0".repeat(scale)))
-        };
-    }
-    let required_zeros = if shifted_scale < 0 {
-        usize::try_from(-i64::from(shifted_scale)).map_err(|error| error.to_string())?
-    } else {
-        0
-    };
-    let expanded_precision = significant_digits.saturating_add(required_zeros);
-    if expanded_precision > precision {
+    // Avoid asking BigDecimal to allocate a power of ten larger than the final value can hold.
+    if source_scale < target_scale
+        && decimal.digits().saturating_add(scale_difference) > u64::from(dtype.precision())
+    {
         return Err(format!(
-            "Decimal literal exceeds precision {precision}: {value}"
+            "Decimal literal exceeds precision {}: {value}",
+            dtype.precision()
+        ));
+    }
+    if source_scale > target_scale && scale_difference >= decimal.digits() {
+        return Err(format!(
+            "Decimal literal has more than {} fractional digits: {value}",
+            dtype.scale()
         ));
     }
 
-    if shifted_scale < 0 {
-        digits.push_str(&"0".repeat(required_zeros));
-    }
-    let shifted_scale = shifted_scale.max(0) as usize;
-    if shifted_scale > scale {
+    let rescaled = decimal.with_scale(target_scale);
+    if rescaled != decimal {
         return Err(format!(
-            "Decimal literal {value} has more than {scale} fractional digits"
+            "Decimal literal has more than {} fractional digits: {value}",
+            dtype.scale()
         ));
     }
-    if digits.len() <= shifted_scale {
-        let leading_zeros = shifted_scale + 1 - digits.len();
-        digits.insert_str(0, &"0".repeat(leading_zeros));
-    }
-    digits.push_str(&"0".repeat(scale - shifted_scale));
-    if scale == 0 {
-        return Ok(digits);
-    }
-    let decimal_index = digits.len() - scale;
-    digits.insert(decimal_index, '.');
-    Ok(digits)
+    let (unscaled, scale) = rescaled.into_bigint_and_exponent();
+    debug_assert_eq!(scale, target_scale);
+    let unscaled = unscaled
+        .to_string()
+        .parse::<i128>()
+        .map_err(|error| error.to_string())?;
+    Scalar::decimal(unscaled, dtype.precision(), dtype.scale()).map_err(|error| error.to_string())
 }
 
 /// Synthesizes both operands of a binary operation and resolves their shared type.
@@ -418,7 +371,9 @@ fn synthesize_binary_exprs(
     let common_ty = match (&l_syn, &r_syn) {
         (Some((_, l_ty)), Some((_, r_ty))) if l_ty == r_ty => l_ty.clone(),
         (Some((_, l_ty)), Some((_, r_ty))) => {
-            return Err(format!("Type mismatch: cannot compare {l_ty:?} with {r_ty:?}").into())
+            // TODO: Support compatible numeric types by casting the narrower expression to the
+            // shared wider type before constructing the Kernel expression.
+            return Err(format!("Type mismatch: cannot compare {l_ty:?} with {r_ty:?}").into());
         }
         (Some((_, ty)), None) | (None, Some((_, ty))) => ty.clone(),
         (None, None) => {
@@ -680,6 +635,10 @@ mod tests {
         KPred::eq(col!("short_col"), Short(-32768))
     )]
     #[case(
+        "short_col = CAST(-(12) AS SHORT)",
+        KPred::eq(col!("short_col"), Short(-12))
+    )]
+    #[case(
         "short_col = CAST(12 AS SHORT)",
         KPred::eq(col!("short_col"), Short(12))
     )]
@@ -690,6 +649,22 @@ mod tests {
     #[case(
         "float_col > CAST(0.0 AS FLOAT)",
         KPred::gt(col!("float_col"), Float(0.0))
+    )]
+    #[case(
+        "int_col = CAST(2147483647 AS INT)",
+        KPred::eq(col!("int_col"), Integer(2147483647))
+    )]
+    #[case(
+        "int_col = CAST(-2147483648 AS INTEGER)",
+        KPred::eq(col!("int_col"), Integer(-2147483648))
+    )]
+    #[case(
+        "long_col = CAST(9223372036854775807 AS BIGINT)",
+        KPred::eq(col!("long_col"), Long(9223372036854775807))
+    )]
+    #[case(
+        "long_col = CAST(-9223372036854775808 AS LONG)",
+        KPred::eq(col!("long_col"), Long(-9223372036854775808))
     )]
     fn literal_types(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
@@ -760,7 +735,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case("byte_col = CAST(1 AS INTEGER)")]
+    #[case("int_col = CAST(2147483648 AS INT)")]
+    #[case("long_col = CAST(9223372036854775808 AS LONG)")]
     #[case("float_col = CAST(1 AS FLOAT(8))")]
     #[case("byte_col = CAST(128 AS BYTE)")]
     #[case("byte_col = CAST(1.9 AS BYTE)")]
