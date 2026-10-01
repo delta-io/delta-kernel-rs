@@ -222,7 +222,7 @@ int main(int argc, char* argv[])
 
     // Configure transaction intent, then build with the UC committer.
     HandleExclusiveUpdateTableTransactionBuilder txn_builder =
-        get_update_table_txn_builder(snapshot);
+        new_update_table_txn_builder(snapshot);
     const char* engine_info = "uc_example_engine";
     KernelStringSlice engine_info_slice = { .ptr = engine_info, .len = strlen(engine_info) };
     ExternResultHandleExclusiveUpdateTableTransactionBuilder builder_with_info_res =

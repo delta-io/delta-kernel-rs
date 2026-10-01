@@ -357,19 +357,6 @@ where
 // Shared methods available on ALL transaction types
 // =============================================================================
 impl<S> Transaction<S> {
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn with_engine_info_for_test(mut self, engine_info: impl Into<String>) -> Self {
-        self.engine_info = Some(engine_info.into());
-        self
-    }
-
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn set_data_change_for_test(&mut self, data_change: bool) {
-        self.data_change = data_change;
-        self.infer_data_change = false;
-    }
     /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed

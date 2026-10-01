@@ -15,7 +15,12 @@ use test_utils::add_commit;
 use crate::error::{AllocateError, AllocateErrorFn, EngineError, ExternResult, FFIKernelError};
 #[cfg(test)]
 use crate::{
-    engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
+    engine_to_handle, free_snapshot, get_snapshot_builder, kernel_string_slice,
+    snapshot_builder_build,
+    transaction::{
+        new_update_table_txn_builder, update_table_txn_builder_build,
+        ExclusiveUpdateTableTransaction,
+    },
     ExternEngine, SharedExternEngine, SharedSnapshot,
 };
 use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
@@ -112,6 +117,24 @@ pub(crate) unsafe fn build_snapshot(
 ) -> crate::handle::Handle<SharedSnapshot> {
     let builder = ok_or_panic(get_snapshot_builder(path, engine));
     ok_or_panic(snapshot_builder_build(builder))
+}
+
+/// Build an update-table transaction through the FFI snapshot and transaction-builder APIs.
+///
+/// Returns an error if the transaction cannot be built. Panics if the snapshot cannot be loaded.
+///
+/// # Safety
+///
+/// `path` and `engine` must be valid. This consumes `engine`.
+#[cfg(test)]
+pub(crate) unsafe fn build_update_table_txn(
+    path: KernelStringSlice,
+    engine: crate::handle::Handle<SharedExternEngine>,
+) -> ExternResult<crate::handle::Handle<ExclusiveUpdateTableTransaction>> {
+    let snapshot = unsafe { build_snapshot(path, engine.shallow_copy()) };
+    let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+    unsafe { free_snapshot(snapshot) };
+    unsafe { update_table_txn_builder_build(builder, engine) }
 }
 
 /// Wrap an already-seeded object store in an engine handle. Caller must free it.

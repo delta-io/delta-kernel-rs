@@ -16,12 +16,12 @@
 // Demonstrates:
 //   - Building a schema via the KernelSchemaVisitorState API (engine-side -> kernel-side
 //     schema conversion): visit_field_long, visit_field_string, visit_field_struct.
-//   - get_create_table_txn_builder with a static schema spec.
+//   - new_create_table_txn_builder with a static schema spec.
 //   - create_table_txn_builder_with_table_property to set `delta.enableChangeDataFeed`.
 //   - create_table_txn_builder_build -> create_table_txn_commit.
 //   - Opening a snapshot on the freshly-created table to confirm the commit landed.
 //
-// Note: get_create_table_txn_builder takes engine_info and stores it on the builder, so the
+// Note: new_create_table_txn_builder takes engine_info and stores it on the builder, so the
 // transaction is already labelled by the time we call create_table_txn_commit.
 //
 // The example does not stage any initial files. The
@@ -131,7 +131,7 @@ int main(int argc, char* argv[]) {
   const char* engine_info_str = "create_table_example";
   KernelStringSlice engine_info_slice = { engine_info_str, strlen(engine_info_str) };
   ExternResultHandleExclusiveCreateTableTransactionBuilder builder_res =
-      get_create_table_txn_builder(table_path_slice, &engine_schema, engine_info_slice, engine);
+      new_create_table_txn_builder(table_path_slice, &engine_schema, engine_info_slice, engine);
   if (builder_res.tag != OkHandleExclusiveCreateTableTransactionBuilder) {
     print_error("Failed to get create-table builder.", (Error*)builder_res.err);
     free_error((Error*)builder_res.err);

@@ -76,7 +76,7 @@ A typical write flow:
 ```text
 get_default_engine()  ->  Handle<SharedExternEngine>
         |
-get_update_table_txn_builder() -> Handle<ExclusiveUpdateTableTransactionBuilder>
+new_update_table_txn_builder() -> Handle<ExclusiveUpdateTableTransactionBuilder>
         |
 update_table_txn_builder_with_engine_info()
         |
@@ -229,7 +229,7 @@ feature is enabled; the rest are always available.
 
 | Function | Purpose |
 |----------|---------|
-| `get_update_table_txn_builder` | Create a builder from a snapshot |
+| `new_update_table_txn_builder` | Create a builder from a snapshot |
 | `update_table_txn_builder_with_engine_info` | Record a connector name and version before writing |
 | `update_table_txn_builder_with_operation` / `update_table_txn_builder_with_custom_operation` | Select the operation stored in table history |
 | `update_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair for idempotent writes (see [Idempotent Writes](../writing/idempotent_writes.md)) |
@@ -276,7 +276,7 @@ unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
-| `get_create_table_txn_builder` | Create a builder for a new Delta table with a schema |
+| `new_create_table_txn_builder` | Create a builder for a new Delta table with a schema |
 | `create_table_txn_builder_with_table_property` | Add a table property to the builder |
 | `create_table_txn_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
 | `create_table_txn_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
@@ -437,7 +437,7 @@ exercises a different slice of the API.
 |---------|--------------|
 | [`read-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/read-table) | The full read path: schema visiting, scan-metadata iteration, and Arrow data handling. Pass `-a` to switch from the callback-based scan-metadata path to the Arrow batch-mode path (`scan_metadata_next_arrow`). |
 | [`read-table-changes`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/read-table-changes) | Reading a [change data feed](../reading/change_data_feed.md) using `table_changes_*` and consuming `ArrowFFIData` batches from `scan_table_changes_next`. |
-| [`create-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/create-table) | Creating a new Delta table via the `get_create_table_txn_builder` / `create_table_txn_builder_build` / `create_table_txn_commit` flow. |
+| [`create-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/create-table) | Creating a new Delta table via the `new_create_table_txn_builder` / `create_table_txn_builder_build` / `create_table_txn_commit` flow. |
 | [`write-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/write-table) | Appending data to an existing table via the `update_table_txn_builder_*` / `update_table_txn_add_files` / `update_table_txn_commit` flow. |
 
 The high-level flow in the `read-table` example:

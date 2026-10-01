@@ -1,6 +1,6 @@
 //! Create-table transaction FFI lifecycle.
 
-use super::update_table::{commit_result_to_committed_handle, decode_engine_schema};
+use super::update_table::commit_result_to_committed_handle;
 use super::*;
 
 /// A handle for a create-table transaction (`Transaction<CreateTable>`).
@@ -29,8 +29,7 @@ pub unsafe extern "C" fn create_table_txn_with_operation_metrics(
 ) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { metrics.try_to_hash_map() }
-        .and_then(|metrics| txn.with_operation_metrics(metrics))
+    unsafe { apply_string_map(txn, metrics, CreateTableTransaction::with_operation_metrics) }
         .map(|txn| Box::new(txn).into())
         .into_extern_result(&engine)
 }
@@ -50,10 +49,13 @@ pub unsafe extern "C" fn create_table_txn_with_commit_info(
     let txn = unsafe { *txn.into_inner() };
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    decode_engine_schema(schema)
-        .map(|schema| txn.with_commit_info(commit_info, Arc::new(schema)))
-        .map(|txn| Box::new(txn).into())
-        .into_extern_result(&engine)
+    unsafe {
+        apply_commit_info(txn, commit_info, schema, |txn, commit_info, schema| {
+            Ok(txn.with_commit_info(commit_info, schema))
+        })
+    }
+    .map(|txn| Box::new(txn).into())
+    .into_extern_result(&engine)
 }
 
 /// Free a create-table transaction handle without committing.
@@ -83,20 +85,15 @@ pub unsafe extern "C" fn create_table_txn_with_domain_metadata(
     configuration: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
-    let txn = unsafe { txn.into_inner() };
+    let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    create_table_txn_with_domain_metadata_impl(*txn, domain, configuration)
-        .into_extern_result(&engine)
-}
-
-fn create_table_txn_with_domain_metadata_impl(
-    txn: CreateTableTransaction,
-    domain: KernelStringSlice,
-    configuration: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveCreateTableTransaction>> {
-    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
+    unsafe {
+        apply_domain_metadata(txn, domain, configuration, |txn, domain, configuration| {
+            Ok(txn.with_domain_metadata(domain, configuration))
+        })
+    }
+    .map(|txn| Box::new(txn).into())
+    .into_extern_result(&engine)
 }
 
 /// Add file metadata to a create-table transaction for files that have been written. The metadata
@@ -187,10 +184,15 @@ pub unsafe extern "C" fn create_table_txn_builder_with_operation_parameters(
 ) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { parameters.try_to_hash_map() }
-        .and_then(|parameters| builder.with_operation_parameters(parameters))
-        .map(|builder| Box::new(builder).into())
-        .into_extern_result(&engine)
+    unsafe {
+        apply_string_map(
+            builder,
+            parameters,
+            CreateTableTransactionBuilder::with_operation_parameters,
+        )
+    }
+    .map(|builder| Box::new(builder).into())
+    .into_extern_result(&engine)
 }
 
 /// Replaces create-table operation metrics recorded in `commitInfo` before writes begin.
@@ -209,10 +211,15 @@ pub unsafe extern "C" fn create_table_txn_builder_with_operation_metrics(
 ) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { metrics.try_to_hash_map() }
-        .and_then(|metrics| builder.with_operation_metrics(metrics))
-        .map(|builder| Box::new(builder).into())
-        .into_extern_result(&engine)
+    unsafe {
+        apply_string_map(
+            builder,
+            metrics,
+            CreateTableTransactionBuilder::with_operation_metrics,
+        )
+    }
+    .map(|builder| Box::new(builder).into())
+    .into_extern_result(&engine)
 }
 
 /// Supplies one connector-defined `commitInfo` row to the create-table builder.
@@ -233,10 +240,16 @@ pub unsafe extern "C" fn create_table_txn_builder_with_commit_info(
     let builder = unsafe { *builder.into_inner() };
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    decode_engine_schema(schema)
-        .map(|schema| builder.with_commit_info(commit_info, Arc::new(schema)))
-        .map(|builder| Box::new(builder).into())
-        .into_extern_result(&engine)
+    unsafe {
+        apply_commit_info(
+            builder,
+            commit_info,
+            schema,
+            |builder, commit_info, schema| Ok(builder.with_commit_info(commit_info, schema)),
+        )
+    }
+    .map(|builder| Box::new(builder).into())
+    .into_extern_result(&engine)
 }
 
 /// Adds user-controlled domain metadata to the create-table builder.
@@ -255,14 +268,16 @@ pub unsafe extern "C" fn create_table_txn_builder_with_domain_metadata(
 ) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let domain: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
-    let configuration: DeltaResult<String> =
-        unsafe { TryFromStringSlice::try_from_slice(&configuration) };
-    domain
-        .and_then(|domain| configuration.map(|configuration| (domain, configuration)))
-        .map(|(domain, configuration)| {
-            Box::new(builder.with_domain_metadata(domain, configuration)).into()
-        })
+    let result = unsafe {
+        apply_domain_metadata(
+            builder,
+            domain,
+            configuration,
+            |builder, domain, configuration| Ok(builder.with_domain_metadata(domain, configuration)),
+        )
+    };
+    result
+        .map(|builder| Box::new(builder).into())
         .into_extern_result(&engine)
 }
 
@@ -374,7 +389,7 @@ pub(super) fn create_table_txn_builder_with_data_layout_impl(
 ///
 /// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
 #[no_mangle]
-pub unsafe extern "C" fn get_create_table_txn_builder(
+pub unsafe extern "C" fn new_create_table_txn_builder(
     path: KernelStringSlice,
     schema: &EngineSchema,
     engine_info: KernelStringSlice,
@@ -383,10 +398,10 @@ pub unsafe extern "C" fn get_create_table_txn_builder(
     let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
     let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    get_create_table_txn_builder_impl(path, schema, info).into_extern_result(&engine)
+    new_create_table_txn_builder_impl(path, schema, info).into_extern_result(&engine)
 }
 
-fn get_create_table_txn_builder_impl(
+fn new_create_table_txn_builder_impl(
     path: DeltaResult<&str>,
     schema: &EngineSchema,
     engine_info: DeltaResult<&str>,

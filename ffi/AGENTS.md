@@ -143,7 +143,7 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 
 ```
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build()
-  -> get_update_table_txn_builder() -> update_table_txn_builder_with_engine_info()
+  -> new_update_table_txn_builder() -> update_table_txn_builder_with_engine_info()
   -> update_table_txn_builder_with_operation() -> update_table_txn_builder_build()
   -> update_table_txn_add_files() -> update_table_txn_commit()
                     |
@@ -180,7 +180,7 @@ Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The
 defaults but never materializes them, so the connector fills every omitted column itself:
 
 ```
-get_update_table_txn_builder()
+new_update_table_txn_builder()
   -> update_table_txn_builder_build()
   -> update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> update_table_txn_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
@@ -193,7 +193,7 @@ get_update_table_txn_builder()
 Deletion vector update flow:
 
 ```
-get_update_table_txn_builder()
+new_update_table_txn_builder()
   -> update_table_txn_builder_build()
   -> dv_descriptor_map_new()
   -> dv_descriptor_new()

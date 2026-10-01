@@ -56,19 +56,6 @@ use crate::{DataType, Engine, Expression, Result};
 // Update table transactions only
 // =============================================================================
 impl Transaction {
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn with_operation_for_test(mut self, operation: impl Into<String>) -> Self {
-        self.operation = Some(super::CommitOperation::from(operation.into()));
-        self
-    }
-
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn with_domain_metadata_removed_for_test(mut self, domain: impl Into<String>) -> Self {
-        self.user_domain_removals.push(domain.into());
-        self
-    }
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------

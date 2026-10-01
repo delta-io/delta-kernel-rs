@@ -7,6 +7,7 @@ mod transaction_id;
 mod update_table;
 mod write_context;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use committed::{
@@ -21,6 +22,7 @@ pub use deletion_vector::{
 };
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
@@ -29,6 +31,7 @@ use delta_kernel::transaction::{
     CommitResult, CommittedTransaction, Transaction, UpdateTableOperation,
     UpdateTableTransactionBuilder,
 };
+use delta_kernel::EngineData;
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
@@ -56,6 +59,42 @@ use crate::{
     SharedSnapshot, TryFromStringSlice,
 };
 
+unsafe fn apply_string_map<T>(
+    value: T,
+    input: &FfiStringMap,
+    apply: impl FnOnce(T, HashMap<String, String>) -> DeltaResult<T>,
+) -> DeltaResult<T> {
+    let values = unsafe { input.try_to_hash_map() }?;
+    apply(value, values)
+}
+
+unsafe fn apply_commit_info<T>(
+    value: T,
+    commit_info: Box<dyn EngineData>,
+    schema: &EngineSchema,
+    apply: impl FnOnce(T, Box<dyn EngineData>, SchemaRef) -> DeltaResult<T>,
+) -> DeltaResult<T> {
+    let schema = decode_engine_schema(schema)?;
+    apply(value, commit_info, Arc::new(schema))
+}
+
+unsafe fn apply_domain_metadata<T>(
+    value: T,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    apply: impl FnOnce(T, String, String) -> DeltaResult<T>,
+) -> DeltaResult<T> {
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    apply(value, domain, configuration)
+}
+
+fn decode_engine_schema(schema: &EngineSchema) -> DeltaResult<delta_kernel::schema::StructType> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    extract_kernel_schema(&mut visitor_state, schema_id)
+}
+
 /// A handle for a [`CommittedTransaction`].
 ///
 /// Returned by [`update_table_txn_commit`] and [`create_table_txn_commit`]. Carries the committed
@@ -71,14 +110,6 @@ pub struct MutableCommitter;
 
 #[cfg(test)]
 use create_table::{collect_create_table_columns, create_table_txn_builder_with_data_layout_impl};
-#[cfg(test)]
-pub(crate) use update_table::transaction;
-#[cfg(all(test, feature = "delta-kernel-unity-catalog"))]
-use update_table::transaction_with_committer;
-#[cfg(test)]
-use update_table::{
-    set_data_change, with_domain_metadata_removed, with_engine_info, with_operation,
-};
 
 #[cfg(test)]
 mod tests {
@@ -106,8 +137,8 @@ mod tests {
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
-        assert_extern_result_error_with_message, build_snapshot, engine_handle_for_store,
-        ok_or_panic, recover_bytes, recover_error, recover_string,
+        assert_extern_result_error_with_message, build_snapshot, build_update_table_txn,
+        engine_handle_for_store, ok_or_panic, recover_bytes, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
@@ -229,6 +260,41 @@ mod tests {
         unsafe { KernelStringSlice::new_unsafe(value) }
     }
 
+    unsafe fn build_update_transaction(
+        path: &str,
+        engine: &Handle<SharedExternEngine>,
+        data_change: bool,
+        engine_info: Option<&str>,
+        operation: Option<KernelUpdateTableOperation>,
+    ) -> Handle<ExclusiveUpdateTableTransaction> {
+        let snapshot = unsafe { build_snapshot(ffi_str(path), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        unsafe { free_snapshot(snapshot) };
+        let builder = unsafe { update_table_txn_builder_with_data_change(builder, data_change) };
+        let builder = match engine_info {
+            Some(engine_info) => unsafe {
+                ok_or_panic(update_table_txn_builder_with_engine_info(
+                    builder,
+                    ffi_str(engine_info),
+                    engine.shallow_copy(),
+                ))
+            },
+            None => builder,
+        };
+        let builder = match operation {
+            Some(operation) => unsafe {
+                update_table_txn_builder_with_operation(builder, operation)
+            },
+            None => builder,
+        };
+        unsafe {
+            ok_or_panic(update_table_txn_builder_build(
+                builder,
+                engine.shallow_copy(),
+            ))
+        }
+    }
+
     fn create_file_metadata(
         path: &str,
         file_size_bytes: u64,
@@ -322,32 +388,14 @@ mod tests {
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
 
-            // Start the transaction
-            let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-            });
-            unsafe { set_data_change(txn.shallow_copy(), false) };
-
-            // Add engine info
-            let engine_info = "default_engine";
-            let engine_info_kernel_string = kernel_string_slice!(engine_info);
             let txn = unsafe {
-                ok_or_panic(with_engine_info(
-                    txn,
-                    engine_info_kernel_string,
-                    engine.shallow_copy(),
-                ))
-            };
-
-            // Add the operation
-            let operation = "WRITE";
-            let operation_kernel_string = kernel_string_slice!(operation);
-            let txn = unsafe {
-                ok_or_panic(with_operation(
-                    txn,
-                    operation_kernel_string,
-                    engine.shallow_copy(),
-                ))
+                build_update_transaction(
+                    table_path_str,
+                    &engine,
+                    false,
+                    Some("default_engine"),
+                    Some(KernelUpdateTableOperation::Write),
+                )
             };
 
             let write_context = ok_or_panic(unsafe {
@@ -523,7 +571,7 @@ mod tests {
             let engine = engine_handle_for_store(store);
             let table_url_str = table_url.as_str();
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                build_update_table_txn(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
             let state = ok_or_panic(unsafe {
                 write_context::update_table_txn_write_state(
@@ -775,25 +823,14 @@ mod tests {
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
 
-            let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-            });
-            unsafe { set_data_change(txn.shallow_copy(), true) };
-            let engine_info = "default_engine";
             let txn = unsafe {
-                ok_or_panic(with_engine_info(
-                    txn,
-                    kernel_string_slice!(engine_info),
-                    engine.shallow_copy(),
-                ))
-            };
-            let operation = "WRITE";
-            let txn = unsafe {
-                ok_or_panic(with_operation(
-                    txn,
-                    kernel_string_slice!(operation),
-                    engine.shallow_copy(),
-                ))
+                build_update_transaction(
+                    table_path_str,
+                    &engine,
+                    true,
+                    Some("default_engine"),
+                    Some(KernelUpdateTableOperation::Write),
+                )
             };
 
             // Build the partition values map: part = 100.
@@ -960,7 +997,7 @@ mod tests {
             let table_url_str = table_url.as_str();
             let engine = engine_handle_for_store(store);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                build_update_table_txn(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
 
             // Supplying partition values for a non-partitioned table is an error, and the call
@@ -1012,7 +1049,7 @@ mod tests {
             let table_url_str = table_url.as_str();
             let engine = engine_handle_for_store(store);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                build_update_table_txn(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
 
             let partition_values = partition_value_map_new();
@@ -1070,7 +1107,7 @@ mod tests {
             let table_url_str = table_url.as_str();
             let engine = engine_handle_for_store(store);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+                build_update_table_txn(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
 
             let partition_values = partition_value_map_new();
@@ -1194,10 +1231,7 @@ mod tests {
         let table_path_str = table_url.as_str();
 
         // === Transaction 1: add domain metadata ===
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
 
         let domain = "testDomain";
         let configuration = r#"{"key": "value"}"#;
@@ -1220,14 +1254,20 @@ mod tests {
         assert_eq!(dm["domainMetadata"]["removed"], false);
 
         // === Transaction 2: remove domain metadata ===
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        unsafe { free_snapshot(snapshot) };
+        let builder = unsafe { update_table_txn_builder_with_data_change(builder, false) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_domain_metadata_removed(
+                builder,
+                kernel_string_slice!(domain),
+                engine.shallow_copy(),
+            )
         });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
-
-        let txn = ok_or_panic(unsafe {
-            with_domain_metadata_removed(txn, kernel_string_slice!(domain), engine.shallow_copy())
-        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
 
         let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let version = unsafe { version_and_free(committed) };
@@ -1250,10 +1290,7 @@ mod tests {
 
         // update_table_txn_with_domain_metadata succeeds (validation is lazy), but commit should
         // fail
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
 
         let sys_domain = "delta.system";
         let config = "config";
@@ -1284,7 +1321,7 @@ mod tests {
             setup_domain_metadata_table("test_row_tracking_hwm_feature", false).await?;
         let table_path = table_url.as_str();
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
             update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
@@ -1307,7 +1344,7 @@ mod tests {
             setup_domain_metadata_table("test_row_tracking_hwm_duplicate", true).await?;
         let table_path = table_url.as_str();
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
             update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
@@ -1331,7 +1368,7 @@ mod tests {
             setup_domain_metadata_table("test_row_tracking_hwm", true).await?;
         let table_path = table_url.as_str();
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
             update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
@@ -1361,7 +1398,7 @@ mod tests {
         let table_path = table_url.as_str();
 
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
             update_table_txn_with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
@@ -1370,7 +1407,7 @@ mod tests {
         assert_eq!(unsafe { version_and_free(committed) }, 1);
 
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
         let txn = ok_or_panic(unsafe {
             update_table_txn_with_row_tracking_high_water_mark(txn, 6, engine.shallow_copy())
@@ -1392,7 +1429,7 @@ mod tests {
             setup_domain_metadata_table("test_row_tracking_hwm_with_adds", true).await?;
         let table_path = table_url.as_str();
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
 
         let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
@@ -1426,7 +1463,7 @@ mod tests {
             setup_domain_metadata_table("test_row_tracking_hwm_below_adds", true).await?;
         let table_path = table_url.as_str();
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path), engine.shallow_copy())
         });
 
         let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
@@ -1458,10 +1495,7 @@ mod tests {
         let table_path_str = table_url.as_str();
 
         // Adding the same domain twice should cause commit to fail
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
 
         let dup_domain = "dup";
         let config_a = "a";
@@ -1518,10 +1552,7 @@ mod tests {
         let table_path_str = table_path.to_str().unwrap();
         let engine = get_default_engine(table_path_str);
 
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
 
         let domain = "myDomain";
         let config = "config";
@@ -1631,28 +1662,26 @@ mod tests {
                 ))
             };
 
+            let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+            let builder = unsafe { update_table_txn_builder_with_data_change(builder, false) };
+            let builder = unsafe {
+                ok_or_panic(update_table_txn_builder_with_engine_info(
+                    builder,
+                    ffi_str("uc_test_engine"),
+                    engine.shallow_copy(),
+                ))
+            };
             let txn = ok_or_panic(unsafe {
-                transaction_with_committer(
-                    snapshot.shallow_copy(),
+                update_table_txn_builder_build_with_committer(
+                    builder,
                     engine.shallow_copy(),
                     uc_committer,
                 )
             });
-            unsafe { set_data_change(txn.shallow_copy(), false) };
-
-            let engine_info = "uc_test_engine";
-            let engine_info_kernel_string = kernel_string_slice!(engine_info);
-            let txn_with_engine_info = unsafe {
-                ok_or_panic(with_engine_info(
-                    txn,
-                    engine_info_kernel_string,
-                    engine.shallow_copy(),
-                ))
-            };
 
             let write_context = ok_or_panic(unsafe {
                 update_table_txn_get_unpartitioned_write_context(
-                    txn_with_engine_info.shallow_copy(),
+                    txn.shallow_copy(),
                     engine.shallow_copy(),
                 )
             });
@@ -1669,12 +1698,7 @@ mod tests {
             ])
             .unwrap();
 
-            let parquet_schema = unsafe {
-                txn_with_engine_info
-                    .shallow_copy()
-                    .as_ref()
-                    .add_files_schema()
-            };
+            let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
             let file_info = put_parquet_file(
                 &store,
                 &table_url,
@@ -1688,15 +1712,9 @@ mod tests {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
-            unsafe {
-                update_table_txn_add_files(
-                    txn_with_engine_info.shallow_copy(),
-                    file_info_engine_data,
-                )
-            };
+            unsafe { update_table_txn_add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            let commit_result =
-                unsafe { update_table_txn_commit(txn_with_engine_info, engine.shallow_copy()) };
+            let commit_result = unsafe { update_table_txn_commit(txn, engine.shallow_copy()) };
 
             // UC committer returns success from our mock callback
             let committed = ok_or_panic(commit_result);
@@ -1934,7 +1952,7 @@ mod tests {
             visitor: visit_test_schema,
         };
         let builder = ok_or_panic(unsafe {
-            get_create_table_txn_builder(
+            new_create_table_txn_builder(
                 kernel_string_slice!(table_path),
                 &schema_arg,
                 kernel_string_slice!(engine_info),
@@ -2044,7 +2062,7 @@ mod tests {
             visitor: visit_single_geometry_field_schema,
         };
         let builder = ok_or_panic(unsafe {
-            get_create_table_txn_builder(
+            new_create_table_txn_builder(
                 kernel_string_slice!(table_path),
                 &schema_arg,
                 kernel_string_slice!(engine_info),
@@ -2223,7 +2241,7 @@ mod tests {
             setup_domain_metadata_table("test_update_builder_setters", false).await?;
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
-        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
 
         let parameter_entries = [FfiStringMapEntry {
             key: ffi_str("key"),
@@ -2386,7 +2404,7 @@ mod tests {
             setup_domain_metadata_table("test_update_builder_empty_parameter", false).await?;
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
-        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
         let entries = [FfiStringMapEntry {
             key: ffi_str(""),
             value: ffi_str("value"),
@@ -2427,12 +2445,12 @@ mod tests {
             KernelUpdateTableOperation::Merge,
             KernelUpdateTableOperation::Optimize,
         ] {
-            let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+            let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
             let builder = unsafe { update_table_txn_builder_with_operation(builder, operation) };
             unsafe { free_update_table_txn_builder(builder) };
         }
 
-        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
         let builder = ok_or_panic(unsafe {
             update_table_txn_builder_with_domain_metadata_removed(
                 builder,
@@ -2442,7 +2460,7 @@ mod tests {
         });
         unsafe { free_update_table_txn_builder(builder) };
 
-        let builder = unsafe { get_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
         let builder = unsafe { update_table_txn_builder_with_data_change(builder, true) };
         let builder = unsafe { update_table_txn_builder_with_blind_append(builder) };
         let committer: Box<dyn Committer> = Box::new(FileSystemCommitter::new());
@@ -2509,7 +2527,7 @@ mod tests {
         let table_path = table_url.to_string();
         let table_path_str = table_path.as_str();
         let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            build_update_table_txn(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
 
         let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
@@ -2837,18 +2855,9 @@ mod tests {
         let (table_path, engine) = create_table_with_one_file(&store, &table_url).await?;
 
         // Blind no-op commit on top of v1 -> v2.
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
-        });
-        unsafe { set_data_change(txn.shallow_copy(), false) };
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
+        let txn = unsafe {
+            build_update_transaction(&table_path, &engine, false, Some("test-engine/1.0"), None)
+        };
 
         let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let v = unsafe { committed_transaction_version(&committed) };
@@ -3145,7 +3154,7 @@ mod tests {
         let snapshot =
             delta_kernel::Snapshot::builder_for(table_url.clone()).build(&kernel_engine)?;
         let snapshot_handle: Handle<SharedSnapshot> = snapshot.into();
-        let mut builder = unsafe { get_update_table_txn_builder(snapshot_handle.shallow_copy()) };
+        let mut builder = unsafe { new_update_table_txn_builder(snapshot_handle.shallow_copy()) };
         builder = unsafe {
             update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::AlterTable)
         };
@@ -3259,7 +3268,7 @@ mod tests {
             visitor: visit_test_schema,
         };
         let builder = ok_or_panic(unsafe {
-            get_create_table_txn_builder(
+            new_create_table_txn_builder(
                 kernel_string_slice!(table_path),
                 &schema_arg,
                 kernel_string_slice!(engine_info),
@@ -3280,17 +3289,9 @@ mod tests {
             ),
         ])?;
 
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
+        let txn = unsafe {
+            build_update_transaction(table_path, &engine, true, Some("test-engine/1.0"), None)
+        };
 
         let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
         let file_info = put_parquet_file(
@@ -3378,17 +3379,9 @@ mod tests {
         let scan_meta = scan_meta_items.into_iter().next().unwrap();
         let (data, sv) = scan_meta.scan_files.into_parts();
 
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
+        let txn = unsafe {
+            build_update_transaction(table_path_str, &engine, true, Some("test-engine/1.0"), None)
+        };
 
         Ok((data, sv, txn, engine, kernel_engine, table_path))
     }
@@ -3530,17 +3523,9 @@ mod tests {
         // === FFI surface under test ===
         let table_path_str = table_url.as_str();
         let engine = engine_handle_for_store(Arc::clone(&store));
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
+        let txn = unsafe {
+            build_update_transaction(table_path_str, &engine, true, Some("test-engine/1.0"), None)
+        };
 
         // Build a descriptor from the connector-authored DV file metadata.
         let dv_url_string = dv_url.to_string();
@@ -3682,7 +3667,7 @@ mod tests {
             let table_root = delta_kernel::try_parse_uri(table_path).unwrap().to_string();
             let engine = get_default_engine(&table_root);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_root), engine.shallow_copy())
+                build_update_table_txn(kernel_string_slice!(table_root), engine.shallow_copy())
             });
             (engine, txn)
         }
