@@ -1083,6 +1083,7 @@ mod test {
     #[rstest]
     #[case::no_constraint(&[], false)]
     #[case::named_constraint(&[("delta.constraints.positive", "amount > 0")], true)]
+    #[case::uppercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")], true)]
     #[case::bare_prefix_key(&[("delta.constraints.", "1 > 0")], false)]
     fn check_constraints_enablement(
         #[case] properties: &[(&str, &str)],

@@ -118,11 +118,12 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
     Some(())
 }
 
-/// Returns the constraint name for a `delta.constraints.<name>` configuration key, or `None`
-/// for any other key (including a bare `delta.constraints.` with an empty name).
+/// Returns the constraint name for a `delta.constraints.<name>` configuration key, or `None` for
+/// any other key (including a bare prefix with an empty name). The prefix is matched
+/// case-insensitively. The name keeps the case it was written with.
 fn strip_constraint_prefix(key: &str) -> Option<&str> {
-    key.strip_prefix(CHECK_CONSTRAINT_PREFIX)
-        .filter(|name| !name.is_empty())
+    let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
+    (prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) && !name.is_empty()).then_some(name)
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`

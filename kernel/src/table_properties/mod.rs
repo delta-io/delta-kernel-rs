@@ -245,7 +245,9 @@ pub struct TableProperties {
     /// same as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
-    /// CHECK constraints declared on the table, keyed by name, value is the raw constraint SQL.
+    /// CHECK constraints declared on the table, keyed by name with the raw constraint SQL as the
+    /// value. The `delta.constraints.` prefix is matched case-insensitively. The name keeps its
+    /// original case.
     pub(crate) check_constraints: HashMap<String, String>,
 
     /// any unrecognized properties are passed through and ignored by the parser
@@ -690,9 +692,10 @@ mod tests {
 
     #[rstest]
     #[case::lowercase_prefix("delta.constraints.c1", Some("c1"))]
-    #[case::uppercase_prefix("DELTA.CONSTRAINTS.c1", None)]
-    #[case::mixed_case_prefix("Delta.Constraints.c1", None)]
+    #[case::uppercase_prefix("DELTA.CONSTRAINTS.c1", Some("c1"))]
+    #[case::mixed_case_prefix("Delta.Constraints.c1", Some("c1"))]
     #[case::name_case_preserved("delta.constraints.MyCheck", Some("MyCheck"))]
+    #[case::uppercase_prefix_preserves_name_case("DELTA.CONSTRAINTS.MyCheck", Some("MyCheck"))]
     #[case::whitespace_name("delta.constraints. ", Some(" "))]
     #[case::bare_prefix_empty_name("delta.constraints.", None)]
     #[case::uppercase_bare_prefix("DELTA.CONSTRAINTS.", None)]
