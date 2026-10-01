@@ -5215,7 +5215,7 @@ fn test_combine_checkpoint_predicates(
     r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
 )]
 // metaData.format.options.k: null
-#[should_panic(expected = "StructArray re-validation failed")]
+#[should_panic(expected = "Found unmasked nulls for non-nullable StructArray field")]
 #[case::metadata_format_options_known_issue(
     "metaData",
     "format.options",
