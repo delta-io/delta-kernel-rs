@@ -610,7 +610,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
@@ -670,7 +670,11 @@ mod tests {
     #[async_trait::async_trait]
     impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for GetOptsCountingStore<T> {
         // ===== The method we instrument: count footer-fetch GETs =====
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
             self.get_opts_count.fetch_add(1, Ordering::SeqCst);
             self.inner.get_opts(location, options).await
         }
@@ -678,7 +682,11 @@ mod tests {
         // ===== Everything else: behavior unchanged, delegate to inner =====
         // Overridden (not inherited) so column-chunk data reads delegate straight to inner and
         // stay off the get_opts counter.
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -687,7 +695,7 @@ mod tests {
             location: &Path,
             payload: PutPayload,
             opts: PutOptions,
-        ) -> Result<PutResult> {
+        ) -> ObjectStoreResult<PutResult> {
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -695,26 +703,34 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
         fn delete_stream(
             &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
             self.inner.delete_stream(locations)
         }
 
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
     }
@@ -756,7 +772,8 @@ mod tests {
             last_modified: 0,
             size: file_size,
         };
-        let data = read_all_rows_helper(file_meta).await.unwrap();
+        let data: delta_kernel::Result<_> = read_all_rows_helper(file_meta).await;
+        let data = data.unwrap();
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
