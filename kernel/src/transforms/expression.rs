@@ -223,6 +223,13 @@ pub trait ExpressionTransform<'a> {
     /// specific transform for each expression variant. Also invoked internally in order to recurse
     /// on the child(ren) of non-leaf expressions.
     fn transform_expr(&mut self, expr: &'a Expression) -> Self::Output<Expression> {
+        self.recurse_into_expr(expr)
+    }
+
+    /// Dispatches to the variant-specific transforms without invoking [`Self::transform_expr`]
+    /// on this node again. Overrides of that method can use this to recurse after handling
+    /// expressions that need replacement with a different variant.
+    fn recurse_into_expr(&mut self, expr: &'a Expression) -> Self::Output<Expression> {
         match expr {
             Expression::Literal(s) => {
                 let child = self.transform_expr_literal(s);

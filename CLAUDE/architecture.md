@@ -55,8 +55,15 @@ start a `Transaction` to write data, or create a checkpoint.
 `Snapshot` -> `ScanBuilder` -> `Scan` -> data
 
 The scan pipeline: log replay (build active file list) -> data skipping (prune files via stats
-and partition values) -> file reading -> physical-to-logical transform (partition values,
-column mapping, schema evolution) -> deletion vector filtering.
+and partition values) -> file reading with optional Parquet predicate pruning -> deletion vector
+filtering by original file row index -> physical-to-logical transform (partition values,
+column mapping, schema evolution).
+
+`Scan::execute()` binds predicate partition references to Add-action values before Parquet
+pushdown, and requests row-index metadata for DV-bearing files. Parquet pushdown is conservative:
+callers must still apply the predicate for exact row-level filtering.
+The built-in Parquet reader normalizes decimal and timestamp bounds using the source Parquet
+scale and time unit. Bounds that cannot be converted safely remain unknown.
 
 **Key modules** (`kernel/src/scan/`): `log_replay.rs` (reconcile Add/Remove into active file
 set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and partition values).
