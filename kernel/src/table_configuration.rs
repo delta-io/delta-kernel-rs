@@ -234,6 +234,21 @@ impl TableConfiguration {
             )
         );
 
+        // Constraint names are case-insensitive, so two that differ only in case are the same
+        // constraint. Reject a corrupt table that declares a case-insensitive duplicate, for both
+        // reads and writes.
+        let check_constraints = &table_config.table_properties.check_constraints;
+        let distinct_constraint_names: HashSet<String> = check_constraints
+            .keys()
+            .map(|name| name.to_lowercase())
+            .collect();
+        require!(
+            distinct_constraint_names.len() == check_constraints.len(),
+            Error::invalid_protocol(
+                "Table declares CHECK constraints whose names differ only in case"
+            )
+        );
+
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
@@ -1029,6 +1044,24 @@ mod test {
             .ensure_operation_supported(Operation::Scan)
             .is_ok();
         assert!(read_supported);
+    }
+
+    #[test]
+    fn try_build_rejects_case_insensitive_duplicate_constraint_names() {
+        let result = MockTableConfigurationBuilder::new()
+            .with_properties([
+                ("delta.constraints.positive", "amount > 0"),
+                ("delta.constraints.POSITIVE", "amount > 1"),
+            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::CheckConstraints])
+                    .build(),
+            )
+            .try_build();
+
+        let is_invalid_protocol = matches!(result, Err(Error::InvalidProtocol(_)));
+        assert!(is_invalid_protocol);
     }
 
     #[test]
