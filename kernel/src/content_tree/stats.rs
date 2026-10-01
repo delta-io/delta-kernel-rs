@@ -821,9 +821,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{AsArray, RecordBatch, StructArray};
     use crate::create_row;
-    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
     use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
@@ -831,6 +829,7 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::DataSkippingNumIndexedCols;
+    use crate::unit_test_utils::assert_batch_matches;
 
     #[rstest]
     #[case(0, 10_000)]
@@ -1924,46 +1923,29 @@ mod tests {
     }
 
     /// Runs the pivot for `table` over a one-row batch whose `stats` column is `stats` (its schema
-    /// is taken from the scalar), returning the resulting `content_stats` struct array (`Err` when
+    /// is taken from the scalar), returning the pivoted batch -- a single
+    /// [`CONTENT_STATS_FIELD_NAME`] column, since the input carries only `stats` (`Err` when
     /// the pivot fails).
-    fn run_pivot(table: &StructType, stats: &Scalar) -> DeltaResult<StructArray> {
+    fn run_pivot(table: &StructType, stats: &Scalar) -> DeltaResult<Box<dyn EngineData>> {
         let input_schema =
             StructType::new_unchecked([StructField::nullable("stats", stats.data_type())]);
         let engine = SyncEngine::new();
         let data =
             create_row(&engine, Arc::new(input_schema.clone()), stats.clone()).expect("create_row");
-        let result = convert_delta_stats_to_amt_stats(
-            &engine,
-            data.as_ref(),
-            "stats",
-            table,
-            &input_schema,
-        )?;
-        Ok(stats_column(result))
+        convert_delta_stats_to_amt_stats(&engine, data.as_ref(), "stats", table, &input_schema)
     }
 
-    /// The AMT [`CONTENT_STATS_FIELD_NAME`] struct column of a batch.
-    fn stats_column(data: Box<dyn EngineData>) -> StructArray {
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)
-            .expect("arrow engine data")
-            .into();
-        batch
-            .column_by_name(CONTENT_STATS_FIELD_NAME)
-            .expect("content_stats column")
-            .as_struct()
-            .clone()
-    }
-
-    /// The expected projected `content_stats` array for `table` given the Delta `stats` shape,
-    /// built from each named leaf's sub-field values and round-tripped through the engine for a
-    /// bulk comparison against the pivot output. The AMT schema is [`projected_stats_schema`]
-    /// for `stats`, so `leaves` must name every surviving leaf; each unlisted sub-field
-    /// defaults to a typed null.
-    fn expected_stats_column(
+    /// The expected pivoted batch for `table` given the Delta `stats` shape: a single
+    /// [`CONTENT_STATS_FIELD_NAME`] column assembled from each named leaf's sub-field values and
+    /// materialized through [`EvaluationHandler::create_many`] for an [`assert_batch_matches`]
+    /// comparison against the pivot output. The AMT schema is [`projected_stats_schema`] for
+    /// `stats`, so `leaves` must name every surviving leaf; each unlisted sub-field defaults to a
+    /// typed null.
+    fn expected_pivot(
         table: &StructType,
         stats: &Scalar,
         leaves: &[(&str, Vec<(&str, Scalar)>)],
-    ) -> StructArray {
+    ) -> Box<dyn EngineData> {
         let DataType::Struct(delta) = stats.data_type() else {
             panic!("stats must be a struct");
         };
@@ -1996,9 +1978,10 @@ mod tests {
         );
         let output_schema =
             StructType::new_unchecked([StructField::nullable(CONTENT_STATS_FIELD_NAME, amt)]);
-        let engine = SyncEngine::new();
-        let data = create_row(&engine, Arc::new(output_schema), content_stats).expect("create_row");
-        stats_column(data)
+        SyncEngine::new()
+            .evaluation_handler()
+            .create_many(Arc::new(output_schema), vec![vec![content_stats]])
+            .expect("create_many")
     }
 
     #[test]
@@ -2061,7 +2044,7 @@ mod tests {
             (NULL_COUNT, struct_scalar(&[("c", 0i64.into())])),
         ]);
         let actual = run_pivot(&table, &stats).expect("pivot ok");
-        let expected = expected_stats_column(
+        let expected = expected_pivot(
             &table,
             &stats,
             &[(
@@ -2073,7 +2056,7 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(actual, expected);
+        assert_batch_matches(actual, expected);
     }
 
     /// Round-trips the flat two-column table. `tight_input` is the file's `tightBounds` (`None`
@@ -2130,8 +2113,8 @@ mod tests {
                 (UPPER_BOUND, "zzz".into()),
             ]);
         }
-        let expected = expected_stats_column(&table, &stats, &[("id", id), ("name", name)]);
-        assert_eq!(actual, expected);
+        let expected = expected_pivot(&table, &stats, &[("id", id), ("name", name)]);
+        assert_batch_matches(actual, expected);
     }
 
     #[test]
@@ -2156,7 +2139,7 @@ mod tests {
             (NULL_COUNT, nest(1i64.into())),
         ]);
         let actual = run_pivot(&table, &stats).expect("pivot ok");
-        let expected = expected_stats_column(
+        let expected = expected_pivot(
             &table,
             &stats,
             &[(
@@ -2170,7 +2153,7 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(actual, expected);
+        assert_batch_matches(actual, expected);
     }
 
     #[test]
@@ -2189,7 +2172,7 @@ mod tests {
             ),
         ]);
         let actual = run_pivot(&table, &stats).expect("variant table must not be dropped");
-        let expected = expected_stats_column(
+        let expected = expected_pivot(
             &table,
             &stats,
             &[
@@ -2203,7 +2186,7 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(actual, expected);
+        assert_batch_matches(actual, expected);
     }
 
     #[test]
