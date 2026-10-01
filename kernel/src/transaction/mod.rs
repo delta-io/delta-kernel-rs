@@ -878,16 +878,30 @@ impl<S> Transaction<S> {
     /// connector has not acknowledged filling them.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn ensure_concurrent_identity_columns_acknowledged(&self) -> DeltaResult<()> {
+        let has_concurrent_identity_column =
+            !crate::schema::try_collect_concurrent_identity_columns(
+                self.effective_table_config.logical_schema_ref(),
+            )?
+            .is_empty();
+        if !has_concurrent_identity_column {
+            return Ok(());
+        }
+        // A CIC column may only exist on a table that enabled the feature.
         require!(
-            self.concurrent_identity_columns_acknowledged
-                || crate::schema::try_collect_concurrent_identity_columns(
-                    self.effective_table_config.logical_schema_ref()
-                )?
-                .is_empty(),
+            self.effective_table_config
+                .is_feature_enabled(&TableFeature::ConcurrentIdentityColumns),
+            Error::invalid_transaction_state(
+                "Table contains Concurrent Identity Columns but the concurrentIdentityColumns \
+                 feature is not enabled."
+            )
+        );
+        // The connector generates and fills CIC values itself, so it must acknowledge
+        // responsibility before kernel produces write state.
+        require!(
+            self.concurrent_identity_columns_acknowledged,
             Error::invalid_transaction_state(
                 "Writing data to a table with Concurrent Identity Columns requires calling \
-                 Transaction::ack_concurrent_identity_columns() first (the connector generates and \
-                 fills the identity values itself)",
+                 Transaction::ack_concurrent_identity_columns() first.",
             )
         );
         Ok(())
