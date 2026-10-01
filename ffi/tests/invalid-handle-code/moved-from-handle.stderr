@@ -8,7 +8,7 @@ error[E0382]: use of moved value: `h`
 13 |     let _ = unsafe { h.into_inner() };
    |                      ^ value used here after move
    |
-note: `delta_kernel_ffi::handle::Handle::<H>::drop_handle` takes ownership of the receiver `self`, which moves `h`
+note: `Handle::<H>::drop_handle` takes ownership of the receiver `self`, which moves `h`
   --> src/handle.rs
    |
    |         pub unsafe fn drop_handle(self) {
@@ -25,7 +25,7 @@ error[E0382]: borrow of moved value: `h`
 14 |     let _ = unsafe { h.as_mut() };
    |                      ^ value borrowed here after move
    |
-note: `delta_kernel_ffi::handle::Handle::<H>::into_inner` takes ownership of the receiver `self`, which moves `h`
+note: `Handle::<H>::into_inner` takes ownership of the receiver `self`, which moves `h`
   --> src/handle.rs
    |
    |         pub unsafe fn into_inner(self) -> H::From {
