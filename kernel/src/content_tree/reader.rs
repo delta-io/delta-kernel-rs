@@ -21,7 +21,9 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, MODIFICATION_TIME_NAME,
     PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
+use crate::schema::{
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, ToSchema as _,
+};
 use crate::{Engine, KernelError, KernelResult};
 
 /// Values the read path emits into every `Add` action but cannot derive from an AMT entry, so the
@@ -35,6 +37,28 @@ pub(crate) struct ReadContext {
     pub(crate) modification_time: i64,
     /// Emitted as `Add.dataChange`.
     pub(crate) data_change: bool,
+}
+
+/// Caller-supplied expressions for the two `Add` fields the read path derives from an entry's
+/// `tracking` sub-struct. The root path ([`AddFieldSources::root`]) reads the entry columns
+/// directly; other callers (e.g. a leaf manifest applying inheritance) can substitute their own
+/// expressions without the root path having to know about them.
+struct AddFieldSources {
+    /// Expression producing `Add.baseRowId`.
+    base_row_id: Expression,
+    /// Expression producing `Add.defaultRowCommitVersion`.
+    default_row_commit_version: Expression,
+}
+
+impl AddFieldSources {
+    /// Root-manifest sources: read `tracking.firstRowId` / `tracking.sequenceNumber` straight off
+    /// the entry (a root entry carries both).
+    fn root() -> Self {
+        Self {
+            base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
+            default_row_commit_version: Expression::column([TRACKING, SEQUENCE_NUMBER]),
+        }
+    }
 }
 
 /// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
@@ -67,13 +91,36 @@ pub(crate) fn convert_root_entries_to_add_actions(
     entries: &dyn EngineData,
     ctx: &ReadContext,
 ) -> KernelResult<FilteredEngineData> {
+    convert_entries_with(
+        engine,
+        entries,
+        ctx,
+        &AddFieldSources::root(),
+        Arc::new(ContentTreeNodeEntry::to_schema()),
+    )
+}
+
+// === Helpers ===
+
+/// Shared body of the read path: build the entry->`Add` transform (with the caller's
+/// [`AddFieldSources`]), evaluate it over `entries`, and pair the result with the live-`Data`
+/// selection vector.
+///
+/// `input_schema` is the schema the transform evaluates against -- the entry schema for a root
+/// batch, or an augmented schema when a caller appends helper columns.
+fn convert_entries_with(
+    engine: &dyn Engine,
+    entries: &dyn EngineData,
+    ctx: &ReadContext,
+    sources: &AddFieldSources,
+    input_schema: SchemaRef,
+) -> KernelResult<FilteredEngineData> {
     // TODO(#2866): cache the expression/evaluator so repeated calls don't rebuild them.
     let mut selector = AddSelectionVisitor::default();
     selector.visit_rows_of(entries)?;
 
-    let input_schema = Arc::new(ContentTreeNodeEntry::to_schema());
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
-    let expr = build_entry_to_add_expression(ctx)?;
+    let expr = build_entry_to_add_expression(ctx, sources)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         input_schema,
         Arc::new(expr),
@@ -83,14 +130,16 @@ pub(crate) fn convert_root_entries_to_add_actions(
     FilteredEngineData::try_new(actions, selector.selection)
 }
 
-// === Helpers ===
-
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
 /// [`crate::actions::LOG_ADD_SCHEMA`].
 ///
-/// `modificationTime` and `dataChange` have no AMT source and are taken from `ctx`; nullable fields
-/// not listed here fall through to a typed null via [`struct_expr_from_schema`].
-fn build_entry_to_add_expression(ctx: &ReadContext) -> KernelResult<Expression> {
+/// `modificationTime` and `dataChange` have no AMT source and are taken from `ctx`; `baseRowId` and
+/// `defaultRowCommitVersion` are taken from `sources` (so a caller can apply inheritance); nullable
+/// fields not listed here fall through to a typed null via [`struct_expr_from_schema`].
+fn build_entry_to_add_expression(
+    ctx: &ReadContext,
+    sources: &AddFieldSources,
+) -> KernelResult<Expression> {
     // TODO(#3320): read partition values from the entry's `partition` tuple once the read path
     // carries a partition spec; the AMT root written by the minimal blind-append path is
     // unpartitioned. The map type is taken from the action schema so its value-nullability
@@ -117,10 +166,8 @@ fn build_entry_to_add_expression(ctx: &ReadContext) -> KernelResult<Expression> 
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
             n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
-            n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
-            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
-                Expression::column([TRACKING, SEQUENCE_NUMBER])
-            }
+            n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
+            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
             _ => return None,
         })
     })?;
