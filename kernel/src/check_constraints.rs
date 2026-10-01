@@ -120,8 +120,9 @@ impl Deref for CheckConstraints {
 pub(crate) enum CheckConstraintOperation {
     /// Add a constraint. The name is stored lowercased.
     Add { name: String, raw_sql: String },
-    /// Drop a constraint, matching its name case-insensitively.
-    Drop { name: String },
+    /// Drop a constraint, matching its name case-insensitively. With `if_exists`, a missing
+    /// constraint is skipped instead of rejected.
+    Drop { name: String, if_exists: bool },
 }
 
 /// Applies `operations` in order to `table_config`'s metadata and returns the validated
@@ -158,11 +159,16 @@ pub(crate) fn apply_check_constraint_operations(
                 metadata
                     .with_configuration_entry(format!("{CHECK_CONSTRAINT_PREFIX}{name}"), raw_sql)
             }
-            CheckConstraintOperation::Drop { name } => {
-                let key = find_constraint_key(&metadata, &name).ok_or_else(|| {
-                    Error::generic(format!("CHECK constraint '{name}' does not exist"))
-                })?;
-                metadata.without_configuration_entry(&key)
+            CheckConstraintOperation::Drop { name, if_exists } => {
+                match find_constraint_key(&metadata, &name) {
+                    Some(key) => metadata.without_configuration_entry(&key),
+                    None if if_exists => metadata,
+                    None => {
+                        return Err(Error::generic(format!(
+                            "CHECK constraint '{name}' does not exist"
+                        )))
+                    }
+                }
             }
         };
     }
@@ -375,6 +381,7 @@ mod tests {
 
         let drop = CheckConstraintOperation::Drop {
             name: "\u{c4}".to_string(),
+            if_exists: false,
         };
         let dropped = apply_check_constraint_operations(&table_config, vec![drop]).unwrap();
         let remaining = dropped.check_constraints();

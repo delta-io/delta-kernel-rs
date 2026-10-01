@@ -181,7 +181,27 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         name: impl Into<String>,
     ) -> AlterTableTransactionBuilder<Modifying> {
         self.check_constraint_operations
-            .push(CheckConstraintOperation::Drop { name: name.into() });
+            .push(CheckConstraintOperation::Drop {
+                name: name.into(),
+                if_exists: false,
+            });
+        self.transition()
+    }
+
+    /// Drop the CHECK constraint whose name matches `name` case-insensitively, if it exists.
+    /// Behaves like [`drop_check_constraint`](Self::drop_check_constraint), except that a missing
+    /// constraint is not an error. If the constraint is missing, the op is a no-op but still
+    /// generates a commit.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn drop_check_constraint_if_exists(
+        mut self,
+        name: impl Into<String>,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.check_constraint_operations
+            .push(CheckConstraintOperation::Drop {
+                name: name.into(),
+                if_exists: true,
+            });
         self.transition()
     }
 

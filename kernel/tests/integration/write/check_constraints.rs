@@ -524,6 +524,7 @@ async fn alter_table_rejects_invalid_constraint_addition(
 #[tokio::test]
 async fn alter_table_drops_constraint_without_acknowledgement(
     #[case] name: &str,
+    #[values(false, true)] if_exists: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
@@ -533,9 +534,13 @@ async fn alter_table_drops_constraint_without_acknowledgement(
     )?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let altered = snapshot
-        .alter_table()
-        .drop_check_constraint(name)
+    let builder = snapshot.alter_table();
+    let builder = if if_exists {
+        builder.drop_check_constraint_if_exists(name)
+    } else {
+        builder.drop_check_constraint(name)
+    };
+    let altered = builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -545,9 +550,13 @@ async fn alter_table_drops_constraint_without_acknowledgement(
     Ok(())
 }
 
+#[rstest]
+#[case::rejected_without_if_exists(false)]
+#[case::skipped_with_if_exists(true)]
 #[tokio::test]
-async fn alter_table_rejects_dropping_missing_constraint() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn alter_table_drop_of_missing_constraint(
+    #[case] if_exists: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
         engine.as_ref(),
@@ -556,11 +565,27 @@ async fn alter_table_rejects_dropping_missing_constraint() -> Result<(), Box<dyn
     )?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let result = snapshot
-        .alter_table()
-        .drop_check_constraint("missing")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
-    let rejected = matches!(result, Err(Error::Generic(_)));
-    assert!(rejected);
+    let builder = snapshot.alter_table();
+    let result = if if_exists {
+        builder.drop_check_constraint_if_exists("missing")
+    } else {
+        builder.drop_check_constraint("missing")
+    }
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if !if_exists {
+        let rejected = matches!(result, Err(Error::Generic(_)));
+        assert!(rejected);
+        return Ok(());
+    }
+    let altered = result?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let discovered: Vec<_> = altered
+        .check_constraints()
+        .iter()
+        .map(|c| c.raw_sql().to_string())
+        .collect();
+    assert_eq!(discovered, ["amount > 0".to_string()]);
     Ok(())
 }
