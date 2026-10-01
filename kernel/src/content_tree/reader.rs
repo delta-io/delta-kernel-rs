@@ -409,6 +409,7 @@ mod tests {
     #[rstest]
     #[case(TrackingStatus::Existing, true)]
     #[case(TrackingStatus::Added, true)]
+    #[case(TrackingStatus::Modified, true)]
     #[case(TrackingStatus::Deleted, false)]
     #[case(TrackingStatus::Replaced, false)]
     fn selects_only_live_data_entries(#[case] status: TrackingStatus, #[case] kept: bool) {
@@ -427,14 +428,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case::deletion_vector_struct(true, false)]
-    #[case::dv_snapshot_id(false, true)]
+    #[case::added_dv_struct(TrackingStatus::Added, true, false)]
+    #[case::added_dv_snapshot_id(TrackingStatus::Added, false, true)]
+    #[case::modified_dv_struct(TrackingStatus::Modified, true, false)]
     fn live_entry_with_deletion_vector_errors(
+        #[case] status: TrackingStatus,
         #[case] set_deletion_vector: bool,
         #[case] set_dv_snapshot_id: bool,
     ) {
         let engine = SyncEngine::new();
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
         if set_deletion_vector {
             entry.deletion_vector = Some(DeletionVectorInfo {
                 location: "dv.bin".to_string(),

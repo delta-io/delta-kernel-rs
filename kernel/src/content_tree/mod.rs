@@ -114,7 +114,8 @@ pub struct TrackingInfo {
     pub snapshot_id: Option<i64>,
 
     /// Snapshot ID in which this entry's deletion vector last changed. May predate this entry's
-    /// own snapshot for a carried-forward entry, so it can be set on any live status.
+    /// own snapshot for a carried-forward entry, so it can be set on any live status, not just
+    /// `Modified`.
     #[field_id = 5]
     pub(crate) dv_snapshot_id: Option<i64>,
 
@@ -298,6 +299,7 @@ pub enum TrackingStatus {
     Added = 1,
     Deleted = 2,
     Replaced = 3,
+    Modified = 4,
 }
 
 impl TrackingStatus {
@@ -308,16 +310,17 @@ impl TrackingStatus {
             1 => Ok(Self::Added),
             2 => Ok(Self::Deleted),
             3 => Ok(Self::Replaced),
+            4 => Ok(Self::Modified),
             other => Err(Error::generic(format!(
                 "Invalid AMT tracking status value: {other}"
             ))),
         }
     }
 
-    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`) are
-    /// surfaced as `Add` actions; not-live entries (`Deleted`, `Replaced`) are not.
+    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`,
+    /// `Modified`) are surfaced as `Add` actions; not-live entries (`Deleted`, `Replaced`) are not.
     pub(crate) fn is_live(self) -> bool {
-        self == Self::Existing || self == Self::Added
+        self == Self::Existing || self == Self::Added || self == Self::Modified
     }
 }
 
@@ -433,6 +436,7 @@ mod tests {
     #[case(1, TrackingStatus::Added)]
     #[case(2, TrackingStatus::Deleted)]
     #[case(3, TrackingStatus::Replaced)]
+    #[case(4, TrackingStatus::Modified)]
     fn tracking_status_try_from_repr_roundtrips(
         #[case] repr: i32,
         #[case] expected: TrackingStatus,
@@ -442,7 +446,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4)]
     #[case(5)]
     #[case(-1)]
     #[case(i32::MAX)]
