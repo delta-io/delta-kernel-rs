@@ -1130,24 +1130,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.column_defaults_acknowledged = true;
     }
 
-    /// Acknowledges that the connector enforces this table's CHECK constraints. Kernel never sees
-    /// row data, so it does not evaluate constraints: acknowledging without actually enforcing them
-    /// lets constraint-violating rows reach the table.
-    ///
-    /// Discover the constraints via [`TableWriteExpressions::check_constraints`] and enforce each
-    /// one's [`raw_sql`](crate::check_constraints::CheckConstraint::raw_sql). Every row written
-    /// must satisfy every constraint. When a commit introduces a constraint on a table that
-    /// already holds data, the connector must also verify that every existing row satisfies it
-    /// before committing.
-    ///
-    /// Without this acknowledgement on a constrained table, [`write_state`](Self::write_state)
-    /// fails, and [`commit`](Self::commit) fails whenever the commit adds data files or introduces
-    /// a constraint.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn ack_check_constraints(&mut self) {
-        self.check_constraints_acknowledged = true;
-    }
-
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -1298,6 +1280,24 @@ impl<S: SupportsDataFiles> Transaction<S> {
 // Internal methods available on ALL transaction types (used by commit path)
 // =============================================================================
 impl<S> Transaction<S> {
+    /// Acknowledges that the connector enforces this table's CHECK constraints. Kernel never sees
+    /// row data, so it does not evaluate constraints: acknowledging without actually enforcing them
+    /// lets constraint-violating rows reach the table.
+    ///
+    /// Discover the constraints via [`TableWriteExpressions::check_constraints`] and enforce each
+    /// one's [`raw_sql`](crate::check_constraints::CheckConstraint::raw_sql). Every row written
+    /// must satisfy every constraint. When a commit introduces a constraint on a table that
+    /// already holds data, the connector must also verify that every existing row satisfies it
+    /// before committing.
+    ///
+    /// Without this acknowledgement on a constrained table,
+    /// [`write_state`](Transaction::write_state) fails, and [`commit`](Self::commit) fails
+    /// whenever the commit adds data files or introduces a constraint.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn ack_check_constraints(&mut self) {
+        self.check_constraints_acknowledged = true;
+    }
+
     /// Validate that add files carry the per-file statistics required by the table's protocol.
     ///
     /// Currently checks two protocol requirements:
