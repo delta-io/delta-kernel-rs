@@ -66,6 +66,10 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     }
 }
 
+/// Builds one side of [`StatsOutputSchemas`] for explicitly selected columns.
+///
+/// Logical and physical output schemas both use this path so they follow the canonical stats
+/// selection rules and omit table-column metadata.
 fn build_stats_schema_for_columns(
     data_schema: &StructType,
     selected_columns: &[ColumnName],
@@ -311,6 +315,11 @@ impl TableConfiguration {
     }
 
     /// Builds the structured statistics schemas for all indexed and extra-indexed columns.
+    ///
+    /// Scan construction and
+    /// [`ScanBuilder::stats_output_schemas`](crate::scan::ScanBuilder::stats_output_schemas) use
+    /// this for `all_struct` requests. It resolves the configured stats columns before building
+    /// matching logical and physical output schemas.
     pub(crate) fn build_indexed_stats_output_schemas(
         &self,
         extra_indexed_columns: &[ColumnName],
@@ -360,6 +369,11 @@ impl TableConfiguration {
     }
 
     /// Builds the structured statistics schemas for explicitly selected logical columns.
+    ///
+    /// Scan construction and
+    /// [`ScanBuilder::stats_output_schemas`](crate::scan::ScanBuilder::stats_output_schemas) use
+    /// this for `struct_columns` requests. It resolves physical names and builds both schemas with
+    /// the same shape.
     pub(crate) fn build_selected_stats_output_schemas(
         &self,
         logical_columns: &[ColumnName],

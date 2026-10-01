@@ -18,6 +18,9 @@ use crate::{DeltaResult, KernelError, PredicateRef, StructField};
 
 /// Resolved physical statistics schemas for a scan.
 ///
+/// [`ScanBuilder::build`](crate::scan::ScanBuilder::build) creates this as part of [`StateInfo`].
+/// Log replay reads and parses `read`; its final metadata projection emits `output`.
+///
 /// `read` contains consumer-requested stats and any additional stats needed by the skipping
 /// predicate. `output` excludes predicate-only fields. For example, when the consumer requests
 /// `name` stats and the predicate is `id > 400`, `read` contains `id` and `name`, while `output`
@@ -43,7 +46,7 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
-    /// Physical statistics schemas used internally and exposed to the scan consumer.
+    /// Physical statistics schemas resolved while building the scan.
     pub(crate) physical_stats_schemas: Option<ResolvedPhysicalStatsSchemas>,
     /// Physical partition schema with native types for `partitionValues_parsed`. Fields use
     /// physical column names (for column mapping) and are always nullable. Present when the

@@ -79,6 +79,10 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
+/// [`ScanBuilder::stats_output_schemas`] returns this before the scan is built. Connectors use the
+/// logical schema for table-facing names and the physical schema to interpret `stats_parsed` in
+/// scan metadata.
+///
 /// The schemas have the same shape and field order. They differ only in table column names when
 /// column mapping is enabled. Field metadata is removed from both schemas.
 #[derive(Debug, Clone)]

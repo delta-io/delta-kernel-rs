@@ -73,7 +73,7 @@ struct InternalScanState {
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
-    /// Physical statistics schemas used internally and exposed to the scan consumer.
+    /// Physical statistics schemas restored when a parallel worker reconstructs log replay.
     #[serde(default)]
     physical_stats_schemas: Option<ResolvedPhysicalStatsSchemas>,
     #[serde(default)]
@@ -166,7 +166,10 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
-    /// Narrows `stats_parsed` to the fields requested by the scan consumer.
+    /// Final metadata projection built when log replay starts.
+    ///
+    /// Batch processing applies it after data skipping and deduplication, so predicate-only fields
+    /// remain available internally but are absent from returned `ScanMetadata`.
     stats_output_projection: Option<Arc<dyn ExpressionEvaluator>>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
@@ -849,7 +852,11 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
-/// Builds a projection when the internal stats schema differs from the consumer-facing schema.
+/// Builds the final `stats_parsed` projection for log replay.
+///
+/// [`ScanLogReplayProcessor::new_with_seen_files`] calls this after its commit and checkpoint
+/// transforms have established the internal metadata schema. It returns no evaluator when that
+/// schema already matches the consumer-facing schema.
 fn build_stats_output_projection(
     engine: &dyn Engine,
     input_schema: SchemaRef,
