@@ -266,98 +266,72 @@ fn is_file_not_found_error(error: &Error) -> bool {
 
 fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
     let actual = error_without_backtrace(actual);
-    match expected.error_code.as_str() {
-        "DELTA_STATE_RECOVER_ERROR" => {
-            matches!(
-                actual,
-                Error::MissingMetadata | Error::MissingProtocol | Error::MissingMetadataAndProtocol
-            ) || matches!(
-                actual,
-                Error::InvalidCheckpoint(message)
-                    if message == "Had a _last_checkpoint hint but didn't find any checkpoints"
-            )
+    match (expected.error_code.as_str(), actual) {
+        (
+            "DELTA_STATE_RECOVER_ERROR",
+            Error::MissingMetadata | Error::MissingProtocol | Error::MissingMetadataAndProtocol,
+        ) => true,
+        ("DELTA_STATE_RECOVER_ERROR", Error::InvalidCheckpoint(message)) => {
+            message == "Had a _last_checkpoint hint but didn't find any checkpoints"
         }
-        "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG" => matches!(
-            actual,
-            Error::EmptyLog | Error::MissingVersion(_) | Error::FileNotFound(_)
-        ),
-        "DELTA_LOG_FILE_NOT_FOUND" => {
-            matches!(actual, Error::FileNotFound(_))
-                || matches!(actual, Error::Generic(message) if message == "Only non-negative snapshot versions are supported")
+        (
+            "DELTA_TABLE_NOT_FOUND"
+            | "DELTA_MISSING_TRANSACTION_LOG"
+            | "DELTA_TRUNCATED_TRANSACTION_LOG",
+            Error::EmptyLog | Error::MissingVersion(_) | Error::FileNotFound(_),
+        ) => true,
+        ("DELTA_LOG_FILE_NOT_FOUND", Error::FileNotFound(_)) => true,
+        (
+            "DELTA_LOG_FILE_NOT_FOUND" | "DELTA_TABLE_RESTORE_VERSION_INVALID",
+            Error::Generic(message),
+        ) => message == "Only non-negative snapshot versions are supported",
+        (
+            "DELTA_VERSIONS_NOT_CONTIGUOUS" | "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
+            Error::LogTailVersionsNotContiguous { .. } | Error::MissingVersion(_),
+        ) => true,
+        ("ColumnMappingUnsupportedException", Error::InvalidColumnMappingMode(_)) => true,
+        ("COLUMN_ALREADY_EXISTS", Error::Schema(message)) => {
+            message.starts_with("Duplicate field name (case-insensitive):")
         }
-        "DELTA_TRUNCATED_TRANSACTION_LOG" => {
-            matches!(
-                actual,
-                Error::EmptyLog | Error::MissingVersion(_) | Error::FileNotFound(_)
-            )
+        ("COLUMN_ALREADY_EXISTS", Error::MalformedJson(error)) => error
+            .to_string()
+            .starts_with("Schema error: Duplicate field name (case-insensitive):"),
+        ("UNRESOLVED_COLUMN", Error::Generic(message)) => {
+            message.starts_with("Cannot determine types for: Identifier(")
         }
-        "DELTA_VERSIONS_NOT_CONTIGUOUS" | "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC" => matches!(
-            actual,
-            Error::LogTailVersionsNotContiguous { .. } | Error::MissingVersion(_)
-        ),
-        "ColumnMappingUnsupportedException" => {
-            matches!(actual, Error::InvalidColumnMappingMode(_))
+        ("FIELD_NOT_FOUND", Error::Generic(message)) => {
+            message.starts_with("Cannot determine types for: CompoundIdentifier(")
         }
-        "COLUMN_ALREADY_EXISTS" => {
-            matches!(
-                actual,
-                Error::Schema(message)
-                    if message.starts_with("Duplicate field name (case-insensitive):")
-            ) || matches!(
-                actual,
-                Error::MalformedJson(error)
-                    if error
-                        .to_string()
-                        .starts_with("Schema error: Duplicate field name (case-insensitive):")
-            )
+        ("DELTA_VERSION_NOT_FOUND", Error::MissingVersion(_) | Error::EmptyLog) => true,
+        ("DELTA_INVALID_PROTOCOL_VERSION", Error::Unsupported(message)) => {
+            message.starts_with("Unsupported minimum reader version ")
         }
-        "UNRESOLVED_COLUMN" => matches!(
-            actual,
-            Error::Generic(message)
-                if message.starts_with("Cannot determine types for: Identifier(")
-        ),
-        "FIELD_NOT_FOUND" => matches!(
-            actual,
-            Error::Generic(message)
-                if message.starts_with("Cannot determine types for: CompoundIdentifier(")
-        ),
-        "DELTA_VERSION_NOT_FOUND" => {
-            matches!(actual, Error::MissingVersion(_) | Error::EmptyLog)
+        ("DELTA_INVALID_PROTOCOL_VERSION", Error::InvalidProtocol(message)) => {
+            message.contains("min_reader_version")
         }
-        "DELTA_TABLE_RESTORE_VERSION_INVALID" => matches!(
-            actual,
-            Error::Generic(message)
-                if message == "Only non-negative snapshot versions are supported"
-        ),
-        "DELTA_INVALID_PROTOCOL_VERSION" => {
-            matches!(actual, Error::Unsupported(message) if message.starts_with("Unsupported minimum reader version "))
-                || matches!(actual, Error::InvalidProtocol(message) if message.contains("min_reader_version"))
+        ("DELTA_UNSUPPORTED_READER_VERSION", Error::InvalidProtocol(message)) => {
+            message == "Writer features must be present when minimum writer version = 7"
         }
-        "DELTA_UNSUPPORTED_READER_VERSION" => matches!(
-            actual,
-            Error::InvalidProtocol(message)
-                if message == "Writer features must be present when minimum writer version = 7"
-        ),
-        "DELTA_UNSUPPORTED_FEATURES_FOR_READ" => {
-            matches!(actual, Error::Unsupported(message) if message.contains(" is not supported"))
+        ("DELTA_UNSUPPORTED_FEATURES_FOR_READ", Error::Unsupported(message)) => {
+            message.contains(" is not supported")
         }
-        "DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH" => {
-            matches!(
-                actual,
-                Error::InvalidProtocol(message)
-                    if message.starts_with(
-                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
-                    )
-            ) || matches!(actual, Error::Unsupported(message) if message.contains(" requires "))
+        ("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH", Error::InvalidProtocol(message)) => message
+            .starts_with(
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+        ("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH", Error::Unsupported(message)) => {
+            message.contains(" requires ")
         }
-        "DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION" | "DELTA_TIMESTAMP_GREATER_THAN_COMMIT" => {
-            matches!(actual, Error::LogHistory(_))
-        }
-        "FAILED_READ_FILE.DBR_FILE_NOT_EXIST" => is_file_not_found_error(actual),
-        "FAILED_READ_FILE.NO_HINT" => {
-            is_file_not_found_error(actual)
-                || matches!(actual, Error::DeletionVector(_))
-                || matches!(actual, Error::InternalError(message) if message.starts_with("Unsupported deletion vector format option:"))
+        (
+            "DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION"
+            | "DELTA_TIMESTAMP_GREATER_THAN_COMMIT",
+            Error::LogHistory(_),
+        ) => true,
+        ("FAILED_READ_FILE.DBR_FILE_NOT_EXIST", error) => is_file_not_found_error(error),
+        ("FAILED_READ_FILE.NO_HINT", error) if is_file_not_found_error(error) => true,
+        ("FAILED_READ_FILE.NO_HINT", Error::DeletionVector(_)) => true,
+        ("FAILED_READ_FILE.NO_HINT", Error::InternalError(message)) => {
+            message.starts_with("Unsupported deletion vector format option:")
         }
         _ => false,
     }
