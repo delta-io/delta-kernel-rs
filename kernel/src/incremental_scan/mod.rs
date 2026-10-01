@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use url::Url;
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -12,7 +14,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::Operation;
+use crate::table_features::{Operation, TableFeature};
 use crate::utils::require;
 use crate::{
     Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
@@ -149,6 +151,12 @@ impl IncrementalScanBuilder {
             None,
         )?;
 
+        let table_root = self
+            .target_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+            .then(|| self.target_snapshot.table_root().clone());
+
         Ok(Some(IncrementalScanStream {
             base_version: self.base_version,
             target_version,
@@ -158,6 +166,7 @@ impl IncrementalScanBuilder {
             live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
+            table_root,
         }))
     }
 
@@ -233,6 +242,9 @@ pub struct IncrementalScanStream {
     live_adds: HashSet<FileActionKey>,
     removes: HashSet<FileActionKey>,
     errored: bool,
+    /// Table root, present (`Some`) iff adaptiveMetadata is enabled; threaded into the
+    /// deduplicator to normalize the deletion-vector identity under adaptiveMetadata.
+    table_root: Option<Url>,
 }
 
 impl Iterator for IncrementalScanStream {
@@ -254,6 +266,7 @@ impl Iterator for IncrementalScanStream {
                     &mut self.seen_file_keys,
                     &mut self.live_adds,
                     &mut self.removes,
+                    self.table_root.clone(),
                 ) {
                     Ok(Some(filtered)) => return Some(Ok(filtered)),
                     Ok(None) => continue,
@@ -561,6 +574,7 @@ fn process_batch(
     seen_file_keys: &mut HashSet<FileActionKey>,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
+    table_root: Option<Url>,
 ) -> KernelResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
     let mut adds_sel = vec![false; row_count];
@@ -583,6 +597,7 @@ fn process_batch(
         REMOVE_PATH_INDEX,
         ADD_DV_START_INDEX,
         REMOVE_DV_START_INDEX,
+        table_root,
     );
     let mut visitor = IncrementalDedupVisitor {
         deduplicator,

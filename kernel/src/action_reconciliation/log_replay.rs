@@ -33,6 +33,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use url::Url;
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
@@ -62,6 +64,9 @@ pub(crate) struct ActionReconciliationProcessor {
     minimum_file_retention_timestamp: i64,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
+    /// Table root, present (`Some`) iff adaptiveMetadata is enabled; threaded into the
+    /// deduplicator to normalize the deletion-vector identity under adaptiveMetadata.
+    table_root: Option<Url>,
 }
 
 /// This struct is the output of the [`ActionReconciliationProcessor`].
@@ -214,6 +219,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
             &mut self.seen_txns,
             &mut self.seen_domains,
             self.txn_expiration_timestamp,
+            self.table_root.clone(),
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -241,6 +247,7 @@ impl ActionReconciliationProcessor {
     pub(crate) fn new(
         minimum_file_retention_timestamp: i64,
         txn_expiration_timestamp: Option<i64>,
+        table_root: Option<Url>,
     ) -> Self {
         Self {
             seen_file_keys: Default::default(),
@@ -250,6 +257,7 @@ impl ActionReconciliationProcessor {
             seen_domains: Default::default(),
             minimum_file_retention_timestamp,
             txn_expiration_timestamp,
+            table_root,
         }
     }
 }
@@ -382,6 +390,7 @@ impl ActionReconciliationVisitor<'_> {
         seen_txns: &'seen mut HashSet<String>,
         seen_domains: &'seen mut HashSet<String>,
         txn_expiration_timestamp: Option<i64>,
+        table_root: Option<Url>,
     ) -> ActionReconciliationVisitor<'seen> {
         ActionReconciliationVisitor {
             deduplicator: FileActionDeduplicator::new(
@@ -392,6 +401,7 @@ impl ActionReconciliationVisitor<'_> {
                 Self::REMOVE_PATH.index,
                 Self::ADD_DV_STORAGE_TYPE.index,
                 Self::REMOVE_DV_STORAGE_TYPE.index,
+                table_root,
             ),
             selection_vector,
             actions_count: 0,
@@ -712,7 +722,7 @@ mod tests {
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> Result<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None)
+        let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None, None)
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
@@ -740,6 +750,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             None,
+            None, // table_root
         );
 
         visitor.visit_rows_of(data.as_ref())?;
@@ -798,6 +809,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             None,
+            None, // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -831,6 +843,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             None,
+            None, // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -872,6 +885,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             None,
+            None, // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -909,6 +923,7 @@ mod tests {
             &mut seen_txns, // Pre-populated transaction
             &mut seen_domains,
             None,
+            None, // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -949,6 +964,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             None,
+            None, // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -1109,6 +1125,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             Some(1000), // expiration timestamp
+            None,       // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -1151,6 +1168,7 @@ mod tests {
             &mut seen_txns,
             &mut seen_domains,
             Some(1000),
+            None, // table_root
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -1184,7 +1202,7 @@ mod tests {
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with txn expiration timestamp
-        let processor = ActionReconciliationProcessor::new(0, Some(1000));
+        let processor = ActionReconciliationProcessor::new(0, Some(1000), None);
         let results: Vec<_> = processor
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
@@ -1302,6 +1320,7 @@ mod tests {
             seen_txns,
             seen_domains,
             txn_expiration_timestamp,
+            None, // table_root
         )
     }
 
@@ -1442,7 +1461,7 @@ mod tests {
         // Create a processor and try to process the batch
         // We can't easily trigger an error in the normal flow since parse_json_batch creates valid
         // data But this test ensures the error propagation path exists and is tested
-        let mut processor = ActionReconciliationProcessor::new(0, None);
+        let mut processor = ActionReconciliationProcessor::new(0, None, None);
         let result = processor.process_actions_batch(batch);
 
         // This should succeed - the test mainly verifies that the error propagation paths compile
