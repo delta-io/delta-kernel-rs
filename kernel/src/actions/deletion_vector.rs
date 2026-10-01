@@ -8,7 +8,6 @@ use bytes::Bytes;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::{internal_api, ToSchema};
-#[cfg(feature = "adaptive-metadata-in-dev")]
 use percent_encoding::percent_decode_str;
 use roaring::RoaringTreemap;
 use serde::Deserialize;
@@ -35,7 +34,6 @@ const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 /// Percent-decodes `s` into an owned UTF-8 string, erroring on invalid UTF-8. Used to decode a
 /// relativized absolute DV path into the same form as the (unencoded) `'u'`/`'r'` paths that name
 /// the same file.
-#[cfg(feature = "adaptive-metadata-in-dev")]
 fn percent_decode(s: &str) -> DeltaResult<String> {
     percent_decode_str(s)
         .decode_utf8()
@@ -328,9 +326,6 @@ impl DeletionVectorDescriptor {
     /// - `'i'` -> marker `i`, path = `path_or_inline_dv`, unchanged.
     ///
     /// `offset` is kept in the identity (a single file may pack multiple DVs at different offsets).
-    // TODO(dv-r): drop `allow(dead_code)` once the deduplicator consumes this.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[allow(dead_code)]
     pub(crate) fn normalized_unique_id_from_parts(
         storage_type: DeletionVectorStorageType,
         path_or_inline_dv: &str,
@@ -345,7 +340,6 @@ impl DeletionVectorDescriptor {
     /// Normalizes a descriptor's `(storage_type, path_or_inline_dv)` to the `(marker, path)` pair
     /// used by [`Self::normalized_unique_id_from_parts`]. See that method for the per-storage-type
     /// rules.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     fn normalized_marker_and_path(
         storage_type: DeletionVectorStorageType,
         path_or_inline_dv: &str,
@@ -1201,7 +1195,6 @@ mod tests {
 
     // `expected` is the normalized `<marker><path>[@<offset>]` identity against table root
     // `s3://mytable/`.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest::rstest]
     // `'u'`: z85 UUID (with "ab" prefix) decodes to the `.bin` relative path, marker `r`.
     #[case(
@@ -1260,7 +1253,6 @@ mod tests {
     /// The core property: a `'u'`, `'r'`, and under-root `'p'` descriptor naming the same physical
     /// DV blob (same offset) all normalize to the same identity, so an `add`/`remove` match
     /// regardless of how each encoded the blob.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_normalized_unique_id_matches_across_storage_types() {
         let table_root = Url::parse("s3://mytable/").unwrap();
