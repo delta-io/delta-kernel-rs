@@ -176,6 +176,12 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    /// This feature enables support for the file data type, which stores a reference to a range of
+    /// bytes located inline or in an external file.
+    FileType,
+    #[strum(serialize = "fileType-preview")]
+    #[serde(rename = "fileType-preview")]
+    FileTypePreview,
     /// Iceberg V4 adaptive metadata tree as the table's native content metadata format.
     ///
     /// TODO(#2866): gated by the `adaptive-metadata-in-dev` cargo feature until fully supported.
@@ -642,6 +648,22 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static FILE_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+static FILE_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 // Dependencies and mutual exclusions per the adaptiveMetadata RFC (delta-io/delta#6978) "Table
 // Feature Enablement" section. Enforcement is covered by
 // `test_adaptive_metadata_feature_requirements`.
@@ -725,6 +747,8 @@ impl TableFeature {
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
             | TableFeature::VariantShreddingPreview
+            | TableFeature::FileType
+            | TableFeature::FileTypePreview
             | TableFeature::AdaptiveMetadataPreview
             | TableFeature::GeospatialType => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
@@ -793,6 +817,8 @@ impl TableFeature {
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
+            TableFeature::FileType => &FILE_TYPE_INFO,
+            TableFeature::FileTypePreview => &FILE_TYPE_PREVIEW_INFO,
             TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
             TableFeature::GeospatialType => &GEOSPATIAL_TYPE_INFO,
 
@@ -1141,6 +1167,8 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::FileType => "fileType",
+                TableFeature::FileTypePreview => "fileType-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::GeospatialType => "geospatial",

@@ -518,7 +518,8 @@ fn get_indices(
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
                     if let DataType::Struct(ref requested_schema)
-                    | DataType::Variant(ref requested_schema) = requested_field.data_type
+                    | DataType::Variant(ref requested_schema)
+                    | DataType::File(ref requested_schema) = requested_field.data_type
                     {
                         let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(

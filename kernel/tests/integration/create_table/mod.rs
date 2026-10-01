@@ -3,6 +3,7 @@
 mod clustering;
 mod column_mapping;
 mod ctas;
+mod file;
 mod iceberg_compat;
 mod ict;
 mod interval;

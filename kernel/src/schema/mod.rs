@@ -39,6 +39,7 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod file_utils;
 pub(crate) mod validation;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
@@ -1296,7 +1297,7 @@ impl StructType {
             }
             // Primitive types cannot contain nested metadata columns and variant types are
             // validated at creation
-            DataType::Primitive(_) | DataType::Variant(_) => {}
+            DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {}
         };
 
         Ok(())
@@ -2076,6 +2077,10 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
+fn serialize_file<S: serde::Serializer>(_: &StructType, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("file")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntervalField {
     Year,
@@ -2270,6 +2275,12 @@ pub enum DataType {
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
     #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
+    /// The File data type. A reference to a range of bytes located inline or in an external file.
+    /// Physically a group of six optional fields: `uri`, `offset`, `size`, `content_type`,
+    /// `checksum`, and `inline`. Like Variant, the type identity is carried in the Delta schema;
+    /// the physical representation is a plain struct.
+    #[serde(serialize_with = "serialize_file")]
+    File(Box<StructType>),
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -2310,6 +2321,12 @@ impl<'de> serde::Deserialize<'de> for DataType {
                 return match DataType::unshredded_variant() {
                     DataType::Variant(st) => Ok(DataType::Variant(st)),
                     _ => Err(Error::custom("Failed to create variant type")),
+                };
+            }
+            if s == "file" {
+                return match DataType::file_type() {
+                    DataType::File(st) => Ok(DataType::File(st)),
+                    _ => Err(Error::custom("Failed to create file type")),
                 };
             }
 
@@ -2409,6 +2426,7 @@ impl DataType {
             Self::Struct(_) => "struct".to_string(),
             Self::Map(_) => "map".to_string(),
             Self::Variant(_) => "variant".to_string(),
+            Self::File(_) => "file".to_string(),
         }
     }
 
@@ -2441,6 +2459,21 @@ impl DataType {
             not_null "metadata": BINARY,
             not_null "value": BINARY,
         }))
+    }
+
+    /// Create a new [`DataType::File`] with the canonical physical layout: a struct of six
+    /// nullable fields — `uri`: STRING, `offset`: LONG, `size`: LONG, `content_type`: STRING,
+    /// `checksum`: STRING, `inline`: BINARY. Like Variant, the type identity is carried in the
+    /// Delta schema; physically a `file` is this struct.
+    pub fn file_type() -> Self {
+        DataType::File(Box::new(StructType::new_unchecked([
+            StructField::nullable("uri", DataType::STRING),
+            StructField::nullable("offset", DataType::LONG),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("content_type", DataType::STRING),
+            StructField::nullable("checksum", DataType::STRING),
+            StructField::nullable("inline", DataType::BINARY),
+        ])))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
@@ -2522,6 +2555,7 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
+            DataType::File(_) => write!(f, "file"),
         }
     }
 }

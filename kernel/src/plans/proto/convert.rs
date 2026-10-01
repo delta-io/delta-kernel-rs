@@ -636,6 +636,10 @@ impl From<&DataType> for proto_schema::DataType {
             DataType::Map(map) => DataTypeKind::Map(Box::new(map.as_ref().into())),
             // The proto `VariantType` is intentionally empty: variants are opaque on the wire.
             DataType::Variant(_) => DataTypeKind::Variant(proto_schema::VariantType {}),
+            // The proto schema has no dedicated `file` kind yet; a `file` is physically a struct,
+            // so represent it as its underlying struct on the wire. (Full proto support for the
+            // file type is deferred to a later slice.)
+            DataType::File(file) => DataTypeKind::Struct(file.as_ref().into()),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
