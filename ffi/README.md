@@ -10,7 +10,7 @@ consumes its builder handle and returns a replacement, so callers must overwrite
 
 ```c
 HandleSharedSnapshot snapshot = /* unwrap(snapshot_builder_build(...)) */;
-HandleExclusiveUpdateTableTransactionBuilder builder = get_update_table_txn_builder(snapshot);
+HandleExclusiveUpdateTableTransactionBuilder builder = new_update_table_txn_builder(snapshot);
 builder = unwrap(update_table_txn_builder_with_engine_info(
     builder, slice("my-engine/1.0"), engine));
 builder = update_table_txn_builder_with_operation(
@@ -26,7 +26,7 @@ HandleExclusiveCommittedTransaction committed = unwrap(update_table_txn_commit(t
 Here `slice` and `unwrap` stand for the connector's usual `KernelStringSlice` and `ExternResult`
 helpers.
 
-Create-table connectors use the same shape: call `get_create_table_txn_builder`, apply
+Create-table connectors use the same shape: call `new_create_table_txn_builder`, apply
 `create_table_txn_builder_with_*` functions, then call `create_table_txn_builder_build`. Application
 transaction identifiers and metadata removals are intentionally available only on the update
 builder. Nested schema changes use `update_table_txn_builder_add_column_at` and

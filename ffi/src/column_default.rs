@@ -5,7 +5,7 @@
 //! write flow from C is:
 //!
 //! ```text
-//! get_update_table_txn_builder(snapshot)
+//! new_update_table_txn_builder(snapshot)
 //! update_table_txn_builder_build(builder, engine)
 //! update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
 //!         // one callback per column with a default; the connector evaluates its raw SQL itself
@@ -103,9 +103,9 @@ mod tests {
     use std::ptr::NonNull;
 
     use super::*;
-    use crate::ffi_test_utils::ok_or_panic;
+    use crate::ffi_test_utils::{build_update_table_txn, ok_or_panic};
     use crate::tests::get_default_engine;
-    use crate::transaction::{free_update_table_txn, transaction};
+    use crate::transaction::free_update_table_txn;
     use crate::{free_engine, TryFromStringSlice};
 
     const FIXTURE: &str = "../kernel/tests/data/table-with-column-defaults/";
@@ -141,7 +141,7 @@ mod tests {
         let table_root = delta_kernel::try_parse_uri(table_path).unwrap().to_string();
         let engine = get_default_engine(&table_root);
         let txn = unsafe {
-            ok_or_panic(transaction(
+            ok_or_panic(build_update_table_txn(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))

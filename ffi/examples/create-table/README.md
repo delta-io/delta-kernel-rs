@@ -2,7 +2,7 @@ create-table
 ============
 
 C FFI example for CREATE TABLE. Demonstrates the schema-visitor handoff
-(`KernelSchemaVisitorState` + `visit_field_*`) used by `get_create_table_txn_builder`, the
+(`KernelSchemaVisitorState` + `visit_field_*`) used by `new_create_table_txn_builder`, the
 consuming-and-returning handle pattern of `create_table_txn_builder_with_table_property` /
 `create_table_txn_builder_build`, and the final `create_table_txn_commit`.
 

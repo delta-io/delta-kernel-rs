@@ -169,7 +169,7 @@ int main(int argc, char* argv[]) {
   snapshot = snapshot_res.ok;
 
   // === Configure and build transaction intent ===
-  ExclusiveUpdateTableTransactionBuilder* txn_builder = get_update_table_txn_builder(snapshot);
+  ExclusiveUpdateTableTransactionBuilder* txn_builder = new_update_table_txn_builder(snapshot);
   const char* engine_info = "update_dv_example";
   KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
   ExternResultHandleExclusiveUpdateTableTransactionBuilder with_info_res =

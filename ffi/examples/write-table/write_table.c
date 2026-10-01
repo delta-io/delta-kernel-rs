@@ -16,7 +16,7 @@
 // The target table must already exist (e.g. created by the `create-table` example).
 //
 // Demonstrates the write-path FFI surface:
-//   - get_update_table_txn_builder(snapshot) to start an update builder
+//   - new_update_table_txn_builder(snapshot) to start an update builder
 //   - update_table_txn_builder_with_engine_info to set commitInfo.engineInfo
 //   - update_table_txn_get_unpartitioned_write_context(txn, engine) plus the four
 //     write-context accessors an engine needs when writing parquet files itself:
@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   SharedSnapshot* snapshot = snapshot_res.ok;
-  ExclusiveUpdateTableTransactionBuilder* txn_builder = get_update_table_txn_builder(snapshot);
+  ExclusiveUpdateTableTransactionBuilder* txn_builder = new_update_table_txn_builder(snapshot);
 
   // This empty commit does not add data.
   txn_builder = update_table_txn_builder_with_data_change(txn_builder, false);
