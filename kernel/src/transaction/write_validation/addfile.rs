@@ -8,7 +8,7 @@ use super::{FileActionTracker, StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::{DeltaResult, KernelError};
+use crate::{DeltaResult, EngineData, KernelError};
 
 /// Column indices, matching the order in [`ADD_FILE_COLUMNS_FOR_VALIDATION`].
 const PATH: usize = 0;
@@ -19,24 +19,35 @@ const MODIFICATION_TIME: usize = 3;
 static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
+/// Validates every staged AddFile row and, when a tracker is provided, file-action uniqueness.
+pub(crate) fn validate_add_files(
+    adds: &[Box<dyn EngineData>],
+    physical_partition_columns: impl IntoIterator<Item = String>,
+    staged_file_actions: Option<&mut FileActionTracker>,
+) -> DeltaResult<()> {
+    StagedDataValidator::staged_add_file(physical_partition_columns, staged_file_actions)
+        .validate(adds)
+}
+
 impl<'a> StagedDataValidator<'a> {
-    /// Creates a validator that validates every staged add-file row.
-    pub(crate) fn staged_add_file(
+    fn staged_add_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        existing_file_actions: Option<&'a mut FileActionTracker>,
+        staged_file_actions: Option<&'a mut FileActionTracker>,
     ) -> Self {
         let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredAddFileVal {
             physical_partition_columns: physical_partition_columns.into_iter().collect(),
         })];
-        if let Some(existing_file_actions) = existing_file_actions {
+        if let Some(staged_file_actions) = staged_file_actions {
             validations.push(Box::new(RepeatedFileAction {
-                existing_file_actions,
+                staged_file_actions,
             }));
         }
         StagedDataValidator::new(&ADD_FILE_COLUMNS_FOR_VALIDATION, validations)
     }
 }
 
+/// Required validations for every staged AddFile row.
+///
 /// Validates required-field existence and that each row's `partitionValues` keys match the table's
 /// physical partition columns.
 ///
@@ -45,11 +56,12 @@ impl<'a> StagedDataValidator<'a> {
 /// `defaultRowCommitVersion`, and `clusteringProvider`.
 ///
 /// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
-/// TODO(2869): Add intent-based validation for dataChange.
+/// TODO(#2869): Add intent-based validation for dataChange.
 pub(crate) struct RequiredAddFileVal {
     physical_partition_columns: HashSet<String>,
 }
 
+// TODO(#3112): Share required AddFile validation with DV updates.
 impl Validation for RequiredAddFileVal {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
@@ -85,13 +97,15 @@ impl Validation for RequiredAddFileVal {
 }
 
 struct RepeatedFileAction<'a> {
-    existing_file_actions: &'a mut FileActionTracker,
+    staged_file_actions: &'a mut FileActionTracker,
 }
 
 impl Validation for RepeatedFileAction<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get(row, "path")?;
-        self.existing_file_actions.record_add(path, None)
+        // Plain staged adds carry no deletion vector (the mandatory add-file schema has no
+        // deletionVector column), so the dv-id is always None here.
+        self.staged_file_actions.record_add(path, None)
     }
 }
 
@@ -111,7 +125,6 @@ mod tests {
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_file,
         nullable_add_files, set_field_as_null,
     };
-    use crate::EngineData;
 
     fn validate_add_files(
         physical_partition_columns: &[&str],
@@ -160,9 +173,9 @@ mod tests {
             .into_iter()
             .map(|batch| Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
             .collect();
-        let mut existing_file_actions = FileActionTracker::default();
+        let mut staged_file_actions = FileActionTracker::default();
         if let Some((path, dv_id)) = existing_add {
-            existing_file_actions
+            staged_file_actions
                 .record_add(path, Some(dv_id.to_owned()))
                 .expect("first AddFile should be accepted");
         }
@@ -170,7 +183,7 @@ mod tests {
         assert_result_error_with_message(
             StagedDataValidator::staged_add_file(
                 std::iter::empty(),
-                Some(&mut existing_file_actions),
+                Some(&mut staged_file_actions),
             )
             .validate(&adds),
             "multiple AddFile actions",

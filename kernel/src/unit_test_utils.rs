@@ -241,11 +241,12 @@ pub(crate) fn nullable_add_files(paths: &[&str]) -> RecordBatch {
 pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
     let schema = batch.schema();
     let index = schema.index_of(field).expect("field in schema");
-    let mut columns = batch.columns().to_vec();
     let null = new_null_array(schema.field(index).data_type(), 1);
-    columns[index] = replace_array_row(&columns[index], null, row);
-    RecordBatch::try_new(schema, columns)
-        .expect("failed to rebuild batch after replacing a field value with null")
+    replace_column(
+        batch,
+        field,
+        replace_array_row(batch.column(index), null, row),
+    )
 }
 
 /// Returns nullable add-file rows with `partitionValues` replaced by `partition_values`.

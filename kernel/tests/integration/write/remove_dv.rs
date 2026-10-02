@@ -306,7 +306,7 @@ fn selected_scan_file_batch(
         file_action("remove-0.parquet", None),
         file_action("add-1.parquet", None),
     ],
-    expected_error: Some("same deletion vector ID"),
+    expected_error: Some("without a deletion vector"),
     ..FileActionUniquenessCase::valid()
 })]
 #[case::add_remove_same_path_different_dv(FileActionUniquenessCase {

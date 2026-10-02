@@ -4,10 +4,11 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::utils::{
-    deletion_vector_unique_id, validate_partition_keys, validate_required_field_exist,
+    columns_from_schema, dv_id_at, validate_partition_keys, validate_required_field_exist,
+    DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
 };
 use super::{FileActionTracker, StagedDataValidator, Validation};
-use crate::engine_data::{GetData, TypedGetData as _};
+use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
@@ -22,16 +23,8 @@ const SIZE: usize = 1;
 const MODIFICATION_TIME: usize = 2;
 const PARTITION_VALUES: usize = 3;
 const OLD_DELETION_VECTOR_STORAGE_TYPE: usize = 4;
-const OLD_DELETION_VECTOR_PATH_OR_INLINE_DV: usize = 5;
-const OLD_DELETION_VECTOR_OFFSET: usize = 6;
 const NEW_DELETION_VECTOR_STORAGE_TYPE: usize = 7;
-const NEW_DELETION_VECTOR_PATH_OR_INLINE_DV: usize = 8;
-const NEW_DELETION_VECTOR_OFFSET: usize = 9;
 const MODIFICATION_TIME_NAME: &str = "modificationTime";
-const DELETION_VECTOR_NAME: &str = "deletionVector";
-const STORAGE_TYPE_NAME: &str = "storageType";
-const PATH_OR_INLINE_DV_NAME: &str = "pathOrInlineDv";
-const OFFSET_NAME: &str = "offset";
 
 static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
@@ -47,17 +40,20 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
             column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
-        let types = names
-            .iter()
-            .map(|name| {
-                intermediate_dv_schema()
-                    .field_at(name)
-                    .map(|field| field.data_type().clone())
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-        Ok((names, types).into())
+        columns_from_schema(intermediate_dv_schema(), names)
     });
 
+/// Validates selected DV-update rows and, when a tracker is provided, file-action uniqueness.
+pub(crate) fn validate_dv_matched_files(
+    dv_matched_files: &[FilteredEngineData],
+    physical_partition_columns: impl IntoIterator<Item = String>,
+    staged_file_actions: Option<&mut FileActionTracker>,
+) -> DeltaResult<()> {
+    StagedDataValidator::staged_dv_matched_file(physical_partition_columns, staged_file_actions)?
+        .validate_filtered(dv_matched_files)
+}
+
+/// Required validations for every selected DV-update row.
 struct RequiredDvMatchedFileVal {
     physical_partition_columns: HashSet<String>,
 }
@@ -99,35 +95,25 @@ impl Validation for RequiredDvMatchedFileVal {
     }
 }
 
+/// Checks each DV update as a remove of the old DV and an add of the new DV on the same path.
 struct RepeatedFileAction<'a> {
-    existing_file_actions: &'a mut FileActionTracker,
+    staged_file_actions: &'a mut FileActionTracker,
 }
 
 impl Validation for RepeatedFileAction<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
-        let old_dv_id = deletion_vector_unique_id(
-            getters[OLD_DELETION_VECTOR_STORAGE_TYPE].get_opt(row, STORAGE_TYPE_NAME)?,
-            getters[OLD_DELETION_VECTOR_PATH_OR_INLINE_DV].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
-            getters[OLD_DELETION_VECTOR_OFFSET].get_opt(row, OFFSET_NAME)?,
-        )?;
-        let new_dv_id = deletion_vector_unique_id(
-            getters[NEW_DELETION_VECTOR_STORAGE_TYPE].get_opt(row, STORAGE_TYPE_NAME)?,
-            getters[NEW_DELETION_VECTOR_PATH_OR_INLINE_DV].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
-            getters[NEW_DELETION_VECTOR_OFFSET].get_opt(row, OFFSET_NAME)?,
-        )?;
-        self.existing_file_actions.record_remove(path, old_dv_id)?;
-        self.existing_file_actions.record_add(path, new_dv_id)
+        let old_dv_id = dv_id_at(getters, OLD_DELETION_VECTOR_STORAGE_TYPE, row)?;
+        let new_dv_id = dv_id_at(getters, NEW_DELETION_VECTOR_STORAGE_TYPE, row)?;
+        self.staged_file_actions.record_remove(path, old_dv_id)?;
+        self.staged_file_actions.record_add(path, new_dv_id)
     }
 }
 
 impl<'a> StagedDataValidator<'a> {
-    /// Creates a validator for selected rows staged for deletion-vector updates.
-    ///
-    /// Errors if the required columns are absent from the intermediate DV schema.
-    pub(crate) fn staged_dv_matched_file(
+    fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        existing_file_actions: Option<&'a mut FileActionTracker>,
+        staged_file_actions: Option<&'a mut FileActionTracker>,
     ) -> DeltaResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
@@ -140,9 +126,9 @@ impl<'a> StagedDataValidator<'a> {
             vec![Box::new(RequiredDvMatchedFileVal {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
             })];
-        if let Some(existing_file_actions) = existing_file_actions {
+        if let Some(staged_file_actions) = staged_file_actions {
             validations.push(Box::new(RepeatedFileAction {
-                existing_file_actions,
+                staged_file_actions,
             }));
         }
         Ok(StagedDataValidator::new(columns, validations))
@@ -164,7 +150,6 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine_data::FilteredEngineData;
     use crate::expressions::column_name;
     use crate::scan::scan_row_schema;
     use crate::unit_test_utils::{
@@ -252,8 +237,24 @@ mod tests {
             column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME)
         );
         assert_eq!(
+            names[OLD_DELETION_VECTOR_STORAGE_TYPE + 1],
+            column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME)
+        );
+        assert_eq!(
+            names[OLD_DELETION_VECTOR_STORAGE_TYPE + 2],
+            column_name!(DELETION_VECTOR_NAME, OFFSET_NAME)
+        );
+        assert_eq!(
             names[NEW_DELETION_VECTOR_STORAGE_TYPE],
             column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME)
+        );
+        assert_eq!(
+            names[NEW_DELETION_VECTOR_STORAGE_TYPE + 1],
+            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME)
+        );
+        assert_eq!(
+            names[NEW_DELETION_VECTOR_STORAGE_TYPE + 2],
+            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME)
         );
         assert_eq!(names.len(), 10);
     }

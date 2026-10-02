@@ -1,9 +1,40 @@
 use std::collections::HashSet;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::MapItem;
+use crate::engine_data::{GetData, MapItem, TypedGetData as _};
+use crate::expressions::ColumnName;
+use crate::schema::{ColumnNamesAndTypes, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, KernelError};
+
+pub(super) const DELETION_VECTOR_NAME: &str = "deletionVector";
+pub(super) const STORAGE_TYPE_NAME: &str = "storageType";
+pub(super) const PATH_OR_INLINE_DV_NAME: &str = "pathOrInlineDv";
+pub(super) const OFFSET_NAME: &str = "offset";
+
+pub(super) fn columns_from_schema(
+    schema: &StructType,
+    names: Vec<ColumnName>,
+) -> DeltaResult<ColumnNamesAndTypes> {
+    let types = names
+        .iter()
+        .map(|name| schema.field_at(name).map(|field| field.data_type().clone()))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok((names, types).into())
+}
+
+/// Reads contiguous `storageType`, `pathOrInlineDv`, and `offset` getters starting at `base`.
+pub(super) fn dv_id_at<'a>(
+    getters: &[&'a dyn GetData<'a>],
+    base: usize,
+    row: usize,
+) -> DeltaResult<Option<String>> {
+    deletion_vector_unique_id(
+        getters[base].get_opt(row, STORAGE_TYPE_NAME)?,
+        getters[base + 1].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
+        getters[base + 2].get_opt(row, OFFSET_NAME)?,
+    )
+}
 
 pub(super) fn validate_required_field_exist<T>(
     value: Option<T>,
@@ -62,4 +93,18 @@ pub(super) fn deletion_vector_unique_id(
         path_or_inline_dv,
         offset,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::unit_test_utils::assert_result_error_with_message;
+
+    #[test]
+    fn dv_unique_id_errors_when_path_missing() {
+        assert_result_error_with_message(
+            deletion_vector_unique_id(Some("u"), None, Some(0)),
+            "DeletionVector is missing required field 'pathOrInlineDv'",
+        );
+    }
 }

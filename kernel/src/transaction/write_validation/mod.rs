@@ -10,7 +10,10 @@ mod utils;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
+pub(super) use addfile::validate_add_files;
 use derive_more::Constructor;
+pub(super) use dv::validate_dv_matched_files;
+pub(super) use removefile::validate_remove_files;
 
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -20,6 +23,12 @@ use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, KernelError};
 
+/// Tracks staged file actions across a transaction.
+///
+/// - AddFile paths must be unique, regardless of deletion vector ID.
+/// - RemoveFile paths must be unique, regardless of deletion vector ID.
+/// - An AddFile and RemoveFile cannot share the same `(path, dv_id)`, including when both IDs are
+///   absent. Different DV IDs on the same path are allowed for deletion-vector updates.
 #[derive(Default)]
 pub(super) struct FileActionTracker {
     add_paths: HashMap<String, Option<String>>,
@@ -35,34 +44,49 @@ impl FileActionTracker {
     }
 
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
-        let Entry::Vacant(entry) = self.add_paths.entry(path.to_owned()) else {
-            return Err(KernelError::generic(format!(
-                "Transaction contains multiple AddFile actions for path '{path}'"
-            )));
-        };
-        require!(
-            self.remove_paths.get(path) != Some(&dv_id),
-            KernelError::generic(format!(
-                "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
-                 same deletion vector ID"
-            ))
-        );
-        entry.insert(dv_id);
-        Ok(())
+        Self::record(
+            path,
+            dv_id,
+            "AddFile",
+            &mut self.add_paths,
+            &self.remove_paths,
+        )
     }
 
     fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
-        let Entry::Vacant(entry) = self.remove_paths.entry(path.to_owned()) else {
-            return Err(KernelError::generic(format!(
-                "Transaction contains multiple RemoveFile actions for path '{path}'"
+        Self::record(
+            path,
+            dv_id,
+            "RemoveFile",
+            &mut self.remove_paths,
+            &self.add_paths,
+        )
+    }
+
+    fn record(
+        path: &str,
+        dv_id: Option<String>,
+        action_name: &str,
+        same_actions: &mut HashMap<String, Option<String>>,
+        other_actions: &HashMap<String, Option<String>>,
+    ) -> DeltaResult<()> {
+        let Entry::Vacant(entry) = same_actions.entry(path.to_owned()) else {
+            return Err(KernelError::invalid_transaction_state(format!(
+                "Transaction contains multiple {action_name} actions for path '{path}'"
             )));
         };
         require!(
-            self.add_paths.get(path) != Some(&dv_id),
-            KernelError::generic(format!(
-                "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
-                 same deletion vector ID"
-            ))
+            other_actions.get(path) != Some(&dv_id),
+            KernelError::invalid_transaction_state(match dv_id.as_deref() {
+                Some(dv_id) => format!(
+                    "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
+                     same deletion vector ID '{dv_id}'"
+                ),
+                None => format!(
+                    "Transaction contains AddFile and RemoveFile actions for path '{path}' \
+                     without a deletion vector"
+                ),
+            })
         );
         entry.insert(dv_id);
         Ok(())
@@ -78,15 +102,16 @@ pub(crate) trait Validation {
 ///
 /// Each instance uses one column projection and applies its configured validations to every staged
 /// row. Every [`Validation`] sees the full getter list and reads the columns it needs.
+/// Borrowing the file-action tracker lets field and uniqueness checks share one pass.
 #[derive(Constructor)]
-pub(crate) struct StagedDataValidator<'a> {
+struct StagedDataValidator<'a> {
     columns_and_types: &'static ColumnNamesAndTypes,
     validations: Vec<Box<dyn Validation + 'a>>,
 }
 
 impl<'a> StagedDataValidator<'a> {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+    fn validate(mut self, batches: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         for batch in batches {
             RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
         }
@@ -94,7 +119,7 @@ impl<'a> StagedDataValidator<'a> {
     }
 
     /// Runs every validation against each selected staged-data row.
-    pub(crate) fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> DeltaResult<()> {
+    fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> DeltaResult<()> {
         for batch in batches {
             FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
         }
@@ -173,7 +198,21 @@ mod tests {
             FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", None),
             FileActionTrackerTestCase::new(TestFileActionType::Add, "same", None),
         ],
+        Some("without a deletion vector"),
+    )]
+    #[case::remove_add_same_non_null_dv(
+        &[
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv")),
+        ],
         Some("same deletion vector ID"),
+    )]
+    #[case::remove_add_different_dv(
+        &[
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-2")),
+        ],
+        None,
     )]
     #[case::add_remove_different_dv(
         &[
@@ -199,6 +238,10 @@ mod tests {
             .try_for_each(|file_action| file_action.record(&mut tracker));
 
         if let Some(expected_error) = expected_error {
+            assert!(matches!(
+                result,
+                Err(KernelError::InvalidTransactionState(_))
+            ));
             assert_result_error_with_message(result, expected_error);
         } else {
             result.expect("valid file-action combination should be accepted");

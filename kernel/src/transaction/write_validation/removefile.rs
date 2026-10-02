@@ -2,9 +2,12 @@
 
 use std::sync::LazyLock;
 
-use super::utils::{deletion_vector_unique_id, validate_required_field_exist};
+use super::utils::{
+    columns_from_schema, dv_id_at, validate_required_field_exist, DELETION_VECTOR_NAME,
+    OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+};
 use super::{FileActionTracker, StagedDataValidator, Validation};
-use crate::engine_data::{GetData, TypedGetData as _};
+use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{PATH_NAME, SIZE_NAME};
 use crate::scan::scan_row_schema;
@@ -16,12 +19,6 @@ use crate::{DeltaResult, KernelError};
 const PATH: usize = 0;
 const SIZE: usize = 1;
 const DELETION_VECTOR_STORAGE_TYPE: usize = 2;
-const DELETION_VECTOR_PATH_OR_INLINE_DV: usize = 3;
-const DELETION_VECTOR_OFFSET: usize = 4;
-const DELETION_VECTOR_NAME: &str = "deletionVector";
-const STORAGE_TYPE_NAME: &str = "storageType";
-const PATH_OR_INLINE_DV_NAME: &str = "pathOrInlineDv";
-const OFFSET_NAME: &str = "offset";
 
 static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
@@ -32,20 +29,20 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTy
             column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
-        let types = names
-            .iter()
-            .map(|name| {
-                scan_row_schema()
-                    .field_at(name)
-                    .map(|field| field.data_type().clone())
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-        Ok((names, types).into())
+        columns_from_schema(&scan_row_schema(), names)
     });
 
+/// Validates selected RemoveFile rows and, when a tracker is provided, file-action uniqueness.
+pub(crate) fn validate_remove_files(
+    removes: &[FilteredEngineData],
+    staged_file_actions: Option<&mut FileActionTracker>,
+) -> DeltaResult<()> {
+    StagedDataValidator::staged_remove_file(staged_file_actions)?.validate_filtered(removes)
+}
+
 impl<'a> StagedDataValidator<'a> {
-    pub(crate) fn staged_remove_file(
-        existing_file_actions: Option<&'a mut FileActionTracker>,
+    fn staged_remove_file(
+        staged_file_actions: Option<&'a mut FileActionTracker>,
     ) -> DeltaResult<Self> {
         let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
@@ -55,17 +52,18 @@ impl<'a> StagedDataValidator<'a> {
                 ))
             })?;
         let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredRemoveFileVal)];
-        if let Some(existing_file_actions) = existing_file_actions {
+        if let Some(staged_file_actions) = staged_file_actions {
             validations.push(Box::new(RepeatedFileAction {
-                existing_file_actions,
+                staged_file_actions,
             }));
         }
         Ok(StagedDataValidator::new(columns, validations))
     }
 }
 
-/// Validates required `RemoveFile` fields: `path` must be present and non-empty, and `size`
-/// must be present and non-negative.
+/// Required validations for every selected RemoveFile row.
+///
+/// `path` must be present and non-empty, and `size` must be present and non-negative.
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
@@ -96,18 +94,14 @@ impl Validation for RequiredRemoveFileVal {
 }
 
 struct RepeatedFileAction<'a> {
-    existing_file_actions: &'a mut FileActionTracker,
+    staged_file_actions: &'a mut FileActionTracker,
 }
 
 impl Validation for RepeatedFileAction<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
-        let dv_id = deletion_vector_unique_id(
-            getters[DELETION_VECTOR_STORAGE_TYPE].get_opt(row, STORAGE_TYPE_NAME)?,
-            getters[DELETION_VECTOR_PATH_OR_INLINE_DV].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
-            getters[DELETION_VECTOR_OFFSET].get_opt(row, OFFSET_NAME)?,
-        )?;
-        self.existing_file_actions.record_remove(path, dv_id)
+        let dv_id = dv_id_at(getters, DELETION_VECTOR_STORAGE_TYPE, row)?;
+        self.staged_file_actions.record_remove(path, dv_id)
     }
 }
 
@@ -125,7 +119,6 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine_data::FilteredEngineData;
     use crate::expressions::ColumnName;
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -140,6 +133,14 @@ mod tests {
         assert_eq!(
             names[DELETION_VECTOR_STORAGE_TYPE],
             ColumnName::new([DELETION_VECTOR_NAME, STORAGE_TYPE_NAME])
+        );
+        assert_eq!(
+            names[DELETION_VECTOR_STORAGE_TYPE + 1],
+            ColumnName::new([DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME])
+        );
+        assert_eq!(
+            names[DELETION_VECTOR_STORAGE_TYPE + 2],
+            ColumnName::new([DELETION_VECTOR_NAME, OFFSET_NAME])
         );
         assert_eq!(names.len(), 5);
     }
@@ -322,8 +323,6 @@ mod tests {
 
     fn validate_remove_files(removes: &[FilteredEngineData]) -> DeltaResult<()> {
         let mut file_actions = FileActionTracker::default();
-        let result = StagedDataValidator::staged_remove_file(Some(&mut file_actions))?
-            .validate_filtered(removes);
-        result
+        super::validate_remove_files(removes, Some(&mut file_actions))
     }
 }
