@@ -102,7 +102,8 @@ pub(crate) trait Validation {
 ///
 /// Each instance uses one column projection and applies its configured validations to every staged
 /// row. Every [`Validation`] sees the full getter list and reads the columns it needs.
-/// The `'a` lifetime lets validations borrow shared state, such as [`FileActionTracker`].
+/// The `'a` lifetime lets validations borrow shared state, such as [`FileActionTracker`], so all
+/// the checks can be run in one pass.
 #[derive(Constructor)]
 struct StagedDataValidator<'a> {
     columns_and_types: &'static ColumnNamesAndTypes,
