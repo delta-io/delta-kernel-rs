@@ -168,6 +168,7 @@ pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
 };
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
@@ -175,7 +176,7 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
     MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
-use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
@@ -185,7 +186,7 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
 };
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -196,7 +197,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType, ToSchema,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
@@ -611,6 +612,69 @@ pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -
     ];
     let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
     concat(&arrays).expect("replacement value must match the modified column type")
+}
+
+/// Builds nullable deletion-vector values for tests.
+///
+/// Each entry supplies `pathOrInlineDv`; `None` produces a null descriptor. Present descriptors
+/// have no offset and use placeholder size and cardinality values.
+///
+/// # Panics
+///
+/// Panics if the deletion-vector schema cannot be converted to Arrow.
+pub fn deletion_vector_array(
+    storage_type: &str,
+    paths_or_inline_dvs: &[Option<&str>],
+) -> StructArray {
+    let schema: ArrowSchema = (&DeletionVectorDescriptor::to_schema())
+        .try_into_arrow()
+        .expect("deletion-vector schema should convert to Arrow");
+    let row_count = paths_or_inline_dvs.len();
+
+    StructArray::new(
+        schema.fields().clone(),
+        vec![
+            Arc::new(StringArray::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| storage_type))
+                    .collect::<Vec<_>>(),
+            )), // storageType
+            Arc::new(StringArray::from(paths_or_inline_dvs.to_vec())), // pathOrInlineDv
+            Arc::new(Int32Array::from(vec![None; row_count])),         // offset
+            Arc::new(Int32Array::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )), // sizeInBytes
+            Arc::new(Int64Array::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )), // cardinality
+        ],
+        Some(NullBuffer::from(
+            paths_or_inline_dvs
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+        )),
+    )
+}
+
+/// Returns a copy of `batch` with `field` replaced by `column`.
+///
+/// # Panics
+///
+/// Panics if `field` does not exist or `column` is incompatible with the batch schema.
+pub fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(schema, columns).expect("replacement column must match the batch schema")
 }
 
 pub fn create_default_engine(
