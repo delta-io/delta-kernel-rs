@@ -19,7 +19,8 @@ const MODIFICATION_TIME: usize = 3;
 static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
-/// Validates every staged AddFile row and, when a tracker is provided, file-action uniqueness.
+/// Runs required validations for every staged AddFile row. When `staged_file_actions` is provided,
+/// also validates file-action (addFile, removeFile) uniqueness.
 pub(crate) fn validate_add_files(
     adds: &[Box<dyn EngineData>],
     physical_partition_columns: impl IntoIterator<Item = String>,
@@ -30,6 +31,7 @@ pub(crate) fn validate_add_files(
 }
 
 impl<'a> StagedDataValidator<'a> {
+    /// Creates a validator that validates every staged add-file row.
     fn staged_add_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
         staged_file_actions: Option<&'a mut FileActionTracker>,
@@ -38,7 +40,7 @@ impl<'a> StagedDataValidator<'a> {
             physical_partition_columns: physical_partition_columns.into_iter().collect(),
         })];
         if let Some(staged_file_actions) = staged_file_actions {
-            validations.push(Box::new(RepeatedFileAction {
+            validations.push(Box::new(RepeatedFileActionValidation {
                 staged_file_actions,
             }));
         }
@@ -96,11 +98,11 @@ impl Validation for RequiredAddFileVal {
     }
 }
 
-struct RepeatedFileAction<'a> {
+struct RepeatedFileActionValidation<'a> {
     staged_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for RepeatedFileAction<'_> {
+impl Validation for RepeatedFileActionValidation<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get(row, "path")?;
         // Plain staged adds carry no deletion vector (the mandatory add-file schema has no

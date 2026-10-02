@@ -32,7 +32,8 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTy
         columns_from_schema(&scan_row_schema(), names)
     });
 
-/// Validates selected RemoveFile rows and, when a tracker is provided, file-action uniqueness.
+/// Runs required validations for every selected RemoveFile row. When `staged_file_actions` is
+/// provided, also validates file-action (addFile, removeFile) uniqueness.
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
     staged_file_actions: Option<&mut FileActionTracker>,
@@ -53,7 +54,7 @@ impl<'a> StagedDataValidator<'a> {
             })?;
         let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredRemoveFileVal)];
         if let Some(staged_file_actions) = staged_file_actions {
-            validations.push(Box::new(RepeatedFileAction {
+            validations.push(Box::new(RepeatedFileActionValidation {
                 staged_file_actions,
             }));
         }
@@ -93,11 +94,11 @@ impl Validation for RequiredRemoveFileVal {
     }
 }
 
-struct RepeatedFileAction<'a> {
+struct RepeatedFileActionValidation<'a> {
     staged_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for RepeatedFileAction<'_> {
+impl Validation for RepeatedFileActionValidation<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let dv_id = dv_id_at(getters, DELETION_VECTOR_STORAGE_TYPE, row)?;

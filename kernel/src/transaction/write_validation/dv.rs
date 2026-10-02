@@ -43,7 +43,8 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesA
         columns_from_schema(intermediate_dv_schema(), names)
     });
 
-/// Validates selected DV-update rows and, when a tracker is provided, file-action uniqueness.
+/// Runs required validations for every selected DV-update row. When `staged_file_actions` is
+/// provided, also validates file-action (addFile, removeFile) uniqueness.
 pub(crate) fn validate_dv_matched_files(
     dv_matched_files: &[FilteredEngineData],
     physical_partition_columns: impl IntoIterator<Item = String>,
@@ -95,12 +96,11 @@ impl Validation for RequiredDvMatchedFileVal {
     }
 }
 
-/// Checks each DV update as a remove of the old DV and an add of the new DV on the same path.
-struct RepeatedFileAction<'a> {
+struct RepeatedFileActionValidation<'a> {
     staged_file_actions: &'a mut FileActionTracker,
 }
 
-impl Validation for RepeatedFileAction<'_> {
+impl Validation for RepeatedFileActionValidation<'_> {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let old_dv_id = dv_id_at(getters, OLD_DELETION_VECTOR_STORAGE_TYPE, row)?;
@@ -127,7 +127,7 @@ impl<'a> StagedDataValidator<'a> {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
             })];
         if let Some(staged_file_actions) = staged_file_actions {
-            validations.push(Box::new(RepeatedFileAction {
+            validations.push(Box::new(RepeatedFileActionValidation {
                 staged_file_actions,
             }));
         }

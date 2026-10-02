@@ -67,16 +67,16 @@ impl FileActionTracker {
         path: &str,
         dv_id: Option<String>,
         action_name: &str,
-        same_actions: &mut HashMap<String, Option<String>>,
-        other_actions: &HashMap<String, Option<String>>,
+        same_type_actions: &mut HashMap<String, Option<String>>,
+        different_type_actions: &HashMap<String, Option<String>>,
     ) -> DeltaResult<()> {
-        let Entry::Vacant(entry) = same_actions.entry(path.to_owned()) else {
+        let Entry::Vacant(entry) = same_type_actions.entry(path.to_owned()) else {
             return Err(KernelError::invalid_transaction_state(format!(
                 "Transaction contains multiple {action_name} actions for path '{path}'"
             )));
         };
         require!(
-            other_actions.get(path) != Some(&dv_id),
+            different_type_actions.get(path) != Some(&dv_id),
             KernelError::invalid_transaction_state(match dv_id.as_deref() {
                 Some(dv_id) => format!(
                     "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
@@ -102,7 +102,7 @@ pub(crate) trait Validation {
 ///
 /// Each instance uses one column projection and applies its configured validations to every staged
 /// row. Every [`Validation`] sees the full getter list and reads the columns it needs.
-/// Borrowing the file-action tracker lets field and uniqueness checks share one pass.
+/// The `'a` lifetime lets validations borrow shared state, such as [`FileActionTracker`].
 #[derive(Constructor)]
 struct StagedDataValidator<'a> {
     columns_and_types: &'static ColumnNamesAndTypes,
@@ -174,57 +174,57 @@ mod tests {
     #[rstest]
     #[case::duplicate_add_different_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv-2")),
         ],
         Some("multiple AddFile actions"),
     )]
     #[case::duplicate_remove_different_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-2")),
         ],
         Some("multiple RemoveFile actions"),
     )]
     #[case::add_remove_same_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv")),
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv")),
         ],
         Some("same deletion vector ID"),
     )]
     #[case::remove_add_same_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", None),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", None),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", None),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", None),
         ],
         Some("without a deletion vector"),
     )]
     #[case::remove_add_same_non_null_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv")),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv")),
         ],
         Some("same deletion vector ID"),
     )]
     #[case::remove_add_different_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv-2")),
         ],
         None,
     )]
     #[case::add_remove_different_dv(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same", Some("dv-2")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv-1")),
+            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-2")),
         ],
         None,
     )]
     #[case::same_dv_different_paths(
         &[
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "first", Some("dv")),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "second", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "path_0", Some("dv")),
+            FileActionTrackerTestCase::new(TestFileActionType::Add, "path_1", Some("dv")),
         ],
         None,
     )]
