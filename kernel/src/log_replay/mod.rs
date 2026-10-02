@@ -19,6 +19,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -65,7 +66,6 @@ impl FileActionKey {
 ///
 /// TODO: Modify deduplication to track only file paths instead of (path, dv_unique_id).
 /// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701
-#[derive(Constructor)]
 pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
@@ -86,6 +86,38 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     add_dv_start_index: usize,
     /// Starting index for remove action deletion vector columns
     remove_dv_start_index: usize,
+    /// Table root used to normalize the deletion-vector identity under adaptiveMetadata; `Some`
+    /// iff adaptiveMetadata is enabled for the table. Not yet consumed by `extract_dv_unique_id`.
+    // TODO(dv-r): consumed in sub-PR C
+    #[allow(dead_code)]
+    table_root: Option<Url>,
+}
+
+impl<'seen> FileActionDeduplicator<'seen> {
+    // Hand-written (not `#[derive(Constructor)]`) so the eight-field constructor can carry the
+    // `too_many_arguments` allow; the positional field order is the call-site argument order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        is_log_batch: bool,
+        add_path_index: usize,
+        add_size_index: usize,
+        remove_path_index: usize,
+        add_dv_start_index: usize,
+        remove_dv_start_index: usize,
+        table_root: Option<Url>,
+    ) -> Self {
+        Self {
+            seen_file_keys,
+            is_log_batch,
+            add_path_index,
+            add_size_index,
+            remove_path_index,
+            add_dv_start_index,
+            remove_dv_start_index,
+            table_root,
+        }
+    }
 }
 
 impl Deduplicator for FileActionDeduplicator<'_> {
@@ -447,11 +479,12 @@ mod tests {
         FileActionDeduplicator::new(
             seen,
             is_log_batch,
-            0, // add_path_index
-            1, // add_size_index,
-            5, // remove_path_index
-            2, // add_dv_start_index
-            6, // remove_dv_start_index
+            0,    // add_path_index
+            1,    // add_size_index,
+            5,    // remove_path_index
+            2,    // add_dv_start_index
+            6,    // remove_dv_start_index
+            None, // table_root (not under adaptiveMetadata)
         )
     }
 
@@ -650,7 +683,7 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
@@ -669,7 +702,7 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2, None)?;
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
@@ -702,7 +735,7 @@ mod tests {
             Some("dv123".to_string()),
         ));
 
-        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);

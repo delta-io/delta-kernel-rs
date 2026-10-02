@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
@@ -95,6 +96,12 @@ struct InternalScanState {
     #[serde(default)]
     is_catalog_managed: bool,
     skip_row_transforms: bool,
+    /// The table root, present (`Some`) iff adaptiveMetadata is enabled; carried through so the
+    /// distributed scan path normalizes the deletion-vector identity the same way the sequential
+    /// phase does. `serde(default)` keeps older blobs (without this field) readable, deserializing
+    /// to `None`.
+    #[serde(default)]
+    table_root: Option<Url>,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -401,6 +408,7 @@ impl ScanLogReplayProcessor {
             requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
+            table_root,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -424,6 +432,7 @@ impl ScanLogReplayProcessor {
             requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
+            table_root,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
             KernelError::generic(format!("Failed to serialize internal state: {e}"))
@@ -488,6 +497,7 @@ impl ScanLogReplayProcessor {
             requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
+            table_root: internal_state.table_root,
         });
 
         Self::new_with_seen_files(
@@ -1056,6 +1066,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_PATH_INDEX,
             Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
+            self.state_info.table_root.clone(),
         )?;
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
@@ -1162,6 +1173,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             Self::REMOVE_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
+            self.state_info.table_root.clone(),
         );
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
@@ -1458,6 +1470,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            table_root: None,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1891,6 +1904,7 @@ mod tests {
                 requested_physical_stats_columns: Vec::new(),
                 is_catalog_managed: false,
                 skip_row_transforms: false,
+                table_root: None,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor = ScanLogReplayProcessor::new(
@@ -1928,6 +1942,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            table_root: None,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1961,6 +1976,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: true,
             skip_row_transforms: false,
+            table_root: None,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1994,6 +2010,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: skip,
+            table_root: None,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2045,6 +2062,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            table_root: None,
         };
         let predicate = Arc::new(crate::expressions::column_pred!("id"));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -2078,6 +2096,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            table_root: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
