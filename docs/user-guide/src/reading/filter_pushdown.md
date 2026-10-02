@@ -318,10 +318,8 @@ let scan = snapshot
 # }
 ```
 
-The named columns always appear in `stats_parsed`. When the scan also has a predicate,
-predicate-referenced columns may appear as well because Kernel can retain the statistics it uses
-for data skipping. Connectors should treat the named columns as a minimum projection and ignore
-additional columns they do not need.
+Only the named data columns appear in `stats_parsed`. Kernel may read additional statistics for
+data skipping, but it removes predicate-only fields from scan metadata before returning it.
 
 ### Choosing the right mode
 

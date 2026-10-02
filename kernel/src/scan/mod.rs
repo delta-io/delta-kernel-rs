@@ -20,9 +20,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{
-    column_name, ColumnName, Expression as Expr, ExpressionRef, Predicate, PredicateRef,
-};
+use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -47,7 +45,7 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{CollectInto, FoldWithOption as _, IteratorExt};
+use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
     Version,
@@ -77,22 +75,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
     (&ADD_FIELD),
 };
 
-/// Logical and physical schemas for the structured statistics emitted by a scan.
-///
-/// [`ScanBuilder::stats_output_schemas`] returns this before the scan is built. Connectors use the
-/// logical schema for table-facing names and the physical schema to interpret `stats_parsed` in
-/// scan metadata.
-///
-/// The schemas have the same shape and field order. They differ only in table column names when
-/// column mapping is enabled. Field metadata is removed from both schemas.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct StatsOutputSchemas {
-    /// Schema using logical table column names.
-    pub logical: SchemaRef,
-    /// Schema using physical table column names.
-    pub physical: SchemaRef,
-}
+pub use crate::table_configuration::StatsOutputSchemas;
 
 /// Initial checkpoint projection without JSON `add.stats`.
 /// Discovery restores JSON stats when structured stats cannot satisfy the scan.
@@ -166,13 +149,16 @@ pub enum StructStats {
     /// disables stats reading entirely.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
+    ///
+    /// Clustering columns outside these sets are not added automatically.
     AllIndexed {
         /// Columns outside the indexed set that may have on-disk stats. Names that cannot be
         /// resolved are omitted with a warning. Missing per-file values read as NULL and do not
         /// prune.
         extra_indexed: Vec<ColumnName>,
     },
-    /// Emit stats for at least the `requested` columns, regardless of the table's indexed set.
+    /// Emit only the `requested` data columns, regardless of the table's indexed set.
+    /// Predicate-only statistics may still be read for data skipping but are not returned.
     Columns {
         /// Columns to request, even outside the indexed set. Names that cannot be resolved return
         /// an error. Missing per-file values read as NULL and do not prune.
@@ -208,7 +194,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for at least `cols`, regardless of the table's indexed set.
+    /// Returns struct stats for only `cols`, regardless of the table's indexed set.
+    /// Predicate-only statistics may still be read for data skipping but are not returned.
     ///
     /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
     /// not prune.
@@ -379,12 +366,14 @@ impl ScanBuilder {
     ///
     /// The result reflects the current [`StatsOptions`]. It is `None` when structured statistics
     /// are disabled or no data columns are selected. Predicate-only statistics used internally
-    /// for data skipping are not included.
+    /// for data skipping are not included. Clustering columns are included only when selected by
+    /// the table's stats configuration or passed as extra-indexed columns.
     ///
     /// # Errors
     ///
-    /// Returns an error when a column requested through [`StatsOptions::struct_columns`] cannot be
-    /// resolved, or when the selected fields cannot form a valid statistics schema.
+    /// Extra-indexed columns that cannot be resolved are omitted with a warning. Returns an error
+    /// when a column requested through [`StatsOptions::struct_columns`] cannot be resolved, or when
+    /// the selected fields cannot form a valid statistics schema.
     pub fn stats_output_schemas(&self) -> DeltaResult<Option<StatsOutputSchemas>> {
         build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
     }
@@ -491,12 +480,6 @@ impl ScanBuilder {
         // Retain the transform spec but skip building per-file expressions, which also skips the
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
-
-        let stats_output_schemas =
-            build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)?;
-        state_info.set_physical_stats_output_schema(
-            stats_output_schemas.map(|schemas| schemas.physical),
-        )?;
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
@@ -774,27 +757,7 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
-/// Builds a nested projection for the requested schema.
-///
-/// The projected struct remains null when its source struct is null.
-pub(crate) fn project_nested_struct_to_schema(
-    root: impl CollectInto<ColumnName>,
-    schema: &StructType,
-) -> Expr {
-    let root = root.collect_into();
-    let fields = schema.fields().map(|field| {
-        let column = root.join(&ColumnName::new([field.name()]));
-        match field.data_type() {
-            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
-            _ => Expr::from(column),
-        }
-    });
-    Expr::struct_with_nullability_from(
-        fields,
-        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
-    )
-}
-
+/// Builds the consumer-visible stats schemas without predicate-only fields.
 fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,

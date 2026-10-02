@@ -1156,13 +1156,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schema = self
-            .effective_table_config
+        let requested_columns = None;
+        self.effective_table_config
             .build_expected_physical_stats_schema(
                 self.physical_clustering_columns.as_deref(),
-                None,
-            )?;
-        Ok(stats_schema)
+                requested_columns,
+            )
     }
 
     /// Returns the list of column names that should have statistics collected.

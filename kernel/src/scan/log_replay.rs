@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
-use super::{project_nested_struct_to_schema, PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -28,7 +28,7 @@ use crate::schema::{
     lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, ExpressionEvaluator, KernelError};
@@ -459,6 +459,9 @@ impl ScanLogReplayProcessor {
         // Deserialize internal state from json
         let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
             .map_err(KernelError::MalformedJson)?;
+        if let Some(schemas) = &internal_state.physical_stats_schemas {
+            schemas.validate()?;
+        }
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
@@ -878,7 +881,7 @@ fn build_stats_output_projection(
         Some(schema) => projection.replace(
             STATS_PARSED_NAME,
             StructField::nullable(STATS_PARSED_NAME, schema.clone()),
-            project_nested_struct_to_schema([STATS_PARSED_NAME], schema),
+            project_struct_preserving_nulls([STATS_PARSED_NAME], schema),
         ),
         None => projection.drop_if_exists(STATS_PARSED_NAME),
     };
@@ -1277,15 +1280,15 @@ mod tests {
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info, RowTrackingState,
-        ROW_TRACKING_FEATURES,
+        assert_transform_spec, get_simple_state_info, get_state_info, get_state_info_with_stats,
+        RowTrackingState, ROW_TRACKING_FEATURES,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
+    use crate::scan::{PhysicalPredicate, StatsOptions, COMMIT_READ_SCHEMA};
     use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -1717,6 +1720,54 @@ mod tests {
         assert!(deserialized.seen_file_keys.contains(&key1));
         assert!(deserialized.seen_file_keys.contains(&key2));
         assert!(deserialized.seen_file_keys.contains(&key3));
+    }
+
+    #[test]
+    fn test_serialization_preserves_stats_read_and_output_schemas() {
+        let engine = SyncEngine::new();
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let predicate = Arc::new(Predicate::gt(col!("id"), lit(0i32)));
+        let state_info = Arc::new(
+            get_state_info_with_stats(
+                schema,
+                vec![],
+                Some(predicate),
+                &[],
+                HashMap::new(),
+                vec![],
+                StatsOptions::struct_columns(vec![column_name!("name")]),
+            )
+            .unwrap(),
+        );
+        let original_read = state_info.physical_stats_read_schema().cloned().unwrap();
+        let original_output = state_info.physical_stats_output_schema().cloned().unwrap();
+        assert_ne!(original_read, original_output);
+
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deserialized.state_info.physical_stats_read_schema(),
+            Some(&original_read)
+        );
+        assert_eq!(
+            deserialized.state_info.physical_stats_output_schema(),
+            Some(&original_output)
+        );
     }
 
     #[test]

@@ -2371,13 +2371,14 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
     let scan = builder.build().unwrap();
 
     assert_eq!(
-        scan.state_info.physical_stats_output_schema(),
+        scan.state_info.physical_stats_read_schema(),
         Some(&expected.physical)
     );
 
     assert_stats_schemas_aligned(&expected.logical, &expected.physical);
 
     let logical_min_values = stats_struct_field(&expected.logical, MIN_VALUES);
+    assert_eq!(logical_min_values.num_fields(), 2);
     assert!(logical_min_values.field("id").is_some());
     assert!(logical_min_values.field("value").is_some());
     assert!(logical_min_values.field("other").is_none());
@@ -2405,24 +2406,36 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
     }
 }
 
-#[test]
-fn scan_builder_stats_output_schemas_returns_none_without_data_columns() {
-    let table_root = "memory:///expected-stats-schemas-empty/";
+#[rstest]
+#[case::no_column_mapping(None)]
+#[case::name_column_mapping(Some("name"))]
+#[case::id_column_mapping(Some("id"))]
+fn scan_builder_stats_output_schemas_returns_none_without_data_columns(
+    #[case] column_mapping_mode: Option<&str>,
+) {
+    let table_root = format!(
+        "memory:///expected-stats-schemas-empty-{}/",
+        column_mapping_mode.unwrap_or("none")
+    );
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
-    create_table(
-        table_root,
+    let mut create_builder = create_table(
+        &table_root,
         schema_ref! { nullable "id": LONG },
         "DefaultEngine",
     )
-    .with_table_properties([("delta.dataSkippingNumIndexedCols", "0")])
-    .build(&engine, Box::new(FileSystemCommitter::new()))
-    .unwrap()
-    .commit(&engine)
-    .unwrap()
-    .unwrap_committed();
+    .with_table_properties([("delta.dataSkippingNumIndexedCols", "0")]);
+    if let Some(mode) = column_mapping_mode {
+        create_builder = create_builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    create_builder
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
 
-    let builder = Snapshot::builder_for(table_root)
+    let builder = Snapshot::builder_for(&table_root)
         .build(&engine)
         .unwrap()
         .scan_builder()
@@ -2466,7 +2479,7 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
         .unwrap_committed();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-    let extra_indexed_columns = vec![column_name!("other")];
+    let extra_indexed_columns = vec![column_name!("part"), column_name!("other")];
     let builder = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all_struct_with_extra_indexed(
@@ -2491,6 +2504,107 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
     let info = stats_struct_field(null_count, "info");
     assert!(info.field("name").is_some());
     assert!(info.field("age").is_none());
+}
+
+#[test]
+fn scan_builder_stats_output_schemas_handle_extra_column_shapes() {
+    let table_root = "memory:///expected-stats-schemas-extra-shapes/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "info": {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+        },
+        nullable "entries": { STRING => nullable STRING },
+        nullable "items": [ nullable INTEGER ],
+        nullable "part": STRING,
+    };
+    create_table(table_root, schema, "DefaultEngine")
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .with_table_properties([("delta.dataSkippingNumIndexedCols", "1")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let schemas = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct_with_extra_indexed(vec![
+            column_name!("id"),
+            column_name!("info"),
+            column_name!("entries"),
+            column_name!("items"),
+            column_name!("part"),
+        ]))
+        .stats_output_schemas()
+        .unwrap()
+        .unwrap();
+
+    let null_count = stats_struct_field(&schemas.logical, NULL_COUNT);
+    for name in ["id", "info", "entries", "items"] {
+        assert!(null_count.field(name).is_some(), "missing {name}");
+    }
+    assert!(null_count.field("part").is_none());
+
+    let min_values = stats_struct_field(&schemas.logical, MIN_VALUES);
+    assert!(min_values.field("id").is_some());
+    let info = stats_struct_field(min_values, "info");
+    assert!(info.field("name").is_some());
+    assert!(info.field("age").is_some());
+    assert!(min_values.field("entries").is_none());
+    assert!(min_values.field("items").is_none());
+}
+
+#[test]
+fn scan_builder_stats_output_schemas_validate_selected_columns() {
+    let table_root = "memory:///expected-stats-schemas-selected-columns/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+    let schema = schema_ref! {
+        nullable "info": {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+        },
+        nullable "part": STRING,
+    };
+    create_table(table_root, schema, "DefaultEngine")
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    let nested = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::struct_columns(vec![column_name!(
+            "info.name"
+        )]))
+        .stats_output_schemas()
+        .unwrap()
+        .unwrap();
+    let info = stats_struct_field(stats_struct_field(&nested.logical, MIN_VALUES), "info");
+    assert!(info.field("name").is_some());
+    assert!(info.field("age").is_none());
+
+    let partition_only = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("part")]));
+    assert!(partition_only.stats_output_schemas().unwrap().is_none());
+    partition_only.build().unwrap();
+
+    let unresolved = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("missing")]));
+    assert!(unresolved.stats_output_schemas().is_err());
+    assert!(unresolved.build().is_err());
 }
 
 #[rstest]

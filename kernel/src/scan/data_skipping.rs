@@ -229,9 +229,8 @@ impl DataSkippingFilter {
     ///
     /// The stats schema is derived from the predicate's column references via
     /// [`TableConfiguration::build_expected_physical_stats_schema`], matching the write side
-    /// exactly;
-    /// references outside the table's stats columns fold to NULL (keeping the file). Partition
-    /// values are parsed from the raw `add.partitionValues` string map with
+    /// exactly. References outside the table's stats columns fold to NULL (keeping the file).
+    /// Partition values are parsed from the raw `add.partitionValues` string map with
     /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
     ///
     /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data skipping

@@ -9,7 +9,7 @@
 //!
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -21,7 +21,6 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::scan::StatsOutputSchemas;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
@@ -42,6 +41,69 @@ use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, KernelError, Version};
+
+/// Logical and physical schemas for the structured statistics emitted by a scan.
+///
+/// [`ScanBuilder::stats_output_schemas`](crate::scan::ScanBuilder::stats_output_schemas) returns
+/// these schemas before the scan is built. The logical schema uses table-facing names, while the
+/// physical schema describes `stats_parsed` in scan metadata.
+///
+/// The schemas have the same shape and field order. They differ only in table column names when
+/// column mapping is enabled. Field metadata is removed from both schemas.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StatsOutputSchemas {
+    /// Schema using logical table column names.
+    pub logical: SchemaRef,
+    /// Schema using physical table column names.
+    pub physical: SchemaRef,
+}
+
+impl StatsOutputSchemas {
+    fn try_new(logical: SchemaRef, physical: SchemaRef) -> DeltaResult<Self> {
+        validate_stats_schema_alignment(&logical, &physical, "stats")?;
+        Ok(Self { logical, physical })
+    }
+}
+
+fn validate_stats_schema_alignment(
+    logical: &StructType,
+    physical: &StructType,
+    path: &str,
+) -> DeltaResult<()> {
+    if logical.num_fields() != physical.num_fields() {
+        return Err(KernelError::internal_error(format!(
+            "logical and physical stats schemas differ at '{path}'"
+        )));
+    }
+
+    for (index, (logical_field, physical_field)) in
+        logical.fields().zip(physical.fields()).enumerate()
+    {
+        let field_path = format!("{path}[{index}]");
+        if logical_field.is_nullable() != physical_field.is_nullable() {
+            return Err(KernelError::internal_error(format!(
+                "logical and physical stats schemas have different nullability at '{field_path}'"
+            )));
+        }
+
+        match (logical_field.data_type(), physical_field.data_type()) {
+            (
+                crate::schema::DataType::Struct(logical),
+                crate::schema::DataType::Struct(physical),
+            ) => {
+                validate_stats_schema_alignment(logical, physical, &field_path)?;
+            }
+            (logical, physical) if logical == physical => {}
+            _ => {
+                return Err(KernelError::internal_error(format!(
+                    "logical and physical stats schemas have different types at '{field_path}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Information about in-commit timestamp enablement state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +140,14 @@ fn build_stats_schema_for_columns(
         data_skipping_stats_columns: Some(selected_columns),
         data_skipping_num_indexed_cols: None,
     };
-    let schema = Arc::new(expected_stats_schema(data_schema, &config, None, None)?);
+    let required_columns = None;
+    let requested_columns = None;
+    let schema = Arc::new(expected_stats_schema(
+        data_schema,
+        &config,
+        required_columns,
+        requested_columns,
+    )?);
     Ok(strip_metadata(schema))
 }
 
@@ -327,6 +396,7 @@ impl TableConfiguration {
         let logical_data_schema = self.logical_schema_without_partition_columns();
         let logical_schema = self.logical_schema();
         let column_mapping_mode = self.column_mapping_mode();
+        let mut resolved_extras = HashMap::new();
         let required_logical_columns: Vec<_> = extra_indexed_columns
             .iter()
             .filter(|column| {
@@ -348,7 +418,10 @@ impl TableConfiguration {
                     );
                 })
                 .ok()
-                .map(|_| logical_column.clone())
+                .map(|physical_column| {
+                    resolved_extras.insert(logical_column.clone(), physical_column);
+                    logical_column.clone()
+                })
             })
             .collect();
 
@@ -365,7 +438,24 @@ impl TableConfiguration {
             Some(&required_logical_columns),
         );
 
-        self.build_selected_stats_output_schemas(&logical_columns)
+        let physical_columns = logical_columns
+            .iter()
+            .map(|logical_column| {
+                resolved_extras
+                    .get(logical_column)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        get_any_level_column_physical_name(
+                            &logical_schema,
+                            logical_column,
+                            column_mapping_mode,
+                        )
+                    })
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        self.build_stats_output_schemas_for_resolved_columns(&logical_columns, &physical_columns)
     }
 
     /// Builds the structured statistics schemas for explicitly selected logical columns.
@@ -396,20 +486,29 @@ impl TableConfiguration {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
+        self.build_stats_output_schemas_for_resolved_columns(logical_columns, &physical_columns)
+    }
+
+    fn build_stats_output_schemas_for_resolved_columns(
+        &self,
+        logical_columns: &[ColumnName],
+        physical_columns: &[ColumnName],
+    ) -> DeltaResult<Option<StatsOutputSchemas>> {
         let logical = build_stats_schema_for_columns(
             &self.logical_schema_without_partition_columns(),
             logical_columns,
         )?;
-        let physical = build_stats_schema_for_columns(
-            &self.physical_data_schema_without_partition_columns(),
-            &physical_columns,
-        )?;
-
+        // `expected_stats_schema` emits `nullCount` only when a data column is selected.
         if logical.field(NULL_COUNT).is_none() {
             return Ok(None);
         }
 
-        Ok(Some(StatsOutputSchemas { logical, physical }))
+        let physical = build_stats_schema_for_columns(
+            &self.physical_data_schema_without_partition_columns(),
+            physical_columns,
+        )?;
+
+        Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
     }
 
     /// Generates the expected physical schema for file statistics.
@@ -1058,7 +1157,7 @@ mod test {
 
     use rstest::rstest;
 
-    use super::{InCommitTimestampEnablement, TableConfiguration};
+    use super::{InCommitTimestampEnablement, StatsOutputSchemas, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
         column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
@@ -1080,6 +1179,37 @@ mod test {
         MockTableConfigurationBuilder,
     };
     use crate::KernelError;
+
+    #[test]
+    fn stats_output_schemas_allow_aligned_physical_names() {
+        let logical = schema_ref! {
+            nullable "minValues": { nullable "logical_name": LONG },
+        };
+        let physical = schema_ref! {
+            nullable "minValues": { nullable "physical_name": LONG },
+        };
+
+        StatsOutputSchemas::try_new(logical, physical).unwrap();
+    }
+
+    #[rstest]
+    #[case::different_shape(
+        schema_ref! { nullable "minValues": { nullable "a": LONG } },
+        schema_ref! { nullable "minValues": {} },
+        "differ at"
+    )]
+    #[case::different_type(
+        schema_ref! { nullable "minValues": { nullable "a": LONG } },
+        schema_ref! { nullable "minValues": { nullable "a": STRING } },
+        "different types"
+    )]
+    fn stats_output_schemas_require_aligned_shapes(
+        #[case] logical: SchemaRef,
+        #[case] physical: SchemaRef,
+        #[case] error: &str,
+    ) {
+        assert_result_error_with_message(StatsOutputSchemas::try_new(logical, physical), error);
+    }
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
