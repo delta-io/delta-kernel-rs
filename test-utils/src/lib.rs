@@ -199,7 +199,9 @@ use delta_kernel::schema::{
     schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
-use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::transaction::{
+    CommitResult, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
+};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
@@ -1190,14 +1192,25 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
-        .with_operation(operation.to_string())
+    let operation = match operation {
+        "WRITE" => UpdateTableOperation::Write,
+        "STREAMING UPDATE" => UpdateTableOperation::StreamingUpdate,
+        "ALTER TABLE" => UpdateTableOperation::AlterTable,
+        "DELETE" => UpdateTableOperation::Delete,
+        "UPDATE" => UpdateTableOperation::Update,
+        "MERGE" => UpdateTableOperation::Merge,
+        "OPTIMIZE" => UpdateTableOperation::Optimize,
+        operation => UpdateTableOperation::Custom(operation.to_string()),
+    };
+    let mut builder = snapshot
+        .transaction_builder()
+        .with_operation(operation)
         .with_data_change(data_change);
-    txn.ack_column_defaults();
     if is_blind_append {
-        txn = txn.with_blind_append();
+        builder = builder.with_blind_append();
     }
+    let mut txn = builder.build(engine.as_ref(), committer)?;
+    txn.ack_column_defaults();
 
     let write_state = txn.write_state()?;
     let write_context = write_state.write_context_builder().build()?;
@@ -1211,7 +1224,16 @@ pub async fn insert_data_with<E: TaskExecutor>(
 
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
 pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
-    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+    begin_transaction_with(snapshot, engine, |builder| builder)
+}
+
+/// Starts a transaction after applying `configure` to its builder.
+pub fn begin_transaction_with(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
+) -> Result<Transaction> {
+    configure(snapshot.transaction_builder()).build(engine, Box::new(FileSystemCommitter::new()))
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1252,8 +1274,17 @@ pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
 ) -> Result<Transaction> {
+    load_and_begin_transaction_with(table_url, engine, |builder| builder)
+}
+
+/// Loads a snapshot and starts a transaction after applying `configure` to its builder.
+pub fn load_and_begin_transaction_with(
+    table_url: impl AsRef<str>,
+    engine: &dyn Engine,
+    configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
+) -> Result<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
-    begin_transaction(snapshot, engine)
+    begin_transaction_with(snapshot, engine, configure)
 }
 
 // Helper function to set json values in a serde_json Values
@@ -1609,9 +1640,10 @@ pub async fn write_batch_to_table(
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction_builder()
         .with_engine_info("DefaultEngine")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
     txn.ack_column_defaults();
     let write_state = txn.write_state()?;
     let write_context = if txn.logical_partition_columns().is_empty() {
@@ -2092,9 +2124,10 @@ pub fn remove_all_and_get_remove_actions(
 
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction_builder()
         .with_engine_info("DefaultEngine")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }

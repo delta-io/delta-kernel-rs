@@ -486,8 +486,8 @@ async fn test_create_table_log_actions() -> Result<()> {
 
     // Create table
     let _ = create_table(&table_path, schema, engine_info)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .with_operation_parameters([("mode", Some("Create")), ("description", None)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .with_operation_metrics([("numFiles", Some("0"))])
         .commit(engine.as_ref())?;
 

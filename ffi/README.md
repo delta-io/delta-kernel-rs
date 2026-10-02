@@ -2,6 +2,40 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Building an update transaction
+
+Connectors configure transaction intent on a builder and use the built transaction for
+write-dependent information and staged actions. Every `update_table_txn_builder_with_*` function
+consumes its builder handle and returns a replacement, so callers must overwrite the old handle.
+
+```c
+HandleSharedSnapshot snapshot = /* unwrap(snapshot_builder_build(...)) */;
+HandleExclusiveUpdateTableTransactionBuilder builder = new_update_table_txn_builder(snapshot);
+builder = unwrap(update_table_txn_builder_with_engine_info(
+    builder, slice("my-engine/1.0"), engine));
+builder = update_table_txn_builder_with_operation(
+    builder, KernelUpdateTableOperationWrite);
+builder = update_table_txn_builder_with_data_change(builder, true);
+
+HandleExclusiveUpdateTableTransaction txn = unwrap(update_table_txn_builder_build(builder, engine));
+/* Write files, then call update_table_txn_add_files(txn, metadata). */
+txn = unwrap(update_table_txn_with_operation_metrics(txn, &metrics, engine));
+HandleExclusiveCommittedTransaction committed = unwrap(update_table_txn_commit(txn, engine));
+uint64_t version = committed_transaction_version(&committed);
+free_committed_transaction(committed);
+```
+
+Here `slice` and `unwrap` stand for the connector's usual `KernelStringSlice` and `ExternResult`
+helpers.
+
+Create-table connectors use the same shape: call `new_create_table_txn_builder`, apply
+`create_table_txn_builder_with_*` functions, then call `create_table_txn_builder_build`. Application
+transaction identifiers are available on both builders; metadata removals are update-only. Nested
+schema changes use `update_table_txn_builder_add_column_at` and
+`update_table_txn_builder_set_nullable` with segmented `FfiColumnName` paths. A snapshot returned
+by `committed_transaction_post_commit_snapshot` is independently owned and must be released with
+`free_snapshot`.
+
 ## Building
 
 ### Building Kernel and Headers

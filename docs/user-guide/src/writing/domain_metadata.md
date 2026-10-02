@@ -26,6 +26,7 @@ transactions.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -33,12 +34,15 @@ transactions.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_builder()
     .with_domain_metadata(
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
-    .with_operation("UPDATE METADATA".to_string());
+    .with_operation(UpdateTableOperation::Custom(
+        "UPDATE METADATA".to_string(),
+    ))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 txn.commit(&engine)?;
 # Ok(())
@@ -61,9 +65,9 @@ calling `with_domain_metadata` more than once with different domain names.
 ## Removing domain metadata
 
 To remove a domain from an existing table, call `with_domain_metadata_removed()`
-on an existing-table transaction. This method is not available on create-table
-transactions because there is no metadata to remove from a table that does not
-exist yet.
+on the update-table builder or built transaction. This method is not available
+on create-table transactions because there is no metadata to remove from a table
+that does not exist yet.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -73,6 +77,7 @@ exist yet.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -80,11 +85,14 @@ exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_domain_metadata_removed("myConnector.settings".to_string())
-    .with_operation("REMOVE METADATA".to_string());
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom(
+        "REMOVE METADATA".to_string(),
+    ))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
-txn.commit(&engine)?;
+txn.with_domain_metadata_removed("myConnector.settings".to_string())
+    .commit(&engine)?;
 # Ok(())
 # }
 ```
@@ -162,10 +170,8 @@ apply:
   transaction.
 
 > [!NOTE]
-> Validation is deferred until `commit()`. The builder methods
-> `with_domain_metadata()` and `with_domain_metadata_removed()` do not check
-> for duplicates or reserved prefixes eagerly. Errors surface when you call
-> `commit()`.
+> Builder-provided domain metadata is validated by `build()`. Additions attached to a built
+> transaction are validated by `commit()`. Setter calls themselves only accumulate intent.
 
 ## What's next
 

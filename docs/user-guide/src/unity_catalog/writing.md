@@ -78,8 +78,9 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone().transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .build(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -285,8 +286,9 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone().transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .build(&engine, committer)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;

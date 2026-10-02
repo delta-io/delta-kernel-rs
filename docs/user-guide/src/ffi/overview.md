@@ -46,7 +46,7 @@ that carry ownership semantics. There are two kinds:
   drops the underlying object if it was the last reference.
 
 Every handle has a corresponding `free_*` function that you must call to release it.
-For example, `free_engine`, `free_snapshot`, `free_scan`, `free_transaction`.
+For example, `free_engine`, `free_snapshot`, `free_scan`, `free_update_table_txn`.
 
 Several FFI functions _consume_ their handle argument and return a new handle. After
 calling such a function, you must not use the old handle. The function documentation
@@ -76,13 +76,15 @@ A typical write flow:
 ```text
 get_default_engine()  ->  Handle<SharedExternEngine>
         |
-    transaction()     ->  Handle<ExclusiveTransaction>
+new_update_table_txn_builder() -> Handle<ExclusiveUpdateTableTransactionBuilder>
         |
-  with_engine_info()  ->  Handle<ExclusiveTransaction>
+update_table_txn_builder_with_engine_info()
         |
-    add_files()
+update_table_txn_builder_build() -> Handle<ExclusiveUpdateTableTransaction>
         |
-    commit()          ->  ExternResult<u64>  (committed version)
+    update_table_txn_add_files()
+        |
+    update_table_txn_commit() -> Handle<ExclusiveCommittedTransaction>
 ```
 
 For more control over scans, you can use the scan builder API instead of the
@@ -227,23 +229,34 @@ feature is enabled; the rest are always available.
 
 | Function | Purpose |
 |----------|---------|
-| `transaction` | Start a write transaction on the latest snapshot |
-| `transaction_with_committer` | Start a transaction with a custom committer |
-| `with_engine_info` | Record a free-form engine identifier on the transaction (consumes and returns a new handle) |
-| `with_transaction_id` | Set an `(app_id, version)` pair for idempotent writes (consumes and returns a new handle; see [Idempotent Writes](../writing/idempotent_writes.md)) |
-| `with_domain_metadata` / `with_domain_metadata_removed` | Attach or remove a domain-metadata entry (each consumes and returns a new handle) |
-| `add_files` | Append file-level write metadata to the transaction |
-| `set_data_change` | Toggle the transaction's data-change flag (does not consume the handle) |
-| `remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
-| `commit` | Commit the transaction and return the new version number |
-| `free_transaction` | Release the transaction handle without committing |
+| `new_update_table_txn_builder` | Create a builder from a snapshot |
+| `update_table_txn_builder_with_engine_info` | Record a connector name and version before writing |
+| `update_table_txn_builder_with_operation` / `update_table_txn_builder_with_custom_operation` | Select the operation stored in table history |
+| `update_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair for idempotent writes (see [Idempotent Writes](../writing/idempotent_writes.md)) |
+| `update_table_txn_builder_with_domain_metadata` / `update_table_txn_builder_with_domain_metadata_removed` | Add or remove user domain metadata |
+| `update_table_txn_builder_build` / `update_table_txn_builder_build_with_committer` | Consume the builder and produce a transaction |
+| `free_update_table_txn_builder` | Release a builder without building it |
+| `update_table_txn_with_domain_metadata` / `update_table_txn_with_domain_metadata_removed` | Add or remove late-bound domain metadata on a built transaction |
+| `update_table_txn_add_files` | Append file-level write metadata to the transaction |
+| `update_table_txn_remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
+| `update_table_txn_commit` | Commit the transaction and return a committed-transaction handle |
+| `free_update_table_txn` | Release the transaction handle without committing |
+| `committed_transaction_version` / `committed_transaction_post_commit_snapshot` | Inspect a committed transaction without consuming it; the returned snapshot is independently owned |
+| `free_committed_transaction` | Release the committed-transaction handle |
 
 **Write context and file writing**
 
 Use a `BoundWriteContext` to learn where to write parquet files and what schema to
 write. For unpartitioned writes, one context serves the whole transaction.
 For partitioned writes, create one context per partition by passing a
-`PartitionValueMap` to `get_partitioned_write_context`.
+`PartitionValueMap` to `update_table_txn_get_partitioned_write_context`.
+
+For distributed writes, `update_table_txn_write_state` borrows the transaction and returns an owned
+`SharedWriteState` that remains valid after the transaction is committed or freed. Encode it on the
+driver with `write_state_encode`, decode it on workers running the same Kernel version with
+`write_state_decode`, and create one consuming `ExclusiveWriteContextBuilder` per output partition.
+Builders and built contexts retain their own state reference, so callers may free the original
+state after creating them.
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
 layout) onto the returned table root. For partitioned tables, use
@@ -254,8 +267,15 @@ unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
-| `get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
-| `get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
+| `update_table_txn_write_state` | Borrow a transaction and return owned, immutable write state |
+| `write_state_encode` / `write_state_decode` | Transport write state between processes using the same Kernel version |
+| `write_context_builder` | Create a consuming builder for one output partition |
+| `write_context_builder_with_partition_values` / `write_context_builder_with_physical_partition_values` | Bind logical or physical partition values |
+| `write_context_builder_with_row_tracking_columns` / `write_context_builder_build` | Bind row-tracking columns and build the context |
+| `get_write_state_stats_columns` | Visit physical columns that require statistics |
+| `free_write_state` / `free_write_context_builder` | Release unused owned handles |
+| `update_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
+| `update_table_txn_get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
 | `get_write_dir` | Return the recommended write subdirectory for a partitioned `SharedWriteContext` |
 | `get_write_path` | Return the table root URL from a `SharedWriteContext` (engines append their own subdirectory and filename) |
 | `get_write_schema` | Return the logical (user-facing) write schema from a `SharedWriteContext` |
@@ -272,17 +292,18 @@ unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
-| `get_create_table_builder` | Create a builder for a new Delta table with a schema |
-| `create_table_builder_with_table_property` | Add a table property to the builder |
-| `create_table_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
-| `create_table_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
-| `create_table_with_engine_info` | Attach a free-form engine identifier to a create-table transaction (consumes and returns a new handle) |
-| `create_table_set_data_change` | Toggle the data-change flag on a create-table transaction (does not consume the handle) |
-| `create_table_get_unpartitioned_write_context` | Get a `BoundWriteContext` to stage initial data files during table creation |
-| `create_table_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
-| `create_table_commit` | Commit the create-table transaction |
-| `free_create_table_builder` | Release a create-table builder handle (before it is consumed by `create_table_builder_build*`) |
-| `create_table_free_transaction` | Release a create-table transaction handle (after build, before commit) |
+| `new_create_table_txn_builder` | Create a builder for a new Delta table with a schema |
+| `create_table_txn_builder_with_table_property` | Add a table property to the builder |
+| `create_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair to the create commit |
+| `create_table_txn_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
+| `create_table_txn_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
+| `create_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` to stage initial data files during table creation |
+| `create_table_txn_add_files` | Register file metadata for initial data being written alongside the CREATE TABLE commit |
+| `create_table_txn_commit` | Commit the create-table transaction |
+| `free_create_table_txn_builder` | Release a create-table builder handle (before it is consumed by `create_table_txn_builder_build*`) |
+| `free_create_table_txn` | Release a create-table transaction handle (after build, before commit) |
+
+Initial Add actions in a create-table transaction always use `dataChange = true`.
 
 **Change data feed (table changes)**
 
@@ -324,7 +345,7 @@ catalog-aware committer without implementing the committer trait from scratch.
 | Function | Purpose |
 |----------|---------|
 | `get_uc_commit_client` | Wrap an engine-provided `CCommit` callback in a `SharedFfiUCCommitClient` |
-| `get_uc_committer` | Produce a `MutableCommitter` bound to a specific `table_id`, ready to pass to `transaction_with_committer` |
+| `get_uc_committer` | Produce a `MutableCommitter` bound to a specific `table_id`, ready to pass to `update_table_txn_builder_build_with_committer` |
 | `free_uc_commit_client` / `free_uc_committer` | Release the corresponding handles |
 
 **Expressions and predicates**
@@ -433,8 +454,8 @@ exercises a different slice of the API.
 |---------|--------------|
 | [`read-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/read-table) | The full read path: schema visiting, scan-metadata iteration, and Arrow data handling. Pass `-a` to switch from the callback-based scan-metadata path to the Arrow batch-mode path (`scan_metadata_next_arrow`). |
 | [`read-table-changes`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/read-table-changes) | Reading a [change data feed](../reading/change_data_feed.md) using `table_changes_*` and consuming `ArrowFFIData` batches from `scan_table_changes_next`. |
-| [`create-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/create-table) | Creating a new Delta table via the `get_create_table_builder` / `create_table_builder_build` / `create_table_commit` flow. |
-| [`write-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/write-table) | Appending data to an existing table via the `transaction` / `add_files` / `commit` flow. |
+| [`create-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/create-table) | Creating a new Delta table via the `new_create_table_txn_builder` / `create_table_txn_builder_build` / `create_table_txn_commit` flow. |
+| [`write-table`](https://github.com/delta-io/delta-kernel-rs/tree/main/ffi/examples/write-table) | Appending data to an existing table via the `update_table_txn_builder_*` / `update_table_txn_add_files` / `update_table_txn_commit` flow. |
 
 The high-level flow in the `read-table` example:
 

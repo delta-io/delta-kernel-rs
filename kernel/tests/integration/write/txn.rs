@@ -1,11 +1,12 @@
 //! Integration tests for transaction-identifier write paths.
 
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
+use test_utils::{set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{get_simple_int_schema, validate_txn_id, ZERO_UUID};
 
@@ -21,18 +22,21 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
-            load_and_begin_transaction(table_url.clone(), &engine)?
+            snapshot.clone().transaction_builder()
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
-                .commit(&engine),
-            Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
+                .build(&engine, Box::new(FileSystemCommitter::new())),
+            Err(KernelError::InvalidTransactionState(msg)) if msg.contains("app_id app_id1")
         ));
 
-        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
+        let txn = snapshot
+            .transaction_builder()
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
-            .with_transaction_id("app_id2".to_string(), 2);
+            .with_transaction_id("app_id2".to_string(), 2)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         // commit!
         assert!(txn.commit(&engine)?.is_committed());

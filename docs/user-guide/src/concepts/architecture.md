@@ -155,9 +155,10 @@ A `Transaction` writes data to a table. It is built from a snapshot:
 
 ```rust,ignore
 let mut txn = snapshot                              // Arc<Snapshot>
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // Write Parquet files, then register their metadata.
 txn.add_files(file_metadata);
@@ -180,8 +181,8 @@ build that batch from Parquet write results.
 > create-table transactions the operation is fixed to `"CREATE TABLE"` and
 > cannot be overridden.
 
-For schema evolution, start from the snapshot's `alter_table()` builder
-instead of `transaction()`. See
+For schema evolution, start from the snapshot's `transaction_builder()`, select
+`UpdateTableOperation::AlterTable`, and add the schema changes. See
 [Altering a Table](../writing/alter_table.md).
 
 See [Quick Start: Writing a Table](../getting_started/quick_start_write.md) for a complete example.

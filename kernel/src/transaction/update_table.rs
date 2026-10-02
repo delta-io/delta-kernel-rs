@@ -63,9 +63,8 @@ impl Transaction {
     /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
     /// to read the current state of the table (e.g. to read the current version).
     ///
-    /// Instead of using this API, the more typical (user-facing) API is
-    /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
-    /// a snapshot.
+    /// Instead of using this API, the typical user-facing API is
+    /// [`Snapshot::transaction_builder`](crate::snapshot::Snapshot::transaction_builder).
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
@@ -117,9 +116,9 @@ impl Transaction {
             should_emit_metadata: false,
             committer,
             operation: None,
-            engine_info: None,
             operation_parameters: None,
             operation_metrics: None,
+            engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -129,6 +128,7 @@ impl Transaction {
             provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
+            infer_data_change: false,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
@@ -150,15 +150,16 @@ impl Transaction {
     ///
     /// Blind append transactions should only add new files and avoid write operations that
     /// depend on existing table state.
-    pub fn with_blind_append(mut self) -> Self {
+    pub(super) fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
         self
     }
 
-    /// Set the operation that this transaction is performing. This string will be persisted in the
-    /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
+    pub(super) fn with_update_table_operation(
+        mut self,
+        operation: super::UpdateTableOperation,
+    ) -> Self {
+        self.operation = Some(operation.into());
         self
     }
 
@@ -173,13 +174,14 @@ impl Transaction {
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> Result<Self> {
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::IcebergCompatV3)
-        {
-            return Err(KernelError::unsupported(
-                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
-            ));
+        let unsupported_iceberg_compat =
+            [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
+                .into_iter()
+                .find(|feature| self.effective_table_config.is_feature_enabled(feature));
+        if let Some(feature) = unsupported_iceberg_compat {
+            return Err(KernelError::unsupported(format!(
+                "Schema changes are not yet supported on tables with {feature} enabled"
+            )));
         }
         if self
             .effective_table_config
@@ -376,7 +378,10 @@ impl Transaction {
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let mut txn = snapshot
+    ///     .clone()
+    ///     .transaction_builder()
+    ///     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -461,8 +466,11 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
-    ///     .with_operation("UPDATE".to_string());
+    /// let mut txn = snapshot
+    ///     .clone()
+    ///     .transaction_builder()
+    ///     .with_operation(UpdateTableOperation::Update)
+    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?

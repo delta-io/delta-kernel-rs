@@ -21,6 +21,7 @@ use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::UpdateTableOperation;
 #[cfg(feature = "internal-api")]
 use delta_kernel::LogPath;
 use delta_kernel::{Result, Snapshot};
@@ -562,10 +563,11 @@ async fn setup_table_with_dms_and_set_txns(write_crc: bool) -> Result<(Url, temp
         .unwrap_post_commit_snapshot();
 
     let snap_v1 = snap_v0
-        .transaction(committer(), engine.as_ref())?
-        .with_operation("WRITE".to_string())
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
-        .with_transaction_id("my-app".to_string(), 1)
+        .with_transaction_id("my-app", 1)
+        .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 

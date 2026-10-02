@@ -31,7 +31,7 @@ may differ.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -42,10 +42,11 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Write)
     .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
@@ -92,18 +93,19 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Write)
     .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 The builder methods:
 
 | Method | Purpose |
 |--------|---------|
-| `with_operation(String)` | Operation name stored in the commit log (e.g. `"INSERT"`, `"MERGE"`) |
-| `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
+| `with_operation(UpdateTableOperation)` | Typed operation stored in the commit log; use `UpdateTableOperation::Custom` for connector-specific names |
+| `with_engine_info(impl Into<String>)` | Supplies the connector name and version recorded in commit information |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## WriteState and BoundWriteContext
@@ -214,9 +216,8 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Transaction methods that prepare or register data files (`write_state`, `add_files`, and
-> `stats_schema`) are gated by the `SupportsDataFiles` trait bound. They're available on standard
-> write transactions but not on metadata-only transaction states such as `AlterTable`.
+> Unless overridden, non-`ALTER TABLE` operations default `dataChange` to `true`.
+> `ALTER TABLE` infers `false` for metadata-only commits and `true` when file actions are staged.
 
 ## Committing
 
@@ -247,9 +248,10 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_blind_append();
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .with_blind_append()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
@@ -279,10 +281,11 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
     .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
     .with_operation_metrics([("numFiles", Some("1"))])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 

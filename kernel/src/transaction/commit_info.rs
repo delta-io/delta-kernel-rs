@@ -79,6 +79,12 @@ impl<S> Transaction<S> {
     ) -> Result<Box<dyn EngineData>, KernelError> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
+                require!(
+                    engine_commit_info.len() == 1,
+                    KernelError::invalid_transaction_state(
+                        "Connector commit info must contain exactly one row",
+                    )
+                );
                 let kernel_schema = CommitInfo::to_schema();
                 let mut commit_info = kernel_commit_info;
                 if engine_commit_info_schema.contains("tags") {
@@ -158,7 +164,9 @@ impl RowVisitor for CommitInfoTagsVisitor {
     ) -> Result<(), KernelError> {
         require!(
             row_count == 1,
-            KernelError::generic("Connector commit info must contain exactly one row")
+            KernelError::invalid_transaction_state(
+                "Connector commit info must contain exactly one row"
+            )
         );
         let [tags_getter] = getters else {
             return Err(KernelError::internal_error(format!(
@@ -183,8 +191,8 @@ mod tests {
     use super::CommitInfoTagsVisitor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
-        Array, ArrayRef, AsArray, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
-        StringBuilder, StructArray,
+        Array, ArrayRef, AsArray, BooleanArray, Int64Array, MapArray, MapBuilder,
+        RecordBatchOptions, StringArray, StringBuilder, StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -291,8 +299,9 @@ mod tests {
     ) -> Result<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string())
+            .transaction_builder()
+            .with_operation(crate::transaction::UpdateTableOperation::Write)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)
             });
@@ -428,9 +437,23 @@ mod tests {
             ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
+        let mut kernel_commit_info = make_kernel_commit_info();
+        kernel_commit_info.operation_parameters = Some(
+            [(
+                "current_parameter".to_string(),
+                Some("current_value".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        kernel_commit_info.operation_metrics = Some(
+            [("current_metric".to_string(), Some("1".to_string()))]
+                .into_iter()
+                .collect(),
+        );
 
         let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+            txn.generate_commit_info(engine.as_ref(), kernel_commit_info)?,
         )?;
         let commit_info = commit_info_struct(&result);
 
@@ -442,8 +465,14 @@ mod tests {
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
-        assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
-        assert!(get_map(commit_info, "operationMetrics").is_empty());
+        let parameters = get_map(commit_info, "operationParameters");
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(get_str(&parameters, "key"), "current_parameter");
+        assert_eq!(get_str(&parameters, "value"), "current_value");
+        let metrics = get_map(commit_info, "operationMetrics");
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(get_str(&metrics, "key"), "current_metric");
+        assert_eq!(get_str(&metrics, "value"), "1");
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
@@ -549,28 +578,40 @@ mod tests {
         Ok(())
     }
 
-    /// engine schema is empty -- all CommitInfo fields are prepended (which, with no engine
-    /// fields preceding them, is equivalent to producing the full CommitInfo schema).
-    #[test]
-    fn test_build_commit_info_empty_engine_schema() -> Result<()> {
-        // A 0-row, 0-column RecordBatch with an empty kernel schema.
-        let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
+    #[rstest::rstest]
+    #[case::zero_rows(0, false)]
+    #[case::one_row(1, true)]
+    #[case::two_rows(2, false)]
+    fn test_build_commit_info_empty_engine_schema(
+        #[case] row_count: usize,
+        #[case] succeeds: bool,
+    ) -> Result<()> {
+        let empty_batch = RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        )?;
         let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),
             empty_schema,
         )))?;
 
-        let result = ArrowEngineData::try_from_engine_data(
-            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
-        )?;
+        let result = txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info());
+        if !succeeds {
+            assert_result_error_with_message(
+                result,
+                "Connector commit info must contain exactly one row",
+            );
+            return Ok(());
+        }
+
+        let result = ArrowEngineData::try_from_engine_data(result?)?;
         let ci = commit_info_struct(&result);
 
-        // With no engine fields, the inner schema matches CommitInfo::to_schema().
         let kernel_schema = CommitInfo::to_schema();
         assert_eq!(ci.num_columns(), kernel_schema.fields().count());
 
-        // Column order matches CommitInfo schema field order.
         for (i, field) in kernel_schema.fields().enumerate() {
             assert_eq!(ci.fields()[i].name(), field.name());
         }
