@@ -7,8 +7,8 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Engine,
-    FileMeta, FileSlice, JsonHandler, KernelError, ParquetHandler, Snapshot, StorageHandler,
+    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
+    KernelError, ParquetHandler, Result, ResultIteratorStatic, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -71,17 +71,18 @@ async fn precancelled_scan_yields_cancelled(
 }
 
 /// Asserts that `scan_metadata` reports cancellation before producing any data.
-fn assert_cancelled<
-    I: Iterator<Item = delta_kernel::DeltaResult<delta_kernel::scan::ScanMetadata>>,
->(
-    result: delta_kernel::DeltaResult<I>,
+fn assert_cancelled<I: Iterator<Item = delta_kernel::Result<delta_kernel::scan::ScanMetadata>>>(
+    result: delta_kernel::Result<I>,
 ) {
     match result {
-        Err(KernelError::Cancelled) => {}
+        Err(delta_kernel::Error::Kernel(KernelError::Cancelled)) => {}
         Err(other) => panic!("expected Cancelled, got {other:?}"),
         Ok(mut iter) => {
             assert!(
-                matches!(iter.next(), Some(Err(KernelError::Cancelled))),
+                matches!(
+                    iter.next(),
+                    Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)))
+                ),
                 "cancelled scan must yield Err(Cancelled), never an Ok batch or bare None"
             );
         }
@@ -133,7 +134,10 @@ async fn mid_stream_cancellation_yields_cancelled() -> Result<(), Box<dyn std::e
 
     token.cancel();
 
-    assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        iter.next(),
+        Some(Err(delta_kernel::Error::Kernel(KernelError::Cancelled)))
+    ));
     Ok(())
 }
 
@@ -257,7 +261,10 @@ async fn parallel_scan_metadata_errors_when_token_set() -> Result<(), Box<dyn st
 
     let result = scan.parallel_scan_metadata(engine);
     assert!(
-        matches!(result, Err(KernelError::Unsupported(_))),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Unsupported(_)))
+        ),
         "parallel_scan_metadata must reject a cancellation token"
     );
     Ok(())
@@ -276,7 +283,10 @@ async fn precancelled_snapshot_build_yields_cancelled() -> Result<(), Box<dyn st
         .build(&engine);
 
     assert!(
-        matches!(result, Err(KernelError::Cancelled)),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ),
         "a cancelled snapshot build must surface KernelError::Cancelled"
     );
     Ok(())
@@ -310,7 +320,7 @@ struct CancelOnListHandler {
 }
 
 impl StorageHandler for CancelOnListHandler {
-    fn list_from(&self, path: &url::Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &url::Url) -> Result<ResultIteratorStatic<FileMeta>> {
         self.inner.list_from(path)
     }
 
@@ -318,16 +328,13 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         path: &url::Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    ) -> Result<ResultIteratorStatic<FileMeta>> {
         self.token.cancel();
         self.inner
             .list_from_with_cancellation(path, cancellation_token)
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<bytes::Bytes>> {
         self.inner.read_files(files)
     }
 
@@ -335,24 +342,24 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+    ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
         self.inner
             .read_files_with_cancellation(files, cancellation_token)
     }
 
-    fn put(&self, path: &url::Url, data: bytes::Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &url::Url, data: bytes::Bytes, overwrite: bool) -> Result<()> {
         self.inner.put(path, data, overwrite)
     }
 
-    fn copy_atomic(&self, src: &url::Url, dest: &url::Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &url::Url, dest: &url::Url) -> Result<()> {
         self.inner.copy_atomic(src, dest)
     }
 
-    fn head(&self, path: &url::Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &url::Url) -> Result<FileMeta> {
         self.inner.head(path)
     }
 
-    fn delete(&self, path: &url::Url) -> DeltaResult<()> {
+    fn delete(&self, path: &url::Url) -> Result<()> {
         self.inner.delete(path)
     }
 }
@@ -398,7 +405,10 @@ async fn snapshot_build_cancelled_during_listing() -> Result<(), Box<dyn std::er
         .with_cancellation_token(token.clone() as CancellationTokenRef)
         .build(&engine);
     assert!(
-        matches!(result, Err(KernelError::Cancelled)),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ),
         "cancellation during listing must surface from build()"
     );
     Ok(())
@@ -421,7 +431,10 @@ async fn precancelled_incremental_snapshot_build_yields_cancelled(
         .build(&engine);
 
     assert!(
-        matches!(result, Err(KernelError::Cancelled)),
+        matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ),
         "a cancelled incremental snapshot build must surface KernelError::Cancelled"
     );
     Ok(())

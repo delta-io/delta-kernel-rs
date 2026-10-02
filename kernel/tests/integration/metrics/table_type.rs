@@ -9,7 +9,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::metrics::{MetricEvent, TableType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{Engine, Result, Snapshot};
 use rstest::rstest;
 use test_utils::{
     add_commit, engine_store_setup, insert_data_with, install_thread_local_metrics_reporter,
@@ -22,11 +22,11 @@ use super::simple_schema;
 #[case::path_based(false)]
 #[case::catalog_managed(true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_metric_events_carry_table_type(#[case] catalog_managed: bool) -> DeltaResult<()> {
+async fn test_metric_events_carry_table_type(#[case] catalog_managed: bool) -> Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let build_snapshot = |max_catalog_version: u64| -> DeltaResult<Arc<Snapshot>> {
+    let build_snapshot = |max_catalog_version: u64| -> Result<Arc<Snapshot>> {
         let builder = Snapshot::builder_for(table_url.clone());
         let builder = if catalog_managed {
             builder.with_max_catalog_version(max_catalog_version)
@@ -142,7 +142,7 @@ async fn test_build_validation_mismatch_events_carry_requested_table_type(
     #[case] create_catalog_managed: bool,
     #[case] request_catalog_version: bool,
     #[case] expected: TableType,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -179,7 +179,7 @@ pub(super) fn create_simple_table(
     engine: &dyn Engine,
     table_path: &str,
     catalog_managed: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let builder = create_table(table_path, simple_schema(), "Test/1.0");
     let builder = if catalog_managed {
         builder.with_table_properties([

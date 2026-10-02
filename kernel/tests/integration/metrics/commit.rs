@@ -12,7 +12,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{Result, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
@@ -50,7 +50,7 @@ impl LastCommitSuccess {
     }
 }
 
-fn setup_empty_table() -> DeltaResult<(tempfile::TempDir, Url)> {
+fn setup_empty_table() -> Result<(tempfile::TempDir, Url)> {
     let (temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     create_table(&table_path, simple_schema(), "Test/1.0")
@@ -69,7 +69,7 @@ async fn commit_append_emits_success_metrics(
     #[case] operation: &str,
     #[case] data_change: bool,
     #[case] is_blind_append: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_url) = setup_empty_table()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
@@ -103,7 +103,7 @@ async fn commit_append_emits_success_metrics(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
+async fn commit_reports_added_file_count_not_batch_count() -> Result<()> {
     // num_add_files counts added FILES, not add_files() batches: two batches of two files each
     // must report 4. A regression to add_files_metadata.len() (a batch count) would report 2.
     let (_temp_dir, table_url) = setup_empty_table()?;
@@ -129,7 +129,8 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
     ];
     for batch in batches {
         let metadata = create_add_files_metadata(add_files_schema, batch)
-            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+            .map_err(delta_kernel::Error::Kernel)?;
         txn.add_files(metadata);
     }
     txn.commit(engine.as_ref())?.unwrap_committed();
@@ -142,7 +143,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
 /// Sets the correlation id on the `Transaction` returned by `build()` and checks it reaches the
 /// commit metric event. The two tests below instead set it on the builder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
+async fn commit_success_carries_correlation_id() -> Result<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -170,7 +171,7 @@ async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
 async fn create_table_builder_carries_correlation_id(
     #[case] correlation_id: Option<&str>,
     #[case] expected: Option<&str>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -202,7 +203,7 @@ async fn create_table_builder_carries_correlation_id(
 async fn alter_table_builder_carries_correlation_id(
     #[case] correlation_id: Option<&str>,
     #[case] expected: Option<&str>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     create_table(&table_path, simple_schema(), "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -233,7 +234,7 @@ async fn alter_table_builder_carries_correlation_id(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
+async fn commit_conflict_emits_conflict_metric() -> Result<()> {
     // GIVEN a table at v0 (00.json) and a snapshot pinned to it.
     let (_temp_dir, table_url) = setup_empty_table()?;
     let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -264,7 +265,7 @@ async fn commit_conflict_emits_conflict_metric() -> DeltaResult<()> {
 #[case::path_based(false)]
 #[case::catalog_managed(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_success_carries_table_type(#[case] catalog_managed: bool) -> DeltaResult<()> {
+async fn commit_success_carries_table_type(#[case] catalog_managed: bool) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     create_simple_table(engine.as_ref(), &table_path, catalog_managed)?;

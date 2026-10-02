@@ -4,7 +4,7 @@ use delta_kernel_derive::internal_api;
 
 use crate::error::KernelError;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData};
+use crate::{Engine, EngineData, Error, Result};
 
 /// Writes a single leaf manifest for a manifest (content-tree) commit.
 ///
@@ -47,20 +47,20 @@ impl LeafNodeWriter {
         &mut self,
         _engine: &dyn Engine,
         _add_metadata: Box<dyn EngineData>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         // TODO(#3352): implement buffering appends, and add the other update kinds a leaf must
         // accept (existing-file moves/removals and deletion-vector updates).
-        Err(KernelError::unsupported(
+        Err(Error::Kernel(KernelError::unsupported(
             "manifest commit leaf writer add_files is not yet supported",
-        ))
+        )))
     }
 
     /// Writes the buffered changes as a leaf manifest and returns its [`LeafNodeWriterResult`].
     #[internal_api]
-    pub(crate) fn finish(self, _engine: &dyn Engine) -> DeltaResult<LeafNodeWriterResult> {
+    pub(crate) fn finish(self, _engine: &dyn Engine) -> Result<LeafNodeWriterResult> {
         // TODO(#3352): write the buffered changes as a leaf manifest.
-        Err(KernelError::unsupported(
+        Err(Error::Kernel(KernelError::unsupported(
             "manifest commit leaf writer finish is not yet supported",
-        ))
+        )))
     }
 }

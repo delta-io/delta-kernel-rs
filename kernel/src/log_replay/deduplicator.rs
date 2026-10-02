@@ -17,7 +17,7 @@ use tracing::warn;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::FileActionKey;
-use crate::DeltaResult;
+use crate::KernelResult;
 
 /// Information we want to return to the add-dedup about file related actions
 pub(crate) struct FileActionInfo {
@@ -40,7 +40,7 @@ pub(crate) trait Deduplicator {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> DeltaResult<Option<FileActionInfo>>;
+    ) -> KernelResult<Option<FileActionInfo>>;
 
     /// Checks if this file has been seen. When `is_log_batch() = true`, updates the hashmap
     /// to track new files. Returns `true` if the file should be filtered out.
@@ -63,14 +63,19 @@ pub(crate) trait Deduplicator {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         dv_start_index: usize,
-    ) -> DeltaResult<Option<String>> {
-        let Some(storage_type) =
-            getters[dv_start_index].get_opt(i, "deletionVector.storageType")?
+    ) -> KernelResult<Option<String>> {
+        let Some(storage_type) = getters[dv_start_index]
+            .get_opt(i, "deletionVector.storageType")
+            .map_err(crate::Error::into_kernel_error)?
         else {
             return Ok(None);
         };
-        let path_or_inline = getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
-        let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
+        let path_or_inline = getters[dv_start_index + 1]
+            .get(i, "deletionVector.pathOrInlineDv")
+            .map_err(crate::Error::into_kernel_error)?;
+        let offset = getters[dv_start_index + 2]
+            .get_opt(i, "deletionVector.offset")
+            .map_err(crate::Error::into_kernel_error)?;
 
         Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
             storage_type,
@@ -102,7 +107,7 @@ impl<'a> CheckpointDeduplicator<'a> {
         add_path_index: usize,
         add_size_index: usize,
         add_dv_start_index: usize,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Ok(CheckpointDeduplicator {
             seen_file_keys,
             add_path_index,
@@ -119,12 +124,18 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
         i: usize,
         getters: &[&'b dyn GetData<'b>],
         _skip_removes: bool,
-    ) -> DeltaResult<Option<FileActionInfo>> {
-        let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? else {
+    ) -> KernelResult<Option<FileActionInfo>> {
+        let Some(path) = getters[self.add_path_index]
+            .get_str(i, "add.path")
+            .map_err(crate::Error::into_kernel_error)?
+        else {
             return Ok(None);
         };
         let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
-        let size = match getters[self.add_size_index].get_long(i, "add.size")? {
+        let size = match getters[self.add_size_index]
+            .get_long(i, "add.size")
+            .map_err(crate::Error::into_kernel_error)?
+        {
             Some(s) => u64::try_from(s).unwrap_or_else(|e| {
                 warn!("Could not convert add.size {s} to u64: {e}");
                 0

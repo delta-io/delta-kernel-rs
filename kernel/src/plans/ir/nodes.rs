@@ -16,7 +16,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
-use crate::{DeltaResult, FileMeta, KernelError};
+use crate::{Error, FileMeta, KernelError, KernelResult, Result};
 
 // ============================================================================
 // Operator: enumerates every operator kind
@@ -314,19 +314,21 @@ impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
 /// [`TryFrom`].
 impl<T> TryFrom<Values> for Vec<T>
 where
-    T: TryFrom<StructData, Error = KernelError> + ToSchema,
+    T: TryFrom<StructData, Error = Error> + ToSchema,
 {
-    type Error = KernelError;
+    type Error = Error;
 
-    fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
+    fn try_from(Values { schema, rows }: Values) -> Result<Self> {
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| {
                 let schema = schema.as_ref().clone();
-                T::try_from(StructData::from_values_unchecked(schema, row))
-                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
+                T::try_from(StructData::from_values_unchecked(schema, row)).map_err(|error| {
+                    add_scalar_path_context(error.into_kernel_error(), format!("[{index}]"))
+                })
             })
             .try_collect()
+            .map_err(Error::Kernel)
     }
 }
 
@@ -488,7 +490,7 @@ impl DynamicScan {
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
         dv_column: Option<ColumnName>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
             .into_iter()
@@ -519,49 +521,56 @@ impl DynamicScan {
     /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
     /// or has invalid nullability; or when a file-constant column is absent from either schema, is
     /// a metadata column, or has different input and output types or nullability.
-    pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
+    pub fn validate_input(&self, input_schema: &SchemaRef) -> Result<()> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
 
         if self.base_url.cannot_be_a_base() || !self.base_url.path().ends_with('/') {
-            return Err(KernelError::generic(format!(
+            return Err(Error::Kernel(KernelError::generic(format!(
                 "dynamic scan: base URL `{}` must be hierarchical and end in `/`",
                 self.base_url
-            )));
+            ))));
         }
 
-        Self::validate_required_column(input_schema, &self.path_column, &DataType::STRING)?;
-        Self::validate_required_column(input_schema, &self.file_size_column, &DataType::LONG)?;
-        Self::validate_required_column(input_schema, &self.last_modified_column, &DataType::LONG)?;
+        Self::validate_required_column(input_schema, &self.path_column, &DataType::STRING)
+            .map_err(Error::Kernel)?;
+        Self::validate_required_column(input_schema, &self.file_size_column, &DataType::LONG)
+            .map_err(Error::Kernel)?;
+        Self::validate_required_column(input_schema, &self.last_modified_column, &DataType::LONG)
+            .map_err(Error::Kernel)?;
         Self::validate_file_constant_columns(
             input_schema,
             &self.schema,
             &self.file_constant_columns,
-        )?;
+        )
+        .map_err(Error::Kernel)?;
 
         if let Some(dv_column) = &self.dv_column {
-            let fields = input_schema.fields_of_path(dv_column).map_err(|err| {
-                KernelError::generic(format!(
-                    "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
-                ))
-            })?;
+            let fields = input_schema
+                .fields_of_path(dv_column)
+                .map_err(|err| {
+                    KernelError::generic(format!(
+                        "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
+                    ))
+                })
+                .map_err(Error::Kernel)?;
             let Some((field, _ancestors)) = fields.split_last() else {
-                return Err(KernelError::internal_error(
+                return Err(Error::Kernel(KernelError::internal_error(
                     "fields_of_path returned no fields",
-                ));
+                )));
             };
             let expected = &*DELETION_VECTOR_DATA_TYPE;
             if field.data_type() != expected {
-                return Err(KernelError::generic(format!(
+                return Err(Error::Kernel(KernelError::generic(format!(
                     "dynamic scan: deletion-vector column `{dv_column}` must have type \
                      {expected}, found {}",
                     field.data_type()
-                )));
+                ))));
             }
             if !field.is_nullable() {
-                return Err(KernelError::generic(format!(
+                return Err(Error::Kernel(KernelError::generic(format!(
                     "dynamic scan: deletion-vector column `{dv_column}` must be nullable"
-                )));
+                ))));
             }
         }
 
@@ -572,8 +581,10 @@ impl DynamicScan {
         schema: &SchemaRef,
         column: &ColumnName,
         expected_type: &DataType,
-    ) -> DeltaResult<()> {
-        let fields = schema.fields_of_path(column)?;
+    ) -> KernelResult<()> {
+        let fields = schema
+            .fields_of_path(column)
+            .map_err(Error::into_kernel_error)?;
         let Some((field, ancestors)) = fields.split_last() else {
             return Err(KernelError::internal_error(
                 "fields_of_path returned no fields",
@@ -597,7 +608,7 @@ impl DynamicScan {
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
         file_constant_columns: &[String],
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         for name in file_constant_columns {
             let Some(input_field) = input_schema.field(name) else {
                 return Err(KernelError::generic(format!(
@@ -906,11 +917,13 @@ impl Agg {
         &self,
         input_schema: &StructType,
         alias: Option<String>,
-    ) -> DeltaResult<StructField> {
+    ) -> KernelResult<StructField> {
         // `output_data_type: None` preserves the input field's type and metadata; `Some` overrides
         // the type and strips metadata (new column).
         let resolve = |value: &ColumnName, output_data_type: Option<DataType>, nullable: bool| {
-            let field = input_schema.field_at(value)?;
+            let field = input_schema
+                .field_at(value)
+                .map_err(Error::into_kernel_error)?;
             let (data_type, metadata) = match output_data_type {
                 Some(data_type) => (data_type, HashMap::new()),
                 None => (field.data_type.clone(), field.metadata.clone()),
@@ -932,8 +945,12 @@ impl Agg {
                 DataType::LONG,
             )),
             Agg::MinNonNullBy(operands) | Agg::MaxNonNullBy(operands) => {
-                let _ = input_schema.field_at(&operands.key)?;
-                let _ = input_schema.field_at(&operands.null_sentinel)?;
+                let _ = input_schema
+                    .field_at(&operands.key)
+                    .map_err(Error::into_kernel_error)?;
+                let _ = input_schema
+                    .field_at(&operands.null_sentinel)
+                    .map_err(Error::into_kernel_error)?;
                 resolve(&operands.value, None, true)
             }
         }
@@ -1023,14 +1040,17 @@ impl AggregateBuilder {
     ///
     /// Returns an error if a group key or an aggregate's operand column is not found in the input
     /// schema, or if two output columns would share a name (case-insensitive).
-    pub fn build(self) -> DeltaResult<Aggregate> {
+    pub fn build(self) -> Result<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {
             fields.push(self.input_schema.field_at(key)?.clone());
         }
         let mut aggs = Vec::with_capacity(self.aggs.len());
         for (agg, alias) in self.aggs {
-            fields.push(agg.output_field(&self.input_schema, alias)?);
+            fields.push(
+                agg.output_field(&self.input_schema, alias)
+                    .map_err(Error::Kernel)?,
+            );
             aggs.push(agg);
         }
         // NOTE: `StructType::try_new` rejects duplicate (case-insensitive) output column names.
@@ -1043,9 +1063,9 @@ impl AggregateBuilder {
 }
 
 impl TryFrom<AggregateBuilder> for Aggregate {
-    type Error = KernelError;
+    type Error = Error;
 
-    fn try_from(builder: AggregateBuilder) -> DeltaResult<Self> {
+    fn try_from(builder: AggregateBuilder) -> Result<Self> {
         builder.build()
     }
 }

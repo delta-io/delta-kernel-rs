@@ -52,9 +52,9 @@ use crate::unit_test_utils::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Snapshot;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    FileSize, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
-    StorageHandler,
+    EngineData, Error, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
+    ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic,
+    RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -67,10 +67,12 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+) -> KernelResult<Option<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
-    visitor.visit_rows_of(batch)?;
+    visitor
+        .visit_rows_of(batch)
+        .map_err(crate::Error::into_kernel_error)?;
 
     // If there are no sidecar files, return early
     if visitor.sidecars.is_empty() {
@@ -84,11 +86,12 @@ fn process_sidecars(
         .try_collect()?;
 
     // Read the sidecar files and return an iterator of sidecar file batches
-    Ok(Some(parquet_handler.read_parquet_files(
-        &sidecar_files,
-        checkpoint_read_schema,
-        meta_predicate,
-    )?))
+    let batches = parquet_handler
+        .read_parquet_files(&sidecar_files, checkpoint_read_schema, meta_predicate)
+        .map_err(Error::into_kernel_error)?;
+    Ok(Some(
+        batches.map(|item| item.map_err(Error::into_kernel_error)),
+    ))
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
@@ -151,7 +154,7 @@ async fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
@@ -161,7 +164,7 @@ pub(crate) async fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data).await
 }
@@ -172,11 +175,12 @@ async fn write_multi_row_group_parquet_to_store(
     store: &Arc<InMemory>,
     row_groups: Vec<Box<dyn EngineData>>,
     path: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let batches = row_groups
         .into_iter()
         .map(ArrowEngineData::try_from_engine_data)
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .map(|item| item.map_err(Error::into_kernel_error))
+        .collect::<KernelResult<Vec<_>>>()?;
     let schema = batches
         .first()
         .ok_or_else(|| KernelError::internal_error("at least one row group is required"))?
@@ -197,15 +201,17 @@ async fn write_multi_row_group_parquet_to_store(
 
 /// Returns the materialized row count and sorted paths of all materialized Add actions.
 fn collect_materialized_adds(
-    actions: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-) -> DeltaResult<(usize, Vec<String>)> {
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+) -> KernelResult<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
     for batch in actions {
         let batch = batch?.actions;
         rows += batch.len();
         let mut visitor = AddVisitor::default();
-        visitor.visit_rows_of(&*batch)?;
+        visitor
+            .visit_rows_of(&*batch)
+            .map_err(crate::Error::into_kernel_error)?;
         add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
     }
     add_paths.sort();
@@ -215,7 +221,7 @@ fn collect_materialized_adds(
 fn collect_projected_adds(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<(usize, Vec<String>)> {
+) -> KernelResult<(usize, Vec<String>)> {
     let actions = log_segment
         .read_actions_with_projected_checkpoint_actions(
             engine,
@@ -225,8 +231,10 @@ fn collect_projected_adds(
             None,
             None,
             None, // cancellation_token
-        )?
-        .actions;
+        )
+        .map_err(Error::into_kernel_error)?
+        .actions
+        .map(|item| item.map_err(Error::into_kernel_error));
     collect_materialized_adds(actions)
 }
 
@@ -238,19 +246,19 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         self.0.read_parquet_files(files, physical_schema, None)
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         self.0.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         self.0.read_parquet_footer(file)
     }
 }
@@ -267,7 +275,7 @@ async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<FileMeta> {
+) -> KernelResult<FileMeta> {
     let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path.clone(), data).await?;
     let size = get_file_size(store, &path).await;
@@ -285,7 +293,7 @@ async fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let json_lines: Vec<String> = actions
         .into_iter()
         .map(|action| serde_json::to_string(&action).expect("action to string"))
@@ -1071,23 +1079,23 @@ async fn test_non_contiguous_log() {
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::MissingVersion(1))
+        Err(crate::Error::Kernel(KernelError::MissingVersion(1)))
     ));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::StartVersionNotFound {
+        Err(crate::Error::Kernel(KernelError::StartVersionNotFound {
             requested: 1,
             earliest: 2
-        })
+        }))
     ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::MissingVersion(1))
+        Err(crate::Error::Kernel(KernelError::MissingVersion(1)))
     ));
 }
 
@@ -1119,8 +1127,10 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
 fn test_sidecar_to_filemeta_valid_paths(
     #[case] input_path: &str,
     #[case] expected_url: &str,
-) -> DeltaResult<()> {
-    let log_root = Url::parse("file:///var/_delta_log/")?;
+) -> Result<()> {
+    let log_root = Url::parse("file:///var/_delta_log/")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let sidecar = Sidecar {
         path: expected_url.to_string(),
         modification_time: 0,
@@ -1128,7 +1138,9 @@ fn test_sidecar_to_filemeta_valid_paths(
         tags: None,
     };
 
-    let filemeta = sidecar.to_filemeta(&log_root)?;
+    let filemeta = sidecar
+        .to_filemeta(&log_root)
+        .map_err(crate::Error::Kernel)?;
     assert_eq!(
         filemeta.location.as_str(),
         expected_url,
@@ -1138,7 +1150,7 @@ fn test_sidecar_to_filemeta_valid_paths(
 }
 
 #[test]
-fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
+fn test_checkpoint_batch_with_no_sidecars_returns_none() -> Result<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
@@ -1149,7 +1161,8 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
         checkpoint_batch.as_ref(),
         get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
         None,
-    )?
+    )
+    .map_err(crate::Error::Kernel)?
     .into_iter()
     .flatten();
 
@@ -1160,7 +1173,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
+async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1170,7 +1183,8 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
-    .await?
+    .await
+    .map_err(crate::Error::Kernel)?
     .size;
 
     let sidecar2_size = add_sidecar_to_store(
@@ -1178,7 +1192,8 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )
-    .await?
+    .await
+    .map_err(crate::Error::Kernel)?
     .size;
 
     let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
@@ -1195,20 +1210,27 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         checkpoint_batch.as_ref(),
         read_schema.clone(),
         None,
-    )?
+    )
+    .map_err(crate::Error::Kernel)?
     .into_iter()
     .flatten();
 
     // Assert the correctness of batches returned
-    assert_batch_matches(iter.next().unwrap()?, add_batch_simple(read_schema.clone()));
-    assert_batch_matches(iter.next().unwrap()?, add_batch_with_remove(read_schema));
+    assert_batch_matches(
+        iter.next().unwrap().map_err(crate::Error::Kernel)?,
+        add_batch_simple(read_schema.clone()),
+    );
+    assert_batch_matches(
+        iter.next().unwrap().map_err(crate::Error::Kernel)?,
+        add_batch_with_remove(read_schema),
+    );
     assert!(iter.next().is_none());
 
     Ok(())
 }
 
 #[test]
-fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
+fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1223,7 +1245,8 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         checkpoint_batch.as_ref(),
         get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
         None,
-    )?
+    )
+    .map_err(crate::Error::Kernel)?
     .into_iter()
     .flatten();
 
@@ -1238,7 +1261,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 }
 
 #[tokio::test]
-async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
+async fn test_reading_sidecar_files_with_predicate() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1249,7 +1272,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
-    .await?
+    .await
+    .map_err(crate::Error::Kernel)?
     .size;
 
     let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
@@ -1267,7 +1291,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         checkpoint_batch.as_ref(),
         read_schema.clone(),
         remove_predicate.clone(),
-    )?
+    )
+    .map_err(crate::Error::Kernel)?
     .into_iter()
     .flatten();
 
@@ -1279,7 +1304,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     add_checkpoint_to_store(
@@ -1289,10 +1314,13 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_one_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
         .to_string();
 
     let v2_checkpoint_read_schema = LOG_METADATA_SCHEMA.clone();
@@ -1307,21 +1335,23 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            v2_checkpoint_read_schema.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
@@ -1334,7 +1364,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1352,19 +1382,29 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
     add_checkpoint_to_store(
         &store,
         sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
     let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
-    let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
-    let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
+    let checkpoint_one_file = log_root
+        .join(checkpoint_part_1)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
+    let checkpoint_two_file = log_root
+        .join(checkpoint_part_2)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
 
     let v2_checkpoint_read_schema = CHECKPOINT_READ_SCHEMA.clone();
 
@@ -1381,14 +1421,16 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            v2_checkpoint_read_schema.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
     let mut iter = checkpoint_result.actions;
 
     // Assert the correctness of batches returned
@@ -1396,7 +1438,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         let ActionsBatch {
             actions: batch,
             is_log_batch,
-        } = iter.next().unwrap()?;
+        } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
         assert!(!is_log_batch);
         assert_batch_matches(
             batch,
@@ -1413,7 +1455,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1422,10 +1464,13 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         add_batch_simple(get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_one_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
         .to_string();
 
     // Get the actual file size for proper footer reading
@@ -1447,21 +1492,23 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            v2_checkpoint_read_schema.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
@@ -1498,7 +1545,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     #[case] expected_rows_after_pruning: usize,
     #[case] expected_add_paths: &[&str],
     #[values(false, true)] ignore_predicate: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
@@ -1516,9 +1563,14 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
         row_groups,
         &format!("_delta_log/{checkpoint_name}"),
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_name)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
 
     let log_segment = LogSegment::try_new(
@@ -1535,7 +1587,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     // The projected checkpoint read derives `add.path IS NOT NULL`. Engines may use it to skip
     // all-remove row groups or ignore it and return extra rows; both paths must surface the same
     // Adds.
-    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, engine)?;
+    let (materialized_rows, add_paths) =
+        collect_projected_adds(&log_segment, engine).map_err(crate::Error::Kernel)?;
     let expected_materialized_rows = if ignore_predicate {
         total_rows
     } else {
@@ -1556,7 +1609,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 /// `SyncJsonHandler` ignores the checkpoint predicate, so replay must tolerate the returned remove
 /// row while still surfacing the live Add.
 #[tokio::test]
-async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResult<()> {
+async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1578,9 +1631,14 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
         ],
         checkpoint_name,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_name)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_file)],
@@ -1592,7 +1650,8 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
         None,
     )?;
 
-    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, &engine)?;
+    let (materialized_rows, add_paths) =
+        collect_projected_adds(&log_segment, &engine).map_err(crate::Error::Kernel)?;
     assert_eq!(
         materialized_rows, 2,
         "SyncJsonHandler should return the unfiltered checkpoint rows"
@@ -1612,7 +1671,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
 async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     #[case] ignore_predicate: bool,
     #[case] expected_materialized_rows: usize,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
@@ -1631,7 +1690,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
         ],
         &format!("_delta_log/_sidecars/{sidecar_name}"),
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
     let sidecar_size = get_file_size(&store, &format!("_delta_log/_sidecars/{sidecar_name}")).await;
 
     let checkpoint_name = "00000000000000000001.checkpoint.parquet";
@@ -1643,8 +1703,13 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
         ),
         checkpoint_name,
     )
-    .await?;
-    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    .await
+    .map_err(crate::Error::Kernel)?;
+    let checkpoint_file = log_root
+        .join(checkpoint_name)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
 
     let log_segment = LogSegment::try_new(
@@ -1660,7 +1725,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 
     // Sidecar discovery reads the manifest without a predicate, so pruning its null-`add.path`
     // rows from the projected action stream cannot hide sidecar references.
-    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, engine)?;
+    let (materialized_rows, add_paths) =
+        collect_projected_adds(&log_segment, engine).map_err(crate::Error::Kernel)?;
     assert_eq!(
         materialized_rows, expected_materialized_rows,
         "materialized rows must reflect whether the engine applies the predicate"
@@ -1679,8 +1745,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
-) -> DeltaResult<()> {
+async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> Result<()>
+{
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1695,9 +1761,14 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         })],
         filename,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let checkpoint_one_file = log_root.join(filename)?.to_string();
+    let checkpoint_one_file = log_root
+        .join(filename)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
@@ -1710,21 +1781,23 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema,
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            v2_checkpoint_read_schema,
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
     assert!(!is_log_batch);
     let mut visitor = AddVisitor::default();
     visitor.visit_rows_of(&*first_batch)?;
@@ -1744,7 +1817,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 // - Each returned batch is correctly flagged with is_log_batch set to false
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1754,7 +1827,8 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         add_batch_simple(COMMIT_READ_SCHEMA.clone()),
         "sidecarfile1.parquet",
     )
-    .await?
+    .await
+    .map_err(crate::Error::Kernel)?
     .size;
 
     let sidecar2_size = add_sidecar_to_store(
@@ -1762,7 +1836,8 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         add_batch_with_remove(COMMIT_READ_SCHEMA.clone()),
         "sidecarfile2.parquet",
     )
-    .await?
+    .await
+    .map_err(crate::Error::Kernel)?
     .size;
 
     // Now create checkpoint with correct sidecar sizes
@@ -1777,10 +1852,13 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         ),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_file_path = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
         .to_string();
 
     // Get the actual file size for proper footer reading
@@ -1803,21 +1881,23 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
     )?;
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            v2_checkpoint_read_schema.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
         actions: first_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
     assert!(!is_log_batch);
     // TODO: per contract this batch is not required to have sidecars, but leaving this test in to
     // verify no behavior change.
@@ -1835,7 +1915,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let ActionsBatch {
         actions: second_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
     assert!(!is_log_batch);
     assert_batch_matches(
         second_batch,
@@ -1846,7 +1926,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let ActionsBatch {
         actions: third_batch,
         is_log_batch,
-    } = iter.next().unwrap()?;
+    } = iter.next().unwrap().map_err(crate::Error::Kernel)?;
     assert!(!is_log_batch);
     assert_batch_matches(
         third_batch,
@@ -1899,7 +1979,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
 }
 
 #[tokio::test]
-async fn test_list_log_files_with_version() -> DeltaResult<()> {
+async fn test_list_log_files_with_version() -> Result<()> {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -1918,7 +1998,8 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
         Some(0),
         None,
         None,
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
     let latest_crc = result.latest_crc_file.unwrap();
     assert_eq!(
         latest_crc.location.location.path(),
@@ -2397,7 +2478,10 @@ fn test_validate_listed_log_file_out_of_order_compaction_files() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidLogSegment(_)))
+    ));
 }
 
 #[test]
@@ -2419,7 +2503,10 @@ fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidCheckpoint(_)))
+    ));
 }
 
 #[rstest]
@@ -2444,7 +2531,10 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
         end_version,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidLogSegment(_)))
+    ));
 }
 
 #[rstest]
@@ -2453,7 +2543,10 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
 fn test_validate_empty_log_segment(#[case] end_version: Option<Version>) {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(LogSegmentFiles::default(), log_root, end_version, None);
-    assert!(matches!(result, Err(KernelError::EmptyLog)));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::EmptyLog))
+    ));
 }
 
 #[test]
@@ -2502,7 +2595,10 @@ fn test_validate_truncated_log_segment_reports_first_missing_version() {
         Some(4),
         None,
     );
-    assert!(matches!(result, Err(KernelError::MissingVersion(3))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::MissingVersion(3)))
+    ));
 }
 
 #[rstest]
@@ -2529,7 +2625,9 @@ fn test_validate_checkpoint_commit_gap_reports_lowest_missing_version(
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::MissingVersion(version)) if version == expected));
+    assert!(
+        matches!(result, Err(crate::Error::Kernel(KernelError::MissingVersion(version))) if version == expected)
+    );
 }
 
 #[test]
@@ -2604,7 +2702,10 @@ fn test_try_new_crc_rejects_non_crc_path() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, KernelError::InvalidLogPath(_)));
+    assert!(matches!(
+        err,
+        crate::Error::Kernel(KernelError::InvalidLogPath(_))
+    ));
 }
 
 #[test]
@@ -2670,7 +2771,10 @@ fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidCheckpoint(_)))
+    ));
 }
 
 #[rstest]
@@ -2726,7 +2830,10 @@ fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidCheckpoint(_)))
+    ));
 }
 
 #[test]
@@ -2744,7 +2851,10 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidCheckpoint(_)))
+    ));
 }
 
 #[test]
@@ -2763,7 +2873,10 @@ fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidCheckpoint(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidCheckpoint(_)))
+    ));
 }
 
 #[test]
@@ -2780,7 +2893,10 @@ fn test_validate_listed_log_file_commit_files_contains_non_commit() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidLogSegment(_)))
+    ));
 }
 
 #[test]
@@ -2803,7 +2919,7 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
     );
     assert!(matches!(
         result,
-        Err(KernelError::InvalidLogSegment(message)) if message.contains("Commit")
+        Err(crate::Error::Kernel(KernelError::InvalidLogSegment(message))) if message.contains("Commit")
     ));
 }
 
@@ -2826,7 +2942,10 @@ fn test_validate_listed_log_file_compaction_start_exceeds_end() {
         None,
         None,
     );
-    assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::Kernel(KernelError::InvalidLogSegment(_)))
+    ));
 }
 
 #[tokio::test]
@@ -3212,7 +3331,10 @@ fn test_log_segment_contiguous_commit_files() {
         None,
         None,
     );
-    assert!(matches!(log_segment, Err(KernelError::MissingVersion(2))));
+    assert!(matches!(
+        log_segment,
+        Err(crate::Error::Kernel(KernelError::MissingVersion(2)))
+    ));
 }
 
 #[test]
@@ -3240,11 +3362,21 @@ fn test_log_segment_checkpoint_gap_rejects_version_overflow() {
 /// doc promises. Real V2 fixtures only carry non-empty sidecar lists, so this synthetic case is the
 /// only place it is exercised.
 #[test]
-fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
+fn checkpoint_sidecars_distinguishes_empty_from_absent() -> Result<()> {
     let (_store, log_root) = new_in_memory_store();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
-    let checkpoint_file = log_root.join(selected)?.to_string();
-    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let checkpoint_file = log_root
+        .join(selected)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
+    let commit = create_log_path(
+        log_root
+            .join("00000000000000000002.json")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?
+            .as_str(),
+    );
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
@@ -3356,7 +3488,7 @@ fn checkpoint_hint_sidecar_file_schema_resolution(
 async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] hint_version: u64,
     #[case] expect_hint_schema_used: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3367,10 +3499,15 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         add_batch_simple(v1_schema.clone()),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_rel = "00000000000000000001.checkpoint.parquet";
-    let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
+    let checkpoint_file = log_root
+        .join(checkpoint_rel)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
     let hint_schema: SchemaRef = schema_ref! {
@@ -3378,7 +3515,11 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     };
 
     // Build a commit that uses v1 checkpoint and a hint that describes a different schema
-    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2_path = log_root
+        .join("00000000000000000002.json")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -3413,7 +3554,9 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 
     // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
     // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) = log_segment
+        .get_file_actions_schema_and_sidecars(&engine, None)
+        .map_err(crate::Error::Kernel)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
         assert_eq!(schema, hint_schema, "should use hint when versions match");
@@ -3437,7 +3580,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 #[tokio::test]
 async fn test_get_file_actions_schema_v2_identity_filter(
     #[case] identity_matches: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3446,8 +3589,14 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 
     // Schema actually written to the selected (leaf, no-sidecar) V2 checkpoint footer.
     let footer_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
-    add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected).await?;
-    let checkpoint_file = log_root.join(selected)?.to_string();
+    add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected)
+        .await
+        .map_err(crate::Error::Kernel)?;
+    let checkpoint_file = log_root
+        .join(selected)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
 
     // A distinct hint schema so we can tell whether the hint or the footer was used.
@@ -3456,7 +3605,11 @@ async fn test_get_file_actions_schema_v2_identity_filter(
     };
     let hint_name = if identity_matches { selected } else { other };
 
-    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2_path = log_root
+        .join("00000000000000000002.json")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -3478,7 +3631,9 @@ async fn test_get_file_actions_schema_v2_identity_filter(
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) = log_segment
+        .get_file_actions_schema_and_sidecars(&engine, None)
+        .map_err(crate::Error::Kernel)?;
     let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
     if identity_matches {
         assert_eq!(
@@ -3500,7 +3655,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 #[case::with_hint(true)]
 #[case::without_hint(false)]
 #[tokio::test]
-async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
+async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3527,19 +3682,29 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         add_batch_simple(v1_schema.clone()),
         checkpoint_part_1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
     add_checkpoint_to_store(
         &store,
         add_batch_simple(v1_schema.clone()),
         checkpoint_part_2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
     let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
-    let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
-    let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
+    let cp1_file = log_root
+        .join(checkpoint_part_1)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
+    let cp2_file = log_root
+        .join(checkpoint_part_2)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -3559,7 +3724,9 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let (schema, sidecars) = log_segment
+        .get_file_actions_schema_and_sidecars(&engine, None)
+        .map_err(crate::Error::Kernel)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -3756,7 +3923,7 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 fn create_checkpoint_file_schema_with_stats_parsed(
     min_values_fields: Vec<StructField>,
     include_json_stats: bool,
-) -> DeltaResult<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let stats_parsed = StructField::nullable(
         "stats_parsed",
         schema! {
@@ -3771,7 +3938,11 @@ fn create_checkpoint_file_schema_with_stats_parsed(
     } else {
         patch.drop_at(["add"], "stats")
     };
-    Ok(Arc::new(patch.build(get_commit_schema().as_ref())?))
+    Ok(Arc::new(
+        patch
+            .build(get_commit_schema().as_ref())
+            .map_err(crate::Error::into_kernel_error)?,
+    ))
 }
 
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
@@ -3803,14 +3974,15 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     #[case] include_json_stats: bool,
     #[case] expect_parsed_stats: bool,
     #[case] expect_json_stats: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let checkpoint_schema = if include_parsed_stats {
         create_checkpoint_file_schema_with_stats_parsed(
             vec![StructField::nullable("other", DataType::LONG)],
             include_json_stats,
-        )?
+        )
+        .map_err(crate::Error::Kernel)?
     } else {
         get_commit_schema().clone()
     };
@@ -3819,10 +3991,13 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         add_batch_simple(checkpoint_schema),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
@@ -3838,14 +4013,16 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     )?;
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
 
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
-        None, // meta_predicate
-        Some(&stats_schema),
-        None, // partition_schema
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
+            None, // meta_predicate
+            Some(&stats_schema),
+            None, // partition_schema
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
 
     assert_eq!(
         checkpoint_result.checkpoint_info.has_stats_parsed,
@@ -3869,7 +4046,8 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     let mut actions = checkpoint_result.actions;
     let batch = actions
         .next()
-        .expect("checkpoint stream must yield one batch")?;
+        .expect("checkpoint stream must yield one batch")
+        .map_err(crate::Error::Kernel)?;
     assert!(!batch.is_log_batch);
     assert_eq!(
         batch.actions.has_field(&column_name!("add.stats")),
@@ -4418,7 +4596,7 @@ fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<Arrow
 }
 
 #[tokio::test]
-async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResult<()> {
+async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -4447,10 +4625,13 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         add_batch_with_partition_values_parsed(checkpoint_schema),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
@@ -4479,14 +4660,16 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 
     // Pass a partition schema to trigger partitionValues_parsed detection
     let partition_schema = schema! { nullable "id": INTEGER };
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        read_schema,
-        None, // meta_predicate
-        None, // stats_schema
-        Some(&partition_schema),
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            read_schema,
+            None, // meta_predicate
+            None, // stats_schema
+            Some(&partition_schema),
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
     assert!(
@@ -4511,7 +4694,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 }
 
 #[tokio::test]
-async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> DeltaResult<()> {
+async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> Result<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -4521,10 +4704,13 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         add_batch_simple(get_all_actions_schema().project(&[ADD_NAME])?),
         "00000000000000000001.checkpoint.parquet",
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
         .to_string();
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
@@ -4544,14 +4730,16 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     // Pass a partition schema — but the checkpoint doesn't have partitionValues_parsed
     let partition_schema = schema! { nullable "id": INTEGER };
-    let checkpoint_result = log_segment.create_checkpoint_stream(
-        &engine,
-        read_schema.clone(),
-        None,
-        None,
-        Some(&partition_schema),
-        None, // cancellation_token
-    )?;
+    let checkpoint_result = log_segment
+        .create_checkpoint_stream(
+            &engine,
+            read_schema.clone(),
+            None,
+            None,
+            Some(&partition_schema),
+            None, // cancellation_token
+        )
+        .map_err(crate::Error::Kernel)?;
 
     // Verify it's false
     assert!(
@@ -5407,12 +5595,13 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<()> {
-    let (engine, table_root) = setup_table()?;
+fn find_last_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
+    let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot
         .log_segment()
-        .find_last_checkpoint_action(&engine)?
+        .find_last_checkpoint_action(&engine)
+        .map_err(crate::Error::Kernel)?
         .is_none());
     Ok(())
 }
@@ -5420,26 +5609,33 @@ fn find_last_checkpoint_action_returns_none_without_checkpoint() -> DeltaResult<
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> DeltaResult<()> {
-    let (engine, table_root) = setup_table()?;
+fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
+    let (engine, table_root) = setup_table().map_err(crate::Error::Kernel)?;
     write_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
-    )?;
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)
+            .map_err(crate::Error::Kernel)?
+            .into_engine_data(&engine)?,
+    )
+    .map_err(crate::Error::Kernel)?;
     write_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
-    )?;
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)
+            .map_err(crate::Error::Kernel)?
+            .into_engine_data(&engine)?,
+    )
+    .map_err(crate::Error::Kernel)?;
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 2);
     let checkpoint = snapshot
         .log_segment()
-        .find_last_checkpoint_action(&engine)?
+        .find_last_checkpoint_action(&engine)
+        .map_err(crate::Error::Kernel)?
         .expect("checkpoint present");
     assert_eq!(checkpoint.version(), 2);
     assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");

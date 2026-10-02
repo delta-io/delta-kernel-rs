@@ -8,7 +8,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{DeltaResult, Version};
+use crate::{Error, KernelResult, Result, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -70,7 +70,7 @@ impl CommitProtocolMetadata {
         read_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         if read_protocol.is_some() != read_metadata.is_some() {
             return Err(crate::KernelError::generic(
                 "read_protocol and read_metadata must both be present or both be absent",
@@ -163,18 +163,20 @@ impl CommitMetadata {
 
     /// The commit path is the absolute path (e.g. s3://bucket/table/_delta_log/{version}.json) to
     /// the published delta file for this commit.
-    pub fn published_commit_path(&self) -> DeltaResult<Url> {
+    pub fn published_commit_path(&self) -> Result<Url> {
         self.log_root
             .new_commit_path(self.version)
             .map(|p| p.location)
+            .map_err(Error::Kernel)
     }
 
     /// The staged commit path is the absolute path (e.g.
     /// s3://bucket/table/_delta_log/{version}.{uuid}.json) to the staged commit file.
-    pub fn staged_commit_path(&self) -> DeltaResult<Url> {
+    pub fn staged_commit_path(&self) -> Result<Url> {
         self.log_root
             .new_staged_commit_path(self.version)
             .map(|p| p.location)
+            .map_err(Error::Kernel)
     }
 
     /// The version to which the transaction is being committed.
@@ -215,7 +217,7 @@ impl CommitMetadata {
 
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
-    pub fn effective_protocol(&self) -> DeltaResult<&Protocol> {
+    pub fn effective_protocol(&self) -> Result<&Protocol> {
         let pm = &self.protocol_metadata;
         pm.new_protocol
             .as_ref()
@@ -225,11 +227,12 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one protocol",
                 )
             })
+            .map_err(Error::Kernel)
     }
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
-    pub fn effective_metadata(&self) -> DeltaResult<&Metadata> {
+    pub fn effective_metadata(&self) -> Result<&Metadata> {
         let pm = &self.protocol_metadata;
         pm.new_metadata
             .as_ref()
@@ -239,6 +242,7 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one metadata",
                 )
             })
+            .map_err(Error::Kernel)
     }
 
     /// Check if the effective protocol has a specific writer feature by name.
@@ -284,7 +288,7 @@ impl CommitMetadata {
     ///
     /// Uses a default modern protocol (empty features) and empty metadata.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
+    pub fn new_unchecked(table_root: Url, version: Version) -> Result<Self> {
         Self::new_unchecked_with(table_root, version, vec![], vec![], HashMap::new())
     }
 
@@ -296,9 +300,10 @@ impl CommitMetadata {
         reader_features: Vec<&str>,
         writer_features: Vec<&str>,
         configuration: HashMap<String, String>,
-    ) -> DeltaResult<Self> {
-        let log_root = crate::path::LogRoot::new(table_root)?;
-        let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
+    ) -> Result<Self> {
+        let log_root = crate::path::LogRoot::new(table_root).map_err(Error::Kernel)?;
+        let protocol =
+            Protocol::try_new_modern(reader_features, writer_features).map_err(Error::Kernel)?;
         let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(
@@ -307,7 +312,8 @@ impl CommitMetadata {
             CommitType::PathBasedWrite,
             0,
             None,
-            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)
+                .map_err(Error::Kernel)?,
             vec![],
         ))
     }

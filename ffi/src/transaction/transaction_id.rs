@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{KernelResult, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
@@ -29,15 +29,17 @@ pub unsafe extern "C" fn with_transaction_id(
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let app_id_res: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
+    let app_id_res: KernelResult<String> = unsafe {
+        TryFromStringSlice::try_from_slice(&app_id).map_err(delta_kernel::Error::into_kernel_error)
+    };
     with_transaction_id_impl(*txn, app_id_res, version).into_extern_result(&engine)
 }
 
 fn with_transaction_id_impl(
     txn: Transaction,
-    app_id_res: DeltaResult<String>,
+    app_id_res: KernelResult<String>,
     version: i64,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> KernelResult<Handle<ExclusiveTransaction>> {
     Ok(Box::new(txn.with_transaction_id(app_id_res?, version)).into())
 }
 
@@ -59,17 +61,23 @@ pub unsafe extern "C" fn get_app_id_version(
     let engine = unsafe { engine.as_ref() };
     let app_id_res = unsafe { String::try_from_slice(&app_id) };
 
-    get_app_id_version_impl(snapshot, app_id_res, engine)
-        .map(OptionalValue::from)
-        .into_extern_result(&engine)
+    get_app_id_version_impl(
+        snapshot,
+        app_id_res.map_err(delta_kernel::Error::into_kernel_error),
+        engine,
+    )
+    .map(OptionalValue::from)
+    .into_extern_result(&engine)
 }
 
 fn get_app_id_version_impl(
     snapshot: Arc<Snapshot>,
-    app_id_res: DeltaResult<String>,
+    app_id_res: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
-) -> DeltaResult<Option<i64>> {
-    snapshot.get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
+) -> KernelResult<Option<i64>> {
+    snapshot
+        .get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 #[cfg(test)]
@@ -77,7 +85,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::schema::schema_ref;
-    use delta_kernel::Snapshot;
+    use delta_kernel::{Result, Snapshot};
     use test_utils::setup_test_tables;
 
     use super::*;

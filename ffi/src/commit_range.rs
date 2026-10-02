@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, KernelError, LogPath, Version};
+use delta_kernel::{KernelError, KernelResult, LogPath, ResultIteratorStatic, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn commit_range_builder_build(
 
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
-) -> DeltaResult<Handle<SharedCommitRange>> {
+) -> KernelResult<Handle<SharedCommitRange>> {
     let engine = builder.engine.engine();
     let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version);
     if let Some(end_version) = builder.end_version {
@@ -177,7 +177,9 @@ fn commit_range_builder_build_impl(
             "Max catalog version is required when providing staged commits.".to_string(),
         ));
     }
-    let range = kernel_builder.build(engine.as_ref())?;
+    let range = kernel_builder
+        .build(engine.as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Arc::new(range).into())
 }
 
@@ -321,8 +323,10 @@ pub unsafe extern "C" fn commit_action_get_actions(
 fn commit_action_get_actions_impl(
     commit_action: &CommitAction,
     engine: Arc<dyn ExternEngine>,
-) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
-    let actions = commit_action.get_actions(engine.engine().as_ref())?;
+) -> KernelResult<Handle<ExclusiveFileReadResultIterator>> {
+    let actions = commit_action
+        .get_actions(engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(FileReadResultIterator::into_handle(actions, engine))
 }
 
@@ -336,7 +340,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     commit_action.drop_handle();
 }
 
-type CommitActionIter = DeltaResultIteratorStatic<CommitAction>;
+type CommitActionIter = ResultIteratorStatic<CommitAction>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -346,7 +350,7 @@ pub struct FfiCommitActionsIterator {
 }
 
 impl FfiCommitActionsIterator {
-    fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
+    fn lock_iter(&self) -> KernelResult<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
             .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
@@ -420,8 +424,10 @@ fn commit_range_commits_impl(
     engine: Arc<dyn ExternEngine>,
     start_snapshot: Option<SnapshotRef>,
     actions: Vec<KernelDeltaAction>,
-) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
-    let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
+) -> KernelResult<Handle<SharedCommitActionsIterator>> {
+    let inner = commit_range
+        .commits(engine.engine(), start_snapshot, &actions)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
         data: Mutex::new(boxed),
@@ -460,9 +466,13 @@ fn commit_range_commits_next_impl(
         engine_context: NullableCvoid,
         commit_action: Handle<SharedCommitAction>,
     ),
-) -> DeltaResult<bool> {
+) -> KernelResult<bool> {
     let mut iter = data.lock_iter()?;
-    match iter.next().transpose()? {
+    match iter
+        .next()
+        .transpose()
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    {
         Some(commit_action) => {
             (engine_visitor)(engine_context, Arc::new(commit_action).into());
             Ok(true)
@@ -487,6 +497,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::Result;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::{actions_to_string, add_commit, TestAction};

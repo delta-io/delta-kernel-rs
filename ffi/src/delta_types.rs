@@ -11,7 +11,7 @@ use delta_kernel::crc::{
     FileStatsState, SetTransactionState,
 };
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
-use delta_kernel::{DeltaResult, KernelError, Version};
+use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::{FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue};
 
@@ -386,12 +386,12 @@ unsafe fn required_ref<'a, O: ?Sized, T>(
     _owner: &'a O,
     ptr: *const T,
     name: &str,
-) -> DeltaResult<&'a T> {
+) -> KernelResult<&'a T> {
     unsafe { ptr.as_ref() }.ok_or_else(|| invalid(format!("{name} value is null")))
 }
 
 impl FfiStringArray {
-    pub(crate) unsafe fn try_to_strings(&self) -> DeltaResult<Vec<String>> {
+    pub(crate) unsafe fn try_to_strings(&self) -> KernelResult<Vec<String>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_string() })
@@ -400,7 +400,7 @@ impl FfiStringArray {
 }
 
 impl FfiStringMap {
-    pub(crate) unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, String>> {
+    pub(crate) unsafe fn try_to_hash_map(&self) -> KernelResult<HashMap<String, String>> {
         let entries = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(entries.len());
         for entry in entries {
@@ -415,7 +415,7 @@ impl FfiStringMap {
 }
 
 impl FfiNullableStringMap {
-    pub(crate) unsafe fn try_to_hash_map(&self) -> DeltaResult<HashMap<String, Option<String>>> {
+    pub(crate) unsafe fn try_to_hash_map(&self) -> KernelResult<HashMap<String, Option<String>>> {
         let entries = unsafe { self.try_as_slice() }?;
         let mut result = HashMap::with_capacity(entries.len());
         for entry in entries {
@@ -432,7 +432,7 @@ impl FfiNullableStringMap {
 }
 
 impl FfiProtocol {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<Protocol> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<Protocol> {
         let reader_features = Option::<&FfiStringArray>::from(&self.reader_features)
             .map(|value| unsafe { value.try_to_strings() })
             .transpose()?;
@@ -445,11 +445,12 @@ impl FfiProtocol {
             reader_features,
             writer_features,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
 impl FfiMetadata {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<Metadata> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<Metadata> {
         let name = Option::<&KernelStringSlice>::from(&self.name)
             .map(|value| unsafe { value.try_to_string() })
             .transpose()?;
@@ -471,7 +472,7 @@ impl FfiMetadata {
 }
 
 impl FfiSetTransaction {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<SetTransaction> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<SetTransaction> {
         Ok(SetTransaction::new(
             unsafe { self.app_id.try_to_string() }?,
             self.version,
@@ -481,7 +482,7 @@ impl FfiSetTransaction {
 }
 
 impl FfiDomainMetadata {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DomainMetadata> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<DomainMetadata> {
         let domain = unsafe { self.domain.try_to_string() }?;
         let configuration = unsafe { self.configuration.try_to_string() }?;
         Ok(if self.removed {
@@ -493,7 +494,7 @@ impl FfiDomainMetadata {
 }
 
 impl FfiCheckpointMetadata {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<CheckpointMetadata> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<CheckpointMetadata> {
         let tags = Option::<&FfiStringMap>::from(&self.tags)
             .map(|value| unsafe { value.try_to_hash_map() })
             .transpose()?;
@@ -502,7 +503,7 @@ impl FfiCheckpointMetadata {
 }
 
 impl FfiSidecar {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<Sidecar> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<Sidecar> {
         if self.size_in_bytes < 0 {
             return Err(invalid(format!(
                 "sidecar size must be non-negative: {}",
@@ -522,17 +523,18 @@ impl FfiSidecar {
 }
 
 impl FfiFileSizeHistogram {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<FileSizeHistogram> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<FileSizeHistogram> {
         FileSizeHistogram::try_new(
             unsafe { self.sorted_bin_boundaries.try_as_slice() }?.to_vec(),
             unsafe { self.file_counts.try_as_slice() }?.to_vec(),
             unsafe { self.total_bytes.try_as_slice() }?.to_vec(),
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
 impl FfiSidecarArray {
-    unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<Sidecar>> {
+    unsafe fn try_to_kernel(&self) -> KernelResult<Vec<Sidecar>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
@@ -541,7 +543,7 @@ impl FfiSidecarArray {
 }
 
 impl FfiCheckpointNonFileAction {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<HintAction> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<HintAction> {
         Ok(match self {
             Self::Metadata(value) => HintAction::Metadata(unsafe {
                 required_ref(self, *value, "metadata action")?.try_to_kernel()?
@@ -563,7 +565,7 @@ impl FfiCheckpointNonFileAction {
 }
 
 impl FfiCheckpointNonFileActionArray {
-    unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<HintAction>> {
+    unsafe fn try_to_kernel(&self) -> KernelResult<Vec<HintAction>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
@@ -572,7 +574,7 @@ impl FfiCheckpointNonFileActionArray {
 }
 
 impl FfiLastCheckpointV2 {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<LastCheckpointV2> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<LastCheckpointV2> {
         let sidecar_files = Option::<&FfiSidecarArray>::from(&self.sidecar_files)
             .map(|value| unsafe { value.try_to_kernel() })
             .transpose()?;
@@ -591,7 +593,7 @@ impl FfiLastCheckpointV2 {
 }
 
 impl FfiLastCheckpoint {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<LastCheckpointHint> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<LastCheckpointHint> {
         let parts = Option::<&u64>::from(&self.parts)
             .map(|value| {
                 let value = u32::try_from(*value)
@@ -622,6 +624,7 @@ impl FfiLastCheckpoint {
             tags,
             v2_checkpoint,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
@@ -636,7 +639,7 @@ impl From<FfiDeletionVectorStorageType> for DeletionVectorStorageType {
 }
 
 impl FfiDeletionVectorDescriptor {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DeletionVectorDescriptor> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<DeletionVectorDescriptor> {
         DeletionVectorDescriptor::try_new(
             self.storage_type.into(),
             unsafe { self.path_or_inline_dv.try_to_string() }?,
@@ -644,11 +647,12 @@ impl FfiDeletionVectorDescriptor {
             self.size_in_bytes,
             self.cardinality,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
 impl FfiAdd {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<Add> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<Add> {
         let deletion_vector = unsafe { self.deletion_vector.as_ref() }
             .map(|value| unsafe { value.try_to_kernel() })
             .transpose()?;
@@ -678,7 +682,7 @@ impl FfiAdd {
 }
 
 impl FfiAddArray {
-    unsafe fn try_to_kernel(&self) -> DeltaResult<Vec<Add>> {
+    unsafe fn try_to_kernel(&self) -> KernelResult<Vec<Add>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
@@ -687,27 +691,30 @@ impl FfiAddArray {
 }
 
 impl FfiFileStatsState {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<FileStatsState> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<FileStatsState> {
         match self.kind {
-            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(unsafe {
-                let histogram = self
-                    .file_size_histogram
-                    .as_ref()
-                    .map(|value| value.try_to_kernel())
-                    .transpose()?;
-                FileStats::try_new(
-                    self.file_stats.num_files,
-                    self.file_stats.table_size_bytes,
-                    histogram,
-                )
-            }?)),
+            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(
+                unsafe {
+                    let histogram = self
+                        .file_size_histogram
+                        .as_ref()
+                        .map(|value| value.try_to_kernel())
+                        .transpose()?;
+                    FileStats::try_new(
+                        self.file_stats.num_files,
+                        self.file_stats.table_size_bytes,
+                        histogram,
+                    )
+                }
+                .map_err(delta_kernel::Error::into_kernel_error)?,
+            )),
             FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate),
         }
     }
 }
 
 impl FfiSetTransactionArray {
-    unsafe fn try_to_vec(&self) -> DeltaResult<Vec<SetTransaction>> {
+    unsafe fn try_to_vec(&self) -> KernelResult<Vec<SetTransaction>> {
         let values = unsafe { self.try_as_slice() }?;
         values
             .iter()
@@ -717,17 +724,19 @@ impl FfiSetTransactionArray {
 }
 
 impl FfiSetTransactionState {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<SetTransactionState> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<SetTransactionState> {
         let transactions = unsafe { self.transactions.try_to_vec() }?;
         match self.kind {
-            FfiSetTransactionStateKind::Complete => SetTransactionState::try_complete(transactions),
-            FfiSetTransactionStateKind::Partial => SetTransactionState::try_partial(transactions),
+            FfiSetTransactionStateKind::Complete => SetTransactionState::try_complete(transactions)
+                .map_err(delta_kernel::Error::into_kernel_error),
+            FfiSetTransactionStateKind::Partial => SetTransactionState::try_partial(transactions)
+                .map_err(delta_kernel::Error::into_kernel_error),
         }
     }
 }
 
 impl FfiDomainMetadataArray {
-    unsafe fn try_to_vec(&self) -> DeltaResult<Vec<DomainMetadata>> {
+    unsafe fn try_to_vec(&self) -> KernelResult<Vec<DomainMetadata>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
@@ -736,29 +745,32 @@ impl FfiDomainMetadataArray {
 }
 
 impl FfiDomainMetadataState {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DomainMetadataState> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<DomainMetadataState> {
         let domain_metadata = unsafe { self.domain_metadata.try_to_vec() }?;
         match self.kind {
             FfiDomainMetadataStateKind::Complete => {
                 DomainMetadataState::try_complete(domain_metadata)
+                    .map_err(delta_kernel::Error::into_kernel_error)
             }
             FfiDomainMetadataStateKind::Partial => {
                 DomainMetadataState::try_partial(domain_metadata)
+                    .map_err(delta_kernel::Error::into_kernel_error)
             }
         }
     }
 }
 
 impl FfiDeletedRecordCountsHistogram {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<DeletedRecordCountsHistogram> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<DeletedRecordCountsHistogram> {
         DeletedRecordCountsHistogram::try_new(
             unsafe { self.deleted_record_counts.try_as_slice() }?.to_vec(),
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 
 impl FfiCrc {
-    pub(crate) unsafe fn try_to_kernel(&self) -> DeltaResult<Crc> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<Crc> {
         let txn_id = Option::<&KernelStringSlice>::from(&self.txn_id)
             .map(|value| unsafe { value.try_to_string() })
             .transpose()?;
@@ -785,6 +797,7 @@ impl FfiCrc {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             None,
         )
+        .map_err(delta_kernel::Error::into_kernel_error)
     }
 }
 

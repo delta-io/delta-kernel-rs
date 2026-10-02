@@ -7,7 +7,7 @@ mod utils;
 
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
-use delta_kernel::{DeltaResult, KernelError, LogPath, Snapshot};
+use delta_kernel::{Error, KernelError, LogPath, Result, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
@@ -24,7 +24,7 @@ pub use utils::{
 ///
 /// Returns an error if a commit's `file_size` is negative (does not fit in `FileSize`) or if
 /// [`LogPath::staged_commit`] rejects the resolved path.
-pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaResult<Vec<LogPath>> {
+pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> Result<Vec<LogPath>> {
     // `load_table` returns the location without a trailing slash, but staged-commit path
     // resolution requires the table root to end in `/`.
     if !table_root.path().ends_with('/') {
@@ -35,12 +35,16 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaRe
     sorted
         .into_iter()
         .map(|c| {
-            let file_size = c.file_size.try_into().map_err(|_| {
-                KernelError::generic(format!(
-                    "commit file_size {} does not fit in FileSize",
-                    c.file_size
-                ))
-            })?;
+            let file_size = c
+                .file_size
+                .try_into()
+                .map_err(|_| {
+                    KernelError::generic(format!(
+                        "commit file_size {} does not fit in FileSize",
+                        c.file_size
+                    ))
+                })
+                .map_err(Error::Kernel)?;
             LogPath::staged_commit(
                 table_root.clone(),
                 &c.file_name,
@@ -62,15 +66,17 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> DeltaRe
 ///
 /// Returns an error if the response's location is not a valid URL, if [`log_tail_from_commits`]
 /// fails, or if `latest_table_version` is negative.
-pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> DeltaResult<SnapshotBuilder> {
+pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> Result<SnapshotBuilder> {
     let table_root = Url::parse(&resp.metadata.location)
-        .map_err(|e| KernelError::generic(format!("invalid table location: {e}")))?;
+        .map_err(|e| KernelError::generic(format!("invalid table location: {e}")))
+        .map_err(Error::Kernel)?;
     let log_tail = log_tail_from_commits(&resp.commits, table_root.clone())?;
     let mut builder = Snapshot::builder_for(table_root).with_log_tail(log_tail);
     if let Some(version) = resp.latest_table_version {
         let max_catalog_version: u64 = version
             .try_into()
-            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
+            .map_err(|_| KernelError::generic("catalog reported a negative table version"))
+            .map_err(Error::Kernel)?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)

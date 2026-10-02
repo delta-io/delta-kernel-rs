@@ -12,7 +12,7 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{Engine, ExpressionRef, FileMeta, KernelResult, Snapshot};
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
@@ -74,14 +74,20 @@ struct ScanState {
     logical_schema: SchemaRef,
 }
 
-fn try_main() -> DeltaResult<()> {
+fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
 
-    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     println!("Reading {url}");
-    let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
-    let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
+    let engine = common::get_engine(&url, &cli.location_args)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let snapshot = Snapshot::builder_for(url)
+        .build(&engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let Some(scan) = common::get_scan(snapshot, &cli.scan_args)
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(());
     };
 
@@ -90,7 +96,9 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_metadata = scan.scan_metadata(&engine)?;
+    let scan_metadata = scan
+        .scan_metadata(&engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     if cli.metadata {
         let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
@@ -127,8 +135,10 @@ fn try_main() -> DeltaResult<()> {
         drop(record_batch_tx);
 
         for res in scan_metadata {
-            let scan_metadata = res?;
-            scan_file_tx = scan_metadata.visit_scan_files(scan_file_tx, send_scan_file)?;
+            let scan_metadata = res.map_err(delta_kernel::Error::into_kernel_error)?;
+            scan_file_tx = scan_metadata
+                .visit_scan_files(scan_file_tx, send_scan_file)
+                .map_err(delta_kernel::Error::into_kernel_error)?;
         }
 
         drop(scan_file_tx);

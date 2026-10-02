@@ -14,7 +14,7 @@
 
 use crate::expressions::{lit, null_lit, Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
-use crate::{DeltaResult, KernelError};
+use crate::{Error, KernelError, KernelResult};
 
 #[cfg(feature = "check-constraints-in-dev")]
 mod parser;
@@ -39,7 +39,7 @@ mod token;
 ///
 /// Returns an error if the input is not a SQL form this parser accepts, or if the parsed value
 /// is not compatible with `data_type` (incompatible type, out of range, etc.).
-pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
+pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> KernelResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         return Err(KernelError::generic("empty SQL literal"));
@@ -59,7 +59,7 @@ pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expressi
 ///
 /// Typed-literal keywords (`DATE`, `TIMESTAMP`, `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, `X`) and
 /// `TRUE`/`FALSE` are case-insensitive.
-fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<Expression> {
+fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> KernelResult<Expression> {
     let DataType::Primitive(primitive) = data_type else {
         return Err(KernelError::generic(format!(
             "SQL literal parsing only supports primitive types, got {data_type:?}"
@@ -74,7 +74,9 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
         PrimitiveType::Float | PrimitiveType::Double => {
             parse_double_or_float(primitive, trimmed, sql)?
         }
-        _ => primitive.parse_scalar(trimmed)?,
+        _ => primitive
+            .parse_scalar(trimmed)
+            .map_err(Error::into_kernel_error)?,
     };
     Ok(lit(scalar))
 }
@@ -83,14 +85,14 @@ fn parse_literal(trimmed: &str, data_type: &DataType, sql: &str) -> DeltaResult<
 /// `it's`). Bypasses `parse_scalar`, which maps an empty input to SQL NULL (partition-value
 /// convention), so an empty literal `''` round-trips here as `Scalar::String("")`, distinct from
 /// NULL. A backslash and double-quoted strings (`"foo"`) are rejected (see [`unquote_string`]).
-fn parse_string_literal(trimmed: &str) -> DeltaResult<Scalar> {
+fn parse_string_literal(trimmed: &str) -> KernelResult<Scalar> {
     Ok(Scalar::String(unquote_string(trimmed)?))
 }
 
 /// Build a `Scalar::Binary` from an `X'deadbeef'` literal (even number of hex digits) via
 /// [`decode_binary_literal`]. Bypasses `parse_scalar` for the same empty-vs-NULL reason as
 /// [`parse_string_literal`].
-fn parse_binary_literal(trimmed: &str) -> DeltaResult<Scalar> {
+fn parse_binary_literal(trimmed: &str) -> KernelResult<Scalar> {
     Ok(Scalar::Binary(decode_binary_literal(trimmed)?))
 }
 
@@ -98,9 +100,11 @@ fn parse_binary_literal(trimmed: &str) -> DeltaResult<Scalar> {
 ///
 /// Supported formats include `'2024-01-01'`, `DATE '2024-01-01'`, or `DATE'2024-01-01'`. The
 /// `DATE` keyword is optional and may have 0 or more whitespace before the apostrophe.
-fn parse_date_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
+fn parse_date_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar> {
     let raw = unwrap_quoted_body(trimmed, &["DATE"], &PrimitiveType::Date, sql)?;
-    PrimitiveType::Date.parse_scalar(&raw)
+    PrimitiveType::Date
+        .parse_scalar(&raw)
+        .map_err(Error::into_kernel_error)
 }
 
 /// Parse a zoneless (wall-clock) `Scalar::TimestampNtz` from a trimmed string.
@@ -109,14 +113,16 @@ fn parse_date_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
 /// 12:00:00'`. The `TIMESTAMP_NTZ` keyword is optional and may have 0 or more whitespace before the
 /// apostrophe; it must be `TIMESTAMP_NTZ`, not bare `TIMESTAMP` (which is LTZ). Carrying no zone,
 /// it needs no UTC guard.
-fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
+fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar> {
     let raw = unwrap_quoted_body(
         trimmed,
         &["TIMESTAMP_NTZ"],
         &PrimitiveType::TimestampNtz,
         sql,
     )?;
-    PrimitiveType::TimestampNtz.parse_scalar(&raw)
+    PrimitiveType::TimestampNtz
+        .parse_scalar(&raw)
+        .map_err(Error::into_kernel_error)
 }
 
 /// Parse a `Scalar::Timestamp` (local-time-zone) from a trimmed string in ISO 8601 / RFC 3339 form
@@ -127,7 +133,7 @@ fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> 
 /// apostrophe. Only the LTZ keywords are accepted: a mismatched keyword (e.g. an NTZ literal on an
 /// LTZ column) carries different timezone semantics and must not be reused. `TIMESTAMP_LTZ` is an
 /// explicit spelling of LTZ (== bare `TIMESTAMP`); both route through [`require_utc_z_suffix`].
-fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> {
+fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar> {
     let raw = unwrap_quoted_body(
         trimmed,
         &["TIMESTAMP", "TIMESTAMP_LTZ"],
@@ -135,7 +141,9 @@ fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> DeltaResult<Scalar> 
         sql,
     )?;
     require_utc_z_suffix(&raw, sql)?;
-    PrimitiveType::Timestamp.parse_scalar(&raw)
+    PrimitiveType::Timestamp
+        .parse_scalar(&raw)
+        .map_err(Error::into_kernel_error)
 }
 
 /// Strip the typed-literal keyword prefix, if any, and return the inner literal value, unquoted and
@@ -149,7 +157,7 @@ fn unwrap_quoted_body(
     keywords: &[&str],
     primitive: &PrimitiveType,
     sql: &str,
-) -> DeltaResult<String> {
+) -> KernelResult<String> {
     let body = strip_typed_prefix_and_unquote(trimmed, keywords)?;
     // Trim the inner body to match Spark's `stringToDate`/ `stringToTimestamp`.
     let body = body.trim();
@@ -168,7 +176,7 @@ fn unwrap_quoted_body(
 /// - lowercase `t`/`z` (RFC 3339 permits, Spark rejects);
 /// - zoneless literals (Spark resolves against the session timezone, unknown to kernel);
 /// - numeric offsets (e.g. `+05:00`, even `+00:00`), which `parse_scalar` silently drops as UTC.
-fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
+fn require_utc_z_suffix(raw: &str, sql: &str) -> KernelResult<()> {
     if raw.contains(['t', 'z']) {
         return Err(KernelError::generic(
             "TIMESTAMP literal must use uppercase 'T' and or 'Z'",
@@ -198,7 +206,7 @@ fn require_utc_z_suffix(raw: &str, sql: &str) -> DeltaResult<()> {
 /// - For FLOAT, parse an exponent literal as f64 then narrow, matching Spark's DOUBLE-then-cast
 ///   (double rounding); a direct f32 parse single-rounds and can differ by 1 ULP.
 /// - Reject non-finite results and fold a plain `-0.0` to `+0.0` (exponent forms keep their sign).
-fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> DeltaResult<Scalar> {
+fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> KernelResult<Scalar> {
     let has_exponent = raw.contains(['e', 'E']);
     if !has_exponent && exceeds_decimal_precision(raw) {
         return Err(KernelError::generic(format!(
@@ -213,7 +221,9 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Del
             .map_err(|_| KernelError::generic(format!("invalid FLOAT literal: {sql}")))?;
         Scalar::Float(value as f32)
     } else {
-        primitive.parse_scalar(raw)?
+        primitive
+            .parse_scalar(raw)
+            .map_err(Error::into_kernel_error)?
     };
     // Negative zero: `+ 0.0` folds a plain `-0.0` to `+0.0` (a no-op for every other value);
     // exponent forms keep their sign, so skip them.
@@ -254,7 +264,7 @@ fn exceeds_decimal_precision(raw: &str) -> bool {
 /// errors as unterminated (the `''` escapes a quote, leaving no closing quote). Errors if `input`
 /// is not a properly terminated single-quoted string (missing closing quote or trailing chars), or
 /// contains a backslash (Spark's `\n`/`\\` escapes are not yet supported).
-fn unquote_string(input: &str) -> DeltaResult<String> {
+fn unquote_string(input: &str) -> KernelResult<String> {
     let body = input.strip_prefix('\'').ok_or_else(|| {
         KernelError::generic(format!("expected a single-quoted SQL string, got: {input}"))
     })?;
@@ -296,7 +306,7 @@ fn unquote_string(input: &str) -> DeltaResult<String> {
 ///
 /// Unlike [`unwrap_quoted_body`], the inner body is returned verbatim, not trimmed: `DATE
 /// ' 2024-01-01 '` returns ` 2024-01-01 ` (interior whitespace preserved).
-fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> DeltaResult<String> {
+fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> KernelResult<String> {
     // Match a keyword only as a complete token: it must be followed by the opening quote or
     // whitespace, never more identifier characters (so `DATEX '..'` is not read as `DATE`).
     let body = keywords.iter().find_map(|kw| {
@@ -310,7 +320,7 @@ fn strip_typed_prefix_and_unquote(input: &str, keywords: &[&str]) -> DeltaResult
 
 /// Decode a `X'hex'` SQL binary literal into a byte vector. The leading `X` is case-insensitive;
 /// the body must be an even-length sequence of hex digits.
-fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
+fn decode_binary_literal(input: &str) -> KernelResult<Vec<u8>> {
     let err = || {
         KernelError::generic(format!(
             "expected a SQL binary literal like X'..', got: {input}"

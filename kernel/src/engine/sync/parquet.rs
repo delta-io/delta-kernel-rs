@@ -18,8 +18,8 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    FileSize, ParquetFooter, ParquetHandler, PredicateRef,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult, ParquetFooter,
+    ParquetHandler, PredicateRef, Result, ResultIteratorStatic,
 };
 
 #[derive(Constructor)]
@@ -32,9 +32,10 @@ pub(super) fn try_create_from_parquet(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
-    let (requested_ordering, mask) = parquet_read_plan(&schema, &metadata)?;
+    let (requested_ordering, mask) =
+        parquet_read_plan(&schema, &metadata).map_err(crate::Error::into_kernel_error)?;
 
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
@@ -45,16 +46,20 @@ pub(super) fn try_create_from_parquet(
             builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
         });
 
-    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+    let mut row_indexes = row_indexes
+        .map(|rb| rb.build())
+        .transpose()
+        .map_err(crate::Error::into_kernel_error)?;
     let stream = builder.build()?;
     Ok(stream.map(move |rbr| {
         fixup_parquet_read(
-            rbr?,
+            rbr.map_err(crate::KernelError::from)?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
             Some(&schema),
         )
+        .map_err(crate::Error::into_kernel_error)
     }))
 }
 
@@ -64,7 +69,7 @@ impl ParquetHandler for SyncParquetHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         let iter = read_files_arrow(
             self.store.as_ref(),
             files,
@@ -72,7 +77,10 @@ impl ParquetHandler for SyncParquetHandler {
             predicate,
             try_create_from_parquet,
         );
-        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
+        Ok(Box::new(iter.map(|data| {
+            data.map(|data| Box::new(data) as _)
+                .map_err(crate::Error::Kernel)
+        })))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -87,11 +95,14 @@ impl ParquetHandler for SyncParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
-        let first_batch = data.next().ok_or_else(|| {
-            crate::KernelError::generic("Cannot write parquet file with empty data iterator")
-        })??;
+        mut data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
+        let first_batch = data
+            .next()
+            .ok_or_else(|| {
+                crate::KernelError::generic("Cannot write parquet file with empty data iterator")
+            })
+            .map_err(crate::Error::Kernel)??;
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
@@ -100,23 +111,35 @@ impl ParquetHandler for SyncParquetHandler {
             &mut buf,
             first_record_batch.schema(),
             writer_options(),
-        )?;
-        writer.write(&first_record_batch)?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
+        writer
+            .write(&first_record_batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         for result in data {
             let engine_data = result?;
             let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
-            writer.write(&batch)?;
+            writer
+                .write(&batch)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?;
         }
-        writer.close()?; // writer must be closed to write the footer
+        writer
+            .close()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?; // writer must be closed to write the footer
         let size_in_bytes = buf.len() as u64;
 
-        put_bytes(self.store.as_ref(), &location, buf.into(), true)?;
+        put_bytes(self.store.as_ref(), &location, buf.into(), true)
+            .map_err(crate::Error::Kernel)?;
         Ok(size_in_bytes)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        parquet_footer(self.store.as_ref(), file)
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+        parquet_footer(self.store.as_ref(), file).map_err(crate::Error::Kernel)
     }
 }
 
@@ -124,7 +147,7 @@ impl ParquetHandler for SyncParquetHandler {
 pub(super) fn parquet_footer(
     store: Option<&Arc<DynObjectStore>>,
     file: &FileMeta,
-) -> DeltaResult<ParquetFooter> {
+) -> KernelResult<ParquetFooter> {
     let data = get_bytes(store, &file.location)?;
     let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
     let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
@@ -144,7 +167,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::EngineData;
 
-    fn test_data_iter() -> DeltaResultIteratorStatic<Box<dyn EngineData>> {
+    fn test_data_iter() -> ResultIteratorStatic<Box<dyn EngineData>> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
@@ -253,8 +276,7 @@ mod tests {
         ));
 
         let batches = vec![Ok(batch1), Ok(batch2), Ok(batch3)];
-        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
-            Box::new(batches.into_iter());
+        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> = Box::new(batches.into_iter());
 
         handler.write_parquet_file(url.clone(), data_iter).unwrap();
         assert!(file_path.exists());

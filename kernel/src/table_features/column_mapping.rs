@@ -19,7 +19,7 @@ use crate::schema::{
 };
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, KernelError};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -47,7 +47,7 @@ pub(crate) const MAX_COLUMN_MAPPING_ID: i64 = i32::MAX as i64;
 /// that want to add context (e.g. the offending field name or table-property name) wrap with
 /// `.map_err(|e| KernelError::schema(format!("Field '{name}': {e}")))?` -- matching the kernel
 /// convention used by sibling validators in `schema/validation.rs`.
-pub(crate) fn validate_column_mapping_id(id: i64) -> DeltaResult<()> {
+pub(crate) fn validate_column_mapping_id(id: i64) -> KernelResult<()> {
     if (0..=MAX_COLUMN_MAPPING_ID).contains(&id) {
         return Ok(());
     }
@@ -110,8 +110,8 @@ pub(crate) fn column_mapping_mode(
 ///   ]}}
 /// ]}
 /// ```
-pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    MakePhysical::validate_schema_column_mapping(mode, schema)
+pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> Result<()> {
+    MakePhysical::validate_schema_column_mapping(mode, schema).map_err(Error::Kernel)
 }
 
 /// How to treat a stale `delta.columnMapping.*` annotation found on a field while column mapping
@@ -198,7 +198,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     parent_field_logical_path: &[&'a str],
     seen_ids: Option<&mut HashMap<i64, &'a str>>,
     current_field_siblings: Option<&mut HashMap<&'a str, &'a str>>,
-) -> DeltaResult<(&'a str, Option<i64>)> {
+) -> KernelResult<(&'a str, Option<i64>)> {
     let logical_field_path = || {
         ColumnName::new(
             parent_field_logical_path
@@ -324,7 +324,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
 /// Returns `ColumnMappingMode::None` if the property is not set.
 pub(crate) fn get_column_mapping_mode_from_properties(
     properties: &HashMap<String, String>,
-) -> DeltaResult<ColumnMappingMode> {
+) -> KernelResult<ColumnMappingMode> {
     match properties.get(COLUMN_MAPPING_MODE) {
         Some(mode_str) => mode_str.parse::<ColumnMappingMode>().map_err(|_| {
             KernelError::generic(format!(
@@ -414,20 +414,20 @@ pub(crate) fn assign_column_mapping_metadata(
     schema: &StructType,
     max_id: &mut i64,
     assign_nested_field_ids: bool,
-) -> DeltaResult<StructType> {
+) -> Result<StructType> {
     // Assign CM id + physical name to every StructField (top-level and nested).
     // `delta.columnMapping.nested.ids` is assigned later separately, this is to
     // align with delta-spark's behavior.
     let new_fields: Vec<StructField> = schema
         .fields()
-        .map(|field| try_assign_flat_column_mapping_info(field, max_id))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .map(|field| try_assign_flat_column_mapping_info(field, max_id).map_err(Error::Kernel))
+        .collect::<Result<Vec<_>>>()?;
     let with_flat_cm_info = StructType::try_new(new_fields)?;
     if !assign_nested_field_ids {
         return Ok(with_flat_cm_info);
     }
     // Then populate `delta.columnMapping.nested.ids` per StructField.
-    assign_nested_cm_ids(&with_flat_cm_info, max_id)
+    assign_nested_cm_ids(&with_flat_cm_info, max_id).map_err(Error::Kernel)
 }
 
 /// JSON object holding [`ColumnMetadataKey::ColumnMappingNestedIds`] entries for an Array/Map
@@ -446,7 +446,7 @@ type NestedFieldIds = serde_json::Map<String, serde_json::Value>;
 /// quintillion) is over four billion times the protocol-permitted maximum and points at a bug
 /// in the connector's id allocator rather than legitimate id exhaustion. The error message
 /// reflects that diagnosis.
-fn next_column_mapping_id(max_id: &mut i64) -> DeltaResult<i64> {
+fn next_column_mapping_id(max_id: &mut i64) -> KernelResult<i64> {
     let next = max_id.checked_add(1).ok_or_else(|| {
         KernelError::generic(format!(
             "Cannot allocate column mapping id: `max_id + 1` overflows `i64` \
@@ -491,7 +491,7 @@ fn next_column_mapping_id(max_id: &mut i64) -> DeltaResult<i64> {
 pub(crate) fn try_assign_flat_column_mapping_info(
     field: &StructField,
     max_id: &mut i64,
-) -> DeltaResult<StructField> {
+) -> KernelResult<StructField> {
     for key in [
         ColumnMetadataKey::ColumnMappingNestedIds,
         ColumnMetadataKey::ParquetFieldNestedIds,
@@ -560,12 +560,13 @@ pub(crate) fn try_assign_flat_column_mapping_info(
 fn flat_cm_info_for_nested_data_type(
     data_type: &DataType,
     max_id: &mut i64,
-) -> DeltaResult<DataType> {
+) -> KernelResult<DataType> {
     match data_type {
         DataType::Struct(inner) => {
             let new_inner = assign_column_mapping_metadata(
                 inner, max_id, /* assign_nested_field_ids */ false,
-            )?;
+            )
+            .map_err(Error::into_kernel_error)?;
             Ok(DataType::from(new_inner))
         }
         DataType::Array(array_type) => {
@@ -607,13 +608,13 @@ fn flat_cm_info_for_nested_data_type(
 ///   "<phys>.value":       4
 /// }
 /// ```
-fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<StructType> {
+fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<StructType> {
     fn walk(
         data_type: &DataType,
         max_id: &mut i64,
         path: &str,
         nested_ids: &mut NestedFieldIds,
-    ) -> DeltaResult<DataType> {
+    ) -> KernelResult<DataType> {
         match data_type {
             DataType::Struct(inner) => Ok(DataType::from(assign_nested_cm_ids(inner, max_id)?)),
             DataType::Array(array_type) => {
@@ -659,12 +660,12 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
             }
             Ok(new_field)
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
-    StructType::try_new(new_fields)
+        .collect::<KernelResult<Vec<_>>>()?;
+    StructType::try_new(new_fields).map_err(Error::into_kernel_error)
 }
 
 // Get the physical name for a field. Error if the field is missing the physical name annotation.
-fn expect_physical_name(field: &StructField) -> DeltaResult<String> {
+fn expect_physical_name(field: &StructField) -> KernelResult<String> {
     match field
         .metadata
         .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
@@ -846,31 +847,31 @@ pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
     col_name: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
-) -> DeltaResult<ColumnName> {
+) -> Result<ColumnName> {
     let fields = schema.fields_of_path(col_name)?;
     let physical_path: Vec<String> = fields
         .iter()
-        .map(|field| -> DeltaResult<String> {
+        .map(|field| -> Result<String> {
             if column_mapping_mode != ColumnMappingMode::None {
                 if !field.has_physical_name_annotation() {
-                    return Err(KernelError::Schema(format!(
+                    return Err(Error::Kernel(KernelError::Schema(format!(
                         "Column mapping is enabled but field '{}' lacks the {} annotation",
                         field.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
-                    )));
+                    ))));
                 }
                 if !field.has_id_annotation() {
-                    return Err(KernelError::Schema(format!(
+                    return Err(Error::Kernel(KernelError::Schema(format!(
                         "Column mapping is enabled but field '{}' lacks the {} annotation",
                         field.name,
                         ColumnMetadataKey::ColumnMappingId.as_ref()
-                    )));
+                    ))));
                 }
             }
 
             Ok(field.physical_name(column_mapping_mode).to_string())
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     Ok(ColumnName::new(physical_path))
 }
 
@@ -884,7 +885,7 @@ pub(crate) fn physical_to_logical_column_name_and_type(
     logical_schema: &StructType,
     physical_col: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
-) -> DeltaResult<(ColumnName, DataType)> {
+) -> KernelResult<(ColumnName, DataType)> {
     let mut fields = vec![];
     logical_schema.visit_fields_of_path_by(
         physical_col,

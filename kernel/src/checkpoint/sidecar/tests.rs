@@ -26,7 +26,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{schema, schema_ref, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{DeltaResult, Engine, EngineData, Snapshot};
+use crate::{Engine, EngineData, KernelResult, Result, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -42,8 +42,10 @@ fn generate_checkpoint_parts(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
-) -> DeltaResult<CheckpointParts> {
-    let data_iter = writer.checkpoint_data(engine)?;
+) -> KernelResult<CheckpointParts> {
+    let data_iter = writer
+        .checkpoint_data(engine)
+        .map_err(crate::Error::into_kernel_error)?;
     let iter_state = data_iter.state();
     let output_schema = writer.output_schema.clone();
 
@@ -64,7 +66,11 @@ fn generate_checkpoint_parts(
             let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
             engine
                 .parquet_handler()
-                .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
+                .write_parquet_file(
+                    sidecar_url.clone(),
+                    Box::new(single_sidecar_iter.map(|batch| batch.map_err(crate::Error::Kernel))),
+                )
+                .map_err(crate::Error::into_kernel_error)?;
             sidecar_files.push(sidecar_url);
             sidecar_index += 1;
         }
@@ -278,7 +284,7 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 /// Verifies: exactly 1 sidecar file, non-file batches buffered, iterator exhausted,
 /// action counts correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
+async fn test_generate_sidecars_single_sidecar() -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -290,7 +296,8 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     write_commit_to_store(
         &store,
@@ -301,15 +308,21 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    write_commit_to_store(&store, vec![create_remove_action("file1.parquet")], 2).await?;
+    write_commit_to_store(&store, vec![create_remove_action("file1.parquet")], 2)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let result = generate_checkpoint_parts(&writer, &engine, usize::MAX)?;
+    let result =
+        generate_checkpoint_parts(&writer, &engine, usize::MAX).map_err(crate::Error::Kernel)?;
 
     assert_eq!(result.sidecar_files.len(), 1);
 
@@ -341,7 +354,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 /// batches with both file and non-file actions correctly split, and the row count of the
 /// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
+async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -357,7 +370,8 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Spread adds and removes across commits so the hint=3 causes chunking at batch
     // boundaries, with removes landing in multiple sidecars.
@@ -370,7 +384,8 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
     write_commit_to_store(
         &store,
         vec![
@@ -380,10 +395,15 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
         ],
         2,
     )
-    .await?;
-    write_commit_to_store(&store, vec![create_add_action("file5.parquet")], 3).await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
+    write_commit_to_store(&store, vec![create_add_action("file5.parquet")], 3)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -396,7 +416,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     // Sidecar 1: commit 3 (1) + commit 2 (3) = 4 file action rows (hint exceeded)
     // Sidecar 2: commit 1 (3) = 3 file action rows (hint reached)
     // Sidecar 3: commit 0 file part (1) = 1 file action row
-    let result = generate_checkpoint_parts(&writer, &engine, 3)?;
+    let result = generate_checkpoint_parts(&writer, &engine, 3).map_err(crate::Error::Kernel)?;
 
     assert!(result.iter_state.is_exhausted());
 
@@ -451,7 +471,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 /// V2 table with adds across multiple commits, hint=1 (very small).
 /// Verifies: produces multiple sidecar files, splitter is exhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
+async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -463,7 +483,8 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     write_commit_to_store(
         &store,
@@ -473,7 +494,8 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     write_commit_to_store(
         &store,
@@ -483,14 +505,17 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
         ],
         2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // hint=1: each batch exceeds the hint, so each gets its own sidecar.
-    let result = generate_checkpoint_parts(&writer, &engine, 1)?;
+    let result = generate_checkpoint_parts(&writer, &engine, 1).map_err(crate::Error::Kernel)?;
 
     assert!(result.iter_state.is_exhausted());
     assert_eq!(
@@ -521,7 +546,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 /// 4. Validate the output schema includes `stats_parsed` and `partitionValues_parsed`.
 /// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> {
+async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -533,7 +558,8 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let mut add = Add {
         path: "category=books/file1.parquet".into(),
@@ -551,9 +577,13 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     };
     add.partition_values
         .insert("category".into(), "books".into());
-    write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
+    write_commit_to_store(&store, vec![Action::Add(add)], 1)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -633,7 +663,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 /// V2 table with only protocol + metadata (no adds/removes).
 /// Verifies: SidecarSplitter yields no file-action rows and buffers all non-file actions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_splitter_no_file_actions() -> DeltaResult<()> {
+async fn test_splitter_no_file_actions() -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -645,9 +675,12 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -658,9 +691,11 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
         data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
 
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
+    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)
+        .map_err(crate::Error::Kernel)?;
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
 

@@ -36,7 +36,7 @@ use crate::table_features::{Operation, TableFeature};
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::PhantomType;
-use crate::{DeltaResult, Engine, KernelError};
+use crate::{Engine, Error, KernelError, Result};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -186,7 +186,7 @@ impl AlterTableTransactionBuilder<Modifying> {
         self,
         _engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> DeltaResult<AlterTableTransaction> {
+    ) -> Result<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // kernel doesn't currently support altering tables with these features
         let unsupported_iceberg_compat =
@@ -194,15 +194,15 @@ impl AlterTableTransactionBuilder<Modifying> {
                 .into_iter()
                 .find(|feature| table_config.is_feature_enabled(feature));
         if let Some(feature) = unsupported_iceberg_compat {
-            return Err(KernelError::unsupported(format!(
+            return Err(Error::Kernel(KernelError::unsupported(format!(
                 "ALTER TABLE is not yet supported on tables with {feature} enabled"
-            )));
+            ))));
         }
         // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
-            ));
+            )));
         }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
@@ -210,7 +210,8 @@ impl AlterTableTransactionBuilder<Modifying> {
         // protocol must also re-check this on the evolved `TableConfiguration`.
         table_config.ensure_operation_supported(Operation::Write)?;
 
-        let evolved_table_config = evolve_table_config(table_config, self.operations)?;
+        let evolved_table_config =
+            evolve_table_config(table_config, self.operations).map_err(Error::Kernel)?;
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
@@ -218,5 +219,6 @@ impl AlterTableTransactionBuilder<Modifying> {
             committer,
             self.correlation_id,
         )
+        .map_err(Error::Kernel)
     }
 }

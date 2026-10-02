@@ -46,9 +46,9 @@ For example:
 ```rust,no_run
 # extern crate delta_kernel;
 # use delta_kernel::scan::state::ScanFile;
-# use delta_kernel::{DeltaResult, Engine};
+# use delta_kernel::{Result, Engine};
 # fn perform_read(_chunk: &[ScanFile]) {}
-# fn example(scan: &delta_kernel::scan::Scan, engine: &dyn Engine) -> DeltaResult<()> {
+# fn example(scan: &delta_kernel::scan::Scan, engine: &dyn Engine) -> Result<()> {
 fn collect_files(files: &mut Vec<ScanFile>, file: ScanFile) {
     files.push(file);
 }
@@ -109,7 +109,9 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into()
+    .map_err(|_| KernelError::generic("negative file size"))
+    .map_err(delta_kernel::Error::Kernel)?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine
@@ -262,8 +264,8 @@ To have Kernel hand you the typed values directly, opt in with `with_partition_v
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::PartitionValuesOptions;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn example() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -308,7 +310,7 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // may yield Err(KernelError::Cancelled) if cancellation stops replay
+    let metadata = metadata?; // cancellation returns Error::Kernel(KernelError::Cancelled)
     // ... process the batch ...
 }
 ```

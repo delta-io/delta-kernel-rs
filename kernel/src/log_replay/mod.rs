@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData};
+use crate::{EngineData, KernelResult, Result};
 
 pub(crate) mod deduplicator;
 
@@ -138,10 +138,16 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> DeltaResult<Option<FileActionInfo>> {
+    ) -> KernelResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
-        if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
-            let size = match getters[self.add_size_index].get_long(i, "add.size")? {
+        if let Some(path) = getters[self.add_path_index]
+            .get_str(i, "add.path")
+            .map_err(crate::Error::into_kernel_error)?
+        {
+            let size = match getters[self.add_size_index]
+                .get_long(i, "add.size")
+                .map_err(crate::Error::into_kernel_error)?
+            {
                 Some(s) => u64::try_from(s).unwrap_or_else(|e| {
                     warn!("Could not convert add.size {s} to u64: {e}");
                     0
@@ -166,7 +172,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         }
 
         // Try to extract a remove action by the required path column
-        if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
+        if let Some(path) = getters[self.remove_path_index]
+            .get_str(i, "remove.path")
+            .map_err(crate::Error::into_kernel_error)?
+        {
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
             return Ok(Some(FileActionInfo {
                 key: FileActionKey::new(path, dv_unique_id),
@@ -210,7 +219,7 @@ impl ActionsBatch {
 #[internal_api]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> Result<Self::Output>;
 }
 
 impl<T> ParallelLogReplayProcessor for Arc<T>
@@ -219,7 +228,7 @@ where
 {
     type Output = T::Output;
 
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         T::process_actions_batch(self, actions_batch)
     }
 }
@@ -294,12 +303,12 @@ pub(crate) trait LogReplayProcessor: Sized {
     ///   representing a batch of actions and a boolean flag indicating whether the batch originates
     ///   from a commit log, `false` if from a checkpoint.
     ///
-    /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected
+    /// Returns a [`Result`] containing the processor’s output, which includes only selected
     /// actions.
     ///
     /// Note: Since log replay is stateful, processing may update internal processor state (e.g.,
     /// deduplication sets).
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> Result<Self::Output>;
 
     /// Applies the processor to an actions iterator and filters out empty results.
     ///
@@ -318,8 +327,8 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// (batches where at least one row was selected).
     fn process_actions_iter(
         mut self,
-        action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
+        action_iter: impl Iterator<Item = Result<ActionsBatch>>,
+    ) -> impl Iterator<Item = Result<Self::Output>> {
         action_iter
             .map(move |actions_batch| self.process_actions_batch(actions_batch?))
             .filter(|res| {
@@ -341,11 +350,11 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// - `batch`: A reference to the batch of actions to be processed.
     ///
     /// # Returns
-    /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be
+    /// A `Result<Vec<bool>>`, where each boolean indicates if the corresponding row should be
     /// included. If no filter is provided, all rows are selected.
-    fn build_selection_vector(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+    fn build_selection_vector(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
         match self.data_skipping_filter() {
-            Some(filter) => filter.apply(batch),
+            Some(filter) => filter.apply(batch).map_err(crate::Error::Kernel),
             None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
         }
     }
@@ -373,7 +382,7 @@ mod tests {
     use super::deduplicator::CheckpointDeduplicator;
     use super::*;
     use crate::engine_data::GetData;
-    use crate::DeltaResult;
+    use crate::Result;
 
     /// Mock GetData implementation for testing
     struct MockGetData {
@@ -408,9 +417,11 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
-        fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+        fn get_str(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a str>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::KernelError::Generic(error_msg.clone()));
+                return Err(crate::Error::Kernel(crate::KernelError::Generic(
+                    error_msg.clone(),
+                )));
             }
             Ok(self
                 .string_values
@@ -418,9 +429,11 @@ mod tests {
                 .map(|s| s.as_str()))
         }
 
-        fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
+        fn get_int(&'a self, row_index: usize, field_name: &str) -> Result<Option<i32>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::KernelError::Generic(error_msg.clone()));
+                return Err(crate::Error::Kernel(crate::KernelError::Generic(
+                    error_msg.clone(),
+                )));
             }
             Ok(self
                 .int_values
@@ -428,9 +441,11 @@ mod tests {
                 .cloned())
         }
 
-        fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
-                return Err(crate::KernelError::Generic(error_msg.clone()));
+                return Err(crate::Error::Kernel(crate::KernelError::Generic(
+                    error_msg.clone(),
+                )));
             }
             Ok(self
                 .long_values
@@ -484,7 +499,7 @@ mod tests {
     fn test_extract_file_action_add(
         #[case] raw_size: Option<i64>,
         #[case] expected_size: u64,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -494,7 +509,9 @@ mod tests {
             mock_add.add_long(0, "add.size", s);
         }
         let getters = create_getters_with_mocks(Some(&mock_add), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         let FileActionInfo { key, size, is_add } = result.unwrap();
         assert_eq!(key.path, "file1.parquet");
@@ -506,14 +523,16 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_remove() -> DeltaResult<()> {
+    fn test_extract_file_action_remove() -> Result<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_remove = MockGetData::new();
         mock_remove.add_string(0, "remove.path", "file2.parquet");
         let getters = create_getters_with_mocks(None, Some(&mock_remove));
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -524,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
+    fn test_extract_file_action_with_deletion_vector() -> Result<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -534,7 +553,9 @@ mod tests {
         mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
         mock_dv.add_int(0, "deletionVector.offset", 100);
         let getters = create_getters_with_mocks(Some(&mock_dv), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -548,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_skip_removes() -> DeltaResult<()> {
+    fn test_extract_file_action_skip_removes() -> Result<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -558,25 +579,28 @@ mod tests {
 
         // With skip_removes=true, should return None
         assert!(deduplicator
-            .extract_file_action(0, &getters, true)?
+            .extract_file_action(0, &getters, true)
+            .map_err(crate::Error::Kernel)?
             .is_none());
 
         // With skip_removes=false, should return Some
         assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?
             .is_some());
 
         Ok(())
     }
 
     #[test]
-    fn test_extract_file_action_no_action_found() -> DeltaResult<()> {
+    fn test_extract_file_action_no_action_found() -> Result<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let getters = create_getters_with_mocks(None, None);
         assert!(deduplicator
-            .extract_file_action(0, &getters, false)?
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?
             .is_none());
 
         Ok(())
@@ -648,14 +672,17 @@ mod tests {
     // ==================== CheckpointDeduplicator Tests ====================
 
     #[test]
-    fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
+    fn test_checkpoint_extract_file_action_add() -> Result<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let deduplicator =
+            CheckpointDeduplicator::try_new(&seen, 0, 2, 3).map_err(crate::Error::Kernel)?;
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
         let getters = create_getters_with_mocks(Some(&mock_add), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -667,9 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
+    fn test_checkpoint_extract_file_action_with_deletion_vector() -> Result<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
+        let deduplicator =
+            CheckpointDeduplicator::try_new(&seen, 0, 1, 2).map_err(crate::Error::Kernel)?;
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
@@ -677,7 +705,9 @@ mod tests {
         mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
         mock_dv.add_int(0, "deletionVector.offset", 100);
         let getters = create_getters_with_mocks(Some(&mock_dv), None);
-        let result = deduplicator.extract_file_action(0, &getters, false)?;
+        let result = deduplicator
+            .extract_file_action(0, &getters, false)
+            .map_err(crate::Error::Kernel)?;
 
         assert!(result.is_some());
         let FileActionInfo { key, is_add, .. } = result.unwrap();
@@ -692,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> DeltaResult<()> {
+    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> Result<()> {
         let mut seen = HashSet::new();
 
         // Files "seen" during commit processing
@@ -702,7 +732,8 @@ mod tests {
             Some("dv123".to_string()),
         ));
 
-        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let mut deduplicator =
+            CheckpointDeduplicator::try_new(&seen, 0, 2, 3).map_err(crate::Error::Kernel)?;
 
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);

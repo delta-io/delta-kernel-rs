@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::path::ParsedLogPath;
 use crate::utils::require;
-use crate::{DeltaResult, FileMeta, FileSize, KernelError};
+use crate::{FileMeta, FileSize, KernelError, Result};
 
 /// A path to a valid delta log file. You can parse a given `FileMeta` into a `LogPath` using
 /// [`LogPath::try_new`].
@@ -23,14 +23,15 @@ impl From<LogPath> for ParsedLogPath {
 impl LogPath {
     /// Attempt to create a `LogPath` from `FileMeta`. This returns an error if the path isn't a
     /// valid log path.
-    pub fn try_new(file_meta: FileMeta) -> DeltaResult<Self> {
+    pub fn try_new(file_meta: FileMeta) -> Result<Self> {
         // TODO: we should avoid the clone
         let parsed = ParsedLogPath::try_from(file_meta.clone())?
-            .ok_or_else(|| KernelError::invalid_log_path(&file_meta.location))?;
+            .ok_or_else(|| KernelError::invalid_log_path(&file_meta.location))
+            .map_err(crate::Error::Kernel)?;
 
         require!(
             !parsed.is_unknown(),
-            KernelError::invalid_log_path(&file_meta.location)
+            crate::Error::Kernel(KernelError::invalid_log_path(&file_meta.location))
         );
 
         Ok(Self(parsed))
@@ -43,7 +44,7 @@ impl LogPath {
         filename: &str,
         last_modified: i64,
         size: FileSize,
-    ) -> DeltaResult<LogPath> {
+    ) -> Result<LogPath> {
         let commit_path = Self::staged_commit_url(table_root, filename)?;
         let file_meta = FileMeta {
             location: commit_path,
@@ -55,16 +56,19 @@ impl LogPath {
 
     /// Create the URL for a staged commit file given the table root and filename. The table_root
     /// must point to the root of the table and end with a '/'.
-    pub fn staged_commit_url(table_root: Url, filename: &str) -> DeltaResult<Url> {
+    pub fn staged_commit_url(table_root: Url, filename: &str) -> Result<Url> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
         if !table_root.path().ends_with('/') {
-            return Err(KernelError::invalid_table_location(table_root));
+            return Err(crate::Error::Kernel(KernelError::invalid_table_location(
+                table_root,
+            )));
         }
         table_root
             .join("_delta_log/")
             .and_then(|url| url.join("_staged_commits/"))
             .and_then(|url| url.join(filename))
             .map_err(|_| KernelError::invalid_table_location(table_root))
+            .map_err(crate::Error::Kernel)
     }
 }
 
@@ -107,7 +111,10 @@ mod test {
         let filename = "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
         let err =
             LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidTableLocation(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidTableLocation(_))
+        ));
 
         // filename with path separators
         let table_root = Url::from_str("s3://my-bucket/my-table/").unwrap();

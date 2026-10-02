@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -25,7 +26,7 @@ use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::log_segment::{CheckpointReadInfo, KernelActionsWithCheckpointInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -47,8 +48,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
-    Version,
+    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, Result, ResultIteratorStatic,
+    SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -278,7 +279,7 @@ impl StatsOptions {
     ///
     /// Returns [`KernelError::Unsupported`] if VARIANT min/max stats are requested without struct
     /// stats output or with JSON stats synthesis.
-    pub(crate) fn validate(&self) -> DeltaResult<()> {
+    pub(crate) fn validate(&self) -> KernelResult<()> {
         if self.variant_min_max {
             require!(
                 !matches!(self.struct_stats, StructStats::None),
@@ -431,8 +432,9 @@ impl ScanBuilder {
     /// Extra-indexed columns that cannot be resolved are omitted with a warning. Returns an error
     /// when a column requested through [`StatsOptions::struct_columns`] cannot be resolved, or when
     /// the selected fields cannot form a valid statistics schema.
-    pub fn stats_output_schemas(&self) -> DeltaResult<Option<StatsOutputSchemas>> {
+    pub fn stats_output_schemas(&self) -> Result<Option<StatsOutputSchemas>> {
         build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
+            .map_err(Error::Kernel)
     }
 
     /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
@@ -500,7 +502,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> DeltaResult<Scan> {
+    pub fn build(self) -> Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -509,10 +511,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -532,7 +534,8 @@ impl ScanBuilder {
             &self.stats,
             &self.partition_values,
             (), // No classifier, default is for scans
-        )?;
+        )
+        .map_err(Error::Kernel)?;
 
         // Retain the transform spec but skip building per-file expressions, which also skips the
         // per-row partition-value parse done only to build them.
@@ -579,7 +582,7 @@ impl PhysicalPredicate {
         predicate: &Predicate,
         logical_schema: &Schema,
         column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<PhysicalPredicate> {
+    ) -> KernelResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
@@ -787,9 +790,10 @@ impl ScanMetadata {
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Ok(Self {
-            scan_files: FilteredEngineData::try_new(data, selection_vector)?,
+            scan_files: FilteredEngineData::try_new(data, selection_vector)
+                .map_err(Error::into_kernel_error)?,
             scan_file_transforms,
         })
     }
@@ -818,7 +822,7 @@ pub struct Scan {
 fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
-) -> DeltaResult<Option<StatsOutputSchemas>> {
+) -> KernelResult<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
         StructStats::AllIndexed { extra_indexed } => table_configuration
@@ -965,9 +969,14 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
-        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>>> {
+        let actions_with_checkpoint_info = self
+            .replay_for_scan_metadata(engine)
+            .map_err(Error::Kernel)?;
+        let scan_metadata = self
+            .scan_metadata_inner(engine, actions_with_checkpoint_info)
+            .map_err(Error::Kernel)?;
+        Ok(scan_metadata.map(|item| item.map_err(Error::Kernel)))
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
@@ -1020,15 +1029,15 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<ScanMetadata>> {
+    ) -> Result<ResultIteratorStatic<ScanMetadata>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
-            return Err(KernelError::Generic(format!(
+            return Err(Error::Kernel(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
-            )));
+            ))));
         }
 
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
@@ -1055,10 +1064,14 @@ impl Scan {
             // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
             // consuming it.
             let actions = CancellableIterator::new(
-                existing_data.into_iter().map(apply_transform),
+                existing_data
+                    .into_iter()
+                    .map(apply_transform)
+                    .map(|item| item.map_err(Error::into_kernel_error)),
                 self.cancellation_token.clone(),
+                identity,
             );
-            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            let actions_with_checkpoint_info = KernelActionsWithCheckpointInfo {
                 actions,
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
@@ -1066,9 +1079,11 @@ impl Scan {
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
-            return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
-            ));
+            let scan_metadata = self
+                .scan_metadata_inner(engine, actions_with_checkpoint_info)
+                .map_err(Error::Kernel)?
+                .map(|item| item.map_err(Error::Kernel));
+            return Ok(Box::new(scan_metadata));
         }
 
         // If the current log segment contains a checkpoint newer than the hint version
@@ -1111,11 +1126,18 @@ impl Scan {
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
         let existing_actions = CancellableIterator::new(
-            existing_data.into_iter().map(apply_transform),
+            existing_data
+                .into_iter()
+                .map(apply_transform)
+                .map(|item| item.map_err(Error::into_kernel_error)),
             self.cancellation_token.clone(),
+            identity,
         );
-        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result.actions.chain(existing_actions),
+        let actions_with_checkpoint_info = KernelActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .map(|item| item.map_err(Error::into_kernel_error))
+                .chain(existing_actions),
             checkpoint_info: CheckpointReadInfo {
                 has_stats_parsed: false,
                 has_partition_values_parsed: false,
@@ -1123,19 +1145,20 @@ impl Scan {
             },
         };
 
-        Ok(Box::new(self.scan_metadata_inner(
-            engine,
-            actions_with_checkpoint_info,
-        )?))
+        let scan_metadata = self
+            .scan_metadata_inner(engine, actions_with_checkpoint_info)
+            .map_err(Error::Kernel)?
+            .map(|item| item.map_err(Error::Kernel));
+        Ok(Box::new(scan_metadata))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
+        actions_with_checkpoint_info: KernelActionsWithCheckpointInfo<
+            impl Iterator<Item = KernelResult<ActionsBatch>> + Send,
         >,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>> + Send> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1195,32 +1218,35 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
+            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)
+                .map_err(Error::Kernel)?
         } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
+            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)
+                .map_err(Error::Kernel)?
         };
-        self.build_metadata_scan_plan(&shape)
+        self.build_metadata_scan_plan(&shape).map_err(Error::Kernel)
     }
 
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    ) -> KernelResult<
+        KernelActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
     > {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
-        self.snapshot
+        let result = self
+            .snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
@@ -1234,6 +1260,13 @@ impl Scan {
                     .map(|s| s.as_ref()),
                 self.cancellation_token.as_ref(),
             )
+            .map_err(Error::into_kernel_error)?;
+        Ok(KernelActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .map(|item| item.map_err(Error::into_kernel_error)),
+            checkpoint_info: result.checkpoint_info,
+        })
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
@@ -1305,15 +1338,17 @@ impl Scan {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::{Engine, DeltaResult};
+    /// # use delta_kernel::{Engine, Result};
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> DeltaResult<()> {
+    /// # fn main() -> Result<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-    /// let table_root = Url::parse("file:///path/to/table")?;
+    /// let table_root = Url::parse("file:///path/to/table")
+    ///     .map_err(delta_kernel::KernelError::from)
+    ///     .map_err(delta_kernel::Error::Kernel)?;
     ///
     /// // Build a snapshot
     /// let snapshot = Snapshot::builder_for(table_root.clone())
@@ -1354,14 +1389,14 @@ impl Scan {
     pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<SequentialScanMetadata> {
+    ) -> Result<SequentialScanMetadata> {
         // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
         // not thread cancellation, so honoring a set token would require dropping it on the floor.
         if self.cancellation_token.is_some() {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \
                  use scan_metadata for a cancellable scan",
-            ));
+            )));
         }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
@@ -1382,7 +1417,8 @@ impl Scan {
             checkpoint_info,
             self.stats_options(),
             self.partition_values_options(),
-        )?;
+        )
+        .map_err(Error::Kernel)?;
         let sequential = SequentialPhase::try_new(
             processor,
             self.snapshot.log_segment(),
@@ -1408,13 +1444,13 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Scan::execute is not supported when the scan was built with \
                  without_row_transforms; use scan_metadata for listing and read data with your \
                  own reader",
-            ));
+            )));
         }
 
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
@@ -1435,18 +1471,18 @@ impl Scan {
                 let scan_files = vec![];
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
-            // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
+            // Iterator<Result<Vec<ScanFile>>> to Iterator<Result<ScanFile>>
             .flatten_ok();
 
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> DeltaResult<_> {
-                let scan_file = scan_file?;
+            .map(move |scan_file| -> KernelResult<_> {
+                let scan_file = scan_file.map_err(Error::into_kernel_error)?;
                 let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
                     .dv_info
-                    .get_selection_vector(engine.as_ref(), &table_root)?;
+                    .get_selection_vector(engine.as_ref(), &table_root).map_err(Error::into_kernel_error)?;
                 let meta = FileMeta {
                     last_modified: scan_file.modification_time,
                     size: scan_file.size.try_into().map_err(|_| {
@@ -1465,7 +1501,7 @@ impl Scan {
                     &[meta],
                     physical_schema.clone(),
                     None,
-                )?;
+                ).map_err(Error::into_kernel_error)?;
 
                 let mut read_result_iter = read_result_iter.peekable();
 
@@ -1485,8 +1521,8 @@ impl Scan {
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
-                    let read_result = read_result?;
+                Ok(read_result_iter.map(move |read_result| -> KernelResult<_> {
+                    let read_result = read_result.map_err(Error::into_kernel_error)?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
@@ -1506,14 +1542,14 @@ impl Scan {
                         logical.and_then(|data| data.apply_selection_vector(sv))
                     });
                     selection_vector = rest;
-                    result
+                    result.map_err(Error::into_kernel_error)
                 }))
             })
-            // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>
+            // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>> to Iterator<DeltaResult<Box<dyn EngineData>>>
+            // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
             .map(|x| x?);
-        Ok(result)
+        Ok(result.map(|item| item.map_err(Error::Kernel)))
     }
 }
 
@@ -1553,7 +1589,7 @@ pub fn selection_vector(
     engine: &dyn Engine,
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
-) -> DeltaResult<Vec<bool>> {
+) -> Result<Vec<bool>> {
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))

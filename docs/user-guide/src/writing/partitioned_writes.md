@@ -37,9 +37,9 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::Scalar;
-# use delta_kernel::{DeltaResult, Snapshot};
+# use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
-# async fn main() -> DeltaResult<()> {
+# async fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/partitioned_table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -132,7 +132,7 @@ that each write-context builder receives a `HashMap<String, Scalar>` for one dis
 and the corresponding data files contain only that partition's rows.
 
 Kernel provides `serialize_partition_value` as a public utility for building hashable
-group keys from `Scalar` values. It returns a `DeltaResult<Option<String>>` per value,
+group keys from `Scalar` values. It returns a `Result<Option<String>>` per value,
 which you can collect into a `Vec<Option<String>>` group key for use in a `HashMap`.
 
 ## Partition value validation

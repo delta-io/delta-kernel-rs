@@ -17,7 +17,7 @@ use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, KernelError, RowVisitor};
+use crate::{KernelError, KernelResult, Result, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +131,7 @@ pub(crate) struct TableChangesFileAction {
 
 impl TableChangesFileAction {
     /// Converts a scan file, preserving both sides of a same-commit deletion-vector update.
-    pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> DeltaResult<Self> {
+    pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> KernelResult<Self> {
         match scan_file.scan_type {
             CdfScanFileType::Add => {
                 require!(
@@ -197,10 +197,10 @@ impl TableChangesScanFile {
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
-) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
+    scan_metadata: impl Iterator<Item = KernelResult<TableChangesScanMetadata>>,
+) -> impl Iterator<Item = KernelResult<CdfScanFile>> {
     scan_metadata
-        .map(|scan_metadata| -> DeltaResult<_> {
+        .map(|scan_metadata| -> KernelResult<_> {
             let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
@@ -240,7 +240,7 @@ pub(crate) fn visit_cdf_scan_files<T>(
     scan_metadata: &TableChangesScanMetadata,
     context: T,
     callback: CdfScanCallback<T>,
-) -> DeltaResult<T> {
+) -> KernelResult<T> {
     let mut visitor = CdfScanFileVisitor {
         callback,
         context,
@@ -248,7 +248,9 @@ pub(crate) fn visit_cdf_scan_files<T>(
         remove_dvs: scan_metadata.remove_dvs.as_ref(),
     };
 
-    visitor.visit_rows_of(scan_metadata.scan_metadata.as_ref())?;
+    visitor
+        .visit_rows_of(scan_metadata.scan_metadata.as_ref())
+        .map_err(crate::Error::into_kernel_error)?;
     Ok(visitor.context)
 }
 
@@ -310,20 +312,29 @@ fn read_file_side<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
     spec: &FileSideSpec,
-) -> DeltaResult<Option<FileSide>> {
-    let Some(path) = getters[spec.start_index].get_opt(row_index, spec.path_field)? else {
+) -> KernelResult<Option<FileSide>> {
+    let Some(path) = getters[spec.start_index]
+        .get_opt(row_index, spec.path_field)
+        .map_err(crate::Error::into_kernel_error)?
+    else {
         return Ok(None);
     };
     let deletion_vector = visit_deletion_vector_at(
         row_index,
         &getters[spec.start_index + 1..=spec.start_index + 5],
     )?;
-    let partition_values =
-        getters[spec.start_index + 6].get_opt(row_index, spec.partition_values_field)?;
-    let size = getters[spec.start_index + 7].get_opt(row_index, spec.size_field)?;
-    let base_row_id = getters[spec.start_index + 8].get_opt(row_index, spec.base_row_id_field)?;
-    let default_row_commit_version =
-        getters[spec.start_index + 9].get_opt(row_index, spec.default_row_commit_version_field)?;
+    let partition_values = getters[spec.start_index + 6]
+        .get_opt(row_index, spec.partition_values_field)
+        .map_err(crate::Error::into_kernel_error)?;
+    let size = getters[spec.start_index + 7]
+        .get_opt(row_index, spec.size_field)
+        .map_err(crate::Error::into_kernel_error)?;
+    let base_row_id = getters[spec.start_index + 8]
+        .get_opt(row_index, spec.base_row_id_field)
+        .map_err(crate::Error::into_kernel_error)?;
+    let default_row_commit_version = getters[spec.start_index + 9]
+        .get_opt(row_index, spec.default_row_commit_version_field)
+        .map_err(crate::Error::into_kernel_error)?;
     Ok(Some(FileSide {
         scan_type: spec.scan_type,
         path,
@@ -336,23 +347,26 @@ fn read_file_side<'a>(
 }
 
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for row_index in 0..row_count {
             if !self.selection_vector[row_index] {
                 continue;
             }
 
-            let file_side = if let Some(side) = read_file_side(row_index, getters, &ADD_FILE_SIDE)?
+            let file_side = if let Some(side) =
+                read_file_side(row_index, getters, &ADD_FILE_SIDE).map_err(crate::Error::Kernel)?
             {
                 side
-            } else if let Some(side) = read_file_side(row_index, getters, &REMOVE_FILE_SIDE)? {
+            } else if let Some(side) = read_file_side(row_index, getters, &REMOVE_FILE_SIDE)
+                .map_err(crate::Error::Kernel)?
+            {
                 side
             } else if let Some(path) =
                 getters[CDC_PATH_INDEX].get_opt(row_index, "scanFile.cdc.path")?

@@ -16,7 +16,7 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, EngineData, FileMeta, KernelError, PredicateRef};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Result};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -108,14 +108,14 @@ impl TableChangesScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
-    pub fn build(self) -> DeltaResult<TableChangesScan> {
+    pub fn build(self) -> Result<TableChangesScan> {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
-            ));
+            )));
         }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
@@ -126,9 +126,9 @@ impl TableChangesScanBuilder {
         if logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
             || logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion)
         {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Row ID and Row Commit Version metadata are unsupported in CDF scans",
-            ));
+            )));
         }
 
         // Create StateInfo using CDF field classifier
@@ -141,7 +141,8 @@ impl TableChangesScanBuilder {
             &StatsOptions::default(),
             &PartitionValuesOptions::default(),
             CdfTransformFieldClassifier,
-        )?;
+        )
+        .map_err(crate::Error::Kernel)?;
 
         Ok(TableChangesScan {
             table_changes: self.table_changes,
@@ -160,7 +161,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
         let commits = self
             .table_changes
             .log_segment
@@ -217,8 +218,10 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        let scan_metadata = self.scan_metadata(engine.clone())?;
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
+        let scan_metadata = self
+            .scan_metadata(engine.clone())
+            .map_err(crate::Error::Kernel)?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
@@ -233,7 +236,7 @@ impl TableChangesScan {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
             }) // Iterator-Result-Iterator
             .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> DeltaResult<_> {
+            .map(move |resolved_scan_file| -> KernelResult<_> {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
@@ -243,7 +246,10 @@ impl TableChangesScan {
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map(|item| {
+                item.and_then(std::convert::identity)
+                    .map_err(crate::Error::Kernel)
+            }); // Iterator-Result
 
         Ok(result)
     }
@@ -257,7 +263,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -276,7 +282,8 @@ fn read_scan_file(
                 state_info.logical_schema.clone().into(),
             )
         })
-        .transpose()?;
+        .transpose()
+        .map_err(crate::Error::into_kernel_error)?;
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
@@ -292,13 +299,13 @@ fn read_scan_file(
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
-    let read_result_iter =
-        engine
-            .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+    let read_result_iter = engine
+        .parquet_handler()
+        .read_parquet_files(&[file], physical_schema, None)
+        .map_err(crate::Error::into_kernel_error)?;
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
-        let batch = batch?;
+    let result = read_result_iter.map(move |batch| -> KernelResult<_> {
+        let batch = batch.map_err(crate::Error::into_kernel_error)?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
             eval.evaluate(batch.as_ref())
@@ -353,7 +360,7 @@ fn read_scan_file(
             logical.and_then(|data| data.apply_selection_vector(sv))
         });
         selection_vector = rest;
-        result
+        result.map_err(crate::Error::into_kernel_error)
     });
     Ok(result)
 }

@@ -1,7 +1,7 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
-use delta_kernel::{DeltaResult, KernelError, Version};
+use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::delta_types::{FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol};
 use crate::error::{ExternResult, IntoExternResult};
@@ -75,7 +75,7 @@ impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
 unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     if matches!(
         &builder.source,
         FfiSnapshotBuilderSource::ExistingSnapshot(_)
@@ -108,7 +108,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
-    )?;
+    )
+    .map_err(delta_kernel::Error::into_kernel_error)?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
 }

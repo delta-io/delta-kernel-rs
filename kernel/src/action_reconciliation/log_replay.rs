@@ -41,7 +41,7 @@ use crate::log_replay::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, KernelError};
+use crate::{Error, KernelError, KernelResult, KernelResultIteratorStatic, Result};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -129,13 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: DeltaResultIteratorStatic<ActionReconciliationBatch>,
+    inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: DeltaResultIteratorStatic<ActionReconciliationBatch>) -> Self {
+    pub(crate) fn new(inner: KernelResultIteratorStatic<ActionReconciliationBatch>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
@@ -150,8 +150,8 @@ impl ActionReconciliationIterator {
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
-        batch: Option<DeltaResult<ActionReconciliationBatch>>,
-    ) -> Option<DeltaResult<FilteredEngineData>> {
+        batch: Option<KernelResult<ActionReconciliationBatch>>,
+    ) -> Option<KernelResult<FilteredEngineData>> {
         let Some(batch) = batch else {
             self.state.is_exhausted.store(true, Ordering::Release);
             return None;
@@ -177,11 +177,12 @@ impl std::fmt::Debug for ActionReconciliationIterator {
 }
 
 impl Iterator for ActionReconciliationIterator {
-    type Item = DeltaResult<FilteredEngineData>;
+    type Item = Result<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let batch = self.inner.next();
         self.transform_batch(batch)
+            .map(|result| result.map_err(Error::Kernel))
     }
 }
 
@@ -196,7 +197,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
     /// implements the deduplication rules described in the module documentation. The method
     /// tracks statistics about processed actions (total count, add actions count) and maintains
     /// state for cross-batch deduplication.
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -415,12 +416,18 @@ impl ActionReconciliationVisitor<'_> {
     /// - If deletion_timestamp <= minimum_file_retention_timestamp: Expired (exclude)
     /// - If deletion_timestamp > minimum_file_retention_timestamp: Valid (include)
     /// - If deletion_timestamp is missing: Defaults to 0, treated as expired (exclude)
-    fn is_expired_tombstone<'a>(&self, i: usize, getter: &'a dyn GetData<'a>) -> DeltaResult<bool> {
+    fn is_expired_tombstone<'a>(
+        &self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> KernelResult<bool> {
         // Ideally this should never be zero, but we are following the same behavior as Delta
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
         // will be excluded as it will be treated as expired.
-        let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
+        let deletion_timestamp = getter
+            .get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)
+            .map_err(crate::Error::into_kernel_error)?;
         let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
         Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
@@ -440,7 +447,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // Extract the file action and handle errors immediately
         let Some(FileActionInfo {
             key: file_key,
@@ -475,12 +482,13 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // minReaderVersion is a required field, so we check for its presence to determine if this
         // is a protocol action. Only return the first (newest) protocol action we see,
         // ignoring other types
         let result = getter
-            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)?
+            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)
+            .map_err(crate::Error::into_kernel_error)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_protocol, true));
         Ok(result)
@@ -497,12 +505,13 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // id is a required field, so we check for its presence to determine if this is a metadata
         // action. Only return the first (newest) metadata action we see, ignoring other
         // types
         let result = getter
-            .get_str(i, Self::METADATA_ID.name)?
+            .get_str(i, Self::METADATA_ID.name)
+            .map_err(crate::Error::into_kernel_error)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_metadata, true));
         Ok(result)
@@ -519,8 +528,10 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Option<bool>> {
-        let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(i, Self::TXN_APP_ID.name)?
+    ) -> KernelResult<Option<bool>> {
+        let Some(app_id) = getters[Self::TXN_APP_ID.index]
+            .get_str(i, Self::TXN_APP_ID.name)
+            .map_err(crate::Error::into_kernel_error)?
         else {
             return Ok(None); // Not a txn action, continue checking other types
         };
@@ -535,8 +546,9 @@ impl ActionReconciliationVisitor<'_> {
         // Exclude the winner when retention has expired it. A txn without last_updated never
         // expires (kept for backward compatibility).
         if let Some(retention_ts) = self.txn_expiration_timestamp {
-            if let Some(last_updated) =
-                getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
+            if let Some(last_updated) = getters[Self::TXN_LAST_UPDATED.index]
+                .get_opt(i, Self::TXN_LAST_UPDATED.name)
+                .map_err(crate::Error::into_kernel_error)?
             {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
@@ -559,9 +571,10 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         let Some(domain) = getters[Self::DOMAIN_METADATA_DOMAIN.index]
-            .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)?
+            .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)
+            .map_err(crate::Error::into_kernel_error)?
         else {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
@@ -576,7 +589,8 @@ impl ActionReconciliationVisitor<'_> {
 
         // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
         let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
-            .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
+            .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)
+            .map_err(crate::Error::into_kernel_error)?
             .unwrap_or(false);
         if removed {
             return Ok(Some(false));
@@ -605,7 +619,7 @@ impl ActionReconciliationVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<bool> {
+    ) -> KernelResult<bool> {
         let is_valid = if let Some(result) = self.check_file_action(i, getters)? {
             result
         } else if let Some(result) = self.check_txn_action(i, getters)? {
@@ -670,17 +684,19 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 16,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for i in 0..row_count {
-            self.selection_vector[i] = self.is_valid_action(i, getters)?;
+            self.selection_vector[i] = self
+                .is_valid_action(i, getters)
+                .map_err(crate::Error::Kernel)?;
         }
         Ok(())
     }
@@ -698,7 +714,7 @@ mod tests {
     use crate::KernelError;
 
     /// Helper function to create test batches from JSON strings
-    fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
+    fn create_batch(json_strings: Vec<&str>) -> Result<ActionsBatch> {
         let actions = parse_json_batch(StringArray::from(json_strings));
         Ok(ActionsBatch::new(actions, true))
     }
@@ -707,7 +723,7 @@ mod tests {
     /// input batches and returns the results.
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
-    ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
+    ) -> Result<(Vec<FilteredEngineData>, i64, i64)> {
         let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None)
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
@@ -721,7 +737,7 @@ mod tests {
         Ok((filtered_data, total_count, add_count))
     }
     #[test]
-    fn test_action_reconciliation_visitor() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor() -> Result<()> {
         let data = action_batch();
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
@@ -770,8 +786,7 @@ mod tests {
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
     #[test]
-    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration(
-    ) -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration() -> Result<()> {
         let json_strings: StringArray = vec![
             r#"{"remove":{"path":"exactly_at_threshold","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
             r#"{"remove":{"path":"one_below_threshold","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#,
@@ -808,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_file_actions_in_batch() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_file_actions_in_batch() -> Result<()> {
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
         ]
@@ -844,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_file_actions_with_deletion_vectors() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_file_actions_with_deletion_vectors() -> Result<()> {
         let json_strings: StringArray = vec![
             // Add action for file1 with deletion vector
             r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
@@ -882,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_already_seen_non_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_already_seen_non_file_actions() -> Result<()> {
         let json_strings: StringArray = vec![
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
@@ -919,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_duplicate_non_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_duplicate_non_file_actions() -> Result<()> {
         let json_strings: StringArray = vec![
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#,
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#, // Duplicate txn
@@ -962,7 +977,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_non_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_non_file_actions() -> Result<()> {
         // Batch 1: protocol, metadata, and txn actions
         let batch1 = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -1006,7 +1021,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_file_actions() -> Result<()> {
         // Batch 1: add action (file1) - new, should be included
         let batch1 = vec![
             r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
@@ -1046,8 +1061,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
-    ) -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors() -> Result<()> {
         // Batch 1: add actions with deletion vectors
         let batch1 = vec![
             // (file1, DV_ONE) New, should be included
@@ -1080,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_txn_retention() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_txn_retention() -> Result<()> {
         let json_strings: StringArray = vec![
             // Transaction with old timestamp (should be filtered)
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":100}}"#,
@@ -1126,7 +1140,7 @@ mod tests {
     // neither reaches the checkpoint. Guards against resurrecting the older txn (a stale winner).
     #[test]
     fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app(
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let json_strings: StringArray = vec![
             // Newest for "app" (visited first), expired.
             r#"{"txn":{"appId":"app","version":2,"lastUpdated":500}}"#,
@@ -1161,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_actions_iter_with_txn_retention() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_with_txn_retention() -> Result<()> {
         // Test that transaction retention works across multiple batches
         let batch1 = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -1229,23 +1243,27 @@ mod tests {
         }
 
         impl<'a> GetData<'a> for MockErrorGetData {
-            fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+            fn get_str(&'a self, _: usize, field_name: &str) -> Result<Option<&'a str>> {
                 if field_name == self.error_on_field && self.error_type == "str" {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type str"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type str"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
             }
 
-            fn get_int(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i32>> {
+            fn get_int(&'a self, _: usize, field_name: &str) -> Result<Option<i32>> {
                 if field_name == self.error_on_field && self.error_type == "int" {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type i32"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type i32"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1258,7 +1276,7 @@ mod tests {
         }
 
         impl<'a> GetData<'a> for FlexibleMock {
-            fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+            fn get_str(&'a self, _: usize, field_name: &str) -> Result<Option<&'a str>> {
                 if field_name == "txn.appId" {
                     Ok(Some("test_app"))
                 } else if field_name == "remove.path" {
@@ -1268,12 +1286,14 @@ mod tests {
                 }
             }
 
-            fn get_long(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+            fn get_long(&'a self, _: usize, field_name: &str) -> Result<Option<i64>> {
                 if field_name.contains(self.error_field) {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type i64"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type i64"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1428,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_processor_error_propagation() -> DeltaResult<()> {
+    fn test_action_reconciliation_processor_error_propagation() -> Result<()> {
         // Test that errors from the visitor are properly propagated by the processor
         let json_strings: StringArray = vec![
             // This will create valid data that parses correctly

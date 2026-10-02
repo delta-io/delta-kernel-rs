@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::{DeltaResult, DeltaResultIterator};
+use delta_kernel::{KernelResult, Result, ResultIterator};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -172,9 +172,9 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: DeltaResultIterator<'_, delta_kernel::FilteredEngineData>,
+        actions: ResultIterator<'_, delta_kernel::FilteredEngineData>,
         commit_metadata: delta_kernel::committer::CommitMetadata,
-    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+    ) -> Result<delta_kernel::committer::CommitResponse> {
         // We hold this guard until the end of the function so we stay in the tokio context until
         // we're done
         let _guard = engine
@@ -191,7 +191,8 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                 delta_kernel::KernelError::generic(
                     "FFIUCCommitter can only be used with the default engine",
                 )
-            })?;
+            })
+            .map_err(delta_kernel::Error::Kernel)?;
         self.inner.commit(engine, actions, commit_metadata)
     }
 
@@ -203,7 +204,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
         &self,
         engine: &dyn delta_kernel::Engine,
         publish_metadata: delta_kernel::committer::PublishMetadata,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         self.inner.publish(engine, publish_metadata)
     }
 }
@@ -234,12 +235,16 @@ fn get_uc_committer_impl(
     catalog: KernelStringSlice,
     schema: KernelStringSlice,
     table_name: KernelStringSlice,
-) -> DeltaResult<Handle<MutableCommitter>> {
+) -> KernelResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
-    let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
-    let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }?;
-    let schema_str: String = unsafe { TryFromStringSlice::try_from_slice(&schema) }?;
-    let table_name_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_name) }?;
+    let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let schema_str: String = unsafe { TryFromStringSlice::try_from_slice(&schema) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let table_name_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_name) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
         inner: UCCommitter::new(
             client,

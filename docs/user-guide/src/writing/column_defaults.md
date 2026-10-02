@@ -109,7 +109,7 @@ and per-row `DEFAULT` requests need separate handling.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::expressions::Scalar;
 # use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, KernelError, SnapshotRef};
+# use delta_kernel::{Error, Result, KernelError, SnapshotRef};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
 // Describe how each table column gets its values.
@@ -122,8 +122,8 @@ async fn append_with_defaults(
     engine: &DefaultEngine<impl TaskExecutor>,
     snapshot: SnapshotRef,
     input_schema: ArrowSchemaRef,
-    batches: impl IntoIterator<Item = DeltaResult<RecordBatch>>,
-) -> DeltaResult<CommitResult> {
+    batches: impl IntoIterator<Item = Result<RecordBatch>>,
+) -> Result<CommitResult> {
     // 1. Start the transaction.
     let table_schema = snapshot.schema();
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)?;
@@ -140,10 +140,10 @@ async fn append_with_defaults(
                         "missing column without a default: {}",
                         field.name()
                     ))
-                })?;
+                }).map_err(Error::Kernel)?;
                 let scalar = column_default.to_scalar()?.ok_or_else(|| {
                     KernelError::generic(format!("cannot evaluate default for {}", field.name()))
-                })?;
+                }).map_err(Error::Kernel)?;
                 ColumnSource::Default(scalar)
             }
         };
@@ -154,7 +154,14 @@ async fn append_with_defaults(
     txn.ack_column_defaults();
     let write_state = txn.write_state()?;
     let write_context = write_state.write_context_builder().build()?;
-    let output_schema = Arc::new(write_context.logical_data_schema().as_ref().try_into_arrow()?);
+    let output_schema = Arc::new(
+        write_context
+            .logical_data_schema()
+            .as_ref()
+            .try_into_arrow()
+            .map_err(KernelError::from)
+            .map_err(Error::Kernel)?,
+    );
 
     // 4. Fill omitted columns and write each incoming batch without collecting them.
     for batch in batches {
@@ -168,8 +175,9 @@ async fn append_with_defaults(
                 ColumnSource::Input(index) => Ok(Arc::clone(batch.column(*index))),
                 ColumnSource::Default(scalar) => scalar.to_array(batch.num_rows()),
             })
-            .collect::<DeltaResult<Vec<_>>>()?;
-        let output_batch = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
+            .collect::<Result<Vec<_>>>()?;
+        let output_batch = RecordBatch::try_new(Arc::clone(&output_schema), columns)
+            .map_err(KernelError::from).map_err(Error::Kernel)?;
         let data = ArrowEngineData::new(output_batch);
         let file_metadata = engine.write_parquet(&data, &write_context).await?;
         txn.add_files(file_metadata);
@@ -218,15 +226,15 @@ SQL with the appropriate SQL semantics and return a value of the declared type:
 # extern crate delta_kernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{ColumnDefault, DataType};
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{Error, Result, KernelError};
 
 fn resolve_default(
     column_default: &ColumnDefault<'_>,
-    evaluate_sql: impl FnOnce(&str, &DataType) -> DeltaResult<Scalar>,
-) -> DeltaResult<Scalar> {
+    evaluate_sql: impl FnOnce(&str, &DataType) -> Result<Scalar>,
+) -> Result<Scalar> {
     let scalar = evaluate_sql(column_default.raw_sql(), column_default.data_type())?;
     if &scalar.data_type() != column_default.data_type() {
-        return Err(KernelError::generic("default evaluator returned the wrong type"));
+        return Err(Error::Kernel(KernelError::generic("default evaluator returned the wrong type")));
     }
     Ok(scalar)
 }

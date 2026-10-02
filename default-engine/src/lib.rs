@@ -18,8 +18,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData,
-    EvaluationHandler, JsonHandler, KernelError, ParquetHandler, StorageHandler,
+    CancellationTokenRef, Engine, EngineData, EvaluationHandler, JsonHandler, KernelError,
+    KernelResult, KernelResultIteratorStatic, ParquetHandler, Result, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -53,8 +53,8 @@ pub mod storage;
 /// Delta Kernel's synchronous handler traits.
 pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
-) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    stream_future: impl Future<Output = KernelResult<BoxStream<'static, T>>> + Send + 'static,
+) -> KernelResult<Box<dyn Iterator<Item = T> + Send>> {
     Ok(Box::new(BlockingStreamIterator {
         stream: Some(task_executor.block_on(stream_future)?),
         task_executor,
@@ -65,15 +65,15 @@ pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor
 /// token. When the token fires, the iterator yields a single `Err(KernelError::Cancelled)` and then
 /// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
 ///
-/// Restricted to `DeltaResult` streams so cancellation can be surfaced as an item. With a `None`
+/// Restricted to `KernelResult` streams so cancellation can be surfaced as an item. With a `None`
 /// token, behavior is identical to [`stream_future_to_iter`].
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
+    stream_future: impl Future<Output = KernelResult<BoxStream<'static, KernelResult<U>>>>
         + Send
         + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<DeltaResultIteratorStatic<U>> {
+) -> KernelResult<KernelResultIteratorStatic<U>> {
     let Some(token) = cancellation_token else {
         return stream_future_to_iter(task_executor, stream_future);
     };
@@ -140,13 +140,13 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 /// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
 /// terminal `Err(KernelError::Cancelled)`.
 struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
-    stream: Option<BoxStream<'static, DeltaResult<U>>>,
+    stream: Option<BoxStream<'static, KernelResult<U>>>,
     task_executor: Arc<E>,
     token: CancellationTokenRef,
 }
 
 impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
-    type Item = DeltaResult<U>;
+    type Item = KernelResult<U>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut stream = self.stream.take()?;
@@ -377,9 +377,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         &self,
         data: &ArrowEngineData,
         write_context: &BoundWriteContext,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> Result<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
+        let input_schema = Schema::try_from_arrow(data.record_batch().schema())
+            .map_err(|error| delta_kernel::Error::Kernel(KernelError::from(error)))?;
         let output_schema = write_context.physical_data_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
@@ -408,9 +409,11 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &BoundWriteContext,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> Result<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
-    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
+    file_metadata
+        .as_record_batch(write_context.physical_partition_values(), &add_path)
+        .map_err(delta_kernel::Error::Kernel)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
@@ -589,8 +592,8 @@ mod tests {
 
         // 0, 1, then a pending tail that never resolves on its own.
         let make_stream = async move {
-            let head = stream::iter(vec![Ok(0i32), Ok(1i32)]);
-            let tail = stream::once(std::future::pending::<DeltaResult<i32>>());
+            let head = stream::iter(vec![Ok::<_, KernelError>(0i32), Ok(1i32)]);
+            let tail = stream::once(std::future::pending::<KernelResult<i32>>());
             Ok(head.chain(tail).boxed())
         };
         let mut iter = stream_future_to_cancellable_iter(executor, make_stream, Some(ct)).unwrap();

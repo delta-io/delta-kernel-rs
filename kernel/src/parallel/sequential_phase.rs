@@ -20,7 +20,7 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FileMeta, KernelError};
+use crate::{Engine, Error, FileMeta, KernelError, KernelResultIteratorStatic, Result};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -70,7 +70,7 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
     // Commit action batches, exhausted before the checkpoint manifest
-    commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>>,
+    commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
     checkpoint_manifest_phase: Option<CheckpointManifestReader>,
@@ -104,20 +104,25 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
         checkpoint_read_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
-        let commit_phase: Option<DeltaResultIteratorStatic<ActionsBatch>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+    ) -> Result<Self> {
+        let commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>> = Some(Box::new(
+            log_segment
+                .read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?
+                .map(|batch| batch.map_err(Error::into_kernel_error)),
         ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new(
-                engine,
-                single_part,
-                log_segment.log_root.clone(),
-                checkpoint_read_schema,
-            )?),
+            [single_part] => Some(
+                CheckpointManifestReader::try_new(
+                    engine,
+                    single_part,
+                    log_segment.log_root.clone(),
+                    checkpoint_read_schema,
+                )
+                .map_err(Error::Kernel)?,
+            ),
             _ => None,
         };
 
@@ -148,23 +153,23 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
     #[internal_api]
-    pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
+    pub(crate) fn finish(self) -> Result<AfterSequential<P>> {
         if !self.is_finished {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Must exhaust iterator before calling finish()",
-            ));
+            )));
         }
 
         let parallel_files = match self.checkpoint_manifest_phase {
-            Some(manifest_reader) => manifest_reader.extract_sidecars()?,
+            Some(manifest_reader) => manifest_reader.extract_sidecars().map_err(Error::Kernel)?,
             None => {
                 let parts = self.checkpoint_parts;
                 require!(
                     parts.len() != 1,
-                    KernelError::generic(
+                    Error::Kernel(KernelError::generic(
                         "Invariant violation: If there is exactly one checkpoint part,
                         there must be a manifest reader"
-                    )
+                    ))
                 );
                 // If this is a multi-part checkpoint, use the checkpoint parts for parallel phase
                 parts
@@ -183,7 +188,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
 }
 
 impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
-    type Item = DeltaResult<P::Output>;
+    type Item = Result<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self
@@ -200,7 +205,11 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
+        Some(
+            result
+                .map_err(Error::Kernel)
+                .and_then(|batch| self.processor.process_actions_batch(batch)),
+        )
     }
 }
 
@@ -216,8 +225,9 @@ mod tests {
         stats: StatsOptions,
         expected_adds: &[&str],
         expected_sidecars: &[&str],
-    ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) =
+            load_test_table(table_name).map_err(crate::Error::Kernel)?;
 
         let scan = snapshot.scan_builder().with_stats(stats).build()?;
         let mut sequential = scan.parallel_scan_metadata(engine)?;
@@ -277,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_v2_with_commits_only() -> DeltaResult<()> {
+    fn test_sequential_v2_with_commits_only() -> Result<()> {
         verify_sequential_processing(
             "table-without-dv-small",
             StatsOptions::default(),
@@ -287,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_v2_with_sidecars() -> DeltaResult<()> {
+    fn test_sequential_v2_with_sidecars() -> Result<()> {
         verify_sequential_processing(
             "v2-checkpoints-json-with-sidecars",
             StatsOptions::default(),
@@ -300,8 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_finish_before_exhaustion_error() -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+    fn test_sequential_finish_before_exhaustion_error() -> Result<()> {
+        let (engine, snapshot, _tempdir) =
+            load_test_table("table-without-dv-small").map_err(crate::Error::Kernel)?;
 
         let scan = snapshot.scan_builder().build()?;
         let sequential = scan.parallel_scan_metadata(engine)?;
@@ -314,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_checkpoint_without_sidecars() -> DeltaResult<()> {
+    fn test_sequential_checkpoint_without_sidecars() -> Result<()> {
         verify_sequential_processing(
             "v2-checkpoints-json-without-sidecars",
             StatsOptions::default(),
@@ -331,9 +342,7 @@ mod tests {
     #[rstest::rstest]
     #[case::default(StatsOptions::default())]
     #[case::without_stats(StatsOptions::none())]
-    fn test_sequential_parquet_checkpoint_with_sidecars(
-        #[case] stats: StatsOptions,
-    ) -> DeltaResult<()> {
+    fn test_sequential_parquet_checkpoint_with_sidecars(#[case] stats: StatsOptions) -> Result<()> {
         verify_sequential_processing(
             "v2-checkpoints-parquet-with-sidecars",
             stats,
@@ -347,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_checkpoint_no_commits() -> DeltaResult<()> {
+    fn test_sequential_checkpoint_no_commits() -> Result<()> {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
             StatsOptions::default(),

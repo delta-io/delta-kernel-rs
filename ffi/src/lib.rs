@@ -23,7 +23,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotHint, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
+use delta_kernel::{Engine, EngineData, FileStats, KernelResult, LogPath, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -185,7 +185,7 @@ impl<T> FfiSlice<T> {
     ///
     /// For nonzero `len`, `ptr` must be aligned and address `len` initialized values. The backing
     /// storage must remain valid for the lifetime of the returned slice.
-    pub(crate) unsafe fn try_as_slice(&self) -> DeltaResult<&[T]> {
+    pub(crate) unsafe fn try_as_slice(&self) -> KernelResult<&[T]> {
         if self.len == 0 {
             return Ok(&[]);
         }
@@ -266,7 +266,7 @@ impl KernelStringSlice {
     ///
     /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
     /// duration of this call.
-    pub(crate) unsafe fn try_to_string(&self) -> DeltaResult<String> {
+    pub(crate) unsafe fn try_to_string(&self) -> KernelResult<String> {
         if self.len == 0 {
             return Ok(String::new());
         }
@@ -276,7 +276,8 @@ impl KernelStringSlice {
                 self.len
             )));
         }
-        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }?;
+        let value: &str = unsafe { TryFromStringSlice::try_from_slice(self) }
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         Ok(value.to_string())
     }
 
@@ -321,7 +322,7 @@ impl KernelBytesSlice {
     ///
     /// For nonzero `len`, `ptr` must address `len` initialized bytes and remain valid for the
     /// returned slice's lifetime.
-    pub(crate) unsafe fn try_as_slice(&self) -> DeltaResult<&[u8]> {
+    pub(crate) unsafe fn try_as_slice(&self) -> KernelResult<&[u8]> {
         if self.len == 0 {
             return Ok(&[]);
         }
@@ -411,7 +412,7 @@ macro_rules! kernel_bytes_slice {
 pub(crate) use kernel_bytes_slice;
 
 trait TryFromStringSlice<'a>: Sized {
-    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> Result<Self>;
 }
 
 impl<'a> TryFromStringSlice<'a> for String {
@@ -421,7 +422,7 @@ impl<'a> TryFromStringSlice<'a> for String {
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> Result<Self> {
         let slice: &str = unsafe { TryFromStringSlice::try_from_slice(slice) }?;
         Ok(slice.into())
     }
@@ -435,9 +436,11 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> Result<Self> {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        Ok(std::str::from_utf8(slice)?)
+        std::str::from_utf8(slice)
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)
     }
 }
 
@@ -475,8 +478,9 @@ pub unsafe extern "C" fn allocate_kernel_string(
 
 fn allocate_kernel_string_impl(
     kernel_str: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveRustString>> {
-    let s = unsafe { String::try_from_slice(&kernel_str) }?;
+) -> KernelResult<Handle<ExclusiveRustString>> {
+    let s = unsafe { String::try_from_slice(&kernel_str) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Box::new(s).into())
 }
 
@@ -796,9 +800,10 @@ impl ExternEngine for ExternEngineVtable {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
-unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
-    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
-    delta_kernel::try_parse_uri(path)
+unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> KernelResult<Url> {
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    delta_kernel::try_parse_uri(path).map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// How [`FfiEngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
@@ -882,9 +887,9 @@ pub unsafe extern "C" fn get_engine_builder(
 
 #[cfg(feature = "default-engine-base")]
 fn get_engine_builder_impl(
-    url: DeltaResult<Url>,
+    url: KernelResult<Url>,
     allocate_fn: AllocateErrorFn,
-) -> DeltaResult<Handle<ExclusiveEngineBuilder>> {
+) -> KernelResult<Handle<ExclusiveEngineBuilder>> {
     let builder = Box::new(FfiEngineBuilder {
         url: url?,
         allocate_fn,
@@ -937,9 +942,11 @@ fn builder_with_option_impl(
     builder: &mut FfiEngineBuilder,
     key: KernelStringSlice,
     value: KernelStringSlice,
-) -> DeltaResult<()> {
-    let key = unsafe { String::try_from_slice(&key) }?;
-    let value = unsafe { String::try_from_slice(&value) }?;
+) -> KernelResult<()> {
+    let key =
+        unsafe { String::try_from_slice(&key) }.map_err(delta_kernel::Error::into_kernel_error)?;
+    let value = unsafe { String::try_from_slice(&value) }
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     builder.set_option(key, value);
     Ok(())
 }
@@ -1042,7 +1049,7 @@ fn builder_with_rest_object_store_impl(
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
     let endpoint_config = unsafe { endpoint_config.as_ref() }
         .ok_or_else(|| delta_kernel::KernelError::generic("null CRestEndpointConfig pointer"))?;
@@ -1097,9 +1104,9 @@ pub unsafe extern "C" fn get_default_engine(
 // get the default version of the default engine :)
 #[cfg(feature = "default-engine-base")]
 fn get_default_default_engine_impl(
-    url: DeltaResult<Url>,
+    url: KernelResult<Url>,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
+) -> KernelResult<Handle<SharedExternEngine>> {
     get_default_engine_impl(
         url?,
         Default::default(),
@@ -1137,11 +1144,13 @@ fn get_default_engine_impl(
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
+) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
     let store = match object_store_backend {
-        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
+        ObjectStoreBackend::UrlScheme => {
+            store_from_url_opts(&url, options).map_err(delta_kernel::Error::into_kernel_error)?
+        }
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
@@ -1157,7 +1166,7 @@ pub(crate) fn build_engine_from_store(
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
+) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
     // The builder is generic over the executor type, so apply the shared I/O config via a generic
@@ -1180,7 +1189,8 @@ pub(crate) fn build_engine_from_store(
         let executor = TokioMultiThreadExecutor::new_owned_runtime(
             config.worker_threads,
             config.max_blocking_threads,
-        )?;
+        )
+        .map_err(delta_kernel::Error::into_kernel_error)?;
         let builder = DefaultEngineBuilder::new(store).with_task_executor(Arc::new(executor));
         Arc::new(apply_io_config(builder, &io_config).build())
     } else {
@@ -1312,7 +1322,7 @@ enum FfiSnapshotBuilderSource {
 fn make_snapshot_builder(
     source: FfiSnapshotBuilderSource,
     engine: Arc<dyn ExternEngine>,
-) -> DeltaResult<Handle<ExclusiveSnapshotBuilder>> {
+) -> KernelResult<Handle<ExclusiveSnapshotBuilder>> {
     Ok(Box::new(FfiSnapshotBuilder {
         engine,
         source,
@@ -1344,7 +1354,7 @@ pub unsafe extern "C" fn get_snapshot_builder(
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let source = match url {
         Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => return DeltaResult::Err(e).into_extern_result(&engine_ref),
+        Err(e) => return Result::Err(e).into_extern_result(&engine_ref),
     };
     make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
 }
@@ -1421,7 +1431,7 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
 unsafe fn snapshot_builder_with_log_tail_impl(
     builder: &mut FfiSnapshotBuilder,
     log_tail: log_path::LogPathArray,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     builder.log_tail = unsafe { log_tail.log_paths() }?;
     Ok(())
 }
@@ -1460,7 +1470,9 @@ pub unsafe extern "C" fn snapshot_builder_build(
     snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
 }
 
-fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
+fn snapshot_builder_build_impl(
+    builder: FfiSnapshotBuilder,
+) -> KernelResult<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
         engine,
         source,
@@ -1482,8 +1494,8 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
             delta_kernel::snapshot::SnapshotBuilder<Mode>,
             Box<SnapshotHint>,
         )
-            -> DeltaResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
-    ) -> DeltaResult<SnapshotRef> {
+            -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
+    ) -> KernelResult<SnapshotRef> {
         if let Some(version) = version {
             builder = builder.at_version(version);
         }
@@ -1496,7 +1508,9 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
         if let Some(snapshot_hint) = snapshot_hint {
             builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
-        builder.build(engine)
+        builder
+            .build(engine)
+            .map_err(delta_kernel::Error::into_kernel_error)
     }
 
     let snapshot = match source {
@@ -1792,16 +1806,17 @@ pub unsafe extern "C" fn get_earliest_commit(
 
 fn get_earliest_commit_impl(
     extern_engine: &dyn ExternEngine,
-    log_root: DeltaResult<Url>,
+    log_root: KernelResult<Url>,
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
-) -> DeltaResult<Version> {
+) -> KernelResult<Version> {
     kernel_get_earliest_commit(
         extern_engine.engine().as_ref(),
         &log_root?,
         earliest_ratified_commit_version.into(),
         commit_type.into(),
     )
+    .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe

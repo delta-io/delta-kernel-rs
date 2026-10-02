@@ -32,18 +32,20 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use delta_kernel::{ActionReconciliationIterator, LogCompactionWriter};
-//! # use delta_kernel::{Engine, Snapshot, DeltaResult, KernelError, FileMeta};
+//! # use delta_kernel::{Engine, Snapshot, Error, KernelError, Result, FileMeta};
 //! # use url::Url;
 //!
 //! // Engine-specific function to write compaction data
-//! fn write_compaction_file(path: &Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_compaction_file(path: &Url, data: ActionReconciliationIterator) -> Result<FileMeta> {
 //!     // In a real implementation, this would write the data to cloud storage
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
+//! # fn example(engine: &dyn Engine) -> Result<()> {
 //! // Create a snapshot for the table
-//! let table_root = Url::parse("file:///path/to/table")?;
+//! let table_root = Url::parse("file:///path/to/table")
+//!     .map_err(KernelError::from)
+//!     .map_err(Error::Kernel)?;
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20

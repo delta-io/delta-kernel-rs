@@ -118,7 +118,8 @@ match commit_result {
         // problem surfaces loudly if the invariant ever changes.
         let post_commit = committed
             .post_commit_snapshot()
-            .ok_or_else(|| KernelError::generic("missing post-commit snapshot"))?;
+            .ok_or_else(|| KernelError::generic("missing post-commit snapshot"))
+            .map_err(delta_kernel::Error::Kernel)?;
 
         // commit() consumed the Box<dyn Committer> from Phase 2. publish() only
         // needs &dyn Committer, so construct a fresh instance here. This moves

@@ -26,7 +26,7 @@ pub fn schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 pub fn try_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     // Wrap the block in a closure that anchors the block's `?` operators
     schema_macro::parse_schema(input, true, |block| {
-        quote! { (|| -> delta_kernel::DeltaResult<_> #block)() }
+        quote! { (|| -> delta_kernel::Result<_> #block)() }
     })
 }
 
@@ -469,7 +469,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 /// - `TryFrom<Scalar> for Self` — unwraps `Scalar::Struct`, else errors
 ///
 /// Missing, duplicate, and unknown fields are errors. Every field type must implement
-/// `TryFrom<Scalar, Error = KernelError>`. `#[skip_schema]` is rejected because the reverse
+/// `TryFrom<Scalar, Error = Error>`. `#[skip_schema]` is rejected because the reverse
 /// conversion cannot infer a value or schema for a field omitted by `ToSchema`.
 #[proc_macro_derive(TryFromStructData, attributes(skip_schema))]
 pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
@@ -501,22 +501,23 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: delta_kernel::schema::ToSchema,
             #(#field_types:
-                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::KernelError>,)*
+                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::Error>,)*
         {
-            type Error = delta_kernel::KernelError;
+            type Error = delta_kernel::Error;
 
             fn try_from(
                 value: delta_kernel::expressions::StructData,
-            ) -> delta_kernel::DeltaResult<Self> {
+            ) -> delta_kernel::Result<Self> {
                 let mut fields =
                     delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
                         <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
-                    )?;
+                    ).map_err(delta_kernel::Error::Kernel)?;
                 let result = Self {
-                    #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
+                    #(#field_idents: fields.take_field(stringify!(#schema_field_names))
+                        .map_err(delta_kernel::Error::Kernel)?,)*
                 };
-                fields.finish()?;
+                fields.finish().map_err(delta_kernel::Error::Kernel)?;
                 Ok(result)
             }
         }
@@ -526,17 +527,19 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #struct_name: TryFrom<
                 delta_kernel::expressions::StructData,
-                Error = delta_kernel::KernelError,
+                Error = delta_kernel::Error,
             >,
         {
-            type Error = delta_kernel::KernelError;
+            type Error = delta_kernel::Error;
 
             fn try_from(
                 value: delta_kernel::expressions::Scalar,
-            ) -> delta_kernel::DeltaResult<Self> {
+            ) -> delta_kernel::Result<Self> {
                 match value {
                     delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
-                    other => Err(other.conversion_error(stringify!(#struct_name))),
+                    other => Err(delta_kernel::Error::Kernel(
+                        other.conversion_error(stringify!(#struct_name)),
+                    )),
                 }
             }
         }

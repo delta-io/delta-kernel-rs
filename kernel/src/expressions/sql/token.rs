@@ -14,7 +14,7 @@ use std::iter::Peekable;
 use std::str::Chars;
 
 use crate::expressions::column_names::{is_simple_char, parse_escaped_field_name};
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, KernelResult};
 
 /// A peekable character stream over the source string.
 type CharStream<'a> = Peekable<Chars<'a>>;
@@ -63,7 +63,7 @@ pub(super) enum Keyword {
 
 /// Tokenize `sql`, or return an error for any character/run outside the recognized token set (e.g.
 /// parentheses, `*` or `/`, a lone `!`, or an unterminated string).
-pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
+pub(super) fn tokenize(sql: &str) -> KernelResult<Vec<Token>> {
     let mut chars = sql.chars().peekable();
     let mut tokens = Vec::new();
     while let Some(&c) = chars.peek() {
@@ -175,7 +175,7 @@ fn peek_second(chars: &CharStream<'_>) -> Option<char> {
 ///
 /// Example: `'it''s'` returns `'it''s'` (verbatim). Returns an error if the input does not start
 /// with a `'`.
-fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<String> {
+fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> KernelResult<String> {
     if chars.next_if_eq(&'\'').is_none() {
         return Err(KernelError::generic(format!(
             "string literal must start with a quote in {sql}"
@@ -232,7 +232,7 @@ fn take_number(chars: &mut CharStream<'_>) -> String {
 ///
 /// Keywords are recognized here rather than downstream so a backtick-quoted `` `AND` `` (parsed as
 /// an `Ident` by the caller of this function) stays distinct from the bareword keyword `AND`.
-fn classify_word(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Token> {
+fn classify_word(chars: &mut CharStream<'_>, sql: &str) -> KernelResult<Token> {
     let mut word = String::new();
     while let Some(c) = chars.next_if(|c| is_simple_char(*c)) {
         word.push(c);

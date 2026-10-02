@@ -11,7 +11,7 @@ use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{Error, KernelError, KernelResult, Result};
 
 const KB: i64 = 1024;
 const MB: i64 = KB * 1024;
@@ -116,36 +116,36 @@ impl FileSizeHistogram {
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
         total_bytes: Vec<i64>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         require!(
             sorted_bin_boundaries.len() >= 2,
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "sorted_bin_boundaries must have at least 2 elements, got {}",
                 sorted_bin_boundaries.len()
-            ))
+            )))
         );
         require!(
             sorted_bin_boundaries[0] == 0,
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "First boundary must be 0, got {}",
                 sorted_bin_boundaries[0]
-            ))
+            )))
         );
         require!(
             sorted_bin_boundaries.len() == file_counts.len()
                 && sorted_bin_boundaries.len() == total_bytes.len(),
-            KernelError::internal_error(format!(
+            Error::Kernel(KernelError::internal_error(format!(
                 "All arrays must have the same length: boundaries={}, file_counts={}, total_bytes={}",
                 sorted_bin_boundaries.len(),
                 file_counts.len(),
                 total_bytes.len()
-            ))
+            )))
         );
         require!(
             sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
-            KernelError::internal_error(
+            Error::Kernel(KernelError::internal_error(
                 "sorted_bin_boundaries must be sorted in strictly ascending order"
-            )
+            ))
         );
         Ok(Self {
             sorted_bin_boundaries,
@@ -160,9 +160,10 @@ impl FileSizeHistogram {
     /// histograms that match, so that `try_apply_delta` succeeds during merge.
     pub(crate) fn create_empty_with_boundaries(
         sorted_bin_boundaries: Vec<i64>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let len = sorted_bin_boundaries.len();
         Self::try_new(sorted_bin_boundaries, vec![0; len], vec![0; len])
+            .map_err(Error::into_kernel_error)
     }
 
     /// Creates a default histogram with the standard 95 bin boundaries and zero counts.
@@ -194,7 +195,7 @@ impl FileSizeHistogram {
 
     /// Adds a file of the given size to the histogram, incrementing the appropriate bin's
     /// file count and total bytes.
-    pub(crate) fn insert(&mut self, file_size: i64) -> DeltaResult<()> {
+    pub(crate) fn insert(&mut self, file_size: i64) -> KernelResult<()> {
         require!(
             file_size >= 0,
             KernelError::internal_error(format!(
@@ -213,7 +214,7 @@ impl FileSizeHistogram {
     ///
     /// Does not validate that the bin remains non-negative, since this is used to build delta
     /// histograms where removes may exceed adds in a given bin.
-    pub(crate) fn remove(&mut self, file_size: i64) -> DeltaResult<()> {
+    pub(crate) fn remove(&mut self, file_size: i64) -> KernelResult<()> {
         require!(
             file_size >= 0,
             KernelError::internal_error(format!(
@@ -236,7 +237,7 @@ impl FileSizeHistogram {
     pub(crate) fn try_apply_delta(
         &self,
         delta: &FileSizeHistogram,
-    ) -> DeltaResult<FileSizeHistogram> {
+    ) -> KernelResult<FileSizeHistogram> {
         require!(
             self.sorted_bin_boundaries == delta.sorted_bin_boundaries,
             KernelError::internal_error("Cannot add histograms with different bin boundaries")
@@ -269,7 +270,7 @@ impl FileSizeHistogram {
     /// Returns `Ok(self)` if valid, or an error indicating the first bin that is negative.
     /// Used to validate a delta histogram before using it as an absolute histogram (e.g. for
     /// version zero where the delta represents the full table state).
-    pub(crate) fn check_non_negative(self) -> DeltaResult<Self> {
+    pub(crate) fn check_non_negative(self) -> KernelResult<Self> {
         for i in 0..self.sorted_bin_boundaries.len() {
             require!(
                 self.file_counts[i] >= 0 && self.total_bytes[i] >= 0,

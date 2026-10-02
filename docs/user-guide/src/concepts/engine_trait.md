@@ -138,9 +138,11 @@ To construct one, create an object store and pass it to the builder:
 # extern crate url;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::DeltaResult;
-# fn example() -> DeltaResult<()> {
-let url = url::Url::parse("file:///path/to/table")?;
+# use delta_kernel::{Error, KernelError, Result};
+# fn example() -> Result<()> {
+let url = url::Url::parse("file:///path/to/table")
+    .map_err(KernelError::from)
+    .map_err(Error::Kernel)?;
 let store = store_from_url(&url)?;
 let engine = DefaultEngine::builder(store).build();
 # Ok(())

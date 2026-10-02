@@ -23,7 +23,7 @@ use delta_kernel::schema::{
     schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, PrimitiveType, SchemaRef,
     StructField, StructType,
 };
-use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
+use delta_kernel::{Engine, EngineData, FileMeta, JsonHandler, ParquetHandler, Result};
 use itertools::Itertools;
 use tempfile::{tempdir, NamedTempFile};
 use url::Url;
@@ -99,11 +99,7 @@ pub fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
             static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::STRING]);
             (&NAMES, &TYPES)
         }
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
             for i in 0..row_count {
                 self.paths.push(getters[0].get(i, "_file")?);
             }

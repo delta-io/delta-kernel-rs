@@ -15,7 +15,7 @@ use crate::schema::{
     column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
 };
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{Error, KernelError, KernelResult, Result};
 
 pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
@@ -31,7 +31,7 @@ impl RowVisitor for MetadataVisitor {
         METADATA_LEAVES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             if let Some(metadata) = visit_metadata_at(i, getters)? {
                 self.metadata = Some(metadata);
@@ -55,13 +55,13 @@ impl RowVisitor for SelectionVectorVisitor {
             LazyLock::new(|| (vec![column_name!("output")], vec![DataType::BOOLEAN]).into());
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of SelectionVectorVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             let selected: bool = getters[0].get(i, "selectionvector.output")?;
@@ -94,7 +94,7 @@ impl RowVisitor for ProtocolVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         PROTOCOL_LEAVES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             if let Some(protocol) = visit_protocol_at(i, getters)? {
                 self.protocol = Some(protocol);
@@ -119,7 +119,7 @@ impl AddVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Add> {
+    ) -> Result<Add> {
         let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
             17
         } else {
@@ -127,10 +127,10 @@ impl AddVisitor {
         };
         require!(
             getters.len() == expected_getters,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         let partition_values: HashMap<_, _> = getters[1].get(row_index, "add.partitionValues")?;
         let size: i64 = getters[2].get(row_index, "add.size")?;
@@ -140,7 +140,8 @@ impl AddVisitor {
 
         // TODO(nick) extract tags if we ever need them at getters[6]
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
+        let deletion_vector =
+            visit_deletion_vector_at(row_index, &getters[7..]).map_err(Error::Kernel)?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
         let default_row_commit_version: Option<i64> =
@@ -149,7 +150,8 @@ impl AddVisitor {
             getters[14].get_opt(row_index, "add.clustering_provider")?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+        let back_reference =
+            visit_back_reference_at(row_index, &getters[15..]).map_err(Error::Kernel)?;
 
         Ok(Add {
             path,
@@ -178,7 +180,7 @@ impl RowVisitor for AddVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         Self::names_and_types()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
@@ -203,7 +205,7 @@ impl RemoveVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Remove> {
+    ) -> Result<Remove> {
         let expected_getters = if cfg!(feature = "adaptive-metadata-in-dev") {
             17
         } else {
@@ -211,10 +213,10 @@ impl RemoveVisitor {
         };
         require!(
             getters.len() == expected_getters,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         let deletion_timestamp: Option<i64> =
             getters[1].get_opt(row_index, "remove.deletionTimestamp")?;
@@ -229,14 +231,16 @@ impl RemoveVisitor {
         let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
         // TODO(nick) tags are skipped in getters[7]
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
+        let deletion_vector =
+            visit_deletion_vector_at(row_index, &getters[8..]).map_err(Error::Kernel)?;
 
         let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
             getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+        let back_reference =
+            visit_back_reference_at(row_index, &getters[15..]).map_err(Error::Kernel)?;
 
         Ok(Remove {
             path,
@@ -265,7 +269,7 @@ impl RowVisitor for RemoveVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         Self::names_and_types()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Remove action
             if let Some(path) = getters[0].get_opt(i, "remove.path")? {
@@ -290,7 +294,7 @@ impl CdcVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Cdc> {
+    ) -> Result<Cdc> {
         Ok(Cdc {
             path,
             partition_values: getters[1].get(row_index, "cdc.partitionValues")?,
@@ -307,13 +311,13 @@ impl RowVisitor for CdcVisitor {
             LazyLock::new(|| Cdc::to_schema().leaves(CDC_NAME));
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 5,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of CdcVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Cdc action
@@ -355,13 +359,13 @@ impl SetTransactionVisitor {
         row_index: usize,
         app_id: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<SetTransaction> {
+    ) -> Result<SetTransaction> {
         require!(
             getters.len() == 3,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of SetTransactionVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         let version: i64 = getters[1].get(row_index, "txn.version")?;
         let last_updated: Option<i64> = getters[2].get_opt(row_index, "txn.lastUpdated")?;
@@ -380,7 +384,7 @@ impl RowVisitor for SetTransactionVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         // Assumes batches are visited in reverse order relative to the log
         for i in 0..row_count {
             if let Some(app_id) = getters[0].get_opt(i, "txn.appId")? {
@@ -413,7 +417,7 @@ impl SidecarVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Sidecar> {
+    ) -> Result<Sidecar> {
         Ok(Sidecar {
             path,
             size_in_bytes: getters[1].get(row_index, "sidecar.sizeInBytes")?,
@@ -429,13 +433,13 @@ impl RowVisitor for SidecarVisitor {
             LazyLock::new(|| Sidecar::to_schema().leaves(SIDECAR_NAME));
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 4,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of SidecarVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Sidecar action
@@ -477,7 +481,7 @@ impl DomainMetadataVisitor {
         row_index: usize,
         domain: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<DomainMetadata> {
+    ) -> KernelResult<DomainMetadata> {
         require!(
             getters.len() == 3,
             KernelError::InternalError(format!(
@@ -485,8 +489,12 @@ impl DomainMetadataVisitor {
                 getters.len()
             ))
         );
-        let configuration: String = getters[1].get(row_index, "domainMetadata.configuration")?;
-        let removed: bool = getters[2].get(row_index, "domainMetadata.removed")?;
+        let configuration: String = getters[1]
+            .get(row_index, "domainMetadata.configuration")
+            .map_err(Error::into_kernel_error)?;
+        let removed: bool = getters[2]
+            .get(row_index, "domainMetadata.removed")
+            .map_err(Error::into_kernel_error)?;
         Ok(DomainMetadata {
             domain,
             configuration,
@@ -523,7 +531,7 @@ impl RowVisitor for DomainMetadataVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         // Requires that batches are visited in reverse order relative to the log
         for i in 0..row_count {
             let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
@@ -537,7 +545,8 @@ impl RowVisitor for DomainMetadataVisitor {
                     // slot is actually empty, avoiding unnecessary field access.
                     if let Entry::Vacant(entry) = self.domain_metadatas.entry(domain.clone()) {
                         let domain_metadata =
-                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)?;
+                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)
+                                .map_err(Error::Kernel)?;
                         entry.insert(domain_metadata);
                     }
                 }
@@ -552,7 +561,7 @@ impl RowVisitor for DomainMetadataVisitor {
 pub(crate) fn visit_deletion_vector_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<DeletionVectorDescriptor>> {
+) -> KernelResult<Option<DeletionVectorDescriptor>> {
     if getters.len() < DELETION_VECTOR_GETTER_COUNT {
         return Err(KernelError::InternalError(format!(
             "Wrong number of DeletionVectorVisitor getters: {}",
@@ -560,15 +569,23 @@ pub(crate) fn visit_deletion_vector_at<'a>(
         )));
     }
 
-    let storage_type_opt: Option<String> =
-        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?;
+    let storage_type_opt: Option<String> = getters[0]
+        .get_opt(row_index, "remove.deletionVector.storageType")
+        .map_err(Error::into_kernel_error)?;
     if let Some(storage_type_str) = storage_type_opt {
-        let storage_type = storage_type_str.parse()?;
-        let path_or_inline_dv: String =
-            getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
-        let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
-        let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
-        let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
+        let storage_type = storage_type_str.parse().map_err(Error::into_kernel_error)?;
+        let path_or_inline_dv: String = getters[1]
+            .get(row_index, "deletionVector.pathOrInlineDv")
+            .map_err(Error::into_kernel_error)?;
+        let offset: Option<i32> = getters[2]
+            .get_opt(row_index, "deletionVector.offset")
+            .map_err(Error::into_kernel_error)?;
+        let size_in_bytes: i32 = getters[3]
+            .get(row_index, "deletionVector.sizeInBytes")
+            .map_err(Error::into_kernel_error)?;
+        let cardinality: i64 = getters[4]
+            .get(row_index, "deletionVector.cardinality")
+            .map_err(Error::into_kernel_error)?;
         Ok(Some(DeletionVectorDescriptor {
             storage_type,
             path_or_inline_dv,
@@ -588,7 +605,7 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 fn visit_back_reference_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<BackReference>> {
+) -> KernelResult<Option<BackReference>> {
     if getters.len() < BACK_REFERENCE_GETTER_COUNT {
         return Err(KernelError::InternalError(format!(
             "Wrong number of BackReference getters: {}",
@@ -596,9 +613,13 @@ fn visit_back_reference_at<'a>(
         )));
     }
 
-    let manifest_opt: Option<String> = getters[0].get_opt(row_index, "backReference.manifest")?;
+    let manifest_opt: Option<String> = getters[0]
+        .get_opt(row_index, "backReference.manifest")
+        .map_err(Error::into_kernel_error)?;
     if let Some(manifest) = manifest_opt {
-        let pos: i32 = getters[1].get(row_index, "backReference.pos")?;
+        let pos: i32 = getters[1]
+            .get(row_index, "backReference.pos")
+            .map_err(Error::into_kernel_error)?;
         Ok(Some(BackReference { manifest, pos }))
     } else {
         Ok(None)
@@ -612,13 +633,13 @@ fn visit_back_reference_at<'a>(
 pub(crate) fn visit_metadata_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<Metadata>> {
+) -> Result<Option<Metadata>> {
     require!(
         getters.len() == 9,
-        KernelError::InternalError(format!(
+        Error::Kernel(KernelError::InternalError(format!(
             "Wrong number of MetadataVisitor getters: {}",
             getters.len()
-        ))
+        )))
     );
 
     // Since id column is required, use it to detect presence of a metadata action
@@ -660,13 +681,13 @@ pub(crate) fn visit_metadata_at<'a>(
 pub(crate) fn visit_protocol_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<Protocol>> {
+) -> Result<Option<Protocol>> {
     require!(
         getters.len() == 4,
-        KernelError::InternalError(format!(
+        Error::Kernel(KernelError::InternalError(format!(
             "Wrong number of ProtocolVisitor getters: {}",
             getters.len()
-        ))
+        )))
     );
     // Since minReaderVersion column is required, use it to detect presence of a Protocol action
     let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
@@ -729,13 +750,13 @@ impl RowVisitor for InCommitTimestampVisitor {
         &mut self,
         row_count: usize,
         getters: &[&'a dyn crate::engine_data::GetData<'a>],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of InCommitTimestampVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         // If the batch is empty, return
@@ -775,19 +796,23 @@ impl RowVisitor for CheckpointVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of CheckpointVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             if let Some(elements) = getters[0].get_struct_list(i, CHECKPOINT_ACTION_NAME)? {
                 let mut element_visitor = CheckpointElementVisitor::default();
                 elements.visit_with(&mut element_visitor)?;
-                self.checkpoint = Some(element_visitor.into_checkpoint_action()?);
+                self.checkpoint = Some(
+                    element_visitor
+                        .into_checkpoint_action()
+                        .map_err(Error::Kernel)?,
+                );
                 // Keep the first checkpoint row found; this only extracts one action, it is not
                 // the RFC's checkpoint selection rule (MAX checkpointMetadata.version across
                 // commits, standalone checkpoints, and _last_checkpoint).
@@ -884,7 +909,7 @@ struct CheckpointElementVisitor {
 impl CheckpointElementVisitor {
     /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
     /// was absent or if `CheckpointAction::validate` rejects the assembled action.
-    fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
+    fn into_checkpoint_action(self) -> KernelResult<CheckpointAction> {
         let missing = |field: &str| {
             KernelError::generic(format!(
                 "checkpoint action is missing required `{field}` element"
@@ -913,7 +938,7 @@ impl RowVisitor for CheckpointElementVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let r = &*CHECKPOINT_ELEMENT_RANGES;
         for i in 0..row_count {
             // Each element is a single-key tagged object, so at most one variant has a non-null
@@ -923,24 +948,28 @@ impl RowVisitor for CheckpointElementVisitor {
             if let Some(version) =
                 getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
             {
-                set_once(&mut self.version, version, "checkpointMetadata")?;
+                set_once(&mut self.version, version, "checkpointMetadata")
+                    .map_err(Error::Kernel)?;
             } else if let Some(content_root) =
-                visit_content_root_at(i, &getters[r.content_root.clone()])?
+                visit_content_root_at(i, &getters[r.content_root.clone()]).map_err(Error::Kernel)?
             {
-                set_once(&mut self.content_root, content_root, "contentRoot")?;
+                set_once(&mut self.content_root, content_root, "contentRoot")
+                    .map_err(Error::Kernel)?;
             } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
-                set_once(&mut self.protocol, protocol, "protocol")?;
+                set_once(&mut self.protocol, protocol, "protocol").map_err(Error::Kernel)?;
             } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
-                set_once(&mut self.metadata, metadata, "metaData")?;
+                set_once(&mut self.metadata, metadata, "metaData").map_err(Error::Kernel)?;
             } else if let Some(domain) =
                 getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
             {
-                self.domain_metadata
-                    .push(DomainMetadataVisitor::visit_domain_metadata(
+                self.domain_metadata.push(
+                    DomainMetadataVisitor::visit_domain_metadata(
                         i,
                         domain,
                         &getters[r.domain_metadata.clone()],
-                    )?);
+                    )
+                    .map_err(Error::Kernel)?,
+                );
             } else if let Some(app_id) = getters[r.txn.start].get_opt(i, "txn.appId")? {
                 self.transactions.push(SetTransactionVisitor::visit_txn(
                     i,
@@ -954,9 +983,9 @@ impl RowVisitor for CheckpointElementVisitor {
                     SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
                     DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
                     other => {
-                        return Err(KernelError::generic(format!(
+                        return Err(Error::Kernel(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        ))))
                     }
                 }
             }
@@ -968,7 +997,7 @@ impl RowVisitor for CheckpointElementVisitor {
 /// Store `value` in `slot`, erroring if it was already occupied. Checkpoint elements named by
 /// `name` are singletons, so a second occurrence is malformed rather than an override.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> KernelResult<()> {
     if slot.replace(value).is_some() {
         return Err(KernelError::generic(format!(
             "duplicate `{name}` element in checkpoint action"
@@ -983,14 +1012,21 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
 fn visit_content_root_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<ContentRoot>> {
-    let Some(path) = getters[0].get_opt(row_index, "contentRoot.path")? else {
+) -> KernelResult<Option<ContentRoot>> {
+    let Some(path) = getters[0]
+        .get_opt(row_index, "contentRoot.path")
+        .map_err(Error::into_kernel_error)?
+    else {
         return Ok(None);
     };
     Ok(Some(ContentRoot {
         path,
-        size_in_bytes: getters[1].get(row_index, "contentRoot.sizeInBytes")?,
-        version: getters[2].get(row_index, "contentRoot.version")?,
+        size_in_bytes: getters[1]
+            .get(row_index, "contentRoot.sizeInBytes")
+            .map_err(Error::into_kernel_error)?,
+        version: getters[2]
+            .get(row_index, "contentRoot.version")
+            .map_err(Error::into_kernel_error)?,
     }))
 }
 
@@ -1033,9 +1069,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_protocol() -> DeltaResult<()> {
+    fn test_parse_protocol() -> Result<()> {
         let data = action_batch();
-        let parsed = Protocol::try_new_from_data(data.as_ref())?.unwrap();
+        let parsed = Protocol::try_new_from_data(data.as_ref())
+            .map_err(crate::Error::Kernel)?
+            .unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -1055,7 +1093,7 @@ mod tests {
     #[case::missing(None)]
     fn test_parse_metadata_format_options(
         #[case] format_options: Option<HashMap<String, String>>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let mut format = serde_json::Map::from_iter([(
             "provider".to_string(),
             serde_json::Value::String("parquet".to_string()),
@@ -1106,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cdc() -> DeltaResult<()> {
+    fn test_parse_cdc() -> Result<()> {
         let data = action_batch();
         let mut visitor = CdcVisitor::default();
         visitor.visit_rows_of(data.as_ref())?;
@@ -1125,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sidecar() -> DeltaResult<()> {
+    fn test_parse_sidecar() -> Result<()> {
         let data = action_batch();
 
         let mut visitor = SidecarVisitor::default();
@@ -1156,7 +1194,7 @@ mod tests {
     #[case::with_tags(Some(HashMap::from([("k".to_string(), "v".to_string())])))]
     fn test_checkpoint_action_write_then_read_round_trip(
         #[case] sidecar_tags: Option<HashMap<String, String>>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let action = CheckpointAction {
             version: 7,
             content_root: ContentRoot {
@@ -1188,8 +1226,12 @@ mod tests {
         // Round-trip through the engine JSON writer and reader: build engine data, serialize it to
         // a commit line with `to_json_bytes`, then parse it back and reconstruct the action.
         let engine = SyncEngine::new();
-        let scalar = action.clone().try_into_scalar()?;
-        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let scalar = action
+            .clone()
+            .try_into_scalar()
+            .map_err(crate::Error::Kernel)?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)
+            .map_err(crate::Error::Kernel)?;
         let bytes = to_json_bytes(std::iter::once(Ok(
             FilteredEngineData::with_all_rows_selected(data),
         )))?;
@@ -1204,7 +1246,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action() -> DeltaResult<()> {
+    fn test_parse_checkpoint_action() -> Result<()> {
         use crate::unit_test_utils::checkpoint_action_batch;
 
         let data = checkpoint_action_batch();
@@ -1251,7 +1293,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_first_row_wins() -> DeltaResult<()> {
+    fn test_parse_checkpoint_action_first_row_wins() -> Result<()> {
         use crate::unit_test_utils::parse_json_batch;
 
         let element = |version: i64| {
@@ -1338,7 +1380,7 @@ mod tests {
     /// skipped rather than failing the surrounding action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_skips_unknown_element_variant() -> DeltaResult<()> {
+    fn test_parse_checkpoint_action_skips_unknown_element_variant() -> Result<()> {
         let data = checkpoint_commit(&[
             checkpoint_elements::CHECKPOINT_METADATA,
             checkpoint_elements::CONTENT_ROOT,
@@ -1356,7 +1398,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_minimal_round_trip() -> DeltaResult<()> {
+    fn test_parse_checkpoint_action_minimal_round_trip() -> Result<()> {
         let data = checkpoint_commit(&[
             checkpoint_elements::CHECKPOINT_METADATA,
             checkpoint_elements::CONTENT_ROOT,
@@ -1377,7 +1419,7 @@ mod tests {
     /// and must parse successfully (the error rstest covers only `<` and `>`).
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> DeltaResult<()> {
+    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> Result<()> {
         let data = checkpoint_commit(&[
             checkpoint_elements::CHECKPOINT_METADATA,
             r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":42}}"#,
@@ -1392,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_metadata() -> DeltaResult<()> {
+    fn test_parse_metadata() -> Result<()> {
         let data = action_batch();
         let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
 

@@ -13,7 +13,7 @@ use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
-use crate::{DeltaResult, Engine, RowVisitor as _, Version};
+use crate::{Engine, KernelResult, RowVisitor as _, Version};
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
@@ -29,7 +29,7 @@ impl LogSegment {
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
-    ) -> DeltaResult<DomainMetadataMap> {
+    ) -> KernelResult<DomainMetadataMap> {
         Ok(self
             .visit_domain_metadatas(domains, engine)?
             .into_domain_metadatas())
@@ -51,7 +51,7 @@ impl LogSegment {
         base_active: &HashMap<String, DomainMetadata>,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
-    ) -> DeltaResult<DomainMetadataMap> {
+    ) -> KernelResult<DomainMetadataMap> {
         let tail = self
             .segment_after_version(base_version)
             .scan_tail_including_tombstones(domains, engine)?;
@@ -83,7 +83,7 @@ impl LogSegment {
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
-    ) -> DeltaResult<DomainMetadataMap> {
+    ) -> KernelResult<DomainMetadataMap> {
         Ok(self
             .visit_domain_metadatas(domains, engine)?
             .into_domain_metadatas_including_tombstones())
@@ -98,7 +98,7 @@ impl LogSegment {
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
-    ) -> DeltaResult<DomainMetadataVisitor> {
+    ) -> KernelResult<DomainMetadataVisitor> {
         let domain_filter = domains.map(|set| {
             set.iter()
                 .map(|s| s.to_string())
@@ -110,7 +110,9 @@ impl LogSegment {
         // are forced to replay the entire log.
         for actions in self.read_domain_metadata_batches(engine)? {
             let domain_metadatas = actions?.actions;
-            visitor.visit_rows_of(domain_metadatas.as_ref())?;
+            visitor
+                .visit_rows_of(domain_metadatas.as_ref())
+                .map_err(crate::Error::into_kernel_error)?;
             // if all requested domains have been found, terminate early
             if visitor.filter_found() {
                 break;
@@ -123,8 +125,10 @@ impl LogSegment {
     fn read_domain_metadata_batches(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+            .map_err(crate::Error::into_kernel_error)
+            .map(|actions| actions.map(|item| item.map_err(crate::Error::into_kernel_error)))
     }
 }
 

@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predic
 use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, KernelError, Version};
+use delta_kernel::{Engine, KernelError, KernelResult, Result, Version};
 use delta_kernel_workloads::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
@@ -45,7 +45,7 @@ fn build_snapshot(
     engine: &dyn Engine,
     table_root: &Url,
     time_travel: Option<&TimeTravel>,
-) -> DeltaResult<Arc<Snapshot>> {
+) -> KernelResult<Arc<Snapshot>> {
     let version = time_travel
         .map(TimeTravel::as_version)
         .transpose()
@@ -55,7 +55,9 @@ fn build_snapshot(
     if let Some(v) = version {
         builder = builder.at_version(v);
     }
-    builder.build(engine)
+    builder
+        .build(engine)
+        .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// Execute a read workload.
@@ -63,8 +65,9 @@ pub fn execute_read_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     read_spec: &ReadSpec,
-) -> DeltaResult<ReadResult> {
-    let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
+) -> Result<ReadResult> {
+    let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())
+        .map_err(delta_kernel::Error::Kernel)?;
 
     let table_schema = snapshot.schema();
 
@@ -73,8 +76,9 @@ pub fn execute_read_workload(
 
     // Extract and parse the predicate if one is present
     let predicate = if let Some(ref predicate_string) = read_spec.predicate {
-        let predicate =
-            parse_predicate(predicate_string, &table_schema).map_err(KernelError::generic)?;
+        let predicate = parse_predicate(predicate_string, &table_schema)
+            .map_err(KernelError::generic)
+            .map_err(delta_kernel::Error::Kernel)?;
         let predicate = Arc::new(predicate);
         scan_builder = scan_builder.with_predicate(predicate.clone());
         Some(predicate)
@@ -95,7 +99,8 @@ pub fn execute_read_workload(
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
-    let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
+    let batches = filter_batches_with_predicate(batches, predicate.as_deref())
+        .map_err(delta_kernel::Error::Kernel)?;
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -111,7 +116,7 @@ pub fn execute_read_workload(
 fn filter_batches_with_predicate(
     batches: Vec<RecordBatch>,
     predicate: Option<&Predicate>,
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let Some(predicate) = predicate else {
         return Ok(batches);
     };
@@ -120,7 +125,8 @@ fn filter_batches_with_predicate(
         .into_iter()
         .map(|batch| {
             // Evaluate predicate to get boolean selection array
-            let selection = evaluate_predicate(predicate, &batch, false)?;
+            let selection = evaluate_predicate(predicate, &batch, false)
+                .map_err(delta_kernel::Error::into_kernel_error)?;
             // Filter the batch using the selection
             let filtered = filter_record_batch(&batch, &selection)?;
             Ok(filtered)
@@ -133,12 +139,13 @@ pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     snapshot_spec: &SnapshotConstructionSpec,
-) -> DeltaResult<SnapshotResult> {
+) -> Result<SnapshotResult> {
     let snapshot = build_snapshot(
         engine.as_ref(),
         table_root,
         snapshot_spec.time_travel.as_ref(),
-    )?;
+    )
+    .map_err(delta_kernel::Error::Kernel)?;
 
     let config = snapshot.table_configuration();
 

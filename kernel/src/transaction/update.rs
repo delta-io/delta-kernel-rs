@@ -50,7 +50,7 @@ use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation}
 use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, DeltaResult, Engine, Expression};
+use crate::{DataType, Engine, Error, Expression, KernelResult, Result};
 
 // =============================================================================
 // Update table transactions only
@@ -70,20 +70,23 @@ impl Transaction {
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before writing to the table we must check it is supported
         read_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Write)?;
+            .ensure_operation_supported(Operation::Write)
+            .map_err(Error::into_kernel_error)?;
 
         // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
         // and materialized column-name properties. Materialized names must be distinct and must not
         // collide with physical data columns.
 
         // Read clustering columns from snapshot (returns None if clustering not enabled)
-        let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+        let clustering_columns = read_snapshot
+            .get_physical_clustering_columns(engine)
+            .map_err(Error::into_kernel_error)?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -172,44 +175,44 @@ impl Transaction {
     /// staged (adaptive-metadata-in-dev only).
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn with_schema_changes(
-        mut self,
-        changes: Vec<SchemaOperation>,
-    ) -> DeltaResult<Self> {
+    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> Result<Self> {
         if self
             .effective_table_config
             .is_feature_enabled(&TableFeature::IcebergCompatV3)
         {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
-            ));
+            )));
         }
         if self
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults)
         {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-            ));
+            )));
         }
         require!(
             !changes.is_empty(),
-            KernelError::generic("with_schema_changes requires at least one schema operation")
+            Error::Kernel(KernelError::generic(
+                "with_schema_changes requires at least one schema operation"
+            ))
         );
         require!(
             !self.has_data_file_actions(),
-            KernelError::invalid_transaction_state(
+            Error::Kernel(KernelError::invalid_transaction_state(
                 "with_schema_changes must be called before staging data files"
-            )
+            ))
         );
         #[cfg(feature = "adaptive-metadata-in-dev")]
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
-            KernelError::invalid_transaction_state(
+            Error::Kernel(KernelError::invalid_transaction_state(
                 "with_schema_changes cannot be called after staging a manifest commit"
-            )
+            ))
         );
-        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.effective_table_config =
+            evolve_table_config(&self.effective_table_config, changes).map_err(Error::Kernel)?;
         self.should_emit_metadata = true;
         Ok(self)
     }
@@ -265,11 +268,11 @@ impl Transaction {
     pub(crate) fn with_row_tracking_high_water_mark(
         mut self,
         high_water_mark: i64,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         if self.provided_row_tracking_high_water_mark.is_some() {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Row-tracking high-water mark already specified in this transaction",
-            ));
+            )));
         }
         self.provided_row_tracking_high_water_mark = Some(high_water_mark);
         Ok(self)
@@ -285,23 +288,29 @@ impl Transaction {
     /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
     /// a manifest (content-tree) commit was already staged.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> Result<Self> {
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
-            KernelError::invalid_transaction_state(
+            Error::Kernel(KernelError::invalid_transaction_state(
                 "explicit root manifest and manifest commit are mutually exclusive"
-            )
+            ))
         );
         require!(
             self.effective_table_config
                 .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
-            KernelError::unsupported(
+            Error::Kernel(KernelError::unsupported(
                 "root manifest file commit requires the adaptiveMetadata-preview feature"
-            )
+            ))
         );
-        let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-            KernelError::internal_error("existing-table transaction unexpectedly has no snapshot")
-        })?;
+        let read_snapshot = self
+            .read_snapshot_opt
+            .clone()
+            .ok_or_else(|| {
+                KernelError::internal_error(
+                    "existing-table transaction unexpectedly has no snapshot",
+                )
+            })
+            .map_err(Error::Kernel)?;
         self.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
             file,
             read_snapshot,
@@ -328,35 +337,40 @@ impl Transaction {
     pub(crate) fn with_manifest_commit(
         &mut self,
         engine: &dyn Engine,
-    ) -> DeltaResult<&mut ManifestCommitState> {
+    ) -> Result<&mut ManifestCommitState> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
-                return Err(KernelError::invalid_transaction_state(
+                return Err(Error::Kernel(KernelError::invalid_transaction_state(
                     "explicit root manifest and manifest commit are mutually exclusive",
-                ))
+                )))
             }
             // Repeated calls reuse the state from the first call.
             Some(ManifestWrite::Commit(_)) => {}
             None => {
-                let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-                    KernelError::internal_error(
-                        "existing-table transaction unexpectedly has no snapshot",
-                    )
-                })?;
+                let read_snapshot = self
+                    .read_snapshot_opt
+                    .clone()
+                    .ok_or_else(|| {
+                        KernelError::internal_error(
+                            "existing-table transaction unexpectedly has no snapshot",
+                        )
+                    })
+                    .map_err(Error::Kernel)?;
                 let state = ManifestCommitState::try_new(
                     engine,
                     read_snapshot,
                     self.get_commit_version(),
                     &self.effective_table_config,
-                )?;
+                )
+                .map_err(Error::Kernel)?;
                 self.manifest_write = Some(ManifestWrite::Commit(state));
             }
         }
         match &mut self.manifest_write {
             Some(ManifestWrite::Commit(state)) => Ok(state),
-            _ => Err(KernelError::internal_error(
+            _ => Err(Error::Kernel(KernelError::internal_error(
                 "manifest commit state missing after initialization",
-            )),
+            ))),
         }
     }
 
@@ -376,7 +390,7 @@ impl Transaction {
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
     /// # use delta_kernel::committer::FileSystemCommitter;
-    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
+    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
@@ -422,8 +436,8 @@ impl Transaction {
     /// txn.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
-        scan_metadata: impl Iterator<Item = DeltaResult<crate::scan::ScanMetadata>>,
-    ) -> impl Iterator<Item = DeltaResult<FilteredEngineData>> {
+        scan_metadata: impl Iterator<Item = Result<crate::scan::ScanMetadata>>,
+    ) -> impl Iterator<Item = Result<FilteredEngineData>> {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
 
@@ -492,14 +506,15 @@ impl Transaction {
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
-        existing_data_files: impl Iterator<Item = DeltaResult<FilteredEngineData>>,
-    ) -> DeltaResult<()> {
+        existing_data_files: impl Iterator<Item = Result<FilteredEngineData>>,
+    ) -> Result<()> {
         if self.is_create_table() {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Deletion vector operations require an existing table",
-            ));
+            )));
         }
-        self.ensure_deletion_vectors_enabled()?;
+        self.ensure_deletion_vectors_enabled()
+            .map_err(Error::Kernel)?;
 
         let mut matched_dv_files = 0;
         let mut matched_files = Vec::new();
@@ -541,11 +556,11 @@ impl Transaction {
         }
 
         if matched_dv_files != new_dv_descriptors.len() {
-            return Err(KernelError::generic(format!(
+            return Err(Error::Kernel(KernelError::generic(format!(
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
-            )));
+            ))));
         }
 
         self.dv_matched_files.extend(matched_files);
@@ -555,7 +570,7 @@ impl Transaction {
 
     /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
     /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
-    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
+    fn ensure_deletion_vectors_enabled(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
@@ -680,7 +695,7 @@ impl<S> Transaction<S> {
     pub(super) fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -705,7 +720,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &'a dyn Engine,
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
@@ -716,19 +731,24 @@ impl<S> Transaction<S> {
                 .replace("stats", col!(NEW_STATS_NAME))
                 .drop(NEW_DELETION_VECTOR_NAME)
                 .drop(NEW_STATS_NAME),
-        )?;
+        )
+        .map_err(Error::into_kernel_error)?;
         // TODO(#3263): `file_metadata_batch` may contain `stats_parsed` and
         // `partitionValues_parsed`; provide its full schema to both evaluators.
-        let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
-            intermediate_dv_schema().clone(),
-            Arc::new(with_new_dv_expr),
-            nullable_scan_rows_schema().clone().into(),
-        )?;
-        let restored_add_eval = evaluation_handler.new_expression_evaluator(
-            nullable_scan_rows_schema().clone(),
-            get_scan_metadata_transform_expr(),
-            nullable_restored_add_schema().clone().into(),
-        )?;
+        let with_new_dv_eval = evaluation_handler
+            .new_expression_evaluator(
+                intermediate_dv_schema().clone(),
+                Arc::new(with_new_dv_expr),
+                nullable_scan_rows_schema().clone().into(),
+            )
+            .map_err(Error::into_kernel_error)?;
+        let restored_add_eval = evaluation_handler
+            .new_expression_evaluator(
+                nullable_scan_rows_schema().clone(),
+                get_scan_metadata_transform_expr(),
+                nullable_restored_add_schema().clone().into(),
+            )
+            .map_err(Error::into_kernel_error)?;
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
         let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
             .insert_after("modificationTime", lit(self.data_change));
@@ -738,26 +758,35 @@ impl<S> Transaction<S> {
         {
             add_patch = add_patch.append(null_lit(BackReference::to_schema()));
         }
-        let with_data_change_patch = Expression::struct_patch(add_patch)?;
+        let with_data_change_patch =
+            Expression::struct_patch(add_patch).map_err(Error::into_kernel_error)?;
         let with_data_change_expr = Arc::new(Expression::struct_from([with_data_change_patch]));
-        let with_data_change_eval = evaluation_handler.new_expression_evaluator(
-            nullable_restored_add_schema().clone(),
-            with_data_change_expr,
-            nullable_add_log_schema().clone().into(),
-        )?;
+        let with_data_change_eval = evaluation_handler
+            .new_expression_evaluator(
+                nullable_restored_add_schema().clone(),
+                with_data_change_expr,
+                nullable_add_log_schema().clone().into(),
+            )
+            .map_err(Error::into_kernel_error)?;
         Ok(file_metadata_batch.map(
-            move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
-                let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
+            move |file_metadata_batch| -> KernelResult<FilteredEngineData> {
+                let with_new_dv_data = with_new_dv_eval
+                    .evaluate(file_metadata_batch.data())
+                    .map_err(Error::into_kernel_error)?;
 
-                let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
+                let as_partial_add_data = restored_add_eval
+                    .evaluate(with_new_dv_data.as_ref())
+                    .map_err(Error::into_kernel_error)?;
 
-                let with_data_change_data =
-                    with_data_change_eval.evaluate(as_partial_add_data.as_ref())?;
+                let with_data_change_data = with_data_change_eval
+                    .evaluate(as_partial_add_data.as_ref())
+                    .map_err(Error::into_kernel_error)?;
 
                 FilteredEngineData::try_new(
                     with_data_change_data,
                     file_metadata_batch.selection_vector().to_vec(),
                 )
+                .map_err(Error::into_kernel_error)
             },
         ))
     }
@@ -837,7 +866,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()
@@ -858,31 +887,38 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 // DVs require an accurate numRecords stat per the Delta protocol.
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
-                let stats = stats.ok_or_else(|| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: file {path} has no stats; \
+                let stats = stats
+                    .ok_or_else(|| {
+                        KernelError::generic(format!(
+                            "update_deletion_vectors: file {path} has no stats; \
                          deletion vectors require an accurate {NUM_RECORDS}"
-                    ))
-                })?;
-                let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
-                    ))
-                })?;
-                let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is not a JSON object"
-                    ))
-                })?;
+                        ))
+                    })
+                    .map_err(Error::Kernel)?;
+                let mut parsed: serde_json::Value = serde_json::from_str(&stats)
+                    .map_err(|e| {
+                        KernelError::generic(format!(
+                            "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
+                        ))
+                    })
+                    .map_err(Error::Kernel)?;
+                let stats_obj = parsed
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        KernelError::generic(format!(
+                            "update_deletion_vectors: stats for {path} is not a JSON object"
+                        ))
+                    })
+                    .map_err(Error::Kernel)?;
                 if stats_obj
                     .get(NUM_RECORDS)
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
-                    return Err(KernelError::generic(format!(
+                    return Err(Error::Kernel(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
-                    )));
+                    ))));
                 }
 
                 // Widen tightBounds to false (unless already false) instead of recomputing the
@@ -895,11 +931,13 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     stats
                 } else {
                     stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
-                    serde_json::to_string(&parsed).map_err(|e| {
-                        KernelError::generic(format!(
+                    serde_json::to_string(&parsed)
+                        .map_err(|e| {
+                            KernelError::generic(format!(
                             "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
                         ))
-                    })?
+                        })
+                        .map_err(Error::Kernel)?
                 };
                 let deletion_vector = Scalar::Struct(StructData::try_new(
                     DV_SCHEMA_FIELDS.clone(),

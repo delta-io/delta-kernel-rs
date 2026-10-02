@@ -678,7 +678,7 @@ mod tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::unit_test_utils::{geography_type, geometry_type};
-    use crate::DeltaResult;
+    use crate::Result;
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
@@ -700,12 +700,14 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_string_conversion() -> DeltaResult<()> {
+    fn test_metadata_string_conversion() -> Result<()> {
         let mut metadata = HashMap::new();
         metadata.insert("description", "hello world".to_owned());
         let struct_field = StructField::not_null("name", DataType::STRING).with_metadata(metadata);
 
-        let arrow_field = ArrowField::try_from_kernel(&struct_field)?;
+        let arrow_field = ArrowField::try_from_kernel(&struct_field)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let new_metadata = arrow_field.metadata();
 
         assert_eq!(
@@ -718,7 +720,7 @@ mod tests {
     // Delta tables can have void columns. The kernel should parse them and convert
     // to Arrow's Null type (and back).
     #[test]
-    fn test_void_type_roundtrip() -> DeltaResult<()> {
+    fn test_void_type_roundtrip() -> Result<()> {
         let json = r#"
         {
             "name": "void_col",
@@ -731,10 +733,14 @@ mod tests {
         let field: crate::schema::StructField = serde_json::from_str(json).unwrap();
         assert_eq!(field.data_type, DataType::Primitive(PrimitiveType::Void));
 
-        let arrow_type = ArrowDataType::try_from_kernel(&field.data_type)?;
+        let arrow_type = ArrowDataType::try_from_kernel(&field.data_type)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(arrow_type, ArrowDataType::Null);
 
-        let kernel_type = DataType::try_from_arrow(&ArrowDataType::Null)?;
+        let kernel_type = DataType::try_from_arrow(&ArrowDataType::Null)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(kernel_type, DataType::Primitive(PrimitiveType::Void));
 
         Ok(())
@@ -747,22 +753,31 @@ mod tests {
     fn test_interval_type_arrow_conversion(
         #[case] kernel_type: DataType,
         #[case] expected: ArrowDataType,
-    ) -> DeltaResult<()> {
-        assert_eq!(ArrowDataType::try_from_kernel(&kernel_type)?, expected);
+    ) -> Result<()> {
+        assert_eq!(
+            ArrowDataType::try_from_kernel(&kernel_type)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
+            expected
+        );
         Ok(())
     }
 
     // Millisecond-precision timestamps (e.g. from externally-written checkpoint stats)
     // must convert like microsecond/nanosecond: UTC tz -> TIMESTAMP, no tz -> TIMESTAMP_NTZ.
     #[test]
-    fn test_millisecond_timestamp_conversion() -> DeltaResult<()> {
+    fn test_millisecond_timestamp_conversion() -> Result<()> {
         let utc = DataType::try_from_arrow(&ArrowDataType::Timestamp(
             TimeUnit::Millisecond,
             Some("UTC".into()),
-        ))?;
+        ))
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         assert_eq!(utc, DataType::TIMESTAMP);
 
-        let ntz = DataType::try_from_arrow(&ArrowDataType::Timestamp(TimeUnit::Millisecond, None))?;
+        let ntz = DataType::try_from_arrow(&ArrowDataType::Timestamp(TimeUnit::Millisecond, None))
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(ntz, DataType::TIMESTAMP_NTZ);
 
         Ok(())
@@ -772,7 +787,7 @@ mod tests {
     // We tolerate it on reads (be permissive), and the Arrow conversion still
     // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
     #[test]
-    fn test_void_type_not_nullable() -> DeltaResult<()> {
+    fn test_void_type_not_nullable() -> Result<()> {
         let json = r#"
         {
             "name": "void_col",
@@ -787,7 +802,9 @@ mod tests {
         assert!(!field.is_nullable());
 
         // Arrow conversion still works — produces Null type
-        let arrow_field = ArrowField::try_from_kernel(&field)?;
+        let arrow_field = ArrowField::try_from_kernel(&field)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(arrow_field.data_type(), &ArrowDataType::Null);
 
         // Void is always-null by definition, so nullable=false is semantically
@@ -798,21 +815,25 @@ mod tests {
     }
 
     #[test]
-    fn test_void_field_in_struct() -> DeltaResult<()> {
+    fn test_void_field_in_struct() -> Result<()> {
         // A struct schema with a void column should convert to Arrow with a Null field
         let schema = schema! {
             nullable "id": INTEGER,
             nullable "void_col": VOID,
         };
 
-        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(arrow_schema.fields().len(), 2);
         assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
         assert_eq!(arrow_schema.field(1).data_type(), &ArrowDataType::Null);
         assert_eq!(arrow_schema.field(1).name(), "void_col");
 
         // And back to kernel
-        let kernel_schema = StructType::try_from_arrow(&arrow_schema)?;
+        let kernel_schema = StructType::try_from_arrow(&arrow_schema)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(
             kernel_schema.field("void_col").unwrap().data_type,
             DataType::VOID
@@ -822,9 +843,11 @@ mod tests {
     }
 
     #[test]
-    fn test_variant_shredded_type_fail() -> DeltaResult<()> {
+    fn test_variant_shredded_type_fail() -> Result<()> {
         let unshredded_variant = DataType::unshredded_variant();
-        let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant)?;
+        let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert!(unshredded_variant_arrow == unshredded_variant_arrow_type());
         let shredded_variant = DataType::variant_type([
             StructField::nullable("metadata", DataType::BINARY),
@@ -863,10 +886,13 @@ mod tests {
     }
 
     #[test]
-    fn test_try_into_arrow_threads_nested_ids_onto_arrow_schema() -> DeltaResult<()> {
+    fn test_try_into_arrow_threads_nested_ids_onto_arrow_schema() -> Result<()> {
         let meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
         let fixture = complex_nested_with_field_ids(meta_key);
-        let arrow_schema: ArrowSchema = (&fixture.kernel_schema).try_into_arrow()?;
+        let arrow_schema: ArrowSchema = (&fixture.kernel_schema)
+            .try_into_arrow()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         assert_eq!(
             arrow_schema, fixture.expected_arrow_schema,
@@ -893,8 +919,11 @@ mod tests {
     fn test_try_into_arrow_sets_field_ids_for_matched_nested_ids_only(
         #[case] schema: StructType,
         #[case] expected_field_ids: &[(&str, &str)],
-    ) -> DeltaResult<()> {
-        let arrow_schema: ArrowSchema = (&schema).try_into_arrow()?;
+    ) -> Result<()> {
+        let arrow_schema: ArrowSchema = (&schema)
+            .try_into_arrow()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let field_ids: HashMap<String, String> =
             collect_arrow_field_metadata(&arrow_schema, PARQUET_FIELD_ID_META_KEY)
                 .into_iter()
@@ -936,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recursive_field_id_transformation() -> DeltaResult<()> {
+    fn test_recursive_field_id_transformation() -> Result<()> {
         // Create a complex nested structure with field IDs at multiple levels:
         // top_struct {
         //   simple_field: int (field_id=1)
@@ -1006,7 +1035,9 @@ mod tests {
         };
 
         // Convert to Arrow schema
-        let arrow_schema = ArrowSchema::try_from_kernel(&top_struct)?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&top_struct)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         let expected_ids: HashMap<String, String> = [
             ("simple_field", "1"),
@@ -1033,7 +1064,9 @@ mod tests {
         );
 
         // Test round-trip: Arrow -> Kernel, field IDs should be preserved unchanged
-        let kernel_struct = StructType::try_from_arrow(&arrow_schema)?;
+        let kernel_struct = StructType::try_from_arrow(&arrow_schema)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let mut collector = FieldIdCollector::default();
         collector.transform_struct(&kernel_struct);
         let kernel_field_ids: HashMap<String, String> = collector.field_ids.into_iter().collect();
@@ -1142,9 +1175,11 @@ mod tests {
     #[case::fixed_size_list(ArrowDataType::FixedSizeList(arc_elem_with_id(42), 3))]
     fn test_try_from_arrow_aggregates_nested_id_for_all_list_kinds(
         #[case] dt: ArrowDataType,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let arrow_field = ArrowField::new("arr", dt, true);
-        let kernel = StructField::try_from_arrow(&arrow_field)?;
+        let kernel = StructField::try_from_arrow(&arrow_field)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(
             kernel
                 .metadata()
@@ -1159,13 +1194,15 @@ mod tests {
     /// `Dictionary` is a transparent wrapper on the Arrow side (kernel collapses it to its value
     /// type), so a nested-ids walker must still descend through it.
     #[test]
-    fn test_try_from_arrow_aggregates_nested_id_through_dictionary() -> DeltaResult<()> {
+    fn test_try_from_arrow_aggregates_nested_id_through_dictionary() -> Result<()> {
         let arrow_dict = ArrowDataType::Dictionary(
             Box::new(ArrowDataType::Int32),
             Box::new(ArrowDataType::List(arc_elem_with_id(7))),
         );
         let arrow_field = ArrowField::new("arr", arrow_dict, true);
-        let kernel = StructField::try_from_arrow(&arrow_field)?;
+        let kernel = StructField::try_from_arrow(&arrow_field)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         assert_eq!(
             kernel
                 .metadata()

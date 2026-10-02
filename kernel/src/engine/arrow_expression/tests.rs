@@ -34,6 +34,7 @@ use crate::schema::{
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
+use crate::KernelResult;
 
 #[test]
 fn test_array_column() {
@@ -663,7 +664,7 @@ impl OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> DeltaResult<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         let op_fn = match inverted {
             true => gt_eq,
             false => lt,
@@ -674,7 +675,10 @@ impl OpaqueLessThanOp {
         };
 
         let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::INTEGER));
-        Ok(op_fn(&eval(left)?, &eval(right)?)?)
+        Ok(op_fn(
+            &eval(left).map_err(crate::Error::into_kernel_error)?,
+            &eval(right).map_err(crate::Error::into_kernel_error)?,
+        )?)
     }
 }
 
@@ -687,7 +691,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expression],
-    ) -> DeltaResult<Scalar> {
+    ) -> Result<Scalar> {
         unimplemented!() // OpaqueExpressionOp is already tested
     }
 
@@ -696,9 +700,11 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         result_type: Option<&KernelDataType>,
-    ) -> DeltaResult<ArrayRef> {
+    ) -> Result<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
-        let result = self.eval_pred(args, batch, false)?;
+        let result = self
+            .eval_pred(args, batch, false)
+            .map_err(crate::Error::Kernel)?;
         Ok(Arc::new(result))
     }
 }
@@ -713,8 +719,9 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> DeltaResult<BooleanArray> {
+    ) -> Result<BooleanArray> {
         self.eval_pred(args, batch, inverted)
+            .map_err(crate::Error::Kernel)
     }
 
     fn eval_pred_scalar(
@@ -723,7 +730,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> Result<Option<bool>> {
         unimplemented!() // OpaquePredicateOp is already tested
     }
 
@@ -831,7 +838,7 @@ fn test_create_many_rejects_null_in_non_nullable_field() {
 }
 
 #[test]
-fn test_scalar_map() -> DeltaResult<()> {
+fn test_scalar_map() -> Result<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
@@ -868,7 +875,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 }
 
 #[test]
-fn test_null_scalar_map() -> DeltaResult<()> {
+fn test_null_scalar_map() -> Result<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
     let null_scalar_map = Scalar::null(map_type);
     let arrow_array = null_scalar_map.to_array(1)?;

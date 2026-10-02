@@ -14,7 +14,7 @@ use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, Struc
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
-use crate::{DeltaResult, KernelError, PredicateRef, StructField};
+use crate::{KernelError, KernelResult, PredicateRef, StructField};
 
 /// Resolved physical statistics schemas for a scan.
 ///
@@ -35,7 +35,7 @@ pub(crate) struct ResolvedPhysicalStatsSchemas {
 
 impl ResolvedPhysicalStatsSchemas {
     /// Resolves the stats schemas and validates that every output field is read.
-    fn try_new(read: Option<SchemaRef>, output: Option<SchemaRef>) -> DeltaResult<Option<Self>> {
+    fn try_new(read: Option<SchemaRef>, output: Option<SchemaRef>) -> KernelResult<Option<Self>> {
         match (read, output) {
             (None, None) => Ok(None),
             (Some(read), output) => {
@@ -50,7 +50,7 @@ impl ResolvedPhysicalStatsSchemas {
     }
 
     /// Validates that every output field is present and compatible in the read schema.
-    pub(crate) fn validate(&self) -> DeltaResult<()> {
+    pub(crate) fn validate(&self) -> KernelResult<()> {
         if let Some(output) = &self.output {
             validate_stats_output_schema(&self.read, output, "")?;
         }
@@ -62,7 +62,7 @@ fn validate_stats_output_schema(
     read: &StructType,
     output: &StructType,
     parent: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     for output_field in output.fields() {
         let path = if parent.is_empty() {
             output_field.name().to_string()
@@ -166,7 +166,7 @@ struct MetadataInfo<'a> {
 fn validate_metadata_columns<'a>(
     logical_schema: &'a SchemaRef,
     table_configuration: &'a TableConfiguration,
-) -> DeltaResult<MetadataInfo<'a>> {
+) -> KernelResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
     let partition_columns = table_configuration.logical_partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
@@ -233,7 +233,7 @@ fn build_data_skipping_schemas(
     predicate_column_names_logical: &[ColumnName],
     requested_physical_stats_columns: Option<&[ColumnName]>,
     table_configuration: &TableConfiguration,
-) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
+) -> KernelResult<(Option<SchemaRef>, Option<SchemaRef>)> {
     // Narrow the table's typed partition schema to the columns the predicate references. The
     // DataSkippingFilter only needs partition columns that appear in the predicate, and the
     // shared helper forces every field nullable (MapToStruct can yield null for a missing key).
@@ -260,7 +260,7 @@ fn build_data_skipping_schemas(
     // `nullCount` whenever it emits min/max; this check relies on that implementation property.
     let build_stats_schema = |required: Option<&[ColumnName]>,
                               requested: Option<&[ColumnName]>|
-     -> DeltaResult<Option<SchemaRef>> {
+     -> KernelResult<Option<SchemaRef>> {
         let stats_schema = table_configuration
             .stats_schema_builder()
             .with_required_physical_columns(required)
@@ -342,12 +342,15 @@ fn resolve_physical_columns_with_warnings(
 fn resolve_physical_columns_strict(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
-) -> DeltaResult<Vec<ColumnName>> {
+) -> KernelResult<Vec<ColumnName>> {
     let logical_schema = table_configuration.logical_schema();
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
         .iter()
-        .map(|col| get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode))
+        .map(|col| {
+            get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                .map_err(crate::Error::into_kernel_error)
+        })
         .collect()
 }
 
@@ -386,7 +389,7 @@ impl StateInfo {
         stats: &StatsOptions,
         partition_values: &PartitionValuesOptions,
         classifier: C,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
@@ -478,7 +481,9 @@ impl StateInfo {
                         // note that RowIndex and FilePath are handled in the parquet reader so we
                         // just add them as if they're normal physical
                         // columns
-                        let physical_field = logical_field.make_physical(column_mapping_mode)?;
+                        let physical_field = logical_field
+                            .make_physical(column_mapping_mode)
+                            .map_err(crate::Error::into_kernel_error)?;
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
@@ -497,7 +502,8 @@ impl StateInfo {
             }
         }
 
-        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+        let physical_schema =
+            Arc::new(StructType::try_new(read_fields).map_err(crate::Error::into_kernel_error)?);
 
         // Logical column names referenced by the predicate. Fed into the stats schema
         // build below and into the dropped-refs observability log.
@@ -684,6 +690,7 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
+    use crate::Result;
 
     #[test]
     fn stats_schemas_can_both_be_absent() {
@@ -758,7 +765,7 @@ pub(crate) mod tests {
     pub(crate) fn get_simple_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
@@ -771,7 +778,7 @@ pub(crate) mod tests {
         features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info_with_stats(
             schema,
             partition_columns,
@@ -791,7 +798,7 @@ pub(crate) mod tests {
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info_with_options(
             schema,
             partition_columns,
@@ -814,7 +821,7 @@ pub(crate) mod tests {
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
         partition_values: PartitionValuesOptions,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         let builder = MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_partition_columns(partition_columns)
@@ -827,7 +834,7 @@ pub(crate) mod tests {
                 builder.with_protocol(MockProtocolBuilder::new().with_features(features).build())
             }
         };
-        let table_configuration = builder.try_build()?;
+        let table_configuration = builder.try_build().map_err(crate::Error::Kernel)?;
 
         let mut schema = schema;
         for (name, spec) in metadata_cols.into_iter() {
@@ -847,6 +854,7 @@ pub(crate) mod tests {
             &partition_values,
             (),
         )
+        .map_err(crate::Error::Kernel)
     }
 
     pub(crate) fn assert_transform_spec(

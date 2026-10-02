@@ -1,6 +1,6 @@
 //! FFI interface for LogPath.
 
-use delta_kernel::{DeltaResult, FileMeta, LogPath};
+use delta_kernel::{FileMeta, KernelResult, LogPath};
 use url::Url;
 
 use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice};
@@ -14,11 +14,11 @@ impl LogPathArray {
     /// # Safety
     /// The ptr must point to `len` valid FfiLogPath elements, and those elements
     /// must remain valid for the duration of this call
-    pub(crate) unsafe fn log_paths(&self) -> DeltaResult<Vec<LogPath>> {
+    pub(crate) unsafe fn log_paths(&self) -> KernelResult<Vec<LogPath>> {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|ffi_path| unsafe { ffi_path.log_path() })
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<KernelResult<Vec<_>>>()
     }
 }
 
@@ -63,14 +63,15 @@ impl FfiLogPath {
     /// # Safety
     ///
     /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
-    unsafe fn log_path(&self) -> DeltaResult<LogPath> {
-        let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
+    unsafe fn log_path(&self) -> KernelResult<LogPath> {
+        let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         let url = Url::parse(location_str)?;
         let file_meta = FileMeta {
             location: url,
             last_modified: self.last_modified,
             size: self.size,
         };
-        LogPath::try_new(file_meta)
+        LogPath::try_new(file_meta).map_err(delta_kernel::Error::into_kernel_error)
     }
 }

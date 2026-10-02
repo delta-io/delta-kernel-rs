@@ -11,7 +11,7 @@ use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreScheme};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::MetadataColumnSpec;
-use delta_kernel::{DeltaResult, SnapshotRef};
+use delta_kernel::{Result, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -127,35 +127,51 @@ where
 pub fn get_engine(
     url: &Url,
     args: &LocationArgs,
-) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
+) -> Result<DefaultEngine<TokioBackgroundExecutor>> {
     if args.env_creds {
-        let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
-            delta_kernel::KernelError::Generic(format!("Object store could not parse url: {e}"))
-        })?;
+        let (scheme, _path) = ObjectStoreScheme::parse(url)
+            .map_err(|e| {
+                delta_kernel::KernelError::Generic(format!("Object store could not parse url: {e}"))
+            })
+            .map_err(delta_kernel::Error::Kernel)?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
         let store: Arc<DynObjectStore> = match scheme {
-            AmazonS3 => Arc::new(AmazonS3Builder::from_env().with_url(url_str).build()?),
+            AmazonS3 => Arc::new(
+                AmazonS3Builder::from_env()
+                    .with_url(url_str)
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
+            ),
             GoogleCloudStorage => Arc::new(
                 GoogleCloudStorageBuilder::from_env()
                     .with_url(url_str)
-                    .build()?,
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
             ),
             MicrosoftAzure => Arc::new(
                 MicrosoftAzureBuilder::from_env()
                     .with_url(url_str)
-                    .build()?,
+                    .build()
+                    .map_err(delta_kernel::KernelError::from)
+                    .map_err(delta_kernel::Error::Kernel)?,
             ),
             Local | Memory | Http => {
-                return Err(delta_kernel::KernelError::Generic(format!(
-                    "Scheme {scheme:?} doesn't support getting credentials from environment"
-                )));
+                return Err(delta_kernel::Error::Kernel(
+                    delta_kernel::KernelError::Generic(format!(
+                        "Scheme {scheme:?} doesn't support getting credentials from environment"
+                    )),
+                ));
             }
             _ => {
                 // scheme is non-exhaustive
-                return Err(delta_kernel::KernelError::Generic(format!(
+                return Err(delta_kernel::Error::Kernel(
+                    delta_kernel::KernelError::Generic(format!(
                     "Unknown schema {scheme:?} doesn't support getting credentials from environment"
-                )));
+                )),
+                ));
             }
         };
         Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
@@ -180,7 +196,7 @@ pub fn get_engine(
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
 /// engine. Parameters of the scan are controlled by the specified `ScanArgs`
-pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
+pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> Result<Option<Scan>> {
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
         return Ok(None);

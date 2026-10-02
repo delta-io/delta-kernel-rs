@@ -14,7 +14,7 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta};
+use crate::{Engine, EngineData, Error, FileMeta, KernelResultIteratorStatic, Result};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -34,7 +34,7 @@ use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta
 #[internal_api]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
-    leaf_checkpoint_reader: DeltaResultIteratorStatic<ActionsBatch>,
+    leaf_checkpoint_reader: KernelResultIteratorStatic<ActionsBatch>,
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
@@ -52,11 +52,15 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
             .read_parquet_files(&leaf_files, read_schema, None)?
-            .map_ok(|batch| ActionsBatch::new(batch, false));
+            .map(|batch| {
+                batch
+                    .map_err(Error::into_kernel_error)
+                    .map(|batch| ActionsBatch::new(batch, false))
+            });
         Ok(Self {
             processor,
             leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
@@ -76,11 +80,13 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     #[allow(unused)]
     pub(crate) fn new_from_iter(
         processor: P,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
+        iter: impl IntoIterator<Item = Result<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
-        let leaf_checkpoint_reader = iter
-            .into_iter()
-            .map_ok(|batch| ActionsBatch::new(batch, false));
+        let leaf_checkpoint_reader = iter.into_iter().map(|batch| {
+            batch
+                .map_err(Error::into_kernel_error)
+                .map(|batch| ActionsBatch::new(batch, false))
+        });
         Self {
             processor,
             leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
@@ -105,17 +111,18 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
 /// the sequential phase) and returns the processed output.
 ///
 /// # Errors
-/// Returns `DeltaResult` errors for:
+/// Returns `Result` errors for:
 /// - File reading failures
 /// - Parquet parsing errors
 /// - Processing errors from the processor
 impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
-    type Item = DeltaResult<P::Output>;
+    type Item = Result<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.leaf_checkpoint_reader
-            .next()
-            .map(|batch| self.processor.process_actions_batch(batch?))
+        self.leaf_checkpoint_reader.next().map(|batch| {
+            self.processor
+                .process_actions_batch(batch.map_err(Error::Kernel)?)
+        })
     }
 }
 
@@ -164,16 +171,28 @@ mod tests {
         store: &Arc<InMemory>,
         path: &str,
         data: Box<dyn EngineData>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let batch = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-        writer.write(record_batch)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .write(record_batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .close()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
-        store.put(&Path::from(path), buffer.into()).await?;
+        store
+            .put(&Path::from(path), buffer.into())
+            .await
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         Ok(())
     }
@@ -195,7 +214,7 @@ mod tests {
     fn create_processor_with_seen_files(
         engine: &dyn crate::Engine,
         seen_paths: &[&str],
-    ) -> DeltaResult<ScanLogReplayProcessor> {
+    ) -> Result<ScanLogReplayProcessor> {
         let state_info = Arc::new(get_simple_state_info(test_schema(), vec![])?);
 
         let seen_file_keys: HashSet<FileActionKey> = seen_paths
@@ -213,6 +232,7 @@ mod tests {
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
+        .map_err(Error::Kernel)
     }
 
     // ============================================================
@@ -229,9 +249,11 @@ mod tests {
         add_paths: &[&str],
         seen_paths: &[&str],
         expected_paths: &[&str],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
@@ -257,7 +279,10 @@ mod tests {
 
         // Create FileMeta for the sidecar
         let file_meta = FileMeta {
-            location: url.join(sidecar_path)?,
+            location: url
+                .join(sidecar_path)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
             last_modified: 0,
             size: get_file_size(&store, sidecar_path).await,
         };
@@ -285,7 +310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_empty_hashmap_all_adds_pass() -> DeltaResult<()> {
+    async fn test_parallel_phase_empty_hashmap_all_adds_pass() -> Result<()> {
         run_parallel_phase_test(
             &["file1.parquet", "file2.parquet", "file3.parquet"],
             &[],
@@ -295,7 +320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_with_removes_filters_matching_adds() -> DeltaResult<()> {
+    async fn test_parallel_phase_with_removes_filters_matching_adds() -> Result<()> {
         run_parallel_phase_test(
             &["file1.parquet", "file2.parquet", "file3.parquet"],
             &["file2.parquet"],
@@ -305,7 +330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_all_files_removed() -> DeltaResult<()> {
+    async fn test_parallel_phase_all_files_removed() -> Result<()> {
         run_parallel_phase_test(
             &["removed1.parquet", "removed2.parquet"],
             &["removed1.parquet", "removed2.parquet"],
@@ -315,10 +340,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_multiple_sidecars() -> DeltaResult<()> {
+    async fn test_parallel_phase_multiple_sidecars() -> Result<()> {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
@@ -342,12 +369,18 @@ mod tests {
 
         let file_metas = vec![
             FileMeta {
-                location: url.join(sidecar1_path)?,
+                location: url
+                    .join(sidecar1_path)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar1_path).await,
             },
             FileMeta {
-                location: url.join(sidecar2_path)?,
+                location: url
+                    .join(sidecar2_path)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar2_path).await,
             },
@@ -384,7 +417,7 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Vec<String>> {
+    ) -> Result<Vec<String>> {
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -407,8 +440,9 @@ mod tests {
         with_serde: bool,
         one_file_per_worker: bool,
         dispatcher: Option<tracing::Dispatch>,
-    ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) =
+            load_test_table(table_name).map_err(crate::Error::Kernel)?;
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
@@ -453,7 +487,7 @@ mod tests {
                         let state = final_state.clone();
                         let dispatcher = dispatcher.clone();
 
-                        thread::spawn(move || -> DeltaResult<Vec<String>> {
+                        thread::spawn(move || -> Result<Vec<String>> {
                             // Set the dispatcher in this thread to capture logs
                             let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
 
@@ -508,9 +542,10 @@ mod tests {
     fn parallel_scan_metadata_phases_carry_correlation_id(
         #[case] with_serde: bool,
         #[case] expected_parallel: Option<&str>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-json-with-sidecars").map_err(crate::Error::Kernel)?;
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -991,7 +1026,7 @@ mod tests {
         #[case] test_case: ParallelLogReplayCase,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         use test_utils::LoggingTest;
 
         // Set up log capture
@@ -1021,8 +1056,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+    fn test_parallel_with_skip_stats() -> Result<()> {
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-json-with-sidecars").map_err(crate::Error::Kernel)?;
 
         // Get expected paths using single-node scan_metadata with skip_stats=true
         let scan = snapshot
@@ -1094,11 +1130,12 @@ mod tests {
     /// Sequential-only tables (single-part checkpoint, no sidecars) emit exactly one
     /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
     #[test]
-    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> DeltaResult<()> {
+    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("table-without-dv-small").map_err(crate::Error::Kernel)?;
         let scan = snapshot.scan_builder().build()?;
         let mut sequential = scan.parallel_scan_metadata(engine)?;
         for result in sequential.by_ref() {
@@ -1131,11 +1168,12 @@ mod tests {
     /// `ScanMetadataCompleted` events. The `operation_id` must be the same on both
     /// events so callers can correlate them.
     #[test]
-    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> DeltaResult<()> {
+    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-json-with-sidecars").map_err(crate::Error::Kernel)?;
         let scan = snapshot.scan_builder().build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
         for result in sequential.by_ref() {

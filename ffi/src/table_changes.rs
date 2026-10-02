@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, EngineData, KernelError, Version};
+use delta_kernel::{EngineData, KernelError, KernelResult, ResultIteratorStatic, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -69,18 +69,18 @@ pub unsafe extern "C" fn table_changes_between_versions(
 }
 
 fn table_changes_impl(
-    url: DeltaResult<Url>,
+    url: KernelResult<Url>,
     extern_engine: &dyn ExternEngine,
     start_version: Version,
     end_version: Option<Version>,
-) -> DeltaResult<Handle<ExclusiveTableChanges>> {
+) -> KernelResult<Handle<ExclusiveTableChanges>> {
     let table_changes = TableChanges::try_new(
         url?,
         extern_engine.engine().as_ref(),
         start_version,
         end_version,
     );
-    Ok(Box::new(table_changes?).into())
+    Ok(Box::new(table_changes.map_err(delta_kernel::Error::into_kernel_error)?).into())
 }
 
 /// Drops table changes.
@@ -169,7 +169,7 @@ pub unsafe extern "C" fn table_changes_scan(
 fn table_changes_scan_impl(
     table_changes: TableChanges,
     predicate: Option<&mut EnginePredicate>,
-) -> DeltaResult<Handle<SharedTableChangesScan>> {
+) -> KernelResult<Handle<SharedTableChangesScan>> {
     let mut scan_builder = table_changes.into_scan_builder();
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();
@@ -178,7 +178,12 @@ fn table_changes_scan_impl(
         debug!("Table changes got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
-    Ok(Arc::new(scan_builder.build()?).into())
+    Ok(Arc::new(
+        scan_builder
+            .build()
+            .map_err(delta_kernel::Error::into_kernel_error)?,
+    )
+    .into())
 }
 
 /// Drops a table changes scan.
@@ -233,7 +238,7 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<DeltaResultIteratorStatic<Box<dyn EngineData>>>;
+type TableChangesData = Mutex<ResultIteratorStatic<Box<dyn EngineData>>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -270,8 +275,10 @@ pub unsafe extern "C" fn table_changes_scan_execute(
 fn table_changes_scan_execute_impl(
     table_changes_scan: &TableChangesScan,
     engine: Arc<dyn ExternEngine>,
-) -> DeltaResult<Handle<SharedScanTableChangesIterator>> {
-    let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
+) -> KernelResult<Handle<SharedScanTableChangesIterator>> {
+    let table_changes_iter = table_changes_scan
+        .execute(engine.engine().clone())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let data = ScanTableChangesIterator {
         data: Mutex::new(Box::new(table_changes_iter)),
         engine: engine.clone(),
@@ -309,17 +316,25 @@ pub unsafe extern "C" fn scan_table_changes_next(
     scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
 }
 
-fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
+fn scan_table_changes_next_impl(
+    data: &ScanTableChangesIterator,
+) -> KernelResult<*mut ArrowFFIData> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| KernelError::generic("poisoned scan table changes iterator mutex"))?;
 
-    let Some(data) = data.next().transpose()? else {
+    let Some(data) = data
+        .next()
+        .transpose()
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(std::ptr::null_mut());
     };
 
-    let record_batch = data.try_into_record_batch()?;
+    let record_batch = data
+        .try_into_record_batch()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
@@ -345,7 +360,7 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::{schema_ref, StructType};
-    use delta_kernel::Engine;
+    use delta_kernel::{Engine, Result};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
@@ -486,10 +501,7 @@ mod tests {
         fields.iter().all(|f| schema.contains(f))
     }
 
-    fn read_scan(
-        scan: &TableChangesScan,
-        engine: Arc<dyn Engine>,
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    fn read_scan(scan: &TableChangesScan, engine: Arc<dyn Engine>) -> Result<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
         scan_results
             .map(EngineDataArrowExt::try_into_record_batch)

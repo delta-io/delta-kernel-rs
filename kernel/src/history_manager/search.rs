@@ -87,10 +87,10 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Finding the Least Upper Bound
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::DeltaResult;
+/// # use delta_kernel::Result;
 /// let values = [10, 20, 30, 40, 50];
 /// // Simple key function that just returns the value
-/// let key_fn = |&val| -> DeltaResult<_> { Ok(val) };
+/// let key_fn = |&val| -> Result<_> { Ok(val) };
 ///
 /// // Find the least upper bound for 25 (element that is ≥ 25)
 /// let result = binary_search_by_key_with_bounds(
@@ -105,9 +105,9 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Finding the Greatest Lower Bound
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::DeltaResult;
+/// # use delta_kernel::Result;
 /// let values = [10, 20, 30, 40, 50];
-/// let key_fn = |&val| -> DeltaResult<_> { Ok(val) };
+/// let key_fn = |&val| -> Result<_> { Ok(val) };
 ///
 /// // Find the greatest lower bound for 25 (element that is ≤ 25)
 /// let result = binary_search_by_key_with_bounds(
@@ -122,9 +122,9 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Handling Out of Range Values
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::DeltaResult;
+/// # use delta_kernel::Result;
 /// let values = [10, 20, 30, 40, 50];
-/// let key_fn = |&val| -> DeltaResult<_> { Ok(val) };
+/// let key_fn = |&val| -> Result<_> { Ok(val) };
 ///
 /// // Finding a bound that's out of range
 /// let result = binary_search_by_key_with_bounds(
@@ -139,7 +139,7 @@ pub(crate) enum SearchError<T: Error> {
 /// ## Using a Fallible Key Function
 /// ```rust,ignore
 /// # use delta_kernel::history_manager::search::*;
-/// # use delta_kernel::DeltaResult;
+/// # use delta_kernel::Result;
 /// // Using a fallible key function
 /// let values = ["10", "20", "thirty", "40"];
 /// let result = binary_search_by_key_with_bounds(
@@ -183,10 +183,10 @@ pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeltaResult, KernelError};
+    use crate::{KernelError, Result};
 
     // Simple key extraction function
-    fn get_val(x: &i32) -> DeltaResult<i32> {
+    fn get_val(x: &i32) -> Result<i32> {
         Ok(*x)
     }
 
@@ -248,9 +248,11 @@ mod tests {
     fn test_error_propagation() {
         let values = vec![1, 3, 5, 7, 9];
 
-        let failing_key_fn = |x: &i32| -> DeltaResult<i32> {
+        let failing_key_fn = |x: &i32| -> Result<i32> {
             if *x == 5 {
-                Err(KernelError::generic("Error extracting key"))
+                Err(crate::Error::Kernel(KernelError::generic(
+                    "Error extracting key",
+                )))
             } else {
                 Ok(*x)
             }
@@ -260,7 +262,7 @@ mod tests {
             binary_search_by_key_with_bounds(&values, 7, failing_key_fn, Bound::LeastUpper);
         assert!(matches!(
             result,
-            Err(SearchError::KeyFunctionError(crate::KernelError::Generic(msg))) if msg.contains("Error extracting key")
+            Err(SearchError::KeyFunctionError(crate::Error::Kernel(crate::KernelError::Generic(msg)))) if msg.contains("Error extracting key")
         ));
     }
 }

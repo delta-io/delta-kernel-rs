@@ -11,7 +11,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{DeltaResult, Engine, FileDataReadResultIterator, KernelError, Version};
+use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Result, Version};
 
 /// A Delta log action kind.
 ///
@@ -70,7 +70,7 @@ impl CommitAction {
         read_schema: SchemaRef,
         seed_protocol: Option<Protocol>,
         seed_metadata: Option<Metadata>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
             table_root,
@@ -84,12 +84,15 @@ impl CommitAction {
         // Build the effective table configuration once (when both protocol and metadata are
         // known) and reuse it for both validation and timestamp resolution.
         let table_config = match (&this.protocol, &this.metadata) {
-            (Some(protocol), Some(metadata)) => Some(TableConfiguration::try_new(
-                metadata.clone(),
-                protocol.clone(),
-                this.table_root.clone(),
-                this.version(),
-            )?),
+            (Some(protocol), Some(metadata)) => Some(
+                TableConfiguration::try_new(
+                    metadata.clone(),
+                    protocol.clone(),
+                    this.table_root.clone(),
+                    this.version(),
+                )
+                .map_err(crate::Error::into_kernel_error)?,
+            ),
             _ => None,
         };
         this.protocol_validation(&table_config)?;
@@ -126,29 +129,35 @@ impl CommitAction {
     /// Read the commit header projected to `[protocol, metadata, commitInfo]`, overlay any
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
-    fn read_commit_header(&mut self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
-        let json_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.log_path.location),
-            HEADER_READ_SCHEMA.clone(),
-            None,
-        )?;
+    fn read_commit_header(&mut self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
+        let json_iter = engine
+            .json_handler()
+            .read_json_files(
+                slice::from_ref(&self.log_path.location),
+                HEADER_READ_SCHEMA.clone(),
+                None,
+            )
+            .map_err(crate::Error::into_kernel_error)?;
 
         let mut extracted_protocol: Option<Protocol> = None;
         let mut extracted_metadata: Option<Metadata> = None;
         let mut ict_visitor = InCommitTimestampVisitor::default();
         for (batch_index, batch_res) in json_iter.enumerate() {
-            let batch = batch_res?;
+            let batch = batch_res.map_err(crate::Error::into_kernel_error)?;
             // The protocol requires commitInfo to be the first action when in-commit timestamps
             // are enabled, so it lives in the first batch (the visitor inspects only its first
             // row). Visiting only that batch matches the `table_changes` reference behavior.
             if batch_index == 0 {
-                ict_visitor.visit_rows_of(batch.as_ref())?;
+                ict_visitor
+                    .visit_rows_of(batch.as_ref())
+                    .map_err(crate::Error::into_kernel_error)?;
             }
             if extracted_protocol.is_none() {
                 extracted_protocol = Protocol::try_new_from_data(batch.as_ref())?;
             }
             if extracted_metadata.is_none() {
-                extracted_metadata = Metadata::try_new_from_data(batch.as_ref())?;
+                extracted_metadata = Metadata::try_new_from_data(batch.as_ref())
+                    .map_err(crate::Error::into_kernel_error)?;
             }
             if extracted_protocol.is_some() && extracted_metadata.is_some() {
                 break;
@@ -176,7 +185,7 @@ impl CommitAction {
         &mut self,
         table_config: &Option<TableConfiguration>,
         extracted_ict: Option<i64>,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let version = self.version();
         self.timestamp = match table_config {
             Some(table_config) => {
@@ -204,9 +213,11 @@ impl CommitAction {
 
     /// Validate that the kernel can read this commit, given the prebuilt effective `table_config`
     /// (present iff both protocol and metadata are known at this commit).
-    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> DeltaResult<()> {
+    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> KernelResult<()> {
         match (table_config, &self.protocol) {
-            (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
+            (Some(table_config), _) => table_config
+                .ensure_operation_supported(Operation::Scan)
+                .map_err(crate::Error::into_kernel_error),
             (None, Some(protocol)) => ensure_table_can_be_read(protocol),
             (None, None) => Ok(()),
         }
@@ -217,7 +228,7 @@ impl CommitAction {
     ///
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
-    pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
+    pub fn get_actions(&self, engine: &dyn Engine) -> Result<FileDataReadResultIterator> {
         engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),
             self.read_schema.clone(),

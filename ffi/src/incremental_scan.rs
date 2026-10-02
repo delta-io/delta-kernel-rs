@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, KernelError, PredicateRef, Version};
+use delta_kernel::{KernelError, KernelResult, PredicateRef, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
 fn incremental_scan_builder_with_predicate_impl(
     mut builder: FfiIncrementalScanBuilder,
     predicate: &mut EnginePredicate,
-) -> DeltaResult<Handle<ExclusiveIncrementalScanBuilder>> {
+) -> KernelResult<Handle<ExclusiveIncrementalScanBuilder>> {
     builder.predicate = Some(Arc::new(decode_engine_predicate(predicate)?));
     Ok(Box::new(builder).into())
 }
@@ -174,13 +174,14 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 
 fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
-) -> DeltaResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+) -> KernelResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
     let maybe_stream = builder
         .target_snapshot
         .incremental_scan_builder(builder.base_version)
         .with_predicate(builder.predicate)
-        .build(engine.as_ref())?;
+        .build(engine.as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let handle = maybe_stream.map(|stream| {
         Arc::new(FfiIncrementalScanStream {
             stream: Mutex::new(Some(stream)),
@@ -233,7 +234,7 @@ pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn incremental_scan_stream_next_arrow_impl(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<*mut ScanMetadataArrowResult> {
+) -> KernelResult<*mut ScanMetadataArrowResult> {
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
@@ -253,12 +254,17 @@ fn incremental_scan_stream_next_arrow_impl(
 #[cfg(feature = "default-engine-base")]
 fn next_arrow_batch(
     stream: &mut IncrementalScanStream,
-) -> DeltaResult<*mut ScanMetadataArrowResult> {
-    let Some(filtered) = stream.next().transpose()? else {
+) -> KernelResult<*mut ScanMetadataArrowResult> {
+    let Some(filtered) = stream
+        .next()
+        .transpose()
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(std::ptr::null_mut());
     };
     let (engine_data, selection_vector) = filtered.into_parts();
-    let arrow_data = ArrowFFIData::try_from_engine_data(engine_data)?;
+    let arrow_data = ArrowFFIData::try_from_engine_data(engine_data)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let result = Box::new(ScanMetadataArrowResult {
         arrow_data,
         selection_vector: selection_vector.into(),
@@ -292,17 +298,19 @@ pub unsafe extern "C" fn incremental_scan_stream_into_summary(
 
 fn incremental_scan_stream_into_summary_impl(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
+) -> KernelResult<Handle<SharedIncrementalScanSummary>> {
     let inner = lock_stream(stream)?
         .take()
         .ok_or_else(|| KernelError::generic("incremental scan stream was already consumed"))?;
-    let summary = inner.into_summary()?;
+    let summary = inner
+        .into_summary()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Arc::new(summary).into())
 }
 
 fn lock_stream(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
+) -> KernelResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
     stream
         .stream
         .lock()
@@ -428,6 +436,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::Result;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use test_utils::{actions_to_string, add_commit, TestAction};
 

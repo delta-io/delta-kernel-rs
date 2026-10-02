@@ -19,7 +19,7 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::FoldWithOption as _;
-use crate::DeltaResult;
+use crate::{Error, KernelResult};
 
 /// A schema evolution operation to be applied to a table.
 ///
@@ -51,7 +51,7 @@ impl SchemaOperation {
     }
 }
 
-fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -> DeltaResult<()> {
+fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -> KernelResult<()> {
     let lowered = field.name().to_lowercase();
     if parent
         .fields()
@@ -70,9 +70,9 @@ fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -
 struct AddedFieldMetadataValidator;
 
 impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
-    transform_output_type!(|'a, T| DeltaResult<()>);
+    transform_output_type!(|'a, T| KernelResult<()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         if let Some(key) = field.metadata.keys().find(|key| {
             key.as_str() == ColumnMetadataKey::GenerationExpression.as_ref()
                 || key.starts_with("delta.identity.")
@@ -88,11 +88,11 @@ impl<'a> SchemaTransform<'a> for AddedFieldMetadataValidator {
     }
 }
 
-fn reject_generated_or_identity_metadata(field: &StructField) -> DeltaResult<()> {
+fn reject_generated_or_identity_metadata(field: &StructField) -> KernelResult<()> {
     AddedFieldMetadataValidator.transform_struct_field(field)
 }
 
-fn set_field_nullable(parent: &mut StructType, name: &str) -> DeltaResult<()> {
+fn set_field_nullable(parent: &mut StructType, name: &str) -> KernelResult<()> {
     let parent = parent
         .field_map_mut()
         .values_mut()
@@ -128,7 +128,7 @@ pub(crate) fn apply_schema_operations(
     column_mapping_mode: ColumnMappingMode,
     current_max_column_id: Option<i64>,
     cdf_enabled: bool,
-) -> DeltaResult<SchemaEvolutionResult> {
+) -> KernelResult<SchemaEvolutionResult> {
     let cm_enabled = column_mapping_mode != ColumnMappingMode::None;
 
     // Reject a persisted seed that already violates the protocol's 32-bit non-negative bound
@@ -203,7 +203,8 @@ pub(crate) fn apply_schema_operations(
                 };
                 let parent_path = parent.as_ref().map_or(&[][..], ColumnName::path);
                 add_field(
-                    root.struct_at_path(parent_path)?,
+                    root.struct_at_path(parent_path)
+                        .map_err(Error::into_kernel_error)?,
                     field,
                     ColumnName::new(parent_path).to_string(),
                 )?;
@@ -213,7 +214,12 @@ pub(crate) fn apply_schema_operations(
                     .path()
                     .split_last()
                     .ok_or_else(|| KernelError::generic("empty column path"))?;
-                set_field_nullable(root.struct_at_path(parent)?, leaf).map_err(|e| {
+                set_field_nullable(
+                    root.struct_at_path(parent)
+                        .map_err(Error::into_kernel_error)?,
+                    leaf,
+                )
+                .map_err(|e| {
                     KernelError::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
             }
@@ -255,7 +261,7 @@ pub(crate) fn apply_schema_operations(
 pub(crate) fn evolve_table_config(
     table_config: &TableConfiguration,
     operations: Vec<SchemaOperation>,
-) -> DeltaResult<TableConfiguration> {
+) -> KernelResult<TableConfiguration> {
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;

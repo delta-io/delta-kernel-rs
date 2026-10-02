@@ -20,6 +20,14 @@ log replay or checkpoint writes, kernel receives opaque `EngineData` batches, in
 visitor pattern, updates a selection vector, and hands them back to the engine: it never
 deserializes the full batch into in-memory structs.
 
+## Errors
+
+Public APIs, public trait implementations, and `internal-api` interfaces use `Result<T, E = Error>`.
+The `Error::Kernel(KernelError)` envelope preserves the implementation error's message, source,
+and backtrace. Private operations use `KernelResult<T>` and explicitly map with `Error::Kernel`
+when returning through public APIs. Private callers unwrap with `Error::into_kernel_error`.
+Iterator item conversions are lazy and follow the same boundary as their owning API.
+
 ## Snapshot
 
 `Snapshot` (`kernel/src/snapshot/`) is the primary entry point for operations on an existing table.

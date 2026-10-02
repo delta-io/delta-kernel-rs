@@ -5,7 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
-use crate::{DeltaResult, EngineData, KernelError};
+use crate::{EngineData, Error, KernelError, KernelResult, Result};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -21,7 +21,7 @@ use crate::{DeltaResult, EngineData, KernelError};
 ///   first before being added to metadata.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<DeletionVectorInfo> {
+) -> KernelResult<DeletionVectorInfo> {
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
             // Use absolute path as-is
@@ -171,19 +171,24 @@ impl DecodedDvVisitor {
         self.decoded_paths.iter().any(|s| !s.is_null())
     }
 
-    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         data.append_columns(
             DV_DECODED_FLAT_SCHEMA.clone(),
             vec![
-                ArrayData::try_new(ArrayType::new(DataType::STRING, true), self.decoded_paths)?,
-                ArrayData::try_new(ArrayType::new(DataType::LONG, true), self.decoded_offsets)?,
-                ArrayData::try_new(ArrayType::new(DataType::LONG, true), self.decoded_sizes)?,
+                ArrayData::try_new(ArrayType::new(DataType::STRING, true), self.decoded_paths)
+                    .map_err(Error::into_kernel_error)?,
+                ArrayData::try_new(ArrayType::new(DataType::LONG, true), self.decoded_offsets)
+                    .map_err(Error::into_kernel_error)?,
+                ArrayData::try_new(ArrayType::new(DataType::LONG, true), self.decoded_sizes)
+                    .map_err(Error::into_kernel_error)?,
                 ArrayData::try_new(
                     ArrayType::new(DataType::LONG, true),
                     self.decoded_cardinalities,
-                )?,
+                )
+                .map_err(Error::into_kernel_error)?,
             ],
         )
+        .map_err(Error::into_kernel_error)
     }
 }
 
@@ -192,7 +197,7 @@ impl RowVisitor for DecodedDvVisitor {
         (self.names, &DV_LEAF_TYPES)
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             // `storageType` is a required (non-null) field of the DV descriptor, so it is null
             // for a row iff the whole `deletionVector` struct is null (the visitor unions parent
@@ -210,7 +215,7 @@ impl RowVisitor for DecodedDvVisitor {
                         size_in_bytes: getters[3].get(i, "sizeInBytes")?,
                         cardinality: getters[4].get(i, "cardinality")?,
                     };
-                    Some(extract_deletion_vector_content(&dv)?)
+                    Some(extract_deletion_vector_content(&dv).map_err(Error::Kernel)?)
                 }
                 None => None,
             };
@@ -261,11 +266,7 @@ mod tests {
             COLUMNS.as_ref()
         }
 
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
             for i in 0..row_count {
                 self.locations.push(getters[0].get_opt(i, DV_LOCATION)?);
                 self.offsets.push(getters[1].get_opt(i, DV_OFFSET)?);

@@ -22,7 +22,7 @@
 use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, KernelError};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
 /// [`StructField`](crate::schema::StructField).
@@ -55,7 +55,7 @@ impl<'a> ColumnDefault<'a> {
     /// Returns a [`KernelError::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
     /// (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is accepted;
     /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
-    pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
+    pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> KernelResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
 
         if matches!(data_type, DataType::Variant(_)) && !is_null {
@@ -89,13 +89,13 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// Returns an error if the parsed default is not a literal. The parser only emits literals, so
     /// this is defensive.
-    pub fn to_scalar(&self) -> DeltaResult<Option<Scalar>> {
+    pub fn to_scalar(&self) -> Result<Option<Scalar>> {
         match &self.parsed_sql {
             None => Ok(None),
             Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
-            Some(other) => Err(KernelError::generic(format!(
+            Some(other) => Err(Error::Kernel(KernelError::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -122,7 +122,7 @@ impl<'a> ColumnDefault<'a> {
 /// whose value is not a string, or a non-`NULL` default on a Variant column.
 pub(crate) fn try_collect_column_defaults(
     schema: &StructType,
-) -> DeltaResult<Vec<(String, ColumnDefault<'_>)>> {
+) -> KernelResult<Vec<(String, ColumnDefault<'_>)>> {
     let mut collector = ColumnDefaultCollector {
         path: Vec::new(),
         defaults: Vec::new(),
@@ -143,7 +143,7 @@ struct ColumnDefaultCollector<'a> {
 impl<'a> ColumnDefaultCollector<'a> {
     /// Recurse into a container element type under a synthetic path `segment`
     /// (`element` for arrays, `key`/`value` for maps).
-    fn descend(&mut self, segment: &str, element: &'a DataType) -> DeltaResult<()> {
+    fn descend(&mut self, segment: &str, element: &'a DataType) -> KernelResult<()> {
         self.path.push(segment.to_string());
         let result = self.transform(element);
         self.path.pop();
@@ -152,11 +152,11 @@ impl<'a> ColumnDefaultCollector<'a> {
 }
 
 impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
-    transform_output_type!(|'a, T| DeltaResult<()>);
+    transform_output_type!(|'a, T| KernelResult<()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         self.path.push(field.name().clone());
-        if let Some(column_default) = field.column_default()? {
+        if let Some(column_default) = field.column_default().map_err(Error::into_kernel_error)? {
             self.defaults.push((self.path.join("."), column_default));
         }
         let result = self.recurse_into_struct_field(field);
@@ -164,19 +164,19 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
         result
     }
 
-    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+    fn transform_array_element(&mut self, etype: &'a DataType) -> KernelResult<()> {
         self.descend("element", etype)
     }
 
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<()> {
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> KernelResult<()> {
         self.descend("key", ktype)
     }
 
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<()> {
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> KernelResult<()> {
         self.descend("value", vtype)
     }
 
-    fn transform_variant(&mut self, _stype: &'a StructType) -> DeltaResult<()> {
+    fn transform_variant(&mut self, _stype: &'a StructType) -> KernelResult<()> {
         Ok(())
     }
 }
@@ -196,7 +196,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 ///
 /// Propagates any error from [`try_collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is
 /// not a string, or a non-NULL default on a Variant column.
-pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<bool> {
+pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> KernelResult<bool> {
     Ok(!try_collect_column_defaults(schema)?.is_empty())
 }
 

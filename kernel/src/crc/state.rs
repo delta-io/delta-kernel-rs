@@ -16,7 +16,7 @@ use delta_kernel_derive::internal_api;
 
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
-use crate::{DeltaResult, KernelError};
+use crate::{Error, KernelError, KernelResult, Result};
 
 /// The state of file statistics for a CRC.
 ///
@@ -101,25 +101,25 @@ impl Default for DomainMetadataState {
 impl DomainMetadataState {
     /// Builds complete state, rejecting tombstones and duplicate domains.
     #[internal_api]
-    pub(crate) fn try_complete(
-        values: impl IntoIterator<Item = DomainMetadata>,
-    ) -> DeltaResult<Self> {
-        Ok(Self::Complete(domain_metadata_map(values, true)?))
+    pub(crate) fn try_complete(values: impl IntoIterator<Item = DomainMetadata>) -> Result<Self> {
+        Ok(Self::Complete(
+            domain_metadata_map(values, true).map_err(Error::Kernel)?,
+        ))
     }
 
     /// Builds partial state, rejecting duplicate domains.
     #[internal_api]
-    pub(crate) fn try_partial(
-        values: impl IntoIterator<Item = DomainMetadata>,
-    ) -> DeltaResult<Self> {
-        Ok(Self::Partial(domain_metadata_map(values, false)?))
+    pub(crate) fn try_partial(values: impl IntoIterator<Item = DomainMetadata>) -> Result<Self> {
+        Ok(Self::Partial(
+            domain_metadata_map(values, false).map_err(Error::Kernel)?,
+        ))
     }
 }
 
 fn domain_metadata_map(
     values: impl IntoIterator<Item = DomainMetadata>,
     reject_tombstones: bool,
-) -> DeltaResult<HashMap<String, DomainMetadata>> {
+) -> KernelResult<HashMap<String, DomainMetadata>> {
     let values = values.into_iter();
     let mut result = HashMap::with_capacity(values.size_hint().0);
     for value in values {
@@ -193,24 +193,24 @@ impl Default for SetTransactionState {
 impl SetTransactionState {
     /// Builds complete state, rejecting duplicate application IDs.
     #[internal_api]
-    pub(crate) fn try_complete(
-        values: impl IntoIterator<Item = SetTransaction>,
-    ) -> DeltaResult<Self> {
-        Ok(Self::Complete(transaction_map(values)?))
+    pub(crate) fn try_complete(values: impl IntoIterator<Item = SetTransaction>) -> Result<Self> {
+        Ok(Self::Complete(
+            transaction_map(values).map_err(Error::Kernel)?,
+        ))
     }
 
     /// Builds partial state, rejecting duplicate application IDs.
     #[internal_api]
-    pub(crate) fn try_partial(
-        values: impl IntoIterator<Item = SetTransaction>,
-    ) -> DeltaResult<Self> {
-        Ok(Self::Partial(transaction_map(values)?))
+    pub(crate) fn try_partial(values: impl IntoIterator<Item = SetTransaction>) -> Result<Self> {
+        Ok(Self::Partial(
+            transaction_map(values).map_err(Error::Kernel)?,
+        ))
     }
 }
 
 fn transaction_map(
     values: impl IntoIterator<Item = SetTransaction>,
-) -> DeltaResult<HashMap<String, SetTransaction>> {
+) -> KernelResult<HashMap<String, SetTransaction>> {
     let values = values.into_iter();
     let mut result = HashMap::with_capacity(values.size_hint().0);
     for value in values {
