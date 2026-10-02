@@ -871,7 +871,9 @@ impl<S> Transaction<S> {
         }
         require!(
             !self.has_data_file_actions(),
-            KernelError::generic("icebergNativeV4 tables cannot write file actions to the log")
+            KernelError::invalid_transaction_state(
+                "icebergNativeV4 tables cannot write file actions to the log"
+            )
         );
         Ok(())
     }
@@ -3317,7 +3319,10 @@ mod tests {
         MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_features([TableFeature::IcebergNativeV4])
+                    .with_features([
+                        TableFeature::AdaptiveMetadataPreview,
+                        TableFeature::IcebergNativeV4,
+                    ])
                     .build(),
             )
             .build()
@@ -3325,12 +3330,15 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_validate_iceberg_native_v4_rejects_file_actions() -> DeltaResult<()> {
-        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+    fn test_commit_rejects_file_actions_on_iceberg_native_v4_table() -> DeltaResult<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn.effective_table_config = iceberg_native_v4_table_config();
         add_dummy_file(&mut txn);
-        let result = txn.validate_iceberg_native_v4_semantics();
-        assert!(result.is_err());
+        let err = txn.commit(engine.as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("icebergNativeV4"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 
