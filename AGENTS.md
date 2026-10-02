@@ -90,7 +90,7 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `prettyprint`: enables Arrow pretty-print helpers (primarily test/example oriented)
 - `schema-diff`: experimental schema diffing
 - `check-constraints-in-dev`: enables the internal SQL tokenizer and single-comparison parser for
-  check-constraint development
+  check-constraint development.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
