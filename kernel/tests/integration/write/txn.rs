@@ -38,8 +38,8 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_operation(UpdateTableOperation::Write)
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
-            .with_transaction_id("app_id2".to_string(), 2)
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let txn = txn.with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
         assert!(txn.commit(&engine)?.is_committed());
