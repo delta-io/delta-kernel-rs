@@ -25,7 +25,7 @@ use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
 };
-use delta_kernel::{Result, EngineData, KernelError};
+use delta_kernel::{EngineData, KernelError, Result};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -117,10 +117,7 @@ pub(crate) fn to_df_struct_columns(
 /// Lowers an arithmetic binary expression (`Plus`/`Minus`/`Multiply`/`Divide`) to an
 /// `Expr::BinaryExpr`. Comparison and `IN` operators are modeled as predicates, not expressions,
 /// so they never reach this arm.
-fn binary_expr_to_df_expr(
-    binary: &BinaryExpression,
-    input_schema: &StructType,
-) -> Result<DFExpr> {
+fn binary_expr_to_df_expr(binary: &BinaryExpression, input_schema: &StructType) -> Result<DFExpr> {
     let op = match binary.op {
         BinaryExpressionOp::Plus => Operator::Plus,
         BinaryExpressionOp::Minus => Operator::Minus,
@@ -535,10 +532,7 @@ impl ScalarUDFImpl for KernelMapToStructUdf {
 /// [`ParseJsonUdf`] scalar UDF, which delegates to kernel's own JSON parser. Unlike the
 /// struct-shaped arms, `ParseJson` is self-typed -- it carries its target `output_schema` -- so it
 /// takes no `output_type` and lowers its string operand untyped.
-fn parse_json_to_df_expr(
-    parse: &ParseJsonExpression,
-    input_schema: &StructType,
-) -> Result<DFExpr> {
+fn parse_json_to_df_expr(parse: &ParseJsonExpression, input_schema: &StructType) -> Result<DFExpr> {
     let json = to_df_expr(&parse.json_expr, input_schema, None)?;
     let udf = ScalarUDF::new_from_impl(ParseJsonUdf::try_new(parse.output_schema.clone())?);
     Ok(udf.call(vec![json]))

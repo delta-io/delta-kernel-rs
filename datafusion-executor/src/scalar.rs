@@ -17,7 +17,7 @@ use delta_kernel::expressions::{
     StructData as KernelStructData,
 };
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{Result, KernelError};
+use delta_kernel::{KernelError, Result};
 
 /// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion
 /// [`ScalarValue`](DFScalarValue).
