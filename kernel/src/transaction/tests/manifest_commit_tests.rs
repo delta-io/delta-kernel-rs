@@ -178,7 +178,7 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> DeltaResult<
     Ok(())
 }
 
-// === physical schema source / schema evolution (Blocker1) ===
+// === physical schema source / schema evolution ===
 
 // The leaf writer's physical schema must come from the effective table config passed to try_new,
 // not from the read snapshot (which may predate schema evolution).
