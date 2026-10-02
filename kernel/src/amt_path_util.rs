@@ -1,14 +1,18 @@
-//! Resolution of AMT paths (relative vs absolute) against the table root.
+//! Resolution of AMT paths (relative vs absolute) against a table root, per the Iceberg V4
+//! [relative paths specification].
+//!
+//! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
 use url::Url;
 
+use crate::path_encoding::uri_encode_path;
 use crate::{DeltaResult, KernelError};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
-/// A `path` with a URI scheme is absolute and used as-is; otherwise it is relative and resolved
-/// against `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
-/// [relative paths specification].
+/// A scheme-bearing `path` is absolute and parsed as-is. Otherwise `path` is treated as a raw,
+/// relative string: it is percent-encoded (preserving `/` separators) and joined onto
+/// `table_root` with a single `/` separator, matching Iceberg V4's [relative paths specification].
 ///
 /// # Errors
 ///
@@ -17,28 +21,24 @@ use crate::{DeltaResult, KernelError};
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> DeltaResult<Url> {
     if has_scheme(path) {
-        // A URI scheme means the path is absolute and used as-is.
+        // A URI scheme means the path is absolute and used as-is. Absolute AMT locations are
+        // required to be well-formed URIs: a raw, decoded path carrying reserved characters
+        // (`%`, `#`, `?`, space) is not re-encoded here, as encoding only its path component
+        // would require authority-aware parsing we do not perform for absolute locations.
         Url::parse(path).map_err(|e| {
             KernelError::generic(format!(
                 "Failed to parse absolute AMT location {path:?}: {e}"
             ))
         })
     } else {
-        // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
-        let mut base = table_root.as_str().to_string();
-        if !base.ends_with('/') {
-            base.push('/');
-        }
-        Url::parse(&format!("{base}{path}")).map_err(|e| {
-            KernelError::generic(format!(
-                "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
-            ))
-        })
+        encode_and_join(path, table_root)
     }
 }
 
 /// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
 /// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
+///
+/// A path without a scheme is relative (per the Iceberg V4 path spec).
 ///
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
 fn has_scheme(location: &str) -> bool {
@@ -63,6 +63,26 @@ fn is_scheme_char(ch: char, position: usize) -> bool {
         return true;
     }
     position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
+}
+
+/// Resolves a relative `path` against `table_root`: percent-encodes `path` so reserved URI
+/// characters survive a round trip through the object store, then concatenates it onto
+/// `table_root` with a single `/` separator and parses the result.
+///
+/// # Errors
+///
+/// Returns an error if the resolved location fails to parse as a [`Url`].
+fn encode_and_join(path: &str, table_root: &Url) -> DeltaResult<Url> {
+    let encoded = uri_encode_path(path);
+    let mut base = table_root.as_str().to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    Url::parse(&format!("{base}{encoded}")).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -117,6 +137,35 @@ mod tests {
         "git+ssh://host/repo/root.parquet",
         "git+ssh://host/repo/root.parquet"
     )]
+    // A raw space is percent-encoded, not left to break URL parsing.
+    #[case::space_is_encoded(
+        "memory:///table/",
+        "metadata/leaf a.parquet",
+        "memory:///table/metadata/leaf%20a.parquet"
+    )]
+    // A literal `%` is encoded to `%25` so it is not misread as a percent-escape.
+    #[case::percent_is_encoded(
+        "memory:///table/",
+        "data/test%dv.bin",
+        "memory:///table/data/test%25dv.bin"
+    )]
+    // A `#` is encoded, not interpreted as a URL fragment delimiter.
+    #[case::hash_is_encoded("memory:///table/", "data/a#b.bin", "memory:///table/data/a%23b.bin")]
+    // A `?` is encoded, not interpreted as a URL query delimiter.
+    #[case::question_is_encoded(
+        "memory:///table/",
+        "data/a?b.bin",
+        "memory:///table/data/a%3Fb.bin"
+    )]
+    // Non-ASCII bytes are percent-encoded per their UTF-8 encoding.
+    #[case::non_ascii_is_encoded(
+        "memory:///table/",
+        "data/M\u{fc}nchen.bin",
+        "memory:///table/data/M%C3%BCnchen.bin"
+    )]
+    // A `..` segment is preserved through encoding, then collapsed (not rejected) by URL path
+    // normalization in `Url::parse`.
+    #[case::dot_dot_is_normalized("memory:///table/", "a/../b.bin", "memory:///table/b.bin")]
     fn test_resolve_amt_location(
         #[case] table_root: &str,
         #[case] path: &str,
