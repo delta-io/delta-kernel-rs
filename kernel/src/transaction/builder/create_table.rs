@@ -920,40 +920,35 @@ impl CreateTableTransactionBuilder {
 
     /// Replaces the operation parameters recorded in `commitInfo`.
     ///
-    /// This map replaces rather than merges with an earlier map. Dedicated parameters take
-    /// precedence over a same-named nested field supplied by
-    /// [`with_commit_info`](Self::with_commit_info).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a key is empty or occurs more than once.
-    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> Result<Self>
+    /// Values must already be stringified as expected in table history; `None` writes a null map
+    /// value. This map replaces rather than merges with an earlier map, and the last value wins
+    /// when a key occurs more than once. Dedicated parameters take precedence over a same-named
+    /// nested field supplied by [`with_commit_info`](Self::with_commit_info).
+    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> Self
     where
-        I: IntoIterator<Item = (K, V)>,
+        I: IntoIterator<Item = (K, Option<V>)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.state = self.state.with_operation_parameters(parameters)?;
-        Ok(self)
+        self.state = self.state.with_operation_parameters(parameters);
+        self
     }
 
     /// Replaces the operation metrics recorded in `commitInfo`.
     ///
-    /// This map replaces rather than merges with an earlier map. Metrics supplied to the built
-    /// transaction replace these values. Dedicated metrics take precedence over a same-named
-    /// nested field supplied by [`with_commit_info`](Self::with_commit_info).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a key is empty or occurs more than once.
-    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Result<Self>
+    /// Values must already be stringified as expected in table history; `None` writes a null map
+    /// value. This map replaces rather than merges with an earlier map, and the last value wins
+    /// when a key occurs more than once. Metrics supplied to the built transaction replace these
+    /// values. Dedicated metrics take precedence over a same-named nested field supplied by
+    /// [`with_commit_info`](Self::with_commit_info).
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Self
     where
-        I: IntoIterator<Item = (K, V)>,
+        I: IntoIterator<Item = (K, Option<V>)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.state = self.state.with_operation_metrics(metrics)?;
-        Ok(self)
+        self.state = self.state.with_operation_metrics(metrics);
+        self
     }
 
     /// Supplies one arbitrary connector-provided `commitInfo` row.
@@ -966,6 +961,15 @@ impl CreateTableTransactionBuilder {
         commit_info_schema: SchemaRef,
     ) -> Self {
         self.state = self.state.with_commit_info(commit_info, commit_info_schema);
+        self
+    }
+
+    /// Adds an application transaction identifier to emit as a `txn` action.
+    ///
+    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
+    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.state = self.state.with_transaction_id(app_id, version);
         self
     }
 
@@ -1014,6 +1018,8 @@ impl CreateTableTransactionBuilder {
     /// - CDF is enabled and the schema contains a top-level column reserved for CDF
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
+    /// - Connector commit information does not contain exactly one row
+    /// - An application transaction identifier occurs more than once
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -1139,7 +1145,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::arrow::array::StringArray;
+    use crate::arrow::datatypes::Schema as ArrowSchema;
+    use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::engine::arrow_conversion::TryIntoArrow;
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_name, ColumnName};
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
@@ -1183,7 +1194,8 @@ mod tests {
             "test-engine",
         )
         .with_correlation_id("test-correlation")
-        .with_operation_parameters([("mode", "Create")])?
+        .with_operation_parameters([("mode", Some("Create"))])
+        .with_transaction_id("app", 7)
         .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
 
         assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
@@ -1191,8 +1203,67 @@ mod tests {
             transaction.correlation_id.as_deref(),
             Some("test-correlation")
         );
-        assert_eq!(transaction.operation_parameters["mode"], "Create");
+        assert_eq!(
+            transaction.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
+            Some("Create")
+        );
+        assert_eq!(transaction.set_transactions[0].app_id, "app");
+        assert_eq!(transaction.set_transactions[0].version, 7);
         assert!(transaction.data_change);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(2)]
+    fn builder_rejects_non_single_row_commit_info(#[case] row_count: usize) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let commit_info_schema = schema_ref! { nullable "tag": STRING };
+        let arrow_schema: ArrowSchema = commit_info_schema.as_ref().try_into_arrow()?;
+        let commit_info = Box::new(ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(StringArray::from(vec![Some("value"); row_count]))],
+        )?));
+
+        let error = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_commit_info(commit_info, commit_info_schema)
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Connector commit info must contain exactly one row"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_transaction_ids_are_rejected() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let error = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_transaction_id("app", 1)
+        .with_transaction_id("app", 2)
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("app_id app appears more than once"),
+            "{error}"
+        );
         Ok(())
     }
 

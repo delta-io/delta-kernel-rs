@@ -60,7 +60,6 @@ use crate::KernelResult;
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
 /// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
-/// - **`with_transaction_id()`** — Transaction ID (app_id) tracking is for existing tables.
 /// - **`with_operation()`** — The operation is fixed to `"CREATE TABLE"`.
 ///
 /// # Example
@@ -167,8 +166,8 @@ impl CreateTableTransaction {
             should_emit_metadata: true,
             committer,
             operation: Some(CommitOperation::CreateTable),
-            operation_parameters: std::collections::HashMap::new(),
-            operation_metrics: std::collections::HashMap::new(),
+            operation_parameters: None,
+            operation_metrics: None,
             engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],

@@ -220,12 +220,10 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     let domain = "app.deprecated";
 
     // removing domain metadata that doesn't exist should NOT write a tombstone
-    let _ = begin_transaction_with(
-        Snapshot::builder_for(table_url.clone()).build(&engine)?,
-        &engine,
-        |builder| builder.with_domain_metadata_removed(domain),
-    )?
-    .commit(&engine)?;
+    let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
+    let _ = txn
+        .with_domain_metadata_removed(domain.to_string())
+        .commit(&engine)?;
 
     let commit_data = store
         .get(&Path::from(format!(

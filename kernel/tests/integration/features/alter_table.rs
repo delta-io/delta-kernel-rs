@@ -38,14 +38,19 @@ fn committer() -> Box<FileSystemCommitter> {
     Box::new(FileSystemCommitter::new())
 }
 
+#[rstest]
+#[case(UpdateTableOperation::Write)]
+#[case(UpdateTableOperation::AlterTable)]
 #[tokio::test]
-async fn schema_evolution_while_writing_round_trips_new_column() -> DeltaResult<()> {
+async fn schema_evolution_while_writing_round_trips_new_column(
+    #[case] operation: UpdateTableOperation,
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
     let mut transaction = snapshot
         .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .with_operation(operation)
         .add_column(StructField::nullable("country", DataType::STRING))
         .build(engine.as_ref(), committer())?;
 
@@ -73,6 +78,10 @@ async fn schema_evolution_while_writing_round_trips_new_column() -> DeltaResult<
     let snapshot = committed
         .post_commit_snapshot()
         .expect("post-commit snapshot");
+    let adds = read_actions_from_commit(snapshot.table_root(), 1, "add")
+        .map_err(|error| delta_kernel::KernelError::generic(error.to_string()))?;
+    assert_eq!(adds.len(), 1);
+    assert_eq!(adds[0]["dataChange"], true);
     assert!(snapshot.schema().contains("country"));
     let scan = snapshot.clone().scan_builder().build()?;
     let batches = test_utils::read_scan(&scan, engine)?;
@@ -220,10 +229,11 @@ async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn
     let table_url = snapshot.table_root().clone();
 
     snapshot
-        .alter_table()
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::AlterTable)
         .add_column(StructField::nullable("added", DataType::STRING))
-        .build(engine.as_ref(), committer())?
         .with_operation_parameters([("columns", Some(r#"["added"]"#))])
+        .build(engine.as_ref(), committer())?
         .with_operation_metrics([("numAddedColumns", Some("1"))])
         .commit(engine.as_ref())?
         .unwrap_committed();

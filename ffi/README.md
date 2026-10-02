@@ -21,6 +21,8 @@ HandleExclusiveUpdateTableTransaction txn = unwrap(update_table_txn_builder_buil
 /* Write files, then call update_table_txn_add_files(txn, metadata). */
 txn = unwrap(update_table_txn_with_operation_metrics(txn, &metrics, engine));
 HandleExclusiveCommittedTransaction committed = unwrap(update_table_txn_commit(txn, engine));
+uint64_t version = committed_transaction_version(&committed);
+free_committed_transaction(committed);
 ```
 
 Here `slice` and `unwrap` stand for the connector's usual `KernelStringSlice` and `ExternResult`
@@ -28,9 +30,11 @@ helpers.
 
 Create-table connectors use the same shape: call `new_create_table_txn_builder`, apply
 `create_table_txn_builder_with_*` functions, then call `create_table_txn_builder_build`. Application
-transaction identifiers and metadata removals are intentionally available only on the update
-builder. Nested schema changes use `update_table_txn_builder_add_column_at` and
-`update_table_txn_builder_set_nullable` with segmented `FfiColumnName` paths.
+transaction identifiers are available on both builders; metadata removals are update-only. Nested
+schema changes use `update_table_txn_builder_add_column_at` and
+`update_table_txn_builder_set_nullable` with segmented `FfiColumnName` paths. A snapshot returned
+by `committed_transaction_post_commit_snapshot` is independently owned and must be released with
+`free_snapshot`.
 
 ## Building
 

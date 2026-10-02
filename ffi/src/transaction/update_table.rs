@@ -2,6 +2,7 @@
 
 use delta_kernel::engine_data::FilteredEngineData;
 
+use super::committed::commit_result_to_committed_handle;
 use super::*;
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
@@ -77,7 +78,7 @@ fn update_table_txn_builder_build_with_committer_impl(
     builder: UpdateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
-) -> DeltaResult<Handle<ExclusiveUpdateTableTransaction>> {
+) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
     let transaction = builder.build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
@@ -110,7 +111,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let correlation_id: DeltaResult<String> =
+    let correlation_id: Result<String> =
         unsafe { TryFromStringSlice::try_from_slice(&correlation_id) };
     correlation_id
         .map(|id| Box::new(builder.with_correlation_id(id)).into())
@@ -119,8 +120,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
 
 /// Replaces the operation parameters recorded in `commitInfo`.
 ///
-/// Empty or duplicate keys are rejected. This map replaces, rather than merges with, the prior
-/// map. Dedicated parameters override same-named nested fields in connector commit information.
+/// Duplicate keys are rejected by the FFI map decoder. This map replaces, rather than merges with,
+/// the prior map. Dedicated parameters override same-named nested fields in connector commit
+/// information.
 ///
 /// # Safety
 ///
@@ -146,7 +148,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
 
 /// Replaces the operation metrics recorded in `commitInfo` before writes begin.
 ///
-/// Empty or duplicate keys are rejected. Metrics supplied later through
+/// Duplicate keys are rejected by the FFI map decoder. Metrics supplied later through
 /// [`Transaction::with_operation_metrics`] replace these builder metrics. Dedicated metrics
 /// override the nested `operationMetrics` field in connector commit information.
 ///
@@ -289,37 +291,15 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
         .into_extern_result(&engine)
 }
 
-/// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
-/// was not successful.
-///
-/// The returned handle owns the [`CommittedTransaction`] and must be freed with
-/// [`free_committed_transaction`].
-///
-/// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
-pub(super) fn commit_result_to_committed_handle<S>(
-    result: DeltaResult<CommitResult<S>>,
-) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
-    match result? {
-        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
-        CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
-            "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
-        CommitResult::Conflicted(conflicted) => Err(delta_kernel::KernelError::Generic(format!(
-            "commit conflict at version {}",
-            conflicted.conflict_version()
-        ))),
-    }
-}
-
-unsafe fn decode_column_name(column: &FfiColumnName) -> DeltaResult<ColumnName> {
+unsafe fn decode_column_name(column: &FfiColumnName) -> Result<ColumnName> {
     let parts = unsafe { column.path.try_as_slice() }?
         .iter()
         .map(|part| unsafe { part.try_to_string() })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     Ok(ColumnName::new(parts))
 }
 
-fn decode_single_field(schema: &EngineSchema) -> DeltaResult<delta_kernel::schema::StructField> {
+fn decode_single_field(schema: &EngineSchema) -> Result<delta_kernel::schema::StructField> {
     let schema = decode_engine_schema(schema)?;
     let mut fields = schema.into_fields();
     let field = fields.next().ok_or_else(|| {
@@ -470,7 +450,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_custom_operation(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let operation: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&operation) };
+    let operation: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&operation) };
     operation
         .map(|operation: String| {
             Box::new(builder.with_operation(UpdateTableOperation::Custom(operation))).into()
@@ -518,6 +498,30 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
 ///
 /// # Safety
 ///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
+    domain: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
+    let txn = unsafe { *txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let domain: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
+    domain
+        .map(|domain| Box::new(txn.with_domain_metadata_removed(domain)).into())
+        .into_extern_result(&engine)
+}
+
+/// Remove domain metadata from the table in this transaction. A tombstone action with
+/// `removed: true` will be written to the Delta log when the transaction is committed.
+///
+/// The caller does not need to provide a configuration value -- the existing value is
+/// automatically preserved in the tombstone.
+///
+/// # Safety
+///
 /// Caller is responsible for passing valid handles. CONSUMES the builder handle and returns a new
 /// one.
 #[no_mangle]
@@ -528,7 +532,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let domain: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
+    let domain: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
     domain
         .map(|domain| Box::new(builder.with_domain_metadata_removed(domain)).into())
         .into_extern_result(&engine)
@@ -563,7 +567,7 @@ pub unsafe extern "C" fn update_table_txn_with_row_tracking_high_water_mark(
 fn with_row_tracking_high_water_mark_impl(
     txn: Transaction,
     high_water_mark: i64,
-) -> DeltaResult<Handle<ExclusiveUpdateTableTransaction>> {
+) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
 }
 
@@ -588,7 +592,7 @@ pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
 fn with_root_manifest_file_impl(
     txn: Transaction,
     file: &FileMeta,
-) -> DeltaResult<Handle<ExclusiveUpdateTableTransaction>> {
+) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
     let location = Url::parse(path)?;
     let size = file
@@ -646,7 +650,7 @@ pub unsafe extern "C" fn update_table_txn_remove_files(
         let raw = unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) };
         raw.iter().map(|&value| value != 0).collect()
     };
-    let result: DeltaResult<bool> = (|| {
+    let result: Result<bool> = (|| {
         let filtered = FilteredEngineData::try_new(data, selection_vector)?;
         txn.remove_files(filtered);
         Ok(true)

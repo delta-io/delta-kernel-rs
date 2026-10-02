@@ -1,6 +1,6 @@
 //! Create-table transaction FFI lifecycle.
 
-use super::update_table::commit_result_to_committed_handle;
+use super::committed::commit_result_to_committed_handle;
 use super::*;
 
 /// A handle for a create-table transaction (`Transaction<CreateTable>`).
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_correlation_id(
 ) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let correlation_id: DeltaResult<String> =
+    let correlation_id: Result<String> =
         unsafe { TryFromStringSlice::try_from_slice(&correlation_id) };
     correlation_id
         .map(|id| Box::new(builder.with_correlation_id(id)).into())
@@ -171,7 +171,8 @@ pub unsafe extern "C" fn create_table_txn_builder_with_correlation_id(
 
 /// Replaces create-table operation parameters recorded in `commitInfo`.
 ///
-/// Empty or duplicate keys are rejected; consecutive calls replace rather than merge.
+/// Duplicate keys are rejected by the FFI map decoder; consecutive calls replace rather than
+/// merge.
 ///
 /// # Safety
 ///
@@ -252,6 +253,28 @@ pub unsafe extern "C" fn create_table_txn_builder_with_commit_info(
     .into_extern_result(&engine)
 }
 
+/// Adds an application transaction identifier to a create-table builder.
+///
+/// Duplicate application ids are rejected when the builder is built.
+///
+/// # Safety
+///
+/// `builder` must be valid. This unconditionally consumes `builder`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_transaction_id(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    app_id: KernelStringSlice,
+    version: i64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let app_id: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
+    app_id
+        .map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into())
+        .into_extern_result(&engine)
+}
+
 /// Adds user-controlled domain metadata to the create-table builder.
 ///
 /// Duplicate domains are rejected when the builder is built.
@@ -293,7 +316,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_domain_metadata(
 pub(super) unsafe fn collect_create_table_columns(
     columns: *const KernelStringSlice,
     num_columns: usize,
-) -> DeltaResult<Vec<String>> {
+) -> Result<Vec<String>> {
     if num_columns == 0 {
         return Ok(Vec::new());
     }
@@ -370,8 +393,8 @@ pub unsafe extern "C" fn create_table_txn_builder_with_partition_columns(
 /// Applies a parsed layout while preserving consuming-handle semantics on parse failure.
 pub(super) fn create_table_txn_builder_with_data_layout_impl(
     builder: CreateTableTransactionBuilder,
-    layout: DeltaResult<DataLayout>,
-) -> DeltaResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    layout: Result<DataLayout>,
+) -> Result<Handle<ExclusiveCreateTableTransactionBuilder>> {
     Ok(Box::new(builder.with_data_layout(layout?)).into())
 }
 
@@ -402,10 +425,10 @@ pub unsafe extern "C" fn new_create_table_txn_builder(
 }
 
 fn new_create_table_txn_builder_impl(
-    path: DeltaResult<&str>,
+    path: Result<&str>,
     schema: &EngineSchema,
-    engine_info: DeltaResult<&str>,
-) -> DeltaResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    engine_info: Result<&str>,
+) -> Result<Handle<ExclusiveCreateTableTransactionBuilder>> {
     let mut visitor_state = KernelSchemaVisitorState::default();
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
     let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
@@ -444,9 +467,9 @@ pub unsafe extern "C" fn create_table_txn_builder_with_table_property(
 
 fn create_table_txn_builder_with_table_property_impl(
     builder: CreateTableTransactionBuilder,
-    key: DeltaResult<String>,
-    value: DeltaResult<String>,
-) -> DeltaResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    key: Result<String>,
+    value: Result<String>,
+) -> Result<Handle<ExclusiveCreateTableTransactionBuilder>> {
     let builder = builder.with_table_properties([(key?, value?)]);
     Ok(Box::new(builder).into())
 }
@@ -495,7 +518,7 @@ fn create_table_txn_builder_build_impl(
     builder: CreateTableTransactionBuilder,
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
-) -> DeltaResult<Handle<ExclusiveCreateTableTransaction>> {
+) -> Result<Handle<ExclusiveCreateTableTransaction>> {
     let engine = extern_engine.engine();
     let create_txn = builder.build(engine.as_ref(), committer)?;
     Ok(Box::new(create_txn).into())
