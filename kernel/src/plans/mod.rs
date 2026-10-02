@@ -19,9 +19,9 @@
 //!     SELECT max_by(action, version) AS add FROM commits GROUP BY file_key
 //! ) WHERE add IS NOT NULL
 //! UNION ALL
-//! -- checkpoint adds that no newer commit superseded
-//! SELECT c.add FROM checkpoint c
-//! LEFT ANTI JOIN commit_keys k ON c.file_key = k.file_key
+//! -- reconciled checkpoint or CRC adds that no newer commit superseded
+//! SELECT b.add FROM metadata_base b
+//! LEFT ANTI JOIN commit_keys k ON b.file_key = k.file_key
 //! ```
 //!
 //! # Writing an executor
