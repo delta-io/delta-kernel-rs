@@ -865,7 +865,7 @@ impl<S> Transaction<S> {
     fn validate_iceberg_native_v4_semantics(&self) -> DeltaResult<()> {
         if !self
             .effective_table_config
-            .is_feature_enabled(&TableFeature::IcebergNativeV4)
+            .is_feature_enabled(&TableFeature::IcebergNativeV4Preview)
         {
             return Ok(());
         }
@@ -3321,7 +3321,7 @@ mod tests {
                 MockProtocolBuilder::new()
                     .with_features([
                         TableFeature::AdaptiveMetadataPreview,
-                        TableFeature::IcebergNativeV4,
+                        TableFeature::IcebergNativeV4Preview,
                     ])
                     .build(),
             )

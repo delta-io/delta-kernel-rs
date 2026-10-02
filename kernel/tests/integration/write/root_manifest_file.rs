@@ -26,7 +26,7 @@ const WRITER_FEATURES: &[&str] = &[
     "domainMetadata",
     "inCommitTimestamp",
     "adaptiveMetadata-preview",
-    "icebergNativeV4",
+    "icebergNativeV4-preview",
 ];
 
 /// Creates a file-backed table supporting `icebergNativeV4` and its dependencies (including

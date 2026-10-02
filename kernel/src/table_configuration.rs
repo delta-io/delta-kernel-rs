@@ -2879,17 +2879,17 @@ mod test {
 
     #[rstest]
     #[case::all_satisfied(
-        vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4],
+        vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4Preview],
         None
     )]
     #[case::missing_adaptive_metadata(
-        vec![TableFeature::IcebergNativeV4],
+        vec![TableFeature::IcebergNativeV4Preview],
         Some("requires 'adaptiveMetadata-preview' to be enabled")
     )]
     #[case::invariants_enabled(
         vec![
             TableFeature::AdaptiveMetadataPreview,
-            TableFeature::IcebergNativeV4,
+            TableFeature::IcebergNativeV4Preview,
             TableFeature::Invariants,
         ],
         Some("requires 'invariants' to not be enabled")
@@ -2901,7 +2901,7 @@ mod test {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(MockProtocolBuilder::new().with_features(features).build())
             .build();
-        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4);
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
         match expected_error_substring {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),

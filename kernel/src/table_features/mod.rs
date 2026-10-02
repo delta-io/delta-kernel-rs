@@ -126,7 +126,9 @@ pub(crate) enum TableFeature {
     /// Iceberg V3 compatibility support
     IcebergCompatV3,
     /// Iceberg V4 native interop. Spec: delta-io/delta#7374
-    IcebergNativeV4,
+    #[strum(serialize = "icebergNativeV4-preview")]
+    #[serde(rename = "icebergNativeV4-preview")]
+    IcebergNativeV4Preview,
     /// The Clustered Table feature facilitates the physical clustering of rows
     /// that share similar values on a predefined set of clustering columns.
     #[strum(serialize = "clustering")]
@@ -495,7 +497,7 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
 /// IcebergNativeV4 native interop. Spec: delta-io/delta#7374.
 ///
 /// TODO(#2866): gated by `adaptive-metadata-in-dev` until adaptiveMetadata is fully supported.
-static ICEBERG_NATIVE_V4_INFO: FeatureInfo = FeatureInfo {
+static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[
@@ -767,7 +769,7 @@ impl TableFeature {
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
             | TableFeature::IcebergCompatV3
-            | TableFeature::IcebergNativeV4
+            | TableFeature::IcebergNativeV4Preview
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
@@ -804,7 +806,7 @@ impl TableFeature {
             TableFeature::IcebergCompatV1 => &ICEBERG_COMPAT_V1_INFO,
             TableFeature::IcebergCompatV2 => &ICEBERG_COMPAT_V2_INFO,
             TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
-            TableFeature::IcebergNativeV4 => &ICEBERG_NATIVE_V4_INFO,
+            TableFeature::IcebergNativeV4Preview => &ICEBERG_NATIVE_V4_PREVIEW_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
@@ -1156,7 +1158,7 @@ mod tests {
                 TableFeature::IcebergCompatV1 => "icebergCompatV1",
                 TableFeature::IcebergCompatV2 => "icebergCompatV2",
                 TableFeature::IcebergCompatV3 => "icebergCompatV3",
-                TableFeature::IcebergNativeV4 => "icebergNativeV4",
+                TableFeature::IcebergNativeV4Preview => "icebergNativeV4-preview",
                 TableFeature::ClusteredTable => "clustering",
                 TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
                 TableFeature::CatalogManaged => "catalogManaged",
