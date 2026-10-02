@@ -191,7 +191,9 @@ impl Scalar {
             // A variant is physically a struct (`metadata`/`value`, plus any shredded fields), so a
             // null variant is a null struct and builds through the same StructBuilder path. (Only
             // the null case is reachable: there is no non-null `Scalar::Variant`.)
-            DataType::Struct(ref stype) | DataType::Variant(ref stype) => {
+            DataType::Struct(ref stype)
+            | DataType::Variant(ref stype)
+            | DataType::File(ref stype) => {
                 // WARNING: Unlike ArrayBuilder and MapBuilder, StructBuilder always requires us to
                 // insert an entry for each child builder, even when we're inserting NULL.
                 let builder = builder_as!(array::StructBuilder);
@@ -464,6 +466,8 @@ fn top_level_types_compatible(expected_type: &DataType, data_type: &ArrowDataTyp
         (DataType::Map(_), ArrowDataType::Map(_, _)) => true,
         // Arrow has no Variant type, and it will be converted to structs.
         (DataType::Variant(_), ArrowDataType::Struct(_)) => true,
+        // Arrow has no File type either; it is likewise converted to structs.
+        (DataType::File(_), ArrowDataType::Struct(_)) => true,
         _ => false,
     }
 }

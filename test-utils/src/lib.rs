@@ -1407,6 +1407,18 @@ pub fn multiple_variant_schema() -> SchemaRef {
     multi_schema_with_type(DataType::unshredded_variant())
 }
 
+pub fn top_level_file_schema() -> SchemaRef {
+    schema_with_type(DataType::file_type())
+}
+
+pub fn nested_file_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::file_type())
+}
+
+pub fn multiple_file_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::file_type())
+}
+
 /// Returns column mapping table properties for the given mode, or empty for `"none"`.
 pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
     if mode == "none" {
