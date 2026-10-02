@@ -74,10 +74,43 @@ pub fn file_meta_for(path: &std::path::Path) -> FileMeta {
 /// Contract: any [`JsonHandler`] that receives a schema with a [`MetadataColumnSpec::FilePath`]
 /// column must populate it with the file URL for every row, readable via [`GetData`] without
 /// any Arrow downcasting.
+///
+/// Checks `handler` across nonempty local files separated by an empty file, including row order
+/// and file boundaries. The handler must support local file URLs.
+///
+/// # Panics
+///
+/// Panics if reading fails or the returned batches violate the contract.
 pub fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
-    let (_temp, file_meta) = make_temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
-    let expected_url = file_meta.location.to_string();
+    let (_first, first_file) = make_temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
+    let (_empty, empty_file) = make_temp_json_file(&[]);
+    let (_last, last_file) = make_temp_json_file(&[r#"{"x": 3}"#, r#"{"x": 4}"#, r#"{"x": 5}"#]);
+    let expected = vec![
+        (1, first_file.location.to_string()),
+        (2, first_file.location.to_string()),
+        (3, last_file.location.to_string()),
+        (4, last_file.location.to_string()),
+        (5, last_file.location.to_string()),
+    ];
+    assert_json_handler_file_path_contract(
+        handler,
+        &[first_file, empty_file, last_file],
+        &expected,
+    );
+}
 
+/// Asserts that `handler` reads integer `x` fields from `files` as `expected_rows`, whose tuples
+/// contain the value and source file URL. Checks row order, exact file URLs through a
+/// [`MetadataColumnSpec::FilePath`] column, and that batches do not span files.
+///
+/// # Panics
+///
+/// Panics if reading fails or the returned batches violate the contract.
+pub fn assert_json_handler_file_path_contract(
+    handler: &dyn JsonHandler,
+    files: &[FileMeta],
+    expected_rows: &[(i32, String)],
+) {
     let schema = Arc::new(
         StructType::try_new([
             StructField::not_null("x", DataType::INTEGER),
@@ -86,20 +119,17 @@ pub fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
         .unwrap(),
     );
 
-    let engine_data = handler
-        .read_json_files(&[file_meta], schema, None)
-        .unwrap()
-        .next()
-        .expect("expected at least one batch")
-        .unwrap();
+    let batches = handler.read_json_files(files, schema, None).unwrap();
 
     struct FilePathCollector {
-        paths: Vec<String>,
+        rows: Vec<(i32, String)>,
     }
     impl RowVisitor for FilePathCollector {
         fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-            static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| vec![column_name!("_file")]);
-            static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::STRING]);
+            static NAMES: LazyLock<Vec<ColumnName>> =
+                LazyLock::new(|| vec![column_name!("x"), column_name!("_file")]);
+            static TYPES: LazyLock<Vec<DataType>> =
+                LazyLock::new(|| vec![DataType::INTEGER, DataType::STRING]);
             (&NAMES, &TYPES)
         }
         fn visit<'a>(
@@ -107,21 +137,28 @@ pub fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
             row_count: usize,
             getters: &[&'a dyn GetData<'a>],
         ) -> DeltaResult<()> {
-            for i in 0..row_count {
-                self.paths.push(getters[0].get(i, "_file")?);
+            for row in 0..row_count {
+                self.rows
+                    .push((getters[0].get(row, "x")?, getters[1].get(row, "_file")?));
             }
             Ok(())
         }
     }
 
-    let mut collector = FilePathCollector { paths: vec![] };
-    collector.visit_rows_of(engine_data.as_ref()).unwrap();
+    let mut collector = FilePathCollector { rows: vec![] };
+    for batch in batches {
+        let start = collector.rows.len();
+        collector.visit_rows_of(batch.unwrap().as_ref()).unwrap();
+        let rows = &collector.rows[start..];
+        if let Some((_, file_path)) = rows.first() {
+            assert!(
+                rows.iter().all(|(_, path)| path == file_path),
+                "JSON batches must not span files"
+            );
+        }
+    }
 
-    assert_eq!(collector.paths.len(), 2, "expected 2 rows");
-    assert!(
-        collector.paths.iter().all(|p| p == &expected_url),
-        "_file values should equal the file URL"
-    );
+    assert_eq!(collector.rows, expected_rows);
 }
 
 // ===========================================================================

@@ -297,8 +297,11 @@ mod tests {
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
+    use rstest::rstest;
     use serde_json::json;
-    use test_utils::engine_contract::test_json_handler_file_path_contract;
+    use test_utils::engine_contract::{
+        assert_json_handler_file_path_contract, test_json_handler_file_path_contract,
+    };
     use tracing::info;
 
     use super::*;
@@ -917,16 +920,43 @@ mod tests {
     }
 
     // === JsonHandler contract tests ===
-    //
-    // Calls the shared contract helper in `engine::tests` against `DefaultJsonHandler` (the
-    // matching `SyncJsonHandler` invocation lives in `engine/sync/json.rs`).
 
-    #[test]
-    fn json_handler_file_path_contract() {
+    #[rstest]
+    fn json_handler_file_path_contract(#[values(1, 2, 100)] batch_size: usize) {
         let handler = DefaultJsonHandler::new(
             Arc::new(LocalFileSystem::new()),
             Arc::new(TokioBackgroundExecutor::new()),
-        );
+        )
+        .with_batch_size(NonZero::new(batch_size).unwrap());
         test_json_handler_file_path_contract(&handler);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn json_handler_stream_file_path_contract(#[values(1, 2, 100)] batch_size: usize) {
+        let store = Arc::new(InMemory::new());
+        let mut files = Vec::new();
+        for (name, contents) in [
+            ("first.json", "{\"x\":1}\n{\"x\":2}\n"),
+            ("empty.json", ""),
+            ("last.json", "{\"x\":3}\n{\"x\":4}\n{\"x\":5}\n"),
+        ] {
+            store
+                .put(&Path::from(name), Bytes::from(contents).into())
+                .await
+                .unwrap();
+            files.push(FileMeta::new(
+                Url::parse(&format!("memory:///{name}")).unwrap(),
+                0,
+                contents.len() as u64,
+            ));
+        }
+        let expected = [(0, 1), (0, 2), (2, 3), (2, 4), (2, 5)]
+            .into_iter()
+            .map(|(index, value)| (value, files[index].location.to_string()))
+            .collect_vec();
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()))
+            .with_batch_size(NonZero::new(batch_size).unwrap());
+        assert_json_handler_file_path_contract(&handler, &files, &expected);
     }
 }

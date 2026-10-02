@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
 use rstest::rstest;
@@ -9,20 +9,28 @@ use test_utils::LoggingTest;
 
 use super::{
     replay_schema, table_changes_action_iter, table_changes_action_iter_with_mode,
-    CommitBatchReader, LogReplayScanner, PreparePhaseVisitor, TableChangesScanMetadata,
+    CommitBatchReader, CommitScanProcessor, LogReplayScanner, PreparePhaseVisitor,
+    TableChangesScanMetadata,
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::arrow::array::{RecordBatch, StringArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use crate::engine::arrow_data::ArrowEngineData;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::plans::PlanBasedEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{column_expr, ArrayData, BinaryPredicateOp, ColumnName, Scalar};
+use crate::engine_data::{GetData, TypedGetData};
+use crate::expressions::{
+    column_expr, column_name, ArrayData, BinaryPredicateOp, ColumnName, Scalar,
+};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MeteredDeltaEngine, MetricEvent};
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType};
 use crate::table_changes::scan_file::scan_metadata_to_scan_file;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
@@ -318,6 +326,10 @@ impl JsonHandler for BatchingJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        assert!(
+            predicate.is_none(),
+            "replay must read all actions in both passes"
+        );
         let pass = {
             let mut calls = self.requested_files.lock().unwrap();
             calls.push(files.iter().map(|file| file.location.to_string()).collect());
@@ -494,7 +506,7 @@ fn preserves_empty_commits_in_each_position(
 }
 
 #[test]
-fn rejects_batches_returning_to_an_earlier_commit() {
+fn rejects_out_of_order_batches() {
     let commits = test_commits(2);
     let files = commits.clone();
     let batches = [0, 1, 0]
@@ -604,6 +616,7 @@ async fn independent_batch_boundaries_preserve_cdc_and_dv_resolution(
     #[values(false, true)] has_cdc: bool,
     #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
 ) {
+    // === Set up commits and independent prepare/scan batch sizes ===
     let (engine, handler) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     let old_dv = test_deletion_vector("old_dv", 1);
@@ -650,10 +663,13 @@ async fn independent_batch_boundaries_preserve_cdc_and_dv_resolution(
         CdfMode::ChangeDataFeed => get_default_table_config(&root),
         CdfMode::RowTracking => row_tracking_table_config(root, get_schema()),
     };
+    // === Replay both passes and collect scan files ===
     let replay =
         table_changes_action_iter_with_mode(engine, &config, commits, get_schema(), None, mode)
             .unwrap();
     let scan_files: Vec<_> = scan_metadata_to_scan_file(replay).try_collect().unwrap();
+
+    // === Check CDC selection, DV pairing, and commit attribution ===
     let observed = scan_files
         .iter()
         .map(|file| {
@@ -767,6 +783,109 @@ async fn empty_commit_does_not_shift_following_actions() {
             (2, "file_2.parquet".to_string()),
         ]
     );
+}
+
+#[derive(Default)]
+struct CommitFilePathCollector {
+    rows: Vec<(String, String)>,
+}
+
+impl RowVisitor for CommitFilePathCollector {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![column_name!("_file"), column_name!("add.path")],
+                vec![DataType::STRING, DataType::STRING],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for row in 0..row_count {
+            self.rows.push((
+                getters[0].get(row, "_file")?,
+                getters[1].get(row, "add.path")?,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::sync(Arc::new(SyncEngine::new()))]
+#[cfg_attr(
+    feature = "declarative-plans",
+    case::plans(Arc::new(PlanBasedEngine::new(
+        Arc::new(SyncEngine::new()),
+        Arc::new(SyncPlanExecutor::default()),
+    )))
+)]
+#[tokio::test]
+async fn json_readers_preserve_file_paths_across_batches_and_empty_commits(
+    #[case] engine: Arc<dyn Engine>,
+    #[values(PreparePhaseVisitor::schema(), CommitScanProcessor::schema())] schema: SchemaRef,
+) {
+    let row_counts = [2050, 0, 3];
+    let mut mock_table = LocalMockTable::new();
+    for (version, row_count) in row_counts.into_iter().enumerate() {
+        mock_table
+            .commit((0..row_count).map(|row| {
+                Action::Add(Add {
+                    path: format!("file_{version}_{row}.parquet"),
+                    data_change: true,
+                    ..Default::default()
+                })
+            }))
+            .await;
+    }
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let files = commits
+        .into_iter()
+        .map(|commit| commit.location)
+        .collect_vec();
+    let expected = files
+        .iter()
+        .enumerate()
+        .flat_map(|(version, file)| {
+            (0..row_counts[version]).map(move |row| {
+                (
+                    file.location.to_string(),
+                    format!("file_{version}_{row}.parquet"),
+                )
+            })
+        })
+        .collect_vec();
+    let batches = engine
+        .json_handler()
+        .read_json_files(&files, replay_schema(schema).unwrap(), None)
+        .unwrap();
+    let mut collector = CommitFilePathCollector::default();
+    let mut batch_counts = [0; 3];
+    for batch in batches {
+        let start = collector.rows.len();
+        collector.visit_rows_of(batch.unwrap().as_ref()).unwrap();
+        let rows = &collector.rows[start..];
+        if let Some((file_path, _)) = rows.first() {
+            assert!(
+                rows.iter().all(|(path, _)| path == file_path),
+                "JSON batches must not span files"
+            );
+            let commit_file_index = files
+                .iter()
+                .position(|file| file.location.as_str() == file_path)
+                .unwrap();
+            batch_counts[commit_file_index] += 1;
+        }
+    }
+    assert_eq!(collector.rows, expected);
+    assert!(
+        batch_counts[0] > 1,
+        "the first commit must span multiple batches"
+    );
+    assert_eq!(batch_counts[1], 0);
+    assert!(batch_counts[2] > 0);
 }
 
 #[tokio::test]
@@ -1544,17 +1663,20 @@ async fn dv() {
 }
 
 // Note: Data skipping does not work on Remove actions.
+#[rstest]
 #[tokio::test]
-async fn data_skipping_filter() {
-    let engine = Arc::new(SyncEngine::new());
+async fn data_skipping_filter(#[values([1, 2], [2, 1], [usize::MAX; 2])] batch_sizes: [usize; 2]) {
+    let (engine, _) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     let deletion_vector = Some(test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2));
+    let old_deletion_vector = test_deletion_vector("old_dv", 1);
     mock_table
         .commit([
             // Remove/Add pair with max value id = 6
             Action::Remove(Remove {
                 path: "fake_path_1".into(),
                 data_change: true,
+                deletion_vector: Some(old_deletion_vector.clone()),
                 ..Default::default()
             }),
             Action::Add(Add {
@@ -1605,10 +1727,25 @@ async fn data_skipping_filter() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
+    let expected_remove_dvs = Arc::new(HashMap::from([
+        (
+            "fake_path_1".to_string(),
+            DvInfo {
+                deletion_vector: Some(old_deletion_vector),
+            },
+        ),
+        (
+            "fake_path_2".to_string(),
+            DvInfo {
+                deletion_vector: None,
+            },
+        ),
+    ]));
     let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, expected_remove_dvs);
             scan_metadata.selection_vector
         })
         .collect_vec();
@@ -1622,9 +1759,12 @@ async fn data_skipping_filter() {
 // drops the Add in partition `y`. The Remove in partition `y` must survive: the `OR(NOT is_add,
 // ...)` guard shields non-Add rows from the predicate, so tombstones are never dropped from the
 // change feed even when their partition does not match.
+#[rstest]
 #[tokio::test]
-async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
-    let engine = Arc::new(SyncEngine::new());
+async fn data_skipping_filter_prunes_partition_values_but_keeps_removes(
+    #[values([1, 2], [2, 1], [usize::MAX; 2])] batch_sizes: [usize; 2],
+) {
+    let (engine, _) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     mock_table
         .commit([
@@ -1695,9 +1835,12 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
 // Stats-based pruning (as opposed to partition-value pruning) with a Remove present: `id > 4`
 // drops the out-of-range Add via its `add.stats`, keeps the in-range Add, and the standalone
 // Remove survives regardless of the predicate because non-Add rows bypass the stats filter.
+#[rstest]
 #[tokio::test]
-async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
-    let engine = Arc::new(SyncEngine::new());
+async fn data_skipping_filter_prunes_stats_but_keeps_removes(
+    #[values([1, 2], [2, 1], [usize::MAX; 2])] batch_sizes: [usize; 2],
+) {
+    let (engine, _) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     mock_table
         .commit([

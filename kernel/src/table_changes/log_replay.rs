@@ -211,14 +211,14 @@ impl CommitBatchReader {
 
     fn batches_for_commit(
         &mut self,
-        commit_index: usize,
+        commit_file_index: usize,
     ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + '_ {
         let mut finished = false;
         std::iter::from_fn(move || {
             if finished {
                 return None;
             }
-            let result = self.next_batch_for_commit(commit_index);
+            let result = self.next_batch_for_commit(commit_file_index);
             finished = !matches!(result, Ok(Some(_)));
             result.transpose()
         })
@@ -226,9 +226,9 @@ impl CommitBatchReader {
 
     fn next_batch_for_commit(
         &mut self,
-        commit_index: usize,
+        commit_file_index: usize,
     ) -> DeltaResult<Option<Box<dyn EngineData>>> {
-        let (batch_index, batch) = match self.pending_batch.take() {
+        let (batch_file_index, batch) = match self.pending_batch.take() {
             Some(batch) => batch,
             None => loop {
                 let Some(batch) = self.batches.next() else {
@@ -244,21 +244,22 @@ impl CommitBatchReader {
                 let path = visitor.file_path.ok_or_else(|| {
                     Error::internal_error("table_changes received a JSON batch without a file path")
                 })?;
-                let batch_index = *self.file_indices.get(&path).ok_or_else(|| {
+                let batch_file_index = *self.file_indices.get(&path).ok_or_else(|| {
                     Error::internal_error(format!(
                         "table_changes received a JSON batch for unrequested commit file {path}"
                     ))
                 })?;
-                break (batch_index, batch);
+                break (batch_file_index, batch);
             },
         };
-        match batch_index.cmp(&commit_index) {
+        match batch_file_index.cmp(&commit_file_index) {
             Ordering::Less => Err(Error::internal_error(format!(
-                "table_changes received an out-of-order JSON batch for commit index {batch_index}"
+                "table_changes received an out-of-order JSON batch for commit file index \
+                 {batch_file_index}"
             ))),
             Ordering::Equal => Ok(Some(batch)),
             Ordering::Greater => {
-                self.pending_batch = Some((batch_index, batch));
+                self.pending_batch = Some((batch_file_index, batch));
                 Ok(None)
             }
         }
@@ -337,8 +338,9 @@ impl RowVisitor for FilePathVisitor {
 ///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
 ///       share a path with an `add` action are selected.
 ///
-/// The two phases use independent readers so preparation can release each action batch after
-/// visiting it. The add-path set and deletion-vector map still grow with the current commit.
+/// The two phases iterate over each action in the commit twice. They use independent readers so
+/// preparation can release each action batch after visiting it. The add-path set and
+/// deletion-vector map still grow with the current commit.
 struct LogReplayScanner {
     // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
     has_cdc_action: bool,
@@ -540,7 +542,6 @@ impl CommitScanProcessor {
         batch: &dyn EngineData,
         filter: Option<&DataSkippingFilter>,
     ) -> DeltaResult<TableChangesScanMetadata> {
-        // Skipping must wait until preparation resolves add/remove DV pairs across the commit.
         let selection_vector = match filter {
             Some(filter) => filter.apply(batch)?,
             None => vec![true; batch.len()],
