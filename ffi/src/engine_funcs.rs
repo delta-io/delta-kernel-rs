@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
-    DeltaResult, EngineData, Expression, ExpressionEvaluator, ExpressionRef,
-    FileDataReadResultIterator, KernelError,
+    EngineData, Expression, ExpressionEvaluator, ExpressionRef, FileDataReadResultIterator,
+    KernelError, KernelResult,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -88,7 +88,7 @@ fn read_result_next_impl(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
     ),
-) -> DeltaResult<bool> {
+) -> KernelResult<bool> {
     if let Some(data) = iter.data.next().transpose()? {
         (engine_visitor)(engine_context, data.into());
         Ok(true)
@@ -126,10 +126,10 @@ pub unsafe extern "C" fn read_parquet_file(
 
 fn read_parquet_file_impl(
     extern_engine: Arc<dyn ExternEngine>,
-    path: DeltaResult<&str>,
+    path: KernelResult<&str>,
     file: &FileMeta,
     physical_schema: Arc<Schema>,
-) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
+) -> KernelResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = extern_engine.engine();
     let parquet_handler = engine.parquet_handler();
     let location = Url::parse(path?)?;
@@ -180,7 +180,7 @@ fn new_expression_evaluator_impl(
     input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
-) -> DeltaResult<Handle<SharedExpressionEvaluator>> {
+) -> KernelResult<Handle<SharedExpressionEvaluator>> {
     let engine = extern_engine.engine();
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         input_schema,
@@ -220,7 +220,7 @@ pub unsafe extern "C" fn evaluate_expression(
 fn evaluate_expression_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
-) -> DeltaResult<Handle<ExclusiveEngineData>> {
+) -> KernelResult<Handle<ExclusiveEngineData>> {
     evaluator.evaluate(batch).map(Into::into)
 }
 

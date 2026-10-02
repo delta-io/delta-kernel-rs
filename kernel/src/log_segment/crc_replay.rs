@@ -36,7 +36,7 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, FileMeta, KernelError, RowVisitor, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Result, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -71,7 +71,7 @@ impl LogSegment {
         engine: &dyn Engine,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
-    ) -> DeltaResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
+    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
@@ -130,7 +130,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         base_crc: &Crc,
-    ) -> DeltaResult<Crc> {
+    ) -> KernelResult<Crc> {
         let seed_histogram = base_crc
             .file_stats()
             .and_then(|s| s.file_size_histogram())
@@ -155,7 +155,7 @@ impl LogSegment {
     pub(crate) fn build_crc_from_checkpoint(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Crc>> {
+    ) -> KernelResult<Option<Crc>> {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
@@ -190,7 +190,7 @@ impl LogSegment {
     pub(crate) fn build_crc_from_version_zero(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Crc>> {
+    ) -> KernelResult<Option<Crc>> {
         require!(
             self.checkpoint_version.is_none(),
             KernelError::internal_error(
@@ -222,7 +222,7 @@ impl LogSegment {
         engine: &dyn Engine,
         base_version: Version,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         require!(
             base_version < self.end_version,
             KernelError::internal_error(format!(
@@ -262,7 +262,7 @@ impl LogSegment {
         engine: &dyn Engine,
         ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         // Replay newest-first: ICT capture reads from the newest commit only.
         let locations: Vec<FileMeta> = ascending_commits
             .rev()
@@ -388,7 +388,7 @@ impl CrcReplayAccumulator {
         }
     }
 
-    fn on_add(&mut self, size: i64) -> DeltaResult<()> {
+    fn on_add(&mut self, size: i64) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -412,7 +412,7 @@ impl CrcReplayAccumulator {
 
     /// `size = None` means the remove row had a path but no size, which makes incremental
     /// tracking impossible.
-    fn on_remove(&mut self, path: &str, size: Option<i64>) -> DeltaResult<()> {
+    fn on_remove(&mut self, path: &str, size: Option<i64>) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
         // file-stats state to `Indeterminate` and discard the accumulated file stats and
@@ -468,7 +468,7 @@ impl CrcReplayAccumulator {
         &mut self,
         i: usize,
         shared: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         // `add.size` (required) marks an Add row.
         if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
             self.on_add(size)?;
@@ -555,7 +555,7 @@ fn check_visitor_getters(
     getters: &[&dyn GetData<'_>],
     n_fixed: usize,
     visitor_name: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
     let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
     require!(
@@ -605,7 +605,7 @@ impl RowVisitor for CommitCrcVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
         if row_count == 0 {
             return Ok(());
@@ -666,7 +666,7 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
         for i in 0..row_count {
             self.acc.apply_shared_columns(i, getters)?;

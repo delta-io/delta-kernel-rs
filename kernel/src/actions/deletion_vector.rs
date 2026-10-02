@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::schema::DataType;
 use crate::utils::require;
-use crate::{DeltaResult, KernelError, StorageHandler};
+use crate::{KernelError, KernelResult, Result, StorageHandler};
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -42,7 +42,7 @@ pub enum DeletionVectorStorageType {
 impl FromStr for DeletionVectorStorageType {
     type Err = KernelError;
 
-    fn from_str(s: &str) -> DeltaResult<Self> {
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "u" => Ok(Self::PersistedRelative),
             "i" => Ok(Self::Inline),
@@ -114,7 +114,7 @@ impl DeletionVectorPath {
     }
 
     /// Returns the absolute path to the deletion vector file.
-    pub fn absolute_path(&self) -> DeltaResult<Url> {
+    pub fn absolute_path(&self) -> Result<Url> {
         let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
         self.table_path
             .join(&dv_suffix)
@@ -174,7 +174,7 @@ struct DeletionVectorRaw {
 impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
     type Error = KernelError;
 
-    fn try_from(raw: DeletionVectorRaw) -> DeltaResult<Self> {
+    fn try_from(raw: DeletionVectorRaw) -> Result<Self> {
         Self::try_new(
             raw.storage_type.parse()?,
             raw.path_or_inline_dv,
@@ -205,7 +205,7 @@ impl DeletionVectorDescriptor {
         offset: Option<i32>,
         size_in_bytes: i32,
         cardinality: i64,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         require!(
             size_in_bytes >= 0,
             KernelError::deletion_vector("size_in_bytes must be non-negative")
@@ -291,7 +291,7 @@ impl DeletionVectorDescriptor {
     ///
     /// Errors if called on a non-`PersistedRelative` descriptor, if the encoded path is shorter
     /// than the 20-character z85 UUID suffix, or if that suffix fails to decode into a UUID.
-    pub(crate) fn relative_path(&self) -> DeltaResult<String> {
+    pub(crate) fn relative_path(&self) -> KernelResult<String> {
         require!(
             self.storage_type == DeletionVectorStorageType::PersistedRelative,
             KernelError::DeletionVector(format!(
@@ -316,7 +316,7 @@ impl DeletionVectorDescriptor {
         Ok(DeletionVectorPath::relative_path(prefix, &uuid))
     }
 
-    pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
+    pub fn absolute_path(&self, parent: &Url) -> Result<Option<Url>> {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
                 let dv_suffix = self.relative_path()?;
@@ -340,11 +340,7 @@ impl DeletionVectorDescriptor {
     //  little, while the version, size, and checksum are big
     //  - dvs can potentially indicate the size in the delta log, and _also_ in the file. If both
     //  are present, we assert they are the same
-    pub fn read(
-        &self,
-        storage: Arc<dyn StorageHandler>,
-        parent: &Url,
-    ) -> DeltaResult<RoaringTreemap> {
+    pub fn read(&self, storage: Arc<dyn StorageHandler>, parent: &Url) -> Result<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
@@ -493,11 +489,7 @@ impl DeletionVectorDescriptor {
 
     /// Materialize the row indexes of the deletion vector as a `Vec<u64>` in which each element
     /// represents a row index that is deleted from the table.
-    pub fn row_indexes(
-        &self,
-        storage: Arc<dyn StorageHandler>,
-        parent: &Url,
-    ) -> DeltaResult<Vec<u64>> {
+    pub fn row_indexes(&self, storage: Arc<dyn StorageHandler>, parent: &Url) -> Result<Vec<u64>> {
         Ok(self.read(storage, parent)?.into_iter().collect())
     }
 }
@@ -514,7 +506,7 @@ pub(crate) fn create_dv_crc32() -> Crc<u32> {
 }
 
 /// small helper to read a big or little endian u32 from a cursor
-fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> DeltaResult<u32> {
+fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> KernelResult<u32> {
     let mut buf = [0; 4];
     cursor
         .read(&mut buf)
@@ -526,7 +518,7 @@ fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> DeltaResult<u32> {
 }
 
 /// decode a slice into a u32
-fn slice_to_u32(buf: &[u8], endian: Endian) -> DeltaResult<u32> {
+fn slice_to_u32(buf: &[u8], endian: Endian) -> KernelResult<u32> {
     let array = buf
         .try_into()
         .map_err(|_| KernelError::generic("Must have a 4 byte slice to decode to u32"))?;

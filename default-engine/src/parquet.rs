@@ -31,9 +31,9 @@ use delta_kernel::parquet::arrow::async_writer::ParquetObjectWriter;
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData,
-    FileDataReadResultIterator, FileMeta, FileSize, FoldWithOption as _, KernelError,
-    ParquetFooter, ParquetHandler, PredicateRef,
+    CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
+    FoldWithOption as _, KernelError, KernelResult, ParquetFooter, ParquetHandler, PredicateRef,
+    Result, ResultIteratorStatic,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -88,7 +88,7 @@ impl DataFileMetadata {
         &self,
         partition_values: &HashMap<String, Option<String>>,
         log_path: &str,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         let path = Arc::new(StringArray::from(vec![log_path]));
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
@@ -196,7 +196,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
         physical_schema: &StructType,
-    ) -> DeltaResult<DataFileMetadata> {
+    ) -> KernelResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
@@ -254,7 +254,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         data: Box<dyn EngineData>,
         write_context: &BoundWriteContext,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> Result<Box<dyn EngineData>> {
         let file_metadata = self
             .write_parquet(
                 &write_context.write_dir(),
@@ -275,7 +275,7 @@ async fn read_parquet_files_impl(
     predicate: Option<PredicateRef>,
     buffer_size: usize,
     batch_size: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
@@ -326,7 +326,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         self.read_parquet_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -336,7 +336,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -369,8 +369,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        mut data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
@@ -406,7 +406,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         })
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         self.read_parquet_footer_with_cancellation(file, None)
     }
 
@@ -414,7 +414,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<ParquetFooter> {
+    ) -> Result<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
@@ -457,7 +457,7 @@ async fn open_parquet_file(
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
-) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
     let file_location = file_meta.location.to_string();
     let path = Path::from_url_path(file_meta.location.path())?;
 
@@ -544,7 +544,7 @@ impl PresignedUrlOpener {
 }
 
 impl FileOpener for PresignedUrlOpener {
-    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> Result<FileOpenFuture> {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
@@ -610,7 +610,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
@@ -670,7 +670,11 @@ mod tests {
     #[async_trait::async_trait]
     impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for GetOptsCountingStore<T> {
         // ===== The method we instrument: count footer-fetch GETs =====
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
             self.get_opts_count.fetch_add(1, Ordering::SeqCst);
             self.inner.get_opts(location, options).await
         }
@@ -678,7 +682,11 @@ mod tests {
         // ===== Everything else: behavior unchanged, delegate to inner =====
         // Overridden (not inherited) so column-chunk data reads delegate straight to inner and
         // stay off the get_opts counter.
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -687,7 +695,7 @@ mod tests {
             location: &Path,
             payload: PutPayload,
             opts: PutOptions,
-        ) -> Result<PutResult> {
+        ) -> ObjectStoreResult<PutResult> {
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -695,31 +703,39 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
         fn delete_stream(
             &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
             self.inner.delete_stream(locations)
         }
 
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
     }
 
-    async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
+    async fn read_all_rows_helper(file_meta: FileMeta) -> Result<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
         let path = Path::from_url_path(file_meta.location.path()).unwrap();
         #[allow(deprecated)]
@@ -756,7 +772,8 @@ mod tests {
             last_modified: 0,
             size: file_size,
         };
-        let data = read_all_rows_helper(file_meta).await.unwrap();
+        let data: delta_kernel::Result<_> = read_all_rows_helper(file_meta).await;
+        let data = data.unwrap();
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
@@ -1188,7 +1205,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Test writing through the trait method
@@ -1395,7 +1412,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the data
@@ -1786,7 +1803,7 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let data_iter: DeltaResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // WHEN we write a parquet file to that path

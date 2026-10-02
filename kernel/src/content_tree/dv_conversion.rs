@@ -5,7 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
-use crate::{DeltaResult, EngineData, KernelError};
+use crate::{EngineData, KernelError, KernelResult, Result};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -21,7 +21,7 @@ use crate::{DeltaResult, EngineData, KernelError};
 ///   first before being added to metadata.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> DeltaResult<DeletionVectorInfo> {
+) -> KernelResult<DeletionVectorInfo> {
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
             // Use absolute path as-is
@@ -171,7 +171,7 @@ impl DecodedDvVisitor {
         self.decoded_paths.iter().any(|s| !s.is_null())
     }
 
-    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         data.append_columns(
             DV_DECODED_FLAT_SCHEMA.clone(),
             vec![
@@ -192,7 +192,7 @@ impl RowVisitor for DecodedDvVisitor {
         (self.names, &DV_LEAF_TYPES)
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             // `storageType` is a required (non-null) field of the DV descriptor, so it is null
             // for a row iff the whole `deletionVector` struct is null (the visitor unions parent
@@ -261,11 +261,7 @@ mod tests {
             COLUMNS.as_ref()
         }
 
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
             for i in 0..row_count {
                 self.locations.push(getters[0].get_opt(i, DV_LOCATION)?);
                 self.offsets.push(getters[1].get_opt(i, DV_OFFSET)?);

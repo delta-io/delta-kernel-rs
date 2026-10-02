@@ -20,7 +20,7 @@ use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
-use crate::{DeltaResult, Predicate};
+use crate::{Predicate, Result};
 
 /// Empty partition column set for tests that don't need partition columns.
 static NO_PARTITIONS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
@@ -969,7 +969,7 @@ impl OpaquePredicateOp for OpaqueLessThanOp {
         _evaluator: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> Result<Option<bool>> {
         unimplemented!("not needed for data skipping tests")
     }
 

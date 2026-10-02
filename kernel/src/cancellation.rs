@@ -33,7 +33,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{AsAny, DeltaResult, KernelError};
+use crate::{AsAny, KernelError, KernelResult};
 
 /// A shared, thread-safe cancellation token. Held as an `Arc` because the lazy scan iterator and
 /// the engine reads it drives can outlive the builder call and run on other threads.
@@ -48,7 +48,7 @@ pub type CancelledFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// `Ok(())`.
 ///
 /// Used as a pre-flight check to avoid starting an already-cancelled operation.
-pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResult<()> {
+pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> KernelResult<()> {
     match token {
         Some(t) if t.is_cancelled() => Err(KernelError::Cancelled),
         _ => Ok(()),
@@ -130,9 +130,9 @@ impl<I> CancellableIterator<I> {
 
 impl<I, T> Iterator for CancellableIterator<I>
 where
-    I: Iterator<Item = DeltaResult<T>>,
+    I: Iterator<Item = KernelResult<T>>,
 {
-    type Item = DeltaResult<T>;
+    type Item = KernelResult<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -174,14 +174,14 @@ mod tests {
         }
     }
 
-    fn ok_iter(n: usize) -> impl Iterator<Item = DeltaResult<usize>> {
+    fn ok_iter(n: usize) -> impl Iterator<Item = KernelResult<usize>> {
         (0..n).map(Ok)
     }
 
     #[test]
     fn no_token_passes_through_unchanged() {
         let out: Vec<_> = CancellableIterator::new(ok_iter(3), None)
-            .map(Result::unwrap)
+            .map(KernelResult::unwrap)
             .collect();
         assert_eq!(out, vec![0, 1, 2]);
     }
@@ -190,7 +190,7 @@ mod tests {
     fn uncancelled_token_passes_through_unchanged() {
         let token: CancellationTokenRef = Arc::new(TestToken::default());
         let out: Vec<_> = CancellableIterator::new(ok_iter(3), Some(token))
-            .map(Result::unwrap)
+            .map(KernelResult::unwrap)
             .collect();
         assert_eq!(out, vec![0, 1, 2]);
     }

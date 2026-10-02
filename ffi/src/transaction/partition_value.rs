@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use delta_kernel::expressions::Scalar;
-use delta_kernel::DeltaResult;
+use delta_kernel::KernelResult;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -66,9 +66,9 @@ pub unsafe extern "C" fn free_partition_value_map(map: Handle<ExclusivePartition
 /// success.
 fn partition_value_map_insert_impl(
     map: &mut PartitionValueMap,
-    name: DeltaResult<&str>,
-    scalar: DeltaResult<Scalar>,
-) -> DeltaResult<bool> {
+    name: KernelResult<&str>,
+    scalar: KernelResult<Scalar>,
+) -> KernelResult<bool> {
     map.inner.insert(name?.to_string(), scalar?);
     Ok(true)
 }

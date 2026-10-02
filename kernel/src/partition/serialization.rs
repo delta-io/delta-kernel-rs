@@ -15,7 +15,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{DecimalData, Scalar};
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, KernelResult, Result};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
 /// `NaiveDate::from_num_days_from_ce_opt`, which counts from 0001-01-01.
@@ -77,7 +77,7 @@ pub(crate) fn would_serialize_to_null(value: &Scalar) -> bool {
 /// The inverse of [`PrimitiveType::parse_scalar`].
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
-pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> {
+pub fn serialize_partition_value(value: &Scalar) -> Result<Option<String>> {
     match value {
         Scalar::Null(_) => Ok(None),
         Scalar::String(s) if s.is_empty() => Ok(None),
@@ -162,7 +162,7 @@ fn format_f64(v: f64) -> String {
 }
 
 /// Formats a date value (days since UNIX epoch) as "YYYY-MM-DD".
-fn format_date(days: i32) -> DeltaResult<String> {
+fn format_date(days: i32) -> KernelResult<String> {
     let ce_days = UNIX_EPOCH_CE_DAYS.checked_add(days).ok_or_else(|| {
         KernelError::generic(format!("date value {days} days from epoch is out of range"))
     })?;
@@ -174,7 +174,7 @@ fn format_date(days: i32) -> DeltaResult<String> {
 }
 
 /// Converts microseconds since epoch to a [`DateTime`], returning an error if out of range.
-fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
+fn micros_to_datetime(micros: i64, label: &str) -> KernelResult<DateTime<Utc>> {
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
     DateTime::from_timestamp(secs, subsec_nanos).ok_or_else(|| {
@@ -185,14 +185,14 @@ fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<Utc>> {
 }
 
 /// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".
-fn format_timestamp(micros: i64) -> DeltaResult<String> {
+fn format_timestamp(micros: i64) -> KernelResult<String> {
     micros_to_datetime(micros, "timestamp")
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
 }
 
 /// Formats a timestamp without timezone (microseconds) as "YYYY-MM-DD HH:MM:SS.ffffff".
 /// Space separator, no Z suffix (there is no timezone).
-fn format_timestamp_ntz(micros: i64) -> DeltaResult<String> {
+fn format_timestamp_ntz(micros: i64) -> KernelResult<String> {
     micros_to_datetime(micros, "timestamp_ntz")
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
 }
@@ -240,7 +240,7 @@ fn format_decimal(d: &DecimalData) -> String {
 ///
 /// Returns an error if the bytes are not valid UTF-8. For example, `[0x48, 0x49]`
 /// ("HI") succeeds, but `[0xDE, 0xAD]` fails because those bytes are not valid UTF-8.
-fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
+fn format_binary(bytes: &[u8]) -> KernelResult<String> {
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|e| {

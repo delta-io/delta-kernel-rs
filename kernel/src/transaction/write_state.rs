@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{DataType, DeltaResult, Expression, KernelError};
+use crate::{DataType, Expression, KernelError, KernelResult, Result};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -155,7 +155,7 @@ impl BoundWriteContextBuilder {
     ///   is not in the table properties.
     /// - The connector specifies a row-tracking metadata column that conflicts with another logical
     ///   field.
-    pub fn build(self) -> DeltaResult<BoundWriteContext> {
+    pub fn build(self) -> Result<BoundWriteContext> {
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
@@ -244,7 +244,7 @@ impl BoundWriteContextBuilder {
         })
     }
 
-    fn build_logical_data_schema(&self) -> DeltaResult<SchemaRef> {
+    fn build_logical_data_schema(&self) -> KernelResult<SchemaRef> {
         if self.logical_row_id_col_name.is_none()
             && self.logical_row_commit_version_col_name.is_none()
         {
@@ -265,7 +265,7 @@ impl BoundWriteContextBuilder {
         Ok(Arc::new(StructType::try_new(fields)?))
     }
 
-    fn build_physical_data_schema(&self) -> DeltaResult<SchemaRef> {
+    fn build_physical_data_schema(&self) -> KernelResult<SchemaRef> {
         if self.logical_row_id_col_name.is_none()
             && self.logical_row_commit_version_col_name.is_none()
         {
@@ -296,7 +296,7 @@ impl BoundWriteContextBuilder {
         logical_name: Option<&str>,
         physical_name: Option<&str>,
         configuration_key: &str,
-    ) -> DeltaResult<Option<StructField>> {
+    ) -> KernelResult<Option<StructField>> {
         if logical_name.is_none() {
             return Ok(None);
         }
@@ -356,7 +356,7 @@ impl WriteState {
     /// kernel upgrades.
     ///
     /// Returns an error if any field cannot be serialized.
-    pub fn encode(&self) -> DeltaResult<Vec<u8>> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(&WriteStateWire {
             version: WRITE_STATE_FORMAT_VERSION,
             write_state: self,
@@ -370,7 +370,7 @@ impl WriteState {
     ///
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
-    pub fn decode(bytes: &[u8]) -> DeltaResult<Arc<Self>> {
+    pub fn decode(bytes: &[u8]) -> Result<Arc<Self>> {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
@@ -408,7 +408,7 @@ impl WriteState {
     fn generate_logical_to_physical(
         &self,
         partition_values: Option<&HashMap<String, Scalar>>,
-    ) -> DeltaResult<Expression> {
+    ) -> KernelResult<Expression> {
         let mut patch = ExpressionStructPatchBuilder::new();
         if self.materialize_partition_columns {
             let partition_cols: HashSet<&str> = self
@@ -703,7 +703,7 @@ mod tests {
     fn physical_partition_names_differing_only_by_case_bind_separately(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] mode_property: &str,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
             StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(id)),
@@ -776,7 +776,7 @@ mod tests {
             ColumnMappingMode::Id
         )]
         column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let mut write_state = partitioned_write_state(
             column_mapping_mode,
             false, /* materialize_partition_columns */

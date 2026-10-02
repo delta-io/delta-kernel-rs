@@ -45,7 +45,7 @@ pub(crate) use writer::try_write_crc_file;
 use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
-use crate::{DeltaResult, KernelError, Version};
+use crate::{KernelError, KernelResult, Result, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -139,7 +139,7 @@ impl Crc {
         #[cfg(feature = "adaptive-metadata-in-dev")] last_manifest_commit_opt: Option<
             LastManifestCommit,
         >,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let crc = Self {
             version,
             metadata,
@@ -260,7 +260,7 @@ impl Crc {
     ///
     /// Returns an error for malformed JSON or invalid counts, statistics, or histogram fields.
     #[internal_api]
-    pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> DeltaResult<Self> {
+    pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> Result<Self> {
         let raw: CrcRaw = serde_json::from_slice(bytes)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
         // Reject malformed files at the deserialization boundary so callers can trust the value.
@@ -394,7 +394,7 @@ where
 }
 
 impl Crc {
-    fn validate(&self) -> DeltaResult<()> {
+    fn validate(&self) -> KernelResult<()> {
         for (name, value) in [
             ("numDeletedRecordsOpt", self.num_deleted_records_opt),
             ("numDeletionVectorsOpt", self.num_deletion_vectors_opt),
@@ -541,7 +541,7 @@ struct DerivedDeletionStats {
 impl TryFrom<&[Add]> for DerivedDeletionStats {
     type Error = KernelError;
 
-    fn try_from(files: &[Add]) -> DeltaResult<Self> {
+    fn try_from(files: &[Add]) -> Result<Self> {
         let cardinalities = || {
             files.iter().map(|add| {
                 add.deletion_vector
@@ -566,7 +566,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
     }
 }
 
-fn validate_sum(name: &str, values: &[i64], expected: i64) -> DeltaResult<()> {
+fn validate_sum(name: &str, values: &[i64], expected: i64) -> KernelResult<()> {
     let actual = checked_sum(name, values.iter().copied())?;
     if actual != expected {
         return Err(KernelError::generic(format!(
@@ -576,7 +576,7 @@ fn validate_sum(name: &str, values: &[i64], expected: i64) -> DeltaResult<()> {
     Ok(())
 }
 
-fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> DeltaResult<i64> {
+fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> KernelResult<i64> {
     values.try_fold(0_i64, |sum, value| {
         sum.checked_add(value)
             .ok_or_else(|| KernelError::generic(format!("CRC {name} overflow")))
@@ -616,7 +616,7 @@ struct DeletedRecordCountsHistogramRaw {
 impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
     type Error = KernelError;
 
-    fn try_from(value: DeletedRecordCountsHistogramRaw) -> DeltaResult<Self> {
+    fn try_from(value: DeletedRecordCountsHistogramRaw) -> Result<Self> {
         Self::try_new(value.deleted_record_counts.into())
     }
 }
@@ -627,14 +627,14 @@ impl DeletedRecordCountsHistogram {
     /// Returns an error unless exactly ten non-negative bin counts are provided.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn try_new(deleted_record_counts: Vec<i64>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(deleted_record_counts: Vec<i64>) -> Result<Self> {
         Self::validate(&deleted_record_counts)?;
         Ok(Self {
             deleted_record_counts,
         })
     }
 
-    fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> DeltaResult<Self> {
+    fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> KernelResult<Self> {
         let mut bins = vec![0; 10];
         for cardinality in cardinalities {
             if cardinality < 0 {
@@ -659,7 +659,7 @@ impl DeletedRecordCountsHistogram {
         Self::try_new(bins)
     }
 
-    fn validate(deleted_record_counts: &[i64]) -> DeltaResult<()> {
+    fn validate(deleted_record_counts: &[i64]) -> KernelResult<()> {
         if deleted_record_counts.len() != 10 {
             return Err(KernelError::generic(format!(
                 "deleted-record-count histogram must contain exactly 10 bins, got {}",

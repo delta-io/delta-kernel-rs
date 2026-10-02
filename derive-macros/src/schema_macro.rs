@@ -186,7 +186,7 @@ fn emit_field_name(
 
 /// Emits a `DataType`-typed expression for the next `type` in the stream. `fallible` recursively
 /// propagates the requesting macro's validation mode: when set, nested structs use `try_new` and
-/// their results are `?`-propagated to the enclosing `DeltaResult` closure.
+/// their results are `?`-propagated to the enclosing `Result` closure.
 fn emit_type(
     input: ParseStream,
     fallible: bool,

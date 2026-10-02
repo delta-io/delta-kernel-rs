@@ -24,7 +24,7 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, KernelError, PredicateRef, RowVisitor};
+use crate::{Engine, EngineData, KernelError, KernelResult, PredicateRef, Result, RowVisitor};
 
 #[cfg(test)]
 mod tests;
@@ -55,7 +55,7 @@ pub(crate) fn table_changes_action_iter(
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -79,7 +79,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -97,7 +97,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
+        .map(move |commit_file| -> KernelResult<_> {
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
@@ -182,7 +182,7 @@ impl LogReplayScanner {
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
         mode: CdfMode,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
@@ -332,7 +332,7 @@ impl LogReplayScanner {
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
         let Self {
             has_cdc_action,
             remove_dvs,
@@ -358,7 +358,7 @@ impl LogReplayScanner {
             cdf_scan_row_schema().into(),
         )?;
 
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
+        let result = action_iter.map(move |actions| -> KernelResult<_> {
             let actions = actions?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.
@@ -433,7 +433,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 11,
             KernelError::InternalError(format!(
@@ -512,7 +512,7 @@ impl RowVisitor for FileActionSelectionVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 5,
             KernelError::InternalError(format!(

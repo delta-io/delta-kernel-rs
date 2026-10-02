@@ -10,13 +10,13 @@ use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, FileMeta, KernelError, RowVisitor};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
-    actions: DeltaResultIteratorStatic<ActionsBatch>,
+    actions: KernelResultIteratorStatic<ActionsBatch>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
@@ -41,7 +41,7 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
         read_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
@@ -73,7 +73,7 @@ impl CheckpointManifestReader {
     /// Extract the sidecars from the manifest file if there were any.
     /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
-    pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
+    pub(crate) fn extract_sidecars(self) -> KernelResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
             KernelError::generic(format!(
@@ -94,7 +94,7 @@ impl CheckpointManifestReader {
 }
 
 impl Iterator for CheckpointManifestReader {
-    type Item = DeltaResult<ActionsBatch>;
+    type Item = KernelResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let Some(result) = self.actions.next() else {
@@ -121,7 +121,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
-    use crate::SnapshotRef;
+    use crate::{Result, SnapshotRef};
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -129,7 +129,7 @@ mod tests {
         snapshot: SnapshotRef,
         expected_add_paths: &[&str],
         expected_sidecars: &[&str],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let log_segment = snapshot.log_segment();
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_extracts_file_paths() -> DeltaResult<()> {
+    fn test_manifest_phase_extracts_file_paths() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
         verify_manifest_phase(
             engine,
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_early_finalize_error() -> DeltaResult<()> {
+    fn test_manifest_phase_early_finalize_error() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
 
         let manifest_phase = CheckpointManifestReader::try_new(
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars() -> DeltaResult<()> {
+    fn test_manifest_phase_collects_sidecars() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         verify_manifest_phase(
             engine,
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars_parquet() -> DeltaResult<()> {
+    fn test_manifest_phase_collects_sidecars_parquet() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-parquet-with-sidecars")?;
         verify_manifest_phase(
             engine,

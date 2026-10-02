@@ -12,7 +12,7 @@
 //! use delta_kernel::committer::FileSystemCommitter;
 //! use std::sync::Arc;
 //! # use delta_kernel::Engine;
-//! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
+//! # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
 //!     StructField::nullable("id", DataType::INTEGER),
@@ -46,7 +46,7 @@ use crate::table_features::{
 };
 use crate::transaction::{CreateTable, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
-use crate::DeltaResult;
+use crate::KernelResult;
 
 /// A type alias for create-table transactions.
 ///
@@ -72,7 +72,7 @@ use crate::DeltaResult;
 /// use delta_kernel::committer::FileSystemCommitter;
 /// use std::sync::Arc;
 /// # use delta_kernel::Engine;
-/// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
+/// # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
 ///     StructField::nullable("id", DataType::INTEGER),
@@ -107,7 +107,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 /// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
-/// # fn main() -> delta_kernel::DeltaResult<()> {
+/// # fn main() -> delta_kernel::Result<()> {
 /// let schema = Arc::new(StructType::try_new([
 ///     StructField::nullable("id", DataType::INTEGER),
 ///     StructField::nullable("name", DataType::STRING),
@@ -147,7 +147,7 @@ impl CreateTableTransaction {
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
         correlation_id: Option<Arc<str>>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         validate_iceberg_compat_if_needed(
             &effective_table_config,
             &V2_VALIDATOR,

@@ -21,7 +21,7 @@ use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, 
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, KernelResult};
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
@@ -84,7 +84,7 @@ pub(crate) fn build_checkpoint_transform(
     read_schema: &StructType,
     stats_schema: &SchemaRef,
     partition_schema: Option<&SchemaRef>,
-) -> DeltaResult<(SchemaRef, ExpressionRef)> {
+) -> KernelResult<(SchemaRef, ExpressionRef)> {
     let mut patch_builder = ProjectionStructPatchBuilder::new(read_schema);
 
     // Handle stats field
@@ -147,7 +147,7 @@ pub(crate) fn build_checkpoint_read_schema(
     base_schema: &StructType,
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
-) -> DeltaResult<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     transform_add_schema(base_schema, |add_struct| {
         // Validate fields aren't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
@@ -249,8 +249,8 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
 /// - The `add` field is not a struct type
 fn transform_add_schema(
     base_schema: &StructType,
-    transform_fn: impl FnOnce(&StructType) -> DeltaResult<StructType>,
-) -> DeltaResult<SchemaRef> {
+    transform_fn: impl FnOnce(&StructType) -> KernelResult<StructType>,
+) -> KernelResult<SchemaRef> {
     // Find and validate the add field
     let add_field = base_schema
         .field(ADD_NAME)

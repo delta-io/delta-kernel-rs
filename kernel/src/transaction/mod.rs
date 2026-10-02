@@ -50,8 +50,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::{require, PhantomType};
 use crate::{
-    create_row, version_as_i64, DataType, DeltaResult, DeltaResultIterator, Engine, EngineData,
-    Expression, FileMeta, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, Engine, EngineData, Expression, FileMeta, KernelResult,
+    KernelResultIterator, Predicate, Result, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -108,7 +108,7 @@ use update::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> = DeltaResultIterator<'a, Box<dyn EngineData>>;
+pub(crate) type EngineDataResultIterator<'a> = KernelResultIterator<'a, Box<dyn EngineData>>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -159,7 +159,7 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-fn with_row_tracking_cols(schema: &SchemaRef) -> DeltaResult<SchemaRef> {
+fn with_row_tracking_cols(schema: &SchemaRef) -> KernelResult<SchemaRef> {
     let patch = SchemaStructPatchBuilder::new()
         .append(StructField::nullable("baseRowId", DataType::LONG))
         .append(StructField::nullable(
@@ -324,7 +324,7 @@ impl<S> std::fmt::Debug for Transaction<S> {
 fn build_add_action_projection(
     input_schema: &StructType,
     data_change: bool,
-) -> DeltaResult<(SchemaRef, Expression)> {
+) -> KernelResult<(SchemaRef, Expression)> {
     let (output_schema, patch) = ProjectionStructPatchBuilder::new(input_schema)
         .insert_after(
             "modificationTime",
@@ -348,9 +348,9 @@ fn build_add_actions<'a, I, T>(
     add_files_metadata: I,
     input_schema: SchemaRef,
     data_change: bool,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a>
+) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + 'a>
 where
-    I: Iterator<Item = DeltaResult<T>> + Send + 'a,
+    I: Iterator<Item = KernelResult<T>> + Send + 'a,
     T: Deref<Target = dyn EngineData> + Send + 'a,
 {
     let evaluation_handler = engine.evaluation_handler();
@@ -399,7 +399,7 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<S>> {
         let commit_start = Instant::now();
 
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
@@ -817,7 +817,7 @@ impl<S> Transaction<S> {
     fn validate_commit_type(
         is_catalog_committer: bool,
         commit_type: &CommitType,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         match (
             is_catalog_committer,
             commit_type.requires_catalog_committer(),
@@ -842,7 +842,7 @@ impl<S> Transaction<S> {
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
         domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
-    ) -> DeltaResult<CommitMetadata> {
+    ) -> KernelResult<CommitMetadata> {
         let log_root = LogRoot::new(self.effective_table_config.table_root().clone())?;
         let is_create = self.is_create_table();
         let commit_type = Self::determine_commit_type(is_create, &self.effective_table_config);
@@ -884,7 +884,7 @@ impl<S> Transaction<S> {
     /// Note: Domain metadata additions/removals are allowed; blind append only constrains
     /// data-file operations and read predicates. Conflict resolution determines whether
     /// metadata changes are problematic.
-    fn validate_blind_append_semantics(&self) -> DeltaResult<()> {
+    fn validate_blind_append_semantics(&self) -> KernelResult<()> {
         if !self.is_blind_append {
             return Ok(());
         }
@@ -921,7 +921,7 @@ impl<S> Transaction<S> {
     /// not built). The `adaptiveMetadata-preview` feature and root/commit mutual exclusion are
     /// enforced when staging, so they need no check here.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn validate_manifest_write_semantics(&self) -> DeltaResult<()> {
+    fn validate_manifest_write_semantics(&self) -> KernelResult<()> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
                 require!(
@@ -947,7 +947,7 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         commit_version: Version,
         dm_changes: &[DomainMetadata],
-    ) -> DeltaResult<Option<Box<dyn EngineData>>> {
+    ) -> KernelResult<Option<Box<dyn EngineData>>> {
         let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
             return Ok(None);
         };
@@ -962,7 +962,7 @@ impl<S> Transaction<S> {
     }
 
     // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
-    fn validate_append_only_semantics(&self) -> DeltaResult<()> {
+    fn validate_append_only_semantics(&self) -> KernelResult<()> {
         if !self.data_change
             || !self
                 .effective_table_config
@@ -987,7 +987,7 @@ impl<S> Transaction<S> {
 
     /// Reject data file writes (add/remove/DV) against an empty-schema table.
     /// CREATE TABLE and metadata-only commits are exempt.
-    fn ensure_schema_non_empty_for_data_writes(&self) -> DeltaResult<()> {
+    fn ensure_schema_non_empty_for_data_writes(&self) -> KernelResult<()> {
         if self.is_create_table() {
             return Ok(());
         }
@@ -999,7 +999,7 @@ impl<S> Transaction<S> {
 
     /// Reject write-state creation on empty-schema tables, so engines fail before staging any
     /// parquet. CREATE TABLE is exempt.
-    fn ensure_schema_non_empty_for_write_state(&self) -> DeltaResult<()> {
+    fn ensure_schema_non_empty_for_write_state(&self) -> KernelResult<()> {
         if self.is_create_table() {
             return Ok(());
         }
@@ -1015,7 +1015,7 @@ impl<S> Transaction<S> {
 
     /// Rejects write-state creation when a table declares column defaults and the connector has
     /// not acknowledged handling them.
-    fn ensure_column_defaults_acknowledged(&self) -> DeltaResult<()> {
+    fn ensure_column_defaults_acknowledged(&self) -> KernelResult<()> {
         require!(
             self.column_defaults_acknowledged
                 || !self
@@ -1030,7 +1030,7 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    fn ensure_row_tracking_preservation_acknowledged(&self) -> DeltaResult<()> {
+    fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::RowTracking)
@@ -1067,7 +1067,7 @@ impl<S> Transaction<S> {
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
     // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
-    fn read_snapshot(&self) -> DeltaResult<&Snapshot> {
+    fn read_snapshot(&self) -> KernelResult<&Snapshot> {
         self.read_snapshot_opt.as_deref().ok_or_else(|| {
             KernelError::internal_error("read_snapshot() called on create-table transaction")
         })
@@ -1077,7 +1077,7 @@ impl<S> Transaction<S> {
     /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
     /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
     /// property must also be `true` (`is_feature_enabled`).
-    fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+    fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
         let has_ict = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::InCommitTimestamp);
@@ -1181,7 +1181,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
     /// settings.
     #[allow(unused)]
-    pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
+    pub fn stats_schema(&self) -> Result<SchemaRef> {
         self.effective_table_config
             .stats_schema_builder()
             .with_required_physical_columns(self.physical_clustering_columns.as_deref())
@@ -1233,7 +1233,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// # Errors
     ///
     /// Propagates any error from [`StructField::column_default`].
-    pub fn top_level_column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
+    pub fn top_level_column_defaults(&self) -> Result<HashMap<String, ColumnDefault<'_>>> {
         if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults)
@@ -1259,7 +1259,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// produce valid files.
     /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
     /// that reach [`add_files`](Self::add_files) without going through write state.
-    fn validate_for_data_write(&self) -> DeltaResult<()> {
+    fn validate_for_data_write(&self) -> KernelResult<()> {
         validate_schema_for_write(&self.effective_table_config.logical_schema())
     }
 
@@ -1278,7 +1278,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
     /// column defaults that the connector has not acknowledged.
-    pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
+    pub fn write_state(&self) -> Result<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
@@ -1318,7 +1318,7 @@ impl<S> Transaction<S> {
     /// Only add files are validated(remove files do not carry statistics).
     ///
     /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
-    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> KernelResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
@@ -1345,7 +1345,7 @@ impl<S> Transaction<S> {
                             })?;
                         Ok((col.clone(), data_type))
                     })
-                    .collect::<DeltaResult<_>>()?;
+                    .collect::<KernelResult<_>>()?;
                 let verifier = StatsColumnVerifier::new(columns_with_types);
                 verifier.verify(add_files)?;
             }
@@ -1359,7 +1359,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &dyn Engine,
         commit_version: u64,
-    ) -> DeltaResult<(
+    ) -> KernelResult<(
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
@@ -1405,7 +1405,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &dyn Engine,
         commit_version: i64,
-    ) -> DeltaResult<(
+    ) -> KernelResult<(
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
@@ -1469,7 +1469,7 @@ impl<S> Transaction<S> {
         self,
         file_meta: FileMeta,
         crc_delta: CrcDelta,
-    ) -> DeltaResult<CommittedTransaction> {
+    ) -> KernelResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1528,7 +1528,7 @@ impl<S> Transaction<S> {
         file_stats: FileStatsDelta,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> KernelResult<CrcDelta> {
         // TODO: drop these conversions by migrating the upstream chain
         //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
         //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
@@ -1605,7 +1605,7 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
         has_dv_update_columns: bool,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.remove_files_metadata.is_empty() {
@@ -1698,7 +1698,7 @@ fn build_remove_struct_patch(
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
     adaptive_metadata_enabled: bool,
-) -> DeltaResult<ExpressionStructPatch> {
+) -> KernelResult<ExpressionStructPatch> {
     let deletion_timestamp = if adaptive_metadata_enabled {
         null_lit(DataType::LONG)
     } else {
@@ -1968,7 +1968,7 @@ mod tests {
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
         CapturingReporter,
     };
-    use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
+    use crate::{EvaluationHandler, ResultIterator, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1986,9 +1986,9 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: ResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        ) -> Result<CommitResponse> {
             Err(KernelError::IOError(std::io::Error::other(
                 "simulated IO error",
             )))
@@ -1996,11 +1996,7 @@ mod tests {
         fn is_catalog_committer(&self) -> bool {
             false
         }
-        fn publish(
-            &self,
-            _engine: &dyn Engine,
-            _publish_metadata: PublishMetadata,
-        ) -> DeltaResult<()> {
+        fn publish(&self, _engine: &dyn Engine, _publish_metadata: PublishMetadata) -> Result<()> {
             Ok(())
         }
     }
@@ -2013,19 +2009,15 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: ResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        ) -> Result<CommitResponse> {
             Err(KernelError::generic("simulated commit error"))
         }
         fn is_catalog_committer(&self) -> bool {
             false
         }
-        fn publish(
-            &self,
-            _engine: &dyn Engine,
-            _publish_metadata: PublishMetadata,
-        ) -> DeltaResult<()> {
+        fn publish(&self, _engine: &dyn Engine, _publish_metadata: PublishMetadata) -> Result<()> {
             Ok(())
         }
     }
@@ -2037,20 +2029,16 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: ResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        ) -> Result<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
             Ok(CommitResponse::Conflict { version: 0 })
         }
         fn is_catalog_committer(&self) -> bool {
             true
         }
-        fn publish(
-            &self,
-            _engine: &dyn Engine,
-            _publish_metadata: PublishMetadata,
-        ) -> DeltaResult<()> {
+        fn publish(&self, _engine: &dyn Engine, _publish_metadata: PublishMetadata) -> Result<()> {
             Ok(())
         }
     }
@@ -2077,7 +2065,7 @@ mod tests {
         (engine, snapshot)
     }
 
-    fn setup_dv_supported_but_disabled_table() -> DeltaResult<(Arc<dyn Engine>, Arc<Snapshot>)> {
+    fn setup_dv_supported_but_disabled_table() -> KernelResult<(Arc<dyn Engine>, Arc<Snapshot>)> {
         let storage = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
         let engine = Arc::new(SyncEngine::new_with_store(storage.clone()));
@@ -2132,7 +2120,7 @@ mod tests {
     fn create_dv_transaction(
         snapshot: Arc<Snapshot>,
         engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
+    ) -> KernelResult<Transaction> {
         Ok(snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine)?
             .with_operation("DELETE".to_string())
@@ -2175,7 +2163,7 @@ mod tests {
     #[rstest]
     #[case::base(false)]
     #[case::row_tracking(true)]
-    fn test_add_action_projection_schema(#[case] row_tracking: bool) -> DeltaResult<()> {
+    fn test_add_action_projection_schema(#[case] row_tracking: bool) -> Result<()> {
         let input_schema = if row_tracking {
             with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?
         } else {
@@ -2221,7 +2209,7 @@ mod tests {
     #[case::adaptive_metadata(true)]
     fn test_remove_action_projection_deletion_timestamp_and_extended_metadata(
         #[case] adaptive_metadata_enabled: bool,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let commit_timestamp = 123;
         let patch = build_remove_struct_patch(
             commit_timestamp,
@@ -2336,7 +2324,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_changes_are_applied_once_and_persisted_on_commit() -> DeltaResult<()> {
+    fn schema_changes_are_applied_once_and_persisted_on_commit() -> Result<()> {
         let (engine, txn, _tempdir) = create_existing_table_txn()?;
 
         let snapshot = txn
@@ -2372,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_set_nullable_is_persisted_on_commit() -> DeltaResult<()> {
+    fn schema_set_nullable_is_persisted_on_commit() -> Result<()> {
         let engine: Arc<dyn Engine> =
             Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
         let schema = Arc::new(StructType::try_new([
@@ -2398,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> DeltaResult<()> {
+    fn schema_add_struct_then_nested_field_is_persisted_on_commit() -> Result<()> {
         let (engine, txn, _tempdir) = create_existing_table_txn()?;
         let snapshot = txn
             .with_schema_changes(vec![
@@ -2428,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_changes_can_precede_staged_data_in_the_same_commit() -> DeltaResult<()> {
+    fn schema_changes_can_precede_staged_data_in_the_same_commit() -> Result<()> {
         let (engine, txn, _tempdir) = create_existing_table_txn()?;
         let mut txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
             None,
@@ -2443,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_changes_are_rejected_after_staging_data() -> DeltaResult<()> {
+    fn schema_changes_are_rejected_after_staging_data() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         add_dummy_file(&mut txn);
 
@@ -2460,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_schema_changes_are_rejected() -> DeltaResult<()> {
+    fn empty_schema_changes_are_rejected() -> Result<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
 
         let result = txn.with_schema_changes(vec![]);
@@ -2511,7 +2499,7 @@ mod tests {
             base: &Transaction,
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
-        ) -> DeltaResult<TableConfiguration> {
+        ) -> KernelResult<TableConfiguration> {
             let metadata = base
                 .effective_table_config
                 .metadata()
@@ -2973,9 +2961,7 @@ mod tests {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         let scan = snapshot.scan_builder().build()?;
-        let scan_metadata = scan
-            .scan_metadata(&engine)?
-            .collect::<DeltaResult<Vec<_>>>()?;
+        let scan_metadata = scan.scan_metadata(&engine)?.collect::<Result<Vec<_>>>()?;
 
         let mut paths = Vec::new();
         for metadata in &scan_metadata {
@@ -3023,9 +3009,7 @@ mod tests {
             ));
         let staged_len_before = txn.dv_matched_files.len();
         let scan = snapshot.scan_builder().build()?;
-        let scan_metadata = scan
-            .scan_metadata(&engine)?
-            .collect::<DeltaResult<Vec<_>>>()?;
+        let scan_metadata = scan.scan_metadata(&engine)?.collect::<Result<Vec<_>>>()?;
 
         let mut paths = Vec::new();
         for metadata in &scan_metadata {
@@ -3091,7 +3075,7 @@ mod tests {
         DeletionVectorUpdate,
     }
 
-    fn set_append_only(txn: &mut Transaction, enabled: bool) -> DeltaResult<()> {
+    fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
         let metadata = txn
             .effective_table_config
             .metadata()
@@ -3170,7 +3154,7 @@ mod tests {
     }
 
     /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
-    fn create_existing_table_txn() -> DeltaResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
+    fn create_existing_table_txn() -> KernelResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
     {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
@@ -3180,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_success() -> DeltaResult<()> {
+    fn test_validate_blind_append_success() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
@@ -3226,7 +3210,7 @@ mod tests {
         #[case] data_change: bool,
         #[case] selection_vector: &[bool],
         #[case] expected_error: bool,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         set_append_only(&mut txn, append_only)?;
         txn.set_data_change(data_change);
@@ -3252,7 +3236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_requires_adds() -> DeltaResult<()> {
+    fn test_validate_blind_append_requires_adds() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         let result = txn.validate_blind_append_semantics();
@@ -3264,7 +3248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_requires_data_change() -> DeltaResult<()> {
+    fn test_validate_blind_append_requires_data_change() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         txn.set_data_change(false);
@@ -3278,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_rejects_removes() -> DeltaResult<()> {
+    fn test_validate_blind_append_rejects_removes() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
@@ -3295,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_rejects_dv_updates() -> DeltaResult<()> {
+    fn test_validate_blind_append_rejects_dv_updates() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
@@ -3312,7 +3296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_blind_append_rejects_create_table() -> DeltaResult<()> {
+    fn test_validate_blind_append_rejects_create_table() -> Result<()> {
         let tempdir = tempfile::tempdir()?;
         let schema = schema_ref! { nullable "id": INTEGER };
         let engine = Arc::new(crate::engine::sync::SyncEngine::new());
@@ -3345,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blind_append_commit_rejects_no_adds() -> DeltaResult<()> {
+    fn test_blind_append_commit_rejects_no_adds() -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         // No files added — commit should fail with blind append validation
@@ -3361,7 +3345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blind_append_commit_success() -> DeltaResult<()> {
+    fn test_blind_append_commit_success() -> Result<()> {
         let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
@@ -3385,7 +3369,7 @@ mod tests {
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
     #[test]
-    fn test_commit_io_error_returns_retryable_transaction() -> DeltaResult<()> {
+    fn test_commit_io_error_returns_retryable_transaction() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
@@ -3405,7 +3389,7 @@ mod tests {
     }
 
     #[test]
-    fn test_existing_table_txn_debug() -> DeltaResult<()> {
+    fn test_existing_table_txn_debug() -> Result<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
         let debug_str = format!("{txn:?}");
         // Existing-table transactions should include the snapshot version number
@@ -3439,7 +3423,7 @@ mod tests {
     fn test_physical_schema_column_mapping(
         #[case] schema: SchemaRef,
         #[case] mode: ColumnMappingMode,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
         let write_context = write_state.write_context_builder().build().unwrap();
@@ -3452,7 +3436,7 @@ mod tests {
     }
 
     /// Builds two-row [`EngineData`] with logical field names matching [`test_schema_nested`].
-    fn build_test_record_batch() -> DeltaResult<Box<dyn EngineData>> {
+    fn build_test_record_batch() -> KernelResult<Box<dyn EngineData>> {
         let schema = test_schema_nested();
         let tag_type = MapType::new(DataType::STRING, DataType::STRING, true);
         let score_type = ArrayType::new(DataType::INTEGER, true);
@@ -3489,7 +3473,7 @@ mod tests {
     /// levels. Builds a RecordBatch with logical names, evaluates the transform, and checks
     /// that the output uses physical names from the physical schema — including nested struct
     /// children.
-    fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
+    fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> KernelResult<()> {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_state = txn.write_state().unwrap();
@@ -3538,7 +3522,7 @@ mod tests {
     #[case::name_mode(ColumnMappingMode::Name)]
     #[case::id_mode(ColumnMappingMode::Id)]
     #[case::none_mode(ColumnMappingMode::None)]
-    fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> DeltaResult<()> {
+    fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> Result<()> {
         validate_logical_to_physical_transform(mode)
     }
 
@@ -3912,9 +3896,9 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: DeltaResultIterator<'_, FilteredEngineData>,
+            _actions: ResultIterator<'_, FilteredEngineData>,
             commit_metadata: CommitMetadata,
-        ) -> DeltaResult<CommitResponse> {
+        ) -> Result<CommitResponse> {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
             Ok(CommitResponse::Conflict {
                 version: commit_metadata.version(),
@@ -3923,17 +3907,13 @@ mod tests {
         fn is_catalog_committer(&self) -> bool {
             false
         }
-        fn publish(
-            &self,
-            _engine: &dyn Engine,
-            _publish_metadata: PublishMetadata,
-        ) -> DeltaResult<()> {
+        fn publish(&self, _engine: &dyn Engine, _publish_metadata: PublishMetadata) -> Result<()> {
             Ok(())
         }
     }
 
     #[test]
-    fn test_commit_metadata_receives_ict_not_wall_time() -> DeltaResult<()> {
+    fn test_commit_metadata_receives_ict_not_wall_time() -> Result<()> {
         // Set up a table with ICT enabled and a very high previous ICT so that the
         // monotonicity rule (max(wall_time, prev_ict + 1)) produces a value strictly
         // greater than the current wall time. This lets us verify the computed ICT is
@@ -4022,7 +4002,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_io_error_emits_retryable_io_failure_metric() -> DeltaResult<()> {
+    fn test_commit_io_error_emits_retryable_io_failure_metric() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -4037,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_terminal_error_emits_error_failure_metric() -> DeltaResult<()> {
+    fn test_commit_terminal_error_emits_error_failure_metric() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());

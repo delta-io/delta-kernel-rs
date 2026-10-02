@@ -7,7 +7,7 @@ use tracing::instrument;
 use super::Crc;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
-use crate::{DeltaResult, Engine, KernelError};
+use crate::{Engine, KernelError, KernelResult};
 
 /// Attempt to read and parse a CRC file.
 ///
@@ -19,7 +19,10 @@ use crate::{DeltaResult, Engine, KernelError};
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
 #[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
-pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
+pub(crate) fn try_read_crc_file(
+    engine: &dyn Engine,
+    crc_path: &ParsedLogPath,
+) -> KernelResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
     let data = storage

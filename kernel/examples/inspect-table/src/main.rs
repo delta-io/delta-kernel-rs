@@ -18,7 +18,7 @@ use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, KernelError, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Result, Snapshot};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -114,7 +114,7 @@ impl RowVisitor for LogVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let expected = NAMES_AND_TYPES.as_ref().0.len();
         if getters.len() != expected {
             return Err(KernelError::InternalError(format!(
@@ -195,7 +195,7 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
     );
 }
 
-fn try_main() -> DeltaResult<()> {
+fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;

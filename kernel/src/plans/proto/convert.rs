@@ -30,7 +30,7 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use crate::{DeltaResult, FileMeta, FileSlice, KernelError};
+use crate::{FileMeta, FileSlice, KernelError, Result};
 
 // === Helpers ===
 
@@ -777,12 +777,12 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
 
 impl TryFrom<proto_schema::StructType> for StructType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::StructType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::StructType) -> Result<Self> {
         let fields = proto
             .fields
             .into_iter()
             .map(StructField::try_from)
-            .collect::<DeltaResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         StructType::try_new(fields)
     }
 }
@@ -790,7 +790,7 @@ impl TryFrom<proto_schema::StructType> for StructType {
 impl TryFrom<proto_schema::StructField> for StructField {
     type Error = KernelError;
 
-    fn try_from(proto: proto_schema::StructField) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::StructField) -> Result<Self> {
         let data_type = proto
             .data_type
             .ok_or_else(|| KernelError::schema("StructField proto missing data_type"))?;
@@ -798,7 +798,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
             .metadata
             .into_iter()
             .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
-            .collect::<DeltaResult<std::collections::HashMap<_, _>>>()?;
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
             data_type: DataType::try_from(data_type)?,
@@ -810,7 +810,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
 
 impl TryFrom<proto_schema::DataType> for DataType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::DataType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::DataType) -> Result<Self> {
         let kind = proto
             .kind
             .ok_or_else(|| KernelError::schema("DataType proto missing kind"))?;
@@ -828,7 +828,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
 
 impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::PrimitiveType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::PrimitiveType) -> Result<Self> {
         let kind = proto
             .kind
             .ok_or_else(|| KernelError::schema("PrimitiveType proto missing kind"))?;
@@ -882,7 +882,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
 
 impl TryFrom<proto_schema::DecimalType> for DecimalType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::DecimalType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::DecimalType) -> Result<Self> {
         let precision = u8::try_from(proto.precision).map_err(|_| {
             KernelError::invalid_decimal(format!("precision out of range: {}", proto.precision))
         })?;
@@ -896,7 +896,7 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::GeometryType) -> Result<Self> {
         GeometryType::try_new(&proto.crs)
     }
 }
@@ -904,7 +904,7 @@ impl TryFrom<proto_schema::GeometryType> for GeometryType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeographyType> for GeographyType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::GeographyType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::GeographyType) -> Result<Self> {
         let algorithm = EdgeAlgo::try_from(proto.algorithm)
             .map_err(|_| {
                 KernelError::invalid_geo_params(format!(
@@ -920,7 +920,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
     type Error = KernelError;
-    fn try_from(proto: EdgeAlgo) -> DeltaResult<Self> {
+    fn try_from(proto: EdgeAlgo) -> Result<Self> {
         let algorithm = match proto {
             EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
             EdgeAlgo::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
@@ -939,7 +939,7 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
 
 impl TryFrom<proto_schema::ArrayType> for ArrayType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::ArrayType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::ArrayType) -> Result<Self> {
         let element_type = proto
             .element_type
             .ok_or_else(|| KernelError::schema("ArrayType proto missing element_type"))?;
@@ -952,7 +952,7 @@ impl TryFrom<proto_schema::ArrayType> for ArrayType {
 
 impl TryFrom<proto_schema::MapType> for MapType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::MapType) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::MapType) -> Result<Self> {
         let key_type = proto
             .key_type
             .ok_or_else(|| KernelError::schema("MapType proto missing key_type"))?;
@@ -969,7 +969,7 @@ impl TryFrom<proto_schema::MapType> for MapType {
 
 impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::MetadataValue) -> DeltaResult<Self> {
+    fn try_from(proto: proto_schema::MetadataValue) -> Result<Self> {
         let value = proto
             .value
             .ok_or_else(|| KernelError::schema("MetadataValue proto missing value"))?;
@@ -1023,7 +1023,7 @@ mod tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-    use crate::{DeltaResult, FileMeta, FileSlice};
+    use crate::{FileMeta, FileSlice, Result};
 
     // === Test helpers ===
 
@@ -1038,7 +1038,7 @@ mod tests {
             &self,
             _eval_expr: &ScalarExpressionEvaluator<'_>,
             _exprs: &[Expression],
-        ) -> DeltaResult<Scalar> {
+        ) -> Result<Scalar> {
             Ok(Scalar::Integer(0))
         }
     }
@@ -1056,7 +1056,7 @@ mod tests {
             _eval_pred: &DirectPredicateEvaluator<'_>,
             _exprs: &[Expression],
             _inverted: bool,
-        ) -> DeltaResult<Option<bool>> {
+        ) -> Result<Option<bool>> {
             Ok(Some(true))
         }
         fn eval_as_data_skipping_predicate(
@@ -1487,7 +1487,7 @@ mod tests {
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
         #[case] dv_column: Option<ColumnName>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let expect_dv_column = dv_column.is_some();
         let node = DynamicScan::try_new(
             &sample_dynamic_scan_input_schema(),

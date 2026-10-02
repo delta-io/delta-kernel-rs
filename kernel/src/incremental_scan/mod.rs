@@ -15,8 +15,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError,
-    PredicateRef, Version,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
+    PredicateRef, Result, Version,
 };
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
@@ -82,7 +82,7 @@ impl IncrementalScanBuilder {
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanStream>> {
+    pub fn build(self, engine: &dyn Engine) -> Result<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
@@ -168,7 +168,7 @@ impl IncrementalScanBuilder {
     /// constructed. [`AddSkipping::SkipAll`] when the predicate statically excludes every file
     /// ([`PhysicalPredicate::StaticSkipAll`]); the stream still reports Removes but yields no
     /// live Adds. [`AddSkipping::Filter`] carries the reusable [`DataSkippingFilter`].
-    fn resolve_add_skipping(&self, engine: &dyn Engine) -> DeltaResult<AddSkipping> {
+    fn resolve_add_skipping(&self, engine: &dyn Engine) -> KernelResult<AddSkipping> {
         let Some(predicate) = self.predicate.as_ref() else {
             return Ok(AddSkipping::KeepAll);
         };
@@ -236,7 +236,7 @@ pub struct IncrementalScanStream {
 }
 
 impl Iterator for IncrementalScanStream {
-    type Item = DeltaResult<FilteredEngineData>;
+    type Item = Result<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.errored {
@@ -284,7 +284,7 @@ impl IncrementalScanStream {
     ///   "cannot finish a stream that previously errored" when a terminal method is called after a
     ///   prior `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
     ///   corruption.
-    pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
+    pub fn into_summary(mut self) -> Result<IncrementalScanSummary> {
         if self.errored {
             return Err(KernelError::generic(
                 "IncrementalScanStream: cannot finish a stream that previously errored",
@@ -317,7 +317,7 @@ impl IncrementalScanStream {
     ///
     /// [`into_summary`]: Self::into_summary
     /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
-    pub fn into_listing(mut self) -> DeltaResult<IncrementalListing> {
+    pub fn into_listing(mut self) -> Result<IncrementalListing> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
@@ -349,7 +349,7 @@ impl IncrementalScanStream {
     pub fn into_summary_against_base_iter<'a>(
         self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
-    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+    ) -> Result<IncrementalScanSummaryAgainstBase> {
         let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = base_keys
             .into_iter()
@@ -382,7 +382,7 @@ impl IncrementalScanStream {
     pub fn into_summary_against_base_closure(
         self,
         base_contains: impl Fn(&FileActionKey) -> bool,
-    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+    ) -> Result<IncrementalScanSummaryAgainstBase> {
         let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = summary
             .live_adds
@@ -415,7 +415,7 @@ impl IncrementalScanStream {
     pub fn into_listing_against_base_iter<'a>(
         mut self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
-    ) -> DeltaResult<IncrementalListingAgainstBase> {
+    ) -> Result<IncrementalListingAgainstBase> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
@@ -436,7 +436,7 @@ impl IncrementalScanStream {
     pub fn into_listing_against_base_closure(
         mut self,
         base_contains: impl Fn(&FileActionKey) -> bool,
-    ) -> DeltaResult<IncrementalListingAgainstBase> {
+    ) -> Result<IncrementalListingAgainstBase> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
@@ -561,7 +561,7 @@ fn process_batch(
     seen_file_keys: &mut HashSet<FileActionKey>,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
-) -> DeltaResult<Option<FilteredEngineData>> {
+) -> KernelResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
     let mut adds_sel = vec![false; row_count];
 
@@ -656,7 +656,7 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         (names, types)
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == NUM_GETTERS,
             KernelError::InternalError(format!(

@@ -7,7 +7,6 @@ use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
-use crate::error::DeltaResult;
 use crate::expressions::{
     col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
     ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
@@ -23,7 +22,8 @@ use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, Schema
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, ExpressionEvaluator, KernelError, PredicateEvaluator, RowVisitor as _,
+    Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult, PredicateEvaluator,
+    RowVisitor as _,
 };
 
 pub(crate) mod stats_schema;
@@ -369,7 +369,7 @@ impl DataSkippingFilter {
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
-    pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+    pub(crate) fn apply(&self, batch: &dyn EngineData) -> KernelResult<Vec<bool>> {
         let start_time = Instant::now();
         let batch_len = batch.len();
 

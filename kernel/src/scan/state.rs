@@ -16,7 +16,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, ExpressionRef, KernelError};
+use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq, From)]
@@ -41,7 +41,7 @@ impl DvInfo {
     /// vector. This reads the descriptor metadata without loading the deletion vector.
     ///
     /// Returns [`KernelError::DeletionVector`] if the stored cardinality is negative.
-    pub fn cardinality(&self) -> DeltaResult<Option<u64>> {
+    pub fn cardinality(&self) -> Result<Option<u64>> {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
@@ -61,7 +61,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<RoaringTreemap>> {
+    ) -> KernelResult<Option<RoaringTreemap>> {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
@@ -75,7 +75,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<Vec<bool>>> {
+    ) -> Result<Option<Vec<bool>>> {
         let dv_treemap = self.get_treemap(engine, table_root)?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
@@ -85,7 +85,7 @@ impl DvInfo {
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<Vec<u64>>> {
+    ) -> Result<Option<Vec<u64>>> {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
@@ -104,7 +104,7 @@ pub fn transform_to_logical(
     physical_schema: &SchemaRef,
     logical_schema: &Schema,
     transform: Option<ExpressionRef>,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> Result<Box<dyn EngineData>> {
     match transform {
         Some(transform) => engine
             .evaluation_handler()
@@ -165,7 +165,7 @@ pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile);
 /// }
 /// ```
 impl ScanMetadata {
-    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
+    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> Result<T> {
         let mut visitor = ScanFileVisitor {
             callback,
             transforms: &self.scan_file_transforms,
@@ -191,7 +191,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         require!(
             getters.len() == 14,
             KernelError::InternalError(format!(

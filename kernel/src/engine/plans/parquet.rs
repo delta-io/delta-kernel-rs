@@ -8,8 +8,8 @@ use url::Url;
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    FileSize, KernelError, ParquetFooter, ParquetHandler, PredicateRef,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelError, ParquetFooter,
+    ParquetHandler, PredicateRef, Result, ResultIteratorStatic,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
@@ -41,7 +41,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
         let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
@@ -53,8 +53,8 @@ impl ParquetHandler for PlanBasedParquetHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         let Some(fallback) = &self.fallback else {
             return Err(KernelError::unsupported(
                 "PlanBasedParquetHandler does not support write_parquet_file yet, and no fallback \
@@ -65,7 +65,7 @@ impl ParquetHandler for PlanBasedParquetHandler {
         fallback.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         let op = IoOperation::parquet_footer(file.clone());
         self.executor
             .execute_op(Operation::IoOperation(op))?

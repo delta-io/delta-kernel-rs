@@ -35,9 +35,8 @@ use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{
-    CancellationTokenRef, DeltaResultIteratorStatic, Engine, EngineData,
-    FileDataReadResultIterator, FileMeta, FileSize, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
+    KernelResult, ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
 };
 
 mod variant_stats;
@@ -618,7 +617,7 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
     );
 }
 
-fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
+fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());
@@ -926,7 +925,7 @@ fn test_missing_column_row_group_skipping() {
 }
 
 #[test_log::test]
-fn test_scan_with_checkpoint() -> DeltaResult<()> {
+fn test_scan_with_checkpoint() -> Result<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
     ))?;
@@ -1769,7 +1768,7 @@ impl ParquetHandler for RecordingParquetHandler {
         files: &[FileMeta],
         physical_schema: schema::SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
             files: files.to_vec(),
             physical_schema: physical_schema.clone(),
@@ -1779,15 +1778,15 @@ impl ParquetHandler for RecordingParquetHandler {
             .read_parquet_files(files, physical_schema, predicate)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 }
@@ -2697,19 +2696,19 @@ impl ParquetHandler for EmptyParquetHandler {
         _files: &[FileMeta],
         _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> Result<ParquetFooter> {
         unimplemented!()
     }
 
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<FileSize> {
+        _data: ResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> Result<FileSize> {
         unimplemented!()
     }
 }

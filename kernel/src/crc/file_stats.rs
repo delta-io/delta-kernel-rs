@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, KernelError, RowVisitor};
+use crate::{EngineData, KernelError, KernelResult, Result, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -50,7 +50,7 @@ impl FileStats {
         num_files: i64,
         table_size_bytes: i64,
         file_size_histogram: Option<FileSizeHistogram>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         for (name, value) in [
             ("numFiles", num_files),
             ("tableSizeBytes", table_size_bytes),
@@ -158,7 +158,7 @@ impl FileStatsDelta {
         add_files_metadata: &[Box<dyn EngineData>],
         remove_files_metadata: &[FilteredEngineData],
         bin_boundaries: Option<&[i64]>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let mut histogram = match bin_boundaries {
             Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
             None => FileSizeHistogram::create_default(),
@@ -199,7 +199,7 @@ impl FileStatsDelta {
 
 /// Read a file `size` (a non-negative byte count stored as `i64`) as `u64`, erroring on a
 /// negative size (corrupt input).
-pub(crate) fn size_to_u64(size: i64) -> DeltaResult<u64> {
+pub(crate) fn size_to_u64(size: i64) -> KernelResult<u64> {
     u64::try_from(size).map_err(|_| {
         KernelError::internal_error(format!("File size must be non-negative, got {size}"))
     })
@@ -254,7 +254,7 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
             KernelError::InternalError(format!(

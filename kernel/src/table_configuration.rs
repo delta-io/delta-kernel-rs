@@ -40,7 +40,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{DeltaResult, KernelError, Version};
+use crate::{KernelError, KernelResult, Result, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -60,7 +60,7 @@ pub struct StatsOutputSchemas {
 }
 
 impl StatsOutputSchemas {
-    fn try_new(logical: SchemaRef, physical: SchemaRef) -> DeltaResult<Self> {
+    fn try_new(logical: SchemaRef, physical: SchemaRef) -> KernelResult<Self> {
         validate_stats_schema_alignment(&logical, &physical, "stats")?;
         Ok(Self { logical, physical })
     }
@@ -70,7 +70,7 @@ fn validate_stats_schema_alignment(
     logical: &StructType,
     physical: &StructType,
     path: &str,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     if logical.num_fields() != physical.num_fields() {
         return Err(KernelError::internal_error(format!(
             "logical and physical stats schemas differ at '{path}'"
@@ -180,7 +180,7 @@ impl<'a> StatsSchemaBuilder<'a> {
     /// # Errors
     ///
     /// Returns an error if the derived stats schema is invalid (see [`StructType::try_new`]).
-    pub(crate) fn build(self) -> DeltaResult<SchemaRef> {
+    pub(crate) fn build(self) -> KernelResult<SchemaRef> {
         let tc = self.table_configuration;
         let physical_data_schema = tc.physical_data_schema_without_partition_columns();
         let required_physical_stats_columns = tc.required_physical_stats_columns();
@@ -230,7 +230,7 @@ fn build_stats_schema_for_columns(
     data_schema: &StructType,
     selected_columns: &[ColumnName],
     variant_min_max: bool,
-) -> DeltaResult<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let config = StatsConfig {
         data_skipping_stats_columns: Some(selected_columns),
         data_skipping_num_indexed_cols: None,
@@ -247,7 +247,10 @@ fn build_stats_schema_for_columns(
     Ok(strip_metadata(schema))
 }
 
-fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> DeltaResult<()> {
+fn validate_partition_columns(
+    metadata: &Metadata,
+    logical_schema: &StructType,
+) -> KernelResult<()> {
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
@@ -320,7 +323,7 @@ impl TableConfiguration {
         protocol: Protocol,
         table_root: Url,
         version: Version,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
@@ -331,7 +334,7 @@ impl TableConfiguration {
         base: &Self,
         metadata: Metadata,
         logical_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -347,7 +350,7 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -435,7 +438,7 @@ impl TableConfiguration {
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_version: Version,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
         if new_metadata.is_none() && new_protocol.is_none() {
             return Ok(Self {
@@ -475,7 +478,7 @@ impl TableConfiguration {
         new_version: Version,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
@@ -489,7 +492,7 @@ impl TableConfiguration {
         &self,
         extra_indexed_columns: &[ColumnName],
         variant_min_max: bool,
-    ) -> DeltaResult<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<Option<StatsOutputSchemas>> {
         let logical_data_schema = self.logical_schema_without_partition_columns();
         let logical_schema = self.logical_schema();
         let column_mapping_mode = self.column_mapping_mode();
@@ -551,7 +554,7 @@ impl TableConfiguration {
                         )
                     })
             })
-            .collect::<DeltaResult<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
 
         self.build_stats_output_schemas_for_resolved_columns(
             &logical_columns,
@@ -570,7 +573,7 @@ impl TableConfiguration {
         &self,
         logical_columns: &[ColumnName],
         variant_min_max: bool,
-    ) -> DeltaResult<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<Option<StatsOutputSchemas>> {
         if logical_columns.is_empty() {
             return Ok(None);
         }
@@ -587,7 +590,7 @@ impl TableConfiguration {
                     column_mapping_mode,
                 )
             })
-            .collect::<DeltaResult<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
 
         self.build_stats_output_schemas_for_resolved_columns(
             logical_columns,
@@ -601,7 +604,7 @@ impl TableConfiguration {
         logical_columns: &[ColumnName],
         physical_columns: &[ColumnName],
         variant_min_max: bool,
-    ) -> DeltaResult<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<Option<StatsOutputSchemas>> {
         let logical = build_stats_schema_for_columns(
             &self.logical_schema_without_partition_columns(),
             logical_columns,
@@ -896,7 +899,7 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(&self, feature: &TableFeature) -> DeltaResult<()> {
+    fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
         for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
@@ -945,7 +948,7 @@ impl TableConfiguration {
         &self,
         feature: &TableFeature,
         operation: Operation,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let info = feature.info();
         match &info.kernel_support {
             KernelSupport::Supported => {}
@@ -998,7 +1001,7 @@ impl TableConfiguration {
     /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
-    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
+    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> Result<()> {
         match operation {
             Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
                 self.ensure_read_supported(operation)
@@ -1008,13 +1011,13 @@ impl TableConfiguration {
     }
 
     /// Ensures Kernel supports both scanning and writing this table.
-    pub(crate) fn ensure_read_write_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_read_write_supported(&self) -> KernelResult<()> {
         self.ensure_operation_supported(Operation::Scan)?;
         self.ensure_operation_supported(Operation::Write)
     }
 
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
-    fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
+    fn ensure_read_supported(&self, operation: Operation) -> KernelResult<()> {
         check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
@@ -1026,7 +1029,7 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> DeltaResult<()> {
+    fn ensure_write_supported(&self) -> KernelResult<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -1069,7 +1072,7 @@ impl TableConfiguration {
     #[allow(unused)]
     pub(crate) fn in_commit_timestamp_enablement(
         &self,
-    ) -> DeltaResult<InCommitTimestampEnablement> {
+    ) -> KernelResult<InCommitTimestampEnablement> {
         if !self.is_feature_enabled(&TableFeature::InCommitTimestamp) {
             return Ok(InCommitTimestampEnablement::NotEnabled);
         }
@@ -1210,7 +1213,7 @@ impl TableConfiguration {
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
-    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
+    pub(crate) fn validate_feature_support_for_remove(&self) -> KernelResult<()> {
         if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(KernelError::unsupported(
                 "Remove actions are not yet supported on tables with icebergCompatV3 enabled",

@@ -50,7 +50,7 @@ use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation}
 use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, DeltaResult, Engine, Expression};
+use crate::{DataType, Engine, Expression, KernelResult, Result};
 
 // =============================================================================
 // Update table transactions only
@@ -70,7 +70,7 @@ impl Transaction {
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before writing to the table we must check it is supported
@@ -172,10 +172,7 @@ impl Transaction {
     /// staged (adaptive-metadata-in-dev only).
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn with_schema_changes(
-        mut self,
-        changes: Vec<SchemaOperation>,
-    ) -> DeltaResult<Self> {
+    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> Result<Self> {
         if self
             .effective_table_config
             .is_feature_enabled(&TableFeature::IcebergCompatV3)
@@ -265,7 +262,7 @@ impl Transaction {
     pub(crate) fn with_row_tracking_high_water_mark(
         mut self,
         high_water_mark: i64,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         if self.provided_row_tracking_high_water_mark.is_some() {
             return Err(KernelError::generic(
                 "Row-tracking high-water mark already specified in this transaction",
@@ -285,7 +282,7 @@ impl Transaction {
     /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
     /// a manifest (content-tree) commit was already staged.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn with_root_manifest_file(mut self, file: FileMeta) -> DeltaResult<Self> {
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> Result<Self> {
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
             KernelError::invalid_transaction_state(
@@ -328,7 +325,7 @@ impl Transaction {
     pub(crate) fn with_manifest_commit(
         &mut self,
         engine: &dyn Engine,
-    ) -> DeltaResult<&mut ManifestCommitState> {
+    ) -> Result<&mut ManifestCommitState> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
                 return Err(KernelError::invalid_transaction_state(
@@ -376,7 +373,7 @@ impl Transaction {
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
     /// # use delta_kernel::committer::FileSystemCommitter;
-    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
+    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
@@ -422,8 +419,8 @@ impl Transaction {
     /// txn.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
-        scan_metadata: impl Iterator<Item = DeltaResult<crate::scan::ScanMetadata>>,
-    ) -> impl Iterator<Item = DeltaResult<FilteredEngineData>> {
+        scan_metadata: impl Iterator<Item = Result<crate::scan::ScanMetadata>>,
+    ) -> impl Iterator<Item = Result<FilteredEngineData>> {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
 
@@ -492,8 +489,8 @@ impl Transaction {
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
-        existing_data_files: impl Iterator<Item = DeltaResult<FilteredEngineData>>,
-    ) -> DeltaResult<()> {
+        existing_data_files: impl Iterator<Item = Result<FilteredEngineData>>,
+    ) -> Result<()> {
         if self.is_create_table() {
             return Err(KernelError::generic(
                 "Deletion vector operations require an existing table",
@@ -555,7 +552,7 @@ impl Transaction {
 
     /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
     /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
-    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
+    fn ensure_deletion_vectors_enabled(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
@@ -680,7 +677,7 @@ impl<S> Transaction<S> {
     pub(super) fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -705,7 +702,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &'a dyn Engine,
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
@@ -746,7 +743,7 @@ impl<S> Transaction<S> {
             nullable_add_log_schema().clone().into(),
         )?;
         Ok(file_metadata_batch.map(
-            move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
+            move |file_metadata_batch| -> KernelResult<FilteredEngineData> {
                 let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
 
                 let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
@@ -837,7 +834,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()

@@ -30,7 +30,7 @@ use delta_kernel::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{KernelError, KernelResult, Result};
 use tracing::warn;
 
 use crate::scan::{CMetadataMap, CMetadataValueKind};
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn visit_metadata_value(
 
 fn visit_engine_metadata(
     engine_metadata: Option<&EngineMetadata>,
-) -> DeltaResult<HashMap<String, MetadataValue>> {
+) -> KernelResult<HashMap<String, MetadataValue>> {
     let Some(engine_metadata) = engine_metadata else {
         return Ok(HashMap::new());
     };
@@ -109,10 +109,10 @@ fn visit_engine_metadata(
 
 fn visit_metadata_value_impl(
     state: &mut CMetadataMap,
-    key: DeltaResult<&str>,
+    key: KernelResult<&str>,
     kind: CMetadataValueKind,
-    value: DeltaResult<&str>,
-) -> DeltaResult<()> {
+    value: KernelResult<&str>,
+) -> KernelResult<()> {
     let key = key?;
     let value = value?;
     let value = match kind {
@@ -136,7 +136,7 @@ fn visit_metadata_value_impl(
 pub fn extract_kernel_schema(
     state: &mut KernelSchemaVisitorState,
     schema_id: usize,
-) -> DeltaResult<StructType> {
+) -> Result<StructType> {
     let schema_element = state
         .elements
         .take(schema_id)
@@ -172,11 +172,11 @@ fn unwrap_field(state: &mut KernelSchemaVisitorState, field_id: usize) -> Option
 /// Generic helper to create primitive fields
 fn visit_field_primitive_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
+    name: KernelResult<&str>,
     primitive_type: PrimitiveType,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let name_str = name?.to_string();
     let metadata = metadata?;
     let field = StructField::new(name_str, DataType::Primitive(primitive_type), nullable)
@@ -555,11 +555,11 @@ pub unsafe extern "C" fn visit_field_geometry(
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geometry_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
-    crs: DeltaResult<&str>,
+    name: Result<&str>,
+    crs: Result<&str>,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: Result<HashMap<String, MetadataValue>>,
+) -> Result<usize> {
     let geometry = GeometryType::try_new(crs?)?;
     visit_field_primitive_impl(
         state,
@@ -603,12 +603,12 @@ pub unsafe extern "C" fn visit_field_geography(
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geography_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
-    crs: DeltaResult<&str>,
-    algorithm: DeltaResult<&str>,
+    name: Result<&str>,
+    crs: Result<&str>,
+    algorithm: Result<&str>,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: Result<HashMap<String, MetadataValue>>,
+) -> Result<usize> {
     let algorithm = algorithm?
         .parse::<EdgeInterpolationAlgorithm>()
         .map_err(|err| {
@@ -652,12 +652,12 @@ pub unsafe extern "C" fn visit_field_decimal(
 
 fn visit_field_decimal_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
+    name: KernelResult<&str>,
     precision: u8,
     scale: u8,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let name_str = name?.to_string();
     let metadata = metadata?;
 
@@ -710,7 +710,7 @@ pub unsafe extern "C" fn visit_field_struct(
 fn create_struct_data_type(
     state: &mut KernelSchemaVisitorState,
     field_ids: &[usize],
-) -> DeltaResult<DataType> {
+) -> KernelResult<DataType> {
     let field_vec = field_ids
         .iter()
         .map(|&field_id| {
@@ -718,7 +718,7 @@ fn create_struct_data_type(
                 KernelError::generic(format!("Invalid field ID {field_id} in struct"))
             })
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
 
     let struct_type = StructType::try_new(field_vec)?;
     Ok(DataType::from(struct_type))
@@ -726,11 +726,11 @@ fn create_struct_data_type(
 
 fn visit_field_struct_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
+    name: KernelResult<&str>,
     field_ids: &[usize],
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let name_str = name?.to_string();
     let metadata = metadata?;
     let data_type = create_struct_data_type(state, field_ids)?;
@@ -765,11 +765,11 @@ pub unsafe extern "C" fn visit_field_array(
 
 fn visit_field_array_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
+    name: KernelResult<&str>,
     element_type_id: usize,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let name_str = name?.to_string();
     let metadata = metadata?;
     let element_field = unwrap_field(state, element_type_id).ok_or_else(|| {
@@ -820,12 +820,12 @@ pub unsafe extern "C" fn visit_field_map(
 
 fn visit_field_map_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
+    name: KernelResult<&str>,
     key_type_id: usize,
     value_type_id: usize,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let name_str = name?.to_string();
     let metadata = metadata?;
 
@@ -877,11 +877,11 @@ pub unsafe extern "C" fn visit_field_variant(
 
 fn visit_field_variant_impl(
     state: &mut KernelSchemaVisitorState,
-    name: DeltaResult<&str>,
+    name: KernelResult<&str>,
     variant_struct_id: usize,
     nullable: bool,
-    metadata: DeltaResult<HashMap<String, MetadataValue>>,
-) -> DeltaResult<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let name_str = name?.to_string();
     let metadata = metadata?;
     let data_type = create_variant_data_type(state, variant_struct_id)?;
@@ -893,7 +893,7 @@ fn visit_field_variant_impl(
 fn create_variant_data_type(
     state: &mut KernelSchemaVisitorState,
     struct_type_id: usize,
-) -> DeltaResult<DataType> {
+) -> KernelResult<DataType> {
     let Some(DataType::Struct(variant_struct)) =
         state.elements.take(struct_type_id).map(|f| f.data_type)
     else {

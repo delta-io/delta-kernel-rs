@@ -47,8 +47,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, FileMeta, KernelError, SnapshotRef,
-    Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, ResultIteratorStatic,
+    SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -278,7 +278,7 @@ impl StatsOptions {
     ///
     /// Returns [`KernelError::Unsupported`] if VARIANT min/max stats are requested without struct
     /// stats output or with JSON stats synthesis.
-    pub(crate) fn validate(&self) -> DeltaResult<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.variant_min_max {
             require!(
                 !matches!(self.struct_stats, StructStats::None),
@@ -431,7 +431,7 @@ impl ScanBuilder {
     /// Extra-indexed columns that cannot be resolved are omitted with a warning. Returns an error
     /// when a column requested through [`StatsOptions::struct_columns`] cannot be resolved, or when
     /// the selected fields cannot form a valid statistics schema.
-    pub fn stats_output_schemas(&self) -> DeltaResult<Option<StatsOutputSchemas>> {
+    pub fn stats_output_schemas(&self) -> Result<Option<StatsOutputSchemas>> {
         build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
     }
 
@@ -500,7 +500,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> DeltaResult<Scan> {
+    pub fn build(self) -> Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -579,7 +579,7 @@ impl PhysicalPredicate {
         predicate: &Predicate,
         logical_schema: &Schema,
         column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<PhysicalPredicate> {
+    ) -> KernelResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
@@ -787,7 +787,7 @@ impl ScanMetadata {
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
@@ -818,7 +818,7 @@ pub struct Scan {
 fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
-) -> DeltaResult<Option<StatsOutputSchemas>> {
+) -> KernelResult<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
         StructStats::AllIndexed { extra_indexed } => table_configuration
@@ -965,7 +965,7 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1020,7 +1020,7 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<ScanMetadata>> {
+    ) -> Result<ResultIteratorStatic<ScanMetadata>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
@@ -1133,9 +1133,9 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
+            impl Iterator<Item = KernelResult<ActionsBatch>> + Send,
         >,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>> + Send> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1195,7 +1195,7 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
@@ -1213,8 +1213,8 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    ) -> KernelResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
     > {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
@@ -1305,13 +1305,13 @@ impl Scan {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::{Engine, DeltaResult};
+    /// # use delta_kernel::{Engine, Result};
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> DeltaResult<()> {
+    /// # fn main() -> Result<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
     ///
@@ -1354,7 +1354,7 @@ impl Scan {
     pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<SequentialScanMetadata> {
+    ) -> Result<SequentialScanMetadata> {
         // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
         // not thread cancellation, so honoring a set token would require dropping it on the floor.
         if self.cancellation_token.is_some() {
@@ -1408,7 +1408,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
                 "Scan::execute is not supported when the scan was built with \
@@ -1435,13 +1435,13 @@ impl Scan {
                 let scan_files = vec![];
                 scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
-            // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
+            // Iterator<Result<Vec<ScanFile>>> to Iterator<Result<ScanFile>>
             .flatten_ok();
 
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> DeltaResult<_> {
+            .map(move |scan_file| -> KernelResult<_> {
                 let scan_file = scan_file?;
                 let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
@@ -1485,7 +1485,7 @@ impl Scan {
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
+                Ok(read_result_iter.map(move |read_result| -> KernelResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
@@ -1509,9 +1509,9 @@ impl Scan {
                     result
                 }))
             })
-            // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>
+            // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>> to Iterator<DeltaResult<Box<dyn EngineData>>>
+            // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
             .map(|x| x?);
         Ok(result)
     }
@@ -1553,7 +1553,7 @@ pub fn selection_vector(
     engine: &dyn Engine,
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
-) -> DeltaResult<Vec<bool>> {
+) -> Result<Vec<bool>> {
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))

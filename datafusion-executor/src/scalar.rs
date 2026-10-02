@@ -17,7 +17,7 @@ use delta_kernel::expressions::{
     StructData as KernelStructData,
 };
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{KernelError, KernelResult, Result};
 
 /// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion
 /// [`ScalarValue`](DFScalarValue).
@@ -26,7 +26,7 @@ use delta_kernel::{DeltaResult, KernelError};
 /// Returns an error for interval scalars, which are not yet supported; for a type with no Arrow
 /// representation (e.g. a shredded variant); or if building the backing Arrow array for a nested
 /// container otherwise fails.
-pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<DFScalarValue> {
+pub fn to_df_scalar(scalar: &KernelScalar) -> Result<DFScalarValue> {
     Ok(match scalar {
         KernelScalar::Integer(i) => DFScalarValue::Int32(Some(*i)),
         KernelScalar::Long(i) => DFScalarValue::Int64(Some(*i)),
@@ -59,14 +59,14 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<DFScalarValue> {
 }
 
 /// Builds a typed-null `DFScalarValue` from a kernel type.
-fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> DeltaResult<DFScalarValue> {
+fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> KernelResult<DFScalarValue> {
     let arrow_type: ArrowDataType = data_type.try_into_arrow()?;
     arrow_type.try_into().map_err(KernelError::generic_err)
 }
 
 /// Builds a `DFScalarValue::List` holding a single list row of the converted elements.
-fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<DFScalarValue> {
-    let elements: DeltaResult<Vec<DFScalarValue>> =
+fn array_to_df_scalar(data: &KernelArrayData) -> KernelResult<DFScalarValue> {
+    let elements: KernelResult<Vec<DFScalarValue>> =
         data.array_elements().iter().map(to_df_scalar).collect();
     // Name the list's element field from kernel's own ArrayType->Arrow conversion
     let element_field: ArrowField = data.array_type().try_into_arrow()?;
@@ -78,7 +78,7 @@ fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<DFScalarValue> {
 }
 
 /// Builds a `DFScalarValue::Struct` from the struct's fields and converted values.
-fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<DFScalarValue> {
+fn struct_to_df_scalar(data: &KernelStructData) -> KernelResult<DFScalarValue> {
     let mut builder = ScalarStructBuilder::new();
     for (field, value) in data.fields().iter().zip(data.values()) {
         let arrow_field: ArrowField = field.try_into_arrow()?;
@@ -88,7 +88,7 @@ fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<DFScalarValue> {
 }
 
 /// Builds a `DFScalarValue::Map` holding a single map row of the converted key/value pairs.
-fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
+fn map_to_df_scalar(data: &KernelMapData) -> KernelResult<DFScalarValue> {
     let map_type = data.map_type();
     let entries_field: ArrowField = map_type.try_into_arrow()?;
     let ArrowDataType::Struct(kv_fields) = entries_field.data_type() else {
@@ -101,7 +101,7 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
     };
 
     let pairs = data.pairs();
-    let converted: DeltaResult<(Vec<DFScalarValue>, Vec<DFScalarValue>)> = pairs
+    let converted: KernelResult<(Vec<DFScalarValue>, Vec<DFScalarValue>)> = pairs
         .iter()
         .map(|(key, value)| Ok((to_df_scalar(key)?, to_df_scalar(value)?)))
         .collect();
@@ -122,7 +122,7 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
 fn df_scalars_to_arrow_array(
     scalars: Vec<DFScalarValue>,
     arrow_type: &ArrowDataType,
-) -> DeltaResult<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     if scalars.is_empty() {
         Ok(new_empty_array(arrow_type))
     } else {

@@ -14,7 +14,7 @@ use crate::schema::{try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::SchemaTransform;
-use crate::DeltaResult;
+use crate::KernelResult;
 
 /// V3 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -53,7 +53,7 @@ fn is_v3_supported_type(dt: &DataType) -> bool {
     )
 }
 
-fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
+fn check_v3_supported_types(tc: &TableConfiguration) -> KernelResult<()> {
     check_only_supported_types(
         tc,
         is_v3_supported_type,
@@ -71,7 +71,7 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 ///
 /// Returns an error if `delta.typeChanges` metadata is malformed, or if any recorded type change
 /// is outside Iceberg V3's allowed widening list.
-fn iceberg_compat_v3_type_changes_validation(tc: &TableConfiguration) -> DeltaResult<()> {
+fn iceberg_compat_v3_type_changes_validation(tc: &TableConfiguration) -> KernelResult<()> {
     if !tc.is_feature_supported(&TableFeature::TypeWidening)
         && !tc.is_feature_supported(&TableFeature::TypeWideningPreview)
     {
@@ -101,7 +101,7 @@ fn iceberg_compat_v3_type_changes_validation(tc: &TableConfiguration) -> DeltaRe
 /// Propagates malformed column-default metadata errors from [`try_collect_column_defaults`].
 pub(crate) fn iceberg_compat_v3_column_defaults_validation(
     table_configuration: &TableConfiguration,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     for (path, column_default) in
         try_collect_column_defaults(table_configuration.logical_schema_ref())?
     {

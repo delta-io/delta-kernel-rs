@@ -139,9 +139,9 @@ This example removes the first file from a filesystem-backed table:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::engine_data::FilteredEngineData;
 # use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, Snapshot};
+# use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
-# async fn main() -> DeltaResult<()> {
+# async fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my_table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Get a snapshot

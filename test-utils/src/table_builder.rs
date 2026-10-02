@@ -73,7 +73,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{Engine, KernelResult, Result, Snapshot};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -105,10 +105,10 @@ pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 /// A multi-threaded runtime is required so kernel operations that call
 /// `block_in_place` (e.g. `Snapshot::checkpoint`) do not deadlock, which is why
 /// the sync wrappers in this module all route through this helper.
-fn block_on_sync<F, Fut, T>(make_fut: F) -> DeltaResult<T>
+fn block_on_sync<F, Fut, T>(make_fut: F) -> KernelResult<T>
 where
     F: FnOnce() -> Fut + Send,
-    Fut: std::future::Future<Output = DeltaResult<T>>,
+    Fut: std::future::Future<Output = Result<T>>,
     T: Send,
 {
     std::thread::scope(|s| {
@@ -434,7 +434,7 @@ fn log_file_version(location: &Path) -> Option<u64> {
     prefix.parse::<u64>().ok()
 }
 
-async fn read_hint_bytes(store: &Arc<DynObjectStore>, path: &Path) -> DeltaResult<Vec<u8>> {
+async fn read_hint_bytes(store: &Arc<DynObjectStore>, path: &Path) -> KernelResult<Vec<u8>> {
     let result = store
         .get(path)
         .await
@@ -1261,12 +1261,12 @@ impl TestTableBuilder {
     /// # Panics
     /// Panics if [`LastCheckpointHintState::Stale`] is paired with fewer than two
     /// checkpoints.
-    pub fn build(self) -> DeltaResult<TestTable> {
+    pub fn build(self) -> Result<TestTable> {
         validate_log_state(&self.log_state);
         block_on_sync(|| self.build_async())
     }
 
-    async fn build_async(self) -> DeltaResult<TestTable> {
+    async fn build_async(self) -> KernelResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let executor = Arc::new(TokioMultiThreadExecutor::new(
@@ -1424,7 +1424,7 @@ impl TestTableBuilder {
 /// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
 /// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
 /// that version cannot already exist on disk.
-fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<()> {
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> KernelResult<()> {
     let (result, _) = snapshot.write_checksum(engine)?;
     assert_eq!(
         result,
@@ -1448,7 +1448,7 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> DeltaResult<delta_kernel::transaction::CommitResult> {
+) -> KernelResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
@@ -1896,7 +1896,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_basic_build() -> DeltaResult<()> {
+    fn test_basic_build() -> Result<()> {
         let table = TestTableBuilder::new().build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1905,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commits_only() -> DeltaResult<()> {
+    fn test_commits_only() -> Result<()> {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(2))
             .build()?;
@@ -1951,7 +1951,7 @@ mod tests {
     }
 
     #[rstest_reuse::apply(feature_sets)]
-    fn test_feature_sets_enable_table_features(feature_set: FeatureSet) -> DeltaResult<()> {
+    fn test_feature_sets_enable_table_features(feature_set: FeatureSet) -> Result<()> {
         let expected_features = feature_set.expected_features();
         let table = TestTableBuilder::new().with_features(feature_set).build()?;
         let engine = table.engine();
@@ -1976,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_config_properties_applied() -> DeltaResult<()> {
+    fn test_table_config_properties_applied() -> Result<()> {
         let table = TestTableBuilder::new()
             .with_table_config(
                 TableConfig::new()
@@ -1991,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_skipping_table_properties_in_metadata() -> DeltaResult<()> {
+    fn test_data_skipping_table_properties_in_metadata() -> Result<()> {
         let table = TestTableBuilder::new()
             .with_table_config(
                 TableConfig::new()
@@ -2018,7 +2018,7 @@ mod tests {
     fn read_metadata_configuration(
         store: &Arc<DynObjectStore>,
         version: u64,
-    ) -> DeltaResult<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, String>> {
         let store = store.clone();
         block_on_sync(move || async move {
             crate::read_metadata_configuration_from_store(store.as_ref(), version)
@@ -2029,7 +2029,7 @@ mod tests {
 
     /// Verifies every common table config builds successfully.
     #[rstest_reuse::apply(table_configs)]
-    fn test_all_table_configs_build(table_config: TableConfig) -> DeltaResult<()> {
+    fn test_all_table_configs_build(table_config: TableConfig) -> Result<()> {
         TestTableBuilder::new()
             .with_table_config(table_config)
             .build()?;
@@ -2042,7 +2042,7 @@ mod tests {
     #[rstest::rstest]
     #[case::default_hint(None)]
     #[case::explicit_hint(Some(1))]
-    fn test_v2_sidecars_emit_sidecar_files(#[case] hint: Option<usize>) -> DeltaResult<()> {
+    fn test_v2_sidecars_emit_sidecar_files(#[case] hint: Option<usize>) -> Result<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([1])
             .with_sidecars_if_enabled(hint);
@@ -2062,7 +2062,7 @@ mod tests {
     /// `with_sidecars_if_enabled` without the `v2Checkpoint` feature is a no-op:
     /// the table builds (no error) and no sidecar directory is produced.
     #[test]
-    fn test_v2_sidecars_silently_ignored_without_v2_feature() -> DeltaResult<()> {
+    fn test_v2_sidecars_silently_ignored_without_v2_feature() -> Result<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([1])
             .with_sidecars_if_enabled(None);
@@ -2079,7 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_and_commits() -> DeltaResult<()> {
+    fn test_checkpoint_and_commits() -> Result<()> {
         let log_state = LogState::with_latest_version(4).with_checkpoint_at([2]);
         let table = TestTableBuilder::new()
             .with_log_state(log_state.clone())
@@ -2152,9 +2152,7 @@ mod tests {
             .with_crc_at([2])
             .with_cleanup_commits_before(2),
     )]
-    fn test_log_state_checkpoint_shapes_land_on_disk(
-        #[case] log_state: LogState,
-    ) -> DeltaResult<()> {
+    fn test_log_state_checkpoint_shapes_land_on_disk(#[case] log_state: LogState) -> Result<()> {
         let expected_version = log_state.latest_version();
         let table = TestTableBuilder::new()
             .with_log_state(log_state.clone())
@@ -2186,7 +2184,7 @@ mod tests {
     /// forward, and pick up the actual latest checkpoint at the higher version --
     /// not the stale-hinted older one.
     #[test]
-    fn test_stale_hint_recovery_resolves_to_actual_latest_checkpoint() -> DeltaResult<()> {
+    fn test_stale_hint_recovery_resolves_to_actual_latest_checkpoint() -> Result<()> {
         let log_state = LogState::with_latest_version(5)
             .with_checkpoint_at([2, 4])
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale);
@@ -2201,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_with_column_mapping() -> DeltaResult<()> {
+    fn test_scan_with_column_mapping() -> Result<()> {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1))
             .with_features(FeatureSet::new().column_mapping("name"))
@@ -2218,7 +2216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_with_data() -> DeltaResult<()> {
+    fn test_scan_with_data() -> Result<()> {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1))
             .with_data(2, 5)
@@ -2237,7 +2235,7 @@ mod tests {
     /// Uses `rows_per_file = NULL_RATE_EVERY_NTH * 3` so each file has exactly three null
     /// rows per column.
     #[test]
-    fn test_sparse_null_injection_in_generated_data() -> DeltaResult<()> {
+    fn test_sparse_null_injection_in_generated_data() -> Result<()> {
         let rows_per_file = NULL_RATE_EVERY_NTH * 3;
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1))
@@ -2273,7 +2271,7 @@ mod tests {
     #[rstest::rstest]
     #[case::partitioned(partitioned())]
     #[case::clustered(clustered())]
-    fn test_layout_column_null_injection(#[case] config: DataLayoutConfig) -> DeltaResult<()> {
+    fn test_layout_column_null_injection(#[case] config: DataLayoutConfig) -> Result<()> {
         let rows_per_file = NULL_RATE_EVERY_NTH * 3;
         // Only partition columns are protected from nulling; clustering columns are not.
         let protected_columns = if config.is_partitioned() {
@@ -2320,7 +2318,7 @@ mod tests {
     fn test_data_layout_table(
         #[case] config: DataLayoutConfig,
         #[case] expected_schema: SchemaRef,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         // 2 versions means v0 (create_table) + v1 (1 data commit with 10 rows)
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1))
@@ -2340,7 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clustered_table_multiple_versions() -> DeltaResult<()> {
+    fn test_clustered_table_multiple_versions() -> Result<()> {
         // v0=create, v1-v3=data commits, 10 rows each
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(3))
@@ -2360,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_clustering_columns_directly() -> DeltaResult<()> {
+    fn test_with_clustering_columns_directly() -> Result<()> {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1))
             .with_schema(clustered_schema())
@@ -2374,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_struct_schema_round_trip() -> DeltaResult<()> {
+    fn test_nested_struct_schema_round_trip() -> Result<()> {
         let schema = schema_ref! {
             nullable "id": LONG,
             nullable "inner": {
@@ -2418,7 +2416,7 @@ mod tests {
     fn test_builder_writes_crc_with_correct_content(
         #[case] features: FeatureSet,
         #[case] expect_ict: bool,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let log_state = LogState::with_latest_version(2)
             .with_checkpoint_at([2])
             .with_crc_at([2]);
@@ -2459,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_commits_before_deletes_old_files_and_rebuilds() -> DeltaResult<()> {
+    fn test_cleanup_commits_before_deletes_old_files_and_rebuilds() -> Result<()> {
         // Checkpoints at v=1 (below cutoff), v=3 (at cutoff), v=5 (above cutoff)
         // exercise both the deletion and preservation paths for checkpoint files.
         let log_state = LogState::with_latest_version(5)
@@ -2537,7 +2535,7 @@ mod tests {
     /// remains below `cleanup_before`, and the `_last_checkpoint` hint reflects
     /// the declared hint state. Snapshot rebuilds can silently succeed via JSON
     /// replay even when these files are wrong.
-    fn assert_log_state_files_on_disk(table: &TestTable, log_state: &LogState) -> DeltaResult<()> {
+    fn assert_log_state_files_on_disk(table: &TestTable, log_state: &LogState) -> Result<()> {
         let entries = list_log_dir_filenames(table.store())?;
         let cleanup = log_state.cleanup_before().unwrap_or(0);
         for &v in log_state.checkpoints_at() {
@@ -2631,7 +2629,7 @@ mod tests {
     async fn try_read_json(
         store: &DynObjectStore,
         path: &Path,
-    ) -> DeltaResult<Option<serde_json::Value>> {
+    ) -> Result<Option<serde_json::Value>> {
         let bytes = match store.get(path).await {
             Ok(r) => r.bytes().await.map_err(delta_kernel::KernelError::from)?,
             Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
@@ -2643,7 +2641,7 @@ mod tests {
     }
 
     /// Read and parse the `_last_checkpoint` hint, if present.
-    fn read_last_checkpoint_hint(store: &Arc<DynObjectStore>) -> DeltaResult<Option<HintFile>> {
+    fn read_last_checkpoint_hint(store: &Arc<DynObjectStore>) -> Result<Option<HintFile>> {
         let store = store.clone();
         block_on_sync(move || async move {
             let path = Path::from("_delta_log/_last_checkpoint");
@@ -2660,7 +2658,7 @@ mod tests {
     }
 
     /// Read and parse a CRC file at `version`. Errors if the file is absent.
-    fn read_crc_json(store: &Arc<DynObjectStore>, version: u64) -> DeltaResult<serde_json::Value> {
+    fn read_crc_json(store: &Arc<DynObjectStore>, version: u64) -> Result<serde_json::Value> {
         let store = store.clone();
         block_on_sync(move || async move {
             let path = Path::from(format!("_delta_log/{version:020}.crc"));
@@ -2673,12 +2671,12 @@ mod tests {
     /// Helper: list filenames (basenames only) directly under `_delta_log/` in
     /// `store`. Returns just the leaf name so callers can match by suffix without
     /// dealing with `memory:///`-style path quirks.
-    fn list_log_dir_filenames(store: &Arc<DynObjectStore>) -> DeltaResult<Vec<String>> {
+    fn list_log_dir_filenames(store: &Arc<DynObjectStore>) -> Result<Vec<String>> {
         list_dir_filenames(store, "_delta_log")
     }
 
     /// Helper: list filenames at an arbitrary prefix.
-    fn list_dir_filenames(store: &Arc<DynObjectStore>, prefix: &str) -> DeltaResult<Vec<String>> {
+    fn list_dir_filenames(store: &Arc<DynObjectStore>, prefix: &str) -> Result<Vec<String>> {
         let store = store.clone();
         let prefix = Path::from(prefix);
         block_on_sync(move || async move {

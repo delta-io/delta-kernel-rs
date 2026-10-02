@@ -15,7 +15,7 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use test_utils::{
     assert_result_error_with_message, cm_properties, multiple_variant_schema,
     nested_variant_schema, test_table_setup, top_level_variant_schema,
@@ -49,7 +49,7 @@ fn test_create_table_with_variant(
     )]
     schema: Arc<StructType>,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
@@ -91,7 +91,7 @@ fn test_create_table_with_variant(
 
 /// A schema without variant columns should not add the variantType feature.
 #[test]
-fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
+fn test_create_table_no_variant_no_feature() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -117,7 +117,7 @@ fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
 
 /// Clustering on a variant column is rejected per the Delta spec.
 #[test]
-fn test_create_table_variant_clustering_rejected() -> DeltaResult<()> {
+fn test_create_table_variant_clustering_rejected() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let result = create_table(&table_path, top_level_variant_schema(), "Test/1.0")

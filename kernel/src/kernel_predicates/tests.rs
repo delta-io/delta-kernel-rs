@@ -8,7 +8,7 @@ use crate::expressions::{
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
 use crate::schema::ArrayType;
-use crate::{DataType, DeltaResult};
+use crate::{DataType, Result};
 
 /// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
 trait LogicalEq {
@@ -743,7 +743,7 @@ impl OpaqueExpressionOp for OpaqueLessThanOp {
         &self,
         eval_expr: &ScalarExpressionEvaluator<'_>,
         exprs: &[Expr],
-    ) -> DeltaResult<Scalar> {
+    ) -> Result<Scalar> {
         let result = match self.eval_expr_scalar(eval_expr, exprs, false) {
             Some(value) => Scalar::from(value),
             None => Scalar::Null(DataType::BOOLEAN),
@@ -762,7 +762,7 @@ impl OpaquePredicateOp for OpaqueLessThanOp {
         _evaluator: &DirectPredicateEvaluator<'_>,
         exprs: &[Expr],
         inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> Result<Option<bool>> {
         Ok(self.eval_expr_scalar(eval_expr, exprs, inverted))
     }
 
@@ -875,7 +875,7 @@ impl OpaquePredicateOp for OpaqueAndOp {
         evaluator: &DirectPredicateEvaluator<'_>,
         exprs: &[Expr],
         inverted: bool,
-    ) -> DeltaResult<Option<bool>> {
+    ) -> Result<Option<bool>> {
         let mut values = exprs
             .iter()
             .map(|expr| evaluator.eval_pred_expr(expr, inverted));

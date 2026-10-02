@@ -11,7 +11,7 @@ use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
-use crate::{DeltaResultIteratorStatic, Engine as _, FileMeta, StorageHandler};
+use crate::{Engine as _, FileMeta, ResultIteratorStatic, StorageHandler};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -164,7 +164,7 @@ impl CountingStorageHandler {
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path)?;
@@ -176,23 +176,23 @@ impl StorageHandler for CountingStorageHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+    ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
-    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> Result<()> {
         panic!("put should not be called during listing");
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
         panic!("copy_atomic should not be called during listing");
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+    fn head(&self, _path: &Url) -> Result<crate::FileMeta> {
         panic!("head should not be called during listing");
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> Result<()> {
         panic!("delete should not be called during listing");
     }
 }
@@ -363,25 +363,25 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+        ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called during listing");
         }
-        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> Result<()> {
             panic!("put should not be called during listing");
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
             panic!("copy_atomic should not be called during listing");
         }
-        fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+        fn head(&self, _path: &Url) -> Result<crate::FileMeta> {
             panic!("head should not be called during listing");
         }
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> Result<()> {
             panic!("delete should not be called during listing");
         }
     }
@@ -1810,7 +1810,7 @@ struct FiniteListingHandler {
 }
 
 impl StorageHandler for FiniteListingHandler {
-    fn list_from(&self, _path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, _path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
         let log_root = self.log_root.clone();
         let pulled = self.items_pulled.clone();
         let iter = (0..self.count as u64).map(move |version| {
@@ -1827,23 +1827,23 @@ impl StorageHandler for FiniteListingHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<bytes::Bytes>> {
+    ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
-    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> Result<()> {
         panic!("put should not be called during listing");
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
         panic!("copy_atomic should not be called during listing");
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, _path: &Url) -> Result<FileMeta> {
         panic!("head should not be called during listing");
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> Result<()> {
         panic!("delete should not be called during listing");
     }
 }

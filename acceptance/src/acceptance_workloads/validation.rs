@@ -12,7 +12,7 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use delta_kernel_workloads::models::{ReadExpected, SnapshotExpected};
 use itertools::Itertools;
 use tracing::debug;
@@ -80,7 +80,7 @@ fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
 
 /// Validate read results against expected outcome.
 pub fn validate_read_result(
-    result: DeltaResult<ReadResult>,
+    result: Result<ReadResult>,
     expected_dir: &Path,
     expected: &ReadExpected,
 ) -> Result<(), String> {
@@ -129,7 +129,7 @@ pub fn validate_read_result(
 
 /// Validate snapshot result against expected outcome.
 pub fn validate_snapshot(
-    result: DeltaResult<SnapshotResult>,
+    result: Result<SnapshotResult>,
     expected: &SnapshotExpected,
 ) -> Result<(), String> {
     match (result, expected) {

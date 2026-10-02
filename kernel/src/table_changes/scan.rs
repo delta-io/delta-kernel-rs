@@ -16,7 +16,7 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, EngineData, FileMeta, KernelError, PredicateRef};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Result};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -108,7 +108,7 @@ impl TableChangesScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
-    pub fn build(self) -> DeltaResult<TableChangesScan> {
+    pub fn build(self) -> Result<TableChangesScan> {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
@@ -160,7 +160,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
         let commits = self
             .table_changes
             .log_segment
@@ -217,7 +217,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -233,7 +233,7 @@ impl TableChangesScan {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
             }) // Iterator-Result-Iterator
             .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> DeltaResult<_> {
+            .map(move |resolved_scan_file| -> KernelResult<_> {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
@@ -257,7 +257,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -297,7 +297,7 @@ fn read_scan_file(
             .parquet_handler()
             .read_parquet_files(&[file], physical_schema, None)?;
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
+    let result = read_result_iter.map(move |batch| -> KernelResult<_> {
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {

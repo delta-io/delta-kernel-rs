@@ -28,7 +28,7 @@ use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, Snapshot, Version};
+use crate::{Engine, KernelResult, Snapshot, Version};
 
 // ============================================================================
 // Expected values
@@ -408,7 +408,7 @@ struct BuiltCrcTest {
 impl BuiltCrcTest {
     /// Construct a `LogSegment` directly from the store state (no `Snapshot`) and run
     /// `build_crc_from_base` against `base`.
-    fn incrementally_build_crc(&self, base: &Crc) -> DeltaResult<Crc> {
+    fn incrementally_build_crc(&self, base: &Crc) -> KernelResult<Crc> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
@@ -420,7 +420,7 @@ impl BuiltCrcTest {
     fn pick_latest_base_crc(
         &self,
         in_memory_base: Option<&Arc<Crc>>,
-    ) -> DeltaResult<Option<Version>> {
+    ) -> KernelResult<Option<Version>> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
@@ -431,7 +431,7 @@ impl BuiltCrcTest {
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
-    fn read_crc_at(&self, version: u64) -> DeltaResult<Crc> {
+    fn read_crc_at(&self, version: u64) -> KernelResult<Crc> {
         try_read_crc_file(
             &self.engine,
             &ParsedLogPath::create_parsed_crc(&self.url, version),

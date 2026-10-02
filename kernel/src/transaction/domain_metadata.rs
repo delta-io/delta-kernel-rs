@@ -7,7 +7,7 @@ use crate::row_tracking::{
     RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
 };
 use crate::table_features::TableFeature;
-use crate::{create_row, DeltaResult, Engine};
+use crate::{create_row, Engine, KernelResult};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -18,7 +18,7 @@ impl<S> Transaction<S> {
     /// - User domains cannot use the delta.* prefix (system-reserved)
     /// - Domain removals are not allowed in create-table transactions
     /// - No duplicate domains within a single transaction (across user and system operations)
-    pub(super) fn validate_domain_metadata_operations(&self) -> DeltaResult<()> {
+    pub(super) fn validate_domain_metadata_operations(&self) -> KernelResult<()> {
         // Feature validation (applies to all transactions with domain operations)
         let has_domain_ops = !self.system_domain_metadata_additions.is_empty()
             || self.provided_row_tracking_high_water_mark.is_some()
@@ -126,7 +126,7 @@ impl<S> Transaction<S> {
     /// This prevents arbitrary `delta.*` domains from entering a transaction through internal
     /// transforms or dedicated system-domain operations. Each known system domain must have its
     /// corresponding feature enabled in the protocol.
-    fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
+    fn validate_system_domain_feature(&self, domain: &str) -> KernelResult<()> {
         let table_config = &self.effective_table_config;
 
         // Map domain to its required feature
@@ -161,7 +161,7 @@ impl<S> Transaction<S> {
     pub(super) fn generate_user_domain_removal_actions(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Vec<DomainMetadata>> {
+    ) -> KernelResult<Vec<DomainMetadata>> {
         if self.user_domain_removals.is_empty() {
             return Ok(vec![]);
         }
@@ -206,7 +206,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
+    ) -> KernelResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
         let is_create = self.is_create_table();
 
         // Validate domain operations (includes feature validation)

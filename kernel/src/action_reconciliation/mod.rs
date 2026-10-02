@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, KernelResult};
 
 pub(crate) mod log_replay;
 
@@ -55,7 +55,7 @@ pub(crate) trait RetentionCalculator {
     /// `deletion_timestamp` field format for comparison.
     ///
     /// Note: The default retention period is 7 days, matching delta-spark's behavior.
-    fn deleted_file_retention_timestamp(&self) -> DeltaResult<i64> {
+    fn deleted_file_retention_timestamp(&self) -> KernelResult<i64> {
         let retention_duration = self.table_properties().deleted_file_retention_duration;
 
         deleted_file_retention_timestamp_with_time(
@@ -77,7 +77,7 @@ pub(crate) trait RetentionCalculator {
     /// # Errors
     /// Returns an error if the current system time cannot be obtained or if the retention
     /// duration exceeds the maximum representable value for i64.
-    fn get_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
+    fn get_transaction_expiration_timestamp(&self) -> KernelResult<Option<i64>> {
         calculate_transaction_expiration_timestamp(self.table_properties())
     }
 }
@@ -95,7 +95,7 @@ pub(crate) trait RetentionCalculator {
 pub(crate) fn deleted_file_retention_timestamp_with_time(
     retention_duration: Option<Duration>,
     now_duration: Duration,
-) -> DeltaResult<i64> {
+) -> KernelResult<i64> {
     // Use provided retention duration or default (7 days)
     let retention_duration =
         retention_duration.unwrap_or_else(|| Duration::from_secs(DEFAULT_RETENTION_SECS));
@@ -117,10 +117,10 @@ pub(crate) fn deleted_file_retention_timestamp_with_time(
 /// Returns None if set_transaction_retention_duration is not set.
 pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties: &TableProperties,
-) -> DeltaResult<Option<i64>> {
+) -> KernelResult<Option<i64>> {
     table_properties
         .set_transaction_retention_duration
-        .map(|duration| -> DeltaResult<i64> {
+        .map(|duration| -> KernelResult<i64> {
             let now_ms = crate::utils::current_time_ms()?;
 
             let expiration_ms = i64::try_from(duration.as_millis()).map_err(|_| {
@@ -139,9 +139,10 @@ mod tests {
     use derive_more::Constructor;
 
     use super::*;
+    use crate::Result;
 
     #[test]
-    fn test_deleted_file_retention_timestamp_with_time() -> DeltaResult<()> {
+    fn test_deleted_file_retention_timestamp_with_time() -> Result<()> {
         // Test with default retention (7 days)
         let reference_time = Duration::from_secs(1_000_000_000);
         let result = deleted_file_retention_timestamp_with_time(None, reference_time)?;
@@ -191,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_transaction_expiration_timestamp() -> DeltaResult<()> {
+    fn test_calculate_transaction_expiration_timestamp() -> Result<()> {
         // No set_transaction_retention_duration
         let properties = TableProperties::default();
         let result = calculate_transaction_expiration_timestamp(&properties)?;
@@ -246,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> DeltaResult<()> {
+    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> Result<()> {
         // Test with default retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);
@@ -275,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> DeltaResult<()> {
+    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> Result<()> {
         // Test with no transaction retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);

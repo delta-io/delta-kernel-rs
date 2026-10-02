@@ -48,14 +48,14 @@ pub fn insert_url_handler(
 /// ```rust
 /// # use url::Url;
 /// # use delta_kernel_default_engine::storage::store_from_url;
-/// # use delta_kernel::DeltaResult;
-/// # fn example() -> DeltaResult<()> {
+/// # use delta_kernel::Result;
+/// # fn example() -> Result<()> {
 /// let url = Url::parse("file:///path/to/table")?;
 /// let store = store_from_url(&url)?;
 /// # Ok(())
 /// # }
 /// ```
-pub fn store_from_url(url: &Url) -> delta_kernel::DeltaResult<Arc<dyn ObjectStore>> {
+pub fn store_from_url(url: &Url) -> delta_kernel::Result<Arc<dyn ObjectStore>> {
     store_from_url_opts(url, std::iter::empty::<(&str, &str)>())
 }
 
@@ -72,8 +72,8 @@ pub fn store_from_url(url: &Url) -> delta_kernel::DeltaResult<Arc<dyn ObjectStor
 /// # use url::Url;
 /// # use std::collections::HashMap;
 /// # use delta_kernel_default_engine::storage::store_from_url_opts;
-/// # use delta_kernel::DeltaResult;
-/// # fn example() -> DeltaResult<()> {
+/// # use delta_kernel::Result;
+/// # fn example() -> Result<()> {
 /// let url = Url::parse("s3://my-bucket/path/to/table")?;
 /// let options = HashMap::from([("region", "us-west-2")]);
 /// let store = store_from_url_opts(&url, options)?;
@@ -83,7 +83,7 @@ pub fn store_from_url(url: &Url) -> delta_kernel::DeltaResult<Arc<dyn ObjectStor
 pub fn store_from_url_opts<I, K, V>(
     url: &Url,
     options: I,
-) -> delta_kernel::DeltaResult<Arc<dyn ObjectStore>>
+) -> delta_kernel::Result<Arc<dyn ObjectStore>>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,

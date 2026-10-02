@@ -17,7 +17,7 @@ use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, KernelError, RowVisitor};
+use crate::{KernelError, KernelResult, Result, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +131,7 @@ pub(crate) struct TableChangesFileAction {
 
 impl TableChangesFileAction {
     /// Converts a scan file, preserving both sides of a same-commit deletion-vector update.
-    pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> DeltaResult<Self> {
+    pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> KernelResult<Self> {
         match scan_file.scan_type {
             CdfScanFileType::Add => {
                 require!(
@@ -197,10 +197,10 @@ impl TableChangesScanFile {
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
-) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
+    scan_metadata: impl Iterator<Item = KernelResult<TableChangesScanMetadata>>,
+) -> impl Iterator<Item = KernelResult<CdfScanFile>> {
     scan_metadata
-        .map(|scan_metadata| -> DeltaResult<_> {
+        .map(|scan_metadata| -> KernelResult<_> {
             let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
@@ -240,7 +240,7 @@ pub(crate) fn visit_cdf_scan_files<T>(
     scan_metadata: &TableChangesScanMetadata,
     context: T,
     callback: CdfScanCallback<T>,
-) -> DeltaResult<T> {
+) -> KernelResult<T> {
     let mut visitor = CdfScanFileVisitor {
         callback,
         context,
@@ -310,7 +310,7 @@ fn read_file_side<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
     spec: &FileSideSpec,
-) -> DeltaResult<Option<FileSide>> {
+) -> KernelResult<Option<FileSide>> {
     let Some(path) = getters[spec.start_index].get_opt(row_index, spec.path_field)? else {
         return Ok(None);
     };
@@ -336,7 +336,7 @@ fn read_file_side<'a>(
 }
 
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
             KernelError::InternalError(format!(

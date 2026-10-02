@@ -4,8 +4,8 @@ use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, FileMeta, FileSlice, KernelError,
-    StorageHandler,
+    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, Result,
+    ResultIteratorStatic, StorageHandler,
 };
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -47,7 +47,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
-) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
     // directory-like, because it strips trailing /, so we're reduced to manually checking the
@@ -99,7 +99,7 @@ async fn read_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileSlice>,
     readahead: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<Bytes>>> {
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
         async move {
@@ -137,7 +137,7 @@ async fn copy_atomic_impl(
     store: Arc<DynObjectStore>,
     src_path: Path,
     dest_path: Path,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
     // necessarily atomic, but since the source file is immutable, we aren't exposed to the
     // possibility of source file changing while we do the PUT.
@@ -160,7 +160,7 @@ async fn put_impl(
     path: Path,
     data: Bytes,
     overwrite: bool,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     let put_mode = if overwrite {
         PutMode::Overwrite
     } else {
@@ -175,7 +175,7 @@ async fn put_impl(
 }
 
 /// Native async implementation for delete.
-async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> DeltaResult<()> {
+async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> KernelResult<()> {
     match store.delete(&path).await {
         Ok(()) => Ok(()),
         Err(object_store::Error::NotFound { .. }) => Ok(()),
@@ -184,7 +184,7 @@ async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> DeltaResult<()> 
 }
 
 /// Native async implementation for head
-async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
+async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMeta> {
     let meta = store.head(&Path::from_url_path(url.path())?).await?;
     Ok(FileMeta {
         location: url,
@@ -194,7 +194,7 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
         self.list_from_with_cancellation(path, None)
     }
 
@@ -202,7 +202,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    ) -> Result<ResultIteratorStatic<FileMeta>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -218,7 +218,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     ///
     /// Multiple reads may occur in parallel, depending on the configured readahead.
     /// See [`Self::with_readahead`].
-    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
         self.read_files_with_cancellation(files, None)
     }
 
@@ -226,7 +226,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
+    ) -> Result<ResultIteratorStatic<Bytes>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -236,25 +236,25 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         Ok(iter)
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
         let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(put_impl(self.inner.clone(), path, data, overwrite))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()> {
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
         let future = copy_atomic_impl(self.inner.clone(), src_path, dest_path);
         self.task_executor.block_on(future)
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> Result<FileMeta> {
         let future = head_impl(self.inner.clone(), path.clone());
         self.task_executor.block_on(future)
     }
 
-    fn delete(&self, path: &Url) -> DeltaResult<()> {
+    fn delete(&self, path: &Url) -> Result<()> {
         let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(delete_impl(self.inner.clone(), path))

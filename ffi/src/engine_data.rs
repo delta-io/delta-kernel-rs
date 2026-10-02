@@ -11,8 +11,8 @@ use delta_kernel::arrow::array::{
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::DeltaResult;
-use delta_kernel::EngineData;
+use delta_kernel::Result;
+use delta_kernel::{EngineData, KernelResult};
 
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
@@ -77,13 +77,13 @@ impl ArrowFFIData {
     /// The returned `ArrowFFIData` owns the exported data. The caller is responsible for
     /// either importing it (via `from_ffi`) or dropping it (the `Drop` impls on
     /// `FFI_ArrowArray`/`FFI_ArrowSchema` call their release callbacks).
-    pub fn try_from_engine_data(data: Box<dyn EngineData>) -> DeltaResult<Self> {
+    pub fn try_from_engine_data(data: Box<dyn EngineData>) -> Result<Self> {
         let record_batch = data.try_into_record_batch()?;
         Self::try_from_record_batch(record_batch)
     }
 
     /// Export a `RecordBatch` as Arrow C Data Interface structs.
-    pub fn try_from_record_batch(batch: RecordBatch) -> DeltaResult<Self> {
+    pub fn try_from_record_batch(batch: RecordBatch) -> Result<Self> {
         let sa: StructArray = batch.into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 }
 
 #[cfg(feature = "default-engine-base")]
-fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
+fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> KernelResult<*mut ArrowFFIData> {
     Ok(Box::into_raw(Box::new(ArrowFFIData::try_from_engine_data(
         data,
     )?)))
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn get_engine_data(
 unsafe fn get_engine_data_impl(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-) -> DeltaResult<Handle<ExclusiveEngineData>> {
+) -> KernelResult<Handle<ExclusiveEngineData>> {
     let array_data = unsafe { arrow::array::ffi::from_ffi(array, schema) };
     let record_batch: RecordBatch = StructArray::from(array_data?).into();
     let arrow_engine_data: ArrowEngineData = record_batch.into();

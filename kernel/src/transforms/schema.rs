@@ -43,9 +43,9 @@ use crate::transforms::{
 /// performed. That carrier determines the return type of each transform method.
 ///
 /// For example, a simple read-only visitor would use `()` as a carrier, while a validity checker
-/// could use `DeltaResult<()>` instead. A mutating transform uses `Cow<_>`, returning `Cow::Owned`
+/// could use `Result<()>` instead. A mutating transform uses `Cow<_>`, returning `Cow::Owned`
 /// for changed/replaced nodes, and a filtering transform uses `Option<Cow<_>>`, where `None`
-/// indicates the node should be dropped rather than replaced. `DeltaResult<Cow<_>>` and
+/// indicates the node should be dropped rather than replaced. `Result<Cow<_>>` and
 /// `Result<Option<Cow<_>>, E>` round out the set as fallible mutating and fitering transforms that
 /// short circuit immediately upon `Err`.
 pub trait SchemaTransform<'a> {

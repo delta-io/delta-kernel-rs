@@ -35,7 +35,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, KernelError as DeltaError, Version};
+use crate::{Engine, KernelError as DeltaError, KernelResult, Result, Version};
 
 pub(crate) mod search;
 
@@ -533,7 +533,7 @@ pub fn latest_version_as_of(
     engine: &dyn Engine,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
-) -> DeltaResult<CommitAt> {
+) -> Result<CommitAt> {
     timestamp_to_version(
         snapshot,
         engine,
@@ -574,7 +574,7 @@ pub fn first_version_after(
     engine: &dyn Engine,
     timestamp: Timestamp,
     resolved_commit_type: HistoryCommitType,
-) -> DeltaResult<CommitAt> {
+) -> Result<CommitAt> {
     timestamp_to_version(
         snapshot,
         engine,
@@ -634,7 +634,7 @@ pub fn timestamp_range_to_versions(
     engine: &dyn Engine,
     start_timestamp: Timestamp,
     end_timestamp: Option<Timestamp>,
-) -> DeltaResult<(Version, Option<Version>)> {
+) -> Result<(Version, Option<Version>)> {
     if let Some(end_timestamp) = end_timestamp {
         // The `start_timestamp` must be no greater than the `end_timestamp`.
         require!(
@@ -717,7 +717,7 @@ fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-) -> DeltaResult<Version> {
+) -> KernelResult<Version> {
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
     list_delta_log_from_storage(
         engine.storage_handler().as_ref(),
@@ -768,7 +768,7 @@ fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-) -> DeltaResult<Version> {
+) -> KernelResult<Version> {
     let mut last_complete_checkpoint: Option<Version> = None;
     // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
     // checkpoint completeness.
@@ -891,7 +891,7 @@ pub fn get_earliest_commit(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
     commit_type: HistoryCommitType,
-) -> DeltaResult<Version> {
+) -> Result<Version> {
     match commit_type {
         HistoryCommitType::Published => get_earliest_published_commit_version(
             engine,

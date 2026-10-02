@@ -9,7 +9,6 @@
 //
 // TODO: The `IoOperation` paths will eventually be used to replace SyncEngine with an
 // PlanBasedEngine (backed by this PlanExecutor)
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -41,8 +40,8 @@ use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EvaluationHandler as _, FileMeta, KernelError,
-    StorageHandler as _,
+    EvaluationHandler as _, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
+    Result, StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`].
@@ -79,7 +78,7 @@ impl Default for SyncPlanExecutor {
 }
 
 impl PlanExecutor for SyncPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+    fn execute_op(&self, op: Operation) -> Result<PlanResult> {
         match op {
             Operation::IoOperation(io_op) => self.execute_io(io_op),
             Operation::QueryPlan(query) => self.execute_query(query),
@@ -88,20 +87,20 @@ impl PlanExecutor for SyncPlanExecutor {
 }
 
 impl SyncPlanExecutor {
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
+    fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         match op {
             IoOperation::FileListing { url } => {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<DeltaResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<DeltaResult<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<KernelResult<Bytes>> = self.storage.read_files(files)?.collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {
@@ -132,7 +131,7 @@ impl SyncPlanExecutor {
 
     /// Evaluates `query` by materializing each node's output in slice (topological) order, then
     /// streams the terminal (last) node's batches to the caller.
-    fn execute_query(&self, query: Plan) -> DeltaResult<PlanResult> {
+    fn execute_query(&self, query: Plan) -> KernelResult<PlanResult> {
         let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(query.nodes.len());
         for node in query.nodes {
             let output = self.eval_node(node, &outputs)?;
@@ -153,7 +152,7 @@ impl SyncPlanExecutor {
         &self,
         node: PlanNode,
         results: &[Vec<RecordBatch>],
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         let PlanNode { op, inputs } = node;
         match op {
             Operator::ScanJson(ScanJson {
@@ -197,7 +196,7 @@ impl SyncPlanExecutor {
         files: Vec<ScanFile>,
         file_constant_columns: Vec<String>,
         schema: SchemaRef,
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         // The engine reads only the non-constant columns; constants are spliced in afterwards.
         let read_fields = schema
             .fields()
@@ -212,7 +211,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: DeltaResultIteratorStatic<ArrowEngineData> = match file_type {
+            let data: KernelResultIteratorStatic<ArrowEngineData> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,
@@ -250,7 +249,7 @@ impl SyncPlanExecutor {
         &self,
         dynamic_scan: DynamicScan,
         input: &[RecordBatch],
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         let files = dynamic_scan_files(&dynamic_scan, input)?;
         self.eval_scan(
             dynamic_scan.file_type,
@@ -264,7 +263,7 @@ impl SyncPlanExecutor {
 fn dynamic_scan_files(
     dynamic_scan: &DynamicScan,
     input: &[RecordBatch],
-) -> DeltaResult<Vec<ScanFile>> {
+) -> KernelResult<Vec<ScanFile>> {
     let mut files = Vec::new();
     for batch in input {
         let path = extract_column(batch, dynamic_scan.path_column.path())?;
@@ -353,7 +352,7 @@ fn dynamic_scan_files(
     Ok(files)
 }
 
-fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
+fn eval_project(project: Project, input: &[RecordBatch]) -> KernelResult<Vec<RecordBatch>> {
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
@@ -373,7 +372,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<Reco
         .collect()
 }
 
-fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
+fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> KernelResult<Vec<RecordBatch>> {
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
@@ -401,7 +400,7 @@ fn eval_semi_join(
     join: SemiJoin,
     probe: &[RecordBatch],
     build: &[RecordBatch],
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let mut build_keys = HashSet::new();
     for batch in build {
         build_keys.extend(encode_keys_as_rows(batch, &join.build_keys)?);
@@ -426,7 +425,7 @@ fn splice_file_constants(
     schema: &SchemaRef,
     file_constant_columns: &[String],
     constants: &[Scalar],
-) -> DeltaResult<Vec<ArrayRef>> {
+) -> KernelResult<Vec<ArrayRef>> {
     let (_, read_columns, rows) = batch.into_parts();
     let mut read_columns = read_columns.into_iter();
     schema
@@ -448,7 +447,7 @@ fn splice_file_constants(
 pub(super) fn encode_keys_as_rows(
     batch: &RecordBatch,
     columns: &[ColumnName],
-) -> DeltaResult<Vec<OwnedRow>> {
+) -> KernelResult<Vec<OwnedRow>> {
     if columns.is_empty() {
         let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
         return Ok(vec![key; batch.num_rows()]);
@@ -468,7 +467,7 @@ pub(super) fn encode_keys_as_rows(
     Ok(rows.iter().map(|row| row.owned()).collect())
 }
 
-fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
+fn scalar_value(array: &dyn Array, row: usize) -> KernelResult<Scalar> {
     if array.is_null(row) {
         return Ok(Scalar::Null(DataType::try_from_arrow(array.data_type())?));
     }
@@ -488,12 +487,12 @@ fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
 /// [`PlanBuilder::build`] output for an absent input) yields zero-row data.
 ///
 /// [`PlanBuilder::build`]: crate::plans::PlanBuilder::build
-fn values_to_record_batch(values: Values) -> DeltaResult<RecordBatch> {
+fn values_to_record_batch(values: Values) -> KernelResult<RecordBatch> {
     let Values { schema, rows } = values;
     let columns: Vec<ArrayRef> = schema
         .fields()
         .enumerate()
-        .map(|(col, field)| -> DeltaResult<ArrayRef> {
+        .map(|(col, field)| -> KernelResult<ArrayRef> {
             let element_type = ArrayType::new(field.data_type().clone(), true);
             let column = ArrayData::try_new(element_type, rows.iter().map(|row| row[col].clone()))?;
             // This produces a single array row. The array contains n elements, one for each
@@ -523,7 +522,7 @@ mod tests {
     use crate::schema::{schema, schema_ref, ToSchema as _};
 
     #[test]
-    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
+    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> Result<()> {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
@@ -562,7 +561,7 @@ mod tests {
         size: Scalar,
         last_modified: Scalar,
         dv: Scalar,
-    ) -> DeltaResult<Vec<ScanFile>> {
+    ) -> Result<Vec<ScanFile>> {
         let input_schema = schema_ref! {
             nullable "path": STRING,
             nullable "size": LONG,

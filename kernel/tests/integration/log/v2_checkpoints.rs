@@ -19,7 +19,7 @@ use delta_kernel::schema::{schema, schema_ref, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{Engine, Result, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
@@ -33,7 +33,7 @@ use crate::common::write_utils::{
     simple_id_batch,
 };
 
-fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
+fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> Result<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
@@ -47,10 +47,7 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
     Ok(batches)
 }
 
-fn test_v2_checkpoint_with_table(
-    table_name: &str,
-    mut expected_table: Vec<String>,
-) -> DeltaResult<()> {
+fn test_v2_checkpoint_with_table(table_name: &str, mut expected_table: Vec<String>) -> Result<()> {
     let batches = read_v2_checkpoint_table(table_name)?;
 
     sort_lines!(expected_table);
@@ -192,7 +189,7 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
 ///   `v2_checkpoints_parquet_with_last_checkpoint`
 #[test]
-fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_json_with_sidecars() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-sidecars",
         generate_sidecar_expected_data(),
@@ -200,7 +197,7 @@ fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_parquet_with_sidecars() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-sidecars",
         generate_sidecar_expected_data(),
@@ -208,7 +205,7 @@ fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_json_without_sidecars() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-without-sidecars",
         get_without_sidecars_table(),
@@ -216,7 +213,7 @@ fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
+fn v2_checkpoints_parquet_without_sidecars() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-without-sidecars",
         get_without_sidecars_table(),
@@ -224,12 +221,12 @@ fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_classic_checkpoint_json() -> DeltaResult<()> {
+fn v2_classic_checkpoint_json() -> Result<()> {
     test_v2_checkpoint_with_table("v2-classic-checkpoint-json", get_classic_checkpoint_table())
 }
 
 #[test]
-fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
+fn v2_classic_checkpoint_parquet() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-classic-checkpoint-parquet",
         get_classic_checkpoint_table(),
@@ -237,7 +234,7 @@ fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
+fn v2_checkpoints_json_with_last_checkpoint() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-last-checkpoint",
         get_simple_id_table(),
@@ -245,7 +242,7 @@ fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
+fn v2_checkpoints_parquet_with_last_checkpoint() -> Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-last-checkpoint",
         get_simple_id_table(),
@@ -258,7 +255,7 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
 /// batches. All batches in a parquet file must share the same schema. This test verifies
 /// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
+async fn test_v2_checkpoint_parquet_write() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -330,7 +327,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
 /// `_last_checkpoint`, the checkpoint parquet contents, and performs a scan to verify the data
 /// is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
+async fn test_v2_checkpoint_with_sidecars() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -760,7 +757,7 @@ async fn test_checkpoint_spec_rejected(
     #[case] enable_v2checkpoint: bool,
     #[case] spec: CheckpointSpec,
     #[case] err_substring: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -790,7 +787,7 @@ async fn test_checkpoint_spec_rejected(
 /// sidecar files, the main checkpoint contains no `sidecar` action rows, and `_last_checkpoint`
 /// reports `numOfAddFiles = 0` and `sizeInBytes` equal to the main checkpoint file size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
+async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -863,7 +860,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
-) -> DeltaResult<Arc<Snapshot>> {
+) -> Result<Arc<Snapshot>> {
     fn make_info_array(names: &[&str]) -> ArrayRef {
         let name_array: ArrayRef = Arc::new(StringArray::from(
             names.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
@@ -1665,7 +1662,7 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 /// A version holding two complete checkpoints must load from the uuid-named one, since it outranks
 /// the classic-named one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> DeltaResult<()> {
+async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 

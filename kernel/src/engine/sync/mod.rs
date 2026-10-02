@@ -26,7 +26,7 @@ use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
-    DeltaResult, Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, ParquetHandler,
+    Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, KernelResult, ParquetHandler,
     PredicateRef, SchemaRef, StorageHandler,
 };
 
@@ -119,7 +119,7 @@ impl Engine for SyncEngine {
 pub(super) fn resolve_scope(
     default_store: Option<&Arc<DynObjectStore>>,
     url: &Url,
-) -> DeltaResult<(Arc<DynObjectStore>, Url, Path)> {
+) -> KernelResult<(Arc<DynObjectStore>, Url, Path)> {
     if let Some(store) = default_store {
         let mut base_url = url.clone();
         base_url.set_path("/");
@@ -170,7 +170,7 @@ pub(super) fn resolve_scope(
 pub(super) fn get_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
-) -> DeltaResult<Bytes> {
+) -> KernelResult<Bytes> {
     let (store, _, path) = resolve_scope(default_store, location)?;
     let get_result = futures::executor::block_on(store.get(&path))?;
     Ok(futures::executor::block_on(get_result.bytes())?)
@@ -187,7 +187,7 @@ pub(super) fn put_bytes(
     location: &Url,
     data: Bytes,
     overwrite: bool,
-) -> DeltaResult<()> {
+) -> KernelResult<()> {
     if location.scheme() == "file" {
         if let Ok(file_path) = location.to_file_path() {
             if let Some(parent) = file_path.parent() {
@@ -224,10 +224,10 @@ fn read_files_arrow<F, I>(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> impl Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static
+) -> impl Iterator<Item = KernelResult<ArrowEngineData>> + Send + 'static
 where
-    I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
+    I: Iterator<Item = KernelResult<ArrowEngineData>> + Send + 'static,
+    F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> KernelResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     let files = files.to_vec(); // Clone for static iterator (clippy hates chained to_vec+into_iter)

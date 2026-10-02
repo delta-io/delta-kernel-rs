@@ -8,7 +8,9 @@ use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
-use crate::{create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError};
+use crate::{
+    create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError, KernelResult,
+};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -16,7 +18,7 @@ use crate::{create_row, DataType, Engine, EngineData, Expression, ExpressionRef,
 /// inserting kernel-only fields after the last engine field.
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
-) -> Result<Vec<(&'static str, ExpressionRef)>, KernelError> {
+) -> KernelResult<Vec<(&'static str, ExpressionRef)>> {
     let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
     let mut literal_exprs = vec![
@@ -59,7 +61,7 @@ fn commit_info_literal_exprs(
 fn string_map_literal_expr(
     map: Option<HashMap<String, Option<String>>>,
     map_type: &MapType,
-) -> Result<ExpressionRef, KernelError> {
+) -> KernelResult<ExpressionRef> {
     let expression = match map {
         Some(map) => lit(MapData::try_new(
             map_type.clone(),
@@ -76,7 +78,7 @@ impl<S> Transaction<S> {
         &self,
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
-    ) -> Result<Box<dyn EngineData>, KernelError> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
@@ -197,7 +199,7 @@ mod tests {
     use crate::transaction::Transaction;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::utils::FoldWithOption as _;
-    use crate::{DeltaResult, Engine, EngineData, RowVisitor};
+    use crate::{Engine, EngineData, KernelResult, Result, RowVisitor};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
 
@@ -288,7 +290,7 @@ mod tests {
     /// Create a transaction with the given engine_commit_info, using the shared test table.
     fn make_txn(
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
+    ) -> KernelResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -315,7 +317,7 @@ mod tests {
     /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
     /// outer struct, matching the Delta log action format produced by `LOG_COMMIT_INFO_SCHEMA`.
     #[test]
-    fn test_build_commit_info_none_branch() -> DeltaResult<()> {
+    fn test_build_commit_info_none_branch() -> Result<()> {
         let (engine, txn) = make_txn(None)?;
         let result = ArrowEngineData::try_from_engine_data(
             txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
@@ -333,7 +335,7 @@ mod tests {
     /// engine schema has fields that are fully disjoint from CommitInfo -- all CommitInfo
     /// fields are appended after the engine-only fields, in CommitInfo schema order.
     #[test]
-    fn test_build_commit_info_disjoint_schemas() -> DeltaResult<()> {
+    fn test_build_commit_info_disjoint_schemas() -> Result<()> {
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("customApp", ArrowDataType::Utf8, false),
@@ -379,7 +381,7 @@ mod tests {
     /// engine schema contains every kernel's CommitInfo field.
     /// All overlapping fields must be replaced by kernel values, no new fields added.
     #[test]
-    fn test_build_commit_info_full_overlap() -> DeltaResult<()> {
+    fn test_build_commit_info_full_overlap() -> Result<()> {
         let mut map_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         map_builder.keys().append_value("stale_key");
         map_builder.values().append_value("stale_value");
@@ -462,7 +464,7 @@ mod tests {
     /// fields pass through, and remaining CommitInfo fields are appended after the last engine
     /// field.
     #[test]
-    fn test_build_commit_info_partial_overlap() -> DeltaResult<()> {
+    fn test_build_commit_info_partial_overlap() -> Result<()> {
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("timestamp", ArrowDataType::Int64, true),
@@ -505,7 +507,7 @@ mod tests {
     /// engine schema has overlapping fields with different DataTypes than kernel expects.
     /// Kernel replacement must win, so each output field has the kernel's type.
     #[test]
-    fn test_build_commit_info_type_conflict_replaced_by_kernel() -> DeltaResult<()> {
+    fn test_build_commit_info_type_conflict_replaced_by_kernel() -> Result<()> {
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("timestamp", ArrowDataType::Utf8, true),
@@ -552,7 +554,7 @@ mod tests {
     /// engine schema is empty -- all CommitInfo fields are prepended (which, with no engine
     /// fields preceding them, is equivalent to producing the full CommitInfo schema).
     #[test]
-    fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
+    fn test_build_commit_info_empty_engine_schema() -> Result<()> {
         // A 0-row, 0-column RecordBatch with an empty kernel schema.
         let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
         let empty_schema = schema_ref! {};
