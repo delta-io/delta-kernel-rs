@@ -305,7 +305,7 @@ fn leaf_stats_field(
     // column) so this is not forgotten once geospatial support lands -- checked before the range
     // check below so an out-of-range geo field ID still errors. Reachable only with the
     // `geo-type-in-dev` feature enabled.
-    // TODO: emit proper stats for geospatial columns.
+    // TODO(#3491): emit proper stats for geospatial columns.
     #[cfg(feature = "geo-type-in-dev")]
     if matches!(
         field.data_type(),
@@ -600,7 +600,8 @@ fn collect_stats_schema<'a>(
 /// `{stats: {numRecords, minValues: {id}, ...}, ...}` becomes
 /// `{content_stats: {id: {lower_bound, value_count, ...}}, ...}`.
 ///
-/// `stats_column_name` must name a Delta-stats struct in `input_schema` (the schema of `data`):
+/// `stats_column_name` must name a Delta-stats struct in `input_schema` (the schema of
+/// `file_metadata`):
 /// `numRecords`, an optional `tightBounds`, and `minValues`/`maxValues`/`nullCount` nested to
 /// mirror the table. `table_schema` is the physical table layout (carrying `parquet.field.id`)
 /// that names and field-ids the AMT leaves.
@@ -611,7 +612,7 @@ fn collect_stats_schema<'a>(
 /// silently drops stats.
 pub(crate) fn convert_delta_stats_to_amt_stats(
     engine: &dyn Engine,
-    data: &dyn EngineData,
+    file_metadata: &dyn EngineData,
     stats_column_name: &str,
     table_schema: &StructType,
     input_schema: &StructType,
@@ -627,15 +628,19 @@ pub(crate) fn convert_delta_stats_to_amt_stats(
         )));
     };
 
-    let (output_schema, expr) =
-        build_delta_to_amt_pivot_expression(table_schema, stats_column_name, input_schema, known)?;
+    let (output_schema, expr) = build_delta_to_amt_pivot_expression(
+        table_schema,
+        stats_column_name,
+        input_schema,
+        known_stats_schema,
+    )?;
 
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         Arc::new(input_schema.clone()),
         expr,
         output_schema.into(),
     )?;
-    evaluator.evaluate(data)
+    evaluator.evaluate(file_metadata)
 }
 
 /// Builds the pivot for `input_schema`: a struct-patch expression plus its output schema that
@@ -653,6 +658,10 @@ fn build_delta_to_amt_pivot_expression(
 ) -> DeltaResult<(SchemaRef, ExpressionRef)> {
     let (amt_struct_expr, amt_stats_schema) =
         build_amt_flat_stats_expr(table_schema, stats_column_name, known_stats_schema)?;
+    // TODO(#3491): `amt_struct_expr` always builds a non-null struct, so a row with null Delta
+    // stats still gets a non-null content_stats whose `tight_bounds` resolves to true via
+    // `coalesce(tightBounds, true)` -- wrongly asserting tight bounds for a file with no stats.
+    // content_stats should be null when the source stats cell is null.
     let content_stats = StructField::nullable(CONTENT_STATS_FIELD_NAME, amt_stats_schema);
     ProjectionStructPatchBuilder::new(input_schema)
         .replace(stats_column_name, content_stats, Arc::new(amt_struct_expr))
@@ -727,14 +736,20 @@ fn build_leaf_pivot_expr(
 
     let exprs = stats_struct.fields().map(|f| {
         let expr = match f.name().as_str() {
-            // TODO: Delta keeps NaN in min/max but Iceberg bounds exclude it, so copying the bound
-            // directly can misstate it for a column containing NaN. A follow-up should null the
-            // affected bound once a NaN-detection expression exists.
+            // TODO(#3491): the bound is copied straight from Delta, but two cases can misstate it:
+            // Delta keeps NaN in min/max while Iceberg bounds exclude it (null the bound once a
+            // NaN-detection expression exists), and Delta truncates timestamp bounds to ms so the
+            // upper bound can be up to 999us below the real max (widen it, saturating). Neither
+            // widening is applied yet; `tight_bounds = false` alone does not make the bound safe.
             LOWER_BOUND => nested_col(MIN_VALUES),
             UPPER_BOUND => nested_col(MAX_VALUES),
+            // TODO(#3491): nullCount is copied unconditionally, but under `tightBounds = false`
+            // (e.g. DV files) the protocol treats it as absent unless it is 0 or `numRecords`.
             NULL_VALUE_COUNT => nested_col(NULL_COUNT),
-            // Delta has no per-column value count; `numRecords` counts every row -- exact for a
-            // top-level leaf, an over-approximation under a nullable struct.
+            // TODO(#3491): Delta has no per-column value count. `numRecords` counts every row --
+            // exact for a top-level leaf, an over-approximation under a nullable struct. The AMT
+            // RFC maps numRecords only to the entry-level record_count; value_count should stay
+            // unpopulated.
             VALUE_COUNT => Expression::column([stats_col, NUM_RECORDS]),
             TIGHT_BOUNDS => tight_bounds_expr(leaf_type, stats_col, tight_bounds_present),
             _ => null_lit(f.data_type().clone()),
@@ -751,8 +766,8 @@ fn build_leaf_pivot_expr(
 /// absent (`tight_bounds_present == false`) or null in a row -- so a `false` file value still
 /// forces `false` for every column.
 ///
-/// TODO: still a conservative subset -- MDV -> `tight_bounds = false` is applied by the write-path
-/// caller, not here.
+/// TODO(#3491): still a conservative subset -- MDV -> `tight_bounds = false` is applied by the
+/// write-path caller, not here.
 fn tight_bounds_expr(
     leaf_type: &DataType,
     stats_col: &str,
@@ -777,9 +792,10 @@ fn tight_bounds_expr(
 /// are not tight for it: string, binary, `TIMESTAMP`, and `TIMESTAMP_NTZ` columns (truncated
 /// bounds), plus `FLOAT` and `DOUBLE` columns.
 ///
-/// TODO: float/double are forced conservatively because Delta records NaN in min/max while Iceberg
-/// bounds exclude it (see [`build_leaf_pivot_expr`]); once a NaN-detection expression exists we can
-/// take the file's `tightBounds` when the column has no NaN instead of always forcing `false`.
+/// TODO(#3491): float/double are forced conservatively because Delta records NaN in min/max while
+/// Iceberg bounds exclude it (see [`build_leaf_pivot_expr`]); once a NaN-detection expression
+/// exists we can take the file's `tightBounds` when the column has no NaN instead of always forcing
+/// `false`.
 ///
 /// Variant and geospatial leaves never reach here: variants get no `tight_bounds` sub-field
 /// ([`build_stats_struct`] excludes it via `!is_variant`), and geospatial leaves error earlier in
@@ -815,7 +831,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
     use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
@@ -1921,11 +1936,23 @@ mod tests {
     /// [`CONTENT_STATS_FIELD_NAME`] column, since the input carries only `stats` (`Err` when
     /// the pivot fails).
     fn run_pivot(table: &StructType, stats: &Scalar) -> DeltaResult<Box<dyn EngineData>> {
+        run_pivot_many(table, std::slice::from_ref(stats))
+    }
+
+    /// Like [`run_pivot`] but over a multi-row batch: one `stats` row per element of `stats_rows`
+    /// (all must share the same struct type). The schema is taken from the first row.
+    fn run_pivot_many(
+        table: &StructType,
+        stats_rows: &[Scalar],
+    ) -> DeltaResult<Box<dyn EngineData>> {
         let input_schema =
-            StructType::new_unchecked([StructField::nullable("stats", stats.data_type())]);
+            StructType::new_unchecked([StructField::nullable("stats", stats_rows[0].data_type())]);
         let engine = SyncEngine::new();
-        let data =
-            create_row(&engine, Arc::new(input_schema.clone()), stats.clone()).expect("create_row");
+        let rows = stats_rows.iter().map(|s| vec![s.clone()]).collect();
+        let data = engine
+            .evaluation_handler()
+            .create_many(Arc::new(input_schema.clone()), rows)
+            .expect("create_many");
         convert_delta_stats_to_amt_stats(&engine, data.as_ref(), "stats", table, &input_schema)
     }
 
@@ -1942,15 +1969,26 @@ mod tests {
         stats: &Scalar,
         content_stats: Scalar,
     ) -> Box<dyn EngineData> {
-        let DataType::Struct(delta) = stats.data_type() else {
+        expected_batch_many(table, &stats.data_type(), vec![content_stats])
+    }
+
+    /// Like [`expected_batch`] but for a multi-row batch: one `content_stats` scalar per row, all
+    /// typed by [`projected_stats_schema`] for `stats_type`.
+    fn expected_batch_many(
+        table: &StructType,
+        stats_type: &DataType,
+        content_rows: Vec<Scalar>,
+    ) -> Box<dyn EngineData> {
+        let DataType::Struct(delta) = stats_type else {
             panic!("stats must be a struct");
         };
-        let amt = projected_stats_schema(table, &delta).expect("projected stats schema");
+        let amt = projected_stats_schema(table, delta).expect("projected stats schema");
         let output_schema =
             StructType::new_unchecked([StructField::nullable(CONTENT_STATS_FIELD_NAME, amt)]);
+        let rows = content_rows.into_iter().map(|c| vec![c]).collect();
         SyncEngine::new()
             .evaluation_handler()
-            .create_many(Arc::new(output_schema), vec![vec![content_stats]])
+            .create_many(Arc::new(output_schema), rows)
             .expect("create_many")
     }
 
@@ -2058,17 +2096,22 @@ mod tests {
 
     /// Round-trips the flat two-column table. `tight_input` is the file's `tightBounds` (`None`
     /// absent, `Some(None)` a present-null cell, `Some(Some(b))` a value); `min_max` toggles the
-    /// bound categories. Numeric `id` resolves `tight_bounds = true` (file true, or the default
-    /// when null/absent); string `name` is forced false; counts come from
+    /// bound categories. Numeric `id` takes the file's `tightBounds` (`expected_id_tight`),
+    /// defaulting to `true` when absent/null; string `name` is forced false; counts come from
     /// `numRecords`/`nullCount`. With `min_max` off the leaves carry no bounds and no
     /// `tight_bounds` sub-field (projected away).
     #[rstest]
-    #[case::full_stats(Some(Some(true)), true)]
-    #[case::null_tight_bounds_defaults_true(Some(None), true)]
-    #[case::missing_min_max_drops_bounds(None, false)]
+    #[case::full_stats(Some(Some(true)), true, true)]
+    #[case::null_tight_bounds_defaults_true(Some(None), true, true)]
+    #[case::absent_tight_bounds_with_bounds_defaults_true(None, true, true)]
+    #[case::file_false(Some(Some(false)), true, false)]
+    #[case::missing_min_max_drops_bounds(None, false, false)]
     fn pivot_round_trip_maps_categories(
         #[case] tight_input: Option<Option<bool>>,
         #[case] min_max: bool,
+        // Expected `tight_bounds` for the numeric `id` leaf when `min_max` is set (unused
+        // otherwise): file value, or the default `true` when absent/null.
+        #[case] expected_id_tight: bool,
     ) {
         let mut entries: Vec<(&str, Scalar)> = vec![(NUM_RECORDS, 10i64.into())];
         match tight_input {
@@ -2101,7 +2144,7 @@ mod tests {
                 vec![
                     (LOWER_BOUND, 1i32.into()),
                     (UPPER_BOUND, 5i32.into()),
-                    (TIGHT_BOUNDS, true.into()),
+                    (TIGHT_BOUNDS, expected_id_tight.into()),
                     (VALUE_COUNT, 10i64.into()),
                     (NULL_VALUE_COUNT, 0i64.into()),
                 ],
@@ -2161,9 +2204,10 @@ mod tests {
     }
 
     #[test]
-    fn pivot_variant_null_count_only_emits_counts_and_returns_some() {
-        // TODO: kernel does not yet plumb variant min/max bounds through, so they appear only in
-        // nullCount. With nullCount the sole category, both leaves project to just the counts.
+    fn pivot_variant_null_count_only_emits_counts() {
+        // TODO(#3491): kernel does not yet plumb variant min/max bounds through, so they appear
+        // only in nullCount. With nullCount the sole category, both leaves project to just the
+        // counts.
         let table = StructType::new_unchecked([
             field_with_id("id", DataType::INTEGER, true, 0),
             field_with_id("v", DataType::unshredded_variant(), true, 1),
@@ -2193,12 +2237,90 @@ mod tests {
     #[test]
     fn pivot_build_error_on_missing_field_id_propagates() {
         // A table leaf lacking parquet.field.id violates the physical-schema precondition;
-        // build errors must propagate as Err, not collapse to Ok(None).
+        // build errors must propagate as Err, not be swallowed.
         let table = StructType::new_unchecked([StructField::nullable("c", DataType::INTEGER)]);
         let stats = struct_scalar(&[
             (NUM_RECORDS, 10i64.into()),
             (MIN_VALUES, struct_scalar(&[("c", 2i32.into())])),
         ]);
         assert!(run_pivot(&table, &stats).is_err());
+    }
+
+    #[test]
+    fn pivot_errors_on_non_delta_shaped_stats_column() {
+        // A stats column with no `numRecords` is not Delta-stats shaped; conversion must return
+        // Err (the caller precondition), not silently drop stats.
+        let table = pivot_table_schema();
+        let stats = struct_scalar(&[(MIN_VALUES, struct_scalar(&[("id", 1i32.into())]))]);
+        assert!(run_pivot(&table, &stats).is_err());
+    }
+
+    #[test]
+    fn pivot_multi_row_resolves_tight_bounds_per_row() {
+        // Three rows whose file `tightBounds` is true / false / null (null defaults to true). The
+        // numeric `id` leaf follows the file value row by row; string `name` is always forced
+        // false. Exercises the pivot over a multi-row batch.
+        let table = pivot_table_schema();
+        let row = |tight_bounds: Scalar| {
+            struct_scalar(&[
+                (NUM_RECORDS, 10i64.into()),
+                (DELTA_TIGHT_BOUNDS, tight_bounds),
+                (
+                    MIN_VALUES,
+                    struct_scalar(&[("id", 1i32.into()), ("name", "aaa".into())]),
+                ),
+                (
+                    MAX_VALUES,
+                    struct_scalar(&[("id", 5i32.into()), ("name", "zzz".into())]),
+                ),
+                (
+                    NULL_COUNT,
+                    struct_scalar(&[("id", 0i64.into()), ("name", 2i64.into())]),
+                ),
+            ])
+        };
+        let rows = [
+            row(true.into()),
+            row(false.into()),
+            row(Scalar::Null(DataType::BOOLEAN)),
+        ];
+        let actual = run_pivot_many(&table, &rows).expect("pivot ok");
+
+        // Expected per-row content_stats: `id` tight_bounds follows the file (true/false/true),
+        // `name` is always forced false.
+        let content_stats = |id_tight: bool| {
+            struct_scalar(&[
+                (
+                    "id",
+                    struct_scalar(&[
+                        (LOWER_BOUND, 1i32.into()),
+                        (UPPER_BOUND, 5i32.into()),
+                        (TIGHT_BOUNDS, id_tight.into()),
+                        (VALUE_COUNT, 10i64.into()),
+                        (NULL_VALUE_COUNT, 0i64.into()),
+                    ]),
+                ),
+                (
+                    "name",
+                    struct_scalar(&[
+                        (LOWER_BOUND, "aaa".into()),
+                        (UPPER_BOUND, "zzz".into()),
+                        (TIGHT_BOUNDS, false.into()),
+                        (VALUE_COUNT, 10i64.into()),
+                        (NULL_VALUE_COUNT, 2i64.into()),
+                    ]),
+                ),
+            ])
+        };
+        let expected = expected_batch_many(
+            &table,
+            &rows[0].data_type(),
+            vec![
+                content_stats(true),
+                content_stats(false),
+                content_stats(true),
+            ],
+        );
+        assert_batch_matches(actual, expected);
     }
 }
