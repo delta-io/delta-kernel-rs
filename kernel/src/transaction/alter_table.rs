@@ -24,12 +24,13 @@ use crate::DeltaResult;
 pub type AlterTableTransaction = Transaction<AlterTable>;
 
 impl AlterTableTransaction {
-    /// Create a new transaction for altering a table's schema. Produces a metadata-only commit
-    /// that emits an updated Metadata action with the evolved schema.
+    /// Create a new transaction for altering a table. Produces a commit that emits an updated
+    /// Metadata action, plus a Protocol action when the protocol differs from the read snapshot's
+    /// (for example after adding a CHECK constraint enables `checkConstraints`).
     ///
-    /// The `effective_table_config` is the evolved table configuration (new schema, same
-    /// protocol). It must be fully validated before calling this constructor (e.g. schema
-    /// operations applied, protocol feature checks passed). The `read_snapshot` provides the
+    /// The `effective_table_config` is the evolved table configuration. It must be fully validated
+    /// before calling this constructor (e.g. schema operations applied, protocol feature checks
+    /// passed). The `read_snapshot` provides the
     /// pre-commit table state (version, previous protocol/metadata, ICT timestamps) used for
     /// commit versioning and post-commit snapshots.
     ///
@@ -46,6 +47,8 @@ impl AlterTableTransaction {
             read_version = read_snapshot.version(),
             operation = "ALTER TABLE",
         );
+        let should_emit_protocol =
+            effective_table_config.protocol() != read_snapshot.table_configuration().protocol();
 
         Ok(Transaction {
             span,
@@ -53,7 +56,7 @@ impl AlterTableTransaction {
             correlation_id,
             read_snapshot_opt: Some(read_snapshot),
             effective_table_config,
-            should_emit_protocol: false,
+            should_emit_protocol,
             should_emit_metadata: true,
             committer,
             operation: Some("ALTER TABLE".to_string()),
@@ -70,6 +73,8 @@ impl AlterTableTransaction {
             user_domain_removals: vec![],
             data_change: false,
             column_defaults_acknowledged: false,
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraints_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             // TODO(#2446): match delta-spark's per-op isBlindAppend policy

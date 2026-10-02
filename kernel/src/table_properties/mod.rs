@@ -26,6 +26,18 @@ pub use deserialize::ParseIntervalError;
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
 
+/// Prefix under which CHECK constraints are stored in the table configuration, as
+/// `delta.constraints.<name>`.
+pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
+
+/// Returns the constraint name for a `delta.constraints.<name>` configuration key, or `None` for
+/// any other key (including a bare prefix with an empty name). The prefix is matched
+/// case-insensitively. The name keeps the case it was written with.
+pub(crate) fn strip_check_constraint_prefix(key: &str) -> Option<&str> {
+    let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
+    (prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) && !name.is_empty()).then_some(name)
+}
+
 // Table property key constants
 pub(crate) const APPEND_ONLY: &str = "delta.appendOnly";
 pub(crate) const AUTO_COMPACT: &str = "delta.autoOptimize.autoCompact";
@@ -241,6 +253,10 @@ pub struct TableProperties {
     /// same as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
+    /// CHECK constraints declared on the table, keyed by name with the raw constraint SQL as the
+    /// value. Names keep the case they were written with but compare case-insensitively.
+    pub(crate) check_constraints: HashMap<String, String>,
+
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
 }
@@ -388,6 +404,8 @@ pub enum ParquetCompressionCodec {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::expressions::column_name;
@@ -658,8 +676,58 @@ mod tests {
             parquet_format_version: Some("2.12.0".to_string()),
             parquet_compression_codec: Some(ParquetCompressionCodec::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
+            check_constraints: HashMap::new(),
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn check_constraints_keyed_by_name() {
+        let props = TableProperties::from([
+            ("delta.constraints.positive", "amount > 0"),
+            ("delta.constraints.name_check", "name = 'a'"),
+        ]);
+        assert_eq!(
+            props.check_constraints,
+            HashMap::from([
+                ("positive".to_string(), "amount > 0".to_string()),
+                ("name_check".to_string(), "name = 'a'".to_string()),
+            ])
+        );
+        // Recognized constraint keys must not leak into `unknown_properties`.
+        assert!(props.unknown_properties.is_empty());
+    }
+
+    #[rstest]
+    #[case::lowercase_prefix("delta.constraints.c1", Some("c1"))]
+    #[case::uppercase_prefix("DELTA.CONSTRAINTS.c1", Some("c1"))]
+    #[case::mixed_case_prefix("Delta.Constraints.c1", Some("c1"))]
+    #[case::name_case_preserved("delta.constraints.MyCheck", Some("MyCheck"))]
+    #[case::uppercase_prefix_preserves_name_case("DELTA.CONSTRAINTS.MyCheck", Some("MyCheck"))]
+    #[case::whitespace_name("delta.constraints. ", Some(" "))]
+    #[case::bare_prefix_empty_name("delta.constraints.", None)]
+    #[case::uppercase_bare_prefix("DELTA.CONSTRAINTS.", None)]
+    #[case::unrecognized_long_key("delta.someOtherKey", None)]
+    #[case::prefix_without_trailing_dot("delta.constraintsX", None)]
+    #[case::too_short_for_prefix("delta.con", None)]
+    fn check_constraint_prefix_matching(#[case] key: &str, #[case] expected_name: Option<&str>) {
+        let props = TableProperties::from([(key, "amount > 0")]);
+        match expected_name {
+            Some(name) => {
+                assert_eq!(
+                    props.check_constraints.get(name),
+                    Some(&"amount > 0".to_string())
+                );
+                assert!(props.unknown_properties.is_empty());
+            }
+            None => {
+                assert!(props.check_constraints.is_empty());
+                assert_eq!(
+                    props.unknown_properties.get(key),
+                    Some(&"amount > 0".to_string())
+                );
+            }
+        }
     }
 }

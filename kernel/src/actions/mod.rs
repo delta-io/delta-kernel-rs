@@ -543,6 +543,14 @@ impl Metadata {
         self
     }
 
+    /// Returns a new Metadata with the configuration entry for `key` removed, preserving all other
+    /// configuration entries and metadata fields.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn without_configuration_entry(mut self, key: &str) -> Self {
+        self.configuration.remove(key);
+        self
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
