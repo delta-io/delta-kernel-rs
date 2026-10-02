@@ -29,6 +29,9 @@ use crate::{DeltaResult, EngineData, KernelError};
 /// - RemoveFile paths must be unique, regardless of deletion vector ID.
 /// - An AddFile and RemoveFile cannot share the same `(path, dv_id)`, including when both IDs are
 ///   absent. Different DV IDs on the same path are allowed for deletion-vector updates.
+///
+/// Note that [`FileActionDeduplicator`](crate::log_replay::FileActionDeduplicator) uses different
+/// rules: it deduplicates `(path, dv_id)` pairs during log replay.
 #[derive(Default)]
 pub(super) struct FileActionTracker {
     add_paths: HashMap<String, Option<String>>,
