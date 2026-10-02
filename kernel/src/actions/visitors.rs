@@ -569,13 +569,16 @@ pub(crate) fn visit_deletion_vector_at<'a>(
         let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
         let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
         let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
-        Ok(Some(DeletionVectorDescriptor {
+        // Validate through `try_new` so every descriptor entering log replay satisfies the
+        // per-storage-type invariants (e.g. a `PersistedUnencodedRelative` path is table-relative)
+        // before it reaches consumers that use the raw path verbatim.
+        Ok(Some(DeletionVectorDescriptor::try_new(
             storage_type,
             path_or_inline_dv,
             offset,
             size_in_bytes,
             cardinality,
-        }))
+        )?))
     } else {
         Ok(None)
     }
@@ -1000,6 +1003,8 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
     use crate::arrow::array::{BooleanArray, StringArray};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::arrow::array::{Int32Array, Int64Array};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1028,6 +1033,27 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Wrong number of DeletionVectorVisitor getters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // The visitor validates through `try_new`, so a log row carrying an `'r'` deletion vector
+    // whose path is actually absolute (a scheme-bearing path that would resolve outside the
+    // table) is rejected during replay rather than silently accepted.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn visit_deletion_vector_rejects_non_relative_unencoded_path() {
+        let storage_type: StringArray = vec!["r"].into();
+        let path: StringArray = vec!["s3://other/dv.bin"].into();
+        let offset = ();
+        let size_in_bytes: Int32Array = vec![4].into();
+        let cardinality: Int64Array = vec![1i64].into();
+        let getters: &[&dyn GetData<'_>] =
+            &[&storage_type, &path, &offset, &size_in_bytes, &cardinality];
+
+        let err = visit_deletion_vector_at(0, getters).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute URL"),
             "unexpected error: {err}"
         );
     }
