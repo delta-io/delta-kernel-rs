@@ -12,6 +12,8 @@ use roaring::RoaringTreemap;
 use serde::Deserialize;
 use url::Url;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
 use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, KernelError, StorageHandler};
@@ -37,6 +39,11 @@ pub enum DeletionVectorStorageType {
     Inline,
     #[cfg_attr(test, serde(rename = "p"))]
     PersistedAbsolute,
+    /// Unlike [`PersistedRelative`](Self::PersistedRelative) (`'u'`), the path in
+    /// `path_or_inline_dv` is used verbatim, with no base85/UUID decoding.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(rename = "r"))]
+    PersistedUnencodedRelative,
 }
 
 impl FromStr for DeletionVectorStorageType {
@@ -47,6 +54,8 @@ impl FromStr for DeletionVectorStorageType {
             "u" => Ok(Self::PersistedRelative),
             "i" => Ok(Self::Inline),
             "p" => Ok(Self::PersistedAbsolute),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            "r" => Ok(Self::PersistedUnencodedRelative),
             _ => Err(KernelError::internal_error(format!(
                 "Unsupported deletion vector format option: {s}"
             ))),
@@ -60,6 +69,8 @@ impl std::fmt::Display for DeletionVectorStorageType {
             DeletionVectorStorageType::PersistedRelative => write!(f, "u"),
             DeletionVectorStorageType::Inline => write!(f, "i"),
             DeletionVectorStorageType::PersistedAbsolute => write!(f, "p"),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            DeletionVectorStorageType::PersistedUnencodedRelative => write!(f, "r"),
         }
     }
 }
@@ -131,7 +142,8 @@ impl DeletionVectorPath {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
-    /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
+    /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'],
+    /// plus 'r' when the `adaptiveMetadata` feature is enabled.
     pub storage_type: DeletionVectorStorageType,
 
     /// Three format options are currently proposed:
@@ -146,6 +158,9 @@ pub struct DeletionVectorDescriptor {
     /// - If `storageType = 'p'` then `<absolute path>`: The DV is stored in a file with an
     ///   absolute path given by this path, which has the same format as the `path` field in the
     ///   `add`/`remove` actions.
+    /// - If `storageType = 'r'` then `<relative path>`: the raw, unencoded path to the DV file,
+    ///   relative to the table root (per the Iceberg V4 path spec). Only valid under the
+    ///   `adaptiveMetadata` feature.
     ///
     /// [Deletion Vector Format]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Deletion-Vector-Format
     pub path_or_inline_dv: String,
@@ -196,6 +211,8 @@ impl DeletionVectorDescriptor {
     /// - `PersistedRelative` paths carry an optional random prefix followed by a 20-character
     ///   z85-encoded UUID, so they must be at least 20 characters long.
     /// - `PersistedAbsolute` paths must parse as a URL.
+    /// - `PersistedUnencodedRelative` paths must be a non-empty, table-root-relative path: no URI
+    ///   scheme (i.e. not an absolute URL) and no leading `/`.
     ///
     /// `Inline` payload bytes are accepted verbatim; the framing of the embedded RoaringBitmap
     /// is only checked when the DV is later read via [`Self::read`].
@@ -249,6 +266,10 @@ impl DeletionVectorDescriptor {
                         "persisted-absolute DV path must parse as a URL: {e}"
                     ))
                 })?;
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            DeletionVectorStorageType::PersistedUnencodedRelative => {
+                validate_table_relative(&path_or_inline_dv)?;
             }
         }
         Ok(Self {
@@ -329,6 +350,13 @@ impl DeletionVectorDescriptor {
                 Ok(Some(Url::parse(&self.path_or_inline_dv).map_err(|_| {
                     KernelError::DeletionVector(format!("invalid path: {}", self.path_or_inline_dv))
                 })?))
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            DeletionVectorStorageType::PersistedUnencodedRelative => {
+                // Validate (reject absolute) and resolve here, not just in `try_new`: descriptors
+                // reach the read path via struct literals (e.g. the log-replay visitor) that
+                // bypass `try_new`.
+                resolve_table_relative(&self.path_or_inline_dv, parent).map(Some)
             }
             DeletionVectorStorageType::Inline => Ok(None),
         }
@@ -701,6 +729,20 @@ mod tests {
         let inline = dv_inline();
         assert_eq!(None, inline.absolute_path(&parent).unwrap());
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let unencoded = DeletionVectorDescriptor::try_new(
+                DeletionVectorStorageType::PersistedUnencodedRelative,
+                "data/deletion_vector_x.bin",
+                Some(1),
+                4,
+                2,
+            )
+            .unwrap();
+            let expected = Url::parse("s3://mytable/data/deletion_vector_x.bin").unwrap();
+            assert_eq!(expected, unencoded.absolute_path(&parent).unwrap().unwrap());
+        }
+
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let parent = url::Url::from_directory_path(path).unwrap();
@@ -709,6 +751,50 @@ mod tests {
             .unwrap();
         let example = dv_example();
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
+    }
+
+    // An unencoded-relative path is percent-encoded (preserving `/`) when resolved, so reserved
+    // characters survive a round trip through the object store.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::space("data/leaf a.bin", "s3://mytable/data/leaf%20a.bin")]
+    #[case::percent("data/a%b.bin", "s3://mytable/data/a%25b.bin")]
+    #[case::hash("data/a#b.bin", "s3://mytable/data/a%23b.bin")]
+    #[case::question("data/a?b.bin", "s3://mytable/data/a%3Fb.bin")]
+    #[case::non_ascii("data/M\u{fc}nchen.bin", "s3://mytable/data/M%C3%BCnchen.bin")]
+    #[case::dot_dot("data/../b.bin", "s3://mytable/b.bin")]
+    fn unencoded_relative_absolute_path_percent_encodes(
+        #[case] path: &str,
+        #[case] expected: &str,
+    ) {
+        let parent = Url::parse("s3://mytable/").unwrap();
+        // The struct literal bypasses `try_new`, mirroring the log-replay visitor.
+        let dv = dv_with_path(DeletionVectorStorageType::PersistedUnencodedRelative, path);
+        assert_eq!(
+            Url::parse(expected).unwrap(),
+            dv.absolute_path(&parent).unwrap().unwrap()
+        );
+    }
+
+    // `absolute_path` enforces the table-relative invariant even for descriptors built via a
+    // struct literal (as the log-replay visitor does), so a scheme-bearing or rooted path cannot
+    // resolve outside the table.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::scheme("s3://other/dv.bin", "absolute URL")]
+    #[case::leading_slash("/abs/dv.bin", "leading '/'")]
+    #[case::empty("", "must not be empty")]
+    fn unencoded_relative_absolute_path_rejects_non_relative(
+        #[case] path: &str,
+        #[case] expected: &str,
+    ) {
+        let parent = Url::parse("s3://mytable/").unwrap();
+        let dv = dv_with_path(DeletionVectorStorageType::PersistedUnencodedRelative, path);
+        let err = dv.absolute_path(&parent).unwrap_err().to_string();
+        assert!(
+            err.contains(expected),
+            "error {err:?} did not contain {expected:?}"
+        );
     }
 
     fn dv_with_path(
@@ -751,6 +837,14 @@ mod tests {
         DeletionVectorStorageType::Inline,
         "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
         "only valid for PersistedRelative"
+    )]
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            "only valid for PersistedRelative"
+        )
     )]
     // Path shorter than the 20-byte z85 UUID suffix.
     #[case(
@@ -952,6 +1046,11 @@ mod tests {
             "p".parse::<DeletionVectorStorageType>().unwrap(),
             DeletionVectorStorageType::PersistedAbsolute
         );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert_eq!(
+            "r".parse::<DeletionVectorStorageType>().unwrap(),
+            DeletionVectorStorageType::PersistedUnencodedRelative
+        );
     }
 
     #[test]
@@ -970,6 +1069,8 @@ mod tests {
         assert!("PersistedAbsolute"
             .parse::<DeletionVectorStorageType>()
             .is_err());
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        assert!("r".parse::<DeletionVectorStorageType>().is_err());
     }
 
     #[test]
@@ -995,6 +1096,19 @@ mod tests {
             let string_repr = variant.to_string();
             let parsed = string_repr.parse::<DeletionVectorStorageType>().unwrap();
             assert_eq!(variant, parsed);
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let variant = DeletionVectorStorageType::PersistedUnencodedRelative;
+            assert_eq!(variant.to_string(), "r");
+            assert_eq!(
+                variant
+                    .to_string()
+                    .parse::<DeletionVectorStorageType>()
+                    .unwrap(),
+                variant
+            );
         }
     }
 
@@ -1113,6 +1227,39 @@ mod tests {
         4,
         1,
         "URL"
+    )]
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::unencoded_relative_empty(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "",
+            Some(1),
+            4,
+            1,
+            "must not be empty"
+        )
+    )]
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::unencoded_relative_leading_slash(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "/abs/dv.bin",
+            Some(1),
+            4,
+            1,
+            "leading '/'"
+        )
+    )]
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::unencoded_relative_absolute_url(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "s3://bucket/dv.bin",
+            Some(1),
+            4,
+            1,
+            "absolute URL"
+        )
     )]
     #[case::negative_size(
         DeletionVectorStorageType::Inline, "ABC", None, -1, 0, "size_in_bytes"

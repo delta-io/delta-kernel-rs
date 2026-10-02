@@ -17,6 +17,9 @@ use crate::{DeltaResult, EngineData, KernelError};
 ///
 /// - `PersistedAbsolute`: The `path_or_inline_dv` contains the absolute path to the DV file.
 ///
+/// - `PersistedUnencodedRelative`: The `path_or_inline_dv` is already the raw table-relative path,
+///   so it is used as-is.
+///
 /// - `Inline`: Currently not supported - returns an error. Inline DVs would need to be persisted
 ///   first before being added to metadata.
 pub(crate) fn extract_deletion_vector_content(
@@ -30,6 +33,10 @@ pub(crate) fn extract_deletion_vector_content(
         DeletionVectorStorageType::PersistedRelative => {
             // Decode to relative path
             dv.relative_path()?
+        }
+        DeletionVectorStorageType::PersistedUnencodedRelative => {
+            // Already a raw table-relative path; use it as-is.
+            dv.path_or_inline_dv.clone()
         }
         DeletionVectorStorageType::Inline => {
             return Err(KernelError::DeletionVector(
@@ -581,6 +588,11 @@ mod tests {
     #[case::relative_no_offset_defaults_to_one(
         (DeletionVectorStorageType::PersistedRelative, "vBn[lx{q8@P<9BNH/isA", None, 36),
         ("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin", 1, 44)
+    )]
+    // Unencoded-relative preserves the raw table-relative path verbatim (no z85 decode).
+    #[case::unencoded_relative(
+        (DeletionVectorStorageType::PersistedUnencodedRelative, "data/deletion_vector_x.bin", Some(4), 40),
+        ("data/deletion_vector_x.bin", 4, 48)
     )]
     fn test_extract_deletion_vector_content(
         #[case] input: (DeletionVectorStorageType, &str, Option<i32>, i32),
