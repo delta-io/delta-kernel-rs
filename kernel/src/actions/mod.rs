@@ -532,6 +532,13 @@ impl Metadata {
         })
     }
 
+    pub(crate) fn with_partition_columns(self, partition_columns: Vec<String>) -> Self {
+        Self {
+            partition_columns,
+            ..self
+        }
+    }
+
     /// Returns a new Metadata with a single configuration entry inserted (or replaced),
     /// preserving all other configuration entries and metadata fields.
     pub(crate) fn with_configuration_entry(

@@ -14,6 +14,7 @@ mod partitioned;
 mod post_commit;
 mod relative_paths;
 mod remove_dv;
+mod replace_table;
 mod root_manifest_file;
 mod row_tracking;
 mod stats;

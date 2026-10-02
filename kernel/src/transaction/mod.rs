@@ -69,6 +69,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub use builder::replace_table::ReplaceTableTransactionBuilder;
 pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::{collect_operation_metadata, TransactionBuilderState};
 mod bound_write_context;
@@ -699,6 +700,19 @@ impl<S> Transaction<S> {
         Ok(self)
     }
 
+    /// Adds an application transaction identifier to the commit.
+    ///
+    /// `app_id` identifies the application and `version` records its progress. Duplicate
+    /// application IDs are rejected by [`commit`](Self::commit).
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.set_transactions.push(SetTransaction::new(
+            app_id.into(),
+            version,
+            Some(self.commit_timestamp),
+        ));
+        self
+    }
+
     pub(super) fn with_transaction_ids(mut self, transaction_ids: Vec<(String, i64)>) -> Self {
         self.set_transactions = transaction_ids
             .into_iter()
@@ -745,6 +759,21 @@ impl<S> Transaction<S> {
         self.infer_data_change = data_change.is_none();
         self.data_change = data_change.unwrap_or(true);
         Ok(self)
+    }
+
+    pub(super) fn with_table_replacement(
+        mut self,
+        config: TableConfiguration,
+        removals: Vec<FilteredEngineData>,
+    ) -> Self {
+        self.effective_table_config = config;
+        self.should_emit_metadata = true;
+        self.operation = Some(CommitOperation::Replace);
+        self.remove_files_metadata = removals;
+        self.data_change = true;
+        self.infer_data_change = false;
+        self.row_tracking_preservation_acknowledged = true;
+        self
     }
 
     /// Determines the commit type based on whether this is a create-table operation and whether
@@ -1010,7 +1039,7 @@ impl<S> Transaction<S> {
     pub(super) fn resolve_data_change(&mut self) {
         if self.infer_data_change {
             self.data_change = match self.operation.as_ref() {
-                Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)) => {
+                Some(CommitOperation::Update(UpdateTableOperation::AlterTable)) => {
                     self.has_data_file_actions()
                 }
                 _ => true,
@@ -1025,23 +1054,22 @@ impl<S> Transaction<S> {
                 .map_err(KernelError::invalid_transaction_state)?;
         }
         match (self.is_create_table(), self.operation.as_ref()) {
-            (true, Some(CommitOperation::CreateTable)) => Ok(()),
-            (false, Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)))
+            (true, Some(CommitOperation::Create)) => Ok(()),
+            (false, Some(CommitOperation::Update(UpdateTableOperation::AlterTable)))
                 if !self.should_emit_metadata =>
             {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ))
             }
-            (false, Some(CommitOperation::UpdateTable(_))) => Ok(()),
+            (false, Some(CommitOperation::Update(_))) => Ok(()),
+            (false, Some(CommitOperation::Replace)) => Ok(()),
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),
-            (false, Some(CommitOperation::CreateTable)) => {
-                Err(KernelError::invalid_transaction_state(
-                    "CREATE TABLE cannot use an update-table transaction",
-                ))
-            }
+            (false, Some(CommitOperation::Create)) => Err(KernelError::invalid_transaction_state(
+                "CREATE TABLE cannot use an update-table transaction",
+            )),
             (false, _) => Ok(()),
         }
     }

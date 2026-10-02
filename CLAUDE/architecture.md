@@ -75,7 +75,7 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> (`WriteState` ->
+`Snapshot` -> transaction builder -> `Transaction` -> (`WriteState` ->
 `BoundWriteContextBuilder` -> `BoundWriteContext`) -> commit
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
@@ -85,8 +85,8 @@ directory. The transaction registers the resulting files, enforces protocol comp
 commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
-1. Configure an `UpdateTableTransactionBuilder` from a snapshot and build it with a `Committer`
-   (e.g. `FileSystemCommitter`)
+1. Configure an `UpdateTableTransactionBuilder` (or `ReplaceTableTransactionBuilder` for full
+   replacement) from a snapshot and build it with a `Committer` (e.g. `FileSystemCommitter`)
 2. Call `txn.write_state()`, then use
    `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
    Distributed writers can encode the state and decode it on each worker before binding partition
@@ -96,8 +96,8 @@ commit actions, and delegates the atomic commit to a `Committer`.
 5. Commit: returns `CommitResult::Committed`, `Conflicted`, or `Retryable`
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
-  updates, table creation (including clustered tables via `DataLayout`), and limited schema
-  evolution
+  updates, table creation (including clustered tables via `DataLayout`), full-table replacement,
+  and limited schema evolution
 - **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` for
   filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
   for catalog-managed tables (staging, ratifying, publishing).

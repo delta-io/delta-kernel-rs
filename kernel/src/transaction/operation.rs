@@ -72,15 +72,17 @@ impl fmt::Display for UpdateTableOperation {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CommitOperation {
-    CreateTable,
-    UpdateTable(UpdateTableOperation),
+    Create,
+    Replace,
+    Update(UpdateTableOperation),
 }
 
 impl CommitOperation {
     pub(crate) fn as_str(&self) -> &str {
         match self {
-            Self::CreateTable => "CREATE TABLE",
-            Self::UpdateTable(operation) => operation.as_str(),
+            Self::Create => "CREATE TABLE",
+            Self::Replace => "REPLACE TABLE",
+            Self::Update(operation) => operation.as_str(),
         }
     }
 
@@ -88,15 +90,15 @@ impl CommitOperation {
         // Connector-defined names collapse to one bounded-cardinality metric label while the
         // exact operation name remains available in commitInfo.
         match self {
-            Self::UpdateTable(UpdateTableOperation::Custom(_)) => "CUSTOM",
+            Self::Update(UpdateTableOperation::Custom(_)) => "CUSTOM",
             operation => operation.as_str(),
         }
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
-            Self::UpdateTable(operation) => operation.validate(),
-            Self::CreateTable => Ok(()),
+            Self::Update(operation) => operation.validate(),
+            Self::Create | Self::Replace => Ok(()),
         }
     }
 }
@@ -109,16 +111,16 @@ impl fmt::Display for CommitOperation {
 
 impl From<UpdateTableOperation> for CommitOperation {
     fn from(operation: UpdateTableOperation) -> Self {
-        Self::UpdateTable(operation)
+        Self::Update(operation)
     }
 }
 
 impl From<String> for CommitOperation {
     fn from(operation: String) -> Self {
-        if operation == "CREATE TABLE" {
-            Self::CreateTable
-        } else {
-            Self::UpdateTable(UpdateTableOperation::from_name(operation))
+        match operation.as_str() {
+            "CREATE TABLE" => Self::Create,
+            "REPLACE TABLE" => Self::Replace,
+            _ => Self::Update(UpdateTableOperation::from_name(operation)),
         }
     }
 }

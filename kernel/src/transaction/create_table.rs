@@ -166,7 +166,7 @@ impl CreateTableTransaction {
             should_emit_protocol: true,
             should_emit_metadata: true,
             committer,
-            operation: Some(CommitOperation::CreateTable),
+            operation: Some(CommitOperation::Create),
             operation_parameters: std::collections::HashMap::new(),
             operation_metrics: std::collections::HashMap::new(),
             engine_info: None,
