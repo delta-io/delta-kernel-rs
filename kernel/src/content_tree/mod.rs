@@ -313,8 +313,11 @@ pub(crate) struct ManifestInfo {
     #[field_id = 506]
     pub(crate) deleted_files_count: i32,
     /// Number of entries with REPLACED status in the manifest.
-    #[field_id = 520]
+    #[field_id = 523]
     pub(crate) replaced_files_count: i32,
+    /// Number of entries with MODIFIED status in the manifest.
+    #[field_id = 525]
+    pub(crate) modified_files_count: i32,
 
     /// Total row count across all ADDED entries in the manifest.
     #[field_id = 512]
@@ -326,10 +329,13 @@ pub(crate) struct ManifestInfo {
     #[field_id = 514]
     pub(crate) deleted_rows_count: i64,
     /// Total row count across all REPLACED entries in the manifest.
-    #[field_id = 521]
+    #[field_id = 524]
     pub(crate) replaced_rows_count: i64,
+    /// Total row count across all MODIFIED entries in the manifest.
+    #[field_id = 526]
+    pub(crate) modified_rows_count: i64,
 
-    /// Minimum data sequence number of all entries in the manifest.
+    /// Minimum data sequence number of all live entries in the manifest.
     #[field_id = 516]
     pub(crate) min_sequence_number: i64,
 
@@ -338,9 +344,6 @@ pub(crate) struct ManifestInfo {
     /// framing used for [`TrackingInfo::deleted_positions`].
     #[field_id = 522]
     pub(crate) dv: Option<Bytes>,
-    /// Number of set bits (deleted rows) in [`Self::dv`], or `None` when `dv` is absent.
-    #[field_id = 523]
-    pub(crate) dv_cardinality: Option<i64>,
 }
 
 #[cfg(test)]
