@@ -309,6 +309,21 @@ impl TableConfiguration {
             )
         );
 
+        // Constraint names are case-insensitive, so two that differ only in case are the same
+        // constraint. Reject a corrupt table that declares a case-insensitive duplicate, for both
+        // reads and writes.
+        let check_constraints = &table_config.table_properties.check_constraints;
+        let distinct_constraint_names: HashSet<String> = check_constraints
+            .keys()
+            .map(|name| name.to_lowercase())
+            .collect();
+        require!(
+            distinct_constraint_names.len() == check_constraints.len(),
+            Error::invalid_protocol(
+                "Table declares CHECK constraints whose names differ only in case"
+            )
+        );
+
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
@@ -721,6 +736,18 @@ impl TableConfiguration {
         self.has_column_with_default
     }
 
+    /// The table's CHECK constraints, read from the `delta.constraints.*` metadata configuration.
+    /// Empty when the table declares none. This does not check the `checkConstraints` feature: a
+    /// table that declares constraints without supporting it is rejected for writes by
+    /// [`ensure_write_supported`](Self::ensure_write_supported).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        crate::check_constraints::CheckConstraints::from_parsed(
+            &self.table_properties().check_constraints,
+            &self.logical_schema,
+        )
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -979,6 +1006,16 @@ impl TableConfiguration {
             self.check_feature_support(&feature, Operation::Write)?;
         }
 
+        // A table that stores CHECK constraints must declare the `checkConstraints` writer feature.
+        require!(
+            self.is_feature_supported(&TableFeature::CheckConstraints)
+                || self.table_properties().check_constraints.is_empty(),
+            Error::invalid_protocol(
+                "Table contains CHECK constraints but does not support the 'checkConstraints' \
+                 writer feature",
+            )
+        );
+
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
@@ -1221,6 +1258,83 @@ mod test {
         assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
     }
 
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[test]
+    fn check_constraints_read_from_configuration_regardless_of_feature() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties([
+                ("delta.constraints.positive", "amount > 0"),
+                ("delta.constraints.named", "name = 'a'"),
+            ])
+            .build();
+        let mut discovered: Vec<_> = table_config
+            .check_constraints()
+            .iter()
+            .map(|c| (c.name().to_string(), c.raw_sql().to_string()))
+            .collect();
+        discovered.sort();
+        let expected = [
+            ("named".to_string(), "name = 'a'".to_string()),
+            ("positive".to_string(), "amount > 0".to_string()),
+        ];
+        assert_eq!(discovered, expected);
+    }
+
+    #[rstest]
+    #[case::table_features_without_feature(MockProtocolBuilder::new().build(), true)]
+    #[case::table_features_with_feature(
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::CheckConstraints])
+            .build(),
+        false
+    )]
+    #[case::legacy_writer_below_min_version(MockProtocolBuilder::new().with_versions(1, 2).build(), true)]
+    #[case::legacy_writer_at_min_version(MockProtocolBuilder::new().with_versions(1, 3).build(), false)]
+    fn write_support_for_table_with_check_constraints(
+        #[case] protocol: Protocol,
+        #[case] malformed: bool,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties([("delta.constraints.positive", "amount > 0")])
+            .with_protocol(protocol)
+            .build();
+
+        let write = table_config.ensure_operation_supported(Operation::Write);
+        if malformed {
+            let rejected_as_malformed = matches!(write, Err(Error::InvalidProtocol(_)));
+            assert!(rejected_as_malformed);
+        } else if cfg!(feature = "check-constraints-in-dev") {
+            let write_supported = write.is_ok();
+            assert!(write_supported);
+        } else {
+            let rejected_as_unsupported = matches!(write, Err(Error::Unsupported(_)));
+            assert!(rejected_as_unsupported);
+        }
+
+        let read_supported = table_config
+            .ensure_operation_supported(Operation::Scan)
+            .is_ok();
+        assert!(read_supported);
+    }
+
+    #[test]
+    fn try_build_rejects_case_insensitive_duplicate_constraint_names() {
+        let result = MockTableConfigurationBuilder::new()
+            .with_properties([
+                ("delta.constraints.positive", "amount > 0"),
+                ("delta.constraints.POSITIVE", "amount > 1"),
+            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::CheckConstraints])
+                    .build(),
+            )
+            .try_build();
+
+        let is_invalid_protocol = matches!(result, Err(Error::InvalidProtocol(_)));
+        assert!(is_invalid_protocol);
+    }
+
     #[test]
     fn table_configuration_rejects_duplicate_partition_columns() {
         let result = MockTableConfigurationBuilder::new()
@@ -1268,6 +1382,29 @@ mod test {
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case::no_constraint(&[], false)]
+    #[case::named_constraint(&[("delta.constraints.positive", "amount > 0")], true)]
+    #[case::uppercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")], true)]
+    #[case::bare_prefix_key(&[("delta.constraints.", "1 > 0")], false)]
+    fn check_constraints_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expected_enabled: bool,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::CheckConstraints])
+                    .build(),
+            )
+            .build();
+        let is_supported = table_config.is_feature_supported(&TableFeature::CheckConstraints);
+        let is_enabled = table_config.is_feature_enabled(&TableFeature::CheckConstraints);
+        assert!(is_supported);
+        assert_eq!(is_enabled, expected_enabled);
     }
 
     #[rstest]

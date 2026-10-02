@@ -332,8 +332,11 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
     feature_requirements: &[],
+    #[cfg(feature = "check-constraints-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "check-constraints-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIf(|props| !props.check_constraints.is_empty()),
 };
 
 static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {

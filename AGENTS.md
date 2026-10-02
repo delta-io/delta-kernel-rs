@@ -89,8 +89,16 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression`: Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint`: enables Arrow pretty-print helpers (primarily test/example oriented)
 - `schema-diff`: experimental schema diffing
-- `check-constraints-in-dev`: enables the internal SQL tokenizer and single-comparison parser for
-  check-constraint development
+- `check-constraints-in-dev`: CHECK constraints support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `checkConstraints` writer feature (writes to tables listing it
+  are blocked with the cargo feature off), the internal SQL tokenizer and single-comparison parser
+  (compiled but not yet wired into discovery), raw-SQL constraint discovery (the `check_constraints`
+  module and the `TableWriteExpressions` trait on `Snapshot`/`Transaction`), CREATE TABLE
+  auto-enablement from `delta.constraints.*` properties, and the acknowledgement gates (on a
+  constrained table, `Transaction::write_state` and any data-adding or constraint-introducing commit
+  require `Transaction::ack_check_constraints`). Discovery exposes each constraint's raw SQL
+  verbatim, so kernel does not parse or evaluate constraint SQL, and parsing and enforcement are the
+  connector's responsibility.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
