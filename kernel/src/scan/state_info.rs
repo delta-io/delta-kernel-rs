@@ -14,7 +14,87 @@ use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, Struc
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
-use crate::{DeltaResult, KernelError, PredicateRef, StructField};
+use crate::{KernelError, PredicateRef, Result, StructField};
+
+/// Resolved physical statistics schemas for a scan.
+///
+/// Both schemas are resolved together during [`StateInfo`] construction. Log replay reads and
+/// parses `read`; its final metadata projection emits `output`.
+///
+/// `read` contains consumer-requested stats and any additional stats needed by the skipping
+/// predicate. `output` excludes predicate-only fields. For example, when the consumer requests
+/// `name` stats and the predicate is `id > 400`, `read` contains `id` and `name`, while `output`
+/// contains only `name`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ResolvedPhysicalStatsSchemas {
+    /// Schema Kernel reads and parses before data skipping.
+    read: SchemaRef,
+    /// Schema Kernel returns to the scan consumer.
+    output: Option<SchemaRef>,
+}
+
+impl ResolvedPhysicalStatsSchemas {
+    /// Resolves the stats schemas and validates that every output field is read.
+    fn try_new(read: Option<SchemaRef>, output: Option<SchemaRef>) -> Result<Option<Self>> {
+        match (read, output) {
+            (None, None) => Ok(None),
+            (Some(read), output) => {
+                let schemas = Self { read, output };
+                schemas.validate()?;
+                Ok(Some(schemas))
+            }
+            (None, Some(_)) => Err(KernelError::internal_error(
+                "stats output schema requires a stats read schema",
+            )),
+        }
+    }
+
+    /// Validates that every output field is present and compatible in the read schema.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(output) = &self.output {
+            validate_stats_output_schema(&self.read, output, "")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_stats_output_schema(
+    read: &StructType,
+    output: &StructType,
+    parent: &str,
+) -> Result<()> {
+    for output_field in output.fields() {
+        let path = if parent.is_empty() {
+            output_field.name().to_string()
+        } else {
+            format!("{parent}.{}", output_field.name())
+        };
+        let read_field = read.field(output_field.name()).ok_or_else(|| {
+            KernelError::internal_error(format!(
+                "stats output field '{path}' is missing from the read schema"
+            ))
+        })?;
+
+        if read_field.is_nullable() != output_field.is_nullable() {
+            return Err(KernelError::internal_error(format!(
+                "stats output field '{path}' has incompatible nullability in the read schema"
+            )));
+        }
+
+        match (read_field.data_type(), output_field.data_type()) {
+            (DataType::Struct(read), DataType::Struct(output)) => {
+                validate_stats_output_schema(read, output, &path)?;
+            }
+            (read, output) if read == output => {}
+            _ => {
+                return Err(KernelError::internal_error(format!(
+                    "stats output field '{path}' has an incompatible type in the read schema"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// All the state needed to process a scan.
 #[derive(Debug, Clone)]
@@ -29,9 +109,8 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
-    /// Physical stats schema for reading/parsing stats from checkpoint files.
-    /// Used to construct checkpoint read schema with stats_parsed.
-    pub(crate) physical_stats_schema: Option<SchemaRef>,
+    /// Physical statistics schemas resolved while building the scan.
+    pub(crate) physical_stats_schemas: Option<ResolvedPhysicalStatsSchemas>,
     /// Physical partition schema with native types for `partitionValues_parsed`. Fields use
     /// physical column names (for column mapping) and are always nullable. Present when the
     /// table has partition columns and either a predicate is provided (narrowed to
@@ -87,7 +166,7 @@ struct MetadataInfo<'a> {
 fn validate_metadata_columns<'a>(
     logical_schema: &'a SchemaRef,
     table_configuration: &'a TableConfiguration,
-) -> DeltaResult<MetadataInfo<'a>> {
+) -> Result<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
     let partition_columns = table_configuration.logical_partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
@@ -149,12 +228,12 @@ fn validate_metadata_columns<'a>(
 /// `requested_physical_stats_columns` bypasses the table's indexed set and seeds the scan's stats
 /// schema. Predicate references may add other indexed columns.
 fn build_data_skipping_schemas(
-    struct_stats: &StructStats,
+    stats: &StatsOptions,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     requested_physical_stats_columns: Option<&[ColumnName]>,
     table_configuration: &TableConfiguration,
-) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
+) -> Result<(Option<SchemaRef>, Option<SchemaRef>)> {
     // Narrow the table's typed partition schema to the columns the predicate references. The
     // DataSkippingFilter only needs partition columns that appear in the predicate, and the
     // shared helper forces every field nullable (MapToStruct can yield null for a missing key).
@@ -173,26 +252,31 @@ fn build_data_skipping_schemas(
     let predicate_refs_physical =
         resolve_physical_columns(table_configuration, predicate_column_names_logical);
 
-    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
-    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
-    // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
-    // per-column stats wrapper, so its presence is the signal that at least one data
-    // column survived. The Delta protocol allows `minValues` / `maxValues` without
-    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
-    // emits min/max; this check relies on that implementation property.
-    let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
-        stats_schema
+    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields the stats
+    // schema builder always emits) has nothing to prune by. Return `None` in that case so the
+    // caller skips building a `DataSkippingFilter`. `nullCount` is the per-column stats wrapper,
+    // so its presence is the signal that at least one data column survived. The Delta protocol
+    // allows `minValues` / `maxValues` without `nullCount`, but the builder always emits
+    // `nullCount` whenever it emits min/max; this check relies on that implementation property.
+    let build_stats_schema = |required: Option<&[ColumnName]>,
+                              requested: Option<&[ColumnName]>|
+     -> Result<Option<SchemaRef>> {
+        let stats_schema = table_configuration
+            .stats_schema_builder()
+            .with_required_physical_columns(required)
+            .with_requested_physical_columns(requested)
+            .with_variant_min_max(stats.variant_min_max)
+            .build()?;
+        Ok(stats_schema
             .field(NULL_COUNT)
             .is_some()
-            .then_some(stats_schema)
+            .then_some(stats_schema))
     };
 
-    let stats_schema = match (struct_stats, physical_predicate) {
-        (StructStats::AllIndexed { .. }, _) => with_data_cols(
-            table_configuration
-                .build_expected_stats_schemas(requested_physical_stats_columns, None)?
-                .physical,
-        ),
+    let stats_schema = match (&stats.struct_stats, physical_predicate) {
+        (StructStats::AllIndexed { .. }, _) => {
+            build_stats_schema(requested_physical_stats_columns, None)?
+        }
         // Requested columns bypass the indexed set and seed the stats schema; predicate refs join
         // the schema so kernel can still prune.
         (StructStats::Columns { .. }, _) if requested_physical_stats_columns.is_some() => {
@@ -200,19 +284,13 @@ fn build_data_skipping_schemas(
                 .unwrap_or_default()
                 .to_vec();
             union_extra_into_filter(&mut filter, &predicate_refs_physical);
-            with_data_cols(
-                table_configuration
-                    .build_expected_stats_schemas(requested_physical_stats_columns, Some(&filter))?
-                    .physical,
-            )
+            build_stats_schema(requested_physical_stats_columns, Some(&filter))?
         }
         // No requested columns, but a predicate is present. Use just the predicate refs so the
         // stats schema is trimmed to what the rewritten predicate needs.
-        (_, PhysicalPredicate::Some(_, _)) => with_data_cols(
-            table_configuration
-                .build_expected_stats_schemas(None, Some(&predicate_refs_physical))?
-                .physical,
-        ),
+        (_, PhysicalPredicate::Some(_, _)) => {
+            build_stats_schema(None, Some(&predicate_refs_physical))?
+        }
         // No struct stats requested and no predicate: nothing to read or emit, so no stats schema.
         (_, _) => None,
     };
@@ -220,10 +298,26 @@ fn build_data_skipping_schemas(
 }
 
 /// Resolves logical column names best-effort, warning and omitting names that cannot be resolved.
-/// Used for `extra_indexed` and predicate references.
+/// Used for predicate references.
 fn resolve_physical_columns(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
+) -> Vec<ColumnName> {
+    resolve_physical_columns_with_warnings(table_configuration, logical, true)
+}
+
+fn resolve_physical_columns_without_warnings(
+    table_configuration: &TableConfiguration,
+    logical: &[ColumnName],
+) -> Vec<ColumnName> {
+    // The output-schema resolver reports unresolved extra-indexed columns once.
+    resolve_physical_columns_with_warnings(table_configuration, logical, false)
+}
+
+fn resolve_physical_columns_with_warnings(
+    table_configuration: &TableConfiguration,
+    logical: &[ColumnName],
+    warn_on_error: bool,
 ) -> Vec<ColumnName> {
     let logical_schema = table_configuration.logical_schema();
     let column_mapping_mode = table_configuration.column_mapping_mode();
@@ -232,7 +326,9 @@ fn resolve_physical_columns(
         .filter_map(|col| {
             get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
                 .inspect_err(|e| {
-                    warn!("Failed to resolve physical name for stats column {col}: {e}")
+                    if warn_on_error {
+                        warn!("Failed to resolve physical name for stats column {col}: {e}");
+                    }
                 })
                 .ok()
         })
@@ -246,7 +342,7 @@ fn resolve_physical_columns(
 fn resolve_physical_columns_strict(
     table_configuration: &TableConfiguration,
     logical: &[ColumnName],
-) -> DeltaResult<Vec<ColumnName>> {
+) -> Result<Vec<ColumnName>> {
     let logical_schema = table_configuration.logical_schema();
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
@@ -290,7 +386,8 @@ impl StateInfo {
         stats: &StatsOptions,
         partition_values: &PartitionValuesOptions,
         classifier: C,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
+        stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
@@ -419,7 +516,7 @@ impl StateInfo {
         // `Columns` is strict; `AllIndexed` treats extra-indexed names as best-effort hints.
         let requested_physical_stats_columns: Vec<ColumnName> = match &stats.struct_stats {
             StructStats::AllIndexed { extra_indexed } => {
-                resolve_physical_columns(table_configuration, extra_indexed)
+                resolve_physical_columns_without_warnings(table_configuration, extra_indexed)
             }
             StructStats::Columns { requested } => {
                 resolve_physical_columns_strict(table_configuration, requested)?
@@ -486,12 +583,19 @@ impl StateInfo {
                 None
             };
 
-        let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
-            &stats.struct_stats,
+        let (physical_stats_read_schema, predicate_partition_schema) = build_data_skipping_schemas(
+            stats,
             &physical_predicate,
             &predicate_column_names,
             requested_physical_stats_columns_ref,
             table_configuration,
+        )?;
+        let physical_stats_output_schema =
+            super::build_stats_output_schemas(table_configuration, stats)?
+                .map(|schemas| schemas.physical);
+        let physical_stats_schemas = ResolvedPhysicalStatsSchemas::try_new(
+            physical_stats_read_schema,
+            physical_stats_output_schema,
         )?;
 
         // When the engine requested the typed struct, emit all partition columns rather than
@@ -524,7 +628,7 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
-            physical_stats_schema,
+            physical_stats_schemas,
             physical_partition_schema,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
@@ -543,11 +647,25 @@ impl StateInfo {
     /// hashbrown doubling events for medium/large tables while staying cheap
     /// for small ones.
     pub(crate) fn dedup_capacity_hint(&self) -> usize {
-        if self.physical_stats_schema.is_some() {
+        if self.physical_stats_schemas.is_some() {
             4096
         } else {
             512
         }
+    }
+
+    /// Returns the physical stats schema Kernel reads and parses.
+    pub(crate) fn physical_stats_read_schema(&self) -> Option<&SchemaRef> {
+        self.physical_stats_schemas
+            .as_ref()
+            .map(|schemas| &schemas.read)
+    }
+
+    /// Returns the physical stats schema exposed to the scan consumer.
+    pub(crate) fn physical_stats_output_schema(&self) -> Option<&SchemaRef> {
+        self.physical_stats_schemas
+            .as_ref()
+            .and_then(|schemas| schemas.output.as_ref())
     }
 }
 
@@ -567,11 +685,80 @@ pub(crate) mod tests {
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
 
+    #[test]
+    fn stats_schemas_can_both_be_absent() {
+        assert!(ResolvedPhysicalStatsSchemas::try_new(None, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stats_read_schema_can_exist_without_output() {
+        let read = schema_ref! { nullable "id": LONG };
+        let schemas = ResolvedPhysicalStatsSchemas::try_new(Some(read.clone()), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(schemas.read, read);
+        assert!(schemas.output.is_none());
+    }
+
+    #[test]
+    fn stats_output_schema_can_be_a_nested_subset_of_read_schema() {
+        let read = schema_ref! {
+            nullable "id": LONG,
+            nullable "nested": {
+                nullable "name": STRING,
+                nullable "value": INTEGER,
+            },
+        };
+        let output = schema_ref! {
+            nullable "nested": { nullable "name": STRING },
+        };
+
+        let schemas =
+            ResolvedPhysicalStatsSchemas::try_new(Some(read), Some(output.clone())).unwrap();
+
+        assert_eq!(schemas.unwrap().output, Some(output));
+    }
+
+    #[test]
+    fn stats_output_schema_requires_read_schema() {
+        let output = schema_ref! { nullable "id": LONG };
+
+        assert_result_error_with_message(
+            ResolvedPhysicalStatsSchemas::try_new(None, Some(output)),
+            "stats output schema requires a stats read schema",
+        );
+    }
+
+    #[test]
+    fn stats_output_fields_must_exist_in_read_schema() {
+        let read = schema_ref! { nullable "id": LONG };
+        let output = schema_ref! { nullable "name": STRING };
+
+        assert_result_error_with_message(
+            ResolvedPhysicalStatsSchemas::try_new(Some(read), Some(output)),
+            "stats output field 'name' is missing from the read schema",
+        );
+    }
+
+    #[test]
+    fn stats_output_fields_must_match_read_types() {
+        let read = schema_ref! { nullable "id": LONG };
+        let output = schema_ref! { nullable "id": STRING };
+
+        assert_result_error_with_message(
+            ResolvedPhysicalStatsSchemas::try_new(Some(read), Some(output)),
+            "stats output field 'id' has an incompatible type in the read schema",
+        );
+    }
+
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
@@ -584,7 +771,7 @@ pub(crate) mod tests {
         features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info_with_stats(
             schema,
             partition_columns,
@@ -604,7 +791,7 @@ pub(crate) mod tests {
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         get_state_info_with_options(
             schema,
             partition_columns,
@@ -627,7 +814,7 @@ pub(crate) mod tests {
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
         partition_values: PartitionValuesOptions,
-    ) -> DeltaResult<StateInfo> {
+    ) -> Result<StateInfo> {
         let builder = MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_partition_columns(partition_columns)
@@ -1214,10 +1401,10 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // physical_stats_schema should be set (from expected_stats_schema)
+        // The stats read schema should be set from expected_stats_schema.
         assert!(
-            state_info.physical_stats_schema.is_some(),
-            "physical_stats_schema should be Some when AllColumns is set"
+            state_info.physical_stats_read_schema().is_some(),
+            "physical_stats_read_schema should be Some when AllColumns is set"
         );
         // physical_predicate should still be active for data skipping
         assert!(
@@ -1250,12 +1437,13 @@ pub(crate) mod tests {
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("value")],
                 },
+                ..Default::default()
             },
         )
         .unwrap();
 
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema()
             .expect("should have physical stats schema");
 
         let min_values = stats_schema
@@ -1298,12 +1486,13 @@ pub(crate) mod tests {
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("value")],
                 },
+                ..Default::default()
             },
         )
         .unwrap();
 
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema()
             .expect("should have physical stats schema");
 
         // Check that minValues/maxValues only contain 'value', not 'id'
@@ -1456,16 +1645,17 @@ pub(crate) mod tests {
                 struct_stats: StructStats::Columns {
                     requested: vec![column_name!("col_a")],
                 },
+                ..Default::default()
             },
         )
         .unwrap();
 
         let stats_schema = state_info
-            .physical_stats_schema
+            .physical_stats_read_schema()
             .expect("should have physical stats schema");
 
         assert_stats_leaves(
-            &stats_schema,
+            stats_schema,
             &["phys_a", "phys_b"],
             &["col_a", "col_b", "phys_c"],
         );
@@ -1571,9 +1761,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(
-            state_info.physical_stats_schema.is_none(),
+            state_info.physical_stats_read_schema().is_none(),
             "Predicate on a past-cap column should produce no stats schema, got {:?}",
-            state_info.physical_stats_schema
+            state_info.physical_stats_read_schema()
         );
         assert!(
             matches!(state_info.physical_predicate, PhysicalPredicate::Some(_, _)),
@@ -1600,8 +1790,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
-            .as_ref()
+            .physical_stats_read_schema()
             .expect("should have stats schema (indexed arm survives)");
         // c0 (indexed) survives; c4 (past cap) is dropped.
         assert_stats_leaves(stats_schema, &["c0"], &["c4"]);
@@ -1630,7 +1819,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        assert!(state_info.physical_stats_schema.is_none());
+        assert!(state_info.physical_stats_read_schema().is_none());
         assert!(!state_info.eligible_physical_stats_columns.is_empty());
         assert!(!state_info
             .eligible_physical_stats_columns
@@ -1689,8 +1878,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
-            .as_ref()
+            .physical_stats_read_schema()
             .expect("indexed arm survives");
         for stats_field in [MIN_VALUES, MAX_VALUES] {
             let DataType::Struct(outer) = stats_schema
@@ -1825,8 +2013,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
-            .as_ref()
+            .physical_stats_read_schema()
             .expect("stats schema present");
         assert_stats_leaves(stats_schema, present, absent);
         let expected: HashSet<ColumnName> =
@@ -1847,8 +2034,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
-            .as_ref()
+            .physical_stats_read_schema()
             .expect("stats schema present because c4 is extra_indexed");
         assert_stats_leaves(stats_schema, &["c4"], &[]);
         assert!(state_info
@@ -1877,8 +2063,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
-            .as_ref()
+            .physical_stats_read_schema()
             .expect("stats schema present");
         for stats_field in [MIN_VALUES, MAX_VALUES] {
             let DataType::Struct(inner) = stats_schema.field(stats_field).unwrap().data_type()
@@ -1959,8 +2144,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let stats_schema = state_info
-            .physical_stats_schema
-            .as_ref()
+            .physical_stats_read_schema()
             .expect("stats schema present");
         assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);
         assert!(state_info

@@ -24,7 +24,7 @@ use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// Field ID offsets for stats fields within a column's stats struct.
 const STATS_OFFSET_LOWER_BOUND: i32 = 1;
@@ -281,7 +281,7 @@ fn leaf_stats_field(
     field: &StructField,
     path: &[String],
     categories: Option<StatCategories>,
-) -> DeltaResult<Option<StructField>> {
+) -> Result<Option<StructField>> {
     // Only leaves carry a field ID that matters for stats. A field ID that is absent, or present
     // but not `i32`-representable, is malformed => error. The spec limits which fields may carry
     // stats, so a field ID outside the supported range is expected for some reserved metadata
@@ -396,7 +396,7 @@ impl<'a> CategoryScopes<'a> {
     /// as a struct mirroring the table, so a scalar header indicates a bug, not bad input. Erroring
     /// (rather than silently dropping) keeps this consistent with [`descend`](Self::descend), which
     /// applies the same rule at every deeper level.
-    fn from_delta_stats_schema(delta_stats_schema: &'a StructType) -> DeltaResult<Self> {
+    fn from_delta_stats_schema(delta_stats_schema: &'a StructType) -> Result<Self> {
         let mut categories = [None; 3];
         for (i, category) in STAT_CATEGORIES.iter().enumerate() {
             categories[i] = match struct_sub_schema(delta_stats_schema, category) {
@@ -420,7 +420,7 @@ impl<'a> CategoryScopes<'a> {
     /// [`from_delta_stats_schema`](Self::from_delta_stats_schema), this can only be an internal
     /// invariant violation (the kernel-generated Delta stats schema must mirror the table), so it
     /// is surfaced as an error rather than silently dropped.
-    fn descend(&self, name: &str, path: &[String]) -> DeltaResult<CategoryScopes<'a>> {
+    fn descend(&self, name: &str, path: &[String]) -> Result<CategoryScopes<'a>> {
         let mut categories = [None; 3];
         for (i, scope) in self.categories.iter().enumerate() {
             categories[i] = match scope {
@@ -443,9 +443,10 @@ impl<'a> CategoryScopes<'a> {
         Ok(CategoryScopes { categories })
     }
 
-    /// Which categories a leaf named `leaf_name` appears in. Every leaf -- variants included -- is
-    /// a scalar in each category (a variant appears in `nullCount` as a scalar `LONG` and is
-    /// absent from `minValues`/`maxValues`), so presence is a same-name field lookup.
+    /// Which categories a leaf named `leaf_name` appears in. Presence is a same-name field lookup:
+    /// every leaf occupies one field per category it appears in, whatever that field's type (a
+    /// variant is a scalar `LONG` in `nullCount`, and its own struct in the bound categories when
+    /// the caller admitted it there).
     fn leaf_categories(&self, leaf_name: &str) -> StatCategories {
         let [null_count, min_values, max_values] = self
             .categories
@@ -536,7 +537,7 @@ where
 /// `_file`/`_pos`, or data field IDs above the reserved range), which are skipped with a warning.
 /// Returns an error if a leaf is missing its field-id metadata entirely, or is an (as-yet
 /// unimplemented) geospatial column.
-pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
+pub(crate) fn stats_schema(table_struct: &StructType) -> Result<StructType> {
     collect_stats_schema(table_struct, None)
 }
 
@@ -562,7 +563,7 @@ pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType>
 pub(crate) fn projected_stats_schema(
     table_struct: &StructType,
     delta_stats_schema: &StructType,
-) -> DeltaResult<StructType> {
+) -> Result<StructType> {
     collect_stats_schema(
         table_struct,
         Some(CategoryScopes::from_delta_stats_schema(delta_stats_schema)?),
@@ -574,7 +575,7 @@ pub(crate) fn projected_stats_schema(
 fn collect_stats_schema<'a>(
     table_struct: &'a StructType,
     projection: Option<CategoryScopes<'a>>,
-) -> DeltaResult<StructType> {
+) -> Result<StructType> {
     let mut fields: Vec<StructField> = Vec::new();
     {
         let mut walker = StatsLeafWalker {
@@ -1558,6 +1559,7 @@ mod tests {
         let config = StatsConfig {
             data_skipping_stats_columns: None,
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
+            ..Default::default()
         };
         let delta = expected_stats_schema(&table, &config, None, None).expect("stats schema");
 

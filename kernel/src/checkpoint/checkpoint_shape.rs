@@ -18,12 +18,13 @@ use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
+use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, FileMeta};
+use crate::{FileMeta, Result};
 
 /// Topology of a checkpoint: where the `add` / `remove` actions live.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,10 +57,7 @@ impl CheckpointShape {
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
-        exec: &dyn PlanExecutor,
-        snapshot: &Snapshot,
-    ) -> DeltaResult<CheckpointShape> {
+    pub(crate) fn try_new(exec: &dyn PlanExecutor, snapshot: &Snapshot) -> Result<CheckpointShape> {
         Self::try_new_impl(exec, snapshot, false)
     }
 
@@ -76,7 +74,7 @@ impl CheckpointShape {
     pub(crate) fn try_new_with_leaf_schema(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
-    ) -> DeltaResult<CheckpointShape> {
+    ) -> Result<CheckpointShape> {
         Self::try_new_impl(exec, snapshot, true)
     }
 
@@ -84,7 +82,7 @@ impl CheckpointShape {
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
-    ) -> DeltaResult<CheckpointShape> {
+    ) -> Result<CheckpointShape> {
         let segment = snapshot.log_segment();
 
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
@@ -168,7 +166,7 @@ impl CheckpointShape {
         root_checkpoint: &FileMeta,
         file_type: FileType,
         needs_leaf_schema: bool,
-    ) -> DeltaResult<Option<CheckpointShape>> {
+    ) -> Result<Option<CheckpointShape>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
                 let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
@@ -211,7 +209,7 @@ impl CheckpointShape {
         sidecar: FileMeta,
         needs_leaf_schema: bool,
         hint_sidecar_schema: Option<StructType>,
-    ) -> DeltaResult<CheckpointShape> {
+    ) -> Result<CheckpointShape> {
         let leaf_checkpoint_schema = match (needs_leaf_schema, hint_sidecar_schema) {
             (false, _) => None,
             (true, Some(schema)) => Some(Arc::new(schema)),
@@ -242,6 +240,22 @@ impl CheckpointShape {
             })
             .then_some(stats_schema)
     }
+
+    /// Returns `partition_schema` when the checkpoint has compatible parsed partition values.
+    pub(crate) fn compatible_partition_values_parsed_schema<'a>(
+        &self,
+        partition_schema: &'a SchemaRef,
+    ) -> Option<&'a SchemaRef> {
+        self.leaf_checkpoint_schema
+            .as_ref()
+            .is_some_and(|checkpoint_schema| {
+                LogSegment::schema_has_compatible_partition_values_parsed(
+                    checkpoint_schema,
+                    partition_schema,
+                )
+            })
+            .then_some(partition_schema)
+    }
 }
 
 #[tracing::instrument(
@@ -250,7 +264,7 @@ impl CheckpointShape {
     fields(enable_call_frame),
     err
 )]
-fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<SchemaRef> {
+fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> Result<SchemaRef> {
     Ok(exec.read_parquet_footer(file)?.schema)
 }
 
@@ -267,13 +281,14 @@ fn collect_single_sidecar(
     file: &FileMeta,
     file_format: FileType,
     log_root: &Url,
-) -> DeltaResult<Option<FileMeta>> {
+) -> Result<Option<FileMeta>> {
     let read_schema = LogSegment::sidecar_read_schema();
     // No file-constant columns: the sidecar column is read directly from each file.
     let plan = match file_format {
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
     }?
+    .filter(col!(SIDECAR_NAME, "path").is_not_null())?
     .build()?;
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
 
@@ -305,14 +320,14 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
 
-    /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
-    /// performs.
+    /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
         inner: SyncPlanExecutor,
         query_scans: AtomicUsize,
@@ -330,9 +345,16 @@ mod tests {
     }
 
     impl PlanExecutor for CountingExecutor {
-        fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+        fn execute_op(&self, op: Operation) -> Result<PlanResult> {
             match &op {
-                Operation::QueryPlan(_) => _ = self.query_scans.fetch_add(1, Ordering::Relaxed),
+                Operation::QueryPlan(plan) => {
+                    let predicate = plan.nodes.iter().find_map(|node| match &node.op {
+                        Operator::Filter(filter) => Some(filter.predicate.as_ref()),
+                        _ => None,
+                    });
+                    assert_eq!(predicate, Some(&col!(SIDECAR_NAME, "path").is_not_null()));
+                    _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
+                }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {
                     _ = self.footer_reads.fetch_add(1, Ordering::Relaxed)
                 }
@@ -391,7 +413,7 @@ mod tests {
         #[case] expect_parsed: Option<bool>,
     ) {
         let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
-        let exec = SyncPlanExecutor::default();
+        let exec = CountingExecutor::new();
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
         let shape = if stats_schema.is_some() {
@@ -451,6 +473,10 @@ mod tests {
         }
     }
 
+    fn probe_partition_schema() -> SchemaRef {
+        schema_ref! { nullable "part": INTEGER }
+    }
+
     #[test]
     fn incompatible_parsed_stats_schema_is_rejected() {
         let (_engine, snapshot, _tempdir) =
@@ -471,6 +497,31 @@ mod tests {
         assert!(shape
             .compatible_stats_parsed_schema(&incompatible)
             .is_none());
+    }
+
+    #[rstest]
+    #[case::matching(probe_partition_schema(), true)]
+    #[case::missing_column(schema_ref! {
+        nullable "part": INTEGER,
+        nullable "missing": STRING,
+    }, true)]
+    #[case::incompatible_type(schema_ref! { nullable "part": STRING }, false)]
+    fn parsed_partition_values_schema_compatibility(
+        #[case] partition_schema: SchemaRef,
+        #[case] expected_compatible: bool,
+    ) {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &SyncPlanExecutor::default(),
+            snapshot.as_ref(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            shape.compatible_partition_values_parsed_schema(&partition_schema),
+            expected_compatible.then_some(&partition_schema)
+        );
     }
 
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards

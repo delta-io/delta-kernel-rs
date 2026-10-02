@@ -1,5 +1,5 @@
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
@@ -37,10 +37,10 @@ pub unsafe extern "C" fn get_domain_metadata(
 
 fn get_domain_metadata_impl(
     snapshot: &Snapshot,
-    domain: DeltaResult<String>,
+    domain: Result<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
-) -> DeltaResult<NullableCvoid> {
+) -> Result<NullableCvoid> {
     Ok(snapshot
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
@@ -131,7 +131,7 @@ fn visit_clustering_columns_impl(
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
-) -> DeltaResult<OptionalValue<usize>> {
+) -> Result<OptionalValue<usize>> {
     let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
         return Ok(OptionalValue::None);
     };
@@ -184,7 +184,7 @@ fn visit_domain_metadata_impl(
         key: KernelStringSlice,
         value: KernelStringSlice,
     ),
-) -> DeltaResult<bool> {
+) -> Result<bool> {
     let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
@@ -206,7 +206,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::DeltaResult;
+    use delta_kernel::Result;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::json;
@@ -221,7 +221,7 @@ mod tests {
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
 
     #[tokio::test]
-    async fn test_domain_metadata() -> DeltaResult<()> {
+    async fn test_domain_metadata() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
@@ -343,8 +343,8 @@ mod tests {
                     state.unwrap().as_ptr() as *mut std::collections::HashMap<String, String>
                 )
             };
-            let key: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
-            let value: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
+            let key: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+            let value: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
             collected_metadata.insert(key.unwrap(), value.unwrap());
             Box::leak(collected_metadata);
         }
@@ -469,9 +469,9 @@ mod tests {
         ) {
             let mut columns =
                 unsafe { Box::from_raw(state.unwrap().as_ptr() as *mut Vec<VisitedColumn>) };
-            let logical: DeltaResult<String> =
+            let logical: Result<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&logical_column) };
-            let physical: DeltaResult<String> =
+            let physical: Result<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&physical_column) };
             columns.push((
                 logical.unwrap(),
@@ -538,8 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> DeltaResult<()>
-    {
+    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> Result<()> {
         let table_root = "memory:///test_clustering_user_facing_rejected/";
         let (engine, snapshot) = build_clustering_snapshot(
             table_root,
@@ -656,7 +655,7 @@ mod tests {
         #[case] follow_up: Option<(&str, bool)>,
         #[case] expected: Option<Vec<(&str, &str, u8)>>,
         #[case] table_root: &str,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let follow_up_commits: Vec<serde_json::Value> = follow_up
             .into_iter()
             .map(|(config, removed)| clustering_domain_action(config, removed))
@@ -697,8 +696,7 @@ mod tests {
 
     // Decimal is the only tag carrying a payload, so pin precision/scale explicitly.
     #[tokio::test]
-    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> DeltaResult<()>
-    {
+    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> Result<()> {
         const TAG_DECIMAL: u8 = 12;
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
@@ -740,7 +738,7 @@ mod tests {
     // With column mapping the domain stores physical identifiers, so the visitor must report the
     // schema-resolved logical name alongside the physical one the domain (and per-file stats) use.
     #[tokio::test]
-    async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> DeltaResult<()> {
+    async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
@@ -810,7 +808,7 @@ mod tests {
     // A clustering column absent from the schema cannot resolve to a logical name, so the
     // symbol surfaces an `ExternResult::Err` rather than reporting the table as unclustered.
     #[tokio::test]
-    async fn test_visit_clustering_columns_column_not_in_schema_errors() -> DeltaResult<()> {
+    async fn test_visit_clustering_columns_column_not_in_schema_errors() -> Result<()> {
         let table_root = "memory:///test_clustering_col_missing/";
         // "ghost" is not one of id/val/addr in clustering_test_schema_json().
         let (engine, snapshot) = build_clustering_snapshot(

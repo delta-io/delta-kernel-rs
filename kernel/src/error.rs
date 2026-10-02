@@ -13,6 +13,16 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+/// An error returned by a Delta Kernel operation.
+#[derive(Debug, thiserror::Error)]
+// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+#[non_exhaustive]
+pub enum Error {
+    /// A failure represented by a kernel implementation error.
+    #[error(transparent)]
+    Kernel(KernelError),
+}
+
 /// Details of a failed conversion from a scalar into a Rust value.
 ///
 /// Conversion code adds path elements as an error unwinds, producing a path from the outermost
@@ -84,20 +94,20 @@ pub(crate) fn add_scalar_path_context(
 }
 
 /// A [`std::result::Result`] that has the kernel [`KernelError`] as the error variant
-pub type DeltaResult<T, E = KernelError> = std::result::Result<T, E>;
+pub type Result<T, E = KernelError> = std::result::Result<T, E>;
 
 /// A result whose error is a [`KernelError`].
 pub type KernelResult<T> = std::result::Result<T, KernelError>;
 
-/// A boxed, `Send` iterator of [`DeltaResult<T>`] items.
+/// A boxed, `Send` iterator of [`Result<T>`] items.
 ///
 /// Convenience alias for the common pattern of returning a streaming, fallible iterator from
 /// kernel APIs.
-pub type DeltaResultIterator<'a, T> = Box<dyn Iterator<Item = DeltaResult<T>> + Send + 'a>;
+pub type ResultIterator<'a, T> = Box<dyn Iterator<Item = Result<T>> + Send + 'a>;
 
-/// `'static` counterpart to [`DeltaResultIterator`] for cases where the iterator does not
+/// `'static` counterpart to [`ResultIterator`] for cases where the iterator does not
 /// reference borrowed data.
-pub type DeltaResultIteratorStatic<T> = DeltaResultIterator<'static, T>;
+pub type ResultIteratorStatic<T> = ResultIterator<'static, T>;
 
 /// An error validating connector-provided state for snapshot construction.
 #[derive(Debug, thiserror::Error)]
@@ -320,6 +330,21 @@ pub enum KernelError {
     /// The payload is the lowest version that the operation requires but cannot obtain.
     #[error("Table version {0} is missing or unavailable for this log operation.")]
     MissingVersion(Version),
+
+    /// The requested start version is unavailable from the queried log segment, though later
+    /// versions remain.
+    #[error(
+        "Start version {requested} is not available; earliest available version is {earliest}."
+    )]
+    StartVersionNotFound {
+        /// The start version the caller requested.
+        requested: Version,
+        /// The earliest version servable from the queried log segment (always > `requested`).
+        /// This is the lowest version this producer can serve, not a promise about the lowest
+        /// version readable on disk: a checkpoint may have trimmed the segment past commits a
+        /// path-based read could still serve.
+        earliest: Version,
+    },
 
     /// A table version required by an operation has not been published to the Delta log.
     ///
@@ -659,9 +684,9 @@ impl From<object_store::Error> for KernelError {
 }
 
 /// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
-/// `DeltaResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
+/// `Result<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
 /// their error type, and this allows those results to be propagated with `?` in functions
-/// returning `DeltaResult`. The match is unreachable since `Infallible` has no variants.
+/// returning `Result`. The match is unreachable since `Infallible` has no variants.
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}

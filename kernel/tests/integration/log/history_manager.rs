@@ -9,7 +9,7 @@ use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, H
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{DeltaResult, Snapshot, Version};
+use delta_kernel::{Result, Snapshot, Version};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
@@ -66,7 +66,7 @@ async fn test_get_earliest_commit(
 /// (see `version_at_timestamp_max`). Resolution correctness across layouts is covered by the
 /// `history_manager` unit tests.
 #[test]
-fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
+fn test_at_timestamp_resolves_to_intermediate_version() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: CreateTable
@@ -114,7 +114,7 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> DeltaResult<()> {
 /// querying one millisecond earlier resolves to its predecessor. Deterministic without setting
 /// commit timestamps explicitly, since ICT values are derived from the table rather than hardcoded.
 #[test]
-fn test_at_timestamp_targets_specific_commit_via_ict() -> DeltaResult<()> {
+fn test_at_timestamp_targets_specific_commit_via_ict() -> Result<()> {
     let table = TestTableBuilder::new()
         .with_features(FeatureSet::new().ict())
         .with_log_state(LogState::with_latest_version(4))

@@ -202,10 +202,9 @@ use delta_kernel::schema::{
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, DeltaResult,
-    DeltaResultIterator, Engine, EngineData, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, KernelError, LogPath, ParquetFooter, ParquetHandler,
-    PredicateRef, Snapshot,
+    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
+    FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
+    LogPath, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIterator, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -451,10 +450,7 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-pub(crate) fn resolve_table_path(
-    table_root: impl AsRef<str>,
-    relative: &Path,
-) -> DeltaResult<Path> {
+pub(crate) fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> Result<Path> {
     let url = try_parse_uri(table_root)?;
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }
@@ -683,7 +679,7 @@ pub fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> Rec
 
 pub fn create_default_engine(
     table_root: &url::Url,
-) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+) -> Result<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     create_default_engine_with_batch(table_root, None)
 }
 
@@ -693,7 +689,7 @@ pub fn create_default_engine(
 pub fn create_default_engine_with_batch(
     table_root: &url::Url,
     batch_size: Option<usize>,
-) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+) -> Result<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
     let mut builder = DefaultEngineBuilder::new(store);
     if let Some(batch_size) = batch_size {
@@ -707,7 +703,7 @@ pub fn create_default_engine_with_batch(
 /// Uses `TokioBackgroundExecutor` as the default executor.
 pub fn create_default_engine_mt_executor(
     table_root: &url::Url,
-) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
+) -> Result<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
     let store = store_from_url(table_root)?;
     let task_executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -730,7 +726,7 @@ pub fn create_default_engine_mt_executor(
 /// ```ignore
 /// let (_temp_dir, table_path, engine) = test_table_setup()?;
 /// ```
-pub fn test_table_setup() -> DeltaResult<(
+pub fn test_table_setup() -> Result<(
     tempfile::TempDir,
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -753,7 +749,7 @@ pub fn test_table_setup() -> DeltaResult<(
 ///
 /// Returns `(temp_dir, table_path, engine)` for use in integration tests.
 /// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
-pub fn test_table_setup_mt() -> DeltaResult<(
+pub fn test_table_setup_mt() -> Result<(
     tempfile::TempDir,
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
@@ -1073,7 +1069,7 @@ fn enable_adaptive_metadata_dependencies<'a>(
 pub fn schema_with_column_defaults(
     schema: &StructType,
     mut column_defaults: HashMap<&str, &str>,
-) -> DeltaResult<SchemaRef> {
+) -> Result<SchemaRef> {
     let augmented_fields: Vec<_> = schema
         .fields()
         .map(|field| match column_defaults.remove(field.name.as_str()) {
@@ -1190,18 +1186,14 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> Result<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()
 }
 
-pub fn test_read(
-    expected: &ArrowEngineData,
-    url: &Url,
-    engine: Arc<dyn Engine>,
-) -> DeltaResult<()> {
+pub fn test_read(expected: &ArrowEngineData, url: &Url, engine: Arc<dyn Engine>) -> Result<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
@@ -1234,7 +1226,7 @@ pub async fn insert_data<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
-) -> DeltaResult<CommitResult> {
+) -> Result<CommitResult> {
     insert_data_with(
         snapshot,
         engine,
@@ -1258,7 +1250,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
-) -> DeltaResult<CommitResult> {
+) -> Result<CommitResult> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
@@ -1282,7 +1274,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
 }
 
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
-pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
     snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
 }
 
@@ -1294,9 +1286,9 @@ impl Committer for TestCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
+    ) -> Result<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
         let written_size =
             engine
@@ -1311,7 +1303,7 @@ impl Committer for TestCatalogCommitter {
         true
     }
 
-    fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> DeltaResult<()> {
+    fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> Result<()> {
         Ok(())
     }
 }
@@ -1323,7 +1315,7 @@ impl Committer for TestCatalogCommitter {
 pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
-) -> DeltaResult<Transaction> {
+) -> Result<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
     begin_transaction(snapshot, engine)
 }
@@ -1845,7 +1837,7 @@ impl JsonHandler for CapturingJsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> Result<Box<dyn EngineData>> {
         self.inner.parse_json(json_strings, output_schema)
     }
 
@@ -1854,7 +1846,7 @@ impl JsonHandler for CapturingJsonHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         self.inner
             .read_json_files(files, physical_schema, predicate)
     }
@@ -1865,7 +1857,7 @@ impl JsonHandler for CapturingJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         capture_first_token(&self.seen, &cancellation_token);
         self.inner.read_json_files_with_cancellation(
             files,
@@ -1878,9 +1870,9 @@ impl JsonHandler for CapturingJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: DeltaResultIterator<'_, FilteredEngineData>,
+        data: ResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<u64> {
+    ) -> Result<u64> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -1896,7 +1888,7 @@ impl ParquetHandler for CapturingParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         self.inner
             .read_parquet_files(files, physical_schema, predicate)
     }
@@ -1907,7 +1899,7 @@ impl ParquetHandler for CapturingParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> Result<FileDataReadResultIterator> {
         capture_first_token(&self.seen, &cancellation_token);
         self.inner.read_parquet_files_with_cancellation(
             files,
@@ -1921,11 +1913,11 @@ impl ParquetHandler for CapturingParquetHandler {
         &self,
         location: Url,
         data: FileDataReadResultIterator,
-    ) -> DeltaResult<()> {
+    ) -> Result<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 }
@@ -1991,7 +1983,7 @@ pub fn create_table_and_load_snapshot(
     schema: SchemaRef,
     engine: &dyn Engine,
     properties: &[(&str, &str)],
-) -> DeltaResult<Arc<Snapshot>> {
+) -> Result<Arc<Snapshot>> {
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 

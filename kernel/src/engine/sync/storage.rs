@@ -8,9 +8,7 @@ use url::Url;
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{
-    DeltaResult, DeltaResultIteratorStatic, FileMeta, FileSlice, KernelError, StorageHandler,
-};
+use crate::{FileMeta, FileSlice, KernelError, Result, ResultIteratorStatic, StorageHandler};
 
 #[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
@@ -31,7 +29,7 @@ impl SyncStorageHandler {
 // It relies on the default `*_with_cancellation` methods to check before delegation and before
 // pulling the resulting in-memory iterator.
 impl StorageHandler for SyncStorageHandler {
-    fn list_from(&self, url_path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, url_path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
@@ -69,9 +67,9 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(iter))
     }
 
-    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
         let store = self.store.clone();
-        let results: Vec<DeltaResult<Bytes>> = files
+        let results: Vec<Result<Bytes>> = files
             .into_iter()
             .map(|(url, _range_opt)| {
                 let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
@@ -82,15 +80,15 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
         put_bytes(self.store.as_ref(), path, data, overwrite)
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
         unimplemented!("SyncStorageHandler does not implement copy");
     }
 
-    fn head(&self, url: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, url: &Url) -> Result<FileMeta> {
         let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
         let meta = futures::executor::block_on(store.head(&path))?;
         Ok(FileMeta {
@@ -100,7 +98,7 @@ impl StorageHandler for SyncStorageHandler {
         })
     }
 
-    fn delete(&self, url: &Url) -> DeltaResult<()> {
+    fn delete(&self, url: &Url) -> Result<()> {
         let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
         match futures::executor::block_on(store.delete(&path)) {
             Ok(()) => Ok(()),

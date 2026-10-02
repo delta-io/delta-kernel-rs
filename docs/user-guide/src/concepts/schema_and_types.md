@@ -33,9 +33,9 @@ Decimals have a precision (1 to 38 inclusive) and a scale (0 to precision inclus
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::DeltaResult;
+# use delta_kernel::Result;
 # use delta_kernel::schema::DataType;
-# fn main() -> DeltaResult<()> {
+# fn main() -> Result<()> {
 let price_type = DataType::decimal(18, 2)?;
 # Ok(())
 # }
@@ -77,8 +77,8 @@ A named collection of fields (see [Schemas](#schemas) below). Structs can be nes
 ```rust,no_run
 # extern crate delta_kernel;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# use delta_kernel::DeltaResult;
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::Result;
+# fn main() -> Result<()> {
 let address_type = StructType::try_new([
     StructField::nullable("street", DataType::STRING),
     StructField::nullable("city", DataType::STRING),
@@ -113,9 +113,9 @@ aliases `Schema` and `SchemaRef` (`Arc<StructType>`) are used throughout the API
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::DeltaResult;
+# use delta_kernel::Result;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# fn main() -> DeltaResult<()> {
+# fn main() -> Result<()> {
 let schema = StructType::try_new([
     StructField::not_null("id", DataType::LONG),
     StructField::nullable("name", DataType::STRING),
@@ -132,9 +132,9 @@ let schema = StructType::try_new([
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::DeltaResult;
+# use delta_kernel::Result;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# fn main() -> DeltaResult<()> {
+# fn main() -> Result<()> {
 let schema = StructType::builder()
     .add_field(StructField::not_null("id", DataType::LONG))
     .add_field(StructField::nullable("name", DataType::STRING))
@@ -215,8 +215,8 @@ Every `Snapshot` exposes the table's schema:
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

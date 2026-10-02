@@ -8,7 +8,7 @@ use super::{FileActionTracker, StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::{DeltaResult, EngineData, KernelError};
+use crate::{EngineData, KernelError, Result};
 
 /// Column indices, matching the order in [`ADD_FILE_COLUMNS_FOR_VALIDATION`].
 const PATH: usize = 0;
@@ -25,7 +25,7 @@ pub(crate) fn validate_add_files(
     adds: &[Box<dyn EngineData>],
     physical_partition_columns: impl IntoIterator<Item = String>,
     staged_file_actions: Option<&mut FileActionTracker>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     StagedDataValidator::staged_add_file(physical_partition_columns, staged_file_actions)
         .validate(adds)
 }
@@ -65,7 +65,7 @@ pub(crate) struct RequiredAddFileVal {
 
 // TODO(#3112): Share required AddFile validation with DV updates.
 impl Validation for RequiredAddFileVal {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
@@ -103,7 +103,7 @@ struct RepeatedFileActionValidation<'a> {
 }
 
 impl Validation for RepeatedFileActionValidation<'_> {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let path: &str = getters[PATH].get(row, "path")?;
         // Plain staged adds carry no deletion vector (the mandatory add-file schema has no
         // deletionVector column), so the dv-id is always None here.
@@ -131,7 +131,7 @@ mod tests {
     fn validate_add_files(
         physical_partition_columns: &[&str],
         adds: &[Box<dyn EngineData>],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let mut file_actions = FileActionTracker::default();
         StagedDataValidator::staged_add_file(
             physical_partition_columns.iter().map(|s| s.to_string()),

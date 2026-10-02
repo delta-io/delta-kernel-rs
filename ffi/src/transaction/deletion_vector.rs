@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{KernelError, Result};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveTransaction;
@@ -102,7 +102,7 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 impl TryFrom<c_int> for KernelDvStorageType {
     type Error = KernelError;
 
-    fn try_from(value: c_int) -> DeltaResult<Self> {
+    fn try_from(value: c_int) -> Result<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
@@ -156,12 +156,12 @@ pub unsafe extern "C" fn dv_descriptor_new(
 
 fn dv_descriptor_new_impl(
     storage_type: KernelDvStorageType,
-    path: DeltaResult<&str>,
+    path: Result<&str>,
     has_offset: bool,
     offset: i32,
     size_in_bytes: i32,
     cardinality: i64,
-) -> DeltaResult<Handle<ExclusiveDvDescriptor>> {
+) -> Result<Handle<ExclusiveDvDescriptor>> {
     let descriptor = DeletionVectorDescriptor::try_new(
         storage_type.into(),
         path?,
@@ -204,9 +204,9 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
 
 fn dv_descriptor_map_insert_impl(
     map: &mut DvDescriptorMap,
-    data_file_path: DeltaResult<&str>,
+    data_file_path: Result<&str>,
     descriptor: DeletionVectorDescriptor,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let path = data_file_path?;
     let owned_path = path.to_string();
     map.inner.insert(owned_path, descriptor);
@@ -259,7 +259,7 @@ fn transaction_update_deletion_vectors_impl(
     txn: &mut Transaction,
     dv_map: DvDescriptorMap,
     scan_iter: &crate::scan::ScanMetadataIterator,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let mut guard = scan_iter.lock_iter()?;
     let files_iter = Transaction::scan_metadata_to_engine_data(&mut **guard);
     txn.update_deletion_vectors(dv_map.inner, files_iter)
@@ -267,28 +267,12 @@ fn transaction_update_deletion_vectors_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use delta_kernel::Engine;
-
     use super::*;
-    use crate::error::{AllocateError, AllocateErrorFn, FFIKernelError};
-    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_with_message};
-    use crate::{free_engine, ExternEngine};
-
-    struct ErrorOnlyExternEngine {
-        allocate_error: AllocateErrorFn,
-    }
-
-    impl ExternEngine for ErrorOnlyExternEngine {
-        fn engine(&self) -> Arc<dyn Engine> {
-            panic!("error-only test engine does not expose a kernel engine")
-        }
-
-        fn error_allocator(&self) -> &dyn AllocateError {
-            &self.allocate_error
-        }
-    }
+    use crate::error::FFIKernelError;
+    use crate::ffi_test_utils::{
+        assert_extern_result_error_with_message, error_only_engine_handle,
+    };
+    use crate::free_engine;
 
     #[test]
     fn kernel_dv_storage_type_maps_to_kernel_storage_type() {
@@ -375,10 +359,7 @@ mod tests {
 
     #[test]
     fn dv_descriptor_map_insert_invalid_utf8_consumes_descriptor() {
-        let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
-            allocate_error: allocate_err,
-        });
-        let engine: Handle<SharedExternEngine> = engine.into();
+        let engine = error_only_engine_handle();
         let map = dv_descriptor_map_new();
         let descriptor =
             dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, 1)

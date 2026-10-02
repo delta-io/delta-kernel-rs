@@ -34,8 +34,8 @@ Call `incremental_scan_builder(base_version)` on a `Snapshot`, then `build(engin
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn example() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -71,10 +71,10 @@ from a full scan:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
+# use delta_kernel::{Result, Snapshot};
 # use delta_kernel::incremental_scan::IncrementalScanStream;
 # fn consume(_: IncrementalScanStream) {}
-# fn example() -> DeltaResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -120,8 +120,8 @@ the live added and removed file keys:
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn example() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -188,9 +188,9 @@ both `removes` and `duplicate_adds`:
 # use std::collections::HashSet;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
+# use delta_kernel::{Result, Snapshot};
 # use delta_kernel::log_replay::FileActionKey;
-# fn example() -> DeltaResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();

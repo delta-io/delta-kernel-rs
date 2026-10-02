@@ -45,9 +45,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
-use crate::{
-    DeltaResult, Engine, EngineData, FileMeta, KernelError, Snapshot, SnapshotRef, Version,
-};
+use crate::{Engine, EngineData, FileMeta, KernelError, Result, Snapshot, SnapshotRef, Version};
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
 /// synthetic log-file listings in tests.
@@ -344,7 +342,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     pub(crate) fn minimal_checkpoint_action(
         path: &str,
         version: Version,
-    ) -> DeltaResult<CheckpointAction> {
+    ) -> Result<CheckpointAction> {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let version = version_as_i64(version)?;
         Ok(CheckpointAction::new(
@@ -358,7 +356,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
-    pub(crate) fn setup_table() -> DeltaResult<(SyncEngine, Url)> {
+    pub(crate) fn setup_table() -> Result<(SyncEngine, Url)> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test")
@@ -377,7 +375,7 @@ pub(crate) mod adaptive_metadata_fixtures {
         table_root: &Url,
         version: Version,
         data: Box<dyn EngineData>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let filtered = FilteredEngineData::with_all_rows_selected(data);
         let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
         engine.json_handler().write_json_file(
@@ -529,7 +527,7 @@ impl MockTableConfigurationBuilder {
         self.try_build().unwrap()
     }
 
-    pub(crate) fn try_build(self) -> DeltaResult<TableConfiguration> {
+    pub(crate) fn try_build(self) -> Result<TableConfiguration> {
         let schema = self
             .schema
             .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });
@@ -911,7 +909,10 @@ fn build_arrow_input_with_stale_element_id() -> StructArray {
     let stale_element = outer_element
         .as_ref()
         .clone()
-        .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "999".to_string())].into());
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "999".to_string(),
+        )]));
     let new_outer_key = Field::new(
         outer_key.name(),
         DataType::List(Arc::new(stale_element)),
@@ -1168,7 +1169,7 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
 pub(crate) fn setup_column_mapping_txn(
     schema: SchemaRef,
     mode: ColumnMappingMode,
-) -> DeltaResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+) -> Result<(Arc<dyn Engine>, Transaction<CreateTable>)> {
     let mode_str = match mode {
         ColumnMappingMode::Name => "name",
         ColumnMappingMode::Id => "id",
@@ -1255,7 +1256,7 @@ pub(crate) fn validate_physical_schema_column_mapping(
     }
 }
 
-fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<TempDir>)> {
+fn resolve_test_table_path(table_name: &str) -> Result<(PathBuf, Option<TempDir>)> {
     match load_test_data("tests/data", table_name) {
         Ok(test_dir) => {
             let test_path = test_dir.path().join(table_name);
@@ -1273,7 +1274,7 @@ fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<Tem
 }
 
 /// Copies a test-table fixture into a writable temporary directory.
-pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
+pub(crate) fn copy_test_table(table_name: &str) -> Result<(Url, TempDir)> {
     let (source, _source_tempdir) = resolve_test_table_path(table_name)?;
     let tempdir = tempfile::tempdir()?;
     let table_path = tempdir.path().join(table_name);
@@ -1290,7 +1291,7 @@ pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
 /// for the duration of the test to prevent premature cleanup of extracted files.
 pub(crate) fn load_test_table(
     table_name: &str,
-) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
+) -> Result<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)

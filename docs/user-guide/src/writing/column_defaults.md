@@ -109,7 +109,7 @@ and per-row `DEFAULT` requests need separate handling.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::expressions::Scalar;
 # use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{DeltaResult, KernelError, SnapshotRef};
+# use delta_kernel::{Result, KernelError, SnapshotRef};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
 // Describe how each table column gets its values.
@@ -122,8 +122,8 @@ async fn append_with_defaults(
     engine: &DefaultEngine<impl TaskExecutor>,
     snapshot: SnapshotRef,
     input_schema: ArrowSchemaRef,
-    batches: impl IntoIterator<Item = DeltaResult<RecordBatch>>,
-) -> DeltaResult<CommitResult> {
+    batches: impl IntoIterator<Item = Result<RecordBatch>>,
+) -> Result<CommitResult> {
     // 1. Start the transaction.
     let table_schema = snapshot.schema();
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)?;
@@ -168,7 +168,7 @@ async fn append_with_defaults(
                 ColumnSource::Input(index) => Ok(Arc::clone(batch.column(*index))),
                 ColumnSource::Default(scalar) => scalar.to_array(batch.num_rows()),
             })
-            .collect::<DeltaResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let output_batch = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
         let data = ArrowEngineData::new(output_batch);
         let file_metadata = engine.write_parquet(&data, &write_context).await?;
@@ -218,12 +218,12 @@ SQL with the appropriate SQL semantics and return a value of the declared type:
 # extern crate delta_kernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{ColumnDefault, DataType};
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{Result, KernelError};
 
 fn resolve_default(
     column_default: &ColumnDefault<'_>,
-    evaluate_sql: impl FnOnce(&str, &DataType) -> DeltaResult<Scalar>,
-) -> DeltaResult<Scalar> {
+    evaluate_sql: impl FnOnce(&str, &DataType) -> Result<Scalar>,
+) -> Result<Scalar> {
     let scalar = evaluate_sql(column_default.raw_sql(), column_default.data_type())?;
     if &scalar.data_type() != column_default.data_type() {
         return Err(KernelError::generic("default evaluator returned the wrong type"));

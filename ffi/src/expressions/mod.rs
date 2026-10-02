@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 
 use delta_kernel::expressions::{MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp};
-use delta_kernel::{DeltaResult, Expression, Predicate};
+use delta_kernel::{Expression, Predicate, Result};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::handle::Handle;
@@ -49,7 +49,7 @@ impl FfiMapToStructOptions {
         }
     }
 
-    unsafe fn try_to_kernel(&self) -> DeltaResult<MapToStructOptions> {
+    unsafe fn try_to_kernel(&self) -> Result<MapToStructOptions> {
         let timestamp_timezone = Option::<&KernelStringSlice>::from(&self.timestamp_timezone)
             .map(|timezone| unsafe { timezone.try_to_string() })
             .transpose()?;

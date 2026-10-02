@@ -9,8 +9,8 @@ use delta_kernel::{Engine, FileMeta};
 use serde_json::json;
 use tempfile::TempDir;
 use test_utils::{
-    begin_transaction, create_table, create_table_with_column_mapping_mode, engine_store_setup,
-    read_actions_from_commit,
+    assert_result_error_with_message, begin_transaction, create_table,
+    create_table_with_column_mapping_mode, engine_store_setup, read_actions_from_commit,
 };
 use url::Url;
 
@@ -173,8 +173,11 @@ async fn test_with_root_manifest_file_requires_the_feature(
         last_modified: 0,
         size: 1024,
     };
-    let txn = test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .with_root_manifest_file(file)?;
-    assert!(txn.commit(&engine).is_err());
+    let result = test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
+        .with_root_manifest_file(file);
+    assert_result_error_with_message(
+        result,
+        "root manifest file commit requires the adaptiveMetadata-preview feature",
+    );
     Ok(())
 }

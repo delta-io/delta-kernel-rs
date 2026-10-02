@@ -6,17 +6,17 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(test)]
-use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::{object_store::memory::InMemory, Engine};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
 use test_utils::add_commit;
 
-use crate::error::{EngineError, ExternResult, FFIKernelError};
+use crate::error::{AllocateError, AllocateErrorFn, EngineError, ExternResult, FFIKernelError};
 #[cfg(test)]
 use crate::{
     engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
-    SharedExternEngine, SharedSnapshot,
+    ExternEngine, SharedExternEngine, SharedSnapshot,
 };
 use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
@@ -80,6 +80,28 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
             );
         },
     }
+}
+
+struct ErrorOnlyExternEngine {
+    allocate_error: AllocateErrorFn,
+}
+
+impl ExternEngine for ErrorOnlyExternEngine {
+    fn engine(&self) -> Arc<dyn Engine> {
+        panic!("error-only test engine does not expose a kernel engine")
+    }
+
+    fn error_allocator(&self) -> &dyn AllocateError {
+        &self.allocate_error
+    }
+}
+
+/// Return a lightweight engine handle for tests that only exercise FFI error allocation.
+pub(crate) fn error_only_engine_handle() -> crate::handle::Handle<SharedExternEngine> {
+    let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
+        allocate_error: allocate_err,
+    });
+    engine.into()
 }
 
 /// Build a latest-version snapshot via the FFI builder API. Panics on error.

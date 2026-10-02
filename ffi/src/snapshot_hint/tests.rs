@@ -15,9 +15,9 @@ use crate::ffi_test_utils::{
 };
 use crate::log_path::FfiLogPath;
 use crate::{
-    engine_to_handle, free_engine, free_snapshot, free_snapshot_builder, get_snapshot_builder,
-    get_snapshot_builder_from, snapshot_builder_build, snapshot_builder_set_version, FfiFileStats,
-    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
+    snapshot_builder_build, snapshot_builder_with_version, FfiFileStats, KernelI64Slice,
+    KernelStringSlice, OptionalValue, SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -132,7 +132,7 @@ fn test_engine() -> Handle<SharedExternEngine> {
     )
 }
 
-fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<MutableFfiSnapshotBuilder> {
+fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<ExclusiveSnapshotBuilder> {
     unsafe {
         ok_or_panic(get_snapshot_builder(
             slice("memory:///hinted-table/"),
@@ -160,7 +160,9 @@ fn test_snapshot_hint(
     }
 }
 
-unsafe fn set_minimal_hint(builder: &mut Handle<MutableFfiSnapshotBuilder>) {
+unsafe fn with_minimal_hint(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+) -> Handle<ExclusiveSnapshotBuilder> {
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
         1,
@@ -171,7 +173,7 @@ unsafe fn set_minimal_hint(builder: &mut Handle<MutableFfiSnapshotBuilder>) {
         0,
         FfiSnapshotHintFreshness::Unverified,
     );
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(builder, &hint)) };
+    unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
 }
 
 #[test]
@@ -208,9 +210,9 @@ impl InvalidHintComponent {
 #[case::protocol(InvalidHintComponent::Protocol)]
 #[case::metadata(InvalidHintComponent::Metadata)]
 #[case::last_checkpoint(InvalidHintComponent::LastCheckpoint)]
-fn aggregate_setter_wraps_invalid_top_level_state(#[case] component: InvalidHintComponent) {
+fn aggregate_with_wraps_invalid_top_level_state(#[case] component: InvalidHintComponent) {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
         1,
@@ -250,7 +252,7 @@ fn aggregate_setter_wraps_invalid_top_level_state(#[case] component: InvalidHint
         InvalidHintComponent::LastCheckpoint => hint.last_checkpoint = &invalid_last_checkpoint,
     }
 
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
@@ -258,16 +260,14 @@ fn aggregate_setter_wraps_invalid_top_level_state(#[case] component: InvalidHint
     );
 
     unsafe {
-        free_snapshot_builder(builder);
         free_engine(engine);
     }
 }
 
 #[test]
-fn aggregate_setter_late_failure_preserves_existing_hint() {
+fn aggregate_with_late_failure_consumes_builder() {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    unsafe { set_minimal_hint(&mut builder) };
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
 
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
@@ -291,26 +291,20 @@ fn aggregate_setter_late_failure_preserves_existing_hint() {
         FfiSnapshotHintFreshness::Latest,
     );
     replacement.crc = &invalid_crc_state;
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &replacement) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &replacement) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
         "supplied CRC",
     );
 
-    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    assert!(!unsafe { snapshot.as_ref() }.is_built_as_latest());
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
-    }
+    unsafe { free_engine(engine) };
 }
 
 #[test]
-fn aggregate_setter_replaces_existing_hint_after_successful_validation() {
+fn aggregate_with_replaces_existing_hint_after_successful_validation() {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    unsafe { set_minimal_hint(&mut builder) };
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
 
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
@@ -322,12 +316,8 @@ fn aggregate_setter_replaces_existing_hint_after_successful_validation() {
         0,
         FfiSnapshotHintFreshness::Latest,
     );
-    unsafe {
-        ok_or_panic(snapshot_builder_set_snapshot_hint(
-            &mut builder,
-            &replacement,
-        ))
-    };
+    let builder =
+        unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &replacement)) };
 
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     assert!(unsafe { snapshot.as_ref() }.is_built_as_latest());
@@ -340,16 +330,16 @@ fn aggregate_setter_replaces_existing_hint_after_successful_validation() {
 #[rstest::rstest]
 #[case("not-a-url")]
 #[case("memory:///hinted-table/_delta_log/not-a-log-file")]
-fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str) {
+fn aggregate_with_wraps_invalid_log_path_errors(#[case] location: &'static str) {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(slice(location), 1, 1);
     let hint = test_snapshot_hint(
         std::slice::from_ref(&log_path),
         0,
         FfiSnapshotHintFreshness::Unverified,
     );
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
@@ -357,15 +347,14 @@ fn aggregate_setter_wraps_invalid_log_path_errors(#[case] location: &'static str
     );
 
     unsafe {
-        free_snapshot_builder(builder);
         free_engine(engine);
     }
 }
 
 #[test]
-fn aggregate_setter_rejects_null_nonempty_log_path_array() {
+fn aggregate_with_rejects_null_nonempty_log_path_array() {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let hint = FfiSnapshotHint {
         version: 0,
         freshness: FfiSnapshotHintFreshness::Unverified,
@@ -378,7 +367,7 @@ fn aggregate_setter_rejects_null_nonempty_log_path_array() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
     };
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
@@ -386,15 +375,14 @@ fn aggregate_setter_rejects_null_nonempty_log_path_array() {
     );
 
     unsafe {
-        free_snapshot_builder(builder);
         free_engine(engine);
     }
 }
 
 #[test]
-fn aggregate_setter_rejects_log_compaction_paths() {
+fn aggregate_with_rejects_log_compaction_paths() {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
         slice(concat!(
             "memory:///hinted-table/_delta_log/",
@@ -408,7 +396,7 @@ fn aggregate_setter_rejects_log_compaction_paths() {
         1,
         FfiSnapshotHintFreshness::Unverified,
     );
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::InvalidSnapshotHint,
@@ -416,15 +404,14 @@ fn aggregate_setter_rejects_log_compaction_paths() {
     );
 
     unsafe {
-        free_snapshot_builder(builder);
         free_engine(engine);
     }
 }
 
 #[test]
-fn aggregate_setter_rejects_single_bin_histogram() {
+fn aggregate_with_rejects_single_bin_histogram() {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
         1,
@@ -462,24 +449,23 @@ fn aggregate_setter_rejects_single_bin_histogram() {
         FfiSnapshotHintFreshness::Unverified,
     );
     hint.crc = &crc;
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
 
     unsafe {
-        free_snapshot_builder(builder);
         free_engine(engine);
     }
 }
 
 #[test]
-fn aggregate_setter_builds_latest_snapshot_from_rich_crc() {
+fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
     const PARTITIONED_SCHEMA: &str = concat!(
         r#"{"type":"struct","fields":[{"name":"p","type":"string","nullable":true,"#,
         r#""metadata":{}}]}"#,
     );
 
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let partition_columns = [slice("p")];
     let metadata = || FfiMetadata {
         id: slice("table-id"),
@@ -609,7 +595,7 @@ fn aggregate_setter_builds_latest_snapshot_from_rich_crc() {
     hint.metadata = metadata();
     hint.last_checkpoint = &last_checkpoint;
     hint.crc = &crc;
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let snapshot_ref = unsafe { snapshot.as_ref() };
@@ -646,13 +632,13 @@ fn aggregate_setter_builds_latest_snapshot_from_rich_crc() {
 #[rstest::rstest]
 #[case::matching(0, true)]
 #[case::conflicting(1, false)]
-fn aggregate_setter_validates_explicit_builder_version_at_build(
+fn aggregate_with_validates_explicit_builder_version_at_build(
     #[case] requested_version: Version,
     #[case] should_build: bool,
 ) {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
-    unsafe { snapshot_builder_set_version(&mut builder, requested_version) };
+    let builder = test_builder(&engine);
+    let builder = unsafe { snapshot_builder_with_version(builder, requested_version) };
 
     let log_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
@@ -664,7 +650,7 @@ fn aggregate_setter_validates_explicit_builder_version_at_build(
         0,
         FfiSnapshotHintFreshness::Unverified,
     );
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
     let result = unsafe { snapshot_builder_build(builder) };
     if should_build {
@@ -685,7 +671,7 @@ fn assert_typed_checkpoint_build(
     expected_hint: &LastCheckpointHint,
 ) {
     let engine = test_engine();
-    let mut builder = test_builder(&engine);
+    let builder = test_builder(&engine);
     let crc = FfiCrc {
         protocol: copy_protocol(&protocol),
         ..empty_crc()
@@ -694,7 +680,7 @@ fn assert_typed_checkpoint_build(
     hint.protocol = protocol;
     hint.last_checkpoint = last_checkpoint;
     hint.crc = &crc;
-    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
 
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let snapshot_ref = unsafe { snapshot.as_ref() };
@@ -854,13 +840,12 @@ fn aggregate_checkpoint_build_preserves_identity_and_reconstructed_state(#[case]
 }
 
 #[test]
-fn aggregate_setter_reports_unsupported_for_existing_snapshot_builder() {
+fn aggregate_with_reports_unsupported_for_existing_snapshot_builder() {
     let engine = test_engine();
-    let mut initial_builder = test_builder(&engine);
-    unsafe { set_minimal_hint(&mut initial_builder) };
+    let initial_builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(initial_builder)) };
 
-    let mut update_builder = unsafe {
+    let update_builder = unsafe {
         ok_or_panic(get_snapshot_builder_from(
             snapshot.shallow_copy(),
             engine.shallow_copy(),
@@ -876,7 +861,7 @@ fn aggregate_setter_reports_unsupported_for_existing_snapshot_builder() {
         0,
         FfiSnapshotHintFreshness::Unverified,
     );
-    let result = unsafe { snapshot_builder_set_snapshot_hint(&mut update_builder, &hint) };
+    let result = unsafe { snapshot_builder_with_snapshot_hint(update_builder, &hint) };
     assert_extern_result_error_contains(
         result,
         FFIKernelError::UnsupportedError,
@@ -884,7 +869,6 @@ fn aggregate_setter_reports_unsupported_for_existing_snapshot_builder() {
     );
 
     unsafe {
-        free_snapshot_builder(update_builder);
         free_snapshot(snapshot);
         free_engine(engine);
     }
@@ -893,12 +877,10 @@ fn aggregate_setter_reports_unsupported_for_existing_snapshot_builder() {
 #[test]
 fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     let engine = test_engine();
-    let mut initial_builder = test_builder(&engine);
-    unsafe { set_minimal_hint(&mut initial_builder) };
+    let initial_builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(initial_builder)) };
 
-    let mut update_builder = test_builder(&engine);
-    unsafe { set_minimal_hint(&mut update_builder) };
+    let mut update_builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     unsafe { update_builder.as_mut() }.source =
         FfiSnapshotBuilderSource::ExistingSnapshot(unsafe { snapshot.clone_as_arc() });
 

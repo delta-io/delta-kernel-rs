@@ -461,7 +461,7 @@ jobs:
         # frequency, so it does not weaken undefined-behavior or data-race detection.
         run: |
           pushd ffi
-          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest

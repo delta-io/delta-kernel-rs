@@ -37,9 +37,8 @@ use crate::handle::Handle;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
-    unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
-    KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot,
-    TryFromStringSlice, Url,
+    unwrap_and_parse_path_as_url, ExclusiveEngineData, ExternEngine, KernelStringSlice,
+    OptionalValue, Result, SharedExternEngine, SharedSnapshot, Snapshot, TryFromStringSlice, Url,
 };
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
@@ -86,9 +85,9 @@ pub unsafe extern "C" fn transaction(
 }
 
 fn transaction_impl(
-    url: DeltaResult<Url>,
+    url: Result<Url>,
     extern_engine: &dyn ExternEngine,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
@@ -118,7 +117,7 @@ fn transaction_with_committer_impl(
     snapshot: Arc<Snapshot>,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
@@ -132,8 +131,8 @@ fn transaction_with_committer_impl(
 ///
 /// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
 fn commit_result_to_committed_handle<S>(
-    result: DeltaResult<CommitResult<S>>,
-) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
+    result: Result<CommitResult<S>>,
+) -> Result<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
         CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
@@ -179,7 +178,7 @@ pub unsafe extern "C" fn with_engine_info(
 fn with_engine_info_impl(
     txn: Transaction,
     engine_info: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
@@ -205,7 +204,7 @@ pub unsafe extern "C" fn with_operation(
 fn with_operation_impl(
     txn: Transaction,
     operation: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }?;
     Ok(Box::new(txn.with_operation(operation)).into())
 }
@@ -240,7 +239,7 @@ fn with_domain_metadata_impl(
     txn: Transaction,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
     Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
@@ -270,7 +269,7 @@ pub unsafe extern "C" fn with_domain_metadata_removed(
 fn with_domain_metadata_removed_impl(
     txn: Transaction,
     domain: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
 }
@@ -303,7 +302,7 @@ pub unsafe extern "C" fn with_row_tracking_high_water_mark(
 fn with_row_tracking_high_water_mark_impl(
     txn: Transaction,
     high_water_mark: i64,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
 }
 
@@ -328,7 +327,7 @@ pub unsafe extern "C" fn with_root_manifest_file(
 fn with_root_manifest_file_impl(
     txn: Transaction,
     file: &FileMeta,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
     let location = Url::parse(path)?;
     let size = file
@@ -427,7 +426,7 @@ pub unsafe extern "C" fn create_table_with_engine_info(
 fn create_table_with_engine_info_impl(
     txn: CreateTableTransaction,
     engine_info: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+) -> Result<Handle<ExclusiveCreateTransaction>> {
     let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
@@ -458,7 +457,7 @@ fn create_table_with_domain_metadata_impl(
     txn: CreateTableTransaction,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
-) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+) -> Result<Handle<ExclusiveCreateTransaction>> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
     Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
@@ -600,7 +599,7 @@ pub struct ExclusiveCreateTableBuilder;
 unsafe fn collect_create_table_columns(
     columns: *const KernelStringSlice,
     num_columns: usize,
-) -> DeltaResult<Vec<String>> {
+) -> Result<Vec<String>> {
     if num_columns == 0 {
         return Ok(Vec::new());
     }
@@ -675,12 +674,12 @@ pub unsafe extern "C" fn create_table_builder_with_partition_columns(
 }
 
 /// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
-/// wrappers so it can be unit-tested. `layout` is a `DeltaResult` so a column-parse failure
+/// wrappers so it can be unit-tested. `layout` is a `Result` so a column-parse failure
 /// short-circuits here, dropping the already-consumed builder rather than producing a layout.
 fn create_table_builder_with_data_layout_impl(
     builder: CreateTableTransactionBuilder,
-    layout: DeltaResult<DataLayout>,
-) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    layout: Result<DataLayout>,
+) -> Result<Handle<ExclusiveCreateTableBuilder>> {
     Ok(Box::new(builder.with_data_layout(layout?)).into())
 }
 
@@ -711,10 +710,10 @@ pub unsafe extern "C" fn get_create_table_builder(
 }
 
 fn get_create_table_builder_impl(
-    path: DeltaResult<&str>,
+    path: Result<&str>,
     schema: &EngineSchema,
-    engine_info: DeltaResult<&str>,
-) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    engine_info: Result<&str>,
+) -> Result<Handle<ExclusiveCreateTableBuilder>> {
     let mut visitor_state = KernelSchemaVisitorState::default();
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
     let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
@@ -752,9 +751,9 @@ pub unsafe extern "C" fn create_table_builder_with_table_property(
 
 fn create_table_builder_with_table_property_impl(
     builder: CreateTableTransactionBuilder,
-    key: DeltaResult<String>,
-    value: DeltaResult<String>,
-) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    key: Result<String>,
+    value: Result<String>,
+) -> Result<Handle<ExclusiveCreateTableBuilder>> {
     let builder = builder.with_table_properties([(key?, value?)]);
     Ok(Box::new(builder).into())
 }
@@ -804,7 +803,7 @@ fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
     committer: Box<dyn Committer>,
     extern_engine: &dyn ExternEngine,
-) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+) -> Result<Handle<ExclusiveCreateTransaction>> {
     let engine = extern_engine.engine();
     let create_txn = builder.build(engine.as_ref(), committer)?;
     Ok(Box::new(create_txn).into())
@@ -867,7 +866,7 @@ pub unsafe extern "C" fn remove_files(
         let raw = unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) };
         raw.iter().map(|&b| b != 0).collect()
     };
-    let result: DeltaResult<bool> = (|| {
+    let result: Result<bool> = (|| {
         let filtered = FilteredEngineData::try_new(data, sv)?;
         txn.remove_files(filtered);
         Ok(true)
@@ -924,6 +923,8 @@ mod tests {
     use super::*;
     use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
     use crate::expressions::free_kernel_expression;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema_visitor::visit_field_geometry;
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
@@ -2292,7 +2293,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel_ffi::{
-            get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
+            get_snapshot_builder, snapshot_builder_build, snapshot_builder_with_max_catalog_version,
         };
 
         use crate::delta_kernel_unity_catalog::tests::{
@@ -2348,11 +2349,11 @@ mod tests {
             let engine = engine_handle_for_store(Arc::clone(&store));
 
             let snapshot = unsafe {
-                let mut ptr = ok_or_panic(get_snapshot_builder(
+                let ptr = ok_or_panic(get_snapshot_builder(
                     kernel_string_slice!(table_path_str),
                     engine.shallow_copy(),
                 ));
-                snapshot_builder_set_max_catalog_version(&mut ptr, 0);
+                let ptr = snapshot_builder_with_max_catalog_version(ptr, 0);
                 ok_or_panic(snapshot_builder_build(ptr))
             };
 
@@ -2730,6 +2731,74 @@ mod tests {
         Ok(())
     }
 
+    /// Schema visitor callback for tests: builds a one-field `{geom: geometry(OGC:CRS84)}` schema.
+    #[cfg(feature = "geo-type-in-dev")]
+    extern "C" fn visit_single_geometry_field_schema(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let name = "geom";
+        let crs = "OGC:CRS84";
+        let field_id = unsafe {
+            ok_or_panic(visit_field_geometry(
+                state,
+                kernel_string_slice!(name),
+                kernel_string_slice!(crs),
+                true,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        };
+        let field_ids = [field_id];
+        let root = "schema";
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                kernel_string_slice!(root),
+                field_ids.as_ptr(),
+                field_ids.len(),
+                false,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        }
+    }
+
+    /// A visitor-built geo schema handed to the create-table path must be rejected: `create_table`
+    /// does not declare the `geospatial` reader/writer feature for the tables it builds, so a
+    /// schema containing a geometry/geography column always fails table-configuration validation
+    /// before any data write is attempted.
+    #[cfg(feature = "geo-type-in-dev")]
+    #[tokio::test]
+    async fn test_create_table_rejects_geospatial_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table_rejects_geospatial_schema", None);
+        let table_path = table_url.to_string();
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_single_geometry_field_schema,
+        };
+        let builder = ok_or_panic(unsafe {
+            get_create_table_builder(
+                kernel_string_slice!(table_path),
+                &schema_arg,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+        let build_res = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
+        assert_extern_result_error_contains(
+            build_res,
+            FFIKernelError::UnsupportedError,
+            "does not have the required 'geospatial' feature",
+        );
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_create_table_with_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
@@ -2828,18 +2897,18 @@ mod tests {
 
         let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
         let file = root_manifest_file_meta(&manifest_path);
-        let txn =
-            ok_or_panic(unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) });
+        let staged = unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) };
 
         if feature_enabled {
+            let txn = ok_or_panic(staged);
             let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
             assert_eq!(unsafe { version_and_free(committed) }, 1);
         } else {
             assert_extern_result_error_with_message(
-                unsafe { commit(txn, engine.shallow_copy()) },
-                FFIKernelError::GenericError,
+                staged,
+                FFIKernelError::UnsupportedError,
                 Some(
-                    "Generic delta kernel error: root manifest file commit requires the \
+                    "Unsupported: root manifest file commit requires the \
                      adaptiveMetadata-preview feature",
                 ),
             );
@@ -3099,7 +3168,7 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
-        let layout: DeltaResult<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
+        let layout: Result<DataLayout> = Err(delta_kernel::KernelError::generic("bad column"));
         let result = create_table_builder_with_data_layout_impl(builder, layout);
         assert!(result.is_err());
         unsafe { free_engine(engine) };

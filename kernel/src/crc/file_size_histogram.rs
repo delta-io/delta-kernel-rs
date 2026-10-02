@@ -11,7 +11,7 @@ use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 const KB: i64 = 1024;
 const MB: i64 = KB * 1024;
@@ -116,7 +116,7 @@ impl FileSizeHistogram {
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
         total_bytes: Vec<i64>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         require!(
             sorted_bin_boundaries.len() >= 2,
             KernelError::internal_error(format!(
@@ -158,9 +158,7 @@ impl FileSizeHistogram {
     ///
     /// Used when a previous CRC has non-default boundaries and we need to build delta
     /// histograms that match, so that `try_apply_delta` succeeds during merge.
-    pub(crate) fn create_empty_with_boundaries(
-        sorted_bin_boundaries: Vec<i64>,
-    ) -> DeltaResult<Self> {
+    pub(crate) fn create_empty_with_boundaries(sorted_bin_boundaries: Vec<i64>) -> Result<Self> {
         let len = sorted_bin_boundaries.len();
         Self::try_new(sorted_bin_boundaries, vec![0; len], vec![0; len])
     }
@@ -194,7 +192,7 @@ impl FileSizeHistogram {
 
     /// Adds a file of the given size to the histogram, incrementing the appropriate bin's
     /// file count and total bytes.
-    pub(crate) fn insert(&mut self, file_size: i64) -> DeltaResult<()> {
+    pub(crate) fn insert(&mut self, file_size: i64) -> Result<()> {
         require!(
             file_size >= 0,
             KernelError::internal_error(format!(
@@ -213,7 +211,7 @@ impl FileSizeHistogram {
     ///
     /// Does not validate that the bin remains non-negative, since this is used to build delta
     /// histograms where removes may exceed adds in a given bin.
-    pub(crate) fn remove(&mut self, file_size: i64) -> DeltaResult<()> {
+    pub(crate) fn remove(&mut self, file_size: i64) -> Result<()> {
         require!(
             file_size >= 0,
             KernelError::internal_error(format!(
@@ -233,10 +231,7 @@ impl FileSizeHistogram {
     /// The delta may contain negative values (more files removed than added in a bin).
     /// Returns a new histogram whose file counts and total bytes are the sum of the two inputs.
     /// Returns an error if any resulting bin would have negative file counts or total bytes.
-    pub(crate) fn try_apply_delta(
-        &self,
-        delta: &FileSizeHistogram,
-    ) -> DeltaResult<FileSizeHistogram> {
+    pub(crate) fn try_apply_delta(&self, delta: &FileSizeHistogram) -> Result<FileSizeHistogram> {
         require!(
             self.sorted_bin_boundaries == delta.sorted_bin_boundaries,
             KernelError::internal_error("Cannot add histograms with different bin boundaries")
@@ -269,7 +264,7 @@ impl FileSizeHistogram {
     /// Returns `Ok(self)` if valid, or an error indicating the first bin that is negative.
     /// Used to validate a delta histogram before using it as an absolute histogram (e.g. for
     /// version zero where the delta represents the full table state).
-    pub(crate) fn check_non_negative(self) -> DeltaResult<Self> {
+    pub(crate) fn check_non_negative(self) -> Result<Self> {
         for i in 0..self.sorted_bin_boundaries.len() {
             require!(
                 self.file_counts[i] >= 0 && self.total_bytes[i] >= 0,

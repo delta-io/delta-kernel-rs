@@ -28,9 +28,7 @@ use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{
-    DeltaResult, Engine, Expression as Expr, KernelError, Predicate as Pred, Snapshot,
-};
+use delta_kernel::{Engine, Expression as Expr, KernelError, Predicate as Pred, Result, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
@@ -131,7 +129,7 @@ async fn append_only_enforces_data_change_for_file_actions(
             };
             FilteredEngineData::try_new(data, selection_vector)
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let mut txn = begin_transaction(snapshot, engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(data_change);
@@ -210,7 +208,7 @@ async fn append_only_enforces_data_change_for_file_actions(
 fn selected_scan_file_batch(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-) -> DeltaResult<FilteredEngineData> {
+) -> Result<FilteredEngineData> {
     for scan_files in get_scan_files(snapshot, engine)? {
         let data = scan_files.apply_selection_vector()?;
         if !data.is_empty() {
@@ -385,7 +383,7 @@ async fn commit_validates_file_action_uniqueness(
     let batches = scan_files
         .into_iter()
         .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let base_row = batch.slice(0, 1);
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
@@ -2313,7 +2311,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let mut txn =
             load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
         let write_state = txn.write_state()?;
-        let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::DeltaResult<_> {
+        let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::Result<_> {
             let data = RecordBatch::try_new(
                 Arc::new(data_schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],

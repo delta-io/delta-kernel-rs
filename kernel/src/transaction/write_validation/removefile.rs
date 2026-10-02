@@ -13,14 +13,14 @@ use crate::scan::log_replay::{PATH_NAME, SIZE_NAME};
 use crate::scan::scan_row_schema;
 use crate::schema::ColumnNamesAndTypes;
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// Column indices, matching the order in [`REMOVE_FILE_COLUMNS_FOR_VALIDATION`].
 const PATH: usize = 0;
 const SIZE: usize = 1;
 const DELETION_VECTOR_STORAGE_TYPE: usize = 2;
 
-static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTypes>> =
+static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<Result<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
         let names = vec![
             column_name!(PATH_NAME),
@@ -37,14 +37,12 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<DeltaResult<ColumnNamesAndTy
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
     staged_file_actions: Option<&mut FileActionTracker>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     StagedDataValidator::staged_remove_file(staged_file_actions)?.validate_filtered(removes)
 }
 
 impl<'a> StagedDataValidator<'a> {
-    fn staged_remove_file(
-        staged_file_actions: Option<&'a mut FileActionTracker>,
-    ) -> DeltaResult<Self> {
+    fn staged_remove_file(staged_file_actions: Option<&'a mut FileActionTracker>) -> Result<Self> {
         let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
             .map_err(|error| {
@@ -71,7 +69,7 @@ impl<'a> StagedDataValidator<'a> {
 struct RequiredRemoveFileVal;
 
 impl Validation for RequiredRemoveFileVal {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let path: &str = getters[PATH].get_opt(row, "path")?.ok_or_else(|| {
             KernelError::missing_data("RemoveFile is missing required field 'path'")
         })?;
@@ -99,7 +97,7 @@ struct RepeatedFileActionValidation<'a> {
 }
 
 impl Validation for RepeatedFileActionValidation<'_> {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let dv_id = dv_id_at(getters, DELETION_VECTOR_STORAGE_TYPE, row)?;
         self.staged_file_actions.record_remove(path, dv_id)
@@ -322,7 +320,7 @@ mod tests {
         FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)))
     }
 
-    fn validate_remove_files(removes: &[FilteredEngineData]) -> DeltaResult<()> {
+    fn validate_remove_files(removes: &[FilteredEngineData]) -> Result<()> {
         let mut file_actions = FileActionTracker::default();
         super::validate_remove_files(removes, Some(&mut file_actions))
     }

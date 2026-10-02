@@ -41,7 +41,7 @@ writers must not overwrite existing checksum files.
 
 ## ChecksumWriteResult
 
-The return type is `DeltaResult<(ChecksumWriteResult, SnapshotRef)>`:
+The return type is `Result<(ChecksumWriteResult, SnapshotRef)>`:
 
 | Variant | Meaning |
 |---------|---------|

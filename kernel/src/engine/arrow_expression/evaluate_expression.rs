@@ -36,7 +36,7 @@ use crate::engine::arrow_expression::opaque::{
 };
 use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
-use crate::error::{DeltaResult, KernelError};
+use crate::error::{KernelError, Result};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
@@ -88,7 +88,7 @@ impl ProvidesColumnByName for StructArray {
 pub(crate) fn extract_column(
     parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
-) -> DeltaResult<ArrayRef> {
+) -> Result<ArrayRef> {
     Ok(extract_column_ref(parent, col)?.clone())
 }
 
@@ -97,7 +97,7 @@ pub(crate) fn extract_column(
 pub(crate) fn extract_column_ref<'a>(
     mut parent: &'a dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
-) -> DeltaResult<&'a ArrayRef> {
+) -> Result<&'a ArrayRef> {
     let mut field_names = col.iter();
     let mut field_name = match field_names.next() {
         Some(name) => name.as_ref(),
@@ -124,7 +124,7 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
     nullability_predicate: Option<&ExpressionRef>,
-) -> DeltaResult<ArrayRef> {
+) -> Result<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
         return Err(KernelError::generic(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
@@ -176,7 +176,7 @@ fn evaluate_struct_patch_expression(
     patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
-) -> DeltaResult<ArrayRef> {
+) -> Result<ArrayRef> {
     let mut used_field_patches = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
@@ -280,7 +280,7 @@ pub fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> DeltaResult<ArrayRef> {
+) -> Result<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
@@ -433,7 +433,7 @@ fn evaluate_array_expression(
     exprs: &[Expression],
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> DeltaResult<ArrayRef> {
+) -> Result<ArrayRef> {
     let num_rows = batch.num_rows();
 
     let array_type = match result_type {
@@ -491,7 +491,7 @@ fn evaluate_array_expression(
     let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, total_len);
     for row in 0..num_rows {
         for col in 0..n {
-            mutable.extend(col, row, row + 1);
+            mutable.try_extend(col, row, row + 1)?;
         }
     }
     let values = make_array(mutable.freeze());
@@ -541,7 +541,7 @@ fn cast_list_elements(
     vals: &Arc<dyn Array>,
     field: &Arc<ArrowField>,
     dir: ViewCast,
-) -> DeltaResult<Arc<dyn Array>> {
+) -> Result<Arc<dyn Array>> {
     let to_type = match dir {
         ViewCast::ToView => match field.data_type() {
             ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
@@ -579,7 +579,7 @@ fn cast_list_elements(
 /// This function converts ArrowView types to their non-view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -596,7 +596,7 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
 /// This function converts  Arrow types to their Arrow view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -617,7 +617,7 @@ pub fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
     inverted: bool,
-) -> DeltaResult<BooleanArray> {
+) -> Result<BooleanArray> {
     use BinaryPredicateOp::*;
     use Predicate::*;
 
@@ -932,9 +932,9 @@ fn coalesce_arrays(
     for row in 0..first.len() {
         // Find first non-null value for this row
         match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
-            Some((array_idx, _)) => mutable.extend(array_idx, row, row + 1),
-            None => mutable.extend_nulls(1),
-        }
+            Some((array_idx, _)) => mutable.try_extend(array_idx, row, row + 1)?,
+            None => mutable.try_extend_nulls(1)?,
+        };
     }
 
     Ok(make_array(mutable.freeze()))
@@ -949,7 +949,7 @@ fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
     timestamp_timezone: TimestampTimezone,
-) -> DeltaResult<Option<Scalar>> {
+) -> Result<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
@@ -992,7 +992,7 @@ fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
     timestamp_timezone: TimestampTimezone,
-) -> DeltaResult<StructArray> {
+) -> Result<StructArray> {
     let map_array = map_arr
         .as_any()
         .downcast_ref::<MapArray>()
@@ -1107,7 +1107,7 @@ fn evaluate_map_to_struct(
     )?)
 }
 
-fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
+fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> Result<ArrayRef> {
     if let Some(expected) = expected {
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
     }
@@ -2838,7 +2838,7 @@ mod tests {
         raw: &str,
         target: DataType,
         timestamp_timezone: Option<&str>,
-    ) -> DeltaResult<ArrayRef> {
+    ) -> Result<ArrayRef> {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("ts");
         builder.values().append_value(raw);
@@ -2861,7 +2861,7 @@ mod tests {
         raw: &str,
         target: DataType,
         timestamp_timezone: Option<&str>,
-    ) -> DeltaResult<Option<i64>> {
+    ) -> Result<Option<i64>> {
         let field = evaluate_map_to_struct_field(raw, target, timestamp_timezone)?;
         let timestamps = field
             .as_any()

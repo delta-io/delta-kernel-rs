@@ -11,7 +11,7 @@ use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
 /// [`BoundWriteContextBuilder`](super::BoundWriteContextBuilder).
@@ -219,7 +219,7 @@ impl BoundWriteContext {
     /// - `s3://bucket/table/year=2024/abc.parquet` -> `"year=2024/abc.parquet"`
     ///
     /// Returns an error if the file is not under the table root.
-    pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
+    pub fn resolve_file_path(&self, file_location: &Url) -> Result<String> {
         let relative = self
             .write_state
             .table_root

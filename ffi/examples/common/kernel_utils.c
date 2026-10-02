@@ -61,18 +61,22 @@ void* allocate_string(const KernelStringSlice slice)
   return strndup(slice.ptr, slice.len);
 }
 
-// utility function to convert key/val into slices and set them on a builder
-// returns false on failure
-bool set_builder_opt(HandleMutableFfiEngineBuilder* engine_builder, char* key, char* val)
+// Utility function to convert key/val into slices and apply them to a builder. The call consumes
+// the input handle. On success, this replaces it with the returned handle; on failure, no builder
+// remains to free.
+bool set_builder_opt(HandleExclusiveEngineBuilder* engine_builder, char* key, char* val)
 {
   KernelStringSlice key_slice = { key, strlen(key) };
   KernelStringSlice val_slice = { val, strlen(val) };
-  ExternResultbool res = set_builder_option(engine_builder, key_slice, val_slice);
-  if (res.tag != Okbool) {
+  ExternResultHandleExclusiveEngineBuilder res =
+      builder_with_option(*engine_builder, key_slice, val_slice);
+  if (res.tag != OkHandleExclusiveEngineBuilder) {
+    *engine_builder = NULL;
     print_error("Failed to set builder option.", (Error*)res.err);
     free_error((Error*)res.err);
     return false;
   }
+  *engine_builder = res.ok;
   return true;
 }
 
@@ -280,12 +284,12 @@ void compile_snapshot_hint_abi(void)
     .last_checkpoint = &last_checkpoint,
     .crc = &crc,
   };
-  ExternResultbool (*set_snapshot_hint)(HandleMutableFfiSnapshotBuilder*,
-                                        const FfiSnapshotHint*) =
-      snapshot_builder_set_snapshot_hint;
+  ExternResultHandleExclusiveSnapshotBuilder (*with_snapshot_hint)(
+      HandleExclusiveSnapshotBuilder, const FfiSnapshotHint*) =
+      snapshot_builder_with_snapshot_hint;
 
   (void)snapshot_hint;
-  (void)set_snapshot_hint;
+  (void)with_snapshot_hint;
   (void)concrete_log_path_slice;
   (void)concrete_string_slice;
   (void)concrete_string_map_slice;

@@ -1,5 +1,5 @@
 use delta_kernel::snapshot::SnapshotHintError;
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{KernelError, Result};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -77,6 +77,9 @@ pub enum FFIKernelError {
     UnpublishedVersionError = 48,
     EmptyLogError = 49,
     InvalidSnapshotHint = 50,
+    StartVersionNotFound = 51,
+    InvalidGeoParamsError = 52,
+    MaxCatalogVersionError = 53,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -90,7 +93,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::Extract(..) => FFIKernelError::ExtractError,
             KernelError::Generic(_) => FFIKernelError::GenericError,
             KernelError::GenericError { .. } => FFIKernelError::GenericError,
-            KernelError::MaxCatalogVersion(_) => FFIKernelError::GenericError,
+            KernelError::MaxCatalogVersion(_) => FFIKernelError::MaxCatalogVersionError,
             KernelError::LogTailVersionsNotContiguous { .. } => FFIKernelError::InvalidLogSegment,
             KernelError::IOError(_) => FFIKernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
@@ -107,6 +110,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::MissingData(_) => FFIKernelError::MissingDataError,
             KernelError::EmptyLog => FFIKernelError::EmptyLogError,
             KernelError::MissingVersion(_) => FFIKernelError::MissingVersionError,
+            KernelError::StartVersionNotFound { .. } => FFIKernelError::StartVersionNotFound,
             KernelError::UnpublishedVersion(_) => FFIKernelError::UnpublishedVersionError,
             KernelError::DeletionVector(_) => FFIKernelError::DeletionVectorError,
             KernelError::InvalidUrl(_) => FFIKernelError::InvalidUrlError,
@@ -126,6 +130,7 @@ impl From<KernelError> for FFIKernelError {
             }
             KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
+            KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
             KernelError::Backtraced {
@@ -234,7 +239,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
     }
 }
 
-/// Converts a [DeltaResult] into an [ExternResult], using the engine's error allocator.
+/// Converts a [Result] into an [ExternResult], using the engine's error allocator.
 ///
 /// # Safety
 ///
@@ -243,8 +248,8 @@ pub(crate) trait IntoExternResult<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
 }
 
-// NOTE: We can't "just" impl From<DeltaResult<T>> because we require an error allocator.
-impl<T> IntoExternResult<T> for DeltaResult<T> {
+// NOTE: We can't "just" impl From<Result<T>> because we require an error allocator.
+impl<T> IntoExternResult<T> for Result<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
@@ -313,6 +318,7 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
             FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::MaxCatalogVersionError => KernelError::MaxCatalogVersion(message),
             FFIKernelError::InternalError => KernelError::InternalError(message),
             FFIKernelError::FileNotFoundError => KernelError::FileNotFound(message),
             FFIKernelError::MissingColumnError => KernelError::MissingColumn(message),
@@ -326,6 +332,7 @@ impl From<EngineExecError> for KernelError {
             }
             FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
+            FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
             FFIKernelError::InvalidLogPath => KernelError::InvalidLogPath(message),
@@ -376,7 +383,8 @@ impl From<EngineExecError> for KernelError {
             | FFIKernelError::RowTrackingChangeFeedUnsupported
             | FFIKernelError::LogHistoryError
             | FFIKernelError::MissingVersionError
-            | FFIKernelError::UnpublishedVersionError) => {
+            | FFIKernelError::UnpublishedVersionError
+            | FFIKernelError::StartVersionNotFound) => {
                 KernelError::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
@@ -442,6 +450,20 @@ mod error_code_tests {
         assert_eq!(FFIKernelError::InvalidLogSegment as i32, 47);
         assert_eq!(FFIKernelError::UnpublishedVersionError as i32, 48);
         assert_eq!(FFIKernelError::EmptyLogError as i32, 49);
+
+        let start_not_found = KernelError::StartVersionNotFound {
+            requested: 5,
+            earliest: 12,
+        };
+        assert_eq!(
+            start_not_found.to_string(),
+            "Start version 5 is not available; earliest available version is 12."
+        );
+        assert_eq!(
+            FFIKernelError::from(start_not_found),
+            FFIKernelError::StartVersionNotFound
+        );
+        assert_eq!(FFIKernelError::StartVersionNotFound as i32, 51);
     }
 
     #[test]
@@ -469,6 +491,30 @@ mod error_code_tests {
             FFIKernelError::InvalidSnapshotHint
         );
         assert_eq!(FFIKernelError::InvalidSnapshotHint as i32, 50);
+    }
+
+    #[test]
+    fn invalid_geo_params_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidGeoParams("invalid".to_string())),
+            FFIKernelError::InvalidGeoParamsError
+        );
+        assert_eq!(FFIKernelError::InvalidGeoParamsError as i32, 52);
+
+        let err: KernelError = exec_error(FFIKernelError::InvalidGeoParamsError, "invalid").into();
+        assert!(matches!(err, KernelError::InvalidGeoParams(message) if message == "invalid"));
+    }
+
+    #[test]
+    fn max_catalog_version_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::MaxCatalogVersion("invalid".to_string())),
+            FFIKernelError::MaxCatalogVersionError
+        );
+        assert_eq!(FFIKernelError::MaxCatalogVersionError as i32, 53);
+
+        let err: KernelError = exec_error(FFIKernelError::MaxCatalogVersionError, "invalid").into();
+        assert!(matches!(err, KernelError::MaxCatalogVersion(message) if message == "invalid"));
     }
 }
 
@@ -515,6 +561,10 @@ mod tests {
     #[case::fallback_unpublished_version(
         FFIKernelError::UnpublishedVersionError,
         "Generic delta kernel error: engine execution error (UnpublishedVersionError): boom"
+    )]
+    #[case::fallback_start_version_not_found(
+        FFIKernelError::StartVersionNotFound,
+        "Generic delta kernel error: engine execution error (StartVersionNotFound): boom"
     )]
     fn engine_exec_error_maps_kernel_error_code(
         #[case] etype: FFIKernelError,

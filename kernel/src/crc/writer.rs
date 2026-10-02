@@ -5,7 +5,7 @@ use url::Url;
 use super::Crc;
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, KernelError};
+use crate::{Engine, KernelError, Result};
 
 /// Serialize and write a CRC file to storage.
 ///
@@ -18,7 +18,7 @@ use crate::{DeltaResult, Engine, KernelError};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
-pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
+pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> Result<()> {
     require!(
         crc.file_stats_state.is_complete(),
         KernelError::ChecksumWriteUnsupported(format!(

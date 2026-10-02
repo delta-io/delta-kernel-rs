@@ -21,7 +21,7 @@ use crate::engine_data::{
 use crate::expressions::ColumnName;
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, KernelError};
+use crate::{EngineData, KernelError, Result};
 
 /// Tracks staged file actions across a transaction.
 ///
@@ -46,7 +46,7 @@ impl FileActionTracker {
         }
     }
 
-    fn record_add(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
+    fn record_add(&mut self, path: &str, dv_id: Option<String>) -> Result<()> {
         Self::record(
             path,
             dv_id,
@@ -56,7 +56,7 @@ impl FileActionTracker {
         )
     }
 
-    fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> DeltaResult<()> {
+    fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> Result<()> {
         Self::record(
             path,
             dv_id,
@@ -72,7 +72,7 @@ impl FileActionTracker {
         action_name: &str,
         same_type_actions: &mut HashMap<String, Option<String>>,
         different_type_actions: &HashMap<String, Option<String>>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let Entry::Vacant(entry) = same_type_actions.entry(path.to_owned()) else {
             return Err(KernelError::invalid_transaction_state(format!(
                 "Transaction contains multiple {action_name} actions for path '{path}'"
@@ -98,7 +98,7 @@ impl FileActionTracker {
 
 /// A single row-level validation.
 pub(crate) trait Validation {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()>;
 }
 
 /// Runs validations over batches that share one staged-data schema.
@@ -115,7 +115,7 @@ struct StagedDataValidator<'a> {
 
 impl<'a> StagedDataValidator<'a> {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    fn validate(mut self, batches: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+    fn validate(mut self, batches: &[Box<dyn EngineData>]) -> Result<()> {
         for batch in batches {
             RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
         }
@@ -123,7 +123,7 @@ impl<'a> StagedDataValidator<'a> {
     }
 
     /// Runs every validation against each selected staged-data row.
-    fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> DeltaResult<()> {
+    fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> Result<()> {
         for batch in batches {
             FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
         }
@@ -134,7 +134,7 @@ impl<'a> StagedDataValidator<'a> {
         &mut self,
         rows: impl IntoIterator<Item = usize>,
         getters: &[&'data dyn GetData<'data>],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         for row in rows {
             for validation in &mut self.validations {
                 validation.validate_row(row, getters)?;
@@ -149,7 +149,7 @@ impl RowVisitor for StagedDataValidator<'_> {
         self.columns_and_types.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         self.validate_rows(0..row_count, getters)
     }
 }
@@ -163,7 +163,7 @@ impl FilteredRowVisitor for StagedDataValidator<'_> {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         self.validate_rows(rows, getters)
     }
 }
@@ -264,7 +264,7 @@ mod tests {
             tracker: &mut FileActionTracker,
             path: &str,
             dv_id: Option<String>,
-        ) -> DeltaResult<()> {
+        ) -> Result<()> {
             match self {
                 Self::Add => tracker.record_add(path, dv_id),
                 Self::Remove => tracker.record_remove(path, dv_id),
@@ -292,7 +292,7 @@ mod tests {
             }
         }
 
-        fn record(self, tracker: &mut FileActionTracker) -> DeltaResult<()> {
+        fn record(self, tracker: &mut FileActionTracker) -> Result<()> {
             self.action_type
                 .record(tracker, self.path, self.dv_id.map(str::to_owned))
         }

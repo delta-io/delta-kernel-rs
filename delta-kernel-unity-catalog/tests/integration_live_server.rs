@@ -40,7 +40,7 @@ use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
     CreateStagingTableRequest, LoadTableResponse, TableIdentifier,
 };
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient, UCUpdateTableRestClient};
 use url::Url;
 
 /// Returns `(server_url, token)` from the environment, or `None` to signal the caller to skip.
@@ -57,8 +57,8 @@ fn client_config(url: &str, token: &str) -> ClientConfig {
         .expect("failed to build ClientConfig")
 }
 
-fn client(url: &str, token: &str) -> UCClient {
-    UCClient::new(client_config(url, token)).expect("failed to build UCClient")
+fn client(url: &str, token: &str) -> UCDeltaTableClient {
+    UCDeltaTableClient::new(client_config(url, token)).expect("failed to build UCDeltaTableClient")
 }
 
 /// Normalize a UC table location to a root URL ending in `/`. UC returns the location without a
@@ -116,8 +116,8 @@ async fn live_load_table_builds_log_tail() {
     );
 }
 
-/// Live CREATE through the full connector flow: `UCClient::create_staging_table` to reserve,
-/// kernel for the v0 commit, then `UCClient::create_table` to register.
+/// Live CREATE through the full connector flow: `UCDeltaTableClient::create_staging_table` to
+/// reserve, kernel for the v0 commit, then `UCDeltaTableClient::create_table` to register.
 ///
 /// The table enables row tracking and clustering so the create body and the write path exercise the
 /// `delta.rowTracking` and `delta.clustering` domains in one round trip: the initial watermark (-1)

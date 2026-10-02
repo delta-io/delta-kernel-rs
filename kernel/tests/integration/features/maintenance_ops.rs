@@ -6,7 +6,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{Result, Snapshot};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{add_commit, assert_result_error_with_message, test_table_setup_mt};
@@ -18,7 +18,7 @@ use url::Url;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_and_checksum_return_updated_snapshots(
     #[case] v2_checkpoint: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -76,7 +76,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
 #[case::v1_checkpoint(false)]
 #[case::v2_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaResult<()> {
+async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine");

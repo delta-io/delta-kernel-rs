@@ -14,7 +14,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::transaction::{AlterTable, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
-use crate::DeltaResult;
+use crate::Result;
 
 /// A type alias for alter-table transactions.
 ///
@@ -39,7 +39,7 @@ impl AlterTableTransaction {
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
         correlation_id: Option<Arc<str>>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let span = tracing::info_span!(
             "txn",
             path = %read_snapshot.table_root(),
@@ -58,6 +58,8 @@ impl AlterTableTransaction {
             committer,
             operation: Some("ALTER TABLE".to_string()),
             engine_info: None,
+            operation_parameters: None,
+            operation_metrics: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
@@ -78,7 +80,7 @@ impl AlterTableTransaction {
             dv_matched_files: vec![],
             num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            root_manifest_file: None,
+            manifest_write: None,
             physical_clustering_columns: None,
             _state: PhantomType::default(),
         })

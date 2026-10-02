@@ -34,7 +34,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{create_row, Engine};
-use crate::{DeltaResult, EngineData, FileMeta, FileSize, KernelError, RowVisitor as _};
+use crate::{EngineData, FileMeta, FileSize, KernelError, Result, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -168,7 +168,7 @@ static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 
 /// The `checkpoint` action serializes as an array whose elements are each one of the metadata
 /// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
-/// element type that may appear in that array (per the adaptiveMetadata RFC, delta-io/delta#6978):
+/// element type that may appear in that array:
 /// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -394,7 +394,7 @@ impl Metadata {
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         // Validate that the schema does not contain metadata columns
         // Note: We don't have to look for nested metadata columns because that is already validated
         // when creating a StructType.
@@ -422,7 +422,7 @@ impl Metadata {
     }
 
     #[internal_api]
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.metadata)
@@ -484,7 +484,7 @@ impl Metadata {
     /// declares a type the kernel doesn't support, or [`KernelError::MalformedJson`] for other
     /// JSON decoding failures.
     #[internal_api]
-    pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
+    pub(crate) fn parse_schema(&self) -> Result<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
         serde_json::from_str(&self.schema_string).map_err(|error| {
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
@@ -525,7 +525,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if schema serialization fails.
-    pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> Result<Self> {
         Ok(Self {
             schema_string: serde_json::to_string(&schema)?,
             ..self
@@ -609,7 +609,7 @@ struct ProtocolRaw {
 impl TryFrom<ProtocolRaw> for Protocol {
     type Error = KernelError;
 
-    fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
+    fn try_from(protocol: ProtocolRaw) -> Result<Self> {
         Protocol::try_new(
             protocol.min_reader_version,
             protocol.min_writer_version,
@@ -633,7 +633,7 @@ impl Protocol {
     pub(crate) fn try_new_modern(
         reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
         writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -644,10 +644,7 @@ impl Protocol {
 
     /// Try to create a new legacy Protocol instance with the given reader/writer versions
     #[cfg(test)]
-    pub(crate) fn try_new_legacy(
-        min_reader_version: i32,
-        min_writer_version: i32,
-    ) -> DeltaResult<Self> {
+    pub(crate) fn try_new_legacy(min_reader_version: i32, min_writer_version: i32) -> Result<Self> {
         Self::try_new(
             min_reader_version,
             min_writer_version,
@@ -663,7 +660,7 @@ impl Protocol {
         min_writer_version: i32,
         reader_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
         writer_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
             KernelError::InvalidProtocol(format!(
@@ -821,7 +818,7 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
@@ -891,7 +888,7 @@ pub(crate) struct CommitInfo {
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine. For now this is always empty on write.
+    /// operation. This is specified by the engine.
     pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
     /// Map of arbitrary string key-value pairs that provide operation metrics.
     /// This is specified by the engine.
@@ -944,6 +941,20 @@ impl CommitInfo {
             ROW_TRACKING_PRESERVED_TAG.to_string(),
             Some("true".to_string()),
         );
+    }
+
+    pub(crate) fn set_operation_parameters(
+        &mut self,
+        operation_parameters: HashMap<String, Option<String>>,
+    ) {
+        self.operation_parameters = Some(operation_parameters);
+    }
+
+    pub(crate) fn set_operation_metrics(
+        &mut self,
+        operation_metrics: HashMap<String, Option<String>>,
+    ) {
+        self.operation_metrics = Some(operation_metrics);
     }
 
     /// Merges the supplied tags into this CommitInfo's tags.
@@ -1285,13 +1296,10 @@ impl SetTransaction {
 ///
 /// Contains the path, size, and version of the root manifest file.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
-#[cfg_attr(
-    test,
-    derive(Serialize, Deserialize, Default),
-    serde(rename_all = "camelCase")
-)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct ContentRoot {
     /// Path to the root manifest file. It is absolute if it begins with an [RFC 3986] URI scheme
     /// (e.g. `s3://bucket/...`); otherwise it is relative and resolved against the table root by
@@ -1304,7 +1312,7 @@ pub(crate) struct ContentRoot {
     /// Size of the root manifest file in bytes. Not exposed directly -- use
     /// [`CheckpointAction::root_filemeta`] to get a validated [`FileMeta`].
     size_in_bytes: i64,
-    /// The table version the root manifest reflects. Per the adaptiveMetadata RFC this is
+    /// The table version the root manifest reflects. This is
     /// `<= checkpointMetadata.version`: equal in a manifest commit, and strictly less in a
     /// standalone checkpoint (where inline file actions cover the gap up to the checkpoint
     /// version). Distinct from [`CheckpointAction::version`], which is
@@ -1340,7 +1348,7 @@ impl LastManifestCommit {
     /// the validation on `CheckpointAction`.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn new(version: i64, content_root_version: i64) -> DeltaResult<Self> {
+    pub(crate) fn new(version: i64, content_root_version: i64) -> Result<Self> {
         let last_manifest_commit = LastManifestCommit {
             version,
             content_root_version,
@@ -1352,7 +1360,7 @@ impl LastManifestCommit {
     /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
     /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
     /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.
-    pub(crate) fn validate(&self) -> DeltaResult<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         require!(
             self.content_root_version <= self.version,
             KernelError::generic(format!(
@@ -1371,9 +1379,6 @@ impl LastManifestCommit {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
-///
-/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
-///
 /// Example manifest-commit JSON:
 /// ```json
 /// { "checkpoint": [
@@ -1387,6 +1392,15 @@ impl LastManifestCommit {
 ///   ]
 /// }
 /// ```
+// Serde is hand-written (see below), not derived: the wire form is a JSON array of tagged element
+// objects (`[{"checkpointMetadata":..}, {"contentRoot":..}, ..]`), not a struct. This is the same
+// shape the EngineData path uses, so the `_last_checkpoint` hint (which serdes this action) and log
+// replay share the wire form and the enumerated invariants (required singletons, no duplicates,
+// known sidecar `type`, `contentRoot.version <= checkpointMetadata.version`). They intentionally
+// differ on unknown elements: log replay skips a future element kind for forward compatibility (see
+// `visitors::CheckpointElementVisitor::visit`), whereas the serde path fails closed on it (an
+// externally-tagged enum with no catch-all), so a hint carrying one is dropped and the reader falls
+// back to log replay. Used by the hint's `AmtCheckpoint.checkpoint` field.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -1411,12 +1425,116 @@ pub(crate) struct CheckpointAction {
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
+// === CheckpointAction <-> JSON (array of tagged elements) ===
+
+/// One element of a [`CheckpointAction`]'s serialized array (the adaptiveMetadata "Checkpoint
+/// Action" wire form). A checkpoint action serializes as a JSON array of single-key tagged objects,
+/// so this is an externally-tagged enum keyed by the action name, reusing kernel's action structs
+/// to yield
+/// the same types as log replay. Having no catch-all variant, it fails the parse on an unrecognized
+/// action key -- deliberately fail-closed, unlike the forward-compatible EngineData
+/// `CheckpointElementVisitor`, which skips unknown elements. A hint carrying a future
+/// element kind is thus dropped and the reader falls back to log replay.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) enum CheckpointActionElement {
+    CheckpointMetadata(CheckpointMetadata),
+    ContentRoot(ContentRoot),
+    Protocol(Protocol),
+    #[serde(rename = "metaData")]
+    Metadata(Metadata),
+    DomainMetadata(DomainMetadata),
+    Txn(SetTransaction),
+    Sidecar(CheckpointSidecar),
+}
+
+/// A `sidecar` element inside a checkpoint action array. The wire form prefixes the [`Sidecar`]
+/// fields with a `type` discriminator (`"txn"` or `"domainMetadata"`) identifying which action kind
+/// the sidecar spills; [`Sidecar`] itself carries no type, so it is flattened in alongside it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct CheckpointSidecar {
+    /// The action kind this sidecar spills: `"txn"` or `"domainMetadata"`.
+    #[serde(rename = "type")]
+    pub(crate) sidecar_type: String,
+    #[serde(flatten)]
+    pub(crate) sidecar: Sidecar,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Serialize for CheckpointAction {
+    /// Emits the array of tagged elements in the same canonical order as
+    /// `try_into_scalar` (`checkpointMetadata`, `contentRoot`, `protocol`, `metaData`,
+    /// then `txn`, `domainMetadata`, and the `txn`/`domainMetadata` sidecars). Validates first,
+    /// so an invalid action can never be written through serde either.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let checkpoint_metadata = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        };
+        let mut elements = vec![
+            CheckpointActionElement::CheckpointMetadata(checkpoint_metadata),
+            CheckpointActionElement::ContentRoot(self.content_root.clone()),
+            CheckpointActionElement::Protocol(self.protocol.clone()),
+            CheckpointActionElement::Metadata(self.metadata.clone()),
+        ];
+        elements.extend(
+            self.transactions
+                .iter()
+                .cloned()
+                .map(CheckpointActionElement::Txn),
+        );
+        elements.extend(
+            self.domain_metadata
+                .iter()
+                .cloned()
+                .map(CheckpointActionElement::DomainMetadata),
+        );
+        let sidecar_element = |type_str: &str, sidecar: &Sidecar| {
+            CheckpointActionElement::Sidecar(CheckpointSidecar {
+                sidecar_type: type_str.to_string(),
+                sidecar: sidecar.clone(),
+            })
+        };
+        elements.extend(
+            self.txn_sidecars
+                .iter()
+                .map(|s| sidecar_element(SET_TRANSACTION_NAME, s)),
+        );
+        elements.extend(
+            self.domain_metadata_sidecars
+                .iter()
+                .map(|s| sidecar_element(DOMAIN_METADATA_NAME, s)),
+        );
+        elements.serialize(serializer)
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl<'de> Deserialize<'de> for CheckpointAction {
+    /// Folds the array of tagged elements into a typed action, applying the same enumerated
+    /// checks as the EngineData [`visitors::CheckpointVisitor`]: required singletons, no
+    /// duplicates, known sidecar `type`, and the `contentRoot.version <=
+    /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
+    /// this path fails closed on an unrecognized element key (see [`CheckpointActionElement`]),
+    /// whereas the visitor skips it for forward compatibility.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let elements = Vec::<CheckpointActionElement>::deserialize(deserializer)?;
+        Self::from_elements(elements).map_err(serde::de::Error::custom)
+    }
+}
+
 // === CheckpointAction -> EngineData ===
 
 /// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
 /// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scalar> {
+fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> Result<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
         .chain(sidecar.fields().iter().cloned());
@@ -1439,7 +1557,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scal
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
+fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> Result<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
@@ -1467,7 +1585,7 @@ impl CheckpointAction {
     /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
     /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
     /// hence a fallible method rather than an infallible `From`.
-    fn try_into_scalar(self) -> DeltaResult<Scalar> {
+    fn try_into_scalar(self) -> Result<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1546,7 +1664,7 @@ impl CheckpointAction {
 
     /// Serialize this checkpoint action into a single-row `EngineData`.
     #[internal_api]
-    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> Result<Box<dyn EngineData>> {
         create_row(
             engine,
             LOG_CHECKPOINT_SCHEMA.clone(),
@@ -1561,18 +1679,80 @@ impl CheckpointAction {
     /// element is missing or repeated, an element or sidecar `type` is unrecognized, or
     /// `contentRoot.version` exceeds `checkpointMetadata.version`.
     #[internal_api]
-    pub(crate) fn try_new_from_data(
-        data: &dyn EngineData,
-    ) -> DeltaResult<Option<CheckpointAction>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<CheckpointAction>> {
         let mut visitor = visitors::CheckpointVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
     }
 
+    /// Folds a deserialized array of tagged [`CheckpointActionElement`]s into a checkpoint
+    /// action, mirroring [`visitors::CheckpointVisitor`]: the four required elements are singletons
+    /// (missing or repeated is an error), `txn`/`domainMetadata` are collected, `sidecar` entries
+    /// are split by their `type` (unknown types error), and the assembled action is validated.
+    fn from_elements(elements: Vec<CheckpointActionElement>) -> Result<Self> {
+        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
+            require!(
+                slot.replace(value).is_none(),
+                KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
+            );
+            Ok(())
+        }
+
+        let mut version = None;
+        let mut content_root = None;
+        let mut protocol = None;
+        let mut metadata = None;
+        let mut transactions = Vec::new();
+        let mut domain_metadata = Vec::new();
+        let mut txn_sidecars = Vec::new();
+        let mut domain_metadata_sidecars = Vec::new();
+        for element in elements {
+            match element {
+                CheckpointActionElement::CheckpointMetadata(cm) => {
+                    set_once(&mut version, cm.version, CHECKPOINT_METADATA_NAME)?
+                }
+                CheckpointActionElement::ContentRoot(cr) => {
+                    set_once(&mut content_root, cr, CONTENT_ROOT_NAME)?
+                }
+                CheckpointActionElement::Protocol(p) => set_once(&mut protocol, p, PROTOCOL_NAME)?,
+                CheckpointActionElement::Metadata(m) => set_once(&mut metadata, m, METADATA_NAME)?,
+                CheckpointActionElement::Txn(t) => transactions.push(t),
+                CheckpointActionElement::DomainMetadata(dm) => domain_metadata.push(dm),
+                CheckpointActionElement::Sidecar(cs) => match cs.sidecar_type.as_str() {
+                    SET_TRANSACTION_NAME => txn_sidecars.push(cs.sidecar),
+                    DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(cs.sidecar),
+                    other => {
+                        return Err(KernelError::generic(format!(
+                            "checkpoint sidecar has unsupported type `{other}`"
+                        )))
+                    }
+                },
+            }
+        }
+
+        let missing = |field: &str| {
+            KernelError::generic(format!(
+                "checkpoint action is missing required `{field}` element"
+            ))
+        };
+        let action = CheckpointAction {
+            version: version.ok_or_else(|| missing(CHECKPOINT_METADATA_NAME))?,
+            content_root: content_root.ok_or_else(|| missing(CONTENT_ROOT_NAME))?,
+            protocol: protocol.ok_or_else(|| missing(PROTOCOL_NAME))?,
+            metadata: metadata.ok_or_else(|| missing(METADATA_NAME))?,
+            transactions,
+            domain_metadata,
+            txn_sidecars,
+            domain_metadata_sidecars,
+        };
+        action.validate()?;
+        Ok(action)
+    }
+
     /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
     /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
     /// can never be written in a shape the reader would reject.
-    fn validate(&self) -> DeltaResult<()> {
+    fn validate(&self) -> Result<()> {
         require!(
             self.content_root.version <= self.version,
             KernelError::generic(format!(
@@ -1606,7 +1786,7 @@ impl CheckpointAction {
     ///
     /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
-    pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
+    pub(crate) fn root_filemeta(&self, table_root: &Url) -> Result<FileMeta> {
         let content_root = &self.content_root;
         Ok(FileMeta {
             location: resolve_amt_location(&content_root.path, table_root)?,
@@ -1658,7 +1838,7 @@ pub(crate) struct Sidecar {
 
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
 /// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
+fn to_file_size(bytes: i64, context: &str) -> Result<FileSize> {
     bytes.try_into().map_err(|_| {
         KernelError::generic(format!(
             "Failed to convert {context} size {bytes} to FileSize"
@@ -1688,7 +1868,7 @@ impl Sidecar {
     ///
     /// This helper first builds the URL by joining the provided log_root with
     /// the "_sidecars/" folder and the given sidecar path.
-    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> Result<FileMeta> {
         Ok(FileMeta {
             location: log_root.join("_sidecars/")?.join(&self.path)?,
             last_modified: self.modification_time,
@@ -1715,6 +1895,7 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) version: i64,
 
     /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[allow_null_container_values]
     pub(crate) tags: Option<HashMap<String, String>>,
 }
@@ -1791,6 +1972,10 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine::to_json_bytes;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -2881,8 +3066,8 @@ mod tests {
                 SIDECAR_NAME,
             ]
         );
-        // `commitInfo` must NOT be a checkpoint-array element; the RFC routes it to the top-level
-        // Delta log.
+        // `commitInfo` must NOT be a checkpoint-array element; adaptiveMetadata routes it to the
+        // top-level Delta log.
         assert!(!field_names.contains(&COMMIT_INFO_NAME));
 
         // Every element type is an optional (union member) struct.
@@ -2993,7 +3178,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_scalar_round_trip() -> DeltaResult<()> {
+    fn test_checkpoint_action_scalar_round_trip() -> Result<()> {
         let engine = ExprEngine::new();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
@@ -3024,10 +3209,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_wire_format() -> DeltaResult<()> {
-        use crate::engine::to_json_bytes;
-        use crate::engine_data::FilteredEngineData;
-
+    fn test_checkpoint_action_wire_format() -> Result<()> {
         // Build the action's engine data, then write it out through the engine JSON writer and
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
@@ -3063,7 +3245,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> DeltaResult<()> {
+    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> Result<()> {
         // `action_batch` carries many action kinds but no `checkpoint` array, so parsing yields
         // `Ok(None)` rather than an error.
         let data = crate::unit_test_utils::action_batch();
@@ -3073,7 +3255,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> DeltaResult<()> {
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> Result<()> {
         // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
         // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
         let sidecar = |path: &str| Sidecar {
@@ -3129,7 +3311,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_protocol_with_features() -> DeltaResult<()> {
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> Result<()> {
         // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
         // read-time feature-consistency check) must survive scalar conversion -> parse.
         let action = CheckpointAction {
@@ -3148,5 +3330,149 @@ mod tests {
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
         Ok(())
+    }
+
+    /// The hand-written serde folds/expands the array losslessly: an action expands to the
+    /// tagged-element array and folds back to the identical action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_round_trip() {
+        let action = sample_checkpoint_action();
+        let json = serde_json::to_value(&action).unwrap();
+        assert!(json.is_array(), "checkpoint action serializes to an array");
+        let back: CheckpointAction = serde_json::from_value(json).unwrap();
+        assert_eq!(back, action);
+    }
+
+    /// The `Serialize` path validates before emitting, mirroring `try_into_scalar`: an action whose
+    /// `contentRoot.version` exceeds the checkpoint version fails to serialize rather than writing
+    /// an out-of-spec array.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_rejects_invalid_content_root_version() {
+        let base = sample_checkpoint_action();
+        let action = CheckpointAction {
+            content_root: ContentRoot {
+                version: base.version + 1,
+                ..base.content_root
+            },
+            ..sample_checkpoint_action()
+        };
+        let err = serde_json::to_value(&action).expect_err("invalid action must not serialize");
+        assert!(
+            err.to_string()
+                .contains("exceeds checkpointMetadata.version"),
+            "expected content-root-version error, got: {err}"
+        );
+    }
+
+    /// The synthesized `checkpointMetadata` element omits `tags` entirely (via
+    /// `skip_serializing_if`) rather than emitting `"tags": null`, matching the EngineData wire
+    /// form. The symmetric round-trip tests cannot observe this because both an absent key and an
+    /// explicit null parse back to `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_omits_checkpoint_metadata_tags() {
+        let json = serde_json::to_value(sample_checkpoint_action()).unwrap();
+        let checkpoint_metadata = json
+            .as_array()
+            .and_then(|elements| elements.first())
+            .and_then(|element| element.get("checkpointMetadata"))
+            .expect("first element is checkpointMetadata");
+        assert_eq!(checkpoint_metadata, &json!({ "version": 42 }));
+        assert!(
+            checkpoint_metadata.get("tags").is_none(),
+            "checkpointMetadata must omit the tags key, got: {checkpoint_metadata}"
+        );
+    }
+
+    /// Fully-populated array elements, used to build valid and malformed variants for the serde
+    /// fold-error cases below. Mirrors `checkpoint_elements` in `visitors.rs` so the serde path and
+    /// the EngineData path are checked against the same inputs.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod checkpoint_serde_elements {
+        pub(super) const CHECKPOINT_METADATA: &str = r#"{"checkpointMetadata":{"version":42}}"#;
+        pub(super) const CONTENT_ROOT: &str =
+            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40}}"#;
+        pub(super) const PROTOCOL: &str =
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        pub(super) const METADATA: &str = r#"{"metaData":{"id":"id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
+    }
+
+    /// The serde fold applies the same enumerated checks as the EngineData `CheckpointVisitor`,
+    /// with identical error messages (compare `test_parse_checkpoint_action_errors` in
+    /// `visitors.rs`): required singletons, no duplicates, known sidecar `type`, and the
+    /// `contentRoot.version` invariant. Unknown elements are the intended exception -- the
+    /// serde path fails closed on them while the visitor skips them -- and are not covered
+    /// here.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::duplicate_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+        checkpoint_serde_elements::METADATA,
+    ], "duplicate `metaData` element in checkpoint action")]
+    #[case::duplicate_checkpoint_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CHECKPOINT_METADATA,
+        checkpoint_serde_elements::CONTENT_ROOT, checkpoint_serde_elements::PROTOCOL,
+        checkpoint_serde_elements::METADATA,
+    ], "duplicate `checkpointMetadata` element in checkpoint action")]
+    #[case::missing_protocol(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::METADATA,
+    ], "checkpoint action is missing required `protocol` element")]
+    #[case::missing_content_root(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::PROTOCOL,
+        checkpoint_serde_elements::METADATA,
+    ], "checkpoint action is missing required `contentRoot` element")]
+    #[case::missing_metadata(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL,
+    ], "checkpoint action is missing required `metaData` element")]
+    #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
+    #[case::bad_sidecar_type(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+        r#"{"sidecar":{"type":"bogus","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
+    ], "checkpoint sidecar has unsupported type `bogus`")]
+    #[case::content_root_version_too_high(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA,
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+    ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    fn test_checkpoint_action_serde_fold_errors(
+        #[case] elements: &[&str],
+        #[case] expected_msg: &str,
+    ) {
+        let array = format!("[{}]", elements.join(","));
+        let err = serde_json::from_str::<CheckpointAction>(&array)
+            .expect_err("checkpoint action should fail to fold");
+        assert!(
+            err.to_string().contains(expected_msg),
+            "expected error containing {expected_msg:?}, got: {err}"
+        );
+    }
+
+    /// The serde path deliberately fails closed on an unrecognized element key, unlike the
+    /// forward-compatible EngineData `CheckpointElementVisitor`, which skips unknown elements. Pins
+    /// that intended asymmetry: an otherwise-valid array carrying a future element kind fails the
+    /// whole-hint parse (so the reader falls back to log replay).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_serde_fails_closed_on_unknown_element() {
+        let array = format!(
+            "[{},{},{},{},{}]",
+            checkpoint_serde_elements::CHECKPOINT_METADATA,
+            checkpoint_serde_elements::CONTENT_ROOT,
+            checkpoint_serde_elements::PROTOCOL,
+            checkpoint_serde_elements::METADATA,
+            r#"{"someNewAction":{"foo":1}}"#,
+        );
+        let err = serde_json::from_str::<CheckpointAction>(&array)
+            .expect_err("unknown element must fail the parse");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected an unknown-variant error, got: {err}"
+        );
     }
 }

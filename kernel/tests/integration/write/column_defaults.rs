@@ -22,7 +22,7 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{Engine, Result, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
@@ -106,7 +106,7 @@ fn assert_top_level_default(
     engine: &dyn Engine,
     column: &str,
     expected: Scalar,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?;
@@ -148,7 +148,7 @@ fn assert_checkpoint_parsed_columns_have_no_column_defaults(
 
 // TODO(#2630): Allow create table to support column defaults
 #[test]
-fn test_create_table_rejects_col_defaults() -> DeltaResult<()> {
+fn test_create_table_rejects_col_defaults() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": LONG };
 

@@ -14,8 +14,8 @@ pass it to `ScanBuilder::with_schema()`:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -58,8 +58,8 @@ information about each row's origin. Add them to your scan schema with
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::MetadataColumnSpec;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;

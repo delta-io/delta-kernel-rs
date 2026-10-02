@@ -33,7 +33,7 @@ pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, C
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{DeltaResult, DeltaResultIterator, Engine, FilteredEngineData};
+use crate::{Engine, FilteredEngineData, Result, ResultIterator};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -62,9 +62,9 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse>;
+    ) -> Result<CommitResponse>;
 
     /// Returns `true` if this committer is for a catalog-managed table, else `false`.
     fn is_catalog_committer(&self) -> bool;
@@ -103,5 +103,5 @@ pub trait Committer: Send {
     /// Returns an error if the publish operation fails.
     ///
     /// [`is_catalog_committer`]: Committer::is_catalog_committer
-    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()>;
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> Result<()>;
 }

@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, KernelError, PredicateRef, Version};
+use delta_kernel::{KernelError, PredicateRef, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
@@ -65,7 +65,7 @@ pub struct FfiIncrementalScanBuilder {
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiIncrementalScanBuilder`].
 #[handle_descriptor(target=FfiIncrementalScanBuilder, mutable=true, sized=true)]
-pub struct MutableFfiIncrementalScanBuilder;
+pub struct ExclusiveIncrementalScanBuilder;
 
 /// An incremental scan stream, guarded by a mutex so it can cross the FFI boundary as a shared
 /// handle. The stream itself is single-consumer; the mutex serializes concurrent `next` calls.
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
     snapshot: Handle<SharedSnapshot>,
     base_version: Version,
     engine: Handle<SharedExternEngine>,
-) -> Handle<MutableFfiIncrementalScanBuilder> {
+) -> Handle<ExclusiveIncrementalScanBuilder> {
     let target_snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.clone_as_arc() };
     Box::new(FfiIncrementalScanBuilder {
@@ -130,10 +130,10 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// fields are safe to call and read.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
-    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    builder: Handle<ExclusiveIncrementalScanBuilder>,
     engine: Handle<SharedExternEngine>,
     predicate: &mut EnginePredicate,
-) -> ExternResult<Handle<MutableFfiIncrementalScanBuilder>> {
+) -> ExternResult<Handle<ExclusiveIncrementalScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
     incremental_scan_builder_with_predicate_impl(*builder, predicate).into_extern_result(&engine)
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
 fn incremental_scan_builder_with_predicate_impl(
     mut builder: FfiIncrementalScanBuilder,
     predicate: &mut EnginePredicate,
-) -> DeltaResult<Handle<MutableFfiIncrementalScanBuilder>> {
+) -> Result<Handle<ExclusiveIncrementalScanBuilder>> {
     builder.predicate = Some(Arc::new(decode_engine_predicate(predicate)?));
     Ok(Box::new(builder).into())
 }
@@ -165,7 +165,7 @@ fn incremental_scan_builder_with_predicate_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_builder_build(
-    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 
 fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
-) -> DeltaResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+) -> Result<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
     let maybe_stream = builder
         .target_snapshot
@@ -198,7 +198,7 @@ fn incremental_scan_builder_build_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn free_incremental_scan_builder(
-    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) {
     builder.drop_handle();
 }
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn incremental_scan_stream_next_arrow_impl(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<*mut ScanMetadataArrowResult> {
+) -> Result<*mut ScanMetadataArrowResult> {
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
@@ -251,9 +251,7 @@ fn incremental_scan_stream_next_arrow_impl(
 }
 
 #[cfg(feature = "default-engine-base")]
-fn next_arrow_batch(
-    stream: &mut IncrementalScanStream,
-) -> DeltaResult<*mut ScanMetadataArrowResult> {
+fn next_arrow_batch(stream: &mut IncrementalScanStream) -> Result<*mut ScanMetadataArrowResult> {
     let Some(filtered) = stream.next().transpose()? else {
         return Ok(std::ptr::null_mut());
     };
@@ -292,7 +290,7 @@ pub unsafe extern "C" fn incremental_scan_stream_into_summary(
 
 fn incremental_scan_stream_into_summary_impl(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
+) -> Result<Handle<SharedIncrementalScanSummary>> {
     let inner = lock_stream(stream)?
         .take()
         .ok_or_else(|| KernelError::generic("incremental scan stream was already consumed"))?;
@@ -302,7 +300,7 @@ fn incremental_scan_stream_into_summary_impl(
 
 fn lock_stream(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
+) -> Result<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
     stream
         .stream
         .lock()
@@ -444,7 +442,7 @@ mod tests {
     use crate::scan::free_scan_metadata_arrow_result;
     use crate::{
         engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
-        snapshot_builder_build, snapshot_builder_set_version, NullableCvoid, TryFromStringSlice,
+        snapshot_builder_build, snapshot_builder_with_version, NullableCvoid, TryFromStringSlice,
     };
 
     /// Build an in-memory engine handle and a snapshot pinned to the last version, from a v0
@@ -467,13 +465,13 @@ mod tests {
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let mut builder = unsafe {
+        let builder = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
-        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
+        let builder = unsafe { snapshot_builder_with_version(builder, target_version) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
         (engine, snapshot)
     }
@@ -1070,13 +1068,13 @@ mod tests {
 
         // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and
         // drops commit 1's JSON.
-        let mut builder_v2 = unsafe {
+        let builder_v2 = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
-        unsafe { snapshot_builder_set_version(&mut builder_v2, 2) };
+        let builder_v2 = unsafe { snapshot_builder_with_version(builder_v2, 2) };
         let snapshot_v2 = unsafe { ok_or_panic(snapshot_builder_build(builder_v2)) };
         // checkpoint_snapshot borrows its handle (clone_as_arc) but does not consume it, so pass a
         // shallow copy and free the original separately.
@@ -1094,13 +1092,13 @@ mod tests {
         unsafe { free_snapshot(snapshot_v2) };
 
         // Fresh snapshot at v3: its log segment starts at the v2 checkpoint, so commit 1 is gone.
-        let mut builder_v3 = unsafe {
+        let builder_v3 = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
-        unsafe { snapshot_builder_set_version(&mut builder_v3, 3) };
+        let builder_v3 = unsafe { snapshot_builder_with_version(builder_v3, 3) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder_v3)) };
 
         // base_version 0 needs commit 1, which the checkpoint truncated => None, not an error.

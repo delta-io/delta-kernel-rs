@@ -7,8 +7,9 @@ A Rust client for the Unity Catalog Delta APIs.
 
 It provides two REST structs:
 
-- `UCClient`: concrete HTTP methods for the connector-driven endpoints: `load_table`, credential
-  vending, `/config`, table and staging-table creation, and metrics reporting.
+- `UCDeltaTableClient`: concrete HTTP methods for the connector-driven endpoints:
+  `load_table`, credential vending, `/config`, table and staging-table creation, and
+  metrics reporting.
 - `UCUpdateTableRestClient`: an implementation of the `UpdateTableClient` trait (from
   `unity-catalog-delta-client-api`) against the `update_table` commit endpoint.
 
@@ -16,7 +17,7 @@ It provides two REST structs:
 
 ```rust,no_run
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::build("https://some.uc.org", "your-token")
         .with_additional_user_agent([("MyEngine", "1.0.0"), ("MyConnector", "1.0.0")])
         .build()?;
-    let client = UCClient::new(config)?;
+    let client = UCDeltaTableClient::new(config)?;
 
     // Load a table by its three-part name. The response carries the table
     // metadata and any inline (unpublished) commits.

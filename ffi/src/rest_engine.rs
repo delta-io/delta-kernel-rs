@@ -1,10 +1,10 @@
 //! REST [`RestObjectStore`] wiring for [`FfiEngineBuilder`](crate::FfiEngineBuilder).
 //!
-//! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) with a
+//! Call [`builder_with_rest_object_store`](crate::builder_with_rest_object_store) with a
 //! [`CRestEndpointConfig`] to select the REST backend. The builder `url` must be the REST service
 //! base URL, not a Delta table path.
 //!
-//! TLS, retries, and static auth use [`set_builder_option`](crate::set_builder_option) with the
+//! TLS, retries, and static auth use [`builder_with_option`](crate::builder_with_option) with the
 //! `REST_BUILDER_OPTION_*` keys below. Pass a [`CAuthHeaderCallback`] when headers expire; with
 //! `callback = NULL`, set static headers via `header.<Name>` options instead. See
 //! [`CAuthHeaderCallback`] for the callback contract.
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
-use delta_kernel::{DeltaResult, KernelError};
+use delta_kernel::{KernelError, Result};
 use delta_kernel_default_engine::rest_store::{
     build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
@@ -31,7 +31,7 @@ use crate::{ExclusiveRustString, KernelStringSlice, NullableCvoid, TryFromString
 /// Max `(name, value)` pairs in a [`CAuthHeaders`] struct.
 pub const AUTH_MAX_NUM_HEADERS: usize = 8;
 
-// === `set_builder_option` keys for REST engines ===
+// === `builder_with_option` keys for REST engines ===
 //
 // Each `REST_BUILDER_OPTION_*` is the Rust `&str` key. The matching `*_KEY` static is a
 // null-terminated byte array exported to C via cbindgen (`extern const uint8_t ...`).
@@ -40,7 +40,7 @@ pub const AUTH_MAX_NUM_HEADERS: usize = 8;
 ///
 /// Example: `header.Authorization` with value `Bearer <token>`. Ignored when a
 /// [`CAuthHeaderCallback`] is passed to
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store).
 pub const REST_BUILDER_OPTION_HEADER_PREFIX: &str = "header.";
 #[no_mangle]
 pub static REST_BUILDER_OPTION_HEADER_PREFIX_KEY: [u8; 8] = *b"header.\0";
@@ -87,7 +87,7 @@ pub static REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS_KEY: [u8; 24] =
     *b"put.verify_on_ambiguous\0";
 
 /// REST file API dialect passed to
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store).
 ///
 /// Each [`KernelStringSlice`] must remain valid for the duration of that call; the kernel copies
 /// the strings into the built engine. Optional fields (the prefixes and `entry_strip_prefix`) may
@@ -141,7 +141,7 @@ pub struct CAuthHeaders {
 /// `ttl_ms = 0` it invokes the callback on every request.
 ///
 /// `context` is the opaque pointer registered via
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). `allocate_error` is
+/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `allocate_error` is
 /// forwarded on each invocation so the callback can pass it to
 /// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
 /// separately.
@@ -150,7 +150,7 @@ pub type CAuthHeaderCallback =
 
 /// State for [`crate::ObjectStoreBackend::Rest`], stored on
 /// [`FfiEngineBuilder`](crate::FfiEngineBuilder)
-/// after [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+/// after [`builder_with_rest_object_store`](crate::builder_with_rest_object_store).
 pub(crate) struct RestBuilderState {
     endpoint_config: RestEndpointConfig,
     auth_callback: Option<FfiAuthHeaderProvider>,
@@ -158,20 +158,20 @@ pub(crate) struct RestBuilderState {
 
 /// Upcalls a [`CAuthHeaderCallback`] whenever the REST client needs fresh auth headers.
 ///
-/// Registered via [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+/// Registered via [`builder_with_rest_object_store`](crate::builder_with_rest_object_store).
 #[derive(Clone, Copy, Constructor)]
 pub(crate) struct FfiAuthHeaderProvider {
     callback: CAuthHeaderCallback,
     context: NullableCvoid,
     allocate_error: AllocateErrorFn,
 }
-// SAFETY: see [`set_builder_rest_object_store`](crate::set_builder_rest_object_store): `context`
+// SAFETY: see [`builder_with_rest_object_store`](crate::builder_with_rest_object_store): `context`
 // and `callback` must be safe to invoke from any thread concurrently.
 unsafe impl Send for FfiAuthHeaderProvider {}
 unsafe impl Sync for FfiAuthHeaderProvider {}
 
 impl FfiAuthHeaderProvider {
-    fn collect(&self) -> DeltaResult<(HeaderMap, Option<Duration>)> {
+    fn collect(&self) -> Result<(HeaderMap, Option<Duration>)> {
         let mut headers = MaybeUninit::<CAuthHeaders>::uninit();
         let out = headers.as_mut_ptr();
         // SAFETY: `out` is valid for writes here. The callback initializes `headers[0..count]`;
@@ -193,7 +193,7 @@ pub(crate) fn rest_builder_state_from_ffi(
     callback: Option<CAuthHeaderCallback>,
     context: NullableCvoid,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<RestBuilderState> {
+) -> Result<RestBuilderState> {
     Ok(RestBuilderState {
         endpoint_config: rest_endpoint_config_from_c(endpoint_config)?,
         auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context, allocate_error)),
@@ -208,7 +208,7 @@ pub(crate) fn rest_builder_state_from_ffi(
 /// `headers[0..count]` must hold handles produced by
 /// [`allocate_kernel_string`](crate::allocate_kernel_string). Padding slots are never read or
 /// dropped.
-unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<(String, String)>> {
+unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> Result<Vec<(String, String)>> {
     let count = (*headers).count as usize;
     if count > AUTH_MAX_NUM_HEADERS {
         return Err(KernelError::generic(format!(
@@ -230,7 +230,7 @@ unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<
 /// Copy a [`CRestEndpointConfig`] into an owned [`RestEndpointConfig`].
 pub(crate) fn rest_endpoint_config_from_c(
     config: &CRestEndpointConfig,
-) -> DeltaResult<RestEndpointConfig> {
+) -> Result<RestEndpointConfig> {
     Ok(RestEndpointConfig {
         files_prefix: copy_optional_string(&config.files_prefix)?,
         directories_prefix: copy_optional_string(&config.directories_prefix)?,
@@ -260,12 +260,12 @@ pub(crate) fn rest_endpoint_config_from_c(
     })
 }
 
-fn copy_optional_string(slice: &KernelStringSlice) -> DeltaResult<String> {
-    // SAFETY: caller keeps slice memory valid until `set_builder_rest_object_store` returns.
+fn copy_optional_string(slice: &KernelStringSlice) -> Result<String> {
+    // SAFETY: caller keeps slice memory valid until `builder_with_rest_object_store` returns.
     unsafe { String::try_from_slice(slice) }
 }
 
-fn copy_required_string(slice: &KernelStringSlice, field: &str) -> DeltaResult<String> {
+fn copy_required_string(slice: &KernelStringSlice, field: &str) -> Result<String> {
     let value = copy_optional_string(slice)?;
     if value.is_empty() {
         return Err(KernelError::generic(format!("`{field}` must be non-empty")));
@@ -278,7 +278,7 @@ pub(crate) fn build_rest_object_store(
     base_url: &Url,
     options: &HashMap<String, String>,
     rest: &RestBuilderState,
-) -> DeltaResult<Arc<dyn ObjectStore>> {
+) -> Result<Arc<dyn ObjectStore>> {
     let config = rest.endpoint_config.clone();
 
     let auth: Arc<dyn AuthHeaderProvider> = match rest.auth_callback {
@@ -348,7 +348,7 @@ pub(crate) fn build_rest_object_store(
     ))
 }
 
-fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
+fn parse_bool_option(key: &str, value: Option<&String>) -> Result<bool> {
     match value {
         None => Ok(false),
         Some(v) => match v.as_str() {

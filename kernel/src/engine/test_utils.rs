@@ -10,7 +10,7 @@ use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 use crate::engine_data::{GetData, RowVisitor};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-use crate::DeltaResult;
+use crate::Result;
 
 /// The list encodings that `ListLikeArray` unifies. The view flavors resolve a row's elements from
 /// a separate sizes buffer rather than from adjacent offsets, so they exercise a structurally
@@ -36,7 +36,7 @@ impl RowVisitor for CollectNVisitor {
             LazyLock::new(|| (vec![ColumnName::new(["n"])], vec![DataType::INTEGER]).into());
         NT.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         for i in 0..row_count {
             self.values.push(getters[0].get_int(i, "n")?);
         }

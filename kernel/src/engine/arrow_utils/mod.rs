@@ -41,7 +41,7 @@ use crate::schema::{
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, KernelError};
+use crate::{EngineData, KernelError, Result};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -90,7 +90,7 @@ pub(crate) use prim_array_cmp;
 pub(crate) fn list_type_with_element(
     list_type: &ArrowDataType,
     element: ArrowFieldRef,
-) -> DeltaResult<ArrowDataType> {
+) -> Result<ArrowDataType> {
     match list_type {
         ArrowDataType::List(_) => Ok(ArrowDataType::List(element)),
         ArrowDataType::LargeList(_) => Ok(ArrowDataType::LargeList(element)),
@@ -178,7 +178,7 @@ impl RowIndexBuilder {
     ///
     /// Returns an error if there are duplicate or out of bounds row group ordinals.
     #[internal_api]
-    pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
+    pub(crate) fn build(self) -> Result<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
                 let mut seen_ordinals = HashSet::with_capacity(ordinals.len());
@@ -243,7 +243,7 @@ pub(crate) fn fixup_parquet_read(
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
-) -> DeltaResult<ArrowEngineData> {
+) -> Result<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
@@ -447,7 +447,7 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
 /// `VARIANT` type is represented as `STRUCT<metadata: BINARY, value: BINARY>`. This is to make
 /// sure that the default engine does not try to read shredded Variants, which it currently does
 /// not support.
-fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
+fn validate_parquet_variant(field: &ArrowField) -> Result<()> {
     fn variant_parquet_error(field_name: &String) -> KernelError {
         KernelError::Generic(format!(
             "The field {field_name} presumed to be of Variant type might be \
@@ -481,7 +481,7 @@ fn get_indices(
     requested_schema: &Schema,
     fields: &ArrowFields,
     mask_indices: &mut Vec<usize>,
-) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
+) -> Result<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.num_fields());
     let mut reorder_indices = Vec::with_capacity(requested_schema.num_fields());
     // Missing entries for structs found in parquet but with no selected leaves. These must
@@ -851,7 +851,7 @@ fn match_parquet_fields<'k, 'p>(
 pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
     file_metadata: &ArrowReaderMetadata,
-) -> DeltaResult<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
+) -> Result<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
     let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
     let mask = generate_mask(file_metadata.parquet_schema(), &indices);
     Ok((reorder, mask))
@@ -860,7 +860,7 @@ pub(crate) fn parquet_read_plan(
 fn get_requested_indices(
     requested_schema: &SchemaRef,
     file_arrow_schema: &ArrowSchemaRef,
-) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
+) -> Result<(Vec<usize>, Vec<ReorderIndex>)> {
     let mut mask_indices = vec![];
     let (_, reorder_indexes) = get_indices(
         0,
@@ -942,7 +942,7 @@ pub(crate) fn reorder_struct_array(
     requested_ordering: &[ReorderIndex],
     mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
-) -> DeltaResult<StructArray> {
+) -> Result<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
@@ -1084,7 +1084,7 @@ fn reorder_list<O: OffsetSizeTrait>(
     input_field_name: &str,
     list_nullable: bool,
     children: &[ReorderIndex],
-) -> DeltaResult<FieldArrayOpt> {
+) -> Result<FieldArrayOpt> {
     let (list_values_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
         let struct_array = struct_array.clone();
@@ -1124,7 +1124,7 @@ fn reorder_map(
     map_array: MapArray,
     input_field_name: &str,
     children: &[ReorderIndex],
-) -> DeltaResult<FieldArrayOpt> {
+) -> Result<FieldArrayOpt> {
     let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
     let result_array = reorder_struct_array(
         struct_array,
@@ -1225,7 +1225,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> Result<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
     let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
@@ -1238,7 +1238,7 @@ pub(crate) fn parse_json(
 pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,
-) -> DeltaResult<RecordBatch> {
+) -> Result<RecordBatch> {
     let num_rows = json_strings.len();
     match json_strings.data_type() {
         ArrowDataType::Utf8 => {
@@ -1260,7 +1260,7 @@ fn parse_json_inner<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
     schema: SchemaRef,
-) -> DeltaResult<RecordBatch> {
+) -> Result<RecordBatch> {
     // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
     // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
     // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
@@ -1285,7 +1285,7 @@ fn decode_with_arrow_json<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
     schema: ArrowSchemaRef,
-) -> DeltaResult<RecordBatch> {
+) -> Result<RecordBatch> {
     if num_rows == 0 {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -1360,7 +1360,7 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
 
 /// Safe-casts each column of `decoded` back to its target type. `safe: true` produces
 /// per-cell NULL on parse failure rather than failing the whole batch.
-fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBatch> {
     let opts = CastOptions {
         safe: true,
         ..Default::default()
@@ -1370,7 +1370,7 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
         .into_iter()
         .zip(target.fields().iter())
         .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
         target.clone(),
         columns,
@@ -1412,7 +1412,7 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
 pub(crate) fn coerce_columns_to_schema(
     columns: Vec<ArrowArrayRef>,
     target: &ArrowSchemaRef,
-) -> DeltaResult<Vec<ArrowArrayRef>> {
+) -> Result<Vec<ArrowArrayRef>> {
     let opts = CastOptions {
         safe: false,
         ..Default::default()
@@ -1437,7 +1437,7 @@ fn cast_array_to_type(
     array: ArrowArrayRef,
     target: &ArrowDataType,
     opts: &CastOptions<'_>,
-) -> DeltaResult<ArrowArrayRef> {
+) -> Result<ArrowArrayRef> {
     if array.data_type() == target {
         return Ok(array);
     }
@@ -1463,7 +1463,7 @@ fn cast_array_to_type(
                 .iter()
                 .zip(target_fields.iter())
                 .map(|(c, f)| cast_array_to_type(c.clone(), f.data_type(), opts))
-                .collect::<DeltaResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(StructArray::try_new(
                 target_fields.clone(),
                 new_children,
@@ -1474,9 +1474,7 @@ fn cast_array_to_type(
     }
 }
 
-pub(crate) fn filter_to_record_batch(
-    filtered_data: FilteredEngineData,
-) -> DeltaResult<RecordBatch> {
+pub(crate) fn filter_to_record_batch(filtered_data: FilteredEngineData) -> Result<RecordBatch> {
     let filtered = filtered_data.apply_selection_vector()?;
     let arrow_data = ArrowEngineData::try_from_engine_data(filtered)?;
     Ok((*arrow_data).into())
@@ -1538,8 +1536,8 @@ impl Encoder for NullMapPlaceholderEncoder {
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send,
-) -> DeltaResult<Vec<u8>> {
+    data: impl Iterator<Item = Result<FilteredEngineData>> + Send,
+) -> Result<Vec<u8>> {
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
@@ -1560,7 +1558,7 @@ pub(crate) fn fixup_json_read(
     batch: RecordBatch,
     reorder_indices: &[ReorderIndex],
     file_location: &str,
-) -> DeltaResult<ArrowEngineData> {
+) -> Result<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
     Ok(data.into())
 }
@@ -1580,7 +1578,7 @@ pub(crate) fn fixup_json_read(
 /// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
 ///   reader.
 #[internal_api]
-pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec<ReorderIndex>> {
+pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<ReorderIndex>> {
     // Real columns: position in reorder_indices IS the source column index (0..N in schema
     // order), and reorder_index.index carries the output position.
     let mut reorder_indices = Vec::with_capacity(schema.num_fields());
@@ -1616,7 +1614,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec
 /// once on the same schema and apply `reorder_struct_array` to each resulting batch to
 /// insert the synthesized metadata columns at their correct positions.
 #[internal_api]
-pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
+pub(crate) fn json_arrow_schema(schema: &StructType) -> Result<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)
 }
@@ -3831,7 +3829,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json() -> DeltaResult<()> {
+    fn test_write_json() -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "string",
             ArrowDataType::Utf8,
@@ -3852,7 +3850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json_bytes_filters_data() -> DeltaResult<()> {
+    fn test_to_json_bytes_filters_data() -> Result<()> {
         // Create test data with 4 rows
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",
@@ -4156,8 +4154,8 @@ mod tests {
                         "entries",
                         ArrowDataType::Struct(
                             vec![
-                                ArrowField::new("keys", ArrowDataType::Utf8, false),
-                                ArrowField::new("values", ArrowDataType::Utf8, true),
+                                ArrowField::new("key", ArrowDataType::Utf8, false),
+                                ArrowField::new("value", ArrowDataType::Utf8, true),
                             ]
                             .into(),
                         ),
@@ -4172,7 +4170,13 @@ mod tests {
 
         let string_builder = StringBuilder::new();
         let string_builder2 = StringBuilder::new();
-        let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
+        let map_field_names = MapFieldNames {
+            entry: "entries".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        };
+        let mut map_builder =
+            MapBuilder::new(Some(map_field_names), string_builder, string_builder2);
 
         // Preserve a null value inside a non-null map as `"b": null`.
         map_builder.keys().append_value("a");

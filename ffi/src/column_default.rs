@@ -13,7 +13,7 @@
 //! ```
 
 use delta_kernel::transaction::Transaction;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -81,7 +81,7 @@ fn visit_top_level_column_defaults_impl(
     txn: &Transaction,
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
-) -> DeltaResult<usize> {
+) -> Result<usize> {
     let defaults = txn.top_level_column_defaults()?;
     for (name, column_default) in &defaults {
         let name = name.as_str();

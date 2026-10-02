@@ -33,7 +33,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{AsAny, DeltaResult, KernelError};
+use crate::{AsAny, KernelError, Result};
 
 /// A shared, thread-safe cancellation token. Held as an `Arc` because the lazy scan iterator and
 /// the engine reads it drives can outlive the builder call and run on other threads.
@@ -48,7 +48,7 @@ pub type CancelledFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// `Ok(())`.
 ///
 /// Used as a pre-flight check to avoid starting an already-cancelled operation.
-pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResult<()> {
+pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> Result<()> {
     match token {
         Some(t) if t.is_cancelled() => Err(KernelError::Cancelled),
         _ => Ok(()),
@@ -130,9 +130,9 @@ impl<I> CancellableIterator<I> {
 
 impl<I, T> Iterator for CancellableIterator<I>
 where
-    I: Iterator<Item = DeltaResult<T>>,
+    I: Iterator<Item = Result<T>>,
 {
-    type Item = DeltaResult<T>;
+    type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -174,7 +174,7 @@ mod tests {
         }
     }
 
-    fn ok_iter(n: usize) -> impl Iterator<Item = DeltaResult<usize>> {
+    fn ok_iter(n: usize) -> impl Iterator<Item = Result<usize>> {
         (0..n).map(Ok)
     }
 

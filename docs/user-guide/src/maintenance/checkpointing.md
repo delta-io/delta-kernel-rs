@@ -23,8 +23,8 @@ The easiest way to write a checkpoint is the convenience method on `Snapshot`:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::snapshot::CheckpointWriteResult;
-# use delta_kernel::{DeltaResult, Snapshot};
-# fn main() -> DeltaResult<()> {
+# use delta_kernel::{Result, Snapshot};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -38,7 +38,7 @@ match result {
 ```
 
 `checkpoint()` takes a `&SnapshotRef` (i.e., `&Arc<Snapshot>`) and returns a
-`DeltaResult<(CheckpointWriteResult, SnapshotRef)>`. The returned `SnapshotRef` reflects
+`Result<(CheckpointWriteResult, SnapshotRef)>`. The returned `SnapshotRef` reflects
 the new checkpoint when `Written`, or the original snapshot when `AlreadyExists`.
 
 This method handles everything in one call: reads the log, reconciles actions, writes the

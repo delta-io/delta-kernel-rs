@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{Result, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
@@ -29,15 +29,15 @@ pub unsafe extern "C" fn with_transaction_id(
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let app_id_res: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
+    let app_id_res: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
     with_transaction_id_impl(*txn, app_id_res, version).into_extern_result(&engine)
 }
 
 fn with_transaction_id_impl(
     txn: Transaction,
-    app_id_res: DeltaResult<String>,
+    app_id_res: Result<String>,
     version: i64,
-) -> DeltaResult<Handle<ExclusiveTransaction>> {
+) -> Result<Handle<ExclusiveTransaction>> {
     Ok(Box::new(txn.with_transaction_id(app_id_res?, version)).into())
 }
 
@@ -66,9 +66,9 @@ pub unsafe extern "C" fn get_app_id_version(
 
 fn get_app_id_version_impl(
     snapshot: Arc<Snapshot>,
-    app_id_res: DeltaResult<String>,
+    app_id_res: Result<String>,
     extern_engine: &dyn ExternEngine,
-) -> DeltaResult<Option<i64>> {
+) -> Result<Option<i64>> {
     snapshot.get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
 }
 
