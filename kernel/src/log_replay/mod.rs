@@ -19,6 +19,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -65,7 +66,6 @@ impl FileActionKey {
 ///
 /// TODO: Modify deduplication to track only file paths instead of (path, dv_unique_id).
 /// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701
-#[derive(Constructor)]
 pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
@@ -86,6 +86,36 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     add_dv_start_index: usize,
     /// Starting index for remove action deletion vector columns
     remove_dv_start_index: usize,
+    /// Table root used to normalize the deletion-vector identity under adaptiveMetadata; `Some`
+    /// iff adaptiveMetadata is enabled for the table. See [`Deduplicator::extract_dv_unique_id`].
+    table_root: Option<Url>,
+}
+
+impl<'seen> FileActionDeduplicator<'seen> {
+    // Hand-written (not `#[derive(Constructor)]`) so the eight-field constructor can carry the
+    // `too_many_arguments` allow; the positional field order is the call-site argument order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        is_log_batch: bool,
+        add_path_index: usize,
+        add_size_index: usize,
+        remove_path_index: usize,
+        add_dv_start_index: usize,
+        remove_dv_start_index: usize,
+        table_root: Option<Url>,
+    ) -> Self {
+        Self {
+            seen_file_keys,
+            is_log_batch,
+            add_path_index,
+            add_size_index,
+            remove_path_index,
+            add_dv_start_index,
+            remove_dv_start_index,
+            table_root,
+        }
+    }
 }
 
 impl Deduplicator for FileActionDeduplicator<'_> {
@@ -185,6 +215,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     /// `false` indicates we are processing a batch from a checkpoint.
     fn is_log_batch(&self) -> bool {
         self.is_log_batch
+    }
+
+    fn dv_normalization_table_root(&self) -> Option<&Url> {
+        self.table_root.as_ref()
     }
 }
 
@@ -447,11 +481,12 @@ mod tests {
         FileActionDeduplicator::new(
             seen,
             is_log_batch,
-            0, // add_path_index
-            1, // add_size_index,
-            5, // remove_path_index
-            2, // add_dv_start_index
-            6, // remove_dv_start_index
+            0,    // add_path_index
+            1,    // add_size_index,
+            5,    // remove_path_index
+            2,    // add_dv_start_index
+            6,    // remove_dv_start_index
+            None, // table_root (not under adaptiveMetadata)
         )
     }
 
@@ -650,7 +685,7 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
@@ -669,7 +704,7 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2, None)?;
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
@@ -691,6 +726,45 @@ mod tests {
         Ok(())
     }
 
+    /// Under adaptiveMetadata (table root `Some`), the deduplicator keys on the normalized DV
+    /// object identity, so the same physical blob encoded as `'u'` and as `'r'` yields the same
+    /// `dv_unique_id` (an `add`/`remove` pair would match); without a table root (legacy), the two
+    /// encodings produce different ids.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_adaptive_metadata_normalizes_dv_identity_across_storage_types() -> DeltaResult<()> {
+        let seen = HashSet::new();
+        let table_root = Url::parse("s3://mytable/").unwrap();
+
+        // One DV file encoded two ways: `'u'` (z85 UUID with an "ab" prefix) and `'r'` (the
+        // decoded table-relative path it names). Same offset -> same physical blob.
+        let decoded = "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin";
+        let dv_id = |storage_type: &str, path: &str, root: Option<Url>| -> DeltaResult<String> {
+            let dedup = CheckpointDeduplicator::try_new(&seen, 0, 1, 2, root)?;
+            let mut mock = MockGetData::new();
+            mock.add_string(0, "add.path", "f.parquet");
+            mock.add_string(0, "deletionVector.storageType", storage_type);
+            mock.add_string(0, "deletionVector.pathOrInlineDv", path);
+            mock.add_int(0, "deletionVector.offset", 4);
+            let getters = create_getters_with_mocks(Some(&mock), None);
+            let info = dedup.extract_file_action(0, &getters, false)?.unwrap();
+            Ok(info.key.dv_unique_id.unwrap())
+        };
+
+        // adaptiveMetadata: both encodings normalize to the same identity.
+        let u = dv_id("u", "ab^-aqEH.-t@S}K{vb[*k^", Some(table_root.clone()))?;
+        let r = dv_id("r", decoded, Some(table_root.clone()))?;
+        assert_eq!(u, r);
+        assert_eq!(u, format!("r{decoded}@4"));
+
+        // Legacy (no table root): the two encodings keep distinct, storage-type-prefixed ids.
+        let u_legacy = dv_id("u", "ab^-aqEH.-t@S}K{vb[*k^", None)?;
+        let r_legacy = dv_id("r", decoded, None)?;
+        assert_ne!(u_legacy, r_legacy);
+
+        Ok(())
+    }
+
     #[test]
     fn test_checkpoint_deduplicator_filters_commit_duplicates() -> DeltaResult<()> {
         let mut seen = HashSet::new();
@@ -702,7 +776,7 @@ mod tests {
             Some("dv123".to_string()),
         ));
 
-        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
+        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);

@@ -9,6 +9,7 @@ use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalcul
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, KernelError, SnapshotRef, Version};
 
@@ -123,11 +124,20 @@ impl LogCompactionWriter {
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 
+        // Under adaptiveMetadata, the deduplicator normalizes DV identity against the table root;
+        // `None` otherwise leaves the legacy identity in effect.
+        let table_root = self
+            .snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+            .then(|| self.snapshot.table_root().clone());
+
         // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
         let processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,
             self.get_transaction_expiration_timestamp()?,
+            table_root,
         );
 
         // Process actions using the same iterator pattern as checkpoints
