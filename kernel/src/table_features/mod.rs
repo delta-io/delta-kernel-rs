@@ -492,16 +492,14 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-/// IcebergNativeV4 stores all table content in the adaptiveMetadata tree so the table reads
-/// natively as Iceberg V4. Spec: delta-io/delta#7374.
+/// IcebergNativeV4 native interop. Spec: delta-io/delta#7374.
 ///
 /// TODO(#2866): gated by `adaptive-metadata-in-dev` until adaptiveMetadata is fully supported.
 static ICEBERG_NATIVE_V4_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[
-        // adaptiveMetadata transitively enforces the structural deps (columnMapping-id,
-        // rowTracking, deletionVectors, inCommitTimestamp, domainMetadata, no v2Checkpoint).
+        // adaptiveMetadata transitively enforces the structural dependencies.
         FeatureRequirement::Enabled(TableFeature::AdaptiveMetadataPreview),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
