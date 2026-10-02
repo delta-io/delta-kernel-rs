@@ -236,11 +236,13 @@ feature is enabled; the rest are always available.
 | `update_table_txn_builder_with_domain_metadata` / `update_table_txn_builder_with_domain_metadata_removed` | Add or remove user domain metadata |
 | `update_table_txn_builder_build` / `update_table_txn_builder_build_with_committer` | Consume the builder and produce a transaction |
 | `free_update_table_txn_builder` | Release a builder without building it |
-| `update_table_txn_with_domain_metadata` | Attach late-bound domain metadata to a built transaction |
+| `update_table_txn_with_domain_metadata` / `update_table_txn_with_domain_metadata_removed` | Add or remove late-bound domain metadata on a built transaction |
 | `update_table_txn_add_files` | Append file-level write metadata to the transaction |
 | `update_table_txn_remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
 | `update_table_txn_commit` | Commit the transaction and return a committed-transaction handle |
 | `free_update_table_txn` | Release the transaction handle without committing |
+| `committed_transaction_version` / `committed_transaction_post_commit_snapshot` | Inspect a committed transaction without consuming it; the returned snapshot is independently owned |
+| `free_committed_transaction` | Release the committed-transaction handle |
 
 **Write context and file writing**
 
@@ -248,6 +250,13 @@ Use a `BoundWriteContext` to learn where to write parquet files and what schema 
 write. For unpartitioned writes, one context serves the whole transaction.
 For partitioned writes, create one context per partition by passing a
 `PartitionValueMap` to `update_table_txn_get_partitioned_write_context`.
+
+For distributed writes, `update_table_txn_write_state` borrows the transaction and returns an owned
+`SharedWriteState` that remains valid after the transaction is committed or freed. Encode it on the
+driver with `write_state_encode`, decode it on workers running the same Kernel version with
+`write_state_decode`, and create one consuming `ExclusiveWriteContextBuilder` per output partition.
+Builders and built contexts retain their own state reference, so callers may free the original
+state after creating them.
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
 layout) onto the returned table root. For partitioned tables, use
@@ -258,6 +267,13 @@ unpartitioned writes.
 
 | Function | Purpose |
 |----------|---------|
+| `update_table_txn_write_state` | Borrow a transaction and return owned, immutable write state |
+| `write_state_encode` / `write_state_decode` | Transport write state between processes using the same Kernel version |
+| `write_context_builder` | Create a consuming builder for one output partition |
+| `write_context_builder_with_partition_values` / `write_context_builder_with_physical_partition_values` | Bind logical or physical partition values |
+| `write_context_builder_with_row_tracking_columns` / `write_context_builder_build` | Bind row-tracking columns and build the context |
+| `get_write_state_stats_columns` | Visit physical columns that require statistics |
+| `free_write_state` / `free_write_context_builder` | Release unused owned handles |
 | `update_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
 | `update_table_txn_get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
 | `get_write_dir` | Return the recommended write subdirectory for a partitioned `SharedWriteContext` |
@@ -278,6 +294,7 @@ unpartitioned writes.
 |----------|---------|
 | `new_create_table_txn_builder` | Create a builder for a new Delta table with a schema |
 | `create_table_txn_builder_with_table_property` | Add a table property to the builder |
+| `create_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair to the create commit |
 | `create_table_txn_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
 | `create_table_txn_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
 | `create_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` to stage initial data files during table creation |

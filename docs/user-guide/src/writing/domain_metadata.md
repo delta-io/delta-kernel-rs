@@ -65,9 +65,9 @@ calling `with_domain_metadata` more than once with different domain names.
 ## Removing domain metadata
 
 To remove a domain from an existing table, call `with_domain_metadata_removed()`
-on an existing-table transaction. This method is not available on create-table
-transactions because there is no metadata to remove from a table that does not
-exist yet.
+on the update-table builder or built transaction. This method is not available
+on create-table transactions because there is no metadata to remove from a table
+that does not exist yet.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -86,13 +86,13 @@ exist yet.
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
     .transaction_builder()
-    .with_domain_metadata_removed("myConnector.settings".to_string())
     .with_operation(UpdateTableOperation::Custom(
         "REMOVE METADATA".to_string(),
     ))
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
-txn.commit(&engine)?;
+txn.with_domain_metadata_removed("myConnector.settings".to_string())
+    .commit(&engine)?;
 # Ok(())
 # }
 ```

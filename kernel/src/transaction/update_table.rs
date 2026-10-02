@@ -116,8 +116,8 @@ impl Transaction {
             should_emit_metadata: false,
             committer,
             operation: None,
-            operation_parameters: HashMap::new(),
-            operation_metrics: HashMap::new(),
+            operation_parameters: None,
+            operation_metrics: None,
             engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
@@ -173,10 +173,7 @@ impl Transaction {
     /// staged (adaptive-metadata-in-dev only).
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn with_schema_changes(
-        mut self,
-        changes: Vec<SchemaOperation>,
-    ) -> Result<Self> {
+    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> Result<Self> {
         let unsupported_iceberg_compat =
             [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
                 .into_iter()
@@ -225,7 +222,7 @@ impl Transaction {
     /// the same domain in a single transaction. If a duplicate domain is included, the `commit`
     /// will fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
-    pub(super) fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
     }

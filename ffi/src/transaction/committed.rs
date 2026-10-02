@@ -1,8 +1,30 @@
 use std::sync::Arc;
 
+use delta_kernel::transaction::CommitResult;
+
 use super::ExclusiveCommittedTransaction;
 use crate::handle::Handle;
-use crate::{OptionalValue, SharedSnapshot};
+use crate::{OptionalValue, Result, SharedSnapshot};
+
+/// Converts a [`CommitResult`] to an owned FFI handle, or returns an error when the commit was not
+/// successful.
+///
+/// The returned handle owns the committed transaction and must be released with
+/// [`free_committed_transaction`].
+pub(super) fn commit_result_to_committed_handle<S>(
+    result: Result<CommitResult<S>>,
+) -> Result<Handle<ExclusiveCommittedTransaction>> {
+    match result? {
+        CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
+        CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(
+            "commit failed: retryable transaction not supported in FFI (yet)",
+        )),
+        CommitResult::Conflicted(conflicted) => Err(delta_kernel::KernelError::Generic(format!(
+            "commit conflict at version {}",
+            conflicted.conflict_version()
+        ))),
+    }
+}
 
 /// Free a committed-transaction handle.
 ///

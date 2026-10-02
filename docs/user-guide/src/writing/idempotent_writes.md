@@ -21,7 +21,7 @@ is up to you.
 
 ## Writing with a transaction ID
 
-Call `with_transaction_id()` on the transaction and check `get_app_id_version()` before
+Call `with_transaction_id()` on the transaction builder and check `get_app_id_version()` before
 committing:
 
 ```rust,no_run

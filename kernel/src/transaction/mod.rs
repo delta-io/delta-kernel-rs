@@ -225,8 +225,8 @@ pub struct Transaction<S = ExistingTable> {
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: Option<CommitOperation>,
-    operation_parameters: HashMap<String, String>,
-    operation_metrics: HashMap<String, String>,
+    operation_parameters: Option<HashMap<String, Option<String>>>,
+    operation_metrics: Option<HashMap<String, Option<String>>>,
     engine_info: Option<String>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -489,20 +489,12 @@ impl<S> Transaction<S> {
             self.engine_info.clone(),
             self.is_blind_append,
         );
-        // Delta writers conventionally emit operationParameters even when the map is empty, while
-        // operationMetrics is optional and omitted when no metrics were supplied.
-        kernel_commit_info.operation_parameters = Some(
-            self.operation_parameters
-                .iter()
-                .map(|(key, value)| (key.clone(), Some(value.clone())))
-                .collect(),
-        );
-        kernel_commit_info.operation_metrics = (!self.operation_metrics.is_empty()).then(|| {
-            self.operation_metrics
-                .iter()
-                .map(|(key, value)| (key.clone(), Some(value.clone())))
-                .collect()
-        });
+        if let Some(operation_parameters) = self.operation_parameters.clone() {
+            kernel_commit_info.set_operation_parameters(operation_parameters);
+        }
+        if let Some(operation_metrics) = self.operation_metrics.clone() {
+            kernel_commit_info.set_operation_metrics(operation_metrics);
+        }
 
         // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
         // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
@@ -699,26 +691,17 @@ impl<S> Transaction<S> {
 
     /// Replaces operation metrics recorded in `commitInfo`.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when a key is empty or occurs more than once.
-    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Result<Self>
+    /// Present values must already be stringified as expected in table history; `None` writes a
+    /// null map value. When unset, `operationMetrics` is omitted; an explicitly empty map is
+    /// written as `{}`. A later call replaces the complete map, and the last value wins when a key
+    /// occurs more than once.
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Self
     where
-        I: IntoIterator<Item = (K, V)>,
+        I: IntoIterator<Item = (K, Option<V>)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.operation_metrics = collect_operation_metadata("metric", metrics)?;
-        Ok(self)
-    }
-
-    pub(super) fn with_transaction_ids(mut self, transaction_ids: Vec<(String, i64)>) -> Self {
-        self.set_transactions = transaction_ids
-            .into_iter()
-            .map(|(app_id, version)| {
-                SetTransaction::new(app_id, version, Some(self.commit_timestamp))
-            })
-            .collect();
+        self.operation_metrics = Some(collect_operation_metadata(metrics));
         self
     }
 
@@ -734,10 +717,7 @@ impl<S> Transaction<S> {
         self
     }
 
-    pub(super) fn with_builder_state(
-        mut self,
-        state: TransactionBuilderState,
-    ) -> Result<Self> {
+    pub(super) fn with_builder_state(mut self, state: TransactionBuilderState) -> Result<Self> {
         state.validate()?;
         let TransactionBuilderState {
             correlation_id,
@@ -745,15 +725,22 @@ impl<S> Transaction<S> {
             operation_metrics,
             engine_info,
             engine_commit_info,
+            transaction_ids,
             domain_metadata_additions,
             data_change,
         } = state;
 
         self.correlation_id = correlation_id;
-        self.operation_parameters = operation_parameters.unwrap_or_default();
-        self.operation_metrics = operation_metrics.unwrap_or_default();
+        self.operation_parameters = operation_parameters;
+        self.operation_metrics = operation_metrics;
         self.engine_info = engine_info;
         self.engine_commit_info = engine_commit_info;
+        self.set_transactions = transaction_ids
+            .into_iter()
+            .map(|(app_id, version)| {
+                SetTransaction::new(app_id, version, Some(self.commit_timestamp))
+            })
+            .collect();
         self.user_domain_metadata_additions = domain_metadata_additions;
         self.infer_data_change = data_change.is_none();
         self.data_change = data_change.unwrap_or(true);
@@ -1018,13 +1005,8 @@ impl<S> Transaction<S> {
     }
 
     pub(super) fn resolve_data_change(&mut self) {
-        if self.infer_data_change {
-            self.data_change = match self.operation.as_ref() {
-                Some(CommitOperation::UpdateTable(UpdateTableOperation::AlterTable)) => {
-                    self.has_data_file_actions()
-                }
-                _ => true,
-            };
+        if self.infer_data_change && self.should_emit_metadata {
+            self.data_change = self.has_data_file_actions();
         }
     }
 
@@ -2122,10 +2104,7 @@ mod tests {
         }
     }
 
-    fn create_dv_transaction(
-        snapshot: Arc<Snapshot>,
-        engine: &dyn Engine,
-    ) -> Result<Transaction> {
+    fn create_dv_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
         snapshot
             .transaction_builder()
             .with_operation(UpdateTableOperation::Delete)

@@ -28,8 +28,7 @@ use delta_kernel::transaction::create_table::{
 };
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
-    CommitResult, CommittedTransaction, Transaction, UpdateTableOperation,
-    UpdateTableTransactionBuilder,
+    CommittedTransaction, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
 use delta_kernel::EngineData;
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -55,25 +54,28 @@ use crate::handle::Handle;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
-    Result, ExclusiveEngineData, ExternEngine, KernelStringSlice, SharedExternEngine,
+    ExclusiveEngineData, ExternEngine, KernelStringSlice, Result, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
 };
 
 unsafe fn apply_string_map<T>(
     value: T,
     input: &FfiStringMap,
-    apply: impl FnOnce(T, HashMap<String, String>) -> DeltaResult<T>,
-) -> DeltaResult<T> {
-    let values = unsafe { input.try_to_hash_map() }?;
-    apply(value, values)
+    apply: impl FnOnce(T, HashMap<String, Option<String>>) -> T,
+) -> Result<T> {
+    let values = unsafe { input.try_to_hash_map() }?
+        .into_iter()
+        .map(|(key, value)| (key, Some(value)))
+        .collect();
+    Ok(apply(value, values))
 }
 
 unsafe fn apply_commit_info<T>(
     value: T,
     commit_info: Box<dyn EngineData>,
     schema: &EngineSchema,
-    apply: impl FnOnce(T, Box<dyn EngineData>, SchemaRef) -> DeltaResult<T>,
-) -> DeltaResult<T> {
+    apply: impl FnOnce(T, Box<dyn EngineData>, SchemaRef) -> Result<T>,
+) -> Result<T> {
     let schema = decode_engine_schema(schema)?;
     apply(value, commit_info, Arc::new(schema))
 }
@@ -82,14 +84,14 @@ unsafe fn apply_domain_metadata<T>(
     value: T,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
-    apply: impl FnOnce(T, String, String) -> DeltaResult<T>,
-) -> DeltaResult<T> {
+    apply: impl FnOnce(T, String, String) -> Result<T>,
+) -> Result<T> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
     apply(value, domain, configuration)
 }
 
-fn decode_engine_schema(schema: &EngineSchema) -> DeltaResult<delta_kernel::schema::StructType> {
+fn decode_engine_schema(schema: &EngineSchema) -> Result<delta_kernel::schema::StructType> {
     let mut visitor_state = KernelSchemaVisitorState::default();
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
     extract_kernel_schema(&mut visitor_state, schema_id)
@@ -173,6 +175,33 @@ mod tests {
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    struct IoErrorCommitter;
+
+    impl Committer for IoErrorCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn delta_kernel::Engine,
+            _actions: delta_kernel::ResultIterator<'_, FilteredEngineData>,
+            _commit_metadata: delta_kernel::committer::CommitMetadata,
+        ) -> Result<delta_kernel::committer::CommitResponse> {
+            Err(delta_kernel::KernelError::IOError(std::io::Error::other(
+                "simulated IO error",
+            )))
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+
+        fn publish(
+            &self,
+            _engine: &dyn delta_kernel::Engine,
+            _publish_metadata: delta_kernel::committer::PublishMetadata,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
 
     type LocalTestTables = Vec<(
         Url,
@@ -1198,6 +1227,24 @@ mod tests {
             .expect("commit should contain a commitInfo action")
     }
 
+    async fn read_transaction_action(
+        store: &DynObjectStore,
+        table_url: &Url,
+        version: u64,
+    ) -> serde_json::Value {
+        let path = format!("_delta_log/{version:020}.json");
+        let commit_url = table_url.join(&path).unwrap();
+        let data = store
+            .get(&Path::from_url_path(commit_url.path()).unwrap())
+            .await
+            .unwrap();
+        Deserializer::from_slice(&data.bytes().await.unwrap())
+            .into_iter::<serde_json::Value>()
+            .map(Result::unwrap)
+            .find(|action| action.get("txn").is_some())
+            .expect("commit should contain a txn action")
+    }
+
     /// Create a table with the requested domain-metadata features.
     async fn setup_domain_metadata_table(
         name: &str,
@@ -1268,6 +1315,14 @@ mod tests {
         });
         let txn =
             ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let missing_domain = "missingDomain";
+        let txn = ok_or_panic(unsafe {
+            update_table_txn_with_domain_metadata_removed(
+                txn,
+                kernel_string_slice!(missing_domain),
+                engine.shallow_copy(),
+            )
+        });
 
         let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         let version = unsafe { version_and_free(committed) };
@@ -2201,6 +2256,14 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_transaction_id(
+                builder,
+                ffi_str("create-app"),
+                7,
+                engine.shallow_copy(),
+            )
+        });
         let txn =
             ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
         let txn = ok_or_panic(unsafe {
@@ -2231,6 +2294,9 @@ mod tests {
             "transaction"
         );
         assert_eq!(commit_info["commitInfo"]["connectorField"], "transaction");
+        let transaction = read_transaction_action(&store, &table_url, 0).await;
+        assert_eq!(transaction["txn"]["appId"], "create-app");
+        assert_eq!(transaction["txn"]["version"], 7);
         unsafe { free_engine(engine) };
     }
 
@@ -2398,7 +2464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_table_builder_rejects_empty_operation_parameter_key(
+    async fn update_table_builder_accepts_empty_operation_parameter_key(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, _store, engine) =
             setup_domain_metadata_table("test_update_builder_empty_parameter", false).await?;
@@ -2411,16 +2477,67 @@ mod tests {
         }];
         let values = unsafe { FfiStringMap::new_unsafe(&entries) };
 
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_operation_parameters(
+                builder,
+                &values,
+                engine.shallow_copy(),
+            )
+        });
+        unsafe {
+            free_update_table_txn_builder(builder);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(KernelUpdateTableOperation::Write, "WRITE")]
+    #[case(KernelUpdateTableOperation::StreamingUpdate, "STREAMING UPDATE")]
+    #[case(KernelUpdateTableOperation::Delete, "DELETE")]
+    #[case(KernelUpdateTableOperation::Update, "UPDATE")]
+    #[case(KernelUpdateTableOperation::Merge, "MERGE")]
+    #[case(KernelUpdateTableOperation::Optimize, "OPTIMIZE")]
+    #[tokio::test]
+    async fn update_table_operation_variants_commit_expected_history_name(
+        #[case] operation: KernelUpdateTableOperation,
+        #[case] expected: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_operation", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { update_table_txn_builder_with_operation(builder, operation) };
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let commit_info = read_commit_info_action(&_store, &table_url, 1).await;
+        assert_eq!(commit_info["commitInfo"]["operation"], expected);
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alter_table_operation_without_schema_change_is_rejected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_alter_requires_schema_change", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe {
+            update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::AlterTable)
+        };
         assert_extern_result_error_contains(
-            unsafe {
-                update_table_txn_builder_with_operation_parameters(
-                    builder,
-                    &values,
-                    engine.shallow_copy(),
-                )
-            },
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
             FFIKernelError::InvalidTransactionStateError,
-            "operation parameter key cannot be empty",
+            "ALTER TABLE requires at least one schema change",
         );
         unsafe {
             free_snapshot(snapshot);
@@ -2430,40 +2547,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_table_builder_lifecycle_and_operation_variants(
+    async fn update_table_commit_conflict_is_reported_through_ffi(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, _store, engine) =
-            setup_domain_metadata_table("test_update_builder_lifecycle", false).await?;
+            setup_domain_metadata_table("test_update_commit_conflict", false).await?;
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let first = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let first =
+            ok_or_panic(unsafe { update_table_txn_builder_build(first, engine.shallow_copy()) });
+        let second = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let second =
+            ok_or_panic(unsafe { update_table_txn_builder_build(second, engine.shallow_copy()) });
 
-        for operation in [
-            KernelUpdateTableOperation::StreamingUpdate,
-            KernelUpdateTableOperation::AlterTable,
-            KernelUpdateTableOperation::Delete,
-            KernelUpdateTableOperation::Update,
-            KernelUpdateTableOperation::Merge,
-            KernelUpdateTableOperation::Optimize,
-        ] {
-            let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
-            let builder = unsafe { update_table_txn_builder_with_operation(builder, operation) };
-            unsafe { free_update_table_txn_builder(builder) };
+        let committed =
+            ok_or_panic(unsafe { update_table_txn_commit(first, engine.shallow_copy()) });
+        unsafe { free_committed_transaction(committed) };
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_commit(second, engine.shallow_copy()) },
+            FFIKernelError::GenericError,
+            "commit conflict at version 1",
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
         }
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn update_table_retryable_error_is_reported_through_ffi(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_retryable_error", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
-        let builder = ok_or_panic(unsafe {
-            update_table_txn_builder_with_domain_metadata_removed(
-                builder,
-                ffi_str("missing.domain"),
-                engine.shallow_copy(),
-            )
-        });
-        unsafe { free_update_table_txn_builder(builder) };
-
-        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
-        let builder = unsafe { update_table_txn_builder_with_data_change(builder, true) };
-        let builder = unsafe { update_table_txn_builder_with_blind_append(builder) };
-        let committer: Box<dyn Committer> = Box::new(FileSystemCommitter::new());
+        let committer: Box<dyn Committer> = Box::new(IoErrorCommitter);
         let txn = ok_or_panic(unsafe {
             update_table_txn_builder_build_with_committer(
                 builder,
@@ -2471,8 +2591,12 @@ mod tests {
                 committer.into(),
             )
         });
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_commit(txn, engine.shallow_copy()) },
+            FFIKernelError::UnsupportedError,
+            "retryable transaction not supported in FFI",
+        );
         unsafe {
-            free_update_table_txn(txn);
             free_snapshot(snapshot);
             free_engine(engine);
         }
@@ -2532,9 +2656,8 @@ mod tests {
 
         let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
         let file = root_manifest_file_meta(&manifest_path);
-        let staged = unsafe {
-            update_table_txn_with_root_manifest_file(txn, &file, engine.shallow_copy())
-        };
+        let staged =
+            unsafe { update_table_txn_with_root_manifest_file(txn, &file, engine.shallow_copy()) };
 
         if feature_enabled {
             let txn = ok_or_panic(staged);
