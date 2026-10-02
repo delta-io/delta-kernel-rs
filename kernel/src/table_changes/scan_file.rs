@@ -63,7 +63,10 @@ pub(crate) struct CdfScanFile {
     pub default_row_commit_version: Option<i64>,
 }
 
-pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
+/// Callback invoked by [`visit_cdf_scan_files`] for each CDF scan file. Returning `false` stops
+/// iteration for the current batch; returning `true` continues it. This mirrors
+/// [`crate::scan::state::ScanCallback`].
+pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile) -> bool;
 
 /// Describes one data file and the metadata required to reconstruct row-level changes.
 ///
@@ -202,8 +205,10 @@ pub(crate) fn scan_metadata_to_scan_file(
     scan_metadata
         .map(|scan_metadata| -> DeltaResult<_> {
             let scan_metadata = scan_metadata?;
-            let callback: CdfScanCallback<Vec<CdfScanFile>> =
-                |context, scan_file| context.push(scan_file);
+            let callback: CdfScanCallback<Vec<CdfScanFile>> = |context, scan_file| {
+                context.push(scan_file);
+                true
+            };
             Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
         }) // Iterator-Result-Iterator
         .flatten_ok() // Iterator-Result
@@ -388,7 +393,10 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 base_row_id: file_side.base_row_id,
                 default_row_commit_version: file_side.default_row_commit_version,
             };
-            (self.callback)(&mut self.context, scan_file)
+            let should_continue = (self.callback)(&mut self.context, scan_file);
+            if !should_continue {
+                return Ok(());
+            }
         }
         Ok(())
     }

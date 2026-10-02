@@ -302,8 +302,9 @@ async fn parsed_partition_values_read_foreign_empty_string(
     );
 }
 
-fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
+fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) -> bool {
     paths.push(scan_file.path);
+    true
 }
 
 /// A file whose partition value is a foreign literal "" is a real empty value, not null, so
