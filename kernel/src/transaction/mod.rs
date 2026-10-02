@@ -895,22 +895,17 @@ impl<S> Transaction<S> {
         commit_version: Version,
         dm_changes: &[DomainMetadata],
     ) -> DeltaResult<Option<Box<dyn EngineData>>> {
-        let root_manifest_file = match &self.manifest_write {
-            Some(ManifestWrite::RootFile(root_manifest_file)) => Some(root_manifest_file),
-            _ => None,
+        let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
+            return Ok(None);
         };
-        root_manifest_file
-            .map(|root_manifest_file| {
-                let action = root_manifest_file.compute_checkpoint_action(
-                    engine,
-                    commit_version,
-                    &self.effective_table_config,
-                    dm_changes,
-                    &self.set_transactions,
-                )?;
-                action.into_engine_data(engine)
-            })
-            .transpose()
+        let action = root_manifest_file.compute_checkpoint_action(
+            engine,
+            commit_version,
+            &self.effective_table_config,
+            dm_changes,
+            &self.set_transactions,
+        )?;
+        Ok(Some(action.into_engine_data(engine)?))
     }
 
     // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.

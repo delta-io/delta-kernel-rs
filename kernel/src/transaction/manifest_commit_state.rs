@@ -14,13 +14,14 @@ use crate::{version_as_i64, DeltaResult, Engine, Version};
 /// State for an in-progress manifest (content-tree) commit.
 #[internal_api]
 pub(crate) struct ManifestCommitState {
+    // TODO(#3352): read these once the manifest-commit write path lands.
     /// Version this commit will write.
-    // TODO(#3352): read this once the manifest-commit write path lands.
     #[allow(dead_code)]
     version_to_write: Version,
     /// Snapshot the commit updates.
     #[allow(dead_code)]
     read_snapshot: SnapshotRef,
+    /// Effective config's physical schema at staging time; used by leaf writers.
     physical_schema: SchemaRef,
 }
 

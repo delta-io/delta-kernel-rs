@@ -165,8 +165,9 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
-    /// enabled, data-file actions have already been staged, or an operation is invalid for the
-    /// current schema or table configuration.
+    /// enabled, data-file actions have already been staged, an operation is invalid for the
+    /// current schema or table configuration, or a manifest (content-tree) commit was already
+    /// staged (adaptive-metadata-in-dev only).
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_schema_changes(
@@ -311,7 +312,9 @@ impl Transaction {
     ///
     /// Mutually exclusive with [`with_root_manifest_file`](Self::with_root_manifest_file), which
     /// commits a caller-supplied root manifest instead of having kernel build the tree. Repeated
-    /// calls return the state initialized by the first call.
+    /// calls return the state initialized by the first call. Call after
+    /// [`with_schema_changes`](Self::with_schema_changes), which rejects any staged manifest
+    /// commit.
     ///
     /// # Errors
     ///
