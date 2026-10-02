@@ -2828,18 +2828,18 @@ mod tests {
 
         let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
         let file = root_manifest_file_meta(&manifest_path);
-        let txn =
-            ok_or_panic(unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) });
+        let staged = unsafe { with_root_manifest_file(txn, &file, engine.shallow_copy()) };
 
         if feature_enabled {
+            let txn = ok_or_panic(staged);
             let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
             assert_eq!(unsafe { version_and_free(committed) }, 1);
         } else {
             assert_extern_result_error_with_message(
-                unsafe { commit(txn, engine.shallow_copy()) },
-                FFIKernelError::GenericError,
+                staged,
+                FFIKernelError::UnsupportedError,
                 Some(
-                    "Generic delta kernel error: root manifest file commit requires the \
+                    "Unsupported: root manifest file commit requires the \
                      adaptiveMetadata-preview feature",
                 ),
             );
