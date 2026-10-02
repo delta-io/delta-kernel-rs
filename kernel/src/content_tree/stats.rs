@@ -617,7 +617,7 @@ pub(crate) fn convert_delta_stats_to_amt_stats(
     input_schema: &StructType,
 ) -> DeltaResult<Box<dyn EngineData>> {
     // Caller precondition: the stats column must be in Delta shape.
-    let Some(known) = delta_json_stats_struct(input_schema, stats_column_name) else {
+    let Some(known_stats_schema) = delta_json_stats_struct(input_schema, stats_column_name) else {
         let found = input_schema
             .field(stats_column_name)
             .map(StructField::data_type);
