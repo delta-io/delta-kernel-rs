@@ -26,12 +26,13 @@ const WRITER_FEATURES: &[&str] = &[
     "domainMetadata",
     "inCommitTimestamp",
     "adaptiveMetadata-preview",
+    "icebergNativeV4",
 ];
 
-/// Creates a file-backed table supporting `adaptiveMetadata-preview` (and its full dependency
-/// chain) at version 0, and loads a snapshot at that version. The returned [`TempDir`] must be kept
-/// alive for the table's lifetime.
-async fn setup_adaptive_metadata_table(
+/// Creates a file-backed table supporting `icebergNativeV4` and its dependencies (including
+/// `adaptiveMetadata-preview`) at version 0, and loads a snapshot at that version. The returned
+/// [`TempDir`] must be kept alive for the table's lifetime.
+async fn setup_iceberg_native_v4_table(
     table_name: &str,
 ) -> Result<(impl Engine, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -59,7 +60,7 @@ async fn setup_adaptive_metadata_table(
 async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_action(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
-        setup_adaptive_metadata_table("root_manifest_file_checkpoint").await?;
+        setup_iceberg_native_v4_table("root_manifest_file_checkpoint").await?;
 
     let file = FileMeta {
         location: table_url.join("metadata/root-v1.parquet")?,
@@ -109,7 +110,7 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
 async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
-        setup_adaptive_metadata_table("root_manifest_file_merge").await?;
+        setup_iceberg_native_v4_table("root_manifest_file_merge").await?;
 
     let txn = begin_transaction(snapshot, &engine)?
         .with_domain_metadata("my.domain".to_string(), "v1".to_string())

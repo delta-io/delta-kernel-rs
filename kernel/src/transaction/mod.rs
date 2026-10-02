@@ -406,6 +406,8 @@ impl<S> Transaction<S> {
         self.ensure_schema_non_empty_for_data_writes()?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         self.validate_root_manifest_file_semantics()?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_iceberg_native_v4_semantics()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
@@ -907,6 +909,24 @@ impl<S> Transaction<S> {
         require!(
             !self.has_data_file_actions(),
             KernelError::generic("root manifest file commit cannot include file actions")
+        );
+        Ok(())
+    }
+
+    /// Reject file actions on a commit to an `icebergNativeV4` table.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn validate_iceberg_native_v4_semantics(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergNativeV4)
+        {
+            return Ok(());
+        }
+        require!(
+            !self.has_data_file_actions(),
+            KernelError::invalid_transaction_state(
+                "icebergNativeV4 tables cannot write file actions to the log"
+            )
         );
         Ok(())
     }
@@ -3358,6 +3378,34 @@ mod tests {
         add_dummy_file(&mut txn);
         let result = txn.validate_root_manifest_file_semantics();
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn iceberg_native_v4_table_config() -> TableConfiguration {
+        MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::AdaptiveMetadataPreview,
+                        TableFeature::IcebergNativeV4,
+                    ])
+                    .build(),
+            )
+            .build()
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_commit_rejects_file_actions_on_iceberg_native_v4_table() -> DeltaResult<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn.effective_table_config = iceberg_native_v4_table_config();
+        add_dummy_file(&mut txn);
+        let err = txn.commit(engine.as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("icebergNativeV4"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 
