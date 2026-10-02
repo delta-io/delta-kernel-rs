@@ -123,21 +123,23 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
-**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
-`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the
-create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to
-`Imperative`. Both entry points return imperative builders; with `declarative-plans`,
-`with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
-generic implementation.
-The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
-provide constructors, custom setters, and build validation.
+**Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` (or
+`ReplaceTableTransactionBuilder` for full replacement) -> `Transaction` -> `commit()`.
+`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`;
+the replace-table builder aliases `TransactionBuilder<ReplaceTable>`, and the create-table builder
+aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to `Imperative`.
+Create and update builders can select another mode with `with_execution_mode::<MODE>()` under
+`declarative-plans`. Common setters have one generic implementation. The sealed `TransactionType`
+trait selects opaque type-specific state; specialized implementations provide constructors,
+custom setters, and build validation.
 `Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
-construction; create-table constructors require the path, schema, engine info, and `data_change`
-and fix the operation to `CREATE TABLE`. These inputs cannot be changed on builders or built
-transactions. `data_change` is never inferred from staged files, including for empty commits.
-`build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
-staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
-introducing a separate transaction type.
+construction; replace-table requires a metadata policy and engine info and fixes `data_change` to
+`true`. Create-table constructors require the path, schema, engine info, and `data_change` and fix
+the operation to `CREATE TABLE`. These inputs cannot be changed on builders or built transactions.
+`data_change` is never inferred from staged files, including for empty commits. `build()` rejects
+ALTER with `true` and blind append with `false`; `commit()` retains operation and staged-file
+checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without introducing a
+separate transaction type.
 Writers configure transaction intent before `build()`, then call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
