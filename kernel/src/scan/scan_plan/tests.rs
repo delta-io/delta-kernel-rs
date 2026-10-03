@@ -33,12 +33,8 @@ async fn declarative_udt_skipping_uses_only_null_counts(
     #[case] expected: [&str; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(crate::object_store::memory::InMemory::new());
-    let schema = schema_ref! {
-        nullable "value": (crate::schema::UserDefinedType {
-            sql_type: Box::new(DataType::LONG),
-            annotation: Default::default(),
-        }),
-    };
+    let udt = crate::schema::UserDefinedType::try_new(DataType::LONG, Default::default())?;
+    let schema = schema_ref! { nullable "value": (udt) };
     let mut actions = vec![
         serde_json::json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
         serde_json::json!({"metaData":{

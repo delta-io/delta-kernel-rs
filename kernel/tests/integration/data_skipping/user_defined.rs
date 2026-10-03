@@ -37,12 +37,11 @@ async fn udt_skipping_ignores_min_max_and_reads_leaf_null_count(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, table_path, engine) = test_table_setup_mt()?;
     let table_root = Url::from_directory_path(&table_path).unwrap().to_string();
-    let schema = schema_ref! {
-        nullable "value": (UserDefinedType {
-            sql_type: Box::new(DataType::LONG),
-            annotation: [("class".into(), Some("example.Value".into()))].into(),
-        }),
-    };
+    let udt = UserDefinedType::try_new(
+        DataType::LONG,
+        [("class".into(), Some("example.Value".into()))].into(),
+    )?;
+    let schema = schema_ref! { nullable "value": (udt) };
     let schema = if mapping_mode == ColumnMappingMode::None {
         schema
     } else {
