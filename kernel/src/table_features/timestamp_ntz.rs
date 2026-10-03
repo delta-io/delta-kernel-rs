@@ -45,7 +45,7 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
         &mut self,
         udt: &'a crate::schema::UserDefinedType,
     ) -> Result<(), ()> {
-        self.transform(&udt.sql_type)
+        self.transform(udt.sql_type())
     }
 }
 
