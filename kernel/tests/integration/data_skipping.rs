@@ -21,7 +21,8 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    col, column_name, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
+    col, column_name, lit, Expression as Expr, IntervalYearMonthData, Predicate as Pred,
+    PredicateRef, Scalar,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -1274,9 +1275,9 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(12),
-    Scalar::IntervalYearMonth(12),
-    Scalar::IntervalYearMonth(24)
+    Scalar::IntervalYearMonth(IntervalYearMonthData::from(12)),
+    Scalar::IntervalYearMonth(IntervalYearMonthData::from(12)),
+    Scalar::IntervalYearMonth(IntervalYearMonthData::from(24))
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,

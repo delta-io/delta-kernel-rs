@@ -64,7 +64,7 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::Scalar;
+use delta_kernel::expressions::{IntervalYearMonthData, Scalar};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
@@ -1850,7 +1850,9 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 }
                 PrimitiveType::Void => panic!("void type is not a valid partition column"),
                 // Intervals are physical integers: months (year-month) / microseconds (day-time).
-                PrimitiveType::IntervalYearMonth => Scalar::IntervalYearMonth((seed % 100) as i32),
+                PrimitiveType::IntervalYearMonth(dtype) => Scalar::IntervalYearMonth(
+                    IntervalYearMonthData::new((seed % 100) as i32, *dtype),
+                ),
                 PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
                 other => panic!("{other:?} is not a valid partition column type"),
             }

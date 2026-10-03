@@ -1952,7 +1952,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::scan::log_replay::PATH_NAME;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{schema, schema_ref, MapType};
+    use crate::schema::{schema, schema_ref, IntervalYearToMonthType, MapType, PrimitiveType};
     use crate::table_features::ColumnMappingMode;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::table_features::TableFeature;
@@ -2276,6 +2276,83 @@ mod tests {
         let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
+
+        Ok(())
+    }
+
+    fn narrow_interval_schema(dtype: IntervalYearToMonthType) -> SchemaRef {
+        Arc::new(
+            StructType::try_new([StructField::nullable(
+                "ym",
+                DataType::Primitive(PrimitiveType::IntervalYearMonth(dtype)),
+            )])
+            .unwrap(),
+        )
+    }
+
+    #[rstest]
+    #[case::year(IntervalYearToMonthType::IntervalYear, "interval year")]
+    #[case::month(IntervalYearToMonthType::IntervalMonth, "interval month")]
+    fn write_state_rejects_narrow_year_month_data_schema(
+        #[case] dtype: IntervalYearToMonthType,
+        #[case] expected_msg: &str,
+    ) {
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let txn = create_table(
+            "memory:///narrow_write_state",
+            narrow_interval_schema(dtype),
+            "test",
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap();
+
+        let err = txn
+            .write_state()
+            .expect_err("write_state must reject narrowed year-month data schemas");
+        assert!(
+            err.to_string().contains(expected_msg),
+            "expected error containing {expected_msg:?}, got {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_only_commit_allows_narrow_year_month_schema() -> Result<()> {
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        create_table(
+            "memory:///narrow_metadata_only",
+            narrow_interval_schema(IntervalYearToMonthType::IntervalYear),
+            "test",
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+        Ok(())
+    }
+
+    #[test]
+    fn commit_with_add_files_rejects_narrow_year_month_schema(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine: Arc<dyn Engine> =
+            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let mut txn = create_table(
+            "memory:///narrow_add_file",
+            narrow_interval_schema(IntervalYearToMonthType::IntervalMonth),
+            "test",
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        add_dummy_file(&mut txn);
+
+        let err = txn
+            .commit(engine.as_ref())
+            .expect_err("commit with AddFile must reject narrowed year-month data schemas");
+        assert!(
+            err.to_string().contains("interval month"),
+            "expected narrowed interval error, got {err}"
+        );
 
         Ok(())
     }

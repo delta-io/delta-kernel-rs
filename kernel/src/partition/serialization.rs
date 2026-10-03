@@ -92,7 +92,7 @@ pub fn serialize_partition_value(value: &Scalar) -> Result<Option<String>> {
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
-        Scalar::IntervalYearMonth(months) => Ok(Some(format_year_month_interval(*months))),
+        Scalar::IntervalYearMonth(data) => Ok(Some(format_year_month_interval(data.months()))),
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
@@ -253,8 +253,10 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
+    use crate::expressions::{ArrayData, IntervalYearMonthData, MapData, Scalar, StructData};
+    use crate::schema::{
+        ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType, StructField,
+    };
 
     // ============================================================================
     // Spark reference: null and empty values
@@ -548,11 +550,26 @@ mod tests {
         Scalar::decimal(1_230_000_000_000_000_000i128, 38, 18).unwrap(),
         PrimitiveType::decimal(38, 18).unwrap()
     )]
-    #[case::interval_ym(Scalar::IntervalYearMonth(30), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_neg(Scalar::IntervalYearMonth(-18), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_zero(Scalar::IntervalYearMonth(0), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_min(Scalar::IntervalYearMonth(i32::MIN), PrimitiveType::IntervalYearMonth)]
-    #[case::interval_ym_max(Scalar::IntervalYearMonth(i32::MAX), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_ym(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
+        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_neg(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(-18)),
+        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_zero(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(0)),
+        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_min(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MIN)),
+        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_ym_max(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MAX)),
+        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
     #[case::interval_dt(
         Scalar::IntervalDayTime(131_445_000_000),
         PrimitiveType::IntervalDayTime
@@ -569,8 +586,14 @@ mod tests {
     /// Interval partition values serialize to Spark ANSI interval literal strings. The
     /// year-month spelling is verified against the DAT `intv_003` workload.
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(12), "INTERVAL '1-0' YEAR TO MONTH")]
-    #[case(Scalar::IntervalYearMonth(30), "INTERVAL '2-6' YEAR TO MONTH")]
+    #[case(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(12)),
+        "INTERVAL '1-0' YEAR TO MONTH"
+    )]
+    #[case(
+        Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
+        "INTERVAL '2-6' YEAR TO MONTH"
+    )]
     #[case(
         Scalar::IntervalDayTime(131_445_000_000),
         "INTERVAL '1 12:30:45' DAY TO SECOND"

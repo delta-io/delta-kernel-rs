@@ -6,7 +6,7 @@ use std::sync::Arc;
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
     lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    IntervalYearMonthData, JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::Result;
@@ -393,7 +393,12 @@ pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalYearMonth(value)))
+    wrap_expression(
+        state,
+        lit(Scalar::IntervalYearMonth(IntervalYearMonthData::from(
+            value,
+        ))),
+    )
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -554,7 +559,7 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
                 PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
@@ -1019,6 +1024,14 @@ mod tests {
     }
 
     #[test]
+    fn interval_year_month_null_tag_reconstructs_full_range() {
+        assert_eq!(
+            NullTypeTag::IntervalYearMonth.to_data_type(0, 0).unwrap(),
+            DataType::INTERVAL_YEAR_MONTH
+        );
+    }
+
+    #[test]
     fn to_data_type_decimal() {
         let dt = NullTypeTag::Decimal.to_data_type(10, 2).unwrap();
         assert_eq!(dt, DataType::decimal(10, 2).unwrap());
@@ -1144,19 +1157,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(17))]
+    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(17)))]
     #[case(Scalar::IntervalDayTime(1_234_567))]
-    #[case(Scalar::IntervalYearMonth(-13))]
-    #[case(Scalar::IntervalYearMonth(i32::MIN))]
-    #[case(Scalar::IntervalYearMonth(i32::MAX))]
+    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(-13)))]
+    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MIN)))]
+    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MAX)))]
     #[case(Scalar::IntervalDayTime(-86_400_000_000))]
     #[case(Scalar::IntervalDayTime(i64::MIN))]
     #[case(Scalar::IntervalDayTime(i64::MAX))]
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
-            Scalar::IntervalYearMonth(value) => {
-                visit_expression_literal_interval_year_month(&mut state, value)
+            Scalar::IntervalYearMonth(ref value) => {
+                visit_expression_literal_interval_year_month(&mut state, value.months())
             }
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)

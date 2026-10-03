@@ -190,7 +190,7 @@ fn column_types_for(dt: &DataType) -> Result<&'static ColumnNamesAndTypes> {
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+        DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats validation: {dt}"
             )))
@@ -233,7 +233,7 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
+        DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) | &DataType::INTERVAL_DAY_TIME => {
             Err(KernelError::unsupported(format!(
                 "Interval types are not supported for stats presence check: {data_type}"
             )))

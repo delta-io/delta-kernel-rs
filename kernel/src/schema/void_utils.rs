@@ -64,6 +64,9 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
 /// metadata and programmatically constructed schemas rely on this validator before writing files.
 ///
 /// Writes are rejected when:
+/// - A data schema contains narrowed year-month interval types (`interval year` or `interval
+///   month`). Kernel preserves these qualifiers for reads and metadata, but does not yet support
+///   writing them to data files.
 /// - Void is nested inside Array or Map. Parquet's UNKNOWN logical type can in principle annotate
 ///   any physical type with all-null values, but Delta itself does not materialize void columns in
 ///   data files, and our logical-to-physical transform does not descend into Array elements or Map
@@ -99,6 +102,17 @@ impl ValidateForWrite {
 
 impl<'a> SchemaTransform<'a> for ValidateForWrite {
     transform_output_type!(|'a, T| Result<()>);
+
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<()> {
+        if let PrimitiveType::IntervalYearMonth(dtype) = ptype {
+            if !dtype.is_full_range() {
+                return Err(KernelError::schema(format!(
+                    "{dtype} is not supported for data writes"
+                )));
+            }
+        }
+        Ok(())
+    }
 
     fn transform_struct(&mut self, stype: &'a StructType) -> Result<()> {
         if has_no_non_void_fields(stype) {
@@ -190,8 +204,8 @@ fn add_void_stripping_inner<'a>(
 mod tests {
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, IntervalYearToMonthType, MapType,
+        MetadataValue, PrimitiveType, StructField, StructType,
     };
 
     // ---- validate_schema_for_write tests ----
@@ -427,6 +441,18 @@ mod tests {
             } },
         }
     )]
+    #[case(
+        "full range year-month interval",
+        schema! {
+            nullable "ym": INTERVAL_YEAR_MONTH,
+        }
+    )]
+    #[case(
+        "day-time interval",
+        schema! {
+            nullable "dt": INTERVAL_DAY_TIME,
+        }
+    )]
     fn test_valid_schema_for_complex_types(#[case] desc: &str, #[case] schema: StructType) {
         validate_schema_for_write(&schema)
             .unwrap_or_else(|e| panic!("{desc}: unexpected validation error: {e}"));
@@ -517,6 +543,92 @@ mod tests {
             nullable "s": {},
         },
         "contains no non-void fields"
+    )]
+    #[case(
+        "top-level interval year",
+        schema! {
+            (StructField::nullable(
+                "ym",
+                DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                    IntervalYearToMonthType::IntervalYear
+                ))
+            )),
+        },
+        "interval year is not supported for data writes"
+    )]
+    #[case(
+        "top-level interval month",
+        schema! {
+            (StructField::nullable(
+                "ym",
+                DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                    IntervalYearToMonthType::IntervalMonth
+                ))
+            )),
+        },
+        "interval month is not supported for data writes"
+    )]
+    #[case(
+        "nested struct interval year",
+        schema! {
+            (StructField::nullable(
+                "s",
+                StructType::try_new([StructField::nullable(
+                    "ym",
+                    DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                        IntervalYearToMonthType::IntervalYear
+                    ))
+                )]).unwrap()
+            )),
+        },
+        "interval year is not supported for data writes"
+    )]
+    #[case(
+        "array interval month",
+        schema! {
+            (StructField::nullable(
+                "arr",
+                ArrayType::new(
+                    DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                        IntervalYearToMonthType::IntervalMonth
+                    )),
+                    true
+                )
+            )),
+        },
+        "interval month is not supported for data writes"
+    )]
+    #[case(
+        "map key interval year",
+        schema! {
+            (StructField::nullable(
+                "m",
+                MapType::new(
+                    DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                        IntervalYearToMonthType::IntervalYear
+                    )),
+                    DataType::STRING,
+                    true
+                )
+            )),
+        },
+        "interval year is not supported for data writes"
+    )]
+    #[case(
+        "map value interval month",
+        schema! {
+            (StructField::nullable(
+                "m",
+                MapType::new(
+                    DataType::STRING,
+                    DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                        IntervalYearToMonthType::IntervalMonth
+                    )),
+                    true
+                )
+            )),
+        },
+        "interval month is not supported for data writes"
     )]
     fn test_write_rejected_schemas(
         #[case] desc: &str,

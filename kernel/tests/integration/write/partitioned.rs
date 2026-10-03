@@ -14,7 +14,7 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::Scalar;
+use delta_kernel::expressions::{IntervalYearMonthData, Scalar};
 use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
@@ -136,7 +136,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
 #[case::day_time(
@@ -203,7 +203,7 @@ async fn test_write_partitioned_interval_roundtrip(
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
 #[case::day_time(
@@ -683,7 +683,7 @@ fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scal
         Scalar::IntervalYearMonth(months) => {
             assert_eq!(
                 get_column!(batch, column_name, Int32Array).value(0),
-                *months,
+                months.months(),
                 "interval year-month column {column_name}"
             );
         }

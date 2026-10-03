@@ -1582,7 +1582,10 @@ fn test_void_scalar_to_array() {
 
 // Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
-#[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
+#[case::year_month(
+    Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
+    DataType::Int32
+)]
 #[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
 fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
     let array = scalar.to_array(2).unwrap();
