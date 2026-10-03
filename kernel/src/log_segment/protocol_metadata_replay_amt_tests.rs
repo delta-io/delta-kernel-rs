@@ -324,81 +324,58 @@ async fn latest_checkpoint_action_scans_when_resolution_unknown() {
     assert_eq!(action.content_root.path, "metadata/root.parquet");
 }
 
-// A fresh (no-CRC) replay captures the checkpoint action into the resolution rather than deferring
-// to a scan, on both the plan and non-plan paths. Asserts the resolution directly because the
-// `latest_checkpoint_action` accessor would return the same action either way (via the scan).
-#[tokio::test]
-async fn replay_resolves_checkpoint_action_as_captured() {
-    assert_replay_captures_checkpoint_action(non_plan_engine).await;
-    #[cfg(feature = "declarative-plans")]
-    assert_replay_captures_checkpoint_action(|store| SyncEngine::new_with_store(store)).await;
-}
-
-async fn assert_replay_captures_checkpoint_action<E: Engine>(
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
-) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
+// `read_protocol_metadata_opt` captures the latest AMT checkpoint action during full replay and
+// reports it on the resolution. Asserts the resolution directly (not the accessor) because the
+// accessor returns the same action whether replay captured it or a later scan found it -- only the
+// resolution shows that replay itself captured it. Runs on both the plan and non-plan paths. Cases:
+// - a single checkpoint commit is captured;
+// - a checkpoint action in a non-first batch is still captured: replay stops only once both P&M are
+//   final, and a newer top-level `metaData` commit does not finalize Protocol, so replay continues
+//   into the older checkpoint commit;
+// - replay that resolves P&M from standalone actions reports no checkpoint action (`None`).
+#[rstest]
+#[case::single_checkpoint_commit(vec![checkpoint_commit(0, &[], one_column_schema())], Some(0))]
+#[case::checkpoint_action_in_non_first_batch(
+    vec![
         checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
-
-    let engine = make_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
-
-    let resolution = log_segment
-        .read_protocol_metadata_opt(&engine, None)
-        .unwrap();
-    assert!(
-        matches!(
-            resolution.checkpoint_action,
-            Some(action) if action.version == 0
-        ),
-        "replay should capture the checkpoint action, not defer to a scan"
-    );
-}
-
-// Replay stops once both Protocol and Metadata are final. A newest commit that carries only
-// top-level metaData does not finalize Protocol, so replay continues into the older commit whose
-// checkpoint action supplies it -- and that action, found in a non-first batch, is still captured.
-#[tokio::test]
-async fn replay_captures_checkpoint_action_from_older_batch_when_newest_batch_not_final() {
-    assert_older_batch_checkpoint_action_captured(non_plan_engine).await;
-    #[cfg(feature = "declarative-plans")]
-    assert_older_batch_checkpoint_action_captured(|store| SyncEngine::new_with_store(store)).await;
-}
-
-async fn assert_older_batch_checkpoint_action_captured<E: Engine>(
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
-) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    // v0 carries P&M via a checkpoint action; v1 is a top-level metaData only (no protocol).
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        1,
         metadata_commit(test_schema_flat_with_column_mapping()),
-    )
-    .await
-    .unwrap();
+    ],
+    Some(0)
+)]
+#[case::standalone_pm_has_no_checkpoint_action(
+    vec![standalone_pm_commit(one_column_schema())],
+    None
+)]
+#[tokio::test]
+async fn replay_resolves_latest_checkpoint_action(
+    #[case] commits: Vec<String>,
+    #[case] expected_version: Option<i64>,
+) {
+    assert_replay_resolution(&commits, expected_version, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_replay_resolution(&commits, expected_version, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn assert_replay_resolution<E: Engine>(
+    commits: &[String],
+    expected_version: Option<i64>,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    for (version, commit) in commits.iter().enumerate() {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version as u64,
+            commit.clone(),
+        )
+        .await
+        .unwrap();
+    }
 
     let engine = make_engine(store);
     let storage = engine.storage_handler();
@@ -410,20 +387,24 @@ async fn assert_older_batch_checkpoint_action_captured<E: Engine>(
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
-    assert!(
-        matches!(
-            resolution.checkpoint_action,
-            Some(action) if action.version == 0
-        ),
-        "the checkpoint action in the older batch must be captured even though the newest commit \
-         finalized Metadata"
+    assert_eq!(
+        resolution.checkpoint_action.map(|a| a.version),
+        expected_version
     );
 }
 
-// An incremental update whose new commit carries a newer checkpoint action surfaces that newer
-// action through `latest_checkpoint_action` on the updated snapshot.
+// An incremental update resolves the latest checkpoint action for the updated snapshot: a new
+// commit carrying a newer checkpoint action surfaces that newer action, while a new commit carrying
+// none leaves the update's resolution unset so the accessor scans and still returns the base's
+// older action.
+#[rstest]
+#[case::new_commit_carries_a_newer_action(checkpoint_commit(1, &[], one_column_schema()), 1)]
+#[case::new_commit_carries_no_action(metadata_commit(one_column_schema()), 0)]
 #[tokio::test]
-async fn incremental_update_captures_latest_checkpoint_action() {
+async fn incremental_update_resolves_latest_checkpoint_action(
+    #[case] new_commit: String,
+    #[case] expected_version: i64,
+) {
     let store = Arc::new(InMemory::new());
     let table_root = url::Url::parse("memory:///").unwrap();
     add_commit(
@@ -447,66 +428,9 @@ async fn incremental_update_captures_latest_checkpoint_action() {
         Some(0)
     );
 
-    // A new manifest commit carries a newer checkpoint action; the incremental replay must pick
-    // it up as the snapshot's latest.
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        1,
-        checkpoint_commit(1, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
-    let updated = Snapshot::builder_from(base).build(&engine).unwrap();
-
-    assert_eq!(updated.version(), 1);
-    assert_eq!(
-        updated
-            .latest_checkpoint_action(&engine)
-            .unwrap()
-            .map(|a| a.version),
-        Some(1)
-    );
-}
-
-// An incremental update whose new commit carries no checkpoint action leaves the updated
-// snapshot's resolution `Unresolved`, so `latest_checkpoint_action` scans the log and still
-// returns the older action from the base's checkpoint commit.
-#[tokio::test]
-async fn incremental_update_without_checkpoint_action_scans_for_older_action() {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
-
-    let engine = non_plan_engine(store.clone());
-    let base = Snapshot::builder_for(table_root.clone())
-        .at_version(0)
-        .build(&engine)
+    add_commit(table_root.as_str(), store.as_ref(), 1, new_commit)
+        .await
         .unwrap();
-    assert_eq!(
-        base.latest_checkpoint_action(&engine)
-            .unwrap()
-            .map(|a| a.version),
-        Some(0)
-    );
-
-    // A plain metaData commit carries no checkpoint action, so the incremental replay captures
-    // none and the accessor must scan back to the base's v0 checkpoint action.
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        1,
-        metadata_commit(one_column_schema()),
-    )
-    .await
-    .unwrap();
     let updated = Snapshot::builder_from(base).build(&engine).unwrap();
 
     assert_eq!(updated.version(), 1);
@@ -515,6 +439,6 @@ async fn incremental_update_without_checkpoint_action_scans_for_older_action() {
             .latest_checkpoint_action(&engine)
             .unwrap()
             .map(|a| a.version),
-        Some(0)
+        Some(expected_version)
     );
 }
