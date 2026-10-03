@@ -2692,7 +2692,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     fn transform_user_defined(
         &mut self,
         udt: &'a UserDefinedType,
-    ) -> DeltaResult<Cow<'a, UserDefinedType>> {
+    ) -> Result<Cow<'a, UserDefinedType>> {
         // Column mapping applies to the enclosing field; sqlType uses its own field names.
         Ok(Cow::Borrowed(udt))
     }

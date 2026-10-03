@@ -469,10 +469,7 @@ mod tests {
         )]
         sql_type: DataType,
     ) {
-        let udt = UserDefinedType {
-            sql_type: Box::new(sql_type),
-            annotation: Default::default(),
-        };
+        let udt = UserDefinedType::try_new(sql_type, Default::default()).unwrap();
         let schema = schema! { nullable "value": (udt), nullable "after": LONG };
         let properties: TableProperties = [(property, setting)].into();
         let config = stats_config_from_table_properties(&properties);

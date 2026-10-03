@@ -1293,7 +1293,11 @@ impl Scan {
             &partition_columns,
             &floating_partition_columns,
             &self.state_info.eligible_physical_stats_columns,
-            &min_max_stats_columns(self.state_info.physical_stats_schema.as_deref()),
+            &min_max_stats_columns(
+                self.state_info
+                    .physical_stats_read_schema()
+                    .map(AsRef::as_ref),
+            ),
         )?;
 
         let mut prefixer = PrefixColumns {
