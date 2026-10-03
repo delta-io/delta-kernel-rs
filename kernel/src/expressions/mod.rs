@@ -16,7 +16,9 @@ pub use self::column_names::{
 };
 #[doc(inline)]
 pub use self::macros::expr;
-pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+pub use self::scalars::{
+    ArrayData, DecimalData, IntervalYearMonthData, MapData, Scalar, StructData,
+};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
