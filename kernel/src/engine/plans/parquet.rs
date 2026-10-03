@@ -42,6 +42,12 @@ impl ParquetHandler for PlanBasedParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> Result<FileDataReadResultIterator> {
+        let predicate = predicate.filter(|predicate| {
+            predicate
+                .references()
+                .into_iter()
+                .all(|column| physical_schema.field_at(column).is_ok())
+        });
         let scan = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?;
         let query = match predicate {
             Some(predicate) => scan.filter(predicate)?,
@@ -224,6 +230,40 @@ mod tests {
                 .unwrap()
                 .values(),
             &[20, 30]
+        );
+    }
+
+    #[test]
+    fn test_read_parquet_files_ignores_predicate_with_missing_column() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("data.parquet");
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let (file_meta, schema) = make_test_parquet_file(&file_path, &batch);
+        let predicate = Arc::new(Predicate::gt(col!("missing"), lit(10i64)));
+
+        let batches: Vec<RecordBatch> = make_handler()
+            .read_parquet_files(&[file_meta], schema, Some(predicate))
+            .unwrap()
+            .map(|r| {
+                ArrowEngineData::try_from_engine_data(r.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[10, 20, 30]
         );
     }
 

@@ -51,6 +51,12 @@ impl JsonHandler for PlanBasedJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> Result<FileDataReadResultIterator> {
+        let predicate = predicate.filter(|predicate| {
+            predicate
+                .references()
+                .into_iter()
+                .all(|column| physical_schema.field_at(column).is_ok())
+        });
         let scan = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?;
         let query = match predicate {
             Some(predicate) => scan.filter(predicate)?,
@@ -206,6 +212,32 @@ mod tests {
                 .unwrap()
                 .values(),
             &[2, 3]
+        );
+        assert!(iter.next().is_none(), "expected exactly one batch");
+    }
+
+    #[test]
+    fn test_read_json_files_ignores_predicate_with_missing_column() {
+        let (_temp, file_meta) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
+        let schema = schema_ref! { not_null "x": INTEGER };
+        let predicate = Arc::new(Predicate::gt(col!("missing"), lit(1i32)));
+
+        let mut iter = make_handler()
+            .read_json_files(&[file_meta], schema, Some(predicate))
+            .unwrap();
+
+        let batch = iter.next().expect("expected at least one batch").unwrap();
+        let record_batch: RecordBatch =
+            ArrowEngineData::try_from_engine_data(batch).unwrap().into();
+        assert_eq!(record_batch.num_rows(), 3);
+        assert_eq!(
+            record_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[1, 2, 3]
         );
         assert!(iter.next().is_none(), "expected exactly one batch");
     }
