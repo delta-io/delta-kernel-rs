@@ -1,18 +1,21 @@
 //! Declarative metadata scan plans.
 //!
-//! [`Scan::build_metadata_scan_plan`] reconciles checkpoint and commit actions into live adds,
-//! applying metadata pruning before newest-action-wins replay.
+//! [`Scan::build_metadata_scan_plan`] reconciles a checkpoint or CRC `allFiles` base with later
+//! commit actions into live adds, applying metadata pruning before newest-action-wins replay.
+
+mod metadata_replay_base;
 
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
+pub(super) use metadata_replay_base::MetadataReplayBase;
 use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    Add, ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
@@ -44,7 +47,7 @@ const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
 
 impl Scan {
-    /// Build the live-add metadata plan from checkpoint and commit actions.
+    /// Build the live-add metadata plan from a reconciled base and later commit actions.
     ///
     /// Returns `None` for an empty result or a statically false predicate.
     #[tracing::instrument(
@@ -53,7 +56,10 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    pub(super) fn build_metadata_scan_plan(&self, shape: &CheckpointShape) -> Result<Option<Plan>> {
+    pub(super) fn build_metadata_scan_plan(
+        &self,
+        base: &MetadataReplayBase,
+    ) -> Result<Option<Plan>> {
         let state = &self.state_info;
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -69,23 +75,27 @@ impl Scan {
         let add_field = self.normalized_add_field()?;
         let (output_expr, output_schema) = self.metadata_output_projection(&add_field)?;
 
-        let commit_actions = self.commit_arm()?.try_fold_with(prune, |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        })?;
+        let (base_adds, base_version) = self.metadata_base_arm(base)?;
+        let commit_actions = self
+            .commit_arm(base_version)?
+            .try_fold_with(prune, |p, prune| {
+                // We filter so that:
+                // * All remove actions are kept
+                // * Add actions that do not match the partition pruning or stats predicate are
+                //   removed.
+                //
+                // NOTE: It is important that add actions are filtered by the partition predicate
+                // because partition filtering may not be applied on data rows. On the other
+                // hand, failing to skip based on data columns is safe because the data
+                // predicate will also be evaluated on data rows. Thus it is crucial that we
+                // partition prune adds here.
+                //
+                // NOTE: It is not safe to prune remove actions using the partition filter. This is
+                // because a NULL result for `remove.partitionValues.partCol` may be due to
+                // `remove.partitionValues` being NULL, or it may be from `partCol` being
+                // NULL. Thus, we simply do not prune removes.
+                p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+            })?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -98,11 +108,9 @@ impl Scan {
             )
         })?;
 
-        let checkpoint_adds = self
-            .checkpoint_arm(shape)?
-            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+        let base_adds = base_adds.try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
 
-        let checkpoint_live_adds = checkpoint_adds
+        let base_live_adds = base_adds
             .anti_join(
                 deduped_commit.clone(),
                 [column_name!(FILE_ACTION_KEY)],
@@ -114,7 +122,35 @@ impl Scan {
             .filter(col!("add").is_not_null())?
             .project(output_expr, output_schema)?;
 
-        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
+        PlanBuilder::union_all([commit_live_adds, base_live_adds])?.build_opt()
+    }
+
+    /// Build normalized adds from the newest reconciled base: CRC `allFiles` or checkpoint.
+    /// Returns an empty relation when neither source exists.
+    fn metadata_base_arm(
+        &self,
+        base: &MetadataReplayBase,
+    ) -> Result<(PlanBuilder, Option<crate::Version>)> {
+        match base {
+            MetadataReplayBase::Crc { version } => {
+                let files = self
+                    .snapshot
+                    .base_crc_all_files()
+                    .filter(|(crc_version, _)| crc_version == version)
+                    .map(|(_, files)| files)
+                    .ok_or_else(|| {
+                        KernelError::internal_error(format!(
+                            "Selected CRC version {version} has no allFiles"
+                        ))
+                    })?;
+                let actions = crc_all_files_values(files, *version)?;
+                Ok((self.normalize_metadata_base(actions)?, Some(*version)))
+            }
+            MetadataReplayBase::Checkpoint(shape) => {
+                let checkpoint_version = self.snapshot.log_segment().checkpoint_version;
+                Ok((self.checkpoint_arm(shape)?, checkpoint_version))
+            }
+        }
     }
 
     /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
@@ -144,7 +180,6 @@ impl Scan {
         let source_physical_partitions = physical_partitions
             .and_then(|schema| shape.compatible_partition_values_parsed_schema(schema));
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
-
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
                 let schema =
@@ -172,12 +207,18 @@ impl Scan {
             }
         }?;
 
+        self.normalize_metadata_base(actions)
+    }
+
+    fn normalize_metadata_base(&self, actions: PlanBuilder) -> Result<PlanBuilder> {
         actions
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| {
                 patch
-                    .with_parsed_add_stats(physical_stats)
-                    .with_parsed_add_partition_values(physical_partitions)
+                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
+                    .with_parsed_add_partition_values(
+                        self.state_info.physical_partition_schema.as_ref(),
+                    )
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
                         Expr::from(col!("add.path").is_not_null()),
@@ -204,9 +245,14 @@ impl Scan {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(&self) -> Result<PlanBuilder> {
+    fn commit_arm(&self, base_version: Option<crate::Version>) -> Result<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
-        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        let commit_files = match base_version {
+            Some(version) => log_segment
+                .segment_after_version(version)
+                .commit_cover_version_tagged_scan_files()?,
+            None => log_segment.commit_cover_version_tagged_scan_files()?,
+        };
         PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
             .filter(Predicate::or(
                 col!("add.path").is_not_null(),
@@ -408,6 +454,17 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
     }
 }
 
+/// Materialize reconciled CRC file actions as the same version-tagged relation as a checkpoint.
+fn crc_all_files_values(files: &[Add], version: crate::Version) -> Result<PlanBuilder> {
+    let version = crate::version_as_i64(version)?;
+    let rows = files
+        .iter()
+        .cloned()
+        .map(|add| vec![add.into(), version.into()])
+        .collect();
+    PlanBuilder::values(json_read_schema(/* include_remove */ false), rows)
+}
+
 /// Read schema for parquet add actions.
 fn parquet_read_schema(
     physical_stats: Option<&SchemaRef>,
@@ -558,7 +615,9 @@ mod execution_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{StringArray, StructArray};
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::arrow::array::{Array, StringArray, StructArray};
+    use crate::crc::Crc;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
@@ -577,13 +636,45 @@ mod tests {
     use crate::Engine as _;
 
     fn mock_snapshot(log_segment: LogSegment) -> Result<Arc<Snapshot>> {
+        mock_snapshot_with_crc(log_segment, None)
+    }
+
+    pub(super) fn mock_snapshot_with_crc(
+        log_segment: LogSegment,
+        crc: Option<Crc>,
+    ) -> Result<Arc<Snapshot>> {
+        let version = log_segment.end_version;
         let table_configuration = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())
             .with_partition_columns(["p"])
             .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
             .with_table_root("memory:///")
+            .with_version(version)
             .try_build()?;
-        Ok(Arc::new(Snapshot::new(log_segment, table_configuration)?))
+        Ok(Arc::new(Snapshot::new_with_crc(
+            log_segment,
+            table_configuration,
+            crc.map(Arc::new),
+            false,
+            false,
+        )?))
+    }
+
+    pub(super) fn add(path: impl Into<String>) -> Add {
+        Add {
+            path: path.into(),
+            size: 1,
+            modification_time: 1,
+            data_change: true,
+            deletion_vector: Some(DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::Inline,
+                path_or_inline_dv: "abc".into(),
+                offset: None,
+                size_in_bytes: 3,
+                cardinality: 1,
+            }),
+            ..Default::default()
+        }
     }
 
     fn partitioned_schema() -> SchemaRef {
@@ -593,11 +684,15 @@ mod tests {
         }
     }
 
-    fn log_root() -> Url {
+    pub(super) fn log_root() -> Url {
         Url::parse("file:///_delta_log/").unwrap()
     }
 
-    fn log_segment(log_root: Url, commits: &[&str], checkpoint: Option<&str>) -> LogSegment {
+    pub(super) fn log_segment(
+        log_root: Url,
+        commits: &[&str],
+        checkpoint: Option<&str>,
+    ) -> LogSegment {
         let ascending_commit_files: Vec<_> =
             commits.iter().map(|path| create_log_path(path)).collect();
         let checkpoint_parts: Vec<_> = checkpoint.into_iter().map(create_log_path).collect();
@@ -623,7 +718,7 @@ mod tests {
         }
     }
 
-    fn checkpoint_path(file_type: FileType) -> &'static str {
+    pub(super) fn checkpoint_path(file_type: FileType) -> &'static str {
         match file_type {
             FileType::Json => concat!(
                 "file:///_delta_log/00000000000000000000.checkpoint.",
@@ -643,8 +738,17 @@ mod tests {
         }
     }
 
-    fn no_checkpoint() -> CheckpointShape {
-        shape(CheckpointType::None, None)
+    fn checkpoint_base(shape: CheckpointShape) -> MetadataReplayBase {
+        MetadataReplayBase::Checkpoint(shape)
+    }
+
+    fn no_checkpoint() -> MetadataReplayBase {
+        checkpoint_base(shape(CheckpointType::None, None))
+    }
+
+    fn crc_base(snapshot: &Snapshot) -> MetadataReplayBase {
+        let (version, _) = snapshot.base_crc_all_files().expect("CRC allFiles");
+        MetadataReplayBase::Crc { version }
     }
 
     fn tags(plan: &Plan) -> Vec<String> {
@@ -773,7 +877,9 @@ mod tests {
             Some(checkpoint_path(file_type)),
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&checkpoint_base(shape))?
+            .expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
@@ -808,7 +914,9 @@ mod tests {
                 parsed_partitions.as_ref(),
             )?),
         };
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&checkpoint_base(shape.clone()))?
+            .expect("non-empty");
 
         let checkpoint_schema = plan
             .nodes
@@ -881,8 +989,28 @@ mod tests {
     ) -> Result<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&checkpoint_base(shape))?
+            .expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_plan_empty_crc_all_files_does_not_fall_back_to_checkpoint() -> Result<()> {
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let snapshot = mock_snapshot_with_crc(
+            segment,
+            Some(Crc {
+                version: 0,
+                all_files: Some(vec![]),
+                ..Default::default()
+            }),
+        )?;
+        let base = crc_base(snapshot.as_ref());
+        let scan = snapshot.scan_builder().build()?;
+
+        assert!(scan.build_metadata_scan_plan(&base)?.is_none());
         Ok(())
     }
 
@@ -906,7 +1034,7 @@ mod tests {
             PhysicalPredicate::StaticSkipAll
         );
         assert!(scan
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+            .build_metadata_scan_plan(&checkpoint_base(shape(CheckpointType::Leaf, None)))?
             .is_none());
         Ok(())
     }
@@ -1001,7 +1129,7 @@ mod tests {
             .build()?;
         let plan = scan
             // Leaf with no compatible parsed stats -> parse add.stats instead.
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+            .build_metadata_scan_plan(&checkpoint_base(shape(CheckpointType::Leaf, None)))?
             .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
