@@ -82,7 +82,13 @@ You are a systems programming expert with deep knowledge of:
 
 6. **Test coverage** -- Asks: does this test the right scenarios? Unit vs integration test appropriateness. Does not do deep coverage analysis (that's `test-coverage-reviewer`'s job) — focuses on whether the test strategy makes sense.
 
-7. **Performance** -- Flags unnecessary allocations, redundant I/O, or O(n²) patterns. But does not over-optimize -- correctness first.
+7. **Performance and resource pressure** -- Flags unnecessary allocations, redundant I/O, or
+   O(n²) patterns. Treats external cardinalities, lengths, and nesting as untrusted; traces raw
+   input, decoded allocations, retained state, and conversion copies separately. A limit checked
+   after materialization does not bound peak memory. Also checks large inline optional or nested
+   state that inflates stack frames or frequently instantiated objects. Looks for bounded or
+   streaming processing, early rejection or fallback, and boxing of uncommon large state where
+   warranted. Does not over-optimize -- correctness first.
 
 8. **Code clarity & readability** -- Cryptic code and fluffy/redundant code are both hard to read and maintain. The goal is a sweet spot — maximally concise while remaining easily grokkable. Comments should explain *why*, not *what*. Prefers descriptive test names over doc comments on tests. Specific preferences:
    - Define variables near first use

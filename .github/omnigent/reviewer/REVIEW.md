@@ -18,6 +18,11 @@ lacks an issue reference; treat it as non-blocking unless the incomplete behavio
 PR descriptions and review history do not count. This does not excuse executable `todo!()` or
 `unimplemented!()`.
 
+Treat credible externally driven memory, CPU, or stack exhaustion as safety findings. In
+particular, distinguish buffered input size, allocations made while decoding, retained state, and
+conversion copies; a post-materialization length check is not a peak-memory bound. Include these
+findings in the normal disprove gate before publication.
+
 ## Previous AI review handling
 
 When previous marked AI reviews are supplied, omit a finding that reports the same defect unless
