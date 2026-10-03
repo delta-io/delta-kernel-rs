@@ -125,7 +125,8 @@ impl CdfMode {
     /// Whether data written with `candidate` can be read using the change feed's `read_schema`.
     ///
     /// [`CdfMode::ChangeDataFeed`] requires exact equality. Row-tracking CDF accepts additive
-    /// nullable fields and wider nullability, but not datatype changes.
+    /// nullable fields and wider nullability, but not datatype changes. Both modes require exact
+    /// UDT equality, including annotations.
     pub(crate) fn schemas_compatible(
         self,
         candidate: &StructType,
