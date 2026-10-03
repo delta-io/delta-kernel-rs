@@ -45,6 +45,24 @@ fn test_kernel_result_explicitly_maps_into_error() {
     );
 }
 
+#[rstest]
+#[case::unwrapped(0)]
+#[case::one_wrapper(1)]
+#[case::nested_wrappers(2)]
+fn test_kernel_error_without_backtrace(#[case] wrapper_count: usize) {
+    let mut error = KernelError::file_not_found("missing.parquet");
+    for _ in 0..wrapper_count {
+        error = KernelError::Backtraced {
+            source: Box::new(error),
+            backtrace: Box::new(Backtrace::disabled()),
+        };
+    }
+
+    assert!(
+        matches!(error.without_backtrace(), KernelError::FileNotFound(path) if path == "missing.parquet")
+    );
+}
+
 #[test]
 fn test_error_trait_bounds() {
     fn assert_error<T: StdError + Send + Sync + 'static>() {}
