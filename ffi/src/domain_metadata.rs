@@ -69,6 +69,32 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
         .into_extern_result(&engine_ref)
 }
 
+/// Read the complete JSON configuration of the clustering domain in `snapshot` using `engine`.
+///
+/// Calls `allocate_fn` with the unmodified configuration, including fields not interpreted by
+/// Kernel. Returns its allocated pointer, or `None` without calling the allocator when the table
+/// has no clustering feature or active clustering domain. Storage errors are returned through
+/// `ExternResult`. The general domain-metadata APIs continue to exclude system domains.
+///
+/// # Safety
+///
+/// The snapshot and engine handles are borrowed and must remain valid for this call. The caller
+/// retains ownership of both handles. `allocate_fn` must copy any data it retains from its borrowed
+/// string slice; ownership of the returned allocation belongs to the caller.
+#[no_mangle]
+pub unsafe extern "C" fn get_clustering_domain_metadata(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    allocate_fn: AllocateStringFn,
+) -> ExternResult<NullableCvoid> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    snapshot
+        .get_clustering_domain_metadata(engine.engine().as_ref())
+        .map(|config| config.and_then(|config| allocate_fn(kernel_string_slice!(config))))
+        .into_extern_result(&engine)
+}
+
 /// Signature of the callback invoked once per clustering column by
 /// [`visit_clustering_columns`], in the order the columns appear in the `delta.clustering`
 /// domain. Each invocation describes one column:
@@ -535,6 +561,74 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
         (engine, snapshot)
+    }
+
+    #[rstest]
+    #[case::unclustered(false, None, vec![], None)]
+    #[case::feature_absent(
+        false,
+        Some(r#"{"clusteringColumns":[["id"]]}"#),
+        vec![],
+        None
+    )]
+    #[case::domain_absent(true, None, vec![], None)]
+    #[case::empty_columns(
+        true,
+        Some(r#"{"clusteringColumns":[]}"#),
+        vec![],
+        Some(r#"{"clusteringColumns":[]}"#)
+    )]
+    #[case::preserve_extensions(
+        true,
+        Some(concat!(
+            r#"{"clusteringColumns":[["id"]],"auto":true,"transforms":["#,
+            r#"{"columnIndex":0,"extra":"kept"}]}"#
+        )),
+        vec![],
+        Some(concat!(
+            r#"{"clusteringColumns":[["id"]],"auto":true,"transforms":["#,
+            r#"{"columnIndex":0,"extra":"kept"}]}"#
+        ))
+    )]
+    #[case::updated(
+        true,
+        Some(r#"{"clusteringColumns":[["id"]]}"#),
+        vec![clustering_domain_action(r#"{"clusteringColumns":[["addr","city"]]}"#, false)],
+        Some(r#"{"clusteringColumns":[["addr","city"]]}"#)
+    )]
+    #[case::removed(
+        true,
+        Some(r#"{"clusteringColumns":[["id"]]}"#),
+        vec![clustering_domain_action(r#"{"clusteringColumns":[]}"#, true)],
+        None
+    )]
+    #[tokio::test]
+    async fn test_get_clustering_domain_metadata(
+        #[case] clustering_feature: bool,
+        #[case] initial_config: Option<&str>,
+        #[case] updates: Vec<serde_json::Value>,
+        #[case] expected: Option<&str>,
+    ) {
+        let (engine, snapshot) = build_clustering_snapshot(
+            "memory:///clustering_domain/",
+            clustering_feature,
+            initial_config,
+            &updates,
+        )
+        .await;
+        let actual = ok_or_panic(unsafe {
+            get_clustering_domain_metadata(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        })
+        .map(recover_string);
+        assert_eq!(actual.as_deref(), expected);
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
     }
 
     #[tokio::test]
