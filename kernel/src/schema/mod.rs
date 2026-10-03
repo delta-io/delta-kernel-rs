@@ -225,6 +225,8 @@ impl Display for MetadataValue {
 
 #[derive(Debug)]
 pub enum ColumnMetadataKey {
+    /// Collation identifiers keyed by field path.
+    Collations,
     ColumnMappingId,
     ColumnMappingPhysicalName,
     /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
@@ -263,6 +265,7 @@ pub enum ColumnMetadataKey {
 impl AsRef<str> for ColumnMetadataKey {
     fn as_ref(&self) -> &str {
         match self {
+            Self::Collations => "__COLLATIONS",
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
             Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
@@ -1544,6 +1547,28 @@ impl<'a> SchemaTransform<'a> for InvariantChecker {
 /// metadata key.
 pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
     InvariantChecker.transform_struct(schema).is_err()
+}
+
+struct CollationMetadataChecker;
+
+impl<'a> SchemaTransform<'a> for CollationMetadataChecker {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+        if field
+            .metadata()
+            .contains_key(ColumnMetadataKey::Collations.as_ref())
+        {
+            Err(())
+        } else {
+            self.recurse_into_struct_field(field)
+        }
+    }
+}
+
+/// Returns whether any field carries `__COLLATIONS` metadata.
+pub(crate) fn schema_has_collations(schema: &Schema) -> bool {
+    CollationMetadataChecker.transform_struct(schema).is_err()
 }
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
@@ -3507,6 +3532,32 @@ mod tests {
             MetadataValue::Other(array_json).to_string(),
             "[\"an\",\"array\"]"
         );
+    }
+
+    #[rstest]
+    #[case::absent(schema! { nullable "value": STRING }, false)]
+    #[case::top_level(
+        schema! {
+            (StructField::nullable("value", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::Collations.as_ref(),
+                MetadataValue::Other(serde_json::json!({ "value": "spark.UTF8_LCASE" })),
+            )])),
+        },
+        true
+    )]
+    #[case::nested(
+        schema! {
+            nullable "outer": {
+                (StructField::nullable("value", DataType::STRING).with_metadata([(
+                    ColumnMetadataKey::Collations.as_ref(),
+                    MetadataValue::Other(serde_json::json!({ "value": "spark.UTF8_LCASE" })),
+                )])),
+            },
+        },
+        true
+    )]
+    fn test_schema_has_collations(#[case] schema: StructType, #[case] expected: bool) {
+        assert_eq!(schema_has_collations(&schema), expected);
     }
 
     #[test]

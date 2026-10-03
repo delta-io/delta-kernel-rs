@@ -647,6 +647,8 @@ async fn test_create_table_txn_debug() -> Result<()> {
     false,
     true
 )]
+#[case("collations", TableFeature::Collations, false, true)]
+#[case("collations-preview", TableFeature::CollationsPreview, false, true)]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,
@@ -687,6 +689,12 @@ fn test_create_table_with_feature_signal(
                 .is_some_and(|f| f.contains(&feature)),
             "{feature_name} should be in reader features"
         );
+    }
+    if matches!(
+        feature,
+        TableFeature::Collations | TableFeature::CollationsPreview
+    ) {
+        assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
     }
 
     Ok(())

@@ -134,6 +134,12 @@ pub(crate) enum TableFeature {
     MaterializePartitionColumns,
     /// Column Default Values.
     AllowColumnDefaults,
+    /// Collation metadata for string columns.
+    Collations,
+    /// Preview collation metadata for string columns.
+    #[strum(serialize = "collations-preview")]
+    #[serde(rename = "collations-preview")]
+    CollationsPreview,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -514,6 +520,22 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static COLLATIONS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+static COLLATIONS_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -740,8 +762,10 @@ impl TableFeature {
             | TableFeature::IcebergCompatV2
             | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
-            | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
-            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
+            | TableFeature::MaterializePartitionColumns
+            | TableFeature::AllowColumnDefaults
+            | TableFeature::Collations
+            | TableFeature::CollationsPreview => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -778,6 +802,8 @@ impl TableFeature {
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
+            TableFeature::Collations => &COLLATIONS_INFO,
+            TableFeature::CollationsPreview => &COLLATIONS_PREVIEW_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -1128,6 +1154,8 @@ mod tests {
                 TableFeature::IcebergCompatV3 => "icebergCompatV3",
                 TableFeature::ClusteredTable => "clustering",
                 TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
+                TableFeature::Collations => "collations",
+                TableFeature::CollationsPreview => "collations-preview",
                 TableFeature::CatalogManaged => "catalogManaged",
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",

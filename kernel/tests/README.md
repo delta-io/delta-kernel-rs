@@ -47,6 +47,13 @@ Test tables organized by feature area. Tables live in two locations:
 | `table-with-columnmapping-mode-name` | golden_data/ | `ByteType: byte, ShortType: short, IntegerType: int, LongType: long, FloatType: float, DoubleType: double, decimal: decimal(10,2), BooleanType: boolean, StringType: string, BinaryType: binary, DateType: date, TimestampType: timestamp, nested_struct: struct{aa: string, ac: struct{aca: int}}, array_of_prims: array<int>, array_of_arrays: array<array<int>>, array_of_structs: array<struct{ab: long}>, map_of_prims: map<int,long>, map_of_rows: map<int,struct{ab: long}>, map_of_arrays: map<long,array<int>>` | v2/v5 | `columnMapping.mode=name` | Column mapping name mode | `golden_tables.rs::golden_test!` |
 | `table-with-columnmapping-mode-id` | golden_data/ | `ByteType: byte, ShortType: short, IntegerType: int, LongType: long, FloatType: float, DoubleType: double, decimal: decimal(10,2), BooleanType: boolean, StringType: string, BinaryType: binary, DateType: date, TimestampType: timestamp, nested_struct: struct{aa: string, ac: struct{aca: int}}, array_of_prims: array<int>, array_of_arrays: array<array<int>>, array_of_structs: array<struct{ab: long}>, map_of_prims: map<int,long>, map_of_rows: map<int,struct{ab: long}>, map_of_arrays: map<long,array<int>>` | v2/v5 | `columnMapping.mode=id` | Column mapping id mode | `golden_tables.rs::golden_test!` |
 
+## Collations
+
+| Table | Location | Schema | Protocol (R/W) | Features | Description | Tests |
+|-------|----------|--------|----------|----------|-------------|-------|
+| `collations` | data/ | `id: int, name: string` | v3/v7 | r:`deletionVectors` w:`deletionVectors,collations,domainMetadata,invariants,appendOnly` | Three externally produced files with `name` annotated as `icu.UNICODE_CI` | `features::collations::reads_external_collation_table_with_binary_predicate_semantics`, `features::collations::appends_to_external_collation_table_without_changing_schema_or_protocol(simple)` |
+| `collations-complex` | data/ | `id: int, name: struct{first: string, last: string}, email: string, department: string` | v3/v7 | r:`deletionVectors` w:`deletionVectors,collations,domainMetadata,invariants,appendOnly` | Nested and top-level `spark.UTF8_LCASE` annotations across two externally produced files | `features::collations::reads_external_nested_collations_with_binary_predicate_semantics`, `features::collations::appends_to_external_collation_table_without_changing_schema_or_protocol(nested)` |
+
 ## Checkpoints
 
 | Table | Location | Schema | Protocol (R/W) | Features | Description | Tests |
