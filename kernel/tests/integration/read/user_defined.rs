@@ -46,13 +46,13 @@ async fn read_udt_as_sql_type_preserves_logical_schema(
     #[case] rows: &str,
     #[values(false, true)] project: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let udt = UserDefinedType {
-        sql_type: Box::new(sql_type),
-        annotation: BTreeMap::from([
+    let udt = UserDefinedType::try_new(
+        sql_type,
+        BTreeMap::from([
             ("class".into(), Some("example.Value".into())),
             ("pyClass".into(), None),
         ]),
-    };
+    )?;
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "value": (udt),
