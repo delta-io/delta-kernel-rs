@@ -87,8 +87,18 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     visit_res = visit_field_timestamp(state, name, item->is_nullable, &metadata, &error_allocators);
   } else if (strcmp(item->type, "timestamp_ntz") == 0) {
     visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, &metadata, &error_allocators);
+  } else if (strcmp(item->type, "interval year") == 0) {
+    visit_res = visit_field_interval_year_month(
+      state, name, item->is_nullable, &metadata,
+      KernelIntervalYearToMonthTypeIntervalYear, &error_allocators);
+  } else if (strcmp(item->type, "interval month") == 0) {
+    visit_res = visit_field_interval_year_month(
+      state, name, item->is_nullable, &metadata,
+      KernelIntervalYearToMonthTypeIntervalMonth, &error_allocators);
   } else if (strcmp(item->type, "interval year to month") == 0) {
-    visit_res = visit_field_interval_year_month(state, name, item->is_nullable, &metadata, &error_allocators);
+    visit_res = visit_field_interval_year_month(
+      state, name, item->is_nullable, &metadata,
+      KernelIntervalYearToMonthTypeIntervalYearToMonth, &error_allocators);
   } else if (strcmp(item->type, "interval day to second") == 0) {
     visit_res = visit_field_interval_day_time(state, name, item->is_nullable, &metadata, &error_allocators);
 #ifdef DEFINE_GEO_TYPE_IN_DEV

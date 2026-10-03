@@ -2,7 +2,7 @@
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
 use std::sync::Arc;
 
-use delta_kernel::KernelResult;
+use delta_kernel::{KernelError, KernelResult};
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
@@ -17,6 +17,7 @@ use crate::expressions::FfiOpaquePredicateOp;
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
+use crate::interval::decode_interval_year_month_kind;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
     EngineIterator, ErrorAllocators, ExternResult, IntoExternResult, KernelStringSlice,
@@ -397,15 +398,32 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, lit(Scalar::TimestampNtz(value)))
 }
 
-/// Registers a `YEAR TO MONTH` literal containing `value` total months in `state`.
+/// Visit an interval year-month literal with its exact qualifier.
 ///
-/// Returns its expression ID. Every `i32` month count is valid.
+/// `value` is a signed total-month count. `interval year` values must be divisible by 12.
+/// `kind` accepts the numeric values of
+/// [`KernelIntervalYearToMonthType`](crate::interval::KernelIntervalYearToMonthType): `1` for
+/// `interval year`, `2` for `interval month`, and `3` for `interval year to month`. Other values
+/// return an allocated [`FFIKernelError::SchemaError`](crate::error::FFIKernelError::SchemaError)
+/// before a literal is inserted. Unaligned `interval year` values return
+/// [`FFIKernelError::InvalidIntervalError`](crate::error::FFIKernelError::InvalidIntervalError).
+/// On success the returned ID is owned by the builder state.
+///
+/// # Safety
+///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for the call and support concurrency when shared.
 #[unsafe(no_mangle)]
-pub extern "C" fn visit_expression_literal_interval_year_month(
+pub unsafe extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
-) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalYearMonth(value.into())))
+    kind: u32,
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<usize> {
+    let result = decode_interval_year_month_kind(kind)
+        .and_then(|kind| Scalar::interval_year_month(value, kind))
+        .map(|scalar| wrap_expression(state, lit(scalar)));
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -629,6 +647,11 @@ impl NullTypeTag {
 /// (`type_tag == 12`), `precision` and `scale` specify the decimal type parameters; for all
 /// other types, callers should pass 0 for both.
 ///
+/// `type_tag == 13` for interval year-month now returns an allocated
+/// [`FFIKernelError::GenericError`](crate::error::FFIKernelError::GenericError) directing callers
+/// to [`visit_expression_literal_null_interval_year_month`], which preserves the exact qualifier.
+/// `type_tag == 14` remains the interval day-time null tag.
+///
 /// Returns an error if the type tag is unrecognized, if the tag is `NonPrimitive` (255), or
 /// if the decimal precision/scale is invalid.
 /// # Safety
@@ -654,8 +677,40 @@ fn visit_expression_literal_null_impl(
     scale: u8,
 ) -> KernelResult<usize> {
     let tag = NullTypeTag::try_from(type_tag)?;
+    if tag == NullTypeTag::IntervalYearMonth {
+        return Err(KernelError::generic(
+            "Use visit_expression_literal_null_interval_year_month for interval year-month nulls",
+        ));
+    }
     let data_type = tag.to_data_type(precision, scale)?;
     Ok(wrap_expression(state, null_lit(data_type)))
+}
+
+/// Visit an interval year-month typed null with its exact qualifier.
+///
+/// `kind` accepts the numeric values of
+/// [`KernelIntervalYearToMonthType`](crate::interval::KernelIntervalYearToMonthType): `1` for
+/// `interval year`, `2` for `interval month`, and `3` for `interval year to month`. Other values
+/// return an allocated [`FFIKernelError::SchemaError`](crate::error::FFIKernelError::SchemaError)
+/// before a literal is inserted. On success the returned ID is owned by the builder state.
+///
+/// # Safety
+///
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for the call and support concurrency when shared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_null_interval_year_month(
+    state: &mut KernelExpressionVisitorState,
+    kind: u32,
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<usize> {
+    let result = decode_interval_year_month_kind(kind).map(|kind| {
+        wrap_expression(
+            state,
+            null_lit(DataType::Primitive(PrimitiveType::IntervalYearMonth(kind))),
+        )
+    });
+    unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 #[unsafe(no_mangle)]
@@ -910,12 +965,16 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
-    use delta_kernel::schema::{ArrayType, DataType, IntervalYearToMonthType, MapType, schema};
+    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
+    use delta_kernel::schema::{
+        schema, ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType,
+    };
     use rstest::rstest;
 
     use super::*;
     use crate::expressions::FfiMapToStructOptions;
+    use crate::ffi_test_utils::assert_extern_result_error_contains;
+    use crate::interval::KernelIntervalYearToMonthType;
 
     #[rstest]
     #[case::default(None)]
@@ -1161,7 +1220,6 @@ mod tests {
     #[case(DataType::DATE)]
     #[case(DataType::TIMESTAMP)]
     #[case(DataType::TIMESTAMP_NTZ)]
-    #[case(DataType::INTERVAL_YEAR_MONTH)]
     #[case(DataType::INTERVAL_DAY_TIME)]
     fn null_type_round_trips_through_tag_encoding(#[case] data_type: DataType) {
         let (tag, precision, scale) = NullTypeTag::from_data_type(&data_type);
@@ -1170,6 +1228,121 @@ mod tests {
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, null_lit(data_type),);
+    }
+
+    #[test]
+    fn generic_interval_year_month_null_tag_points_to_dedicated_api() {
+        let mut state = KernelExpressionVisitorState::default();
+        let existing = visit_expression_literal_int(&mut state, 7);
+        let result = visit_expression_literal_null(
+            &mut state,
+            NullTypeTag::IntervalYearMonth as u8,
+            0,
+            0,
+            &TEST_ERROR_ALLOCATORS,
+        );
+
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::GenericError,
+            "visit_expression_literal_null_interval_year_month",
+        );
+        assert_eq!(state.inflight_ids.len(), 1);
+        let existing_expr = unwrap_kernel_expression(&mut state, existing).unwrap();
+        assert_eq!(existing_expr, lit(7i32));
+        assert!(state.inflight_ids.is_empty());
+
+        let retry = unsafe {
+            visit_expression_literal_null_interval_year_month(
+                &mut state,
+                KernelIntervalYearToMonthType::IntervalMonth as u32,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+        let id = ok_or_panic(retry);
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(
+            expr,
+            null_lit(DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalMonth
+            )))
+        );
+    }
+
+    #[rstest]
+    #[case::year(
+        KernelIntervalYearToMonthType::IntervalYear,
+        IntervalYearToMonthType::IntervalYear
+    )]
+    #[case::month(
+        KernelIntervalYearToMonthType::IntervalMonth,
+        IntervalYearToMonthType::IntervalMonth
+    )]
+    #[case::year_to_month(
+        KernelIntervalYearToMonthType::IntervalYearToMonth,
+        IntervalYearToMonthType::IntervalYearToMonth
+    )]
+    fn dedicated_interval_year_month_null_preserves_kind(
+        #[case] ffi_kind: KernelIntervalYearToMonthType,
+        #[case] expected: IntervalYearToMonthType,
+    ) {
+        let mut state = KernelExpressionVisitorState::default();
+        let id = unsafe {
+            ok_or_panic(visit_expression_literal_null_interval_year_month(
+                &mut state,
+                ffi_kind as u32,
+                &TEST_ERROR_ALLOCATORS,
+            ))
+        };
+
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(
+            expr,
+            null_lit(DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                expected
+            )))
+        );
+    }
+
+    #[rstest]
+    #[case::unspecified(0)]
+    #[case::unknown(u32::MAX)]
+    fn dedicated_interval_year_month_null_rejects_invalid_kind(#[case] invalid_kind: u32) {
+        let mut state = KernelExpressionVisitorState::default();
+        let existing = visit_expression_literal_int(&mut state, 7);
+        let result = unsafe {
+            visit_expression_literal_null_interval_year_month(
+                &mut state,
+                invalid_kind,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::SchemaError,
+            &format!("invalid interval year-month kind: {invalid_kind}"),
+        );
+        assert_eq!(state.inflight_ids.len(), 1);
+        let existing_expr = unwrap_kernel_expression(&mut state, existing).unwrap();
+        assert_eq!(existing_expr, lit(7i32));
+        assert!(state.inflight_ids.is_empty());
+
+        let retry = unsafe {
+            visit_expression_literal_null_interval_year_month(
+                &mut state,
+                KernelIntervalYearToMonthType::IntervalYear as u32,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+        let id = ok_or_panic(retry);
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(
+            expr,
+            null_lit(DataType::Primitive(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalYear
+            )))
+        );
     }
 
     #[test]
@@ -1187,8 +1360,8 @@ mod tests {
     #[rstest]
     #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(1_234_567))]
-    #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
-    #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(-12, IntervalYearToMonthType::IntervalYear).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalMonth).unwrap())]
     #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(-86_400_000_000))]
     #[case(Scalar::IntervalDayTime(i64::MIN))]
@@ -1196,9 +1369,14 @@ mod tests {
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
-            Scalar::IntervalYearMonth(ref value) => {
-                visit_expression_literal_interval_year_month(&mut state, value.months())
-            }
+            Scalar::IntervalYearMonth(ref value) => ok_or_panic(unsafe {
+                visit_expression_literal_interval_year_month(
+                    &mut state,
+                    value.months(),
+                    KernelIntervalYearToMonthType::from(*value.ty()) as u32,
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            }),
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)
             }
@@ -1206,6 +1384,66 @@ mod tests {
         };
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, lit(expected));
+    }
+
+    #[rstest]
+    #[case::literal_unspecified(0)]
+    #[case::literal_unknown(u32::MAX)]
+    fn interval_year_month_literal_rejects_invalid_kind(#[case] invalid_kind: u32) {
+        let mut state = KernelExpressionVisitorState::default();
+        let existing = visit_expression_literal_int(&mut state, 7);
+        let result = unsafe {
+            visit_expression_literal_interval_year_month(
+                &mut state,
+                -13,
+                invalid_kind,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::SchemaError,
+            &format!("invalid interval year-month kind: {invalid_kind}"),
+        );
+        assert_eq!(state.inflight_ids.len(), 1);
+        let existing_expr = unwrap_kernel_expression(&mut state, existing).unwrap();
+        assert_eq!(existing_expr, lit(7i32));
+        assert!(state.inflight_ids.is_empty());
+
+        let retry = unsafe {
+            visit_expression_literal_interval_year_month(
+                &mut state,
+                -12,
+                KernelIntervalYearToMonthType::IntervalYear as u32,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+        let id = ok_or_panic(retry);
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(
+            expr,
+            lit(Scalar::interval_year_month(-12, IntervalYearToMonthType::IntervalYear).unwrap())
+        );
+    }
+
+    #[test]
+    fn interval_year_month_literal_rejects_unaligned_year() {
+        let mut state = KernelExpressionVisitorState::default();
+        let result = unsafe {
+            visit_expression_literal_interval_year_month(
+                &mut state,
+                -13,
+                KernelIntervalYearToMonthType::IntervalYear as u32,
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::InvalidIntervalError,
+            "not divisible by 12",
+        );
+        assert!(state.inflight_ids.is_empty());
     }
 
     /// A field name containing a literal period must survive as a single field part.

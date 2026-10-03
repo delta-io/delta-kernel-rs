@@ -56,8 +56,17 @@ uintptr_t convert_engine_to_kernel_literal(
           lit->value.long_data);
     case Date:
       return visit_expression_literal_date(state, lit->value.integer_data);
-    case IntervalYearMonth:
-      return visit_expression_literal_interval_year_month(state, lit->value.integer_data);
+    case IntervalYearMonth: {
+      struct IntervalYearMonthData* data = &lit->value.interval_year_month_data;
+      ExternResultusize result = visit_expression_literal_interval_year_month(
+          state, data->months, data->kind, &error_allocators);
+      if (result.tag == Errusize) {
+        print_error("visit_expression_literal_interval_year_month failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
     case IntervalDayTime:
       return visit_expression_literal_interval_day_time(state, lit->value.long_data);
     case Binary: {
@@ -70,6 +79,17 @@ uintptr_t convert_engine_to_kernel_literal(
           state, dec->hi, dec->lo, dec->precision, dec->scale, &error_allocators);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_decimal failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
+    case IntervalYearMonthNull: {
+      ExternResultusize result = visit_expression_literal_null_interval_year_month(
+          state, lit->value.interval_year_month_data.kind, &error_allocators);
+      if (result.tag == Errusize) {
+        print_error("visit_expression_literal_null_interval_year_month failed",
+            (Error*)result.err);
         free_error((Error*)result.err);
         abort();
       }

@@ -449,6 +449,11 @@ void log_line_callback(KernelStringSlice line) {
 
 int main(int argc, char* argv[])
 {
+  if (kernel_ffi_abi_version() != KERNEL_FFI_ABI_VERSION) {
+    fprintf(stderr, "Unsupported delta-kernel FFI ABI version\n");
+    return -1;
+  }
+
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
   bool print_scan_schema = false;

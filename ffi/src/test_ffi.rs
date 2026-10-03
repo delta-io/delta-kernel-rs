@@ -16,7 +16,7 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::schema::{
-    ArrayType, DataType, IntervalYearToMonthType, MapType, StructField, StructType,
+    ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType, StructField, StructType,
 };
 
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -268,11 +268,21 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         lit(Scalar::Date(19000)),
         lit(Scalar::Timestamp(1234567890)),
         lit(Scalar::TimestampNtz(9876543210)),
+        lit(Scalar::interval_year_month(-12, IntervalYearToMonthType::IntervalYear).unwrap()),
+        lit(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalMonth).unwrap()),
         lit(
-            Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+            Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth)
+                .unwrap(),
         ),
         lit(Scalar::IntervalDayTime(9_876_543_210)),
         null_lit(DataType::INTEGER),
+        null_lit(DataType::Primitive(PrimitiveType::IntervalYearMonth(
+            IntervalYearToMonthType::IntervalYear,
+        ))),
+        null_lit(DataType::Primitive(PrimitiveType::IntervalYearMonth(
+            IntervalYearToMonthType::IntervalMonth,
+        ))),
+        null_lit(DataType::INTERVAL_YEAR_MONTH),
         null_lit(DataType::decimal(10, 5).unwrap()),
         Expr::binary(BinaryExpressionOp::Plus, lit(10), lit(20)),
         Expr::binary(BinaryExpressionOp::Minus, lit(50), lit(30)),

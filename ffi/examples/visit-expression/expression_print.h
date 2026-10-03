@@ -39,6 +39,18 @@ void print_opaque_op_name(void* op_type, KernelStringSlice name) {
   printf("%s(%.*s)\n", (char*) op_type, len, name.ptr);
 }
 
+const char* interval_year_month_kind_name(enum KernelIntervalYearToMonthType kind) {
+  switch (kind) {
+    case KernelIntervalYearToMonthTypeIntervalYear:
+      return "IntervalYear";
+    case KernelIntervalYearToMonthTypeIntervalMonth:
+      return "IntervalMonth";
+    case KernelIntervalYearToMonthTypeIntervalYearToMonth:
+      return "IntervalYearToMonth";
+  }
+  return "UnknownIntervalYearMonth";
+}
+
 void print_tree_helper(ExpressionItem ref, int depth) {
   print_n_spaces(depth);
   switch (ref.type) {
@@ -184,9 +196,18 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case Date:
           printf("Date(%d)\n", lit->value.integer_data);
           break;
-        case IntervalYearMonth:
-          printf("IntervalYearMonth(%d)\n", lit->value.integer_data);
+        case IntervalYearMonth: {
+          struct IntervalYearMonthData* data = &lit->value.interval_year_month_data;
+          printf("IntervalYearMonth(%d,%s)\n",
+                 data->months,
+                 interval_year_month_kind_name(data->kind));
           break;
+        }
+        case IntervalYearMonthNull: {
+          struct IntervalYearMonthData* data = &lit->value.interval_year_month_data;
+          printf("Null(%s)\n", interval_year_month_kind_name(data->kind));
+          break;
+        }
         case IntervalDayTime:
           printf("IntervalDayTime(%lld)\n", (long long)lit->value.long_data);
           break;

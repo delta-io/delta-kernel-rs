@@ -6,6 +6,7 @@ use crate::delta_types::FfiNullableStringMap;
 #[cfg(feature = "udt-in-dev")]
 use crate::delta_types::FfiNullableStringMapEntry;
 use crate::handle::Handle;
+use crate::interval::KernelIntervalYearToMonthType;
 use crate::scan::CMetadataMap;
 use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
@@ -204,6 +205,7 @@ pub struct EngineSchemaVisitor {
         name: KernelStringSlice,
         is_nullable: bool,
         metadata: &CMetadataMap,
+        kind: KernelIntervalYearToMonthType,
     ),
 
     /// Visit an `interval day to second` belonging to the list identified by `sibling_list_id`.
@@ -458,9 +460,8 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
-            DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) => {
-                // The callback carries no qualifier, so narrowed types lose it here.
-                call!(visit_interval_year_month)
+            DataType::Primitive(PrimitiveType::IntervalYearMonth(kind)) => {
+                call!(visit_interval_year_month, (*kind).into())
             }
             &DataType::INTERVAL_DAY_TIME => call!(visit_interval_day_time),
             &DataType::VOID => call!(visit_void),
@@ -490,12 +491,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use delta_kernel::schema::schema;
+    use delta_kernel::schema::{schema, IntervalYearToMonthType, StructField};
     #[cfg(feature = "geo-type-in-dev")]
-    use delta_kernel::schema::{
-        EdgeInterpolationAlgorithm, GeographyType, GeometryType, StructField,
-    };
+    use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -669,10 +669,25 @@ mod tests {
     visit_simple_type!(visit_date, "date");
     visit_simple_type!(visit_timestamp, "timestamp");
     visit_simple_type!(visit_timestamp_ntz, "timestamp_ntz");
-    visit_simple_type!(visit_interval_year_month, "interval year to month");
     visit_simple_type!(visit_interval_day_time, "interval day to second");
     visit_simple_type!(visit_void, "void");
     visit_simple_type!(visit_variant, "variant");
+
+    extern "C" fn visit_interval_year_month(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        _metadata: &CMetadataMap,
+        kind: KernelIntervalYearToMonthType,
+    ) {
+        let data_type = match kind {
+            KernelIntervalYearToMonthType::IntervalYear => "interval year",
+            KernelIntervalYearToMonthType::IntervalMonth => "interval month",
+            KernelIntervalYearToMonthType::IntervalYearToMonth => "interval year to month",
+        };
+        add_field(data, sibling_list_id, name, is_nullable, data_type, None);
+    }
 
     extern "C" fn visit_geometry(
         data: *mut c_void,
@@ -747,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn visit_schema_encodes_interval_fields_with_generic_tags() {
+    fn visit_schema_preserves_interval_qualifiers() {
         let schema = schema! {
             nullable "ym": INTERVAL_YEAR_MONTH,
             nullable "narrow_year": INTERVAL_YEAR,
@@ -771,11 +786,11 @@ mod tests {
         );
         assert_eq!(
             builder.lists[0][1],
-            VisitedField::new("narrow_year", "interval year to month", true, None)
+            VisitedField::new("narrow_year", "interval year", true, None)
         );
         assert_eq!(
             builder.lists[0][2],
-            VisitedField::new("narrow_month", "interval year to month", true, None)
+            VisitedField::new("narrow_month", "interval month", true, None)
         );
         assert_eq!(
             builder.lists[0][3],
@@ -822,6 +837,41 @@ mod tests {
                 ("class".into(), Some("Id".into())),
                 ("pyClass".into(), None)
             ])]
+        );
+    }
+
+    #[test]
+    fn public_visit_schema_preserves_all_interval_year_month_kinds() {
+        let schema = StructType::try_new(vec![
+            StructField::not_null(
+                "year",
+                PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYear),
+            ),
+            StructField::nullable(
+                "month",
+                PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalMonth),
+            ),
+            StructField::nullable(
+                "full",
+                PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+            ),
+        ])
+        .unwrap();
+        let handle: Handle<SharedSchema> = Arc::new(schema).into();
+        let mut builder = TestSchemaBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = unsafe { visit_schema(handle.shallow_copy(), &mut visitor) };
+        unsafe { handle.drop_handle() };
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.lists[0],
+            vec![
+                VisitedField::new("year", "interval year", false, None),
+                VisitedField::new("month", "interval month", true, None),
+                VisitedField::new("full", "interval year to month", true, None),
+            ]
         );
     }
 

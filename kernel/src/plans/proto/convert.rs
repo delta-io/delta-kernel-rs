@@ -3,7 +3,9 @@
 use super::plan::agg as proto_agg;
 #[cfg(feature = "geo-type-in-dev")]
 use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
-use super::schema::SimplePrimitiveType as Simple;
+use super::schema::{
+    IntervalYearToMonthKind as ProtoIntervalYearToMonthKind, SimplePrimitiveType as Simple,
+};
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
@@ -605,7 +607,7 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
-            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(v.months()),
+            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonthData(v.into()),
             Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
@@ -725,10 +727,7 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
                 PrimitiveTypeKind::Geography(geography.as_ref().into())
             }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
-            PrimitiveType::IntervalYearMonth(_) => {
-                // The proto tag carries no qualifier; decoding reconstructs the full-range type.
-                PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
-            }
+            PrimitiveType::IntervalYearMonth(ty) => PrimitiveTypeKind::IntervalYearMonth(ty.into()),
             PrimitiveType::IntervalDayTime => {
                 PrimitiveTypeKind::Simple(Simple::IntervalDayTime as i32)
             }
@@ -742,6 +741,28 @@ impl From<DecimalType> for proto_schema::DecimalType {
         proto_schema::DecimalType {
             precision: u32::from(decimal.precision()),
             scale: u32::from(decimal.scale()),
+        }
+    }
+}
+
+impl From<&IntervalYearToMonthType> for proto_schema::IntervalYearMonthType {
+    fn from(ty: &IntervalYearToMonthType) -> Self {
+        let kind = match ty {
+            IntervalYearToMonthType::IntervalYear => ProtoIntervalYearToMonthKind::IntervalYear,
+            IntervalYearToMonthType::IntervalMonth => ProtoIntervalYearToMonthKind::IntervalMonth,
+            IntervalYearToMonthType::IntervalYearToMonth => {
+                ProtoIntervalYearToMonthKind::IntervalYearToMonth
+            }
+        };
+        proto_schema::IntervalYearMonthType { kind: kind as i32 }
+    }
+}
+
+impl From<&crate::expressions::IntervalYearMonthData> for proto_expr::IntervalYearMonthData {
+    fn from(value: &crate::expressions::IntervalYearMonthData) -> Self {
+        proto_expr::IntervalYearMonthData {
+            months: value.months(),
+            interval_type: Some(value.ty().into()),
         }
     }
 }
@@ -933,9 +954,6 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::Timestamp => PrimitiveType::Timestamp,
                     Simple::TimestampNtz => PrimitiveType::TimestampNtz,
                     Simple::Void => PrimitiveType::Void,
-                    Simple::IntervalYearMonth => PrimitiveType::interval_year_month(
-                        IntervalYearToMonthType::IntervalYearToMonth,
-                    ),
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
                     Simple::Unspecified => {
                         return Err(KernelError::schema("SimplePrimitiveType is unspecified"));
@@ -943,6 +961,9 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                 }
             }
             PrimitiveTypeKind::Decimal(decimal) => PrimitiveType::Decimal(decimal.try_into()?),
+            PrimitiveTypeKind::IntervalYearMonth(interval_type) => {
+                PrimitiveType::IntervalYearMonth(interval_type.try_into()?)
+            }
             #[cfg(feature = "geo-type-in-dev")]
             PrimitiveTypeKind::Geometry(geometry) => {
                 PrimitiveType::Geometry(Box::new(geometry.try_into()?))
@@ -961,6 +982,27 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
             }
         };
         Ok(primitive)
+    }
+}
+
+impl TryFrom<proto_schema::IntervalYearMonthType> for IntervalYearToMonthType {
+    type Error = KernelError;
+
+    fn try_from(proto: proto_schema::IntervalYearMonthType) -> KernelResult<Self> {
+        let kind = ProtoIntervalYearToMonthKind::try_from(proto.kind).map_err(|_| {
+            KernelError::schema(format!(
+                "unknown IntervalYearToMonthKind value: {}",
+                proto.kind
+            ))
+        })?;
+        match kind {
+            ProtoIntervalYearToMonthKind::IntervalYear => Ok(Self::IntervalYear),
+            ProtoIntervalYearToMonthKind::IntervalMonth => Ok(Self::IntervalMonth),
+            ProtoIntervalYearToMonthKind::IntervalYearToMonth => Ok(Self::IntervalYearToMonth),
+            ProtoIntervalYearToMonthKind::Unspecified => Err(KernelError::schema(
+                "IntervalYearToMonthKind is unspecified",
+            )),
+        }
     }
 }
 
@@ -1079,6 +1121,7 @@ mod tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     use super::EdgeAlgo;
+    use super::ProtoIntervalYearToMonthKind;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
@@ -1107,7 +1150,7 @@ mod tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-    use crate::{FileMeta, FileSlice, KernelResult};
+    use crate::{FileMeta, FileSlice, KernelError, KernelResult};
 
     // === Test helpers ===
 
@@ -2122,7 +2165,7 @@ mod tests {
             Value::Boolean(_) => "boolean",
             Value::Timestamp(_) => "timestamp",
             Value::TimestampNtz(_) => "timestamp_ntz",
-            Value::IntervalYearMonth(_) => "interval_year_month",
+            Value::IntervalYearMonthData(_) => "interval_year_month",
             Value::IntervalDayTime(_) => "interval_day_time",
             Value::Date(_) => "date",
             Value::Binary(_) => "binary",
@@ -2136,22 +2179,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case(
-        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
-        proto_expr::scalar::Value::IntervalYearMonth(30)
-    )]
-    #[case(
-        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
-        proto_expr::scalar::Value::IntervalYearMonth(24)
-    )]
-    #[case(
-        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
-        proto_expr::scalar::Value::IntervalYearMonth(30)
-    )]
-    #[case(
-        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
-        proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
-    )]
     #[case(
         Scalar::IntervalDayTime(-5),
         proto_expr::scalar::Value::IntervalDayTime(-5)
@@ -2168,17 +2195,184 @@ mod tests {
     }
 
     #[rstest]
-    #[case(IntervalYearToMonthType::IntervalYear)]
-    #[case(IntervalYearToMonthType::IntervalMonth)]
-    #[case(IntervalYearToMonthType::IntervalYearToMonth)]
-    fn from_interval_year_month_null_encodes_generic_type(#[case] dtype: IntervalYearToMonthType) {
-        let scalar = Scalar::Null(DataType::interval_year_month(dtype));
+    #[case::year(
+        24,
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear
+    )]
+    #[case::month(-13, IntervalYearToMonthType::IntervalMonth, ProtoIntervalYearToMonthKind::IntervalMonth)]
+    #[case::full_min(
+        i32::MIN,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth
+    )]
+    #[case::full_max(
+        i32::MAX,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth
+    )]
+    #[case::zero(
+        0,
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear
+    )]
+    fn from_interval_year_month_scalar_preserves_payload_and_kind(
+        #[case] months: i32,
+        #[case] ty: IntervalYearToMonthType,
+        #[case] expected_kind: ProtoIntervalYearToMonthKind,
+    ) {
+        let scalar = Scalar::interval_year_month(months, ty).unwrap();
+        let proto_expr::scalar::Value::IntervalYearMonthData(data) = scalar_value_of(scalar) else {
+            panic!("expected interval year-month data");
+        };
+
+        assert_eq!(data.months, months);
+        let interval_type = data.interval_type.expect("interval type present");
+        assert_eq!(interval_type.kind, expected_kind as i32);
+    }
+
+    #[rstest]
+    #[case(
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear
+    )]
+    #[case(
+        IntervalYearToMonthType::IntervalMonth,
+        ProtoIntervalYearToMonthKind::IntervalMonth
+    )]
+    #[case(
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth
+    )]
+    fn from_interval_year_month_null_encodes_exact_type(
+        #[case] dtype: IntervalYearToMonthType,
+        #[case] expected_kind: ProtoIntervalYearToMonthKind,
+    ) {
+        let scalar = Scalar::Null(DataType::Primitive(PrimitiveType::IntervalYearMonth(dtype)));
         let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
             panic!("expected a null scalar");
         };
 
         let decoded = DataType::try_from(data_type).unwrap();
-        assert_eq!(decoded, DataType::INTERVAL_YEAR_MONTH);
+        assert_eq!(
+            decoded,
+            DataType::Primitive(PrimitiveType::IntervalYearMonth(dtype))
+        );
+
+        let data_type = match scalar_value_of(Scalar::Null(DataType::Primitive(
+            PrimitiveType::IntervalYearMonth(dtype),
+        ))) {
+            proto_expr::scalar::Value::Null(data_type) => data_type,
+            _ => unreachable!(),
+        };
+        let Some(proto_schema::data_type::Kind::Primitive(primitive)) = data_type.kind else {
+            panic!("expected primitive data type");
+        };
+        let Some(proto_schema::primitive_type::Kind::IntervalYearMonth(interval_type)) =
+            primitive.kind
+        else {
+            panic!("expected interval year-month primitive");
+        };
+        assert_eq!(interval_type.kind, expected_kind as i32);
+    }
+
+    #[rstest]
+    #[case::year_zero(
+        0,
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear,
+        &[0xa2, 0x01, 0x04, 0x12, 0x02, 0x08, 0x01],
+    )]
+    #[case::year_negative(
+        -12,
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear,
+        &[
+            0xa2, 0x01, 0x0f, 0x08, 0xf4, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+            0x12, 0x02, 0x08, 0x01,
+        ],
+    )]
+    #[case::month_max(
+        i32::MAX,
+        IntervalYearToMonthType::IntervalMonth,
+        ProtoIntervalYearToMonthKind::IntervalMonth,
+        &[0xa2, 0x01, 0x0a, 0x08, 0xff, 0xff, 0xff, 0xff, 0x07, 0x12, 0x02, 0x08, 0x02],
+    )]
+    #[case::full_min(
+        i32::MIN,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth,
+        &[
+            0xa2, 0x01, 0x0f, 0x08, 0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0xff, 0xff, 0xff, 0x01,
+            0x12, 0x02, 0x08, 0x03,
+        ],
+    )]
+    fn interval_year_month_scalar_wire_bytes_pin_field_numbers(
+        #[case] months: i32,
+        #[case] ty: IntervalYearToMonthType,
+        #[case] expected_kind: ProtoIntervalYearToMonthKind,
+        #[case] expected_bytes: &[u8],
+    ) {
+        let scalar = Scalar::interval_year_month(months, ty).unwrap();
+        let encoded = prost::Message::encode_to_vec(&proto_expr::Scalar::from(&scalar));
+        assert_eq!(encoded, expected_bytes);
+
+        let decoded: proto_expr::Scalar =
+            prost::Message::decode(expected_bytes).expect("scalar bytes decode");
+        let Some(proto_expr::scalar::Value::IntervalYearMonthData(data)) = decoded.value else {
+            panic!("expected interval year-month scalar");
+        };
+        assert_eq!(data.months, months);
+        assert_eq!(
+            data.interval_type.expect("interval type present").kind,
+            expected_kind as i32
+        );
+    }
+
+    #[rstest]
+    #[case::year(
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear,
+        &[0x72, 0x06, 0x0a, 0x04, 0x2a, 0x02, 0x08, 0x01],
+    )]
+    #[case::month(
+        IntervalYearToMonthType::IntervalMonth,
+        ProtoIntervalYearToMonthKind::IntervalMonth,
+        &[0x72, 0x06, 0x0a, 0x04, 0x2a, 0x02, 0x08, 0x02],
+    )]
+    #[case::year_to_month(
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth,
+        &[0x72, 0x06, 0x0a, 0x04, 0x2a, 0x02, 0x08, 0x03],
+    )]
+    fn interval_year_month_typed_null_wire_bytes_pin_field_numbers(
+        #[case] ty: IntervalYearToMonthType,
+        #[case] expected_kind: ProtoIntervalYearToMonthKind,
+        #[case] expected_bytes: &[u8],
+    ) {
+        let scalar = Scalar::Null(DataType::Primitive(PrimitiveType::IntervalYearMonth(ty)));
+        let encoded = prost::Message::encode_to_vec(&proto_expr::Scalar::from(&scalar));
+        assert_eq!(encoded, expected_bytes);
+
+        let decoded: proto_expr::Scalar =
+            prost::Message::decode(expected_bytes).expect("typed null bytes decode");
+        let Some(proto_expr::scalar::Value::Null(data_type)) = decoded.value else {
+            panic!("expected typed null");
+        };
+        let Some(proto_schema::data_type::Kind::Primitive(primitive)) = data_type.kind.as_ref()
+        else {
+            panic!("expected primitive data type");
+        };
+        let Some(proto_schema::primitive_type::Kind::IntervalYearMonth(interval_type)) =
+            primitive.kind.as_ref()
+        else {
+            panic!("expected interval year-month primitive");
+        };
+        assert_eq!(interval_type.kind, expected_kind as i32);
+        assert_eq!(
+            DataType::try_from(data_type).unwrap(),
+            DataType::Primitive(PrimitiveType::IntervalYearMonth(ty))
+        );
     }
 
     #[test]
@@ -2350,18 +2544,6 @@ mod tests {
     )]
     #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
     #[case(
-        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
-        proto_schema::SimplePrimitiveType::IntervalYearMonth
-    )]
-    #[case(
-        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
-        proto_schema::SimplePrimitiveType::IntervalYearMonth
-    )]
-    #[case(
-        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
-        proto_schema::SimplePrimitiveType::IntervalYearMonth
-    )]
-    #[case(
         PrimitiveType::IntervalDayTime,
         proto_schema::SimplePrimitiveType::IntervalDayTime
     )]
@@ -2377,6 +2559,72 @@ mod tests {
         assert_eq!(simple, expected as i32);
     }
 
+    #[rstest]
+    #[case(
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear
+    )]
+    #[case(
+        IntervalYearToMonthType::IntervalMonth,
+        ProtoIntervalYearToMonthKind::IntervalMonth
+    )]
+    #[case(
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth
+    )]
+    fn from_interval_year_month_primitive_type(
+        #[case] ty: IntervalYearToMonthType,
+        #[case] expected: ProtoIntervalYearToMonthKind,
+    ) {
+        let primitive = PrimitiveType::IntervalYearMonth(ty);
+        let Some(proto_schema::primitive_type::Kind::IntervalYearMonth(interval_type)) =
+            proto_schema::PrimitiveType::from(&primitive).kind
+        else {
+            panic!("expected an interval year-month primitive type");
+        };
+        assert_eq!(interval_type.kind, expected as i32);
+    }
+
+    #[rstest]
+    #[case::year(
+        IntervalYearToMonthType::IntervalYear,
+        ProtoIntervalYearToMonthKind::IntervalYear,
+        &[0x0a, 0x04, 0x2a, 0x02, 0x08, 0x01],
+    )]
+    #[case::month(
+        IntervalYearToMonthType::IntervalMonth,
+        ProtoIntervalYearToMonthKind::IntervalMonth,
+        &[0x0a, 0x04, 0x2a, 0x02, 0x08, 0x02],
+    )]
+    #[case::year_to_month(
+        IntervalYearToMonthType::IntervalYearToMonth,
+        ProtoIntervalYearToMonthKind::IntervalYearToMonth,
+        &[0x0a, 0x04, 0x2a, 0x02, 0x08, 0x03],
+    )]
+    fn interval_year_month_schema_wire_bytes_pin_field_numbers(
+        #[case] ty: IntervalYearToMonthType,
+        #[case] expected_kind: ProtoIntervalYearToMonthKind,
+        #[case] expected_bytes: &[u8],
+    ) {
+        let data_type = DataType::Primitive(PrimitiveType::IntervalYearMonth(ty));
+        let encoded = prost::Message::encode_to_vec(&proto_schema::DataType::from(&data_type));
+        assert_eq!(encoded, expected_bytes);
+
+        let decoded: proto_schema::DataType =
+            prost::Message::decode(expected_bytes).expect("schema bytes decode");
+        let Some(proto_schema::data_type::Kind::Primitive(primitive)) = decoded.kind.as_ref()
+        else {
+            panic!("expected primitive data type");
+        };
+        let Some(proto_schema::primitive_type::Kind::IntervalYearMonth(interval_type)) =
+            primitive.kind.as_ref()
+        else {
+            panic!("expected interval year-month primitive");
+        };
+        assert_eq!(interval_type.kind, expected_kind as i32);
+        assert_eq!(DataType::try_from(decoded).unwrap(), data_type);
+    }
+
     #[test]
     fn from_decimal_type() {
         let primitive = PrimitiveType::decimal(10, 2).unwrap();
@@ -2386,6 +2634,20 @@ mod tests {
             panic!("expected a decimal primitive type");
         };
         assert_eq!((decimal.precision, decimal.scale), (10, 2));
+    }
+
+    #[test]
+    fn interval_year_month_primitive_encodes_exact_kind() {
+        let primitive = PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYear);
+        let Some(proto_schema::primitive_type::Kind::IntervalYearMonth(interval_type)) =
+            proto_schema::PrimitiveType::from(&primitive).kind
+        else {
+            panic!("expected an interval year-month primitive type");
+        };
+        assert_eq!(
+            interval_type.kind,
+            proto_schema::IntervalYearToMonthKind::IntervalYear as i32
+        );
     }
 
     #[rstest]
@@ -2657,6 +2919,12 @@ mod tests {
         )))
     }
 
+    fn interval_year_month_data_type(kind: i32) -> proto_schema::DataType {
+        primitive_data_type(Some(proto_schema::primitive_type::Kind::IntervalYearMonth(
+            proto_schema::IntervalYearMonthType { kind },
+        )))
+    }
+
     #[rstest]
     #[case::missing_data_type_kind(proto_schema::DataType { kind: None })]
     #[case::missing_primitive_kind(primitive_data_type(None))]
@@ -2664,6 +2932,12 @@ mod tests {
         proto_schema::SimplePrimitiveType::Unspecified as i32
     ))]
     #[case::unknown_primitive(simple_primitive_data_type(9999))]
+    #[case::legacy_interval_year_month_simple14(simple_primitive_data_type(14))]
+    #[case::interval_year_month_unspecified(interval_year_month_data_type(
+        proto_schema::IntervalYearToMonthKind::Unspecified as i32
+    ))]
+    #[case::interval_year_month_negative_kind(interval_year_month_data_type(-1))]
+    #[case::interval_year_month_unknown_kind(interval_year_month_data_type(999))]
     #[case::decimal_zero_precision(decimal_data_type(0, 0))]
     #[case::decimal_precision_too_large(decimal_data_type(39, 0))]
     #[case::decimal_scale_exceeds_precision(decimal_data_type(5, 6))]
@@ -2690,6 +2964,54 @@ mod tests {
     })]
     fn data_type_decode_rejects_invalid(#[case] proto: proto_schema::DataType) {
         assert!(DataType::try_from(proto).is_err());
+    }
+
+    #[rstest]
+    #[case::legacy_simple14(&[0x0a, 0x02, 0x08, 0x0e])]
+    #[case::missing_primitive_kind(&[0x0a, 0x00])]
+    #[case::empty_interval_type(&[0x0a, 0x02, 0x2a, 0x00])]
+    #[case::zero_interval_type(&[0x0a, 0x04, 0x2a, 0x02, 0x08, 0x00])]
+    #[case::negative_interval_type(&[
+        0x0a, 0x0d, 0x2a, 0x0b, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x01,
+    ])]
+    #[case::unknown_interval_type(&[0x0a, 0x05, 0x2a, 0x03, 0x08, 0xe7, 0x07])]
+    fn data_type_decode_rejects_invalid_interval_year_month_wire_bytes(#[case] bytes: &[u8]) {
+        let decoded: proto_schema::DataType =
+            prost::Message::decode(bytes).expect("invalid semantic schema bytes still decode");
+        let error = DataType::try_from(decoded).expect_err("semantic schema decode rejects");
+        assert!(matches!(error, KernelError::Schema(_)));
+    }
+
+    #[test]
+    fn legacy_interval_year_month_raw18_decodes_with_unset_scalar_value() {
+        // The retired field 18 encoded a raw i32 month count. Prost skips the unknown field and
+        // leaves the oneof unset.
+        let bytes = [0x90, 0x01, 30];
+        let decoded: proto_expr::Scalar =
+            prost::Message::decode(bytes.as_slice()).expect("unknown field decodes");
+        assert!(decoded.value.is_none());
+    }
+
+    #[test]
+    fn interval_year_month_scalar_field20_requires_embedded_type_for_semantics() {
+        let proto = proto_expr::Scalar {
+            value: Some(proto_expr::scalar::Value::IntervalYearMonthData(
+                proto_expr::IntervalYearMonthData {
+                    months: -13,
+                    interval_type: None,
+                },
+            )),
+        };
+        let bytes = prost::Message::encode_to_vec(&proto);
+        let decoded: proto_expr::Scalar =
+            prost::Message::decode(bytes.as_slice()).expect("field 20 decodes");
+
+        let Some(proto_expr::scalar::Value::IntervalYearMonthData(data)) = decoded.value else {
+            panic!("expected interval year-month data");
+        };
+        assert_eq!(data.months, -13);
+        assert!(data.interval_type.is_none());
     }
 
     #[test]

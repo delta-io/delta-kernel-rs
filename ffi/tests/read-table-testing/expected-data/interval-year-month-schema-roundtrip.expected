@@ -1,0 +1,9 @@
+Schema:
+├─ year: interval year (column mapping id: 1)
+├─ month: interval month (column mapping id: 2)
+└─ full: interval year to month (column mapping id: 3)
+
+Projected schema:
+├─ year: interval year (column mapping id: 1)
+├─ month: interval month (column mapping id: 2)
+└─ full: interval year to month (column mapping id: 3)

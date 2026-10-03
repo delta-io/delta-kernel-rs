@@ -74,6 +74,7 @@ pub mod ffi_metrics;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod incremental_scan;
+pub mod interval;
 pub mod log_path;
 pub mod log_segment;
 #[cfg(feature = "declarative-plans")]
@@ -100,6 +101,31 @@ pub mod transaction;
 use transaction::MutableCommitter;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
+
+/// FFI ABI generation implemented by this library.
+///
+/// Version 2 changes visitor layouts and interval year-month constructor signatures. Consumers
+/// should compare this constant with [`kernel_ffi_abi_version`] before filling visitor structs.
+/// A missing accessor or mismatched value is incompatible with these headers; old consumers are
+/// not automatically protected from loading a newer library.
+pub const KERNEL_FFI_ABI_VERSION: u32 = 2;
+
+/// Return the native FFI ABI generation implemented by this library.
+#[no_mangle]
+pub extern "C" fn kernel_ffi_abi_version() -> u32 {
+    KERNEL_FFI_ABI_VERSION
+}
+
+#[cfg(test)]
+mod abi_version_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_ffi_abi_version_reports_current_generation() {
+        assert_eq!(KERNEL_FFI_ABI_VERSION, 2);
+        assert_eq!(kernel_ffi_abi_version(), KERNEL_FFI_ABI_VERSION);
+    }
+}
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
