@@ -33,6 +33,7 @@ fn test_udt_skipping_uses_null_count_without_min_max(
     let config = stats_schema::StatsConfig {
         data_skipping_stats_columns: None,
         data_skipping_num_indexed_cols: None,
+        variant_min_max: false,
     };
     let stats_schema =
         Arc::new(stats_schema::expected_stats_schema(&data_schema, &config, None, None).unwrap());
