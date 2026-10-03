@@ -290,11 +290,9 @@ mod tests {
                 _ => unreachable!(),
             };
             if is_udt {
-                crate::schema::UserDefinedType {
-                    sql_type: Box::new(sql_type),
-                    annotation: Default::default(),
-                }
-                .into()
+                crate::schema::UserDefinedType::try_new(sql_type, Default::default())
+                    .unwrap()
+                    .into()
             } else {
                 sql_type
             }
