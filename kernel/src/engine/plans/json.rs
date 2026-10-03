@@ -49,11 +49,14 @@ impl JsonHandler for PlanBasedJsonHandler {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> Result<FileDataReadResultIterator> {
-        // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
-        // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
+        let scan = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?;
+        let query = match predicate {
+            Some(predicate) => scan.filter(predicate)?,
+            None => scan,
+        }
+        .build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -94,10 +97,11 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
+    use crate::expressions::{col, lit};
     use crate::schema::{schema_ref, SchemaRef};
     use crate::{
         Engine as _, EngineData, FileDataReadResultIterator, FileMeta, JsonHandler as _,
-        ParquetHandler as _, Result,
+        ParquetHandler as _, Predicate, Result,
     };
 
     fn make_handler() -> PlanBasedJsonHandler {
@@ -177,6 +181,31 @@ mod tests {
                 .unwrap()
                 .values(),
             &[1, 2, 3]
+        );
+        assert!(iter.next().is_none(), "expected exactly one batch");
+    }
+
+    #[test]
+    fn test_read_json_files_applies_predicate() {
+        let (_temp, file_meta) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#, r#"{"x": 3}"#]);
+        let schema = schema_ref! { not_null "x": INTEGER };
+        let predicate = Arc::new(Predicate::gt(col!("x"), lit(1i32)));
+
+        let mut iter = make_handler()
+            .read_json_files(&[file_meta], schema, Some(predicate))
+            .unwrap();
+
+        let batch = iter.next().expect("expected at least one batch").unwrap();
+        let record_batch: RecordBatch =
+            ArrowEngineData::try_from_engine_data(batch).unwrap().into();
+        assert_eq!(
+            record_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[2, 3]
         );
         assert!(iter.next().is_none(), "expected exactly one batch");
     }

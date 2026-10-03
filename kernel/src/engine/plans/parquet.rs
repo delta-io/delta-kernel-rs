@@ -40,11 +40,14 @@ impl ParquetHandler for PlanBasedParquetHandler {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> Result<FileDataReadResultIterator> {
-        // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
-        // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
+        let scan = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?;
+        let query = match predicate {
+            Some(predicate) => scan.filter(predicate)?,
+            None => scan,
+        }
+        .build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
@@ -89,9 +92,10 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::{col, lit};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::schema::{schema_ref, SchemaRef};
-    use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _};
+    use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _, Predicate};
 
     fn make_handler() -> PlanBasedParquetHandler {
         PlanBasedParquetHandler::new(
@@ -186,6 +190,40 @@ mod tests {
                 .unwrap()
                 .values(),
             &[10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn test_read_parquet_files_applies_predicate() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("data.parquet");
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let (file_meta, schema) = make_test_parquet_file(&file_path, &batch);
+        let predicate = Arc::new(Predicate::gt(col!("value"), lit(10i64)));
+
+        let batches: Vec<RecordBatch> = make_handler()
+            .read_parquet_files(&[file_meta], schema, Some(predicate))
+            .unwrap()
+            .map(|r| {
+                ArrowEngineData::try_from_engine_data(r.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[20, 30]
         );
     }
 
