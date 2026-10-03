@@ -145,6 +145,15 @@ impl Snapshot {
 
     /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
     /// to a more recent version.
+    ///
+    /// Refreshes compare sizes and modification times for overlapping log files from the normal
+    /// listing with cached files. Changed cached files cause an error; newly loaded metadata must
+    /// retain the input snapshot's table ID. Use [`Snapshot::builder_for`] to load a
+    /// replacement table. This does not detect replacements whose compared file metadata is
+    /// identical.
+    ///
+    /// Requesting the input snapshot's version returns it without I/O or freshness validation.
+    /// Requests for older versions return an error.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
