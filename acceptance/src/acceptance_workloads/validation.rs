@@ -227,13 +227,6 @@ fn protocols_equal(
     Ok(normalized(actual)? == normalized(expected)?)
 }
 
-fn error_without_backtrace(error: &Error) -> &Error {
-    match error {
-        Error::Backtraced { source, .. } => error_without_backtrace(source),
-        error => error,
-    }
-}
-
 fn source_is_not_found(error: &(dyn StdError + 'static)) -> bool {
     if error
         .downcast_ref::<std::io::Error>()
@@ -265,7 +258,7 @@ fn is_file_not_found_error(error: &Error) -> bool {
 }
 
 fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
-    let actual = error_without_backtrace(actual);
+    let actual = actual.without_backtrace();
     match (expected.error_code.as_str(), actual) {
         (
             "DELTA_STATE_RECOVER_ERROR",

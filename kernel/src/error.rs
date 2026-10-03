@@ -635,6 +635,16 @@ impl KernelError {
         Self::PlanResultTypeMismatch { expected, actual }
     }
 
+    /// Returns the first error that is not wrapped by [`KernelError::Backtraced`].
+    ///
+    /// If this error has no backtrace wrapper, this returns `self`.
+    pub fn without_backtrace(&self) -> &Self {
+        match self {
+            Self::Backtraced { source, .. } => source.without_backtrace(),
+            error => error,
+        }
+    }
+
     // Capture a backtrace when the error is constructed.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
