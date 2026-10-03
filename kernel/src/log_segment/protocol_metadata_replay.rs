@@ -39,44 +39,11 @@ use crate::{Engine, EngineData, KernelError, Result, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns an error if either is missing. The [`CheckedPmResolution`] also carries the
-    /// [`ProtocolMetadataSource`] describing how P&M was resolved and, under
-    /// `adaptive-metadata-in-dev`, how the latest AMT checkpoint action was resolved.
+    /// Returns `None` for either if not found; callers that require both present (e.g. fresh
+    /// snapshot creation) check for that themselves.
     ///
-    /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
-    /// snapshot creation where both Protocol and Metadata must exist.
-    pub(crate) fn read_protocol_metadata(
-        &self,
-        engine: &dyn Engine,
-        crc: Option<&Arc<Crc>>,
-    ) -> Result<CheckedPmResolution> {
-        let PmResolution {
-            metadata,
-            protocol,
-            source,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action,
-        } = self.read_protocol_metadata_opt(engine, crc)?;
-        match (metadata, protocol) {
-            (Some(metadata), Some(protocol)) => Ok(CheckedPmResolution {
-                metadata,
-                protocol,
-                source,
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action,
-            }),
-            (None, Some(_)) => Err(KernelError::MissingMetadata),
-            (Some(_), None) => Err(KernelError::MissingProtocol),
-            (None, None) => Err(KernelError::MissingMetadataAndProtocol),
-        }
-    }
-
-    /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns `None` for either if not found.
-    ///
-    /// This is the unchecked variant of [`Self::read_protocol_metadata`], used for incremental
-    /// snapshot updates where the caller can fall back to an existing snapshot's Protocol and
-    /// Metadata.
+    /// The result carries the [`ProtocolMetadataSource`] describing how P&M was resolved and,
+    /// under `adaptive-metadata-in-dev`, the latest AMT checkpoint action captured by replay.
     ///
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
@@ -323,20 +290,7 @@ impl LogSegment {
     }
 }
 
-/// Result of a checked P&M resolution (see [`LogSegment::read_protocol_metadata`]).
-pub(crate) struct CheckedPmResolution {
-    pub(crate) metadata: Metadata,
-    pub(crate) protocol: Protocol,
-    /// How the Protocol and Metadata were resolved.
-    pub(crate) source: ProtocolMetadataSource,
-    /// The latest AMT `checkpoint` action captured during replay, or `None` when replay did not
-    /// settle it (a miss, which does not prove absence since replay can stop early, or the
-    /// CRC-at-target path that runs no replay); consumers then fall back to a log scan.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) checkpoint_action: Option<CheckpointAction>,
-}
-
-/// Result of an unchecked P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
+/// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
 pub(crate) struct PmResolution {
     pub(crate) metadata: Option<Metadata>,
     pub(crate) protocol: Option<Protocol>,

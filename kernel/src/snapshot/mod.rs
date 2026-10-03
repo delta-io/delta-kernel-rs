@@ -407,14 +407,23 @@ impl Snapshot {
             }
             None => {
                 let resolution = log_segment
-                    .read_protocol_metadata(engine, base_crc.as_ref())
+                    .read_protocol_metadata_opt(engine, base_crc.as_ref())
                     .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
-                (metadata, protocol, source) =
-                    (resolution.metadata, resolution.protocol, resolution.source);
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 {
                     checkpoint_action = resolution.checkpoint_action;
                 }
+                // Fresh snapshot creation requires both Protocol and Metadata to be present.
+                let fail = |e| {
+                    emit_protocol_metadata_load_failure(metric_context);
+                    Err(e)
+                };
+                (metadata, protocol, source) = match (resolution.metadata, resolution.protocol) {
+                    (Some(metadata), Some(protocol)) => (metadata, protocol, resolution.source),
+                    (None, Some(_)) => return fail(KernelError::MissingMetadata),
+                    (Some(_), None) => return fail(KernelError::MissingProtocol),
+                    (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
+                };
             }
         }
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
