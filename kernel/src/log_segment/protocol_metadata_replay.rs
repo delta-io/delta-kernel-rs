@@ -135,7 +135,7 @@ impl LogSegment {
             protocol: candidate.protocol.map(|(_, p)| p),
             source: ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: candidate.checkpoint
+            checkpoint_action: candidate.checkpoint,
         })
     }
 

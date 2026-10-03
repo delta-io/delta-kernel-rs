@@ -28,7 +28,7 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
-use crate::log_segment::{DomainMetadataMap, LogSegment};
+use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -376,41 +376,38 @@ impl Snapshot {
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full) and, under AMT,
-        //         how it resolved the latest checkpoint action.
-        let (metadata, protocol, source);
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action;
-        match &crc_at_version {
-            Some((crc, crc_source)) => {
-                // No replay ran, so the checkpoint action is unresolved.
-                (metadata, protocol, source) =
-                    (crc.metadata.clone(), crc.protocol.clone(), *crc_source);
+        //         how it resolved the latest checkpoint action. The CRC-reuse arm runs no replay,
+        //         so it reports the checkpoint action as unresolved (`None`).
+        let PmResolution {
+            metadata,
+            protocol,
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action,
+        } = match &crc_at_version {
+            Some((crc, crc_source)) => PmResolution {
+                metadata: Some(crc.metadata.clone()),
+                protocol: Some(crc.protocol.clone()),
+                source: *crc_source,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                {
-                    checkpoint_action = None;
-                }
-            }
-            None => {
-                let resolution = log_segment
-                    .read_protocol_metadata_opt(engine, base_crc.as_ref())
-                    .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                {
-                    checkpoint_action = resolution.checkpoint_action;
-                }
-                // Fresh snapshot creation requires both Protocol and Metadata to be present.
-                let fail = |e| {
-                    emit_protocol_metadata_load_failure(metric_context);
-                    Err(e)
-                };
-                (metadata, protocol, source) = match (resolution.metadata, resolution.protocol) {
-                    (Some(metadata), Some(protocol)) => (metadata, protocol, resolution.source),
-                    (None, Some(_)) => return fail(KernelError::MissingMetadata),
-                    (Some(_), None) => return fail(KernelError::MissingProtocol),
-                    (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
-                };
-            }
-        }
+                checkpoint_action: None,
+            },
+            None => log_segment
+                .read_protocol_metadata_opt(engine, base_crc.as_ref())
+                .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
+        };
+
+        // Fresh snapshot creation requires both Protocol and Metadata to be present.
+        let fail = |e| {
+            emit_protocol_metadata_load_failure(metric_context);
+            Err(e)
+        };
+        let (metadata, protocol) = match (metadata, protocol) {
+            (Some(metadata), Some(protocol)) => (metadata, protocol),
+            (None, Some(_)) => return fail(KernelError::MissingMetadata),
+            (Some(_), None) => return fail(KernelError::MissingProtocol),
+            (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
+        };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
         let table_configuration = TableConfiguration::try_new(

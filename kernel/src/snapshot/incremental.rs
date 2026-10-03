@@ -9,7 +9,7 @@ use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::cancellation::CancellationTokenRef;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
@@ -256,10 +256,9 @@ impl Snapshot {
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        // The CRC-reuse arm runs no replay, so it reports the checkpoint action as Unresolved; only
-        // the P&M-replay arm can resolve it. Bound as a tuple, then destructured below: tuple
-        // patterns can't carry the `#[cfg]` the checkpoint-action element needs.
-        let pm_outcome = match &crc_at_version {
+        // The CRC-reuse arm runs no replay, so it reports the checkpoint action as unresolved
+        // (`None`); only the P&M-replay arm can resolve it.
+        let resolution = match &crc_at_version {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
                 // creation.
@@ -267,13 +266,13 @@ impl Snapshot {
                     .then(|| crc.metadata.clone());
                 let new_protocol = (crc.protocol != *existing_table_config.protocol())
                     .then(|| crc.protocol.clone());
-                (
-                    new_metadata,
-                    new_protocol,
-                    *source,
+                PmResolution {
+                    metadata: new_metadata,
+                    protocol: new_protocol,
+                    source: *source,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    None,
-                )
+                    checkpoint_action: None,
+                }
             }
             None => {
                 // No incremental CRC to reuse: there was no base CRC, or advancing it was out of
@@ -283,23 +282,19 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
-                let resolution = combined_log_segment
+                combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
-                    .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
-                (
-                    resolution.metadata,
-                    resolution.protocol,
-                    resolution.source,
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    resolution.checkpoint_action,
-                )
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?
             }
         };
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let (new_metadata, new_protocol, source, checkpoint_action) = pm_outcome;
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let (new_metadata, new_protocol, source) = pm_outcome;
+        let PmResolution {
+            metadata: new_metadata,
+            protocol: new_protocol,
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action,
+        } = resolution;
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
         let table_configuration = TableConfiguration::try_new_from(
