@@ -145,17 +145,8 @@ fn unresolved_crc(reason: &str) -> KernelError {
     KernelError::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
 }
 
-/// Table configuration, CRC, and (under AMT) checkpoint-action resolution produced by the P&M
-/// resolution step, before the CRC is validated against the segment.
-struct ResolvedTableConfiguration {
-    table_configuration: TableConfiguration,
-    crc: Option<Arc<Crc>>,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_action: Option<CheckpointAction>,
-}
-
-/// The same as [`ResolvedTableConfiguration`] but with a validated [`SnapshotCrc`], ready to build
-/// a [`Snapshot`].
+/// Table configuration, validated [`SnapshotCrc`], and (under AMT) checkpoint-action resolution
+/// produced by the P&M resolution step, ready to build a [`Snapshot`].
 struct PreparedSnapshot {
     table_configuration: TableConfiguration,
     crc: SnapshotCrc,
@@ -338,29 +329,14 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> Result<PreparedSnapshot> {
-        let result = Self::resolve_table_configuration_and_crc(
+        Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
             engine,
             metric_context,
             incremental_replay,
         )
-        .and_then(|resolved| {
-            let ResolvedTableConfiguration {
-                table_configuration,
-                crc,
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action,
-            } = resolved;
-            let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
-            Ok(PreparedSnapshot {
-                table_configuration,
-                crc,
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action,
-            })
-        });
-        result.inspect_err(|error| {
+        .inspect_err(|error| {
             error!(
                 %error,
                 ?location,
@@ -379,7 +355,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-    ) -> Result<ResolvedTableConfiguration> {
+    ) -> Result<PreparedSnapshot> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -436,7 +412,8 @@ impl Snapshot {
         )?;
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Ok(ResolvedTableConfiguration {
+        let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
+        Ok(PreparedSnapshot {
             table_configuration,
             crc,
             #[cfg(feature = "adaptive-metadata-in-dev")]

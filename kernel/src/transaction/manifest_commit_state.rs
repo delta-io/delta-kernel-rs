@@ -48,10 +48,7 @@ impl ManifestCommitState {
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.
-        if let Some(checkpoint) = read_snapshot
-            .log_segment()
-            .latest_checkpoint_action(engine)?
-        {
+        if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
             let snapshot_version = version_as_i64(read_snapshot.version())?;
             require!(
                 checkpoint.version() >= snapshot_version,
