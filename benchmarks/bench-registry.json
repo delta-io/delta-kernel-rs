@@ -4,5 +4,81 @@
       { "name": "serial",    "parallelScan": "disabled" },
       { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
     ]
+  },
+  "crc1Col200Commits1ChkptCrc150": {
+    "snapshotLatest": [
+      {
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "fromTableIncrementalCrc",
+        "snapshotBuilder": "fromTable",
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 50 } }
+      },
+      {
+        "name": "from199IncrementalCrc",
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } },
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 50 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptCrc195": {
+    "snapshotLatest": [
+      {
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "fromTableIncrementalCrc",
+        "snapshotBuilder": "fromTable",
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 5 } }
+      },
+      {
+        "name": "from199IncrementalCrc",
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } },
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 5 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptCrcLatest": {
+    "snapshotLatest": [
+      {
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptNoCrc": {
+    "snapshotLatest": [
+      {
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      }
+    ]
   }
 }
