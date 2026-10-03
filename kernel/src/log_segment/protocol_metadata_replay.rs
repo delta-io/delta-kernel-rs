@@ -102,7 +102,7 @@ impl LogSegment {
             // the latest action: any action at or below the CRC is older. A miss stays `None`
             // because the latest action may sit at or below the CRC, which this replay never reads.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let checkpoint_action = candidate.checkpoint;
+            let checkpoint_action = candidate.checkpoint.map(|(_, c)| c);
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -135,7 +135,7 @@ impl LogSegment {
             protocol: candidate.protocol.map(|(_, p)| p),
             source: ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: candidate.checkpoint,
+            checkpoint_action: candidate.checkpoint.map(|(_, c)| c),
         })
     }
 
@@ -306,9 +306,10 @@ pub(crate) struct PmResolution {
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
-    /// The AMT checkpoint action found in this batch, or the latest one across batches.
+    /// The AMT checkpoint action found in this batch, or the latest one across batches, tagged
+    /// with its `checkpointMetadata.version` so it ranks the same way as Protocol and Metadata.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint: Option<CheckpointAction>,
+    checkpoint: Option<(i64, CheckpointAction)>,
 }
 
 /// A P&M-projected batch with the versions to rank its Protocol and Metadata at.
@@ -325,7 +326,7 @@ fn resolve_pm_batches(
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    let mut checkpoint: Option<CheckpointAction> = None;
+    let mut checkpoint: Option<(i64, CheckpointAction)> = None;
     for batch in batches {
         let VersionedBatch {
             protocol_version,
@@ -336,15 +337,12 @@ fn resolve_pm_batches(
         let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
         metadata = newer(metadata, candidate.metadata);
         protocol = newer(protocol, candidate.protocol);
-        // Keep the highest-versioned checkpoint action rather than relying on iteration order.
-        // Best-effort: if the loop breaks below before reaching a checkpoint action, it stays
+        // Keep the highest-versioned checkpoint action, ranked by version like P&M (not by
+        // iteration order). Best-effort: if the loop breaks below before reaching one, it stays
         // `None`.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         {
-            checkpoint = match (checkpoint, candidate.checkpoint) {
-                (Some(current), Some(found)) if found.version() >= current.version() => Some(found),
-                (current, found) => current.or(found),
-            };
+            checkpoint = newer(checkpoint, candidate.checkpoint);
         }
         // A checkpoint action's P&M can be older than its commit, so check version not presence.
         if is_final(&protocol, batch_version) && is_final(&metadata, batch_version) {
@@ -466,7 +464,7 @@ fn pm_candidate(
         Ok(PmCandidate {
             protocol: newer(protocol, checkpoint_protocol),
             metadata: newer(metadata, checkpoint_metadata),
-            checkpoint,
+            checkpoint: checkpoint.map(|c| (c.version(), c)),
         })
     }
 
