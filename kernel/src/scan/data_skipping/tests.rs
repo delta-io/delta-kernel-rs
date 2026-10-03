@@ -28,10 +28,7 @@ fn test_udt_skipping_uses_null_count_without_min_max(
     #[case] keep: bool,
     #[case] checkpoint_keep: bool,
 ) {
-    let udt = UserDefinedType {
-        sql_type: Box::new(DataType::LONG),
-        annotation: Default::default(),
-    };
+    let udt = UserDefinedType::try_new(DataType::LONG, Default::default()).unwrap();
     let data_schema = schema! { nullable "value": (udt), nullable "other": LONG };
     let config = stats_schema::StatsConfig {
         data_skipping_stats_columns: None,

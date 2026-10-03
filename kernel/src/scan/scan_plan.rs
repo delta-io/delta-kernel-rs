@@ -548,7 +548,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
         pred,
         &partition_column_names,
         &state.eligible_physical_stats_columns,
-        &min_max_stats_columns(state.physical_stats_schema.as_deref()),
+        &min_max_stats_columns(state.physical_stats_read_schema().map(AsRef::as_ref)),
     )?;
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
     let skipping = Predicate::distinct(skipping, lit(false));
