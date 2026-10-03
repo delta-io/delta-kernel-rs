@@ -135,14 +135,22 @@ pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
     pub file_type: LogPathFileType,
 }
 
-// Internal helper used by TryFrom<FileMeta> below. It parses a fixed-length string into the numeric
-// type expected by the caller. A parsing failure returns None. A wrong length produces None, even
-// if the parse succeeded.
+// Internal helper used by TryFrom<FileMeta> below. It parses a fixed-length path component.
+// A parsing failure returns None. A wrong length produces None, even if the parse succeeded.
 fn parse_path_part<T: FromStr>(value: &str, expect_len: usize) -> Option<T> {
     match value.parse() {
         Ok(result) if value.len() == expect_len => Some(result),
         _ => None,
     }
+}
+
+// Numeric path components must contain only ASCII digits. Rust's integer parsers also accept a
+// leading `+`, which is not valid in Delta's zero-padded numeric filename components.
+fn parse_numeric_path_part<T: FromStr>(value: &str, expect_len: usize) -> Option<T> {
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    parse_path_part(value, expect_len)
 }
 
 // We normally construct ParsedLogPath from FileMeta, but in testing it's convenient to use
@@ -218,13 +226,9 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         #[allow(clippy::unwrap_used)]
         let version = split.next().unwrap();
 
-        // Every valid log path starts with a numeric version part. If version parsing fails, it
-        // must not be a log path and we simply return None. However, it is an error if version
-        // parsing succeeds for a wrong-length numeric string.
-        let version = match version.parse().ok() {
-            Some(v) if version.len() == VERSION_LEN => v,
-            Some(_) => return Ok(None), // has a version but it's not 20 chars
-            None => return Ok(None),
+        // Every valid log path starts with a zero-padded 20-digit version.
+        let Some(version) = parse_numeric_path_part::<Version>(version, VERSION_LEN) else {
+            return Ok(None);
         };
 
         // Every valid log path has a file extension as its last part. Return None if it's missing.
@@ -275,16 +279,16 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] if in_delta_log_dir => {
-                let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
+                let Some(hi) = parse_numeric_path_part(hi, VERSION_LEN) else {
                     return Ok(None);
                 };
                 LogPathFileType::CompactedCommit { hi }
             }
             ["checkpoint", part_num, num_parts, "parquet"] if in_delta_log_dir => {
-                let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
+                let Some(part_num) = parse_numeric_path_part(part_num, MULTIPART_PART_LEN) else {
                     return Ok(None);
                 };
-                let Some(num_parts) = parse_path_part(num_parts, MULTIPART_PART_LEN) else {
+                let Some(num_parts) = parse_numeric_path_part(num_parts, MULTIPART_PART_LEN) else {
                     return Ok(None);
                 };
 
@@ -737,6 +741,11 @@ pub(crate) mod tests {
         let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert!(log_path.is_none());
 
+        // invalid - Rust integer parsing accepts a leading '+', but Delta versions are digits only
+        let log_path = table_log_dir.join("+0000000000000000001.json").unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
+
         // unknown - two parts
         let log_path = table_log_dir.join("00000000000000000010.foo").unwrap();
         let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
@@ -981,6 +990,18 @@ pub(crate) mod tests {
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
+            .join("00000000000000000008.checkpoint.+000000001.0000000002.parquet")
+            .unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
+
+        let log_path = table_log_dir
+            .join("00000000000000000008.checkpoint.0000000001.+000000002.parquet")
+            .unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
+
+        let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.000000002.parquet")
             .unwrap();
         let log_path = ParsedLogPath::try_from(log_path).unwrap();
@@ -1019,6 +1040,12 @@ pub(crate) mod tests {
         ));
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
+
+        let signed_hi = format!("+{:019}", 15);
+        let signed_filename = format!("00000000000000000008.{signed_hi}.compacted.json");
+        let log_path = table_log_dir.join(&signed_filename).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         // invalid extension
         let log_path = table_log_dir
