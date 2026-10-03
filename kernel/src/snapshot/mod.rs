@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
@@ -12,6 +14,8 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::CheckpointAction;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -24,7 +28,9 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
-use crate::log_segment::{DomainMetadataMap, LogSegment};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::CheckpointActionResolution;
+use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -95,6 +101,24 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// How this snapshot's latest AMT `checkpoint` action was resolved at build time: captured
+    /// during P&M replay, hinted by the CRC's manifest-commit pointer, or unresolved (see
+    /// [`CheckpointActionResolution`]). [`Snapshot::latest_checkpoint_action`] serves `Captured`
+    /// directly; for `Hint`/`Unresolved` it scans the log and memoizes the result in
+    /// [`Self::checkpoint_action`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_action_resolution: CheckpointActionResolution,
+    /// Memoized scan result backing [`Self::checkpoint_action_resolution`]'s `Hint`/`Unresolved`
+    /// path, so the log is scanned at most once; unused for a `Captured` resolution, which serves
+    /// its action directly. `None` means the scan found no checkpoint action in this snapshot's
+    /// log segment (a classic non-AMT table, or an AMT table that has none yet).
+    ///
+    /// Safe to memoize: the snapshot's `log_segment` is frozen and Delta log files are immutable,
+    /// so the scanned result cannot change for this snapshot. A checkpoint written later belongs
+    /// to a new snapshot's segment, not this one. Behind an [`Arc`] so repeated calls clone
+    /// only the pointer, not the action's inline transaction and domain-metadata vectors.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_action: OnceLock<Option<Arc<CheckpointAction>>>,
 }
 
 impl PartialEq for Snapshot {
@@ -129,6 +153,15 @@ impl std::fmt::Debug for Snapshot {
 /// writable CRC. `reason` completes the sentence "Cannot resolve a CRC to write: ...".
 fn unresolved_crc(reason: &str) -> KernelError {
     KernelError::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
+}
+
+/// Table configuration, validated [`SnapshotCrc`], and (under AMT) checkpoint-action resolution
+/// produced by the P&M resolution step, ready to build a [`Snapshot`].
+struct PreparedSnapshot {
+    table_configuration: TableConfiguration,
+    crc: SnapshotCrc,
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_action: CheckpointActionResolution,
 }
 
 impl Snapshot {
@@ -188,6 +221,9 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            // No replay ran on this path, so the checkpoint action is resolved on demand.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            CheckpointActionResolution::Unresolved,
         ))
     }
 
@@ -210,6 +246,7 @@ impl Snapshot {
         crc: SnapshotCrc,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
+        #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: CheckpointActionResolution,
     ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -225,6 +262,42 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action_resolution: checkpoint_action,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: OnceLock::new(),
+        }
+    }
+
+    /// The latest AMT `checkpoint` action this snapshot covers, or `None` when this snapshot's log
+    /// segment has no checkpoint action (a classic non-AMT table, or an AMT table that has none
+    /// yet). Serves the action captured during P&M replay directly; otherwise (a CRC hint, or an
+    /// unresolved build) scans the log once and memoizes a successful scan, so later calls do not
+    /// re-scan (a failed scan is not cached and is retried). Memoizing is correct because the
+    /// snapshot's `log_segment` is frozen and Delta log files are immutable.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> Result<Option<Arc<CheckpointAction>>> {
+        match &self.checkpoint_action_resolution {
+            // Captured during replay: serve it directly (cheap `Arc` clone).
+            CheckpointActionResolution::Captured(action) => Ok(Some(action.clone())),
+            // TODO(#3495): when a `Hint` is present, resolve the action from the single manifest
+            // commit it names instead of scanning the whole log. For now both scan, memoizing the
+            // result. A concurrent caller may win the race to fill the cell; both compute the same
+            // action, so either value is correct.
+            CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => {
+                if let Some(cached) = self.checkpoint_action.get() {
+                    return Ok(cached.clone());
+                }
+                let found = self
+                    .log_segment
+                    .find_last_checkpoint_action(engine)?
+                    .map(Arc::new);
+                let _ = self.checkpoint_action.set(found.clone());
+                Ok(found)
+            }
         }
     }
 
@@ -240,7 +313,12 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> Result<Self> {
-        let (table_configuration, crc) = Self::prepare_new_from_log_segment(
+        let PreparedSnapshot {
+            table_configuration,
+            crc,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action,
+        } = Self::prepare_new_from_log_segment(
             &location,
             &log_segment,
             engine,
@@ -255,6 +333,8 @@ impl Snapshot {
             crc,
             built_as_latest,
             false, /* skipped_new_checkpoints */
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action,
         ))
     }
 
@@ -266,19 +346,15 @@ impl Snapshot {
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> Result<(TableConfiguration, SnapshotCrc)> {
-        let result = Self::resolve_table_configuration_and_crc(
+    ) -> Result<PreparedSnapshot> {
+        Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
             engine,
             metric_context,
             incremental_replay,
         )
-        .and_then(|(table_configuration, crc)| {
-            let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
-            Ok((table_configuration, crc))
-        });
-        result.inspect_err(|error| {
+        .inspect_err(|error| {
             error!(
                 %error,
                 ?location,
@@ -297,7 +373,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-    ) -> Result<(TableConfiguration, Option<Arc<Crc>>)> {
+    ) -> Result<PreparedSnapshot> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -308,12 +384,39 @@ impl Snapshot {
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
-        //         first commit. The replay reports its own source (seeded vs full).
-        let (metadata, protocol, source) = match &crc_at_version {
-            Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
+        //         first commit. The replay reports its own source (seeded vs full) and, under AMT,
+        //         how it resolved the latest checkpoint action. The CRC-reuse arm runs no replay,
+        //         so it reports the checkpoint action as unresolved (`None`).
+        let PmResolution {
+            metadata,
+            protocol,
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action,
+        } = match &crc_at_version {
+            Some((crc, crc_source)) => PmResolution {
+                metadata: Some(crc.metadata.clone()),
+                protocol: Some(crc.protocol.clone()),
+                source: *crc_source,
+                // No replay ran: hint from the CRC's manifest-commit pointer when present.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                checkpoint_action: CheckpointActionResolution::from_crc(crc),
+            },
             None => log_segment
-                .read_protocol_metadata(engine, base_crc.as_ref())
+                .read_protocol_metadata_opt(engine, base_crc.as_ref())
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
+        };
+
+        // Fresh snapshot creation requires both Protocol and Metadata to be present.
+        let fail = |e| {
+            emit_protocol_metadata_load_failure(metric_context);
+            Err(e)
+        };
+        let (metadata, protocol) = match (metadata, protocol) {
+            (Some(metadata), Some(protocol)) => (metadata, protocol),
+            (None, Some(_)) => return fail(KernelError::MissingMetadata),
+            (Some(_), None) => return fail(KernelError::MissingProtocol),
+            (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
         };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
 
@@ -325,7 +428,13 @@ impl Snapshot {
         )?;
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        Ok((table_configuration, crc))
+        let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
+        Ok(PreparedSnapshot {
+            table_configuration,
+            crc,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action,
+        })
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
