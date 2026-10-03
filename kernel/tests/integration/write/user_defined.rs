@@ -57,15 +57,15 @@ async fn write_udt_preserves_annotation_across_metadata_and_checkpoints(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, table_path, engine) = test_table_setup_mt()?;
     let table_root = Url::from_directory_path(&table_path).unwrap();
-    let udt = UserDefinedType {
-        sql_type: Box::new(sql_type),
-        annotation: [
+    let udt = UserDefinedType::try_new(
+        sql_type,
+        [
             ("class".into(), Some("example.Value".into())),
             ("pyClass".into(), None),
             ("extension".into(), Some("opaque\0member".into())),
         ]
         .into(),
-    };
+    )?;
     let expected_type = serde_json::to_value(&udt)?;
     let schema = schema_ref! { nullable "id": LONG, nullable "value": (udt) };
     let schema = if mapping_mode == ColumnMappingMode::None {
