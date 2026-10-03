@@ -65,6 +65,7 @@ impl LogSegment {
                 protocol: Some(crc.protocol.clone()),
                 source: ProtocolMetadataSource::CrcAtTarget,
                 // No replay ran, so the checkpoint action is unresolved.
+                // TODO: Leverage lastManifestCommit from the CRC
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 checkpoint_action: None,
             });
@@ -129,15 +130,12 @@ impl LogSegment {
 
         // Case 3: Full P&M log replay.
         let candidate = self.replay_for_pm(engine)?;
-        // A full replay reaches every batch, so a hit is the latest action and a miss means absent.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action = candidate.checkpoint;
         Ok(PmResolution {
             metadata: candidate.metadata.map(|(_, m)| m),
             protocol: candidate.protocol.map(|(_, p)| p),
             source: ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action,
+            checkpoint_action: candidate.checkpoint
         })
     }
 
@@ -433,8 +431,7 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
 }
 
 /// The Protocol and Metadata in `batch`, tagged with the given versions, plus any AMT checkpoint
-/// action's nested P&M at its own version. The checkpoint action itself is retained (under
-/// `adaptive-metadata-in-dev`) so callers can surface it.
+/// action's nested P&M at its own version.
 fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
@@ -446,12 +443,15 @@ fn pm_candidate(
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
-        // A checkpoint action's nested P&M is at its own `checkpointMetadata.version`. The two
-        // engines disagree on what counts as a log batch: the non-plan path sets `is_log_batch`
-        // only for commit batches, so it captures the action solely from commits, while the plan
-        // path marks every row as a log batch and so can also capture it from checkpoint parts.
-        // Both land on the same answer because a non-plan miss falls back to the log scan in
-        // `latest_checkpoint_action`.
+        // A checkpoint action's nested P&M is at its own `checkpointMetadata.version`. Only parse
+        // it from batches projected with the checkpoint-action column. The non-plan read
+        // (`read_pm_batches`) reads commits with `commit_schema` (which includes
+        // `CHECKPOINT_ACTION_FIELD`) and checkpoint parts with `checkpoint_schema` (which omits
+        // it), so here `is_log_batch` is exactly "this batch carries the column" and the action is
+        // captured solely from commits. The plan path instead projects every union input with one
+        // schema that includes the column and marks all batches as log batches, so it can also
+        // capture the action from checkpoint parts. Both land on the same answer because a non-plan
+        // miss falls back to the full log scan in `latest_checkpoint_action`.
         let checkpoint = if batch.is_log_batch {
             CheckpointAction::try_new_from_data(actions)?
         } else {
