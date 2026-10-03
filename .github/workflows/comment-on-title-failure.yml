@@ -10,25 +10,39 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
+      actions: read
     steps:
-      # Step taken from: https://github.com/orgs/community/discussions/25220#discussioncomment-11316244
-      - name: Find PR info
+      - name: Download PR number
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pr-number
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Validate and resolve PR info
         id: pr-context
         env:
           GH_TOKEN: ${{ github.token }}
           PR_TARGET_REPO: ${{ github.repository }}
-          # If the PR is from a fork, prefix it with `<owner-login>:`, otherwise only the PR branch name is relevant:
-          PR_BRANCH: |-
-            ${{
-              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
-                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
-                || github.event.workflow_run.head_branch
-            }}
-        # Query the PR number by repo + branch, then assign to step output:
         run: |
-          gh pr view --repo "${PR_TARGET_REPO}" "${PR_BRANCH}" \
-             --json 'number,title' --jq '"number=\(.number)\ntitle=\(.title)"' \
-             >> "${GITHUB_OUTPUT}"
+          set -euo pipefail
+
+          mapfile -t lines < pr-number.txt
+          if [[ ${#lines[@]} -ne 1 || ! "${lines[0]:-}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::invalid PR number artifact"
+            exit 1
+          fi
+          number="${lines[0]}"
+
+          pr_json=$(gh api "repos/${PR_TARGET_REPO}/pulls/${number}")
+          title=$(jq -r '.title' <<< "$pr_json")
+          delimiter="PR_TITLE_$(cat /proc/sys/kernel/random/uuid)"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          {
+            echo "title<<$delimiter"
+            echo "$title"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Find existing comment
         id: find
