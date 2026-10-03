@@ -2529,7 +2529,7 @@ impl Display for DataType {
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
             #[cfg(feature = "udt-in-dev")]
-            DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type),
+            DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
         }
     }
 }

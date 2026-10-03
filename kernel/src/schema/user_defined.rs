@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 
 use serde::de::Error as _;
-use serde::ser::{Error as _, SerializeMap};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::DataType;
-use crate::{DeltaResult, Error};
+use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::{KernelError, Result};
 
 /// An engine-defined annotation over a physical Delta type.
 ///
@@ -15,8 +16,7 @@ use crate::{DeltaResult, Error};
 /// `sql_type`; schema serialization preserves both the physical type and the opaque annotation.
 ///
 /// Equality compares both the complete `sql_type` and the annotation, including explicit nulls.
-/// Use equality to check logical schema identity or annotation preservation. Schema read
-/// compatibility also requires exact UDT equality, even when physical types match.
+/// Schema read compatibility requires exact UDT equality, even when physical types match.
 ///
 /// # Example
 ///
@@ -26,13 +26,14 @@ use crate::{DeltaResult, Error};
 /// use delta_kernel::schema::{DataType, StructField, UserDefinedType};
 /// use serde_json::json;
 ///
-/// let udt = UserDefinedType {
-///     sql_type: Box::new(DataType::LONG),
-///     annotation: [
+/// let udt = UserDefinedType::try_new(
+///     DataType::LONG,
+///     [
 ///         ("class".to_owned(), Some("example.Id".to_owned())),
 ///         ("pyClass".to_owned(), None),
-///     ].into(),
-/// };
+///     ]
+///     .into(),
+/// )?;
 /// let field = StructField::nullable("id", udt);
 /// assert_eq!(serde_json::to_value(field)?, json!({
 ///     "name": "id",
@@ -40,29 +41,52 @@ use crate::{DeltaResult, Error};
 ///     "nullable": true,
 ///     "metadata": {}
 /// }));
-/// # Ok::<(), serde_json::Error>(())
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDefinedType {
-    /// Physical schema used to read and write values. It must not contain another UDT.
-    pub sql_type: Box<DataType>,
-    /// Engine-specific type information retained when transporting or serializing the schema.
-    /// `None` preserves an explicit JSON null; absent keys stay absent.
-    /// The keys `type` and `sqlType` are reserved.
-    pub annotation: BTreeMap<String, Option<String>>,
+    sql_type: Box<DataType>,
+    annotation: BTreeMap<String, Option<String>>,
 }
 
 impl UserDefinedType {
-    pub(crate) fn validate(&self) -> DeltaResult<()> {
-        if contains_udt(&self.sql_type) {
-            return Err(Error::schema("A UDT sqlType must not contain another UDT"));
+    /// Creates a UDT over `sql_type` with the supplied engine annotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sql_type` contains another UDT or `annotation` contains the reserved
+    /// key `type` or `sqlType`.
+    pub fn try_new(
+        sql_type: impl Into<DataType>,
+        annotation: BTreeMap<String, Option<String>>,
+    ) -> Result<Self> {
+        let sql_type = sql_type.into();
+        if contains_udt(&sql_type) {
+            return Err(KernelError::schema(
+                "A UDT sqlType must not contain another UDT",
+            ));
         }
-        if self.annotation.contains_key("type") || self.annotation.contains_key("sqlType") {
-            return Err(Error::schema(
+        if annotation.contains_key("type") || annotation.contains_key("sqlType") {
+            return Err(KernelError::schema(
                 "UDT annotation keys type and sqlType are reserved",
             ));
         }
-        Ok(())
+        Ok(Self {
+            sql_type: Box::new(sql_type),
+            annotation,
+        })
+    }
+
+    /// Returns the physical type used to store the UDT.
+    pub fn sql_type(&self) -> &DataType {
+        &self.sql_type
+    }
+
+    /// Returns the engine-defined annotation.
+    ///
+    /// A value of `None` represents an explicit JSON `null`; an absent key is not serialized.
+    pub fn annotation(&self) -> &BTreeMap<String, Option<String>> {
+        &self.annotation
     }
 }
 
@@ -71,7 +95,6 @@ impl Serialize for UserDefinedType {
         // The required `type` and `sqlType` members are separate from the engine annotation.
         const REQUIRED_UDT_FIELD_COUNT: usize = 2;
 
-        self.validate().map_err(S::Error::custom)?;
         let mut map =
             serializer.serialize_map(Some(self.annotation.len() + REQUIRED_UDT_FIELD_COUNT))?;
         map.serialize_entry("type", "udt")?;
@@ -98,25 +121,22 @@ impl<'de> Deserialize<'de> for UserDefinedType {
         if repr.type_name != "udt" {
             return Err(D::Error::custom("Expected UDT type to be 'udt'"));
         }
-        let udt = Self {
-            sql_type: repr.sql_type,
-            annotation: repr.annotation,
-        };
-        udt.validate().map_err(D::Error::custom)?;
-        Ok(udt)
+        Self::try_new(*repr.sql_type, repr.annotation).map_err(D::Error::custom)
+    }
+}
+
+struct ContainsUdt;
+
+impl<'a> SchemaTransform<'a> for ContainsUdt {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> Result<(), ()> {
+        Err(())
     }
 }
 
 fn contains_udt(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::UserDefined(_) => true,
-        DataType::Struct(s) | DataType::Variant(s) => {
-            s.fields().any(|f| contains_udt(f.data_type()))
-        }
-        DataType::Array(a) => contains_udt(a.element_type()),
-        DataType::Map(m) => contains_udt(m.key_type()) || contains_udt(m.value_type()),
-        DataType::Primitive(_) => false,
-    }
+    ContainsUdt.transform(data_type).is_err()
 }
 
 #[cfg(test)]
@@ -202,10 +222,13 @@ mod tests {
         wrap: fn(DataType) -> DataType,
     ) {
         let with_annotation = |annotation| {
-            DataType::from(UserDefinedType {
-                sql_type: Box::new(physical_type.clone()),
-                annotation: serde_json::from_value(annotation).unwrap(),
-            })
+            DataType::from(
+                UserDefinedType::try_new(
+                    physical_type.clone(),
+                    serde_json::from_value(annotation).unwrap(),
+                )
+                .unwrap(),
+            )
         };
         let source = wrap(with_annotation(source_annotation));
         let target = wrap(with_annotation(target_annotation));
@@ -284,10 +307,13 @@ mod tests {
         #[case] target: DataType,
     ) {
         let wrap = |sql_type| {
-            DataType::from(UserDefinedType {
-                sql_type: Box::new(sql_type),
-                annotation: [("class".to_owned(), Some("Id".to_owned()))].into(),
-            })
+            DataType::from(
+                UserDefinedType::try_new(
+                    sql_type,
+                    [("class".to_owned(), Some("Id".to_owned()))].into(),
+                )
+                .unwrap(),
+            )
         };
         let source = wrap(source);
         let target = wrap(target);
@@ -315,10 +341,9 @@ mod tests {
         #[values(DataType::LONG, DataType::from(schema! { nullable "x": LONG }))]
         physical_type: DataType,
     ) {
-        let udt = DataType::from(UserDefinedType {
-            sql_type: Box::new(physical_type.clone()),
-            annotation: BTreeMap::new(),
-        });
+        let udt = DataType::from(
+            UserDefinedType::try_new(physical_type.clone(), BTreeMap::new()).unwrap(),
+        );
         assert_ne!(udt, physical_type);
         for (source, target) in [(&udt, &physical_type), (&physical_type, &udt)] {
             assert!(matches!(
@@ -345,10 +370,11 @@ mod tests {
         let field = |nullable, class: &str| {
             StructField::new(
                 "id",
-                UserDefinedType {
-                    sql_type: Box::new(DataType::LONG),
-                    annotation: [("class".to_owned(), Some(class.to_owned()))].into(),
-                },
+                UserDefinedType::try_new(
+                    DataType::LONG,
+                    [("class".to_owned(), Some(class.to_owned()))].into(),
+                )
+                .unwrap(),
                 nullable,
             )
         };
@@ -381,10 +407,11 @@ mod tests {
     #[case::different_annotation("Other", false)]
     fn union_all_requires_equal_udt_annotations(#[case] class: &str, #[case] equal: bool) {
         let input = |class: &str| {
-            let udt = UserDefinedType {
-                sql_type: Box::new(DataType::LONG),
-                annotation: [("class".to_owned(), Some(class.to_owned()))].into(),
-            };
+            let udt = UserDefinedType::try_new(
+                DataType::LONG,
+                [("class".to_owned(), Some(class.to_owned()))].into(),
+            )
+            .unwrap();
             PlanBuilder::values(schema! { nullable "id": (udt) }, vec![]).unwrap()
         };
         let result = PlanBuilder::union_all([input("Id"), input(class)]);
@@ -397,15 +424,24 @@ mod tests {
     #[rstest]
     #[case("type")]
     #[case("sqlType")]
-    fn serialization_rejects_reserved_annotation_keys(#[case] key: &str) {
-        let udt = UserDefinedType {
-            sql_type: Box::new(DataType::LONG),
-            annotation: [(key.to_owned(), None)].into(),
-        };
-        assert!(serde_json::to_value(udt)
-            .unwrap_err()
-            .to_string()
-            .contains("reserved"));
+    fn construction_rejects_reserved_annotation_keys(#[case] key: &str) {
+        assert!(
+            UserDefinedType::try_new(DataType::LONG, [(key.to_owned(), None)].into())
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+    }
+
+    #[test]
+    fn construction_rejects_nested_udt() {
+        let inner = UserDefinedType::try_new(DataType::LONG, BTreeMap::new()).unwrap();
+        assert!(
+            UserDefinedType::try_new(DataType::from(inner), BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("another UDT")
+        );
     }
 
     #[test]
@@ -420,10 +456,7 @@ mod tests {
                 Err(())
             }
         }
-        let udt = UserDefinedType {
-            sql_type: Box::new(DataType::LONG),
-            annotation: BTreeMap::new(),
-        };
+        let udt = UserDefinedType::try_new(DataType::LONG, BTreeMap::new()).unwrap();
         assert!(RejectPrimitives.transform(&DataType::from(udt)).is_ok());
         assert!(RejectPrimitives.transform(&DataType::LONG).is_err());
     }

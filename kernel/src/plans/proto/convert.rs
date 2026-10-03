@@ -641,9 +641,9 @@ impl From<&DataType> for proto_schema::DataType {
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => {
                 DataTypeKind::UserDefined(Box::new(proto_schema::UserDefinedType {
-                    sql_type: Some(Box::new(udt.sql_type.as_ref().into())),
+                    sql_type: Some(Box::new(udt.sql_type().into())),
                     annotation: udt
-                        .annotation
+                        .annotation()
                         .iter()
                         .map(|(key, value)| {
                             (
@@ -844,26 +844,22 @@ impl TryFrom<proto_schema::DataType> for DataType {
             DataTypeKind::UserDefined(udt) => {
                 #[cfg(feature = "udt-in-dev")]
                 {
-                    let udt = crate::schema::UserDefinedType {
-                        sql_type: Box::new(
-                            (*udt
-                                .sql_type
-                                .ok_or_else(|| Error::schema("UDT proto missing sql_type"))?)
-                            .try_into()?,
-                        ),
-                        annotation: udt
-                            .annotation
-                            .into_iter()
-                            .map(|(key, value)| (key, value.value))
-                            .collect(),
-                    };
-                    udt.validate()?;
+                    let sql_type = DataType::try_from(
+                        *udt.sql_type
+                            .ok_or_else(|| KernelError::schema("UDT proto missing sql_type"))?,
+                    )?;
+                    let annotation = udt
+                        .annotation
+                        .into_iter()
+                        .map(|(key, value)| (key, value.value))
+                        .collect();
+                    let udt = crate::schema::UserDefinedType::try_new(sql_type, annotation)?;
                     DataType::UserDefined(udt)
                 }
                 #[cfg(not(feature = "udt-in-dev"))]
                 {
                     let _ = udt;
-                    return Err(Error::unsupported("UDT requires udt-in-dev"));
+                    return Err(KernelError::unsupported("UDT requires udt-in-dev"));
                 }
             }
         };
@@ -2168,25 +2164,35 @@ mod tests {
     #[rstest]
     #[case::reserved_key(true)]
     #[case::nested_udt(false)]
-    fn proto_decode_rejects_invalid_public_udt(#[case] reserved_key: bool) {
-        let inner = crate::schema::UserDefinedType {
-            sql_type: Box::new(DataType::LONG),
+    fn proto_decode_rejects_invalid_udt(#[case] reserved_key: bool) {
+        let inner = proto_schema::UserDefinedType {
+            sql_type: Some(Box::new(proto_schema::DataType::from(&DataType::LONG))),
             annotation: Default::default(),
         };
-        let invalid = crate::schema::UserDefinedType {
-            sql_type: Box::new(if reserved_key {
-                DataType::LONG
+        let invalid = proto_schema::UserDefinedType {
+            sql_type: Some(Box::new(if reserved_key {
+                proto_schema::DataType::from(&DataType::LONG)
             } else {
-                inner.into()
-            }),
+                proto_schema::DataType {
+                    kind: Some(proto_schema::data_type::Kind::UserDefined(Box::new(inner))),
+                }
+            })),
             annotation: if reserved_key {
-                [("type".into(), None)].into()
+                [(
+                    "type".into(),
+                    proto_schema::UserDefinedAnnotationValue { value: None },
+                )]
+                .into()
             } else {
                 Default::default()
             },
         };
-        let encoded = proto_schema::DataType::from(&DataType::from(invalid));
-        let error = DataType::try_from(encoded).unwrap_err();
+        let proto = proto_schema::DataType {
+            kind: Some(proto_schema::data_type::Kind::UserDefined(Box::new(
+                invalid,
+            ))),
+        };
+        let error = DataType::try_from(proto).unwrap_err();
         assert!(error.to_string().contains(if reserved_key {
             "reserved"
         } else {

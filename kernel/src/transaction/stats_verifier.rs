@@ -178,7 +178,7 @@ static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 fn column_types_for(dt: &DataType) -> Result<&'static ColumnNamesAndTypes> {
     match dt {
         #[cfg(feature = "udt-in-dev")]
-        DataType::UserDefined(_) => Err(Error::unsupported("UDT min/max statistics")),
+        DataType::UserDefined(_) => Err(KernelError::unsupported("UDT min/max statistics")),
         &DataType::BOOLEAN => Ok(&COL_TYPES_BOOL),
         &DataType::BYTE => Ok(&COL_TYPES_BYTE),
         &DataType::SHORT => Ok(&COL_TYPES_SHORT),
@@ -220,7 +220,7 @@ fn is_stat_present<'b>(
     let field_name = "stat";
     match data_type {
         #[cfg(feature = "udt-in-dev")]
-        DataType::UserDefined(_) => Err(Error::unsupported("UDT min/max statistics")),
+        DataType::UserDefined(_) => Err(KernelError::unsupported("UDT min/max statistics")),
         &DataType::BOOLEAN => Ok(getter.get_bool(row_idx, field_name)?.is_some()),
         &DataType::BYTE => Ok(getter.get_byte(row_idx, field_name)?.is_some()),
         &DataType::SHORT => Ok(getter.get_short(row_idx, field_name)?.is_some()),

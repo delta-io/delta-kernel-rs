@@ -398,14 +398,14 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 let child_list_id = (visitor.make_field_list)(visitor.data, 1);
                 visit_schema_item(
                     "sqlType",
-                    &udt.sql_type,
+                    udt.sql_type(),
                     is_nullable,
                     &CMetadataMap::default(),
                     visitor,
                     child_list_id,
                 );
                 let entries: Vec<_> = udt
-                    .annotation
+                    .annotation()
                     .iter()
                     .map(|(key, value)| FfiNullableStringMapEntry {
                         key: kernel_string_slice!(key),
