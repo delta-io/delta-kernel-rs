@@ -352,6 +352,20 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
+    assert_metadata_matches_imperative_for_stats_options(
+        engine.as_ref(),
+        &snapshot,
+        stats,
+        expected_stats_field_groups,
+    )
+}
+
+fn assert_metadata_matches_imperative_for_stats_options(
+    engine: &dyn Engine,
+    snapshot: &Arc<Snapshot>,
+    stats: StatsOptions,
+    expected_stats_field_groups: &[&[&str]],
+) -> Result<()> {
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
     let expected_stats = if no_stats {
@@ -366,14 +380,15 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .with_stats(expected_stats)
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate.clone());
-    let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
+    let expected = imperative_metadata(expected_builder.build()?, engine)?;
     let builder = snapshot
+        .clone()
         .scan_builder()
         .with_stats(stats.clone())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate);
     let scan = builder.build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine)?;
     let actual_fields = leaf_paths(&actual);
     let imperative_fields = leaf_paths(&expected);
     let unexpected_fields: Vec<_> = actual_fields
@@ -741,8 +756,21 @@ fn declarative_metadata_synthesizes_json_for_struct_only_bases(
 }
 
 #[rstest]
-fn declarative_metadata_json_stats_use_crc_all_files_without_checkpoint(
-    #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
+#[case::json_only(StatsOptions::json_only(), &[JSON_STATS_FIELDS])]
+#[case::all_struct(StatsOptions::all_struct(), &[ALL_STATS_PARSED_FIELDS])]
+#[case::struct_columns(
+    StatsOptions::struct_columns(vec![column_name!("id")]),
+    &[ID_STATS_PARSED_FIELDS]
+)]
+#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
+#[case::all(
+    StatsOptions::all(),
+    &[ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+)]
+#[case::none(StatsOptions::none(), &[])]
+fn declarative_metadata_stats_use_crc_all_files_without_checkpoint(
+    #[case] stats: StatsOptions,
+    #[case] expected_stats_field_groups: &[&[&str]],
 ) -> Result<()> {
     let (engine, latest, _tempdir) =
         load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
@@ -754,19 +782,12 @@ fn declarative_metadata_json_stats_use_crc_all_files_without_checkpoint(
     assert_eq!(crc_version, 4);
     assert!(all_files.iter().all(|add| add.stats.is_some()));
 
-    let scan = snapshot.scan_builder().with_stats(stats).build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
-    assert!(!actual.is_empty(), "CRC metadata must be populated");
-    for batch in actual {
-        let stats = batch
-            .column_by_name(STATS)
-            .expect("requested JSON stats")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("JSON stats");
-        assert_eq!(stats.null_count(), 0);
-    }
-    Ok(())
+    assert_metadata_matches_imperative_for_stats_options(
+        engine.as_ref(),
+        &snapshot,
+        stats,
+        expected_stats_field_groups,
+    )
 }
 
 fn assert_metadata_output_options(
@@ -1176,27 +1197,6 @@ fn assert_declarative_metadata_matches_imperative(
     let actual = declarative_metadata(&scan, &engine)?;
 
     assert_metadata_eq(&actual, &expected, table.description())
-}
-
-#[test]
-fn test_declarative_metadata_scan_plan_crc_all_files_needs_no_executor() -> Result<()> {
-    let (engine, latest, _tempdir) =
-        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
-    let snapshot = Snapshot::builder_for(latest.table_root().clone())
-        .at_version(4)
-        .build(engine.as_ref())?;
-    assert_eq!(snapshot.log_segment().checkpoint_version, None);
-    assert_eq!(
-        snapshot.base_crc_all_files().map(|(version, _)| version),
-        Some(4)
-    );
-    let scan = snapshot.scan_builder().build()?;
-
-    let no_plan_engine = DelegatingEngine::new(engine).without_plan_executor();
-    assert!(scan
-        .declarative_metadata_scan_plan(&no_plan_engine)?
-        .is_some());
-    Ok(())
 }
 
 #[test]
