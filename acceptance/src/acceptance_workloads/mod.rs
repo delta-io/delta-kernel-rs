@@ -190,64 +190,11 @@ fn is_supported_spec_type(spec_type: &str) -> bool {
     )
 }
 
-/// Return a spec's extension-free path relative to the corpus root.
-///
-/// # Errors
-///
-/// Returns an error if `spec_path` is outside `corpus_root`, has no extension, or is not valid
-/// UTF-8.
-pub fn corpus_relative_spec_id(spec_path: &Path, corpus_root: &Path) -> Result<String, String> {
-    let relative = spec_path.strip_prefix(corpus_root).map_err(|_| {
-        format!(
-            "Spec path '{}' is outside corpus root '{}'",
-            spec_path.display(),
-            corpus_root.display()
-        )
-    })?;
-    let without_extension = relative.with_extension("");
-    if without_extension == relative {
-        return Err(format!(
-            "Spec path '{}' has no extension",
-            spec_path.display()
-        ));
-    }
-    without_extension
-        .to_str()
-        .map(|path| path.replace('\\', "/"))
-        .ok_or_else(|| format!("Spec path '{}' is not valid UTF-8", spec_path.display()))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use delta_kernel_workloads::models::Spec;
 
-    use super::{corpus_relative_spec_id, is_supported_spec_type};
-
-    #[test]
-    fn corpus_spec_id_is_exact_and_extension_free() {
-        let root = Path::new("/tmp/corpus");
-        let spec = root.join("table/specs/read_all.json");
-
-        assert_eq!(
-            corpus_relative_spec_id(&spec, root).unwrap(),
-            "table/specs/read_all"
-        );
-        assert_ne!(
-            corpus_relative_spec_id(&root.join("table/specs/read_all_extra.json"), root).unwrap(),
-            "table/specs/read_all"
-        );
-    }
-
-    #[test]
-    fn corpus_spec_id_rejects_paths_outside_root() {
-        assert!(corpus_relative_spec_id(
-            Path::new("/tmp/other/table/specs/read.json"),
-            Path::new("/tmp/corpus")
-        )
-        .is_err());
-    }
+    use super::is_supported_spec_type;
 
     #[test]
     fn loader_accepts_all_snapshot_spec_aliases() {
