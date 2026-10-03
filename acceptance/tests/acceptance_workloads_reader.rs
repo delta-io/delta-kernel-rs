@@ -8,6 +8,31 @@ use std::path::Path;
 use acceptance::acceptance_workloads::workload::execute_and_validate_workload;
 use acceptance::acceptance_workloads::{LoadedTestCase, TestCase};
 
+#[expect(
+    dead_code,
+    reason = "used by the expected-failure inventory in PR #3454"
+)]
+fn corpus_relative_spec_id(spec_path: &Path, corpus_root: &Path) -> Result<String, String> {
+    let relative = spec_path.strip_prefix(corpus_root).map_err(|_| {
+        format!(
+            "Spec path '{}' is outside corpus root '{}'",
+            spec_path.display(),
+            corpus_root.display()
+        )
+    })?;
+    let without_extension = relative.with_extension("");
+    if without_extension == relative {
+        return Err(format!(
+            "Spec path '{}' has no extension",
+            spec_path.display()
+        ));
+    }
+    without_extension
+        .to_str()
+        .map(|path| path.replace('\\', "/"))
+        .ok_or_else(|| format!("Spec path '{}' is not valid UTF-8", spec_path.display()))
+}
+
 /// Tests that cannot be executed due to test harness limitations.
 /// These fail at parse time or cause infrastructure issues (OOM, hang).
 /// All other failures (bugs, divergences, missing features) go in EXPECTED_KERNEL_FAILURES.
