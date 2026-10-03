@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rstest::rstest;
 use test_utils::add_commit;
 
-use super::LogSegment;
+use super::{CheckpointActionResolution, LogSegment};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
@@ -387,10 +387,12 @@ async fn assert_replay_resolution<E: Engine>(
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
-    assert_eq!(
-        resolution.checkpoint_action.map(|a| a.version),
-        expected_version
-    );
+    // No CRC is passed, so replay never produces a `Hint`: only `Captured` or `Unresolved`.
+    let version = match resolution.checkpoint_action {
+        CheckpointActionResolution::Captured(action) => Some(action.version),
+        CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => None,
+    };
+    assert_eq!(version, expected_version);
 }
 
 // An incremental update resolves the latest checkpoint action for the updated snapshot: a new

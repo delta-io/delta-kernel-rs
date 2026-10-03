@@ -28,6 +28,8 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
@@ -99,18 +101,22 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
-    /// The latest AMT `checkpoint` action this snapshot covers, memoized. Seeded at build time
-    /// with the action captured during P&M replay; otherwise filled lazily by
-    /// [`Snapshot::latest_checkpoint_action`] on the first log scan. `None` means no checkpoint
-    /// action in this snapshot's log segment (a classic non-AMT table, or an AMT table that has
-    /// none yet).
+    /// How this snapshot's latest AMT `checkpoint` action was resolved at build time: captured
+    /// during P&M replay, hinted by the CRC's manifest-commit pointer, or unresolved (see
+    /// [`CheckpointActionResolution`]). [`Snapshot::latest_checkpoint_action`] serves `Captured`
+    /// directly; for `Hint`/`Unresolved` it scans the log and memoizes the result in
+    /// [`Self::checkpoint_action`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_action_resolution: CheckpointActionResolution,
+    /// Memoized scan result backing [`Self::checkpoint_action_resolution`]'s `Hint`/`Unresolved`
+    /// path, so the log is scanned at most once; unused for a `Captured` resolution, which serves
+    /// its action directly. `None` means the scan found no checkpoint action in this snapshot's
+    /// log segment (a classic non-AMT table, or an AMT table that has none yet).
     ///
     /// Safe to memoize: the snapshot's `log_segment` is frozen and Delta log files are immutable,
-    /// so the scanned result cannot change for this snapshot. A checkpoint written later
-    /// belongs to a new snapshot's segment, not this one.
-    ///
-    /// Stored behind an [`Arc`] so cache hits and the returned value clone only the pointer, not
-    /// the action's inline transaction and domain-metadata vectors.
+    /// so the scanned result cannot change for this snapshot. A checkpoint written later belongs
+    /// to a new snapshot's segment, not this one. Behind an [`Arc`] so repeated calls clone
+    /// only the pointer, not the action's inline transaction and domain-metadata vectors.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     checkpoint_action: OnceLock<Option<Arc<CheckpointAction>>>,
 }
@@ -155,7 +161,7 @@ struct PreparedSnapshot {
     table_configuration: TableConfiguration,
     crc: SnapshotCrc,
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_action: Option<CheckpointAction>,
+    checkpoint_action: CheckpointActionResolution,
 }
 
 impl Snapshot {
@@ -217,7 +223,7 @@ impl Snapshot {
             skipped_new_checkpoints,
             // No replay ran on this path, so the checkpoint action is resolved on demand.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            None,
+            CheckpointActionResolution::Unresolved,
         ))
     }
 
@@ -240,7 +246,7 @@ impl Snapshot {
         crc: SnapshotCrc,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-        #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
+        #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: CheckpointActionResolution,
     ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -249,13 +255,6 @@ impl Snapshot {
             version = table_configuration.version(),
         );
         info!(parent: &span, "Created snapshot");
-        // Seed the memoized cache when replay already captured the latest action; `None` leaves the
-        // cell empty so the first accessor call settles it by scanning.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action = match checkpoint_action {
-            Some(action) => OnceLock::from(Some(Arc::new(action))),
-            None => OnceLock::new(),
-        };
         Self {
             span,
             log_segment,
@@ -264,32 +263,42 @@ impl Snapshot {
             built_as_latest,
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action,
+            checkpoint_action_resolution: checkpoint_action,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: OnceLock::new(),
         }
     }
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when this snapshot's log
     /// segment has no checkpoint action (a classic non-AMT table, or an AMT table that has none
-    /// yet). Returns the action captured during P&M replay when available; otherwise scans the log
-    /// once and memoizes a successful scan, so later calls do not re-scan (a failed scan is not
-    /// cached and is retried). Memoizing is correct because the snapshot's `log_segment` is frozen
-    /// and Delta log files are immutable.
+    /// yet). Serves the action captured during P&M replay directly; otherwise (a CRC hint, or an
+    /// unresolved build) scans the log once and memoizes a successful scan, so later calls do not
+    /// re-scan (a failed scan is not cached and is retried). Memoizing is correct because the
+    /// snapshot's `log_segment` is frozen and Delta log files are immutable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<Arc<CheckpointAction>>> {
-        if let Some(cached) = self.checkpoint_action.get() {
-            return Ok(cached.clone());
+        match &self.checkpoint_action_resolution {
+            // Captured during replay: serve it directly (cheap `Arc` clone).
+            CheckpointActionResolution::Captured(action) => Ok(Some(action.clone())),
+            // TODO(#3495): when a `Hint` is present, resolve the action from the single manifest
+            // commit it names instead of scanning the whole log. For now both scan, memoizing the
+            // result. A concurrent caller may win the race to fill the cell; both compute the same
+            // action, so either value is correct.
+            CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => {
+                if let Some(cached) = self.checkpoint_action.get() {
+                    return Ok(cached.clone());
+                }
+                let found = self
+                    .log_segment
+                    .find_last_checkpoint_action(engine)?
+                    .map(Arc::new);
+                let _ = self.checkpoint_action.set(found.clone());
+                Ok(found)
+            }
         }
-        // Not captured during replay: scan the log and memoize the result. A concurrent caller may
-        // win the race to fill the cell; both compute the same action, so either value is correct.
-        let found = self
-            .log_segment
-            .find_last_checkpoint_action(engine)?
-            .map(Arc::new);
-        let _ = self.checkpoint_action.set(found.clone());
-        Ok(found)
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -389,8 +398,9 @@ impl Snapshot {
                 metadata: Some(crc.metadata.clone()),
                 protocol: Some(crc.protocol.clone()),
                 source: *crc_source,
+                // No replay ran: hint from the CRC's manifest-commit pointer when present.
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action: None,
+                checkpoint_action: CheckpointActionResolution::from_crc(crc),
             },
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())

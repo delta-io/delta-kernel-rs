@@ -9,6 +9,8 @@ use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::cancellation::CancellationTokenRef;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -270,8 +272,9 @@ impl Snapshot {
                     metadata: new_metadata,
                     protocol: new_protocol,
                     source: *source,
+                    // No replay ran: hint from the CRC's manifest-commit pointer when present.
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action: None,
+                    checkpoint_action: CheckpointActionResolution::from_crc(crc),
                 }
             }
             None => {

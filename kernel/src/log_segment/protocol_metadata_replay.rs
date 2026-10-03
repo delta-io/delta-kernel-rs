@@ -12,7 +12,7 @@ use super::LogSegment;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::CHECKPOINT_ACTION_NAME;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
+use crate::actions::{CheckpointAction, LastManifestCommit, CHECKPOINT_ACTION_FIELD};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
@@ -48,9 +48,10 @@ impl LogSegment {
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
     ///
-    /// Under `adaptive-metadata-in-dev`, the result's `checkpoint_action` carries the latest AMT
-    /// checkpoint action captured by replay, or `None` when replay did not settle it, for the
-    /// caller to store on the [`Snapshot`](crate::Snapshot).
+    /// Under `adaptive-metadata-in-dev`, the result's `checkpoint_action` is a
+    /// [`CheckpointActionResolution`] describing how the latest AMT checkpoint action was resolved
+    /// (captured by replay, hinted by the CRC, or unresolved), for the caller to store on the
+    /// [`Snapshot`](crate::Snapshot).
     #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
@@ -64,10 +65,10 @@ impl LogSegment {
                 metadata: Some(crc.metadata.clone()),
                 protocol: Some(crc.protocol.clone()),
                 source: ProtocolMetadataSource::CrcAtTarget,
-                // No replay ran, so the checkpoint action is unresolved.
-                // TODO: Leverage lastManifestCommit from the CRC
+                // No replay ran: use the CRC's manifest-commit pointer as a hint when present, so a
+                // consumer can resolve the latest checkpoint action without a full log scan.
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action: None,
+                checkpoint_action: CheckpointActionResolution::from_crc(crc),
             });
         }
 
@@ -99,10 +100,11 @@ impl LogSegment {
                 .filter(|(v, _)| *v > crc.version as i64)
                 .map(|(_, p)| p);
             // The pruned replay only reads commits after the CRC version, but a hit there is still
-            // the latest action: any action at or below the CRC is older. A miss stays `None`
+            // the latest action: any action at or below the CRC is older. A miss stays `Unresolved`
             // because the latest action may sit at or below the CRC, which this replay never reads.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let checkpoint_action = candidate.checkpoint.map(|(_, c)| c);
+            let checkpoint_action =
+                CheckpointActionResolution::from_replay(candidate.checkpoint.map(|(_, c)| c));
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -135,7 +137,9 @@ impl LogSegment {
             protocol: candidate.protocol.map(|(_, p)| p),
             source: ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: candidate.checkpoint.map(|(_, c)| c),
+            checkpoint_action: CheckpointActionResolution::from_replay(
+                candidate.checkpoint.map(|(_, c)| c),
+            ),
         })
     }
 
@@ -288,17 +292,62 @@ impl LogSegment {
     }
 }
 
+/// How the latest AMT `checkpoint` action was resolved during P&M replay, stored on the
+/// [`Snapshot`](crate::Snapshot) so consumers can read it without re-scanning the log.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug)]
+pub(crate) enum CheckpointActionResolution {
+    /// The latest `checkpoint` action, captured during replay.
+    Captured(Arc<CheckpointAction>),
+    /// Not captured, but the CRC carries a [`LastManifestCommit`] pointer to the commit that
+    /// emitted the latest checkpoint action, letting a consumer resolve it from that one commit
+    /// instead of a full log scan.
+    //
+    // TODO(#3495): the pointer is carried but not yet read -- `Snapshot::latest_checkpoint_action`
+    // still falls back to a full scan on `Hint`. Resolving the action from the pointed commit will
+    // consume it; `#[allow(dead_code)]` holds the field until then.
+    Hint(#[allow(dead_code)] LastManifestCommit),
+    /// Replay did not settle it and no pointer is available -- a miss, which does not prove
+    /// absence since replay can stop early. Consumers fall back to a log scan.
+    Unresolved,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl CheckpointActionResolution {
+    /// Resolves a replay's checkpoint-action find. A hit is the latest action: replay keeps the
+    /// highest `checkpointMetadata.version` across the batches it reaches, and checkpoint versions
+    /// strictly increase, so an earlier-stopping replay can only skip older actions. A miss does
+    /// not prove absence (the action may sit in a batch the replay stopped before, or at/below a
+    /// seeding CRC version), so it stays [`Unresolved`](Self::Unresolved) for the accessor to
+    /// settle by scanning.
+    fn from_replay(checkpoint: Option<CheckpointAction>) -> Self {
+        match checkpoint {
+            Some(action) => Self::Captured(Arc::new(action)),
+            None => Self::Unresolved,
+        }
+    }
+
+    /// Resolves from a CRC that short-circuits replay: its [`LastManifestCommit`] pointer, when
+    /// present, becomes a [`Hint`](Self::Hint); otherwise there is nothing to go on and it is
+    /// [`Unresolved`](Self::Unresolved).
+    pub(crate) fn from_crc(crc: &Crc) -> Self {
+        match &crc.last_manifest_commit_opt {
+            Some(hint) => Self::Hint(hint.clone()),
+            None => Self::Unresolved,
+        }
+    }
+}
+
 /// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
 pub(crate) struct PmResolution {
     pub(crate) metadata: Option<Metadata>,
     pub(crate) protocol: Option<Protocol>,
     /// How the Protocol and Metadata were resolved.
     pub(crate) source: ProtocolMetadataSource,
-    /// The latest AMT `checkpoint` action captured during replay, or `None` when replay did not
-    /// settle it (a miss, which does not prove absence since replay can stop early, or the
-    /// CRC-at-target path that runs no replay); consumers then fall back to a log scan.
+    /// How the latest AMT `checkpoint` action was resolved: captured during replay, hinted by the
+    /// CRC's manifest-commit pointer, or unresolved. See [`CheckpointActionResolution`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) checkpoint_action: Option<CheckpointAction>,
+    pub(crate) checkpoint_action: CheckpointActionResolution,
 }
 
 /// Protocol and Metadata, each tagged with the version it was found at. Holds both a single
