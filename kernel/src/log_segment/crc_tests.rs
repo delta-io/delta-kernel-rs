@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use super::CheckpointActionResolution;
 use super::LogSegment;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::CheckpointAction;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
     try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
@@ -512,7 +512,7 @@ impl BuiltCrcTest {
     /// Lists the log, reads the latest on-disk CRC, and runs the unchecked P&M replay, returning
     /// how it resolved the latest AMT `checkpoint` action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn checkpoint_action_resolution(&self) -> CheckpointActionResolution {
+    fn checkpoint_action_resolution(&self) -> Option<CheckpointAction> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
@@ -819,7 +819,7 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
         .await
         .checkpoint_action_resolution();
     assert!(
-        matches!(resolution, CheckpointActionResolution::Captured(a) if a.version == 1),
+        matches!(resolution, Some(a) if a.version == 1),
         "a checkpoint action after the CRC is the latest and must be captured, not deferred"
     );
 }
@@ -848,7 +848,7 @@ async fn test_crc_at_target_leaves_checkpoint_action_unresolved() {
         .build()
         .await
         .checkpoint_action_resolution();
-    assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+    assert!(resolution.is_none());
 }
 
 // A CRC-seeded pruned replay that resolves P&M from standalone actions but finds no checkpoint
@@ -888,7 +888,7 @@ async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
         .build()
         .await
         .checkpoint_action_resolution();
-    assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+    assert!(resolution.is_none());
 }
 
 #[tokio::test]

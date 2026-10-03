@@ -28,8 +28,6 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
@@ -153,7 +151,7 @@ struct ResolvedTableConfiguration {
     table_configuration: TableConfiguration,
     crc: Option<Arc<Crc>>,
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_action: CheckpointActionResolution,
+    checkpoint_action: Option<CheckpointAction>,
 }
 
 /// The same as [`ResolvedTableConfiguration`] but with a validated [`SnapshotCrc`], ready to build
@@ -162,7 +160,7 @@ struct PreparedSnapshot {
     table_configuration: TableConfiguration,
     crc: SnapshotCrc,
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_action: CheckpointActionResolution,
+    checkpoint_action: Option<CheckpointAction>,
 }
 
 impl Snapshot {
@@ -224,7 +222,7 @@ impl Snapshot {
             skipped_new_checkpoints,
             // No replay ran on this path, so the checkpoint action is resolved on demand.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            CheckpointActionResolution::Unresolved,
+            None,
         ))
     }
 
@@ -247,7 +245,7 @@ impl Snapshot {
         crc: SnapshotCrc,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-        #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: CheckpointActionResolution,
+        #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
     ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -256,12 +254,12 @@ impl Snapshot {
             version = table_configuration.version(),
         );
         info!(parent: &span, "Created snapshot");
-        // Seed the memoized cache when replay already captured the latest action; an `Unresolved`
-        // resolution leaves the cell empty so the first accessor call settles it by scanning.
+        // Seed the memoized cache when replay already captured the latest action; `None` leaves the
+        // cell empty so the first accessor call settles it by scanning.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action = match checkpoint_action {
-            CheckpointActionResolution::Captured(action) => OnceLock::from(Some(*action)),
-            CheckpointActionResolution::Unresolved => OnceLock::new(),
+            Some(action) => OnceLock::from(Some(action)),
+            None => OnceLock::new(),
         };
         Self {
             span,
@@ -404,7 +402,7 @@ impl Snapshot {
                     (crc.metadata.clone(), crc.protocol.clone(), *crc_source);
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 {
-                    checkpoint_action = CheckpointActionResolution::Unresolved;
+                    checkpoint_action = None;
                 }
             }
             None => {

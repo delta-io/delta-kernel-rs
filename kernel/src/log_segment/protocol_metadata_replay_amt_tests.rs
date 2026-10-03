@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rstest::rstest;
 use test_utils::add_commit;
 
-use super::{CheckpointActionResolution, LogSegment};
+use super::LogSegment;
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
@@ -257,7 +257,7 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
 // A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot:
 // `Snapshot::latest_checkpoint_action` returns `Some` with the action's version when a commit
 // carries one, and `None` when P&M come from standalone actions (a replay miss leaves the
-// resolution `Unresolved`, so the accessor scans and still resolves `None`).
+// resolution unset, so the accessor scans and still resolves `None`).
 #[rstest]
 #[case::commit_carries_checkpoint_action(checkpoint_commit(0, &[], one_column_schema()), Some(0))]
 #[case::standalone_pm_has_no_checkpoint_action(standalone_pm_commit(one_column_schema()), None)]
@@ -293,7 +293,7 @@ async fn assert_latest_checkpoint_action<E: Engine>(
 }
 
 // A snapshot built without P&M replay (`Snapshot::new`) leaves its checkpoint-action resolution
-// `Unresolved`, so `latest_checkpoint_action` resolves lazily by scanning the log, including the
+// unset, so `latest_checkpoint_action` resolves lazily by scanning the log, including the
 // root manifest path.
 #[tokio::test]
 async fn latest_checkpoint_action_scans_when_resolution_unknown() {
@@ -362,7 +362,7 @@ async fn assert_replay_captures_checkpoint_action<E: Engine>(
     assert!(
         matches!(
             resolution.checkpoint_action,
-            CheckpointActionResolution::Captured(action) if action.version == 0
+            Some(action) if action.version == 0
         ),
         "replay should capture the checkpoint action, not defer to a scan"
     );
@@ -414,7 +414,7 @@ async fn assert_older_batch_checkpoint_action_captured<E: Engine>(
     assert!(
         matches!(
             resolution.checkpoint_action,
-            CheckpointActionResolution::Captured(action) if action.version == 0
+            Some(action) if action.version == 0
         ),
         "the checkpoint action in the older batch must be captured even though the newest commit \
          finalized Metadata"
