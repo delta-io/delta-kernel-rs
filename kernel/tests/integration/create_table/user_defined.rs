@@ -72,7 +72,7 @@ fn create_udt_rejects_column_metadata(
 
 #[rstest]
 #[case::v1("delta.enableIcebergCompatV1", "Setting delta property")]
-#[case::v2("delta.enableIcebergCompatV2", "Setting delta property")]
+#[case::v2("delta.enableIcebergCompatV2", "does not support type at column")]
 #[case::v3("delta.enableIcebergCompatV3", "does not support type at column")]
 fn create_udt_rejects_iceberg_compat(
     #[case] property: &str,
