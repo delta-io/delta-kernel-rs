@@ -996,6 +996,12 @@ pub(crate) mod tests {
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
+            .join("00000000000000000008.checkpoint.0000000001.+000000002.parquet")
+            .unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
+
+        let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.000000002.parquet")
             .unwrap();
         let log_path = ParsedLogPath::try_from(log_path).unwrap();
@@ -1034,6 +1040,12 @@ pub(crate) mod tests {
         ));
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
+
+        let signed_hi = format!("+{:019}", 15);
+        let signed_filename = format!("00000000000000000008.{signed_hi}.compacted.json");
+        let log_path = table_log_dir.join(&signed_filename).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         // invalid extension
         let log_path = table_log_dir
