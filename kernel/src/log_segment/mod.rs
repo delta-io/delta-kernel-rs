@@ -870,8 +870,9 @@ impl LogSegment {
     }
 
     /// Scan this segment's log newest-first for the latest AMT `checkpoint` action, returning
-    /// `None` for a classic (non-AMT) table whose checkpoints lack the action. The first action
-    /// found is the latest, since the files are read in descending version order.
+    /// `None` when the segment has no checkpoint action (a classic non-AMT table, or an AMT table
+    /// that has none yet). The first action found is the latest, since the files are read in
+    /// descending version order.
     ///
     /// This opens log files until an action is found. TODO: once commitInfo carries a pointer to
     /// the latest checkpoint action (delta-io/delta#7533), resolve this by opening at most two log
@@ -880,7 +881,7 @@ impl LogSegment {
     /// # Errors
     /// Returns an error if the log cannot be read or a checkpoint action fails to parse.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn latest_checkpoint_action(
+    pub(crate) fn find_last_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<CheckpointAction>> {

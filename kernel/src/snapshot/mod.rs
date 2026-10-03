@@ -101,14 +101,18 @@ pub struct Snapshot {
     skipped_new_checkpoints: bool,
     /// The latest AMT `checkpoint` action this snapshot covers, memoized. Seeded at build time
     /// with the action captured during P&M replay; otherwise filled lazily by
-    /// [`Snapshot::latest_checkpoint_action`] on the first log scan. `None` means a classic
-    /// (non-AMT) table with no such action.
+    /// [`Snapshot::latest_checkpoint_action`] on the first log scan. `None` means no checkpoint
+    /// action in this snapshot's log segment (a classic non-AMT table, or an AMT table that has
+    /// none yet).
     ///
     /// Safe to memoize: the snapshot's `log_segment` is frozen and Delta log files are immutable,
     /// so the scanned result cannot change for this snapshot. A checkpoint written later
     /// belongs to a new snapshot's segment, not this one.
+    ///
+    /// Stored behind an [`Arc`] so cache hits and the returned value clone only the pointer, not
+    /// the action's inline transaction and domain-metadata vectors.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_action: OnceLock<Option<CheckpointAction>>,
+    checkpoint_action: OnceLock<Option<Arc<CheckpointAction>>>,
 }
 
 impl PartialEq for Snapshot {
@@ -249,7 +253,7 @@ impl Snapshot {
         // cell empty so the first accessor call settles it by scanning.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action = match checkpoint_action {
-            Some(action) => OnceLock::from(Some(action)),
+            Some(action) => OnceLock::from(Some(Arc::new(action))),
             None => OnceLock::new(),
         };
         Self {
@@ -264,21 +268,26 @@ impl Snapshot {
         }
     }
 
-    /// The latest AMT `checkpoint` action this snapshot covers, or `None` for a classic (non-AMT)
-    /// table. Returns the action captured during P&M replay when available; otherwise scans the log
-    /// once and memoizes the result, so repeated calls do not re-scan. Memoizing a single scan is
-    /// correct because the snapshot's `log_segment` is frozen and Delta log files are immutable.
+    /// The latest AMT `checkpoint` action this snapshot covers, or `None` when this snapshot's log
+    /// segment has no checkpoint action (a classic non-AMT table, or an AMT table that has none
+    /// yet). Returns the action captured during P&M replay when available; otherwise scans the log
+    /// once and memoizes a successful scan, so later calls do not re-scan (a failed scan is not
+    /// cached and is retried). Memoizing is correct because the snapshot's `log_segment` is frozen
+    /// and Delta log files are immutable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,
-    ) -> Result<Option<CheckpointAction>> {
+    ) -> Result<Option<Arc<CheckpointAction>>> {
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
         // Not captured during replay: scan the log and memoize the result. A concurrent caller may
         // win the race to fill the cell; both compute the same action, so either value is correct.
-        let found = self.log_segment.latest_checkpoint_action(engine)?;
+        let found = self
+            .log_segment
+            .find_last_checkpoint_action(engine)?
+            .map(Arc::new);
         let _ = self.checkpoint_action.set(found.clone());
         Ok(found)
     }

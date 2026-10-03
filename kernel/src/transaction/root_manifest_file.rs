@@ -1,5 +1,7 @@
 //! Commits a caller-supplied root manifest file as the table's content root.
 
+use std::sync::Arc;
+
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
@@ -101,7 +103,7 @@ impl RootManifestFile {
     ) -> Result<(
         DomainMetadataMap,
         SetTransactionMap,
-        Option<CheckpointAction>,
+        Option<Arc<CheckpointAction>>,
     )> {
         let snapshot = self.read_snapshot.as_ref();
         let crc = snapshot.crc_at_version();
