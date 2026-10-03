@@ -8,10 +8,7 @@ struct ContainsUdt;
 impl<'a> SchemaTransform<'a> for ContainsUdt {
     transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
-    fn transform_user_defined(
-        &mut self,
-        _: &'a UserDefinedType,
-    ) -> std::result::Result<(), ()> {
+    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> std::result::Result<(), ()> {
         Err(())
     }
 }

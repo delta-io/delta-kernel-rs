@@ -1465,13 +1465,13 @@ mod tests {
     )]
     #[cfg_attr(feature = "udt-in-dev", case::udt_physical_features(
         schema_ref! {
-            nullable "value": (crate::schema::UserDefinedType {
-                sql_type: Box::new(DataType::from(schema! {
+            nullable "value": (crate::schema::UserDefinedType::try_new(
+                DataType::from(schema! {
                     nullable "v": unshredded_variant(),
                     nullable "ts": TIMESTAMP_NTZ,
-                })),
-                annotation: Default::default(),
-            }),
+                }),
+                Default::default(),
+            ).unwrap()),
         },
         &[TableFeature::VariantType, TableFeature::TimestampWithoutTimezone],
     ))]
