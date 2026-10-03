@@ -17,6 +17,14 @@ target_compile_options(read_table PUBLIC)
 
 # Add the test
 include(CTest)
+add_executable(udt_annotation_test udt_annotation_test.c ../common/kernel_utils.c)
+target_compile_definitions(udt_annotation_test PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
+target_include_directories(udt_annotation_test PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_directories(udt_annotation_test PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
+target_link_libraries(udt_annotation_test PUBLIC delta_kernel_ffi)
+add_test(NAME udt_annotation_bytes COMMAND udt_annotation_test)
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
