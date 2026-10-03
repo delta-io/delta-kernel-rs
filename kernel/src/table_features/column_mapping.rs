@@ -584,6 +584,7 @@ fn flat_cm_info_for_nested_data_type(data_type: &DataType, max_id: &mut i64) -> 
         }
         // Primitive and Variant types don't contain nested struct fields - return as-is
         DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+        DataType::UserDefined(_) => Ok(data_type.clone()),
     }
 }
 
@@ -640,6 +641,7 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> Result<StructT
                 )))
             }
             DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+            DataType::UserDefined(_) => Ok(data_type.clone()),
         }
     }
 
@@ -909,12 +911,53 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_name, ColumnName};
-    use crate::schema::{schema, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{
+        schema, DataType, MetadataValue, StructField, StructType, UserDefinedType,
+    };
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm, MockTableConfigurationBuilder,
     };
     use crate::utils::FoldWithOption as _;
+
+    #[rstest::rstest]
+    fn test_udt_column_mapping_preserves_sql_type(
+        #[values(ColumnMappingMode::Name, ColumnMappingMode::Id)] mode: ColumnMappingMode,
+        #[values(false, true)] assign_nested_field_ids: bool,
+    ) {
+        let sql_type = schema! {
+            nullable "kind": BYTE,
+            nullable "values": (ArrayType::new(DataType::DOUBLE, false)),
+            nullable "labels": (MapType::new(DataType::STRING, DataType::LONG, true)),
+        };
+        let udt = UserDefinedType::try_new(
+            sql_type,
+            [("class".into(), Some("example.Vector".into()))].into(),
+        )
+        .unwrap();
+        let schema = schema! { nullable "value": (udt.clone()) };
+        let mut max_id = 0;
+        let mapped =
+            assign_column_mapping_metadata(&schema, &mut max_id, assign_nested_field_ids).unwrap();
+        assert_eq!(max_id, 1);
+        validate_schema_column_mapping(&mapped, mode).unwrap();
+        let field = mapped.field("value").unwrap();
+        assert_eq!(
+            field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(&MetadataValue::Number(1))
+        );
+        assert!(field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+            .is_none());
+        let physical = field.make_physical(mode).unwrap();
+        assert_ne!(physical.name(), "value");
+        assert_eq!(physical.name(), field.physical_name(mode));
+        assert_eq!(
+            physical.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+            Some(&MetadataValue::Number(1))
+        );
+        assert_eq!(physical.data_type(), &DataType::from(udt));
+    }
 
     #[test]
     fn test_column_mapping_mode() {

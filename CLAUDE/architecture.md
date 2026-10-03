@@ -101,6 +101,21 @@ commit actions, and delegates the atomic commit to a `Committer`.
   filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
   for catalog-managed tables (staging, ratifying, publishing).
 
+## User-Defined Types
+
+`DataType::UserDefined(UserDefinedType)` stores an engine-defined annotation alongside a physical
+`sql_type`. UDTs require no cargo or table feature. Arrow conversion and physical reads use
+`sql_type`; schema serialization and write-state transport preserve the annotation.
+
+Generic schema transforms, column mapping, and statistics treat the UDT wrapper as a leaf.
+Feature detection explicitly descends into `sql_type`. Logical equality compares the complete
+physical type and annotations; use it for exact schema matching and preservation assertions.
+Directional `can_read_as` / `can_read_as_without_type_widening` checks require exact UDT equality,
+including the complete physical type and annotations. They validate schema compatibility without
+converting data. Ordinary CDF and plan unions use equality; row-tracking CDF uses compatibility
+without type widening, retaining nullable additions and relaxed outer nullability around unchanged
+UDTs. Both CDF modes reject annotation changes to existing UDTs.
+
 ## Engine Trait System
 
 The kernel is built around the `Engine` trait (`kernel/src/lib.rs`), which provides the required

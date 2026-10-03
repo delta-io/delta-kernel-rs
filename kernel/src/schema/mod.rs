@@ -39,7 +39,10 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod udt_utils;
+mod user_defined;
 pub(crate) mod validation;
+pub use user_defined::UserDefinedType;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
@@ -519,9 +522,8 @@ impl StructField {
     ///
     /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
     /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
-    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
-    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
-    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
+    /// - `Err(_)` -- `CURRENT_DEFAULT` is not a [`MetadataValue::String`], or the declared type
+    ///   rejects the default: any UDT default (including `NULL`) or a non-`NULL` Variant default.
     pub fn column_default(&self) -> Result<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
             None => return Ok(None),
@@ -1288,6 +1290,7 @@ impl StructType {
             // Primitive types cannot contain nested metadata columns and variant types are
             // validated at creation
             DataType::Primitive(_) | DataType::Variant(_) => {}
+            DataType::UserDefined(_) => {}
         };
 
         Ok(())
@@ -2258,6 +2261,11 @@ pub enum DataType {
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
     #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
+    /// An engine annotation over a physical Delta type.
+    /// Retains logical type information in schemas; physical operations use the enclosed
+    /// `sql_type`. See [`UserDefinedType`] for a schema example.
+    #[from(UserDefinedType)]
+    UserDefined(UserDefinedType),
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -2320,6 +2328,9 @@ impl<'de> serde::Deserialize<'de> for DataType {
                     "map" => MapType::deserialize(value)
                         .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
+                    "udt" => UserDefinedType::deserialize(value)
+                        .map(DataType::UserDefined)
+                        .map_err(Error::custom),
                     _ => Err(unsupported_delta_type_error(type_str)),
                 };
             }
@@ -2397,6 +2408,7 @@ impl DataType {
             Self::Struct(_) => "struct".to_string(),
             Self::Map(_) => "map".to_string(),
             Self::Variant(_) => "variant".to_string(),
+            Self::UserDefined(_) => "udt".to_string(),
         }
     }
 
@@ -2510,6 +2522,7 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
+            DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
         }
     }
 }
@@ -2666,6 +2679,14 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
         Ok(Cow::Borrowed(stype))
+    }
+
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a UserDefinedType,
+    ) -> Result<Cow<'a, UserDefinedType>> {
+        // Column mapping applies to the enclosing field; sqlType uses its own field names.
+        Ok(Cow::Borrowed(udt))
     }
 }
 

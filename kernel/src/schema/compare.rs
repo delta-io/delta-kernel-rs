@@ -50,17 +50,29 @@ pub(crate) enum Error {
 /// A [`std::result::Result`] that has the schema comparison [`Error`] as the error variant.
 pub(crate) type SchemaComparisonResult = Result<(), Error>;
 
-/// Represents a schema compatibility check for the type. If `self` can be read as `read_type`,
-/// this function returns `Ok(())`. Otherwise, this function returns `Err`.
+/// Checks whether data described by a source schema can be read using a target schema.
+///
+/// Use this directional check when nullable additions or relaxed nullability are acceptable.
+/// Use ordinary equality when the complete logical schemas, including UDT annotations, must match.
+/// These methods validate compatibility; they do not convert data or modify either schema.
 pub(crate) trait SchemaComparison {
+    /// Returns `Ok(())` when `self` can be read as `read_type`, allowing supported type widening.
+    /// Returns a comparison error for incompatible fields or types. UDTs require exact equality
+    /// of both the complete physical type and annotations.
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
         self.can_read_as_internal(read_type, true)
     }
 
+    /// Returns `Ok(())` when `self` can be read as `read_type` without type widening.
+    /// Nullable additions and relaxed nullability are allowed. UDTs require exact equality,
+    /// including annotations; incompatible schemas return an error.
     fn can_read_as_without_type_widening(&self, read_type: &Self) -> SchemaComparisonResult {
         self.can_read_as_internal(read_type, false)
     }
 
+    /// Implements recursive compatibility with the caller's `allow_type_widening` policy.
+    /// Callers use the wrapper methods to select that policy; implementations propagate it to
+    /// nested comparisons and return an error when `self` cannot be read as `read_type`.
     fn can_read_as_internal(
         &self,
         read_type: &Self,
@@ -166,6 +178,9 @@ impl SchemaComparison for DataType {
     ///     3. For array data types, the nullability may not be tightened in the `read_type`. See
     ///        [`Nullable::can_read_as`]
     ///
+    /// UDTs require identical complete physical types and annotations, even when
+    /// `allow_type_widening` is enabled.
+    ///
     /// [`PrimitiveType::can_widen_to`]: super::PrimitiveType::can_widen_to
     fn can_read_as_internal(
         &self,
@@ -197,7 +212,7 @@ impl SchemaComparison for DataType {
                     .value_type()
                     .can_read_as_internal(read_map.value_type(), allow_type_widening)?;
             }
-            // Exact match
+            // Exact match, including UDT annotations.
             (a, b) if a == b => {}
             // Type widening: smaller primitive types can be read as larger ones
             (Self::Primitive(a), Self::Primitive(b))
@@ -252,6 +267,42 @@ mod tests {
         };
 
         assert!(schema.can_read_as(&schema).is_ok());
+    }
+
+    #[rstest]
+    #[case::to_udt(false, true)]
+    #[case::from_udt(true, false)]
+    #[case::inside_udt(true, true)]
+    fn udt_type_widening_is_rejected(
+        #[case] source_udt: bool,
+        #[case] target_udt: bool,
+        #[values("primitive", "struct", "array", "map")] physical_layout: &str,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
+        let wrap = |value, is_udt| {
+            let sql_type = match physical_layout {
+                "primitive" => value,
+                "struct" => schema! { nullable "inner": (value) }.into(),
+                "array" => ArrayType::new(value, true).into(),
+                "map" => MapType::new(DataType::STRING, value, true).into(),
+                _ => unreachable!(),
+            };
+            if is_udt {
+                crate::schema::UserDefinedType::try_new(sql_type, Default::default())
+                    .unwrap()
+                    .into()
+            } else {
+                sql_type
+            }
+        };
+        assert!(matches!(
+            mode.can_read_as(
+                &wrap(DataType::INTEGER, source_udt),
+                &wrap(DataType::LONG, target_udt)
+            ),
+            Err(Error::TypeMismatch)
+        ));
     }
     #[rstest]
     fn add_nullable_column_to_map_key_and_value(
