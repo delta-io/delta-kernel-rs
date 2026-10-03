@@ -37,6 +37,7 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 criterion = "0.5"
+rstest = "0.23"
 tempfile = "3"
 
 [[bench]]
