@@ -512,7 +512,7 @@ fn get_indices(
             let requested_type = requested_field.data_type();
             #[cfg(feature = "udt-in-dev")]
             let requested_type = match requested_type {
-                DataType::UserDefined(udt) => udt.sql_type.as_ref(),
+                DataType::UserDefined(udt) => udt.sql_type(),
                 data_type => data_type,
             };
             // If the field is a variant, make sure the parquet schema matches the unshredded

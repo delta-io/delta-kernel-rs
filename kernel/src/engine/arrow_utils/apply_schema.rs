@@ -367,8 +367,8 @@ fn apply_schema_to_inner(
     let array: ArrayRef = match schema {
         #[cfg(feature = "udt-in-dev")]
         UserDefined(udt) => {
-            ensure_data_types(&udt.sql_type, array.data_type(), ValidationMode::TypesOnly)?;
-            apply_schema_to_inner(array, &udt.sql_type, None, "")?
+            ensure_data_types(udt.sql_type(), array.data_type(), ValidationMode::TypesOnly)?;
+            apply_schema_to_inner(array, udt.sql_type(), None, "")?
         }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
@@ -427,10 +427,8 @@ mod apply_schema_validation_tests {
     ) {
         let physical: ArrowDataType = (&physical).try_into_arrow().unwrap();
         let input = crate::arrow::array::new_empty_array(&physical);
-        let udt = crate::schema::UserDefinedType {
-            sql_type: Box::new(logical.clone()),
-            annotation: Default::default(),
-        };
+        let udt =
+            crate::schema::UserDefinedType::try_new(logical.clone(), Default::default()).unwrap();
         let output = apply_schema_to(&input, &DataType::from(udt)).unwrap();
         let expected: ArrowDataType = (&logical).try_into_arrow().unwrap();
         assert_eq!(output.data_type(), &expected);
@@ -440,10 +438,7 @@ mod apply_schema_validation_tests {
     #[rstest]
     fn apply_schema_rejects_udt_struct_field_count_mismatch(#[values(1, 3)] count: usize) {
         let sql_type = DataType::from(schema! { nullable "x": LONG, nullable "y": LONG });
-        let udt = crate::schema::UserDefinedType {
-            sql_type: Box::new(sql_type),
-            annotation: Default::default(),
-        };
+        let udt = crate::schema::UserDefinedType::try_new(sql_type, Default::default()).unwrap();
         let fields: Fields = (0..count)
             .map(|i| ArrowField::new(format!("field{i}"), ArrowDataType::Int64, false))
             .collect();

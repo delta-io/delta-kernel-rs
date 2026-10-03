@@ -74,10 +74,9 @@ fn test_array_column() {
 #[case(KernelDataType::from(ArrayType::new(KernelDataType::LONG, true)))]
 #[case(KernelDataType::from(MapType::new(KernelDataType::STRING, KernelDataType::LONG, true)))]
 fn null_udt_scalar_uses_physical_type(#[case] sql_type: KernelDataType) {
-    let udt = KernelDataType::from(crate::schema::UserDefinedType {
-        sql_type: Box::new(sql_type.clone()),
-        annotation: Default::default(),
-    });
+    let udt = KernelDataType::from(
+        crate::schema::UserDefinedType::try_new(sql_type.clone(), Default::default()).unwrap(),
+    );
     let array = Scalar::null(udt.clone()).to_array(3).unwrap();
     let expected = Scalar::null(sql_type).to_array(3).unwrap();
     assert_eq!(array.as_ref(), expected.as_ref());

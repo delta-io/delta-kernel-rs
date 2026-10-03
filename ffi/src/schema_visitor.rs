@@ -881,10 +881,9 @@ pub unsafe extern "C" fn visit_field_user_defined(
         let name = unsafe { name.try_to_string() }?;
         let annotation = unsafe { annotation.try_to_hash_map() }?;
         let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
-        let physical = unwrap_field(state, sql_type_id)
-            .ok_or_else(|| {
-                KernelError::schema(format!("Invalid UDT physical type ID {sql_type_id}"))
-            })?;
+        let physical = unwrap_field(state, sql_type_id).ok_or_else(|| {
+            KernelError::schema(format!("Invalid UDT physical type ID {sql_type_id}"))
+        })?;
         let udt = delta_kernel::schema::UserDefinedType::try_new(
             physical.data_type,
             annotation.into_iter().collect(),
