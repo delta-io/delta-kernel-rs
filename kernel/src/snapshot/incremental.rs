@@ -258,8 +258,6 @@ impl Snapshot {
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        // The CRC-reuse arm runs no replay, so it reports the checkpoint action as unresolved
-        // (`None`); only the P&M-replay arm can resolve it.
         let resolution = match &crc_at_version {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
@@ -291,19 +289,12 @@ impl Snapshot {
                     .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?
             }
         };
-        let PmResolution {
-            metadata: new_metadata,
-            protocol: new_protocol,
-            source,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action,
-        } = resolution;
-        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
 
         let table_configuration = TableConfiguration::try_new_from(
             existing_table_config,
-            new_metadata,
-            new_protocol,
+            resolution.metadata,
+            resolution.protocol,
             new_end_version,
         )?;
 
@@ -323,7 +314,7 @@ impl Snapshot {
             built_as_latest,
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action,
+            resolution.checkpoint_action,
         );
         Ok(Arc::new(snapshot))
     }
