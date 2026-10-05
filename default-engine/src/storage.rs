@@ -50,7 +50,9 @@ pub fn insert_url_handler(
 /// # use delta_kernel_default_engine::storage::store_from_url;
 /// # use delta_kernel::Result;
 /// # fn example() -> Result<()> {
-/// let url = Url::parse("file:///path/to/table")?;
+/// let url = Url::parse("file:///path/to/table")
+///     .map_err(delta_kernel::KernelError::from)
+///     .map_err(delta_kernel::Error::Kernel)?;
 /// let store = store_from_url(&url)?;
 /// # Ok(())
 /// # }
@@ -74,7 +76,9 @@ pub fn store_from_url(url: &Url) -> delta_kernel::Result<Arc<dyn ObjectStore>> {
 /// # use delta_kernel_default_engine::storage::store_from_url_opts;
 /// # use delta_kernel::Result;
 /// # fn example() -> Result<()> {
-/// let url = Url::parse("s3://my-bucket/path/to/table")?;
+/// let url = Url::parse("s3://my-bucket/path/to/table")
+///     .map_err(delta_kernel::KernelError::from)
+///     .map_err(delta_kernel::Error::Kernel)?;
 /// let options = HashMap::from([("region", "us-west-2")]);
 /// let store = store_from_url_opts(&url, options)?;
 /// # Ok(())
@@ -97,12 +101,15 @@ where
                 .into_iter()
                 .map(|(k, v)| (k.as_ref().to_string(), v.into()))
                 .collect();
-            handler(url, options)?
+            handler(url, options)
+                .map_err(|err| delta_kernel::Error::Kernel(DeltaError::from(err)))?
         } else {
-            object_store::parse_url_opts(url, options)?
+            object_store::parse_url_opts(url, options)
+                .map_err(|err| delta_kernel::Error::Kernel(DeltaError::from(err)))?
         }
     } else {
-        object_store::parse_url_opts(url, options)?
+        object_store::parse_url_opts(url, options)
+            .map_err(|err| delta_kernel::Error::Kernel(DeltaError::from(err)))?
     };
 
     Ok(Arc::new(store))
@@ -166,10 +173,9 @@ mod tests {
         // to connect to, so the only way to really verify that we got the object store we
         // expected is to inspect the `store` on the error v_v
         match store_from_url_opts(&url, options) {
-            Err(delta_kernel::KernelError::ObjectStore(object_store::Error::Generic {
-                store,
-                source: _,
-            })) => {
+            Err(delta_kernel::Error::Kernel(delta_kernel::KernelError::ObjectStore(
+                object_store::Error::Generic { store, source: _ },
+            ))) => {
                 assert_eq!(store, "HdfsObjectStore");
             }
             Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),

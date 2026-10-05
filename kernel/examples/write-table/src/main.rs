@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{Engine, KernelError, Result, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> Result<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
@@ -72,12 +72,16 @@ async fn try_main() -> Result<()> {
         })?;
     }
 
-    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
     use delta_kernel_default_engine::storage::store_from_url;
-    let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
+    let engine = DefaultEngineBuilder::new(
+        store_from_url(&url).map_err(delta_kernel::Error::into_kernel_error)?,
+    )
+    .build();
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
@@ -88,14 +92,23 @@ async fn try_main() -> Result<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
+        .transaction(committer, &engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
 
     // This example assumes the table is unpartitioned.
-    let write_context = txn.write_state()?.write_context_builder().build()?;
-    let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
+    let write_context = txn
+        .write_state()
+        .map_err(delta_kernel::Error::into_kernel_error)?
+        .write_context_builder()
+        .build()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let file_metadata = engine
+        .write_parquet(&sample_data, &write_context)
+        .await
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
@@ -108,7 +121,10 @@ async fn try_main() -> Result<()> {
                 "Exceeded maximum 5 retries for committing transaction",
             ));
         }
-        txn = match txn.commit(&engine)? {
+        txn = match txn
+            .commit(&engine)
+            .map_err(delta_kernel::Error::into_kernel_error)?
+        {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
@@ -139,7 +155,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> Result<SnapshotRef> {
+) -> KernelResult<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
@@ -151,13 +167,15 @@ async fn create_or_get_base_snapshot(
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(url, &schema, engine).await?;
-            Snapshot::builder_for(url.clone()).build(engine)
+            Snapshot::builder_for(url.clone())
+                .build(engine)
+                .map_err(delta_kernel::Error::into_kernel_error)
         }
     }
 }
 
 /// Parse a schema string into a SchemaRef.
-fn parse_schema(schema_str: &str) -> Result<SchemaRef> {
+fn parse_schema(schema_str: &str) -> KernelResult<SchemaRef> {
     let fields = schema_str
         .split(',')
         .map(|field| {
@@ -185,25 +203,33 @@ fn parse_schema(schema_str: &str) -> Result<SchemaRef> {
 
             Ok(StructField::nullable(name, data_type))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
 
-    Ok(Arc::new(StructType::try_new(fields)?))
+    Ok(Arc::new(
+        StructType::try_new(fields).map_err(delta_kernel::Error::into_kernel_error)?,
+    ))
 }
 
 /// Create a new Delta table with the given schema using the official CreateTable API.
-async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) -> Result<()> {
+async fn create_table(
+    table_url: &Url,
+    schema: &SchemaRef,
+    engine: &dyn Engine,
+) -> KernelResult<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
+        .build(engine, Box::new(FileSystemCommitter::new()))
+        .map_err(delta_kernel::Error::into_kernel_error)?
+        .commit(engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())
 }
 
 /// Create sample data based on the schema.
-fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> Result<ArrowEngineData> {
+fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> KernelResult<ArrowEngineData> {
     let fields = schema.fields();
     let mut columns = Vec::new();
 
@@ -256,14 +282,21 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> Result<ArrowEngine
 async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
-) -> Result<()> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let scan = snapshot.scan_builder().build()?;
+) -> KernelResult<()> {
+    let snapshot = Snapshot::builder_for(table_url.clone())
+        .build(&engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let scan = snapshot
+        .scan_builder()
+        .build()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     let batches: Vec<RecordBatch> = scan
-        .execute(Arc::new(engine))?
+        .execute(Arc::new(engine))
+        .map_err(delta_kernel::Error::into_kernel_error)?
         .map(EngineDataArrowExt::try_into_record_batch)
-        .try_collect()?;
+        .try_collect()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     print_batches(&batches)?;
     Ok(())

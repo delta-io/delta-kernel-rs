@@ -26,11 +26,12 @@ impl LogPath {
     pub fn try_new(file_meta: FileMeta) -> Result<Self> {
         // TODO: we should avoid the clone
         let parsed = ParsedLogPath::try_from(file_meta.clone())?
-            .ok_or_else(|| KernelError::invalid_log_path(&file_meta.location))?;
+            .ok_or_else(|| KernelError::invalid_log_path(&file_meta.location))
+            .map_err(crate::Error::Kernel)?;
 
         require!(
             !parsed.is_unknown(),
-            KernelError::invalid_log_path(&file_meta.location)
+            crate::Error::Kernel(KernelError::invalid_log_path(&file_meta.location))
         );
 
         Ok(Self(parsed))
@@ -58,13 +59,16 @@ impl LogPath {
     pub fn staged_commit_url(table_root: Url, filename: &str) -> Result<Url> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
         if !table_root.path().ends_with('/') {
-            return Err(KernelError::invalid_table_location(table_root));
+            return Err(crate::Error::Kernel(KernelError::invalid_table_location(
+                table_root,
+            )));
         }
         table_root
             .join("_delta_log/")
             .and_then(|url| url.join("_staged_commits/"))
             .and_then(|url| url.join(filename))
             .map_err(|_| KernelError::invalid_table_location(table_root))
+            .map_err(crate::Error::Kernel)
     }
 }
 
@@ -107,7 +111,10 @@ mod test {
         let filename = "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
         let err =
             LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidTableLocation(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidTableLocation(_))
+        ));
 
         // filename with path separators
         let table_root = Url::from_str("s3://my-bucket/my-table/").unwrap();

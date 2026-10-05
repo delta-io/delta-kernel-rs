@@ -31,7 +31,7 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{Engine, ExpressionEvaluator, KernelError, Result};
+use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, Result};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -214,7 +214,7 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
             engine,
@@ -246,7 +246,7 @@ impl ScanLogReplayProcessor {
         seen_file_keys: HashSet<FileActionKey>,
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
@@ -294,7 +294,8 @@ impl ScanLogReplayProcessor {
             engine,
             output_schema.clone(),
             state_info.physical_stats_output_schema().map(AsRef::as_ref),
-        )?;
+        )
+        .map_err(crate::Error::into_kernel_error)?;
 
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
@@ -325,31 +326,37 @@ impl ScanLogReplayProcessor {
         Ok(Self {
             data_skipping_filter,
             // Commit transform: parse JSON for stats, MapToStruct for partition values
-            commit_transform: engine.evaluation_handler().new_expression_evaluator(
-                COMMIT_READ_SCHEMA.clone(),
-                get_add_transform_expr(
-                    stats_schema_for_transform.clone(),
-                    false,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform.clone(),
-                    false,
-                ),
-                output_schema.clone().into(),
-            )?,
+            commit_transform: engine
+                .evaluation_handler()
+                .new_expression_evaluator(
+                    COMMIT_READ_SCHEMA.clone(),
+                    get_add_transform_expr(
+                        stats_schema_for_transform.clone(),
+                        false,
+                        skip_stats,
+                        synthesize_json,
+                        partition_schema_for_transform.clone(),
+                        false,
+                    ),
+                    output_schema.clone().into(),
+                )
+                .map_err(crate::Error::into_kernel_error)?,
             // Checkpoint transform: read pre-parsed columns directly when available
-            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
-                checkpoint_read_schema,
-                get_add_transform_expr(
-                    stats_schema_for_transform,
-                    has_stats_parsed,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform,
-                    has_partition_values_parsed,
-                ),
-                output_schema.into(),
-            )?,
+            checkpoint_transform: engine
+                .evaluation_handler()
+                .new_expression_evaluator(
+                    checkpoint_read_schema,
+                    get_add_transform_expr(
+                        stats_schema_for_transform,
+                        has_stats_parsed,
+                        skip_stats,
+                        synthesize_json,
+                        partition_schema_for_transform,
+                        has_partition_values_parsed,
+                    ),
+                    output_schema.into(),
+                )
+                .map_err(crate::Error::into_kernel_error)?,
             stats_output_projection,
             seen_file_keys,
             state_info,
@@ -425,9 +432,9 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
         };
-        let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize internal state: {e}"))
-        })?;
+        let internal_state_blob = serde_json::to_vec(&internal_state)
+            .map_err(|e| KernelError::generic(format!("Failed to serialize internal state: {e}")))
+            .map_err(crate::Error::Kernel)?;
 
         Ok(SerializableScanState {
             predicate,
@@ -458,18 +465,19 @@ impl ScanLogReplayProcessor {
     ) -> Result<Self> {
         // Deserialize internal state from json
         let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
-            .map_err(KernelError::MalformedJson)?;
+            .map_err(KernelError::MalformedJson)
+            .map_err(crate::Error::Kernel)?;
         if let Some(schemas) = &internal_state.physical_stats_schemas {
-            schemas.validate()?;
+            schemas.validate().map_err(crate::Error::Kernel)?;
         }
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
             Some(predicate) => {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
-                    return Err(KernelError::generic(
+                    return Err(crate::Error::Kernel(KernelError::generic(
                         "Invalid serialized internal state. Expected predicate schema.",
-                    ));
+                    )));
                 };
                 PhysicalPredicate::Some(predicate, predicate_schema)
             }
@@ -498,13 +506,14 @@ impl ScanLogReplayProcessor {
             internal_state.stats_options,
             internal_state.partition_values_options,
         )
+        .map_err(crate::Error::Kernel)
     }
 
     fn transform_and_data_skip(
         &self,
         actions: &dyn EngineData,
         is_log_batch: bool,
-    ) -> Result<(Box<dyn EngineData>, Vec<bool>)> {
+    ) -> KernelResult<(Box<dyn EngineData>, Vec<bool>)> {
         let transform = if is_log_batch {
             &self.commit_transform
         } else {
@@ -514,7 +523,7 @@ impl ScanLogReplayProcessor {
         let transformed = transform.evaluate(actions);
         self.metrics
             .add_action_transform_time_ns(start.elapsed().as_nanos() as u64);
-        let transformed = transformed?;
+        let transformed = transformed.map_err(crate::Error::into_kernel_error)?;
         require!(
             transformed.len() == actions.len(),
             KernelError::internal_error(format!(
@@ -524,7 +533,9 @@ impl ScanLogReplayProcessor {
             ))
         );
 
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        let selection_vector = self
+            .build_selection_vector(transformed.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
         require!(
             selection_vector.len() == actions.len(),
             KernelError::internal_error(format!(
@@ -553,7 +564,7 @@ impl ScanLogReplayProcessor {
         dedup_selection: Vec<bool>,
         row_transform_exprs: Vec<Option<ExpressionRef>>,
         active_add_file_sizes: Vec<u64>,
-    ) -> Result<RetryTransformAndDataSkipOutput> {
+    ) -> KernelResult<RetryTransformAndDataSkipOutput> {
         let row_transform_exprs = dedup_selection
             .iter()
             .enumerate()
@@ -565,7 +576,9 @@ impl ScanLogReplayProcessor {
             .zip(active_add_file_sizes)
             .filter_map(|(selected, size)| (*selected).then_some(size))
             .collect();
-        let actions = actions.apply_selection_vector(dedup_selection)?;
+        let actions = actions
+            .apply_selection_vector(dedup_selection)
+            .map_err(crate::Error::into_kernel_error)?;
         let (transformed_actions, final_selection) =
             self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
         Ok(RetryTransformAndDataSkipOutput {
@@ -580,7 +593,7 @@ impl ScanLogReplayProcessor {
         &self,
         selection_vector: &[bool],
         active_add_file_sizes: &[u64],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         require!(
             selection_vector.len() == active_add_file_sizes.len(),
             KernelError::internal_error(format!(
@@ -636,7 +649,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         row: usize,
         getters: &[&'b dyn GetData<'b>],
         selected: bool,
-    ) -> Result<bool> {
+    ) -> KernelResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
         // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
@@ -690,7 +703,8 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if !self.state_info.skip_row_transforms => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(row, "add.partitionValues")?;
+                    .get(row, "add.partitionValues")
+                    .map_err(crate::Error::into_kernel_error)?;
                 parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -702,11 +716,13 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         };
 
         if !self.state_info.skip_row_transforms {
-            let base_row_id: Option<i64> =
-                getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
+            let base_row_id: Option<i64> = getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX]
+                .get_opt(row, "add.baseRowId")
+                .map_err(crate::Error::into_kernel_error)?;
             let default_row_commit_version: Option<i64> = getters
                 [ScanLogReplayProcessor::DEFAULT_ROW_COMMIT_VERSION_INDEX]
-                .get_opt(row, "add.defaultRowCommitVersion")?;
+                .get_opt(row, "add.defaultRowCommitVersion")
+                .map_err(crate::Error::into_kernel_error)?;
             let patch_expr = self
                 .state_info
                 .transform_spec
@@ -777,15 +793,17 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let expected_getters = if is_log_batch { 12 } else { 8 };
         require!(
             getters.len() == expected_getters,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of AddRemoveDedupVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for row in 0..row_count {
             let selected = self.selection_vector[row];
-            self.selection_vector[row] = self.is_valid_add(row, getters, selected)?;
+            self.selection_vector[row] = self
+                .is_valid_add(row, getters, selected)
+                .map_err(crate::Error::Kernel)?;
         }
 
         self.metrics
@@ -837,7 +855,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let needs_extra = stats_schema.is_some() || partition_schema.is_some();
     if !needs_extra {
         return Ok(SCAN_ROW_SCHEMA.clone());
@@ -852,7 +870,11 @@ fn scan_row_schema_with_parsed_columns(
                 schema.clone(),
             ))
         });
-    Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
+    Ok(Arc::new(
+        patch
+            .build(&SCAN_ROW_SCHEMA)
+            .map_err(crate::Error::into_kernel_error)?,
+    ))
 }
 
 /// Builds the final `stats_parsed` projection for log replay.
@@ -1027,9 +1049,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = actions_batch;
         require!(
             !is_log_batch,
-            KernelError::generic(
+            crate::Error::Kernel(KernelError::generic(
                 "Parallel checkpoint processor may only be applied to checkpoint files"
-            )
+            ))
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -1047,7 +1069,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(crate::Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1056,7 +1078,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_PATH_INDEX,
             Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
-        )?;
+        )
+        .map_err(crate::Error::Kernel)?;
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
@@ -1087,19 +1110,22 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            )
+            .map_err(crate::Error::Kernel)?
         } else {
             RetryTransformAndDataSkipOutput {
-                transformed_actions: pre_dedup_transform_result?,
+                transformed_actions: pre_dedup_transform_result.map_err(crate::Error::Kernel)?,
                 final_selection: dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
             }
         };
-        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)
+            .map_err(crate::Error::Kernel)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
         let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)
+                .map_err(crate::Error::Kernel)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1150,7 +1176,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(crate::Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1193,19 +1219,22 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            )
+            .map_err(crate::Error::Kernel)?
         } else {
             RetryTransformAndDataSkipOutput {
-                transformed_actions: pre_dedup_transform_result?,
+                transformed_actions: pre_dedup_transform_result.map_err(crate::Error::Kernel)?,
                 final_selection: dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
             }
         };
-        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)
+            .map_err(crate::Error::Kernel)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
         let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)
+                .map_err(crate::Error::Kernel)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1233,12 +1262,15 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = Result<ActionsBatch>>,
+    action_iter: impl Iterator<Item = KernelResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> Result<(impl Iterator<Item = Result<ScanMetadata>>, Arc<ScanMetrics>)> {
+) -> KernelResult<(
+    impl Iterator<Item = KernelResult<ScanMetadata>>,
+    Arc<ScanMetrics>,
+)> {
     let processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
@@ -1247,7 +1279,11 @@ pub(crate) fn scan_action_iter(
         partition_values_options,
     )?;
     let metrics = processor.metrics.clone();
-    Ok((processor.process_actions_iter(action_iter), metrics))
+    let action_iter = action_iter.map(|item| item.map_err(crate::Error::Kernel));
+    let metadata_iter = processor
+        .process_actions_iter(action_iter)
+        .map(|item| item.map_err(crate::Error::into_kernel_error));
+    Ok((metadata_iter, metrics))
 }
 
 #[cfg(test)]
@@ -1305,10 +1341,10 @@ mod tests {
         fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>> {
             std::thread::sleep(self.delay);
             if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                Err(KernelError::ParseError(
+                Err(crate::Error::Kernel(KernelError::ParseError(
                     "retry".to_string(),
                     DataType::STRING,
-                ))
+                )))
             } else {
                 self.inner.evaluate(batch)
             }
@@ -1637,12 +1673,15 @@ mod tests {
             test_checkpoint_info(),
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
-        )?;
+        )
+        .map_err(crate::Error::Kernel)?;
 
         let mut iter = iter.peekable();
         assert!(iter.peek().is_some(), "scan metadata must not be empty");
         for scan_metadata in iter {
-            let transforms = scan_metadata?.scan_file_transforms;
+            let transforms = scan_metadata
+                .map_err(crate::Error::Kernel)?
+                .scan_file_transforms;
             assert_eq!(transforms.len(), 1);
             let Some(Expr::StructPatch(patch)) = transforms[0].as_ref().map(Arc::as_ref) else {
                 panic!("Expected a StructPatch expression");

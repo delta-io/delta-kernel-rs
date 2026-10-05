@@ -1,5 +1,6 @@
 //! Some utilities for working with arrow data types
 
+use crate::KernelResult;
 pub(crate) mod apply_schema;
 
 use std::borrow::Cow;
@@ -90,7 +91,7 @@ pub(crate) use prim_array_cmp;
 pub(crate) fn list_type_with_element(
     list_type: &ArrowDataType,
     element: ArrowFieldRef,
-) -> Result<ArrowDataType> {
+) -> KernelResult<ArrowDataType> {
     match list_type {
         ArrowDataType::List(_) => Ok(ArrowDataType::List(element)),
         ArrowDataType::LargeList(_) => Ok(ArrowDataType::LargeList(element)),
@@ -200,7 +201,8 @@ impl RowIndexBuilder {
                                 ))
                             })
                     })
-                    .try_collect()?
+                    .try_collect()
+                    .map_err(crate::Error::Kernel)?
             }
             None => self.row_group_row_index_ranges,
         };
@@ -244,10 +246,11 @@ pub(crate) fn fixup_parquet_read(
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
 ) -> Result<ArrowEngineData> {
-    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
+    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)
+        .map_err(crate::Error::Kernel)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        apply_schema_to_struct(&data, schema)?
+        apply_schema_to_struct(&data, schema).map_err(crate::Error::Kernel)?
     } else {
         data
     };
@@ -447,7 +450,7 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
 /// `VARIANT` type is represented as `STRUCT<metadata: BINARY, value: BINARY>`. This is to make
 /// sure that the default engine does not try to read shredded Variants, which it currently does
 /// not support.
-fn validate_parquet_variant(field: &ArrowField) -> Result<()> {
+fn validate_parquet_variant(field: &ArrowField) -> KernelResult<()> {
     fn variant_parquet_error(field_name: &String) -> KernelError {
         KernelError::Generic(format!(
             "The field {field_name} presumed to be of Variant type might be \
@@ -481,7 +484,7 @@ fn get_indices(
     requested_schema: &Schema,
     fields: &ArrowFields,
     mask_indices: &mut Vec<usize>,
-) -> Result<(usize, Vec<ReorderIndex>)> {
+) -> KernelResult<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.num_fields());
     let mut reorder_indices = Vec::with_capacity(requested_schema.num_fields());
     // Missing entries for structs found in parquet but with no selected leaves. These must
@@ -696,7 +699,9 @@ fn get_indices(
                         &requested_field.data_type,
                         field.data_type(),
                         super::ensure_data_types::ValidationMode::TypesAndNames,
-                    )? {
+                    )
+                    .map_err(crate::Error::into_kernel_error)?
+                    {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
                         }
@@ -852,7 +857,8 @@ pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
     file_metadata: &ArrowReaderMetadata,
 ) -> Result<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
-    let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
+    let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())
+        .map_err(crate::Error::Kernel)?;
     let mask = generate_mask(file_metadata.parquet_schema(), &indices);
     Ok((reorder, mask))
 }
@@ -860,7 +866,7 @@ pub(crate) fn parquet_read_plan(
 fn get_requested_indices(
     requested_schema: &SchemaRef,
     file_arrow_schema: &ArrowSchemaRef,
-) -> Result<(Vec<usize>, Vec<ReorderIndex>)> {
+) -> KernelResult<(Vec<usize>, Vec<ReorderIndex>)> {
     let mut mask_indices = vec![];
     let (_, reorder_indexes) = get_indices(
         0,
@@ -942,7 +948,7 @@ pub(crate) fn reorder_struct_array(
     requested_ordering: &[ReorderIndex],
     mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
@@ -1084,7 +1090,7 @@ fn reorder_list<O: OffsetSizeTrait>(
     input_field_name: &str,
     list_nullable: bool,
     children: &[ReorderIndex],
-) -> Result<FieldArrayOpt> {
+) -> KernelResult<FieldArrayOpt> {
     let (list_values_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
         let struct_array = struct_array.clone();
@@ -1124,7 +1130,7 @@ fn reorder_map(
     map_array: MapArray,
     input_field_name: &str,
     children: &[ReorderIndex],
-) -> Result<FieldArrayOpt> {
+) -> KernelResult<FieldArrayOpt> {
     let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
     let result_array = reorder_struct_array(
         struct_array,
@@ -1227,7 +1233,8 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> Result<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
+    let result =
+        parse_json_impl(json_strings.column(0).as_ref(), schema).map_err(crate::Error::Kernel)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
@@ -1238,7 +1245,7 @@ pub(crate) fn parse_json(
 pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,
-) -> Result<RecordBatch> {
+) -> KernelResult<RecordBatch> {
     let num_rows = json_strings.len();
     match json_strings.data_type() {
         ArrowDataType::Utf8 => {
@@ -1260,7 +1267,7 @@ fn parse_json_inner<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
     schema: SchemaRef,
-) -> Result<RecordBatch> {
+) -> KernelResult<RecordBatch> {
     // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
     // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
     // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
@@ -1285,7 +1292,7 @@ fn decode_with_arrow_json<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
     schema: ArrowSchemaRef,
-) -> Result<RecordBatch> {
+) -> KernelResult<RecordBatch> {
     if num_rows == 0 {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -1360,7 +1367,7 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
 
 /// Safe-casts each column of `decoded` back to its target type. `safe: true` produces
 /// per-cell NULL on parse failure rather than failing the whole batch.
-fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBatch> {
+fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> KernelResult<RecordBatch> {
     let opts = CastOptions {
         safe: true,
         ..Default::default()
@@ -1370,7 +1377,7 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> Result<Recor
         .into_iter()
         .zip(target.fields().iter())
         .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
         target.clone(),
         columns,
@@ -1412,7 +1419,7 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> Result<Recor
 pub(crate) fn coerce_columns_to_schema(
     columns: Vec<ArrowArrayRef>,
     target: &ArrowSchemaRef,
-) -> Result<Vec<ArrowArrayRef>> {
+) -> KernelResult<Vec<ArrowArrayRef>> {
     let opts = CastOptions {
         safe: false,
         ..Default::default()
@@ -1437,7 +1444,7 @@ fn cast_array_to_type(
     array: ArrowArrayRef,
     target: &ArrowDataType,
     opts: &CastOptions<'_>,
-) -> Result<ArrowArrayRef> {
+) -> KernelResult<ArrowArrayRef> {
     if array.data_type() == target {
         return Ok(array);
     }
@@ -1463,7 +1470,7 @@ fn cast_array_to_type(
                 .iter()
                 .zip(target_fields.iter())
                 .map(|(c, f)| cast_array_to_type(c.clone(), f.data_type(), opts))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<KernelResult<Vec<_>>>()?;
             Ok(Arc::new(StructArray::try_new(
                 target_fields.clone(),
                 new_children,
@@ -1474,9 +1481,14 @@ fn cast_array_to_type(
     }
 }
 
-pub(crate) fn filter_to_record_batch(filtered_data: FilteredEngineData) -> Result<RecordBatch> {
-    let filtered = filtered_data.apply_selection_vector()?;
-    let arrow_data = ArrowEngineData::try_from_engine_data(filtered)?;
+pub(crate) fn filter_to_record_batch(
+    filtered_data: FilteredEngineData,
+) -> KernelResult<RecordBatch> {
+    let filtered = filtered_data
+        .apply_selection_vector()
+        .map_err(crate::Error::into_kernel_error)?;
+    let arrow_data =
+        ArrowEngineData::try_from_engine_data(filtered).map_err(crate::Error::into_kernel_error)?;
     Ok((*arrow_data).into())
 }
 
@@ -1541,10 +1553,16 @@ pub(crate) fn to_json_bytes(
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
-        let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch)?;
+        let batch = filter_to_record_batch(chunk?).map_err(crate::Error::Kernel)?;
+        writer
+            .write(&batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
     }
-    writer.finish()?;
+    writer
+        .finish()
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     Ok(writer.into_inner())
 }
 
@@ -1559,7 +1577,8 @@ pub(crate) fn fixup_json_read(
     reorder_indices: &[ReorderIndex],
     file_location: &str,
 ) -> Result<ArrowEngineData> {
-    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
+    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))
+        .map_err(crate::Error::Kernel)?;
     Ok(data.into())
 }
 
@@ -1596,7 +1615,12 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
     }
 
     for (output_pos, field, spec) in metadata_entries {
-        let field = Arc::new(field.try_into_arrow()?);
+        let field = Arc::new(
+            field
+                .try_into_arrow()
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
+        );
         let rindex = match spec {
             MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
             _ => ReorderIndex::missing(output_pos, field),
@@ -1616,7 +1640,9 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
 #[internal_api]
 pub(crate) fn json_arrow_schema(schema: &StructType) -> Result<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
-    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+    ArrowSchema::try_from_kernel(&json_fields)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)
 }
 
 #[cfg(test)]
@@ -3838,7 +3864,9 @@ mod tests {
         let data = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
-        )?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data))))?;
@@ -3862,7 +3890,9 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![
                 "row0", "row1", "row2", "row3",
             ]))],
-        )?;
+        )
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
 
         // Helper function to create EngineData from the same record batch
         let create_engine_data =

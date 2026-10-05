@@ -21,7 +21,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri, PhantomType};
-use crate::{Engine, KernelError, Result, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
 #[doc(hidden)]
@@ -106,7 +106,7 @@ impl SnapshotHint {
             !parsed_paths
                 .iter()
                 .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
-            SnapshotHintError::LogCompaction.into()
+            crate::Error::Kernel(SnapshotHintError::LogCompaction.into())
         );
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
@@ -117,7 +117,8 @@ impl SnapshotHint {
             0,
             None,
             CheckpointHandling::Adopt,
-        )?;
+        )
+        .map_err(crate::Error::Kernel)?;
         Ok(Self {
             version,
             log_segment_files,
@@ -138,7 +139,9 @@ impl SnapshotHint {
 /// # use delta_kernel::{Snapshot, Engine};
 /// # use url::Url;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
-/// let table_root = Url::parse("file:///path/to/table")?;
+/// let table_root = Url::parse("file:///path/to/table")
+///     .map_err(delta_kernel::KernelError::from)
+///     .map_err(delta_kernel::Error::Kernel)?;
 ///
 /// // Build a snapshot
 /// let snapshot = Snapshot::builder_for(table_root.clone())
@@ -227,7 +230,7 @@ impl IncrementalReplay {
         self,
         crc_version: Version,
         target_version: Version,
-    ) -> Result<bool> {
+    ) -> KernelResult<bool> {
         let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
             KernelError::internal_error(format!(
                 "CRC version {crc_version} is ahead of target version {target_version}"
@@ -276,9 +279,10 @@ impl SnapshotBuilder<FromTableRoot> {
     ///
     /// # Errors
     ///
-    /// [`build`](Self::build) returns [`KernelError::SnapshotHint`] for hint conflicts and hinted
-    /// log-segment validation failures. Catalog-version, table-root URI, protocol, and metadata
-    /// failures retain their normal error variants.
+    /// [`build`](Self::build) returns [`crate::Error::Kernel`] wrapping
+    /// [`KernelError::SnapshotHint`] for hint conflicts and hinted log-segment validation
+    /// failures. Catalog-version, table-root URI, protocol, and metadata failures retain their
+    /// normal kernel error variants.
     #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn with_snapshot_hint(mut self, hint: impl Into<Box<SnapshotHint>>) -> Self {
@@ -482,12 +486,14 @@ impl<Mode> SnapshotBuilder<Mode> {
                 max_catalog_version,
                 incremental_replay,
                 snapshot_hint,
-            )?
+            )
+            .map_err(crate::Error::Kernel)?
         } else {
             let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
 
             // Pre-build validations for catalog-managed tables
-            Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
+            Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)
+                .map_err(crate::Error::Kernel)?;
 
             // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing
             // this as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint
@@ -502,7 +508,10 @@ impl<Mode> SnapshotBuilder<Mode> {
                 let table_url = try_parse_uri(table_root)?;
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
+                    table_url
+                        .join("_delta_log/")
+                        .map_err(crate::KernelError::from)
+                        .map_err(crate::Error::Kernel)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
@@ -516,12 +525,13 @@ impl<Mode> SnapshotBuilder<Mode> {
                     incremental_replay,
                     built_as_latest,
                 )
-                .map(Into::into)?
+                .map(Into::into)
+                .map_err(crate::Error::Kernel)?
             } else {
                 let Some(existing_snapshot) = existing_snapshot else {
-                    return Err(KernelError::internal_error(
+                    return Err(crate::Error::Kernel(KernelError::internal_error(
                         "SnapshotBuilder should have either table_root or existing_snapshot",
-                    ));
+                    )));
                 };
                 Snapshot::try_new_from(
                     existing_snapshot,
@@ -533,12 +543,14 @@ impl<Mode> SnapshotBuilder<Mode> {
                     checkpoint_handling,
                     built_as_latest,
                     cancellation_token.as_ref(),
-                )?
+                )
+                .map_err(crate::Error::Kernel)?
             }
         };
 
         // Post-build validations for catalog-managed tables
-        Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
+        Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)
+            .map_err(crate::Error::Kernel)?;
         tracing::Span::current().record("version", snapshot.version());
         Ok(snapshot)
     }
@@ -554,7 +566,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
         snapshot_hint: Box<SnapshotHint>,
-    ) -> Result<SnapshotRef> {
+    ) -> KernelResult<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
             incremental_replay.is_disabled(),
@@ -585,7 +597,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 "SnapshotBuilder with a snapshot hint must have a table root",
             )
         })?;
-        let table_url = try_parse_uri(table_root)?;
+        let table_url = try_parse_uri(table_root).map_err(crate::Error::into_kernel_error)?;
         let log_root = table_url.join("_delta_log/")?;
         let SnapshotHint {
             version,
@@ -635,6 +647,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             Some(version),
             last_checkpoint_hint,
         )
+        .map_err(crate::Error::into_kernel_error)
         .map_err(|source| SnapshotHintError::LogSegment {
             source: Box::new(source),
         })?;
@@ -657,7 +670,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::MissingHistoryAnchor.into()
         );
         let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, table_url, version)?;
+            TableConfiguration::try_new(metadata, protocol, table_url, version)
+                .map_err(crate::Error::into_kernel_error)?;
         if let Some(crc) = crc.as_ref() {
             require!(
                 crc.version == version,
@@ -691,7 +705,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_snapshot_hint_paths(
         log_segment_files: &LogSegmentFiles,
         log_root: &url::Url,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let log_root = log_root.as_str();
         if let Some(path) = log_segment_files
             .iter_all_paths()
@@ -713,7 +727,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
     }
 
@@ -722,7 +736,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let is_catalog_managed = snapshot.table_configuration().is_catalog_managed();
 
         require!(
@@ -878,7 +892,10 @@ mod tests {
         expected: &str,
     ) {
         let error = builder.with_snapshot_hint(hint).build(engine).unwrap_err();
-        assert!(matches!(&error, KernelError::SnapshotHint(_)));
+        assert!(matches!(
+            &error,
+            crate::Error::Kernel(KernelError::SnapshotHint(_))
+        ));
         assert!(
             error.to_string().contains(expected),
             "expected error to contain {expected:?}, got {error}"
@@ -891,7 +908,7 @@ mod tests {
             error.to_string(),
             "Invalid snapshot hint: supplied log files do not form a valid log segment"
         );
-        let KernelError::SnapshotHint(source) = error else {
+        let crate::Error::Kernel(KernelError::SnapshotHint(source)) = error else {
             panic!("expected SnapshotHint")
         };
         let source = source
@@ -1072,7 +1089,7 @@ mod tests {
         let error = result.unwrap_err();
         assert!(matches!(
             error,
-            KernelError::SnapshotHint(source)
+            crate::Error::Kernel(KernelError::SnapshotHint(source))
                 if matches!(
                     &*source,
                     SnapshotHintError::LogPathOutsideRoot { path, log_root }
@@ -1284,7 +1301,10 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap_err();
-        assert!(matches!(err, KernelError::SnapshotHint(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::SnapshotHint(_))
+        ));
         Ok(())
     }
 
@@ -1377,7 +1397,7 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap_err();
-        let KernelError::SnapshotHint(source) = err else {
+        let crate::Error::Kernel(KernelError::SnapshotHint(source)) = err else {
             panic!("expected SnapshotHint")
         };
         let source = source
@@ -1488,7 +1508,10 @@ mod tests {
             .with_max_catalog_version(hint.version + 1)
             .with_snapshot_hint(hint)
             .build(engine.as_ref());
-        assert!(matches!(&result, Err(KernelError::SnapshotHint(_))));
+        assert!(matches!(
+            &result,
+            Err(crate::Error::Kernel(KernelError::SnapshotHint(_)))
+        ));
         assert_result_error_with_message(result, "does not match snapshot hint version");
         let events = reporter.events();
         assert_eq!(events.len(), 1);
@@ -1565,7 +1588,10 @@ mod tests {
             .with_max_catalog_version(0)
             .with_snapshot_hint(lower_bound_hint)
             .build(engine.as_ref());
-        assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+        ));
 
         let hinted = SnapshotBuilder::new_for(&table_root)
             .at_version(1)
@@ -1969,7 +1995,10 @@ mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2006,7 +2035,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2031,7 +2063,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2043,7 +2078,10 @@ mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2060,7 +2098,10 @@ mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2084,7 +2125,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2138,7 +2182,10 @@ mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -2174,7 +2221,9 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(KernelError::LogTailVersionsNotContiguous { .. })
+                Err(crate::Error::Kernel(
+                    KernelError::LogTailVersionsNotContiguous { .. }
+                ))
             ));
 
             Ok(())

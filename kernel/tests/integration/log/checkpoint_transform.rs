@@ -35,7 +35,11 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 /// Writes a JSON commit file to the store.
 async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> Result<()> {
     let path = Path::from(format!("_delta_log/{version:020}.json"));
-    store.put(&path, content.to_string().into()).await?;
+    store
+        .put(&path, content.to_string().into())
+        .await
+        .map_err(delta_kernel::KernelError::from)
+        .map_err(delta_kernel::Error::Kernel)?;
     Ok(())
 }
 

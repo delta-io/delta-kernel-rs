@@ -1,5 +1,5 @@
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::Result;
+use delta_kernel::KernelResult;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
@@ -32,17 +32,24 @@ pub unsafe extern "C" fn get_domain_metadata(
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+    get_domain_metadata_impl(
+        snapshot,
+        domain.map_err(delta_kernel::Error::into_kernel_error),
+        engine,
+        allocate_fn,
+    )
+    .into_extern_result(&engine)
 }
 
 fn get_domain_metadata_impl(
     snapshot: &Snapshot,
-    domain: Result<String>,
+    domain: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
-) -> Result<NullableCvoid> {
+) -> KernelResult<NullableCvoid> {
     Ok(snapshot
-        .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
+        .get_domain_metadata(&domain?, extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
 
@@ -131,8 +138,11 @@ fn visit_clustering_columns_impl(
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
-) -> Result<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+) -> KernelResult<OptionalValue<usize>> {
+    let Some(infos) = snapshot
+        .get_clustering_column_infos(extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -184,8 +194,10 @@ fn visit_domain_metadata_impl(
         key: KernelStringSlice,
         value: KernelStringSlice,
     ),
-) -> Result<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+) -> KernelResult<bool> {
+    let res = snapshot
+        .get_all_domain_metadata(extern_engine.engine().as_ref())
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();

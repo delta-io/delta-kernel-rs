@@ -9,7 +9,7 @@ use delta_kernel::expressions::{
     JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
-use delta_kernel::Result;
+use delta_kernel::{KernelResult, Result};
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
@@ -246,7 +246,7 @@ unsafe fn visit_expression_column_impl(
     state: &mut KernelExpressionVisitorState,
     parts: *const KernelStringSlice,
     parts_len: usize,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     if parts_len == 0 {
         return Err(delta_kernel::KernelError::generic(
             "column must have at least one field part",
@@ -256,8 +256,10 @@ unsafe fn visit_expression_column_impl(
     let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
     let fields = slices
         .iter()
-        .map(|slice| unsafe { String::try_from_slice(slice) })
-        .collect::<Result<Vec<String>>>()?;
+        .map(|slice| {
+            unsafe { String::try_from_slice(slice) }.map_err(delta_kernel::Error::into_kernel_error)
+        })
+        .collect::<KernelResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
         return Err(delta_kernel::KernelError::generic(
             "column field part must not be empty",
@@ -293,12 +295,16 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    visit_expression_literal_string_impl(
+        state,
+        value.map_err(delta_kernel::Error::into_kernel_error),
+    )
+    .into_extern_result(&allocate_error)
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
-    value: Result<String>,
-) -> Result<usize> {
+    value: KernelResult<String>,
+) -> KernelResult<usize> {
     Ok(wrap_expression(state, lit(value?)))
 }
 
@@ -444,10 +450,11 @@ fn visit_expression_literal_decimal_impl(
     value_lo: u64,
     precision: u8,
     scale: u8,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     // Reconstruct the i128 from two u64 parts
     let value = ((value_hi as i128) << 64) | (value_lo as i128);
-    let decimal = Scalar::decimal(value, precision, scale)?;
+    let decimal =
+        Scalar::decimal(value, precision, scale).map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(wrap_expression(state, lit(decimal)))
 }
 
@@ -583,7 +590,7 @@ impl NullTypeTag {
     ///
     /// Returns an error for [`NonPrimitive`](Self::NonPrimitive) since complex types cannot be
     /// reconstructed from a type tag alone.
-    pub(crate) fn to_data_type(self, precision: u8, scale: u8) -> Result<DataType> {
+    pub(crate) fn to_data_type(self, precision: u8, scale: u8) -> KernelResult<DataType> {
         match self {
             Self::Boolean => Ok(DataType::BOOLEAN),
             Self::Byte => Ok(DataType::BYTE),
@@ -599,9 +606,10 @@ impl NullTypeTag {
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
             Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
-            Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
-                precision, scale,
-            )?)),
+            Self::Decimal => Ok(DataType::Primitive(
+                PrimitiveType::decimal(precision, scale)
+                    .map_err(delta_kernel::Error::into_kernel_error)?,
+            )),
             Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
                 "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
                  from a type tag. Use opaque expressions or a schema visitor instead.",
@@ -638,7 +646,7 @@ fn visit_expression_literal_null_impl(
     type_tag: u8,
     precision: u8,
     scale: u8,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     let tag = NullTypeTag::try_from(type_tag)?;
     let data_type = tag.to_data_type(precision, scale)?;
     Ok(wrap_expression(state, null_lit(data_type)))
@@ -728,7 +736,7 @@ pub unsafe extern "C" fn visit_engine_expression(
 
 fn visit_engine_expression_impl(
     engine_expression: &mut EngineExpression,
-) -> Result<Handle<SharedExpression>> {
+) -> KernelResult<Handle<SharedExpression>> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let expr_id = (engine_expression.visitor)(engine_expression.expression, &mut visitor_state);
 
@@ -758,7 +766,7 @@ pub unsafe extern "C" fn visit_engine_predicate(
 
 fn visit_engine_predicate_impl(
     engine_predicate: &mut EnginePredicate,
-) -> Result<Handle<SharedPredicate>> {
+) -> KernelResult<Handle<SharedPredicate>> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (engine_predicate.visitor)(engine_predicate.predicate, &mut visitor_state);
 
@@ -808,14 +816,19 @@ pub unsafe extern "C" fn visit_predicate_opaque(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
-    visit_predicate_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+    visit_predicate_opaque_impl(
+        state,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        children,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_predicate_opaque_impl(
     state: &mut KernelExpressionVisitorState,
-    name: Result<String>,
+    name: KernelResult<String>,
     children: &mut EngineIterator,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     let name = name?;
     if resolve_opaque_children(state, children.map(|c| c as usize)).is_none() {
         return Ok(0);
@@ -854,17 +867,22 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     let name = unsafe { String::try_from_slice(&name) };
     // Wrap immediately so free_state fires exactly once on every exit path.
     let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
-    visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
-        .into_extern_result(&allocate_error)
+    visit_predicate_opaque_with_eval_impl(
+        state,
+        name.map_err(delta_kernel::Error::into_kernel_error),
+        children,
+        callbacks,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "default-engine-base")]
 fn visit_predicate_opaque_with_eval_impl(
     state: &mut KernelExpressionVisitorState,
-    name: Result<String>,
+    name: KernelResult<String>,
     children: &mut EngineIterator,
     callbacks: Arc<FfiOpaqueEvalCallbacks>,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     let name = name?;
     let Some(exprs) = resolve_opaque_children(state, children.map(|c| c as usize)) else {
         return Ok(0);

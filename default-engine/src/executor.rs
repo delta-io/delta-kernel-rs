@@ -179,7 +179,11 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
+            Box::pin(
+                tokio::task::spawn_blocking(task)
+                    .map_err(KernelError::join_failure)
+                    .map_err(delta_kernel::Error::Kernel),
+            )
         }
 
         fn enter(&self) -> EnterGuard<'_> {
@@ -239,7 +243,9 @@ pub mod tokio {
             }
 
             let runtime = builder.build().map_err(|e| {
-                KernelError::generic(format!("Failed to create Tokio runtime: {e}"))
+                delta_kernel::Error::Kernel(KernelError::generic(format!(
+                    "Failed to create Tokio runtime: {e}"
+                )))
             })?;
 
             let handle = runtime.handle().clone();
@@ -304,7 +310,11 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(KernelError::join_failure))
+            Box::pin(
+                tokio::task::spawn_blocking(task)
+                    .map_err(KernelError::join_failure)
+                    .map_err(delta_kernel::Error::Kernel),
+            )
         }
 
         fn enter(&self) -> EnterGuard<'_> {

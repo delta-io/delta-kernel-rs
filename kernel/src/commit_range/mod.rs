@@ -19,10 +19,11 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
-//! use delta_kernel::{Engine, KernelError, Snapshot};
+//! use delta_kernel::{Engine, Result, Snapshot};
 //! use delta_kernel::object_store::local::LocalFileSystem;
 //! use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 //!
+//! # fn main() -> Result<()> {
 //! let engine: Arc<dyn Engine> =
 //!     Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
 //! let start_snapshot = Snapshot::builder_for("file:///data/T").at_version(0).build(engine.as_ref())?;
@@ -41,7 +42,8 @@
 //!         let _batch = batch?;
 //!     }
 //! }
-//! # Ok::<(), KernelError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 mod actions;
@@ -64,7 +66,7 @@ use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{Engine, KernelError, Result, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
@@ -135,29 +137,29 @@ impl CommitRange {
         actions: &[DeltaAction],
     ) -> Result<impl Iterator<Item = Result<CommitAction>> + Send> {
         if actions.is_empty() {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "at least one DeltaAction must be requested",
-            ));
+            )));
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(KernelError::generic(format!(
+                    return Err(crate::Error::Kernel(KernelError::generic(format!(
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
-                    )));
+                    ))));
                 }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(KernelError::generic(format!(
+                    return Err(crate::Error::Kernel(KernelError::generic(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
-                    )));
+                    ))));
                 }
                 let table_config = snapshot.table_configuration();
                 table_config.ensure_operation_supported(Operation::Scan)?;
@@ -206,7 +208,7 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> Result<CommitAction> {
+    fn try_advance(&mut self, log_path: ParsedLogPath) -> KernelResult<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
             self.engine.as_ref(),
@@ -252,7 +254,7 @@ impl Iterator for CommitActionsIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
-        Some(self.try_advance(log_path))
+        Some(self.try_advance(log_path).map_err(crate::Error::Kernel))
     }
 }
 
@@ -697,16 +699,16 @@ mod tests {
     #[rstest::rstest]
     #[case::too_high_reader_version(
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &KernelError| matches!(err, KernelError::Unsupported(_)),
+        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
-        |err: &KernelError| matches!(err, KernelError::InvalidProtocol(_)),
+        |err: &crate::Error| matches!(err, crate::Error::Kernel(KernelError::InvalidProtocol(_))),
     )]
     #[tokio::test]
     async fn test_commits_errors_on_unsupported_reader_version(
         #[case] v1: &str,
-        #[case] is_expected_err: fn(&KernelError) -> bool,
+        #[case] is_expected_err: fn(&crate::Error) -> bool,
     ) {
         let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
         let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
@@ -960,7 +962,7 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, KernelError::Unsupported(_)),
+                matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
                 "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
@@ -989,7 +991,7 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(KernelError::Unsupported(msg)) => {
+            Err(crate::Error::Kernel(KernelError::Unsupported(msg))) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
             Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),

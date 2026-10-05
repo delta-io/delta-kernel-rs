@@ -27,7 +27,7 @@ use crate::expressions::Scalar;
 use crate::partition::serialization::would_serialize_to_null;
 use crate::schema::{DataType, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Validates and normalizes partition keys and value types against the table schema.
 /// Returns the map re-keyed to schema case.
@@ -44,7 +44,7 @@ pub(crate) fn validate_partition_values(
     logical_partition_columns: &[String],
     logical_schema: &StructType,
     logical_partition_values: HashMap<String, Scalar>,
-) -> Result<HashMap<String, Scalar>> {
+) -> KernelResult<HashMap<String, Scalar>> {
     let expected_keys: Vec<_> = logical_partition_columns
         .iter()
         .map(|name| ExpectedPartitionKey {
@@ -67,7 +67,7 @@ pub(crate) fn validate_physical_partition_values(
     logical_schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
     physical_partition_values: HashMap<String, Scalar>,
-) -> Result<HashMap<String, Scalar>> {
+) -> KernelResult<HashMap<String, Scalar>> {
     let mut expected_keys = Vec::with_capacity(logical_partition_columns.len());
     for logical_name in logical_partition_columns {
         let field = logical_schema.field(logical_name).ok_or_else(|| {
@@ -121,7 +121,7 @@ fn validate_and_rekey_partition_values(
     logical_schema: &StructType,
     partition_values: HashMap<String, Scalar>,
     matching: PartitionKeyMatching,
-) -> Result<HashMap<String, Scalar>> {
+) -> KernelResult<HashMap<String, Scalar>> {
     let normalized = validate_keys(expected_keys, partition_values, matching)?;
     validate_types(logical_schema, &normalized)?;
     Ok(normalized)
@@ -144,7 +144,7 @@ fn validate_keys(
     expected_keys: &[ExpectedPartitionKey<'_>],
     partition_values: HashMap<String, Scalar>,
     matching: PartitionKeyMatching,
-) -> Result<HashMap<String, Scalar>> {
+) -> KernelResult<HashMap<String, Scalar>> {
     let mut schema_lookup = HashMap::with_capacity(expected_keys.len());
     for expected in expected_keys {
         if schema_lookup
@@ -221,7 +221,7 @@ fn validate_keys(
 fn validate_types(
     logical_schema: &StructType,
     logical_partition_values: &HashMap<String, Scalar>,
-) -> Result<()> {
+) -> KernelResult<()> {
     for (col_name, value) in logical_partition_values {
         let field = logical_schema.field(col_name).ok_or_else(|| {
             KernelError::invalid_partition_values(format!(
@@ -293,7 +293,7 @@ mod tests {
     fn validate_logical_keys(
         logical_partition_columns: &[String],
         logical_partition_values: HashMap<String, Scalar>,
-    ) -> Result<HashMap<String, Scalar>> {
+    ) -> KernelResult<HashMap<String, Scalar>> {
         let expected_keys = logical_partition_columns
             .iter()
             .map(|name| ExpectedPartitionKey {

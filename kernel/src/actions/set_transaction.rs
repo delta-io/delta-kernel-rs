@@ -3,7 +3,7 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{Engine, Result, RowVisitor as _, Version};
+use crate::{Engine, Error, KernelResult, RowVisitor as _, Version};
 
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
@@ -22,7 +22,7 @@ impl SetTransactionScanner {
         log_segment: &LogSegment,
         application_id: &str,
         engine: &dyn Engine,
-    ) -> Result<Option<SetTransaction>> {
+    ) -> KernelResult<Option<SetTransaction>> {
         let mut transactions =
             scan_application_transactions(log_segment, Some(application_id), engine)?;
         Ok(transactions.remove(application_id))
@@ -33,7 +33,7 @@ impl SetTransactionScanner {
     pub(crate) fn get_all(
         log_segment: &LogSegment,
         engine: &dyn Engine,
-    ) -> Result<SetTransactionMap> {
+    ) -> KernelResult<SetTransactionMap> {
         scan_application_transactions(log_segment, None, engine)
     }
 
@@ -51,7 +51,7 @@ impl SetTransactionScanner {
         base_active: &SetTransactionMap,
         base_version: Version,
         engine: &dyn Engine,
-    ) -> Result<Option<SetTransaction>> {
+    ) -> KernelResult<Option<SetTransaction>> {
         let tail = Self::get_one(
             &log_segment.segment_after_version(base_version),
             application_id,
@@ -68,13 +68,15 @@ fn scan_application_transactions(
     log_segment: &LogSegment,
     application_id: Option<&str>,
     engine: &dyn Engine,
-) -> Result<SetTransactionMap> {
+) -> KernelResult<SetTransactionMap> {
     let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
     for maybe_data in replay_for_app_ids(log_segment, engine)? {
         let txns = maybe_data?.actions;
-        visitor.visit_rows_of(txns.as_ref())?;
+        visitor
+            .visit_rows_of(txns.as_ref())
+            .map_err(Error::into_kernel_error)?;
         // if a specific id is requested and a transaction was found, then return
         if application_id.is_some() && !visitor.set_transactions.is_empty() {
             break;
@@ -88,8 +90,11 @@ fn scan_application_transactions(
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> Result<impl Iterator<Item = Result<ActionsBatch>> + Send> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
+    Ok(log_segment
+        .read_actions(engine, LOG_TXN_SCHEMA.clone())
+        .map_err(Error::into_kernel_error)?
+        .map(|batch| batch.map_err(Error::into_kernel_error)))
 }
 
 #[cfg(test)]

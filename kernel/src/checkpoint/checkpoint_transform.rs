@@ -21,7 +21,7 @@ use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, 
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, Result};
+use crate::{Error, KernelError, KernelResult};
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
@@ -84,7 +84,7 @@ pub(crate) fn build_checkpoint_transform(
     read_schema: &StructType,
     stats_schema: &SchemaRef,
     partition_schema: Option<&SchemaRef>,
-) -> Result<(SchemaRef, ExpressionRef)> {
+) -> KernelResult<(SchemaRef, ExpressionRef)> {
     let mut patch_builder = ProjectionStructPatchBuilder::new(read_schema);
 
     // Handle stats field
@@ -126,7 +126,7 @@ pub(crate) fn build_checkpoint_transform(
         }
     }
 
-    patch_builder.build()
+    patch_builder.build().map_err(Error::into_kernel_error)
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -147,7 +147,7 @@ pub(crate) fn build_checkpoint_read_schema(
     base_schema: &StructType,
     stats_schema: &StructType,
     partition_schema: Option<&StructType>,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     transform_add_schema(base_schema, |add_struct| {
         // Validate fields aren't already present
         if add_struct.field(STATS_PARSED_FIELD).is_some() {
@@ -172,6 +172,7 @@ pub(crate) fn build_checkpoint_read_schema(
                 )
             })
             .build(add_struct)
+            .map_err(Error::into_kernel_error)
     })
 }
 
@@ -249,8 +250,8 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
 /// - The `add` field is not a struct type
 fn transform_add_schema(
     base_schema: &StructType,
-    transform_fn: impl FnOnce(&StructType) -> Result<StructType>,
-) -> Result<SchemaRef> {
+    transform_fn: impl FnOnce(&StructType) -> KernelResult<StructType>,
+) -> KernelResult<SchemaRef> {
     // Find and validate the add field
     let add_field = base_schema
         .field(ADD_NAME)
@@ -268,7 +269,8 @@ fn transform_add_schema(
         .with_metadata(add_field.metadata.clone());
     let new_schema = SchemaStructPatchBuilder::new()
         .replace(ADD_NAME, new_add_field)
-        .build(base_schema)?;
+        .build(base_schema)
+        .map_err(Error::into_kernel_error)?;
 
     Ok(Arc::new(new_schema))
 }

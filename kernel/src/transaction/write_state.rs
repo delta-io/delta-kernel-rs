@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{DataType, Expression, KernelError, Result};
+use crate::{DataType, Error, Expression, KernelError, KernelResult, Result};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -159,34 +159,34 @@ impl BoundWriteContextBuilder {
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
-            KernelError::invalid_partition_values(
+            Error::Kernel(KernelError::invalid_partition_values(
                 "table is not partitioned; partition values are not allowed"
-            )
+            ))
         );
         require!(
             !is_partitioned || self.partition_values.is_some(),
-            KernelError::invalid_partition_values(
+            Error::Kernel(KernelError::invalid_partition_values(
                 "table is partitioned; partition values are required"
-            )
+            ))
         );
         let has_row_tracking_columns = self.logical_row_id_col_name.is_some()
             || self.logical_row_commit_version_col_name.is_some();
         require!(
             !has_row_tracking_columns || self.write_state.row_tracking_enabled,
-            KernelError::unsupported(
+            Error::Kernel(KernelError::unsupported(
                 "Kernel does not allow writing materialized Row IDs or Row Commit Versions when \
                  Row Tracking is not enabled"
-            )
+            ))
         );
         require!(
             !has_row_tracking_columns || !self.write_state.iceberg_compat_v3_enabled,
-            KernelError::unsupported(
+            Error::Kernel(KernelError::unsupported(
                 "Kernel does not support writing materialized Row IDs or Row Commit Versions to \
                  IcebergCompatV3 tables"
-            )
+            ))
         );
-        let logical_data_schema = self.build_logical_data_schema()?;
-        let physical_data_schema = self.build_physical_data_schema()?;
+        let logical_data_schema = self.build_logical_data_schema().map_err(Error::Kernel)?;
+        let physical_data_schema = self.build_physical_data_schema().map_err(Error::Kernel)?;
 
         let normalized = self
             .partition_values
@@ -205,16 +205,20 @@ impl BoundWriteContextBuilder {
                     )
                 }
             })
-            .transpose()?;
+            .transpose()
+            .map_err(Error::Kernel)?;
 
         let mut serialized = HashMap::with_capacity(normalized.as_ref().map_or(0, HashMap::len));
         if let Some(normalized) = &normalized {
             for logical_name in &self.write_state.logical_partition_columns {
-                let scalar = normalized.get(logical_name).ok_or_else(|| {
-                    KernelError::internal_error(format!(
-                        "partition column '{logical_name}' missing after validation"
-                    ))
-                })?;
+                let scalar = normalized
+                    .get(logical_name)
+                    .ok_or_else(|| {
+                        KernelError::internal_error(format!(
+                            "partition column '{logical_name}' missing after validation"
+                        ))
+                    })
+                    .map_err(Error::Kernel)?;
                 let value = serialize_partition_value(scalar)?;
                 let physical_name = self
                     .write_state
@@ -224,7 +228,8 @@ impl BoundWriteContextBuilder {
                         KernelError::internal_error(format!(
                             "partition column '{logical_name}' not found in schema after validation"
                         ))
-                    })?
+                    })
+                    .map_err(Error::Kernel)?
                     .physical_name(self.write_state.column_mapping_mode)
                     .to_string();
                 serialized.insert(physical_name, value);
@@ -232,7 +237,8 @@ impl BoundWriteContextBuilder {
         }
         let logical_to_physical = Arc::new(
             self.write_state
-                .generate_logical_to_physical(normalized.as_ref())?,
+                .generate_logical_to_physical(normalized.as_ref())
+                .map_err(Error::Kernel)?,
         );
 
         Ok(BoundWriteContext {
@@ -244,7 +250,7 @@ impl BoundWriteContextBuilder {
         })
     }
 
-    fn build_logical_data_schema(&self) -> Result<SchemaRef> {
+    fn build_logical_data_schema(&self) -> KernelResult<SchemaRef> {
         if self.logical_row_id_col_name.is_none()
             && self.logical_row_commit_version_col_name.is_none()
         {
@@ -262,10 +268,12 @@ impl BoundWriteContextBuilder {
         if let Some(logical_name) = self.logical_row_commit_version_col_name.as_deref() {
             fields.push(StructField::nullable(logical_name, DataType::LONG));
         }
-        Ok(Arc::new(StructType::try_new(fields)?))
+        Ok(Arc::new(
+            StructType::try_new(fields).map_err(Error::into_kernel_error)?,
+        ))
     }
 
-    fn build_physical_data_schema(&self) -> Result<SchemaRef> {
+    fn build_physical_data_schema(&self) -> KernelResult<SchemaRef> {
         if self.logical_row_id_col_name.is_none()
             && self.logical_row_commit_version_col_name.is_none()
         {
@@ -289,14 +297,16 @@ impl BoundWriteContextBuilder {
                 .as_deref(),
             MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
         )?);
-        Ok(Arc::new(StructType::try_new(fields)?))
+        Ok(Arc::new(
+            StructType::try_new(fields).map_err(Error::into_kernel_error)?,
+        ))
     }
 
     fn build_physical_row_tracking_field(
         logical_name: Option<&str>,
         physical_name: Option<&str>,
         configuration_key: &str,
-    ) -> Result<Option<StructField>> {
+    ) -> KernelResult<Option<StructField>> {
         if logical_name.is_none() {
             return Ok(None);
         }
@@ -357,10 +367,12 @@ impl WriteState {
     ///
     /// Returns an error if any field cannot be serialized.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&WriteStateWire {
+        serde_json::to_vec(&WriteStateWire {
             version: WRITE_STATE_FORMAT_VERSION,
             write_state: self,
-        })?)
+        })
+        .map_err(crate::KernelError::from)
+        .map_err(Error::Kernel)
     }
 
     /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
@@ -371,13 +383,15 @@ impl WriteState {
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
     pub fn decode(bytes: &[u8]) -> Result<Arc<Self>> {
-        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
+        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)
+            .map_err(crate::KernelError::from)
+            .map_err(Error::Kernel)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
-            KernelError::generic(format!(
+            Error::Kernel(KernelError::generic(format!(
                 "unsupported write state format version {}; expected {}",
                 wire.version, WRITE_STATE_FORMAT_VERSION
-            ))
+            )))
         );
         Ok(Arc::new(wire.write_state))
     }
@@ -408,7 +422,7 @@ impl WriteState {
     fn generate_logical_to_physical(
         &self,
         partition_values: Option<&HashMap<String, Scalar>>,
-    ) -> Result<Expression> {
+    ) -> KernelResult<Expression> {
         let mut patch = ExpressionStructPatchBuilder::new();
         if self.materialize_partition_columns {
             let partition_cols: HashSet<&str> = self
@@ -439,7 +453,7 @@ impl WriteState {
             }
         }
         let patch = add_void_stripping(patch, &self.full_logical_schema);
-        Expression::struct_patch(patch)
+        Expression::struct_patch(patch).map_err(Error::into_kernel_error)
     }
 }
 

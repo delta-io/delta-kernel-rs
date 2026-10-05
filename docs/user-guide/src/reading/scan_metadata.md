@@ -109,7 +109,9 @@ Resolve the file path against the table root and read with the physical schema:
 
 ```rust,ignore
 let file_url = scan.table_root().join(&scan_file.path)?;
-let size: u64 = scan_file.size.try_into().map_err(|_| KernelError::generic("negative file size"))?;
+let size: u64 = scan_file.size.try_into()
+    .map_err(|_| KernelError::generic("negative file size"))
+    .map_err(delta_kernel::Error::Kernel)?;
 let file_meta = FileMeta::new(file_url, scan_file.modification_time, size);
 
 let read_results = engine
@@ -308,7 +310,7 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // may yield Err(KernelError::Cancelled) if cancellation stops replay
+    let metadata = metadata?; // cancellation returns Error::Kernel(KernelError::Cancelled)
     // ... process the batch ...
 }
 ```

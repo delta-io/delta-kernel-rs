@@ -12,7 +12,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::EngineData;
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::Result;
+use delta_kernel::{KernelResult, Result};
 
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
@@ -87,7 +87,9 @@ impl ArrowFFIData {
         let sa: StructArray = batch.into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);
-        let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
+        let schema = FFI_ArrowSchema::try_from(array_data.data_type())
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
         Ok(Self { array, schema })
     }
 }
@@ -113,10 +115,10 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 }
 
 #[cfg(feature = "default-engine-base")]
-fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> Result<*mut ArrowFFIData> {
-    Ok(Box::into_raw(Box::new(ArrowFFIData::try_from_engine_data(
-        data,
-    )?)))
+fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> KernelResult<*mut ArrowFFIData> {
+    Ok(Box::into_raw(Box::new(
+        ArrowFFIData::try_from_engine_data(data).map_err(delta_kernel::Error::into_kernel_error)?,
+    )))
 }
 
 /// Free an [`ArrowFFIData`] pointer produced by a kernel FFI function (e.g.
@@ -168,7 +170,7 @@ pub unsafe extern "C" fn get_engine_data(
 unsafe fn get_engine_data_impl(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-) -> Result<Handle<ExclusiveEngineData>> {
+) -> KernelResult<Handle<ExclusiveEngineData>> {
     let array_data = unsafe { arrow::array::ffi::from_ffi(array, schema) };
     let record_batch: RecordBatch = StructArray::from(array_data?).into();
     let arrow_engine_data: ArrowEngineData = record_batch.into();

@@ -7,7 +7,7 @@ use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{lazy_schema_ref, ColumnNamesAndTypes, SchemaRef};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{Error, KernelError, KernelResult};
 
 /// Column indices, matching the order in [`MANDATORY_REMOVE_FILE_COLUMNS`].
 const PATH: usize = 0;
@@ -38,16 +38,25 @@ impl StagedDataValidator {
 struct RemoveFileRequiredFields;
 
 impl Validation for RemoveFileRequiredFields {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
-        let path: &str = getters[PATH].get_opt(row, "path")?.ok_or_else(|| {
-            KernelError::missing_data("RemoveFile is missing required field 'path'")
-        })?;
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
+        let path: &str = getters[PATH]
+            .get_opt(row, "path")
+            .map_err(Error::into_kernel_error)?
+            .ok_or_else(|| {
+                KernelError::missing_data("RemoveFile is missing required field 'path'")
+            })?;
         require!(
             !path.is_empty(),
             KernelError::generic("RemoveFile path must not be empty")
         );
         let size = validate_required_field_exist::<i64>(
-            getters[SIZE].get_opt(row, "size")?,
+            getters[SIZE]
+                .get_opt(row, "size")
+                .map_err(Error::into_kernel_error)?,
             path,
             "size",
         )?;

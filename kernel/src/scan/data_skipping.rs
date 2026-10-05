@@ -7,7 +7,6 @@ use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
-use crate::error::Result;
 use crate::expressions::{
     col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
     ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
@@ -23,7 +22,8 @@ use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, Schema
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, ExpressionEvaluator, KernelError, PredicateEvaluator, RowVisitor as _,
+    Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult, PredicateEvaluator,
+    RowVisitor as _,
 };
 
 pub(crate) mod stats_schema;
@@ -369,11 +369,14 @@ impl DataSkippingFilter {
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
-    pub(crate) fn apply(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
+    pub(crate) fn apply(&self, batch: &dyn EngineData) -> KernelResult<Vec<bool>> {
         let start_time = Instant::now();
         let batch_len = batch.len();
 
-        let file_stats = self.stats_evaluator.evaluate(batch)?;
+        let file_stats = self
+            .stats_evaluator
+            .evaluate(batch)
+            .map_err(crate::Error::into_kernel_error)?;
         require!(
             file_stats.len() == batch_len,
             KernelError::internal_error(format!(
@@ -383,7 +386,10 @@ impl DataSkippingFilter {
             ))
         );
 
-        let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
+        let skipping_predicate = self
+            .skipping_evaluator
+            .evaluate(&*file_stats)
+            .map_err(crate::Error::into_kernel_error)?;
         require!(
             skipping_predicate.len() == batch_len,
             KernelError::internal_error(format!(
@@ -395,7 +401,8 @@ impl DataSkippingFilter {
 
         let selection_vector = self
             .filter_evaluator
-            .evaluate(skipping_predicate.as_ref())?;
+            .evaluate(skipping_predicate.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
         debug_assert_eq!(selection_vector.len(), batch_len);
         require!(
             selection_vector.len() == batch_len,
@@ -407,7 +414,9 @@ impl DataSkippingFilter {
         );
 
         let mut visitor = SelectionVectorVisitor::default();
-        visitor.visit_rows_of(selection_vector.as_ref())?;
+        visitor
+            .visit_rows_of(selection_vector.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
 
         if visitor.num_filtered > 0 {
             debug!(

@@ -138,10 +138,15 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
         ),
     );
     let error = match result.unwrap_err() {
-        KernelError::Backtraced { source, .. } => *source,
+        delta_kernel::Error::Kernel(KernelError::Backtraced { source, .. }) => {
+            delta_kernel::Error::Kernel(*source)
+        }
         error => error,
     };
-    assert!(matches!(error, KernelError::Schema(_)));
+    assert!(matches!(
+        error,
+        delta_kernel::Error::Kernel(KernelError::Schema(_))
+    ));
     Ok(())
 }
 

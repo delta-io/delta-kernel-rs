@@ -2,7 +2,8 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::io;
 
-use delta_kernel::{Error, KernelError, KernelResult};
+use delta_kernel::schema::PrimitiveType;
+use delta_kernel::{Error, KernelError, KernelResult, Result};
 use rstest::rstest;
 
 #[rstest]
@@ -33,7 +34,7 @@ fn test_error_preserves_kernel_display_and_source(#[case] kernel: KernelError) {
 
 #[test]
 fn test_kernel_result_explicitly_maps_into_error() {
-    let propagate = |result: KernelResult<()>| -> Result<(), Error> {
+    let propagate = |result: KernelResult<()>| -> Result<()> {
         result.map_err(Error::Kernel)?;
         Ok(())
     };
@@ -67,4 +68,13 @@ fn test_kernel_error_without_backtrace(#[case] wrapper_count: usize) {
 fn test_error_trait_bounds() {
     fn assert_error<T: StdError + Send + Sync + 'static>() {}
     assert_error::<Error>();
+}
+
+#[test]
+fn test_public_scalar_parser_returns_error_envelope() {
+    let result: Result<_> = PrimitiveType::Integer.parse_scalar("not an integer");
+    assert!(matches!(
+        result,
+        Err(Error::Kernel(KernelError::ParseError(..)))
+    ));
 }

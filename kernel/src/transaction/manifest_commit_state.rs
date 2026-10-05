@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, Result, Version};
+use crate::{version_as_i64, Engine, Error, KernelResult, Result, Version};
 
 /// State for an in-progress manifest (content-tree) commit.
 #[internal_api]
@@ -38,7 +38,7 @@ impl ManifestCommitState {
         read_snapshot: SnapshotRef,
         version_to_write: Version,
         table_config: &TableConfiguration,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         require!(
             table_config.is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
             KernelError::unsupported(
@@ -85,8 +85,8 @@ impl ManifestCommitState {
     #[internal_api]
     pub(crate) fn add_leaf(&mut self, _result: LeafNodeWriterResult) -> Result<()> {
         // TODO(#3352): fold the finished leaf's result into the commit.
-        Err(KernelError::unsupported(
+        Err(Error::Kernel(KernelError::unsupported(
             "manifest commit add_leaf is not yet supported",
-        ))
+        )))
     }
 }

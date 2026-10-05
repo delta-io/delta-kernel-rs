@@ -8,7 +8,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{Result, Version};
+use crate::{Error, KernelResult, Result, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -70,7 +70,7 @@ impl CommitProtocolMetadata {
         read_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         if read_protocol.is_some() != read_metadata.is_some() {
             return Err(crate::KernelError::generic(
                 "read_protocol and read_metadata must both be present or both be absent",
@@ -167,6 +167,7 @@ impl CommitMetadata {
         self.log_root
             .new_commit_path(self.version)
             .map(|p| p.location)
+            .map_err(Error::Kernel)
     }
 
     /// The staged commit path is the absolute path (e.g.
@@ -175,6 +176,7 @@ impl CommitMetadata {
         self.log_root
             .new_staged_commit_path(self.version)
             .map(|p| p.location)
+            .map_err(Error::Kernel)
     }
 
     /// The version to which the transaction is being committed.
@@ -225,6 +227,7 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one protocol",
                 )
             })
+            .map_err(Error::Kernel)
     }
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
@@ -239,6 +242,7 @@ impl CommitMetadata {
                     "CommitProtocolMetadata should have at least one metadata",
                 )
             })
+            .map_err(Error::Kernel)
     }
 
     /// Check if the effective protocol has a specific writer feature by name.
@@ -297,8 +301,9 @@ impl CommitMetadata {
         writer_features: Vec<&str>,
         configuration: HashMap<String, String>,
     ) -> Result<Self> {
-        let log_root = crate::path::LogRoot::new(table_root)?;
-        let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
+        let log_root = crate::path::LogRoot::new(table_root).map_err(Error::Kernel)?;
+        let protocol =
+            Protocol::try_new_modern(reader_features, writer_features).map_err(Error::Kernel)?;
         let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(
@@ -307,7 +312,8 @@ impl CommitMetadata {
             CommitType::PathBasedWrite,
             0,
             None,
-            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)
+                .map_err(Error::Kernel)?,
             vec![],
         ))
     }

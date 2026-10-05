@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::arrow::AsyncArrowWriter;
 use delta_kernel::parquet::errors::Result as ParquetResult;
-use delta_kernel::{ActionReconciliationIterator, KernelError, Result, Snapshot};
+use delta_kernel::{ActionReconciliationIterator, KernelError, KernelResult, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::future::{BoxFuture, FutureExt};
@@ -48,43 +48,59 @@ async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
     batch_iter: &mut ActionReconciliationIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
-) -> Result<()> {
+) -> KernelResult<()> {
     parquet_writer.write(first_batch).await?;
     for data_res in batch_iter {
-        let data = data_res?.apply_selection_vector()?;
-        let batch = data.try_into_record_batch()?;
+        let data = data_res
+            .map_err(delta_kernel::Error::into_kernel_error)?
+            .apply_selection_vector()
+            .map_err(delta_kernel::Error::into_kernel_error)?;
+        let batch = data
+            .try_into_record_batch()
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         parquet_writer.write(&batch).await?;
     }
     Ok(())
 }
 
-async fn try_main() -> Result<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
-    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     println!("Checkpointing Delta table at: {url}");
 
     use delta_kernel_default_engine::storage::store_from_url;
-    let store = store_from_url(&url)?;
+    let store = store_from_url(&url).map_err(delta_kernel::Error::into_kernel_error)?;
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     let engine = DefaultEngineBuilder::new(store)
         .with_task_executor(executor)
         .build();
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let snapshot = Snapshot::builder_for(url)
+        .build(&engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
 
     if cli.unsafe_i_know_what_im_doing {
-        snapshot.checkpoint(&engine, None)?;
+        snapshot
+            .checkpoint(&engine, None)
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         println!("Table checkpointed");
     } else {
         // first we create a checkpoint writer
-        let writer = snapshot.create_checkpoint_writer(&engine)?;
+        let writer = snapshot
+            .create_checkpoint_writer(&engine)
+            .map_err(delta_kernel::Error::into_kernel_error)?;
 
         // this tells us the path where we should write the checkpoint file
-        let checkpoint_path = writer.checkpoint_path()?;
+        let checkpoint_path = writer
+            .checkpoint_path()
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         // this gives us a iterator of `FilteredEngineData` that needs to be written to the file
-        let mut data_iter = writer.checkpoint_data(&engine)?;
+        let mut data_iter = writer
+            .checkpoint_data(&engine)
+            .map_err(delta_kernel::Error::into_kernel_error)?;
 
         let batch_iter = data_iter.by_ref();
         // we'll use the first batch to determine the schema
@@ -98,8 +114,13 @@ async fn try_main() -> Result<()> {
         // write only the selected rows out without having to allocate a new engine data.
         // NB: Unselected rows MUST NOT be written to the checkpoint! Doing so will create an
         // invalid checkpoint
-        let first_data = first?.apply_selection_vector()?;
-        let first_batch = first_data.try_into_record_batch()?;
+        let first_data = first
+            .map_err(delta_kernel::Error::into_kernel_error)?
+            .apply_selection_vector()
+            .map_err(delta_kernel::Error::into_kernel_error)?;
+        let first_batch = first_data
+            .try_into_record_batch()
+            .map_err(delta_kernel::Error::into_kernel_error)?;
 
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");
         // this block just writes the checkpoint to a blackhole

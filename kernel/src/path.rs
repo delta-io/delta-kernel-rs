@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, Result, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Result, Version};
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -312,10 +312,11 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 
     /// Parse a location into a commit path (published or staged), returning an error if invalid or
     /// not a commit.
-    pub(crate) fn parse_commit(location: Location) -> Result<Self> {
+    pub(crate) fn parse_commit(location: Location) -> KernelResult<Self> {
         let url = location.as_url().to_string();
-        let parsed =
-            Self::try_from(location)?.ok_or_else(|| KernelError::invalid_log_path(&url))?;
+        let parsed = Self::try_from(location)
+            .map_err(crate::Error::into_kernel_error)?
+            .ok_or_else(|| KernelError::invalid_log_path(&url))?;
         require!(
             parsed.is_commit(),
             KernelError::generic(format!(
@@ -341,7 +342,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 
     /// Convenience wrapper around [`version_as_i64`] for this parsed path's `version`.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn version_as_i64(&self) -> Result<i64> {
+    pub(crate) fn version_as_i64(&self) -> KernelResult<i64> {
         crate::version_as_i64(self.version)
     }
 
@@ -382,7 +383,7 @@ impl ParsedLogPath<FileMeta> {
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
     #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
-    pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> Result<i64> {
+    pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
             return Err(KernelError::generic(format!(
@@ -391,11 +392,14 @@ impl ParsedLogPath<FileMeta> {
             )));
         }
 
-        let mut action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.location),
-            InCommitTimestampVisitor::schema(),
-            None,
-        )?;
+        let mut action_iter = engine
+            .json_handler()
+            .read_json_files(
+                slice::from_ref(&self.location),
+                InCommitTimestampVisitor::schema(),
+                None,
+            )
+            .map_err(crate::Error::into_kernel_error)?;
 
         // Process the actions to find inCommitTimestamp
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,
@@ -403,12 +407,14 @@ impl ParsedLogPath<FileMeta> {
         match action_iter.next() {
             Some(Ok(actions)) => {
                 let mut visitor = InCommitTimestampVisitor::default();
-                visitor.visit_rows_of(actions.as_ref())?;
+                visitor
+                    .visit_rows_of(actions.as_ref())
+                    .map_err(crate::Error::into_kernel_error)?;
                 visitor.in_commit_timestamp.ok_or_else(|| {
                     KernelError::generic("In-Commit Timestamp not found in commit file")
                 })
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(crate::Error::into_kernel_error(err)),
             None => Err(KernelError::generic("Commit file contains no actions")),
         }
     }
@@ -416,18 +422,22 @@ impl ParsedLogPath<FileMeta> {
 
 impl ParsedLogPath<Url> {
     /// Helper method to create a path with the given filename generator
-    fn create_path(table_root: &Url, filename: String) -> Result<Self> {
+    fn create_path(table_root: &Url, filename: String) -> KernelResult<Self> {
         let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
-        Self::try_from(location)?.ok_or_else(|| {
-            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
-        })
+        Self::try_from(location)
+            .map_err(crate::Error::into_kernel_error)?
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Attempted to create an invalid path: {filename}"
+                ))
+            })
     }
 
     // TODO: normalize all these log path constructors. we have overlap with this + LogPath +
     // LogRoot types.
     #[allow(unused)]
     /// Create a new ParsedCommitPath<Url> for a new json commit file
-    pub(crate) fn new_commit(table_root: &Url, version: Version) -> Result<Self> {
+    pub(crate) fn new_commit(table_root: &Url, version: Version) -> KernelResult<Self> {
         let filename = format!("{version:020}.json");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_commit() {
@@ -442,7 +452,7 @@ impl ParsedLogPath<Url> {
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let filename = format!("{version:020}.checkpoint.parquet");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
@@ -455,7 +465,10 @@ impl ParsedLogPath<Url> {
 
     /// Create a new ParsedCheckpointPath<Url> for a UUID-based parquet checkpoint file
     #[allow(dead_code)] // TODO: Remove this once we have a use case for it
-    pub(crate) fn new_uuid_parquet_checkpoint(table_root: &Url, version: Version) -> Result<Self> {
+    pub(crate) fn new_uuid_parquet_checkpoint(
+        table_root: &Url,
+        version: Version,
+    ) -> KernelResult<Self> {
         let filename = format!("{:020}.checkpoint.{}.parquet", version, Uuid::new_v4());
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
@@ -470,11 +483,11 @@ impl ParsedLogPath<Url> {
     #[internal_api]
     pub(crate) fn new_crc(table_root: &Url, version: Version) -> Result<Self> {
         let filename = format!("{version:020}.crc");
-        let path = Self::create_path(table_root, filename)?;
+        let path = Self::create_path(table_root, filename).map_err(crate::Error::Kernel)?;
         if !matches!(path.file_type, LogPathFileType::Crc) {
-            return Err(KernelError::internal_error(
+            return Err(crate::Error::Kernel(KernelError::internal_error(
                 "ParsedLogPath::new_crc created a non-CRC path",
-            ));
+            )));
         }
         Ok(path)
     }
@@ -486,7 +499,7 @@ impl ParsedLogPath<Url> {
         table_root: &Url,
         start_version: Version,
         end_version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let filename = format!("{start_version:020}.{end_version:020}.compacted.json");
         let path = Self::create_path(table_root, filename)?;
         if !matches!(path.file_type, LogPathFileType::CompactedCommit { .. }) {
@@ -503,7 +516,7 @@ impl ParsedLogPath<Url> {
 ///
 /// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
 /// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
-pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> Result<(String, Url)> {
+pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> KernelResult<(String, Url)> {
     let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
     let url = table_root
         .join(DELTA_LOG_DIR_WITH_SLASH)?
@@ -525,7 +538,7 @@ impl LogRoot {
     /// s3://bucket/table/_delta_log/)
     ///
     /// TODO: could take a `table_root: TableRoot`
-    pub(crate) fn new(mut table_root: Url) -> Result<Self> {
+    pub(crate) fn new(mut table_root: Url) -> KernelResult<Self> {
         if !table_root.path().ends_with('/') {
             let new_path = format!("{}/", table_root.path());
             table_root.set_path(&new_path);
@@ -546,22 +559,33 @@ impl LogRoot {
     }
 
     /// Create a new commit path (absolute path) for the given version.
-    pub(crate) fn new_commit_path(&self, version: Version) -> Result<ParsedLogPath<Url>> {
+    pub(crate) fn new_commit_path(&self, version: Version) -> KernelResult<ParsedLogPath<Url>> {
         let filename = format!("{version:020}.json");
         let path = self.log_root().join(&filename)?;
-        ParsedLogPath::try_from(path)?.ok_or_else(|| {
-            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
-        })
+        ParsedLogPath::try_from(path)
+            .map_err(crate::Error::into_kernel_error)?
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Attempted to create an invalid path: {filename}"
+                ))
+            })
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
-    pub(crate) fn new_staged_commit_path(&self, version: Version) -> Result<ParsedLogPath<Url>> {
+    pub(crate) fn new_staged_commit_path(
+        &self,
+        version: Version,
+    ) -> KernelResult<ParsedLogPath<Url>> {
         let uuid = uuid::Uuid::new_v4();
         let filename = format!("{version:020}.{uuid}.json");
         let path = self.log_root().join(STAGED_COMMITS_DIR)?.join(&filename)?;
-        ParsedLogPath::try_from(path)?.ok_or_else(|| {
-            KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
-        })
+        ParsedLogPath::try_from(path)
+            .map_err(crate::Error::into_kernel_error)?
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Attempted to create an invalid path: {filename}"
+                ))
+            })
     }
 }
 

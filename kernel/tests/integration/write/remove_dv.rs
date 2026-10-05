@@ -215,7 +215,9 @@ fn selected_scan_file_batch(
             return Ok(FilteredEngineData::with_all_rows_selected(data));
         }
     }
-    Err(KernelError::generic("expected at least one scan file"))
+    Err(delta_kernel::Error::Kernel(KernelError::generic(
+        "expected at least one scan file",
+    )))
 }
 
 #[derive(Clone, Copy)]
@@ -1998,9 +2000,17 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let write_state = txn.write_state()?;
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::Result<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                Arc::new(
+                    data_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::KernelError::from)
+                        .map_err(delta_kernel::Error::Kernel)?,
+                ),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],
-            )?;
+            )
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {

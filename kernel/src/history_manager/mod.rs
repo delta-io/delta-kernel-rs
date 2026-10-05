@@ -35,7 +35,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
-use crate::{Engine, KernelError as DeltaError, Result, Version};
+use crate::{Engine, Error, KernelError as DeltaError, KernelResult, Result, Version};
 
 pub(crate) mod search;
 
@@ -389,6 +389,7 @@ pub(crate) fn timestamp_to_version(
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
         .get_timestamp(engine)
+        .map_err(Error::into_kernel_error)
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {
         // Exact match: snapshot version satisfies both bounds
@@ -429,8 +430,11 @@ pub(crate) fn timestamp_to_version(
                 HistoryCommitType::Recreatable,
             )
             .map_err(|e| match e {
-                DeltaError::LogHistory(inner) => *inner,
-                _ => LogHistoryError::internal("failed to get earliest commit", e),
+                Error::Kernel(DeltaError::LogHistory(inner)) => *inner,
+                _ => LogHistoryError::internal(
+                    "failed to get earliest commit",
+                    Error::into_kernel_error(e),
+                ),
             })?;
             let limit = snapshot
                 .version()
@@ -541,7 +545,7 @@ pub fn latest_version_as_of(
         Bound::GreatestLower,
         resolved_commit_type,
     )
-    .map_err(Into::into)
+    .map_err(|error| Error::Kernel(error.into()))
 }
 
 /// Gets the first [`CommitAt`] (version and timestamp) with a timestamp at or after `timestamp`.
@@ -582,7 +586,7 @@ pub fn first_version_after(
         Bound::LeastUpper,
         resolved_commit_type,
     )
-    .map_err(Into::into)
+    .map_err(|error| Error::Kernel(error.into()))
 }
 
 /// Converts a timestamp range to a corresponding version range.
@@ -639,11 +643,13 @@ pub fn timestamp_range_to_versions(
         // The `start_timestamp` must be no greater than the `end_timestamp`.
         require!(
             start_timestamp <= end_timestamp,
-            LogHistoryError::InvalidTimestampRange {
-                start_timestamp,
-                end_timestamp
-            }
-            .into()
+            Error::Kernel(
+                LogHistoryError::InvalidTimestampRange {
+                    start_timestamp,
+                    end_timestamp,
+                }
+                .into(),
+            )
         );
     }
 
@@ -665,7 +671,9 @@ pub fn timestamp_range_to_versions(
     let end_version = end_timestamp
         .map(|end| {
             let end_version =
-                latest_version_as_of(snapshot, engine, end, HistoryCommitType::Published)?.version;
+                latest_version_as_of(snapshot, engine, end, HistoryCommitType::Published)
+                    .map_err(Error::into_kernel_error)?
+                    .version;
 
             // Verify that the start version is no greater than the end version. This can
             // happen in the case that the entire timestamp range falls between two commits.
@@ -687,7 +695,8 @@ pub fn timestamp_range_to_versions(
 
             Ok(end_version)
         })
-        .transpose()?;
+        .transpose()
+        .map_err(Error::Kernel)?;
 
     Ok((start_version, end_version))
 }
@@ -717,7 +726,7 @@ fn get_earliest_published_commit_version(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-) -> Result<Version> {
+) -> KernelResult<Version> {
     // TODO(#3188): thread a cancellation token through the history-manager entry points.
     list_delta_log_from_storage(
         engine.storage_handler().as_ref(),
@@ -725,10 +734,12 @@ fn get_earliest_published_commit_version(
         0,
         Version::MAX,
         None,
-    )?
+    )
+    .map_err(Error::into_kernel_error)?
     .filter_ok(|f| f.file_type == LogPathFileType::Commit)
     .next()
-    .transpose()?
+    .transpose()
+    .map_err(Error::into_kernel_error)?
     .map(|f| f.version)
     .ok_or_else(|| {
         if earliest_ratified_commit_version == Some(0) {
@@ -768,7 +779,7 @@ fn get_earliest_recreatable_commit(
     engine: &dyn Engine,
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
-) -> Result<Version> {
+) -> KernelResult<Version> {
     let mut last_complete_checkpoint: Option<Version> = None;
     // Tracks (version, num_parts) -> set of part numbers observed so far, for multi-part
     // checkpoint completeness.
@@ -782,9 +793,10 @@ fn get_earliest_recreatable_commit(
         0,
         Version::MAX,
         None,
-    )?;
+    )
+    .map_err(Error::into_kernel_error)?;
     for parsed_result in listing {
-        let parsed_log_path = parsed_result?;
+        let parsed_log_path = parsed_result.map_err(Error::into_kernel_error)?;
         if !should_process_log_file(&parsed_log_path) {
             continue;
         }
@@ -897,10 +909,12 @@ pub fn get_earliest_commit(
             engine,
             log_root,
             earliest_ratified_commit_version,
-        ),
+        )
+        .map_err(Error::Kernel),
 
         HistoryCommitType::Recreatable => {
             get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+                .map_err(Error::Kernel)
         }
     }
 }
@@ -1637,7 +1651,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::KernelError::LogHistory(ref e))
+                Err(crate::Error::Kernel(crate::KernelError::LogHistory(ref e)))
                     if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
             ),
             "{res:?}"
@@ -1664,7 +1678,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::KernelError::LogHistory(ref e))
+                Err(crate::Error::Kernel(crate::KernelError::LogHistory(ref e)))
                     if matches!(**e, LogHistoryError::EmptyTimestampRange { between_version: 0, .. })
             ),
             "{res:?}"

@@ -24,7 +24,7 @@ use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{FileMeta, Result};
+use crate::{Error, FileMeta, KernelResult};
 
 /// Topology of a checkpoint: where the `add` / `remove` actions live.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,7 +57,10 @@ impl CheckpointShape {
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(exec: &dyn PlanExecutor, snapshot: &Snapshot) -> Result<CheckpointShape> {
+    pub(crate) fn try_new(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> KernelResult<CheckpointShape> {
         Self::try_new_impl(exec, snapshot, false)
     }
 
@@ -74,7 +77,7 @@ impl CheckpointShape {
     pub(crate) fn try_new_with_leaf_schema(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
-    ) -> Result<CheckpointShape> {
+    ) -> KernelResult<CheckpointShape> {
         Self::try_new_impl(exec, snapshot, true)
     }
 
@@ -82,7 +85,7 @@ impl CheckpointShape {
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
-    ) -> Result<CheckpointShape> {
+    ) -> KernelResult<CheckpointShape> {
         let segment = snapshot.log_segment();
 
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
@@ -166,7 +169,7 @@ impl CheckpointShape {
         root_checkpoint: &FileMeta,
         file_type: FileType,
         needs_leaf_schema: bool,
-    ) -> Result<Option<CheckpointShape>> {
+    ) -> KernelResult<Option<CheckpointShape>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
             Some([sidecar, ..]) => {
                 let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
@@ -209,7 +212,7 @@ impl CheckpointShape {
         sidecar: FileMeta,
         needs_leaf_schema: bool,
         hint_sidecar_schema: Option<StructType>,
-    ) -> Result<CheckpointShape> {
+    ) -> KernelResult<CheckpointShape> {
         let leaf_checkpoint_schema = match (needs_leaf_schema, hint_sidecar_schema) {
             (false, _) => None,
             (true, Some(schema)) => Some(Arc::new(schema)),
@@ -264,8 +267,11 @@ impl CheckpointShape {
     fields(enable_call_frame),
     err
 )]
-fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> Result<SchemaRef> {
-    Ok(exec.read_parquet_footer(file)?.schema)
+fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> KernelResult<SchemaRef> {
+    Ok(exec
+        .read_parquet_footer(file)
+        .map_err(Error::into_kernel_error)?
+        .schema)
 }
 
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's
@@ -281,20 +287,29 @@ fn collect_single_sidecar(
     file: &FileMeta,
     file_format: FileType,
     log_root: &Url,
-) -> Result<Option<FileMeta>> {
+) -> KernelResult<Option<FileMeta>> {
     let read_schema = LogSegment::sidecar_read_schema();
     // No file-constant columns: the sidecar column is read directly from each file.
     let plan = match file_format {
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
-    }?
-    .filter(col!(SIDECAR_NAME, "path").is_not_null())?
-    .build()?;
-    let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
+    }
+    .map_err(Error::into_kernel_error)?
+    .filter(col!(SIDECAR_NAME, "path").is_not_null())
+    .map_err(Error::into_kernel_error)?
+    .build()
+    .map_err(Error::into_kernel_error)?;
+    let data = exec
+        .execute_op(Operation::QueryPlan(plan))
+        .map_err(Error::into_kernel_error)?
+        .into_data()
+        .map_err(Error::into_kernel_error)?;
 
     let mut visitor = SidecarVisitor::default();
     for batch in data {
-        visitor.visit_rows_of(batch?.as_ref())?;
+        visitor
+            .visit_rows_of(batch.map_err(Error::into_kernel_error)?.as_ref())
+            .map_err(Error::into_kernel_error)?;
         if !visitor.sidecars.is_empty() {
             break;
         }
@@ -326,6 +341,7 @@ mod tests {
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
+    use crate::Result;
 
     /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {

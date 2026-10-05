@@ -26,7 +26,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{schema, schema_ref, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{Engine, EngineData, Result, Snapshot};
+use crate::{Engine, EngineData, KernelResult, Result, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -42,8 +42,10 @@ fn generate_checkpoint_parts(
     writer: &CheckpointWriter,
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
-) -> Result<CheckpointParts> {
-    let data_iter = writer.checkpoint_data(engine)?;
+) -> KernelResult<CheckpointParts> {
+    let data_iter = writer
+        .checkpoint_data(engine)
+        .map_err(crate::Error::into_kernel_error)?;
     let iter_state = data_iter.state();
     let output_schema = writer.output_schema.clone();
 
@@ -64,7 +66,11 @@ fn generate_checkpoint_parts(
             let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
             engine
                 .parquet_handler()
-                .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
+                .write_parquet_file(
+                    sidecar_url.clone(),
+                    Box::new(single_sidecar_iter.map(|batch| batch.map_err(crate::Error::Kernel))),
+                )
+                .map_err(crate::Error::into_kernel_error)?;
             sidecar_files.push(sidecar_url);
             sidecar_index += 1;
         }
@@ -290,7 +296,8 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     write_commit_to_store(
         &store,
@@ -301,15 +308,21 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    write_commit_to_store(&store, vec![create_remove_action("file1.parquet")], 2).await?;
+    write_commit_to_store(&store, vec![create_remove_action("file1.parquet")], 2)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let result = generate_checkpoint_parts(&writer, &engine, usize::MAX)?;
+    let result =
+        generate_checkpoint_parts(&writer, &engine, usize::MAX).map_err(crate::Error::Kernel)?;
 
     assert_eq!(result.sidecar_files.len(), 1);
 
@@ -357,7 +370,8 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     // Spread adds and removes across commits so the hint=3 causes chunking at batch
     // boundaries, with removes landing in multiple sidecars.
@@ -370,7 +384,8 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
     write_commit_to_store(
         &store,
         vec![
@@ -380,10 +395,15 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
         ],
         2,
     )
-    .await?;
-    write_commit_to_store(&store, vec![create_add_action("file5.parquet")], 3).await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
+    write_commit_to_store(&store, vec![create_add_action("file5.parquet")], 3)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -396,7 +416,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     // Sidecar 1: commit 3 (1) + commit 2 (3) = 4 file action rows (hint exceeded)
     // Sidecar 2: commit 1 (3) = 3 file action rows (hint reached)
     // Sidecar 3: commit 0 file part (1) = 1 file action row
-    let result = generate_checkpoint_parts(&writer, &engine, 3)?;
+    let result = generate_checkpoint_parts(&writer, &engine, 3).map_err(crate::Error::Kernel)?;
 
     assert!(result.iter_state.is_exhausted());
 
@@ -463,7 +483,8 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     write_commit_to_store(
         &store,
@@ -473,7 +494,8 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
         ],
         1,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     write_commit_to_store(
         &store,
@@ -483,14 +505,17 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
         ],
         2,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // hint=1: each batch exceeds the hint, so each gets its own sidecar.
-    let result = generate_checkpoint_parts(&writer, &engine, 1)?;
+    let result = generate_checkpoint_parts(&writer, &engine, 1).map_err(crate::Error::Kernel)?;
 
     assert!(result.iter_state.is_exhausted());
     assert_eq!(
@@ -533,7 +558,8 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
     let mut add = Add {
         path: "category=books/file1.parquet".into(),
@@ -551,9 +577,13 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
     };
     add.partition_values
         .insert("category".into(), "books".into());
-    write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
+    write_commit_to_store(&store, vec![Action::Add(add)], 1)
+        .await
+        .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -645,9 +675,12 @@ async fn test_splitter_no_file_actions() -> Result<()> {
         ],
         0,
     )
-    .await?;
+    .await
+    .map_err(crate::Error::Kernel)?;
 
-    let table_root = Url::parse("memory:///")?;
+    let table_root = Url::parse("memory:///")
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
@@ -658,9 +691,11 @@ async fn test_splitter_no_file_actions() -> Result<()> {
         data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
 
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
+    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)
+        .map_err(crate::Error::Kernel)?;
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
 

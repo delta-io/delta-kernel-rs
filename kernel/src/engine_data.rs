@@ -11,7 +11,7 @@ use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{AsAny, KernelError, Result};
+use crate::{AsAny, KernelError, KernelResult, Result};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -33,10 +33,12 @@ pub struct FilteredEngineData {
 impl FilteredEngineData {
     pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> Result<Self> {
         if selection_vector.len() > data.len() {
-            return Err(KernelError::InvalidSelectionVector(format!(
-                "Selection vector is larger than data length: {} > {}",
-                selection_vector.len(),
-                data.len()
+            return Err(crate::Error::Kernel(KernelError::InvalidSelectionVector(
+                format!(
+                    "Selection vector is larger than data length: {} > {}",
+                    selection_vector.len(),
+                    data.len()
+                ),
             )));
         }
         Ok(Self {
@@ -241,7 +243,7 @@ macro_rules! impl_default_get {
         $(
             fn $name(&'a self, _row_index: usize, field_name: &str) -> Result<Option<$typ>> {
                 debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-                Err(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
+                Err(crate::Error::Kernel(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace()))
             }
         )*
     };
@@ -249,8 +251,8 @@ macro_rules! impl_default_get {
 
 /// When calling back into a [`RowVisitor`], the engine needs to provide a slice of items that
 /// implement this trait. This allows type_safe extraction from the raw data by the kernel. By
-/// default all these methods will return a `KernelError` that an incorrect type has been asked
-/// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
+/// default these methods return [`crate::Error::Kernel`] wrapping an incorrect-type error.
+/// Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
 ///
 /// All methods return `Ok(None)` when the row's value is null.
@@ -314,6 +316,7 @@ pub trait TypedGetData<'a, T> {
             KernelError::MissingData(format!("Data missing for field {field_name}"))
                 .with_backtrace()
         })
+        .map_err(crate::Error::Kernel)
     }
 }
 
@@ -610,10 +613,14 @@ pub trait EngineData: AsAny {
 pub(crate) fn filter_by_predicate(
     filter: &dyn crate::PredicateEvaluator,
     batch: Box<dyn EngineData>,
-) -> Result<Box<dyn EngineData>> {
-    let predicate_result = filter.evaluate(batch.as_ref())?;
+) -> KernelResult<Box<dyn EngineData>> {
+    let predicate_result = filter
+        .evaluate(batch.as_ref())
+        .map_err(crate::Error::into_kernel_error)?;
     let mut visitor = SelectionVectorVisitor::default();
-    visitor.visit_rows_of(predicate_result.as_ref())?;
+    visitor
+        .visit_rows_of(predicate_result.as_ref())
+        .map_err(crate::Error::into_kernel_error)?;
     require!(
         visitor.selection_vector.len() == batch.len(),
         KernelError::internal_error(format!(
@@ -622,7 +629,9 @@ pub(crate) fn filter_by_predicate(
             batch.len()
         ))
     );
-    batch.apply_selection_vector(visitor.selection_vector)
+    batch
+        .apply_selection_vector(visitor.selection_vector)
+        .map_err(crate::Error::into_kernel_error)
 }
 
 #[cfg(test)]

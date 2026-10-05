@@ -12,7 +12,7 @@ use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::Result;
+use crate::KernelResult;
 
 /// Generates the expected schema for file statistics.
 ///
@@ -135,7 +135,7 @@ pub(crate) fn expected_stats_schema(
     config: &StatsConfig<'_>,
     required_columns: Option<&[ColumnName]>,
     requested_columns: Option<&[ColumnName]>,
-) -> Result<Schema> {
+) -> KernelResult<Schema> {
     let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
 
@@ -171,7 +171,7 @@ pub(crate) fn expected_stats_schema(
     // outdated due to deletion vectors (false)
     fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
 
-    StructType::try_new(fields)
+    StructType::try_new(fields).map_err(crate::Error::into_kernel_error)
 }
 
 /// Returns the column names that should have statistics collected.

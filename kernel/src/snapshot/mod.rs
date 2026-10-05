@@ -39,7 +39,7 @@ use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
-use crate::{Engine, KernelError, LogCompactionWriter, Result, Version};
+use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Version};
 
 mod builder;
 mod incremental;
@@ -167,6 +167,7 @@ impl Snapshot {
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
+        .map_err(crate::Error::Kernel)
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
@@ -180,7 +181,7 @@ impl Snapshot {
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
         Ok(Self::new_with_validated_crc(
             log_segment,
@@ -195,8 +196,10 @@ impl Snapshot {
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
         crc: Option<Arc<Crc>>,
-    ) -> Result<SnapshotCrc> {
-        table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
+    ) -> KernelResult<SnapshotCrc> {
+        table_configuration
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .map_err(crate::Error::into_kernel_error)?;
         SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
@@ -239,7 +242,7 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let (table_configuration, crc) = Self::prepare_new_from_log_segment(
             &location,
             &log_segment,
@@ -266,7 +269,7 @@ impl Snapshot {
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> Result<(TableConfiguration, SnapshotCrc)> {
+    ) -> KernelResult<(TableConfiguration, SnapshotCrc)> {
         let result = Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
@@ -297,7 +300,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-    ) -> Result<(TableConfiguration, Option<Arc<Crc>>)> {
+    ) -> KernelResult<(TableConfiguration, Option<Arc<Crc>>)> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -322,7 +325,8 @@ impl Snapshot {
             protocol,
             location.clone(),
             log_segment.end_version,
-        )?;
+        )
+        .map_err(crate::Error::into_kernel_error)?;
 
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
         Ok((table_configuration, crc))
@@ -343,7 +347,7 @@ impl Snapshot {
         &self,
         commit: ParsedLogPath,
         crc_delta: CrcDelta,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         require!(
             commit.is_commit(),
             KernelError::internal_error(format!(
@@ -568,7 +572,8 @@ impl Snapshot {
         }
 
         let expiration_timestamp =
-            calculate_transaction_expiration_timestamp(self.table_properties())?;
+            calculate_transaction_expiration_timestamp(self.table_properties())
+                .map_err(crate::Error::Kernel)?;
 
         // Fast path: serve from CRC if available at this version.
         if let Some(crc) = self.crc_at_version() {
@@ -604,7 +609,8 @@ impl Snapshot {
                     base_active,
                     base.version,
                     engine,
-                )?;
+                )
+                .map_err(crate::Error::Kernel)?;
                 let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
@@ -617,7 +623,8 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)
+            .map_err(crate::Error::Kernel)?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
@@ -625,7 +632,10 @@ impl Snapshot {
 
     /// Fetch the latest transaction version for every application id in this snapshot.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn get_app_id_versions(&self, engine: &dyn Engine) -> Result<SetTransactionMap> {
+    pub(crate) fn get_app_id_versions(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<SetTransactionMap> {
         if let Some(crc) = self.crc_at_version() {
             if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
                 return Ok(map.clone());
@@ -640,9 +650,9 @@ impl Snapshot {
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     pub fn get_domain_metadata(&self, domain: &str, engine: &dyn Engine) -> Result<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
-            ));
+            )));
         }
 
         self.get_domain_metadata_internal(domain, engine)
@@ -660,6 +670,7 @@ impl Snapshot {
         self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
+            .map_err(crate::Error::Kernel)
     }
 
     /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
@@ -697,7 +708,8 @@ impl Snapshot {
                     &logical_schema,
                     &physical_col,
                     column_mapping_mode,
-                )?;
+                )
+                .map_err(crate::Error::Kernel)?;
                 Ok(ClusteringColumnInfo {
                     physical_column: physical_col,
                     logical_column: logical_col,
@@ -722,8 +734,13 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<Vec<ColumnName>>> {
-        match self.get_clustering_domain_metadata(engine)? {
-            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
+        match self
+            .get_clustering_domain_metadata(engine)
+            .map_err(crate::Error::Kernel)?
+        {
+            Some(config) => Ok(Some(
+                parse_clustering_columns(&config).map_err(crate::Error::Kernel)?,
+            )),
             None => Ok(None),
         }
     }
@@ -736,7 +753,7 @@ impl Snapshot {
     pub(crate) fn get_clustering_domain_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> Result<Option<String>> {
+    ) -> KernelResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -745,6 +762,7 @@ impl Snapshot {
             return Ok(None);
         }
         self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+            .map_err(crate::Error::into_kernel_error)
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -815,12 +833,10 @@ impl Snapshot {
         // scan and falls through to the full replay below.
         if let Some(base) = self.base_crc() {
             if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
-                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
-                    base.version,
-                    base_active,
-                    domains,
-                    engine,
-                )?;
+                let rooted = self
+                    .log_segment()
+                    .scan_domain_metadatas_rooted_in_crc(base.version, base_active, domains, engine)
+                    .map_err(crate::Error::Kernel)?;
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
                 //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
@@ -835,7 +851,10 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        let replayed = self
+            .log_segment()
+            .scan_domain_metadatas(domains, engine)
+            .map_err(crate::Error::Kernel)?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }
@@ -896,7 +915,8 @@ impl Snapshot {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()
-            .in_commit_timestamp_enablement()?;
+            .in_commit_timestamp_enablement()
+            .map_err(crate::Error::Kernel)?;
 
         // Return None if ICT is not enabled at all
         if matches!(enablement, InCommitTimestampEnablement::NotEnabled) {
@@ -910,11 +930,11 @@ impl Snapshot {
         } = enablement
         {
             if self.version() < enablement_version {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "Invalid state: snapshot at version {} has ICT enablement version {} in the future",
                     self.version(),
                     enablement_version
-                )));
+                ))));
             }
         }
 
@@ -923,10 +943,10 @@ impl Snapshot {
             match crc.in_commit_timestamp_opt {
                 Some(ict) => return Ok(Some(ict)),
                 None => {
-                    return Err(KernelError::generic(format!(
+                    return Err(crate::Error::Kernel(KernelError::generic(format!(
                         "In-Commit Timestamp not found in CRC file at version {}",
                         self.version()
-                    )));
+                    ))));
                 }
             }
         }
@@ -934,10 +954,14 @@ impl Snapshot {
         // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.listed.latest_commit_file {
             Some(commit_file_meta) => {
-                let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
+                let ict = commit_file_meta
+                    .read_in_commit_timestamp(engine)
+                    .map_err(crate::Error::Kernel)?;
                 Ok(Some(ict))
             }
-            None => Err(KernelError::MissingVersion(self.version())),
+            None => Err(crate::Error::Kernel(KernelError::MissingVersion(
+                self.version(),
+            ))),
         }
     }
 
@@ -957,7 +981,8 @@ impl Snapshot {
     pub fn get_timestamp(&self, engine: &dyn Engine) -> Result<i64> {
         match self
             .table_configuration()
-            .in_commit_timestamp_enablement()?
+            .in_commit_timestamp_enablement()
+            .map_err(crate::Error::Kernel)?
         {
             InCommitTimestampEnablement::NotEnabled => {
                 match &self.log_segment.listed.latest_commit_file {
@@ -965,18 +990,21 @@ impl Snapshot {
                         let ts = commit_file_meta.location.last_modified;
                         Ok(ts)
                     }
-                    None => Err(KernelError::MissingVersion(self.version())),
+                    None => Err(crate::Error::Kernel(KernelError::MissingVersion(
+                        self.version(),
+                    ))),
                 }
             }
-            InCommitTimestampEnablement::Enabled { .. } => {
-                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+            InCommitTimestampEnablement::Enabled { .. } => self
+                .get_in_commit_timestamp(engine)?
+                .ok_or_else(|| {
                     KernelError::internal_error(format!(
                         "Invalid state: version {}, ICT is enabled \
                         but get_in_commit_timestamp returned None",
                         self.version()
                     ))
                 })
-            }
+                .map_err(crate::Error::Kernel),
         }
     }
 
@@ -1009,7 +1037,7 @@ impl Snapshot {
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
     ) -> Result<Transaction> {
-        Transaction::try_new_existing_table(self, committer, engine)
+        Transaction::try_new_existing_table(self, committer, engine).map_err(crate::Error::Kernel)
     }
 
     /// Creates a builder for altering this table's metadata. Currently supports schema change
@@ -1036,7 +1064,7 @@ impl Snapshot {
         self: Arc<Self>,
         engine: &dyn Engine,
     ) -> Result<CheckpointWriter> {
-        CheckpointWriter::try_new(self, engine)
+        CheckpointWriter::try_new(self, engine).map_err(crate::Error::Kernel)
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -1057,7 +1085,7 @@ impl Snapshot {
         start_version: Version,
         end_version: Version,
     ) -> Result<LogCompactionWriter> {
-        LogCompactionWriter::try_new(self, start_version, end_version)
+        LogCompactionWriter::try_new(self, start_version, end_version).map_err(crate::Error::Kernel)
     }
 
     // ============================================================================
@@ -1107,23 +1135,33 @@ impl Snapshot {
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
-        self.table_configuration().ensure_read_write_supported()?;
+        self.table_configuration()
+            .ensure_read_write_supported()
+            .map_err(crate::Error::Kernel)?;
 
-        let crc = self.resolve_crc_for_write(engine)?;
+        let crc = self
+            .resolve_crc_for_write(engine)
+            .map_err(crate::Error::Kernel)?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
         match try_write_crc_file(engine, &crc_path.location, &crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
-                let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
-                let new_snapshot = Arc::new(Snapshot::new_with_crc(
-                    new_log_segment,
-                    self.table_configuration().clone(),
-                    Some(crc),
-                    self.built_as_latest,
-                    self.skipped_new_checkpoints,
-                )?);
+                let new_log_segment = self
+                    .log_segment
+                    .try_new_with_crc_file(crc_path)
+                    .map_err(crate::Error::Kernel)?;
+                let new_snapshot = Arc::new(
+                    Snapshot::new_with_crc(
+                        new_log_segment,
+                        self.table_configuration().clone(),
+                        Some(crc),
+                        self.built_as_latest,
+                        self.skipped_new_checkpoints,
+                    )
+                    .map_err(crate::Error::Kernel)?,
+                );
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
             Err(KernelError::FileAlreadyExists(_)) => {
@@ -1133,7 +1171,7 @@ impl Snapshot {
                 );
                 Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(crate::Error::Kernel(e)),
         }
     }
 
@@ -1153,7 +1191,7 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> Result<Arc<Crc>> {
+    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> KernelResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1183,7 +1221,9 @@ impl Snapshot {
                 let mut crc = log_segment
                     .build_crc_from_checkpoint(engine)?
                     .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt = self
+                    .get_in_commit_timestamp(engine)
+                    .map_err(crate::Error::into_kernel_error)?;
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
@@ -1276,25 +1316,25 @@ impl Snapshot {
         match spec {
             Some(CheckpointSpec::V2(cfg)) => {
                 if !v2_supported {
-                    return Err(KernelError::checkpoint_write(
+                    return Err(crate::Error::Kernel(KernelError::checkpoint_write(
                         "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
-                    ));
+                    )));
                 }
                 if let V2CheckpointConfig::WithSidecar {
                     file_actions_per_sidecar_hint: Some(0),
                 } = cfg
                 {
-                    return Err(KernelError::checkpoint_write(
+                    return Err(crate::Error::Kernel(KernelError::checkpoint_write(
                         "file_actions_per_sidecar_hint must be greater than 0",
-                    ));
+                    )));
                 }
             }
             Some(CheckpointSpec::V1) if v2_supported => {
                 // TODO: remove this once we support writing V1 checkpoints even if table supports
                 // v2Checkpoint See <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
-                return Err(KernelError::unsupported(
+                return Err(crate::Error::Kernel(KernelError::unsupported(
                     "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
-                ));
+                )));
             }
             _ => {}
         }
@@ -1324,28 +1364,34 @@ impl Snapshot {
                 );
                 return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(crate::Error::Kernel(e)),
         };
 
         writer.finalize(engine, &info.last_checkpoint_stats)?;
 
-        let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
-            KernelError::internal_error("Checkpoint path could not be parsed as a log path")
-        })?;
+        let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?
+            .ok_or_else(|| {
+                KernelError::internal_error("Checkpoint path could not be parsed as a log path")
+            })
+            .map_err(crate::Error::Kernel)?;
         let new_log_segment = self
             .log_segment
-            .try_new_with_checkpoint(checkpoint_log_path)?;
+            .try_new_with_checkpoint(checkpoint_log_path)
+            .map_err(crate::Error::Kernel)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
         Ok((
             CheckpointWriteResult::Written,
-            Arc::new(Snapshot::new_with_crc(
-                new_log_segment,
-                self.table_configuration().clone(),
-                self.crc_at_version().cloned(),
-                self.built_as_latest,
-                false, /* skipped_new_checkpoints */
-            )?),
+            Arc::new(
+                Snapshot::new_with_crc(
+                    new_log_segment,
+                    self.table_configuration().clone(),
+                    self.crc_at_version().cloned(),
+                    self.built_as_latest,
+                    false, /* skipped_new_checkpoints */
+                )
+                .map_err(crate::Error::Kernel)?,
+            ),
         ))
     }
 
@@ -1375,7 +1421,10 @@ impl Snapshot {
         engine: &dyn Engine,
         committer: &dyn Committer,
     ) -> Result<SnapshotRef> {
-        let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
+        let unpublished_catalog_commits = self
+            .log_segment()
+            .get_unpublished_catalog_commits()
+            .map_err(crate::Error::Kernel)?;
 
         if unpublished_catalog_commits.is_empty() {
             return Ok(Arc::clone(self));
@@ -1385,24 +1434,24 @@ impl Snapshot {
             unpublished_catalog_commits
                 .windows(2)
                 .all(|commits| commits[0].version() + 1 == commits[1].version()),
-            KernelError::generic(format!(
+            crate::Error::Kernel(KernelError::generic(format!(
                 "Expected ordered and contiguous unpublished catalog commits. \
                  Got: {unpublished_catalog_commits:?}"
-            ))
+            )))
         );
 
         require!(
             self.table_configuration().is_catalog_managed(),
-            KernelError::generic(
+            crate::Error::Kernel(KernelError::generic(
                 "There are catalog commits that need publishing, but the table is not catalog-managed.",
-            )
+            ))
         );
 
         require!(
             committer.is_catalog_committer(),
-            KernelError::generic(
+            crate::Error::Kernel(KernelError::generic(
                 "There are catalog commits that need publishing, but the committer is not a catalog committer.",
-            )
+            ))
         );
 
         let publish_metadata =
@@ -1410,13 +1459,18 @@ impl Snapshot {
 
         committer.publish(engine, publish_metadata)?;
 
-        Ok(Arc::new(Snapshot::new_with_crc(
-            self.log_segment().new_as_published()?,
-            self.table_configuration().clone(),
-            self.base_crc().cloned(),
-            self.built_as_latest,
-            self.skipped_new_checkpoints,
-        )?))
+        Ok(Arc::new(
+            Snapshot::new_with_crc(
+                self.log_segment()
+                    .new_as_published()
+                    .map_err(crate::Error::Kernel)?,
+                self.table_configuration().clone(),
+                self.base_crc().cloned(),
+                self.built_as_latest,
+                self.skipped_new_checkpoints,
+            )
+            .map_err(crate::Error::Kernel)?,
+        ))
     }
 }
 
@@ -1565,7 +1619,10 @@ mod tests {
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
         let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
-            location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
+            location: url
+                .join("_delta_log/00000000000000000000.checkpoint.parquet")
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
             last_modified: 0,
             size: 100,
         })?
@@ -1576,8 +1633,14 @@ mod tests {
             ..Default::default()
         };
 
-        let log_segment =
-            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
+        let log_segment = LogSegment::try_new(
+            listed_files,
+            url.join("_delta_log/")
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
+            Some(0),
+            None,
+        )?;
 
         Snapshot::new_with_crc(
             log_segment,
@@ -1586,6 +1649,7 @@ mod tests {
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
+        .map_err(crate::Error::Kernel)
     }
 
     #[test]
@@ -1870,8 +1934,10 @@ mod tests {
         let err = snapshot
             .get_domain_metadata("delta.domain3", &engine)
             .unwrap_err();
-        assert!(matches!(err, KernelError::Generic(msg) if
-                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert!(
+            matches!(err, crate::Error::Kernel(KernelError::Generic(msg)) if
+                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain")
+        );
 
         // Test get_domain_metadata_internal
         assert_eq!(
@@ -2151,7 +2217,9 @@ mod tests {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2179,7 +2247,10 @@ mod tests {
         )?;
 
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
-        assert!(matches!(result, Err(KernelError::MissingVersion(0))));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::MissingVersion(0)))
+        ));
 
         Ok(())
     }
@@ -2233,12 +2304,24 @@ mod tests {
         let checkpoint: RecordBatch = checkpoint.into();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
-        writer.write(&checkpoint)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .write(&checkpoint)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .close()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         let checkpoint_path = delta_path_for_version(1, "checkpoint.parquet");
-        store.put(&checkpoint_path, buffer.into()).await?;
+        store
+            .put(&checkpoint_path, buffer.into())
+            .await
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
@@ -2303,7 +2386,9 @@ mod tests {
     async fn test_get_timestamp_errors_when_commit_file_missing(
         #[case] ict_enabled: bool,
     ) -> Result<()> {
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2342,7 +2427,10 @@ mod tests {
         )?;
 
         let result = snapshot_no_commit.get_timestamp(&engine);
-        assert!(matches!(result, Err(KernelError::MissingVersion(0))));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::MissingVersion(0)))
+        ));
 
         Ok(())
     }
@@ -2372,12 +2460,20 @@ mod tests {
             None,
             false,
             false, /* skipped_new_checkpoints */
-        )?;
-        store.delete(&delta_path_for_version(0, "json")).await?;
+        )
+        .map_err(crate::Error::Kernel)?;
+        store
+            .delete(&delta_path_for_version(0, "json"))
+            .await
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         let result = snapshot.get_timestamp(&engine);
         assert!(
-            matches!(&result, Err(KernelError::FileNotFound(_))),
+            matches!(
+                &result,
+                Err(crate::Error::Kernel(KernelError::FileNotFound(_)))
+            ),
             "expected FileNotFound, got {result:?}"
         );
 

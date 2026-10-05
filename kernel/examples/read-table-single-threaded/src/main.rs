@@ -6,7 +6,7 @@ use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::{Result, Snapshot};
+use delta_kernel::{KernelResult, Snapshot};
 use itertools::Itertools;
 
 /// An example program that dumps out the data of a delta table.
@@ -35,19 +35,26 @@ fn main() -> ExitCode {
     }
 }
 
-fn try_main() -> Result<()> {
+fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
-    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     println!("Reading {url}");
-    let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
-    let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
+    let engine = common::get_engine(&url, &cli.location_args)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let snapshot = Snapshot::builder_for(url)
+        .build(&engine)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let Some(scan) = common::get_scan(snapshot, &cli.scan_args)
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    else {
         return Ok(());
     };
 
     let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
-        .execute(Arc::new(engine))?
+        .execute(Arc::new(engine))
+        .map_err(delta_kernel::Error::into_kernel_error)?
         .map(EngineDataArrowExt::try_into_record_batch)
         .scan(&mut rows_so_far, |rows_so_far, record_batch| {
             // handle truncation if we've specified a limit
@@ -71,7 +78,8 @@ fn try_main() -> Result<()> {
             **rows_so_far += batch_rows;
             Some(result)
         })
-        .try_collect()?;
+        .try_collect()
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     if let Some(limit) = cli.scan_args.limit {
         if limit >= rows_so_far {
             println!("Printing all {rows_so_far} rows.");

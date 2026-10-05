@@ -14,7 +14,7 @@ use delta_kernel::expressions::{
     UnaryPredicateOp as KernelUnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, StructType};
-use delta_kernel::{KernelError, Result};
+use delta_kernel::{KernelError, KernelResult, Result};
 
 use crate::expression::to_df_expr;
 use crate::scalar::to_df_scalar;
@@ -34,17 +34,22 @@ pub fn to_df_predicate_expr(pred: &KernelPredicate, input_schema: &StructType) -
             let df_inner = to_df_predicate_expr(inner, input_schema)?;
             Ok(DFExpr::Not(Box::new(df_inner)))
         }
-        KernelPredicate::Unary(unary) => unary_to_df_predicate_expr(unary, input_schema),
-        KernelPredicate::Binary(binary) => binary_to_df_predicate_expr(binary, input_schema),
+        KernelPredicate::Unary(unary) => {
+            unary_to_df_predicate_expr(unary, input_schema).map_err(delta_kernel::Error::Kernel)
+        }
+        KernelPredicate::Binary(binary) => {
+            binary_to_df_predicate_expr(binary, input_schema).map_err(delta_kernel::Error::Kernel)
+        }
         KernelPredicate::Junction(junction) => {
             junction_to_df_predicate_expr(junction, input_schema)
+                .map_err(delta_kernel::Error::Kernel)
         }
-        KernelPredicate::Opaque(_) => Err(KernelError::unsupported(
+        KernelPredicate::Opaque(_) => Err(delta_kernel::Error::Kernel(KernelError::unsupported(
             "cannot convert an engine-defined Opaque predicate",
-        )),
-        KernelPredicate::Unknown(name) => Err(KernelError::unsupported(format!(
-            "cannot convert Unknown predicate {name:?}"
         ))),
+        KernelPredicate::Unknown(name) => Err(delta_kernel::Error::Kernel(
+            KernelError::unsupported(format!("cannot convert Unknown predicate {name:?}")),
+        )),
     }
 }
 
@@ -52,8 +57,9 @@ pub fn to_df_predicate_expr(pred: &KernelPredicate, input_schema: &StructType) -
 fn unary_to_df_predicate_expr(
     unary: &KernelUnaryPredicate,
     input_schema: &StructType,
-) -> Result<DFExpr> {
-    let expr = to_df_expr(&unary.expr, input_schema, None)?;
+) -> KernelResult<DFExpr> {
+    let expr = to_df_expr(&unary.expr, input_schema, None)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     match unary.op {
         KernelUnaryPredicateOp::IsNull => Ok(DFExpr::IsNull(Box::new(expr))),
     }
@@ -63,7 +69,7 @@ fn unary_to_df_predicate_expr(
 fn binary_to_df_predicate_expr(
     binary: &KernelBinaryPredicate,
     input_schema: &StructType,
-) -> Result<DFExpr> {
+) -> KernelResult<DFExpr> {
     let op = match binary.op {
         KernelBinaryPredicateOp::In => {
             return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema)
@@ -73,8 +79,10 @@ fn binary_to_df_predicate_expr(
         KernelBinaryPredicateOp::GreaterThan => Operator::Gt,
         KernelBinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
     };
-    let left = to_df_expr(&binary.left, input_schema, None)?;
-    let right = to_df_expr(&binary.right, input_schema, None)?;
+    let left = to_df_expr(&binary.left, input_schema, None)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
+    let right = to_df_expr(&binary.right, input_schema, None)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(binary_expr(left, op, right))
 }
 
@@ -107,7 +115,7 @@ fn in_to_df_predicate_expr(
     value: &KernelExpression,
     list: &KernelExpression,
     input_schema: &StructType,
-) -> Result<DFExpr> {
+) -> KernelResult<DFExpr> {
     // Kernel's Arrow evaluator accepts `IN` only with a literal left operand (a column left
     // operand errors), so reject anything else to match it exactly.
     let KernelExpression::Literal(_) = value else {
@@ -115,7 +123,8 @@ fn in_to_df_predicate_expr(
             "converting an IN predicate requires a literal left-hand side",
         ));
     };
-    let value = to_df_expr(value, input_schema, None)?;
+    let value =
+        to_df_expr(value, input_schema, None).map_err(delta_kernel::Error::into_kernel_error)?;
     let membership =
         match list {
             KernelExpression::Literal(KernelScalar::Array(array)) => in_list_expr(value, array)?,
@@ -131,12 +140,16 @@ fn in_to_df_predicate_expr(
 /// Builds `value IN (<elements>)` from a literal array. Null elements stay in the list: they can
 /// never match under logical equality, and the caller's `IS TRUE` collapses the null they would
 /// otherwise contribute down to false.
-fn in_list_expr(value: DFExpr, array: &KernelArrayData) -> Result<DFExpr> {
+fn in_list_expr(value: DFExpr, array: &KernelArrayData) -> KernelResult<DFExpr> {
     let elements: Vec<DFExpr> = array
         .array_elements()
         .iter()
-        .map(|scalar| Ok(lit(to_df_scalar(scalar)?)))
-        .collect::<Result<_>>()?;
+        .map(|scalar| {
+            Ok(lit(
+                to_df_scalar(scalar).map_err(delta_kernel::Error::into_kernel_error)?
+            ))
+        })
+        .collect::<KernelResult<_>>()?;
     let in_expr = DFExpr::InList(InList::new(Box::new(value), elements, false));
     Ok(in_expr)
 }
@@ -152,13 +165,20 @@ fn array_has_expr(
     column: &KernelExpression,
     name: &KernelColumnName,
     input_schema: &StructType,
-) -> Result<DFExpr> {
-    let DataType::Array(_) = input_schema.field_at(name)?.data_type else {
+) -> KernelResult<DFExpr> {
+    let DataType::Array(_) = input_schema
+        .field_at(name)
+        .map_err(delta_kernel::Error::into_kernel_error)?
+        .data_type
+    else {
         return Err(KernelError::unsupported(
             "converting an IN predicate against a column requires an array-typed column",
         ));
     };
-    Ok(array_has(to_df_expr(column, input_schema, None)?, value))
+    Ok(array_has(
+        to_df_expr(column, input_schema, None).map_err(delta_kernel::Error::into_kernel_error)?,
+        value,
+    ))
 }
 
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
@@ -166,11 +186,13 @@ fn array_has_expr(
 fn junction_to_df_predicate_expr(
     junction: &KernelJunctionPredicate,
     input_schema: &StructType,
-) -> Result<DFExpr> {
-    let preds: Result<Vec<DFExpr>> = junction
+) -> KernelResult<DFExpr> {
+    let preds: KernelResult<Vec<DFExpr>> = junction
         .preds
         .iter()
-        .map(|pred| to_df_predicate_expr(pred, input_schema))
+        .map(|pred| {
+            to_df_predicate_expr(pred, input_schema).map_err(delta_kernel::Error::into_kernel_error)
+        })
         .collect();
     // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics.
     match junction.op {

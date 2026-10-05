@@ -17,7 +17,7 @@ use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::{KernelError as Error, Result};
+use delta_kernel::{KernelError as Error, KernelResult, Result};
 use delta_kernel_workloads::models::{ExpectedError, ReadExpected, SnapshotExpected, TimeTravel};
 use itertools::Itertools;
 use serde_json::Value;
@@ -30,9 +30,10 @@ fn assert_aligned_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
-) -> Result<()> {
+) -> KernelResult<()> {
     let expected = align_batch_to_schema(expected, result_schema.clone())?;
     assert_data_matches(result, result_schema, expected)
+        .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 /// Makes the expected Parquet data match Kernel's schema before comparing rows.
@@ -42,7 +43,7 @@ fn assert_aligned_data_matches(
 /// timestamp as timezone-free nanoseconds, while Kernel returns microseconds in UTC. This function
 /// converts that timestamp when no precision would be lost. It makes the same adjustments inside
 /// structs, lists, and maps, but rejects all other schema differences.
-fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> KernelResult<RecordBatch> {
     let source_schema = batch.schema();
     require_matching_field_order(source_schema.fields(), schema.fields())?;
     let columns = schema
@@ -59,7 +60,7 @@ fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> Result<Record
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
+fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef> {
     if array.data_type() == data_type {
         return Ok(array.clone());
     }
@@ -147,7 +148,7 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
     )))
 }
 
-fn require_matching_field_order(source: &Fields, target: &Fields) -> Result<()> {
+fn require_matching_field_order(source: &Fields, target: &Fields) -> KernelResult<()> {
     let source_names = source
         .iter()
         .map(|field| field.name().clone())
@@ -176,7 +177,7 @@ fn require_matching_field_order(source: &Fields, target: &Fields) -> Result<()> 
     Ok(())
 }
 
-fn missing_void_array(field: &Field, len: usize) -> Result<ArrayRef> {
+fn missing_void_array(field: &Field, len: usize) -> KernelResult<ArrayRef> {
     if field.data_type() == &DataType::Null {
         Ok(new_null_array(field.data_type(), len))
     } else {
@@ -187,7 +188,7 @@ fn missing_void_array(field: &Field, len: usize) -> Result<ArrayRef> {
     }
 }
 
-fn require_same_nullability(context: &str, source: &Field, target: &Field) -> Result<()> {
+fn require_same_nullability(context: &str, source: &Field, target: &Field) -> KernelResult<()> {
     if source.is_nullable() != target.is_nullable() {
         return Err(Error::generic(format!(
             "Expected {context} nullability does not match the result"
@@ -201,7 +202,7 @@ fn require_map_compatibility(
     target_ordered: bool,
     source_field: &Field,
     target_field: &Field,
-) -> Result<()> {
+) -> KernelResult<()> {
     if source_ordered != target_ordered {
         return Err(Error::generic(
             "Expected map ordering does not match the result",
@@ -435,7 +436,7 @@ pub fn validate_read_result(
             Ok(())
         }
         (Err(kernel_err), ReadExpected::Error { error }) => {
-            validate_expected_error(&kernel_err, error)
+            validate_expected_error(&kernel_err.into_kernel_error(), error)
         }
         (Ok(_), ReadExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",
@@ -480,7 +481,7 @@ pub fn validate_snapshot(
             Ok(())
         }
         (Err(kernel_err), SnapshotExpected::Error { error }) => {
-            validate_expected_error(&kernel_err, error)
+            validate_expected_error(&kernel_err.into_kernel_error(), error)
         }
         (Ok(_), SnapshotExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",

@@ -44,6 +44,7 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::KernelResult;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -101,12 +102,18 @@ pub(crate) fn extract_column_ref<'a>(
     let mut field_names = col.iter();
     let mut field_name = match field_names.next() {
         Some(name) => name.as_ref(),
-        None => return Err(ArrowError::SchemaError("Empty column path".to_string()))?,
+        None => {
+            return Err(crate::Error::Kernel(crate::KernelError::from(
+                ArrowError::SchemaError("Empty column path".to_string()),
+            )))
+        }
     };
     loop {
         let child = parent
             .column_by_name(field_name)
-            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
+            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         field_name = match field_names.next() {
             Some(name) => name.as_ref(),
             None => return Ok(child),
@@ -114,7 +121,9 @@ pub(crate) fn extract_column_ref<'a>(
         parent = child
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))?;
+            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
     }
 }
 
@@ -124,7 +133,7 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
     nullability_predicate: Option<&ExpressionRef>,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
         return Err(KernelError::generic(format!(
             "Struct expression field count mismatch: {} fields in expression but {} in schema",
@@ -137,7 +146,8 @@ fn evaluate_struct_expression(
         .iter()
         .zip(output_schema.fields())
         .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())))
-        .try_collect()?;
+        .try_collect()
+        .map_err(crate::Error::into_kernel_error)?;
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
         .zip(output_schema.fields())
@@ -151,7 +161,8 @@ fn evaluate_struct_expression(
         })
         .collect();
     let null_buffer = if let Some(predicate_expr) = nullability_predicate {
-        let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))?;
+        let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))
+            .map_err(crate::Error::into_kernel_error)?;
         let bool_array = predicate_array
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -176,7 +187,7 @@ fn evaluate_struct_patch_expression(
     patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     let mut used_field_patches = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
@@ -193,14 +204,18 @@ fn evaluate_struct_patch_expression(
 
     // Handle prepends (insertions before any field)
     for expr in &patch.prepended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        output_cols.push(
+            evaluate_expression(expr, batch, Some(next_output_type()?))
+                .map_err(crate::Error::into_kernel_error)?,
+        );
     }
 
     // Extract the input path, if any
     let source_array = patch
         .input_path()
         .map(|path| extract_column(batch, path))
-        .transpose()?;
+        .transpose()
+        .map_err(crate::Error::into_kernel_error)?;
 
     let source_data: &dyn ProvidesColumnByName = match source_array {
         Some(ref array) => array
@@ -216,14 +231,20 @@ fn evaluate_struct_patch_expression(
 
         let field_patch = patch.field_patches.get(field_name);
         if field_patch.is_none_or(|patch| patch.keep_input) {
-            output_cols.push(extract_column(source_data, &[field_name])?);
+            output_cols.push(
+                extract_column(source_data, &[field_name])
+                    .map_err(crate::Error::into_kernel_error)?,
+            );
             let _ = next_output_type()?; // consume and discard the output schema field
         }
 
         // Process any insertions that come at or after this field's output position.
         if let Some(field_patch) = field_patch {
             for expr in &field_patch.insertions {
-                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+                output_cols.push(
+                    evaluate_expression(expr, batch, Some(next_output_type()?))
+                        .map_err(crate::Error::into_kernel_error)?,
+                );
             }
             used_field_patches += 1;
         }
@@ -243,7 +264,10 @@ fn evaluate_struct_patch_expression(
 
     // Handle appends (insertions after all input fields and field-specific insertions)
     for expr in &patch.appended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        output_cols.push(
+            evaluate_expression(expr, batch, Some(next_output_type()?))
+                .map_err(crate::Error::into_kernel_error)?,
+        );
     }
 
     // Verify we consumed all output schema fields
@@ -288,35 +312,43 @@ pub fn evaluate_expression(
     match (expression, result_type) {
         (Literal(scalar), _) => {
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
+                .map_err(crate::Error::Kernel)
         }
-        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
+        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type)
+            .map_err(crate::Error::Kernel),
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
+                .map_err(crate::Error::Kernel)
         }
-        (Struct(..), dt) => Err(KernelError::Generic(format!(
+        (Struct(..), dt) => Err(crate::Error::Kernel(KernelError::Generic(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
-        ))),
+        )))),
         (StructPatch(patch), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_patch_expression(patch, batch, output_schema)
+                .map_err(crate::Error::Kernel)
         }
-        (StructPatch(_), _) => Err(KernelError::generic(
+        (StructPatch(_), _) => Err(crate::Error::Kernel(KernelError::generic(
             "Data type is required to evaluate struct patch expressions",
-        )),
+        ))),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
             let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
         }
-        (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
-            "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
-        ))),
+        (Predicate(_), Some(data_type)) => {
+            Err(crate::Error::Kernel(KernelError::generic(format!(
+                "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
+            ))))
+        }
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
                 let input = evaluate_expression(expr, batch, None)?;
-                Ok(to_json(&input)?)
+                Ok(to_json(&input)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?)
             }
-            Some(data_type) => Err(KernelError::generic(format!(
+            Some(data_type) => Err(crate::Error::Kernel(KernelError::generic(format!(
                 "ToJson operator requires STRING output, but got {data_type:?}"
-            ))),
+            )))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -330,7 +362,13 @@ pub fn evaluate_expression(
                 Divide => div,
             };
 
-            validate_array_type(eval(&left_arr, &right_arr)?, result_type)
+            validate_array_type(
+                eval(&left_arr, &right_arr)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?,
+                result_type,
+            )
+            .map_err(crate::Error::Kernel)
         }
         (
             Variadic(VariadicExpression {
@@ -353,10 +391,12 @@ pub fn evaluate_expression(
             }
 
             // Coalesce accumulated arrays
-            Ok(coalesce_arrays(&arrays, result_type)?)
+            Ok(coalesce_arrays(&arrays, result_type)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?)
         }
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
-            evaluate_array_expression(exprs, batch, result_type)
+            evaluate_array_expression(exprs, batch, result_type).map_err(crate::Error::Kernel)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -364,9 +404,9 @@ pub fn evaluate_expression(
                 .downcast_ref::<ArrowOpaqueExpressionOpAdaptor>()
             {
                 Some(op) => op.eval_expr(exprs, batch, result_type),
-                None => Err(KernelError::unsupported(format!(
+                None => Err(crate::Error::Kernel(KernelError::unsupported(format!(
                     "Unsupported opaque expression: {op:?}"
-                ))),
+                )))),
             }
         }
         (ParseJson(p), _) => {
@@ -382,7 +422,9 @@ pub fn evaluate_expression(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
                         p.output_schema,
                     );
-                    let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())?;
+                    let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())
+                        .map_err(crate::KernelError::from)
+                        .map_err(crate::Error::Kernel)?;
                     Ok(new_null_array(
                         &ArrowDataType::Struct(arrow_schema.fields().clone()),
                         json_arr.len(),
@@ -392,28 +434,34 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let timestamp_timezone = TimestampTimezone::try_from_options(&m.options)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)?;
+            let timestamp_timezone =
+                TimestampTimezone::try_from_options(&m.options).map_err(crate::Error::Kernel)?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema, timestamp_timezone)
+                .map_err(crate::Error::Kernel)?;
             Ok(Arc::new(result) as ArrayRef)
         }
-        (MapToStruct(_), dt) => Err(KernelError::Generic(format!(
+        (MapToStruct(_), dt) => Err(crate::Error::Kernel(KernelError::Generic(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
-        ))),
+        )))),
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
-            let target = ArrowDataType::try_from_kernel(&c.target)?;
+            let target = ArrowDataType::try_from_kernel(&c.target)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?;
             // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
             // that to an all-NULL column so an unsupported cast keeps the file.
             let output = if can_cast_types(input.data_type(), &target) {
-                cast(&input, &target)?
+                cast(&input, &target)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?
             } else {
                 new_null_array(&target, input.len())
             };
-            validate_array_type(output, result_type)
+            validate_array_type(output, result_type).map_err(crate::Error::Kernel)
         }
-        (Unknown(name), _) => Err(KernelError::unsupported(format!(
+        (Unknown(name), _) => Err(crate::Error::Kernel(KernelError::unsupported(format!(
             "Unknown expression: {name:?}"
-        ))),
+        )))),
     }
 }
 
@@ -433,7 +481,7 @@ fn evaluate_array_expression(
     exprs: &[Expression],
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     let num_rows = batch.num_rows();
 
     let array_type = match result_type {
@@ -451,7 +499,8 @@ fn evaluate_array_expression(
     let element_arrays: Vec<ArrayRef> = exprs
         .iter()
         .map(|expr| evaluate_expression(expr, batch, element_kernel_type))
-        .try_collect()?;
+        .try_collect()
+        .map_err(crate::Error::into_kernel_error)?;
 
     let element_type = element_arrays
         .first()
@@ -541,7 +590,7 @@ fn cast_list_elements(
     vals: &Arc<dyn Array>,
     field: &Arc<ArrowField>,
     dir: ViewCast,
-) -> Result<Arc<dyn Array>> {
+) -> KernelResult<Arc<dyn Array>> {
     let to_type = match dir {
         ViewCast::ToView => match field.data_type() {
             ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
@@ -579,7 +628,7 @@ fn cast_list_elements(
 /// This function converts ArrowView types to their non-view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -596,7 +645,7 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>
 /// This function converts  Arrow types to their Arrow view type equivalents. This is used for
 /// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
 /// supports limited conversions (see code for exactly which).
-fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
         ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -634,8 +683,12 @@ pub fn evaluate_predicate(
             // instances are still cheaply clonable.
             let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
             match arr.as_any().downcast_ref::<BooleanArray>() {
-                Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))?),
-                None => Err(KernelError::generic("expected boolean array")),
+                Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?),
+                None => Err(crate::Error::Kernel(KernelError::generic(
+                    "expected boolean array",
+                ))),
             }
         }
         Not(pred) => evaluate_predicate(pred, batch, !inverted),
@@ -645,7 +698,9 @@ pub fn evaluate_predicate(
                 (UnaryPredicateOp::IsNull, false) => is_null,
                 (UnaryPredicateOp::IsNull, true) => is_not_null,
             };
-            Ok(eval_op_fn(&arr)?)
+            Ok(eval_op_fn(&arr)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?)
         }
         Binary(BinaryPredicate { op, left, right }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
@@ -655,10 +710,12 @@ pub fn evaluate_predicate(
             // TODO: Factor out as a stand-alone function instead of a closure?
             let eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
-                    let left = evaluate_expression(left, batch, None)?;
+                    let left = evaluate_expression(left, batch, None)
+                        .map_err(crate::Error::into_kernel_error)?;
                     let left = arrow_convert_to_non_view_type(left)?;
 
-                    let right = evaluate_expression(right, batch, None)?;
+                    let right = evaluate_expression(right, batch, None)
+                        .map_err(crate::Error::into_kernel_error)?;
                     let right = arrow_convert_to_non_view_type(right)?;
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
@@ -725,7 +782,11 @@ pub fn evaluate_predicate(
                 (Equal, true) => neq,
                 (Distinct, false) => distinct,
                 (Distinct, true) => not_distinct,
-                (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
+                (In, _) => {
+                    return maybe_inverted(Cow::Owned(eval_in().map_err(crate::Error::Kernel)?))
+                        .map_err(crate::KernelError::from)
+                        .map_err(crate::Error::Kernel)
+                }
             };
 
             let left = evaluate_expression(left, batch, None)?;
@@ -739,11 +800,13 @@ pub fn evaluate_predicate(
                 (left, right)
             } else {
                 (
-                    arrow_convert_to_view_type(left)?,
-                    arrow_convert_to_view_type(right)?,
+                    arrow_convert_to_view_type(left).map_err(crate::Error::Kernel)?,
+                    arrow_convert_to_view_type(right).map_err(crate::Error::Kernel)?,
                 )
             };
-            Ok(eval_fn(&left, &right)?)
+            Ok(eval_fn(&left, &right)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):
@@ -761,20 +824,24 @@ pub fn evaluate_predicate(
             preds
                 .iter()
                 .map(|pred| evaluate_predicate(pred, batch, inverted))
-                .reduce(|l, r| Ok(reducer(&l?, &r?)?))
+                .reduce(|l, r| {
+                    reducer(&l?, &r?)
+                        .map_err(crate::KernelError::from)
+                        .map_err(crate::Error::Kernel)
+                })
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
         Opaque(OpaquePredicate { op, exprs }) => {
             match op.any_ref().downcast_ref::<ArrowOpaquePredicateOpAdaptor>() {
                 Some(op) => op.eval_pred(exprs, batch, inverted),
-                None => Err(KernelError::unsupported(format!(
+                None => Err(crate::Error::Kernel(KernelError::unsupported(format!(
                     "Unsupported opaque predicate: {op:?}"
-                ))),
+                )))),
             }
         }
-        Unknown(name) => Err(KernelError::unsupported(format!(
+        Unknown(name) => Err(crate::Error::Kernel(KernelError::unsupported(format!(
             "Unknown predicate: {name:?}"
-        ))),
+        )))),
     }
 }
 
@@ -949,7 +1016,7 @@ fn parse_partition_scalar(
     prim: &PrimitiveType,
     raw: &str,
     timestamp_timezone: TimestampTimezone,
-) -> Result<Option<Scalar>> {
+) -> KernelResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
@@ -976,7 +1043,9 @@ fn parse_partition_scalar(
         }
         _ => {}
     }
-    let scalar = prim.parse_scalar(raw)?;
+    let scalar = prim
+        .parse_scalar(raw)
+        .map_err(crate::Error::into_kernel_error)?;
     Ok((!matches!(scalar, Scalar::Null(_))).then_some(scalar))
 }
 
@@ -992,7 +1061,7 @@ fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
     timestamp_timezone: TimestampTimezone,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     let map_array = map_arr
         .as_any()
         .downcast_ref::<MapArray>()
@@ -1107,9 +1176,10 @@ fn evaluate_map_to_struct(
     )?)
 }
 
-fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> Result<ArrayRef> {
+fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> KernelResult<ArrayRef> {
     if let Some(expected) = expected {
-        ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
+        ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)
+            .map_err(crate::Error::into_kernel_error)?;
     }
     Ok(array)
 }
@@ -3006,7 +3076,7 @@ mod tests {
                 DataType::TIMESTAMP,
                 Some("America/Los_Angeles")
             ),
-            Err(KernelError::ParseError(..))
+            Err(crate::Error::Kernel(KernelError::ParseError(..)))
         ));
         assert!(matches!(
             evaluate_map_timestamp_timezone(
@@ -3014,7 +3084,7 @@ mod tests {
                 DataType::TIMESTAMP,
                 None,
             ),
-            Err(KernelError::ParseError(..))
+            Err(crate::Error::Kernel(KernelError::ParseError(..)))
         ));
     }
 

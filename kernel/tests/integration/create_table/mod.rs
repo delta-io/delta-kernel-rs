@@ -241,7 +241,9 @@ async fn test_create_table_with_user_domain_metadata() -> Result<()> {
     );
 
     // Parse and verify the JSON contents
-    let parsed: Value = serde_json::from_str(retrieved_config.as_ref().unwrap())?;
+    let parsed: Value = serde_json::from_str(retrieved_config.as_ref().unwrap())
+        .map_err(delta_kernel::KernelError::from)
+        .map_err(delta_kernel::Error::Kernel)?;
     assert_eq!(parsed["version"], 1);
     assert_eq!(parsed["enabled"], true);
 

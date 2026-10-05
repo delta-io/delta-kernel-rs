@@ -94,6 +94,13 @@ From a snapshot, you can:
 | Write data | `snapshot.transaction(committer, &engine)` | Writer / Committer |
 | Checkpoint | `snapshot.create_checkpoint_writer(&engine)` | Maintenance task |
 
+## Handling errors
+
+Kernel's public `Result<T>` alias returns `Error`. Implementation failures are wrapped in
+`Error::Kernel(KernelError)`, preserving their message and source. Match the outer `Error` before
+inspecting the `KernelError`; custom Engine implementations wrap their errors explicitly with
+`map_err(Error::Kernel)`.
+
 ## What your connector does vs. what Kernel does
 
 The key principle: **Kernel handles the Delta protocol, your connector handles execution.**

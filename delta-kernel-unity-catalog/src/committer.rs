@@ -5,7 +5,8 @@ use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, Result, ResultIterator,
+    Engine, Error, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult, Result,
+    ResultIterator,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
@@ -71,7 +72,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Validates that protocol features and metadata properties are correct for a UC
     /// catalog-managed table.
-    fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> Result<()> {
+    fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> KernelResult<()> {
         require!(
             commit_metadata.commit_type() != CommitType::UpgradeToCatalogManaged,
             errors::upgrade_downgrade_unsupported("upgrade")
@@ -114,7 +115,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Validates that this commit does not include ALTER TABLE changes (protocol, metadata,
     /// or clustering column changes).
-    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> Result<()> {
+    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> KernelResult<()> {
         require!(
             !commit_metadata.has_protocol_change(),
             errors::alter_table_unsupported("protocol")
@@ -137,14 +138,16 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         engine: &dyn Engine,
         actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: &CommitMetadata,
-    ) -> Result<CommitResponse> {
+    ) -> KernelResult<CommitResponse> {
         debug_assert!(
             commit_metadata.version() == 0,
             "commit_version_0 called with version {}",
             commit_metadata.version()
         );
         self.validate_catalog_managed_state(commit_metadata)?;
-        let published_commit_path = commit_metadata.published_commit_path()?;
+        let published_commit_path = commit_metadata
+            .published_commit_path()
+            .map_err(Error::into_kernel_error)?;
         match engine.json_handler().write_json_file(
             &published_commit_path,
             Box::new(actions),
@@ -159,11 +162,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(DeltaError::FileAlreadyExists(_)) => {
+            Err(Error::Kernel(DeltaError::FileAlreadyExists(_))) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into_kernel_error()),
         }
     }
 
@@ -174,7 +177,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         engine: &dyn Engine,
         actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> Result<CommitResponse>
+    ) -> KernelResult<CommitResponse>
     where
         C: 'static,
     {
@@ -184,12 +187,18 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         );
         self.validate_catalog_managed_state(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
-        let staged_commit_path = commit_metadata.staged_commit_path()?;
+        let staged_commit_path = commit_metadata
+            .staged_commit_path()
+            .map_err(Error::into_kernel_error)?;
         engine
             .json_handler()
-            .write_json_file(&staged_commit_path, Box::new(actions), false)?;
+            .write_json_file(&staged_commit_path, Box::new(actions), false)
+            .map_err(Error::into_kernel_error)?;
 
-        let committed = engine.storage_handler().head(&staged_commit_path)?;
+        let committed = engine
+            .storage_handler()
+            .head(&staged_commit_path)
+            .map_err(Error::into_kernel_error)?;
         debug!("wrote staged commit file: {:?}", committed);
 
         let mut updates = vec![DeltaTableUpdate::AddCommit {
@@ -266,9 +275,12 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         commit_metadata: CommitMetadata,
     ) -> Result<CommitResponse> {
         if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
+            return self
+                .commit_version_0(engine, actions, &commit_metadata)
+                .map_err(Error::Kernel);
         }
         self.commit_version_non_zero(engine, actions, commit_metadata)
+            .map_err(Error::Kernel)
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -285,7 +297,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
+                Err(Error::Kernel(DeltaError::FileAlreadyExists(_))) => (),
                 Err(e) => return Err(e),
             }
         }
@@ -295,13 +307,13 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
 }
 
 /// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
-fn u64_to_wire_i64(value: u64, field: &str) -> Result<i64> {
+fn u64_to_wire_i64(value: u64, field: &str) -> KernelResult<i64> {
     value
         .try_into()
         .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
 }
 
-fn staged_commit_file_name(path: &url::Url) -> Result<String> {
+fn staged_commit_file_name(path: &url::Url) -> KernelResult<String> {
     path.path_segments()
         .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())

@@ -14,7 +14,7 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, Result, ResultIteratorStatic};
+use crate::{Engine, EngineData, Error, FileMeta, KernelResultIteratorStatic, Result};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -34,7 +34,7 @@ use crate::{Engine, EngineData, FileMeta, Result, ResultIteratorStatic};
 #[internal_api]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
-    leaf_checkpoint_reader: ResultIteratorStatic<ActionsBatch>,
+    leaf_checkpoint_reader: KernelResultIteratorStatic<ActionsBatch>,
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
@@ -56,7 +56,11 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
             .read_parquet_files(&leaf_files, read_schema, None)?
-            .map_ok(|batch| ActionsBatch::new(batch, false));
+            .map(|batch| {
+                batch
+                    .map_err(Error::into_kernel_error)
+                    .map(|batch| ActionsBatch::new(batch, false))
+            });
         Ok(Self {
             processor,
             leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
@@ -78,9 +82,11 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         processor: P,
         iter: impl IntoIterator<Item = Result<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
-        let leaf_checkpoint_reader = iter
-            .into_iter()
-            .map_ok(|batch| ActionsBatch::new(batch, false));
+        let leaf_checkpoint_reader = iter.into_iter().map(|batch| {
+            batch
+                .map_err(Error::into_kernel_error)
+                .map(|batch| ActionsBatch::new(batch, false))
+        });
         Self {
             processor,
             leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
@@ -113,9 +119,10 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
     type Item = Result<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.leaf_checkpoint_reader
-            .next()
-            .map(|batch| self.processor.process_actions_batch(batch?))
+        self.leaf_checkpoint_reader.next().map(|batch| {
+            self.processor
+                .process_actions_batch(batch.map_err(Error::Kernel)?)
+        })
     }
 }
 
@@ -169,11 +176,23 @@ mod tests {
         let record_batch = batch.record_batch();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-        writer.write(record_batch)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .write(record_batch)
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
+        writer
+            .close()
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
-        store.put(&Path::from(path), buffer.into()).await?;
+        store
+            .put(&Path::from(path), buffer.into())
+            .await
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
 
         Ok(())
     }
@@ -213,6 +232,7 @@ mod tests {
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
+        .map_err(Error::Kernel)
     }
 
     // ============================================================
@@ -231,7 +251,9 @@ mod tests {
         expected_paths: &[&str],
     ) -> Result<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
@@ -257,7 +279,10 @@ mod tests {
 
         // Create FileMeta for the sidecar
         let file_meta = FileMeta {
-            location: url.join(sidecar_path)?,
+            location: url
+                .join(sidecar_path)
+                .map_err(crate::KernelError::from)
+                .map_err(crate::Error::Kernel)?,
             last_modified: 0,
             size: get_file_size(&store, sidecar_path).await,
         };
@@ -318,7 +343,9 @@ mod tests {
     async fn test_parallel_phase_multiple_sidecars() -> Result<()> {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///")
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
@@ -342,12 +369,18 @@ mod tests {
 
         let file_metas = vec![
             FileMeta {
-                location: url.join(sidecar1_path)?,
+                location: url
+                    .join(sidecar1_path)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar1_path).await,
             },
             FileMeta {
-                location: url.join(sidecar2_path)?,
+                location: url
+                    .join(sidecar2_path)
+                    .map_err(crate::KernelError::from)
+                    .map_err(crate::Error::Kernel)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar2_path).await,
             },
@@ -408,7 +441,8 @@ mod tests {
         one_file_per_worker: bool,
         dispatcher: Option<tracing::Dispatch>,
     ) -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table(table_name).map_err(crate::Error::Kernel)?;
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
@@ -510,7 +544,8 @@ mod tests {
         #[case] expected_parallel: Option<&str>,
     ) -> Result<()> {
         // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-json-with-sidecars").map_err(crate::Error::Kernel)?;
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -1022,7 +1057,8 @@ mod tests {
 
     #[test]
     fn test_parallel_with_skip_stats() -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-json-with-sidecars").map_err(crate::Error::Kernel)?;
 
         // Get expected paths using single-node scan_metadata with skip_stats=true
         let scan = snapshot
@@ -1098,7 +1134,8 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("table-without-dv-small").map_err(crate::Error::Kernel)?;
         let scan = snapshot.scan_builder().build()?;
         let mut sequential = scan.parallel_scan_metadata(engine)?;
         for result in sequential.by_ref() {
@@ -1135,7 +1172,8 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-json-with-sidecars").map_err(crate::Error::Kernel)?;
         let scan = snapshot.scan_builder().build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
         for result in sequential.by_ref() {

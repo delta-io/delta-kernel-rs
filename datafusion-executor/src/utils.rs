@@ -13,7 +13,8 @@ pub(crate) trait ColumnResolver {
     type Error;
 
     /// Validates and returns the root DataFusion column.
-    fn resolve_column(&self, name: &KernelColumnName) -> Result<DFColumn, Self::Error>;
+    fn resolve_column(&self, name: &KernelColumnName)
+        -> std::result::Result<DFColumn, Self::Error>;
 }
 
 /// Lowers a column reference to a nested field access, e.g. `a.b.c` becomes a single
@@ -38,13 +39,18 @@ pub(crate) fn column_to_df_expr<E>(
 impl ColumnResolver for StructType {
     type Error = KernelError;
 
-    fn resolve_column(&self, name: &KernelColumnName) -> Result<DFColumn> {
+    fn resolve_column(
+        &self,
+        name: &KernelColumnName,
+    ) -> std::result::Result<DFColumn, Self::Error> {
         let Some(root) = name.first() else {
             return Err(KernelError::generic(
                 "cannot convert an empty column reference",
             ));
         };
-        let _ = self.field_at(name)?;
+        let _ = self
+            .field_at(name)
+            .map_err(delta_kernel::Error::into_kernel_error)?;
         Ok(DFColumn::new_unqualified(root.as_str()))
     }
 }
@@ -52,7 +58,10 @@ impl ColumnResolver for StructType {
 impl ColumnResolver for DFSchema {
     type Error = DataFusionError;
 
-    fn resolve_column(&self, name: &KernelColumnName) -> Result<DFColumn, DataFusionError> {
+    fn resolve_column(
+        &self,
+        name: &KernelColumnName,
+    ) -> std::result::Result<DFColumn, DataFusionError> {
         let Some(root) = name.first() else {
             return Err(DataFusionError::Plan(
                 "cannot convert an empty column reference".to_string(),

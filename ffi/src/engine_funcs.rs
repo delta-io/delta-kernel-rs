@@ -5,7 +5,7 @@ use std::sync::Arc;
 use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
     EngineData, Expression, ExpressionEvaluator, ExpressionRef, FileDataReadResultIterator,
-    KernelError, Result,
+    KernelError, KernelResult,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -88,8 +88,13 @@ fn read_result_next_impl(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
     ),
-) -> Result<bool> {
-    if let Some(data) = iter.data.next().transpose()? {
+) -> KernelResult<bool> {
+    if let Some(data) = iter
+        .data
+        .next()
+        .transpose()
+        .map_err(delta_kernel::Error::into_kernel_error)?
+    {
         (engine_visitor)(engine_context, data.into());
         Ok(true)
     } else {
@@ -120,16 +125,21 @@ pub unsafe extern "C" fn read_parquet_file(
     let engine = unsafe { engine.clone_as_arc() };
     let physical_schema = unsafe { physical_schema.clone_as_arc() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) };
-    let res = read_parquet_file_impl(engine.clone(), path, file, physical_schema);
+    let res = read_parquet_file_impl(
+        engine.clone(),
+        path.map_err(delta_kernel::Error::into_kernel_error),
+        file,
+        physical_schema,
+    );
     res.into_extern_result(&engine.as_ref())
 }
 
 fn read_parquet_file_impl(
     extern_engine: Arc<dyn ExternEngine>,
-    path: Result<&str>,
+    path: KernelResult<&str>,
     file: &FileMeta,
     physical_schema: Arc<Schema>,
-) -> Result<Handle<ExclusiveFileReadResultIterator>> {
+) -> KernelResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = extern_engine.engine();
     let parquet_handler = engine.parquet_handler();
     let location = Url::parse(path?)?;
@@ -142,7 +152,9 @@ fn read_parquet_file_impl(
             .map_err(|_| KernelError::generic_err("unable to convert to FileSize"))?,
     };
     // TODO: Plumb the predicate through the FFI?
-    let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;
+    let data = parquet_handler
+        .read_parquet_files(&[delta_fm], physical_schema, None)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     let res = Box::new(FileReadResultIterator {
         data,
         engine: extern_engine,
@@ -180,13 +192,12 @@ fn new_expression_evaluator_impl(
     input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
-) -> Result<Handle<SharedExpressionEvaluator>> {
+) -> KernelResult<Handle<SharedExpressionEvaluator>> {
     let engine = extern_engine.engine();
-    let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        input_schema,
-        expression,
-        output_type,
-    )?;
+    let evaluator = engine
+        .evaluation_handler()
+        .new_expression_evaluator(input_schema, expression, output_type)
+        .map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(evaluator.into())
 }
 
@@ -220,8 +231,11 @@ pub unsafe extern "C" fn evaluate_expression(
 fn evaluate_expression_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
-) -> Result<Handle<ExclusiveEngineData>> {
-    evaluator.evaluate(batch).map(Into::into)
+) -> KernelResult<Handle<ExclusiveEngineData>> {
+    evaluator
+        .evaluate(batch)
+        .map(Into::into)
+        .map_err(delta_kernel::Error::into_kernel_error)
 }
 
 #[cfg(test)]

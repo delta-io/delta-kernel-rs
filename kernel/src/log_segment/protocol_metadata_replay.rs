@@ -35,7 +35,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{Engine, EngineData, KernelError, Result, Version};
+use crate::{Engine, EngineData, KernelError, KernelResult, Result, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -48,7 +48,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> Result<(Metadata, Protocol, ProtocolMetadataSource)> {
+    ) -> KernelResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
             (None, Some(_), _) => Err(KernelError::MissingMetadata),
@@ -71,7 +71,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> Result<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
+    ) -> KernelResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
@@ -144,7 +144,7 @@ impl LogSegment {
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
-    fn replay_for_pm(&self, engine: &dyn Engine) -> Result<PmCandidate> {
+    fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
         if let Some(executor) = engine.plan_executor() {
             return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
@@ -154,7 +154,7 @@ impl LogSegment {
 
     /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
     #[cfg(feature = "declarative-plans")]
-    fn build_pm_plan(&self) -> Result<Plan> {
+    fn build_pm_plan(&self) -> KernelResult<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -170,7 +170,8 @@ impl LogSegment {
         };
 
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
-        let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())?;
+        let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())
+            .map_err(crate::Error::into_kernel_error)?;
 
         // A checkpoint's parts share one format; scan them with the matching operator.
         let checkpoint = self
@@ -182,7 +183,8 @@ impl LogSegment {
                 };
                 scan(checkpoint_files, &["version"], versioned_schema.clone())
             })
-            .transpose()?;
+            .transpose()
+            .map_err(crate::Error::into_kernel_error)?;
 
         // Required fields are non-null exactly when their Protocol or Metadata action is present.
         // Filter on required leaf fields so readers can use row group skipping.
@@ -194,8 +196,10 @@ impl LogSegment {
         let relevant_action =
             Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
 
-        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
-            .filter(relevant_action)?
+        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))
+            .map_err(crate::Error::into_kernel_error)?
+            .filter(relevant_action)
+            .map_err(crate::Error::into_kernel_error)?
             .aggregate_ungrouped(|a| {
                 let protocol = || column_name!(PROTOCOL_NAME);
                 let metadata = || column_name!(METADATA_NAME);
@@ -219,8 +223,10 @@ impl LogSegment {
                     version(),
                 );
                 a
-            })?
+            })
+            .map_err(crate::Error::into_kernel_error)?
             .build()
+            .map_err(crate::Error::into_kernel_error)
     }
 
     /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
@@ -229,15 +235,18 @@ impl LogSegment {
     fn read_pm_batches_via_plan(
         &self,
         executor: &dyn PlanExecutor,
-    ) -> Result<impl Iterator<Item = Result<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
+            .execute_op(Operation::QueryPlan(plan))
+            .map_err(crate::Error::into_kernel_error)?
+            .into_data()
+            .map_err(crate::Error::into_kernel_error)?
             .map(|batch| {
                 // Mark as a log batch so the checkpoint action is read from it.
-                let batch = ActionsBatch::new(batch?, true);
+                let batch =
+                    ActionsBatch::new(batch.map_err(crate::Error::into_kernel_error)?, true);
                 let (protocol_version, metadata_version) =
                     pm_versions_from_plan_output(batch.actions.as_ref())?;
                 Ok(VersionedBatch {
@@ -253,14 +262,15 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> Result<impl Iterator<Item = Result<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
             StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath);
-        let commit_schema = Arc::new(StructType::try_new(
-            commit_schema.fields().cloned().chain([file_column]),
-        )?);
+        let commit_schema = Arc::new(
+            StructType::try_new(commit_schema.fields().cloned().chain([file_column]))
+                .map_err(crate::Error::into_kernel_error)?,
+        );
         let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
         let batches = self
             .read_actions_with_projected_checkpoint_actions(
@@ -271,10 +281,11 @@ impl LogSegment {
                 None,
                 None,
                 None,
-            )?
+            )
+            .map_err(crate::Error::into_kernel_error)?
             .actions;
         Ok(batches.map(move |batch| {
-            let batch = batch?;
+            let batch = batch.map_err(crate::Error::into_kernel_error)?;
             // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
             let version = if batch.is_log_batch {
                 batch_version(batch.actions.as_ref())? as i64
@@ -308,8 +319,8 @@ struct VersionedBatch {
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
-    batches: impl Iterator<Item = Result<VersionedBatch>>,
-) -> Result<PmCandidate> {
+    batches: impl Iterator<Item = KernelResult<VersionedBatch>>,
+) -> KernelResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
     for batch in batches {
@@ -331,7 +342,7 @@ fn resolve_pm_batches(
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
-fn batch_version(data: &dyn EngineData) -> Result<Version> {
+fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
     #[derive(Default)]
     struct FilePathVisitor {
         file: Option<String>,
@@ -350,13 +361,16 @@ fn batch_version(data: &dyn EngineData) -> Result<Version> {
         }
     }
     let mut visitor = FilePathVisitor::default();
-    visitor.visit_rows_of(data)?;
+    visitor
+        .visit_rows_of(data)
+        .map_err(crate::Error::into_kernel_error)?;
     let file = visitor
         .file
         .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
         .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
-    ParsedLogPath::try_from(url)?
+    ParsedLogPath::try_from(url)
+        .map_err(crate::Error::into_kernel_error)?
         .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
@@ -407,10 +421,11 @@ fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
-) -> Result<PmCandidate> {
+) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
-    let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
+    let metadata = metadata_version
+        .zip(Metadata::try_new_from_data(actions).map_err(crate::Error::into_kernel_error)?);
     let (checkpoint_protocol, checkpoint_metadata) = match checkpoint_pm(batch)? {
         Some((version, p, m)) => (Some((version, p)), Some((version, m))),
         None => (None, None),
@@ -423,14 +438,15 @@ fn pm_candidate(
 
 /// The Protocol and Metadata nested in `batch`'s `checkpoint` action, at the action's own
 /// `checkpointMetadata.version`.
-fn checkpoint_pm(batch: &ActionsBatch) -> Result<Option<(i64, Protocol, Metadata)>> {
+fn checkpoint_pm(batch: &ActionsBatch) -> KernelResult<Option<(i64, Protocol, Metadata)>> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
         if !batch.is_log_batch {
             return Ok(None);
         }
 
-        let checkpoint = CheckpointAction::try_new_from_data(batch.actions.as_ref())?;
+        let checkpoint = CheckpointAction::try_new_from_data(batch.actions.as_ref())
+            .map_err(crate::Error::into_kernel_error)?;
 
         Ok(checkpoint.map(|checkpoint| {
             (
@@ -450,7 +466,9 @@ fn checkpoint_pm(batch: &ActionsBatch) -> Result<Option<(i64, Protocol, Metadata
 
 /// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
 #[cfg(feature = "declarative-plans")]
-fn pm_versions_from_plan_output(actions: &dyn EngineData) -> Result<(Option<i64>, Option<i64>)> {
+fn pm_versions_from_plan_output(
+    actions: &dyn EngineData,
+) -> KernelResult<(Option<i64>, Option<i64>)> {
     #[derive(Default)]
     struct PmVersionsVisitor {
         protocol: Option<i64>,
@@ -479,7 +497,9 @@ fn pm_versions_from_plan_output(actions: &dyn EngineData) -> Result<(Option<i64>
         }
     }
     let mut visitor = PmVersionsVisitor::default();
-    visitor.visit_rows_of(actions)?;
+    visitor
+        .visit_rows_of(actions)
+        .map_err(crate::Error::into_kernel_error)?;
     Ok((visitor.protocol, visitor.metadata))
 }
 
@@ -511,7 +531,9 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> Result<PlanResult> {
-            Err(KernelError::generic("plan executor deliberately failed"))
+            Err(crate::Error::Kernel(KernelError::generic(
+                "plan executor deliberately failed",
+            )))
         }
     }
 

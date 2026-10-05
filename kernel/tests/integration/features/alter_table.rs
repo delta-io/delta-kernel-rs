@@ -925,7 +925,8 @@ async fn empty_create_then_add_column(
         .await
         .map_err(|e| {
             delta_kernel::KernelError::generic(format!("write_batch_to_table failed: {e}"))
-        })?;
+        })
+        .map_err(delta_kernel::Error::Kernel)?;
     assert_eq!(v2.version(), 2);
 
     let scan = v2.scan_builder().build()?;
@@ -1675,7 +1676,12 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
         (StructField::nullable("value", DataType::INTEGER)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))])),
     };
-    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
+    let escaped = serde_json::to_string(
+        &serde_json::to_string(&stale_schema)
+            .map_err(delta_kernel::KernelError::from)
+            .map_err(delta_kernel::Error::Kernel)?,
+    )
+    .unwrap();
     // v0 written directly to bypass create_table validation (which strips stale annotations).
     let v0 = format!(
         r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}

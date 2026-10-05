@@ -34,7 +34,9 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{create_row, Engine};
-use crate::{EngineData, FileMeta, FileSize, KernelError, Result, RowVisitor as _};
+use crate::{
+    EngineData, Error, FileMeta, FileSize, KernelError, KernelResult, Result, RowVisitor as _,
+};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -399,10 +401,10 @@ impl Metadata {
         // Note: We don't have to look for nested metadata columns because that is already validated
         // when creating a StructType.
         if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
-            return Err(KernelError::Schema(format!(
+            return Err(Error::Kernel(KernelError::Schema(format!(
                 "Table schema must not contain metadata columns. Found metadata column: '{}'",
                 metadata_field.name
-            )));
+            ))));
         }
 
         Ok(Self {
@@ -414,7 +416,9 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: serde_json::to_string(&schema)
+                .map_err(crate::KernelError::from)
+                .map_err(Error::Kernel)?,
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -486,25 +490,27 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> Result<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
-            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
-            // matching.
-            if error.is_syntax()
-                && error
-                    .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-            {
-                KernelError::schema(format!(
+        serde_json::from_str(&self.schema_string)
+            .map_err(|error| {
+                // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
+                // matching.
+                if error.is_syntax()
+                    && error
+                        .to_string()
+                        .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
+                {
+                    KernelError::schema(format!(
                     "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
                      serde_json's recursion limit: {error}"
                 ))
-                .with_backtrace()
-            } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
-            } else {
-                error.into()
-            }
-        })
+                    .with_backtrace()
+                } else if is_unsupported_delta_type_error(&error) {
+                    KernelError::schema(error.to_string()).with_backtrace()
+                } else {
+                    error.into()
+                }
+            })
+            .map_err(Error::Kernel)
     }
 
     #[internal_api]
@@ -525,7 +531,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if schema serialization fails.
-    pub(crate) fn with_schema(self, schema: SchemaRef) -> Result<Self> {
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
             schema_string: serde_json::to_string(&schema)?,
             ..self
@@ -607,7 +613,7 @@ struct ProtocolRaw {
 }
 
 impl TryFrom<ProtocolRaw> for Protocol {
-    type Error = KernelError;
+    type Error = Error;
 
     fn try_from(protocol: ProtocolRaw) -> Result<Self> {
         Protocol::try_new(
@@ -633,24 +639,29 @@ impl Protocol {
     pub(crate) fn try_new_modern(
         reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
         writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
             Some(reader_features),
             Some(writer_features),
         )
+        .map_err(Error::into_kernel_error)
     }
 
     /// Try to create a new legacy Protocol instance with the given reader/writer versions
     #[cfg(test)]
-    pub(crate) fn try_new_legacy(min_reader_version: i32, min_writer_version: i32) -> Result<Self> {
+    pub(crate) fn try_new_legacy(
+        min_reader_version: i32,
+        min_writer_version: i32,
+    ) -> KernelResult<Self> {
         Self::try_new(
             min_reader_version,
             min_writer_version,
             TableFeature::NO_LIST,
             TableFeature::NO_LIST,
         )
+        .map_err(crate::Error::into_kernel_error)
     }
 
     /// Try to create a new Protocol instance from reader/writer versions and table features.
@@ -663,15 +674,15 @@ impl Protocol {
     ) -> Result<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
-            ))
+            )))
         );
         require!(
             min_writer_version >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
-            ))
+            )))
         );
 
         let reader_features = parse_features(reader_features);
@@ -682,16 +693,16 @@ impl Protocol {
         if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 reader_features.is_some(),
-                KernelError::invalid_protocol(
+                Error::Kernel(KernelError::invalid_protocol(
                     "Reader features must be present when minimum reader version = 3"
-                )
+                ))
             );
         } else {
             require!(
                 reader_features.is_none(),
-                KernelError::invalid_protocol(
+                Error::Kernel(KernelError::invalid_protocol(
                     "Reader features must not be present when minimum reader version != 3"
-                )
+                ))
             );
         }
 
@@ -700,16 +711,16 @@ impl Protocol {
         if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 writer_features.is_some(),
-                KernelError::invalid_protocol(
+                Error::Kernel(KernelError::invalid_protocol(
                     "Writer features must be present when minimum writer version = 7"
-                )
+                ))
             );
         } else {
             require!(
                 writer_features.is_none(),
-                KernelError::invalid_protocol(
+                Error::Kernel(KernelError::invalid_protocol(
                     "Writer features must not be present when minimum writer version != 7"
-                )
+                ))
             );
         }
 
@@ -725,12 +736,12 @@ impl Protocol {
                         FeatureType::ReaderWriter | FeatureType::Unknown
                     ) || !writer_features.contains(*feature)
                 }) {
-                    return Err(KernelError::invalid_protocol(format!(
+                    return Err(Error::Kernel(KernelError::invalid_protocol(format!(
                         "Reader features must contain only ReaderWriter features that are also \
                          listed in writer features, but {offending:?} is not \
                          (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
                          minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
-                    )));
+                    ))));
                 }
 
                 // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
@@ -757,7 +768,7 @@ impl Protocol {
                     if LEGACY_READER_FEATURES.contains(feature) {
                         legacy_orphans.push(feature);
                     } else {
-                        return Err(KernelError::invalid_protocol(format!(
+                        return Err(Error::Kernel(KernelError::invalid_protocol(format!(
                             "Writer features must be Writer-only or also listed in reader features, \
                              but ReaderWriter feature {feature:?} is listed in writerFeatures and \
                              missing from readerFeatures \
@@ -765,7 +776,7 @@ impl Protocol {
                              writerFeatures={writer_features:?}, \
                              minReaderVersion={min_reader_version}, \
                              minWriterVersion={min_writer_version})"
-                        )));
+                        ))));
                     }
                 }
                 // Reached only once the whole writer list is known valid.
@@ -793,20 +804,20 @@ impl Protocol {
                         }
                     }
                 }) {
-                    return Err(KernelError::invalid_protocol(format!(
+                    return Err(Error::Kernel(KernelError::invalid_protocol(format!(
                         "Writer features must be Writer-only or also listed in reader features, \
                          but ReaderWriter feature {offending:?} is listed in writerFeatures with \
                          no reader features present \
                          (writerFeatures={writer_features:?}, minReaderVersion={min_reader_version}, \
                          minWriterVersion={min_writer_version})"
-                    )));
+                    ))));
                 }
                 Ok(())
             }
             (Some(_), None) => Err(KernelError::invalid_protocol(
                 "Reader features should be present in writer features",
             )),
-        }?;
+        }.map_err(Error::Kernel)?;
 
         Ok(Protocol {
             min_reader_version,
@@ -818,9 +829,11 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
-        visitor.visit_rows_of(data)?;
+        visitor
+            .visit_rows_of(data)
+            .map_err(Error::into_kernel_error)?;
         Ok(visitor.protocol)
     }
 
@@ -1353,14 +1366,14 @@ impl LastManifestCommit {
             version,
             content_root_version,
         };
-        last_manifest_commit.validate()?;
+        last_manifest_commit.validate().map_err(Error::Kernel)?;
         Ok(last_manifest_commit)
     }
 
     /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
     /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
     /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> KernelResult<()> {
         require!(
             self.content_root_version <= self.version,
             KernelError::generic(format!(
@@ -1534,7 +1547,7 @@ impl<'de> Deserialize<'de> for CheckpointAction {
 /// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
 /// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> Result<Scalar> {
+fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
         .chain(sidecar.fields().iter().cloned());
@@ -1549,7 +1562,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> Result<Scalar> {
     // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
     // which will let this use `try_new`.
     Ok(Scalar::Struct(StructData::from_values_unchecked(
-        StructType::try_new(fields)?,
+        StructType::try_new(fields).map_err(Error::into_kernel_error)?,
         values,
     )))
 }
@@ -1557,7 +1570,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> Result<Scalar> {
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> Result<Scalar> {
+fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
         fields.iter().any(|f| f.name() == field_name),
@@ -1575,7 +1588,9 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> Result<Sc
             }
         })
         .collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    Ok(Scalar::Struct(
+        StructData::try_new(fields, values).map_err(Error::into_kernel_error)?,
+    ))
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1585,7 +1600,7 @@ impl CheckpointAction {
     /// struct-scalar conversion because that nested array-of-union shape can't be expressed by the
     /// derive, so we build the `Scalar::Array` by hand. This is also where the action is validated,
     /// hence a fallible method rather than an infallible `From`.
-    fn try_into_scalar(self) -> Result<Scalar> {
+    fn try_into_scalar(self) -> KernelResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1619,7 +1634,9 @@ impl CheckpointAction {
         }
 
         let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
-        Ok(Scalar::Array(ArrayData::try_new(array_type, elements)?))
+        Ok(Scalar::Array(
+            ArrayData::try_new(array_type, elements).map_err(Error::into_kernel_error)?,
+        ))
     }
 }
 
@@ -1668,8 +1685,9 @@ impl CheckpointAction {
         create_row(
             engine,
             LOG_CHECKPOINT_SCHEMA.clone(),
-            self.try_into_scalar()?,
+            self.try_into_scalar().map_err(Error::Kernel)?,
         )
+        .map_err(Error::Kernel)
     }
 
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
@@ -1689,8 +1707,8 @@ impl CheckpointAction {
     /// action, mirroring [`visitors::CheckpointVisitor`]: the four required elements are singletons
     /// (missing or repeated is an error), `txn`/`domainMetadata` are collected, `sidecar` entries
     /// are split by their `type` (unknown types error), and the assembled action is validated.
-    fn from_elements(elements: Vec<CheckpointActionElement>) -> Result<Self> {
-        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
+    fn from_elements(elements: Vec<CheckpointActionElement>) -> KernelResult<Self> {
+        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> KernelResult<()> {
             require!(
                 slot.replace(value).is_none(),
                 KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
@@ -1752,7 +1770,7 @@ impl CheckpointAction {
     /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
     /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
     /// can never be written in a shape the reader would reject.
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> KernelResult<()> {
         require!(
             self.content_root.version <= self.version,
             KernelError::generic(format!(
@@ -1789,9 +1807,11 @@ impl CheckpointAction {
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> Result<FileMeta> {
         let content_root = &self.content_root;
         Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
+            location: resolve_amt_location(&content_root.path, table_root)
+                .map_err(Error::Kernel)?,
             last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
+            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")
+                .map_err(Error::Kernel)?,
         })
     }
 
@@ -1838,7 +1858,7 @@ pub(crate) struct Sidecar {
 
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
 /// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> Result<FileSize> {
+fn to_file_size(bytes: i64, context: &str) -> KernelResult<FileSize> {
     bytes.try_into().map_err(|_| {
         KernelError::generic(format!(
             "Failed to convert {context} size {bytes} to FileSize"
@@ -1868,7 +1888,7 @@ impl Sidecar {
     ///
     /// This helper first builds the URL by joining the provided log_root with
     /// the "_sidecars/" folder and the given sidecar path.
-    pub(crate) fn to_filemeta(&self, log_root: &Url) -> Result<FileMeta> {
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> KernelResult<FileMeta> {
         Ok(FileMeta {
             location: log_root.join("_sidecars/")?.join(&self.path)?,
             last_modified: self.modification_time,
@@ -2114,8 +2134,8 @@ mod tests {
                 ),
             );
             let error = match result.unwrap_err() {
-                KernelError::Backtraced { source, .. } => *source,
-                error => error,
+                crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+                error => error.into_kernel_error(),
             };
             assert!(matches!(error, KernelError::Schema(_)));
         } else {
@@ -2170,8 +2190,8 @@ mod tests {
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
         let error = match metadata.parse_schema().unwrap_err() {
-            KernelError::Backtraced { source, .. } => *source,
-            error => error,
+            crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+            error => error.into_kernel_error(),
         };
         match expected_error {
             "MalformedJson" => {
@@ -2457,7 +2477,7 @@ mod tests {
                     reader_features,
                     writer_features
                 ),
-                Err(KernelError::InvalidProtocol(_)),
+                Err(crate::Error::Kernel(KernelError::InvalidProtocol(_))),
             ));
         }
     }
@@ -2880,7 +2900,7 @@ mod tests {
         )
         .unwrap();
 
-        let record_batch = engine_data.try_into_record_batch().unwrap();
+        let record_batch = engine_data.unwrap().try_into_record_batch().unwrap();
 
         assert_eq!(record_batch, expected);
     }
@@ -3181,8 +3201,12 @@ mod tests {
     fn test_checkpoint_action_scalar_round_trip() -> Result<()> {
         let engine = ExprEngine::new();
         let action = sample_checkpoint_action();
-        let scalar = action.clone().try_into_scalar()?;
-        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let scalar = action
+            .clone()
+            .try_into_scalar()
+            .map_err(crate::Error::Kernel)?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)
+            .map_err(crate::Error::Kernel)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
@@ -3215,8 +3239,11 @@ mod tests {
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
         let engine = ExprEngine::new();
-        let scalar = sample_checkpoint_action().try_into_scalar()?;
-        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let scalar = sample_checkpoint_action()
+            .try_into_scalar()
+            .map_err(crate::Error::Kernel)?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)
+            .map_err(crate::Error::Kernel)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
         let bytes = to_json_bytes(std::iter::once(Ok(filtered)))?;
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3301,8 +3328,12 @@ mod tests {
             domain_metadata_sidecars: vec![],
         };
         let engine = ExprEngine::new();
-        let scalar = action.clone().try_into_scalar()?;
-        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let scalar = action
+            .clone()
+            .try_into_scalar()
+            .map_err(crate::Error::Kernel)?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)
+            .map_err(crate::Error::Kernel)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);
@@ -3324,8 +3355,12 @@ mod tests {
             ..sample_checkpoint_action()
         };
         let engine = ExprEngine::new();
-        let scalar = action.clone().try_into_scalar()?;
-        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
+        let scalar = action
+            .clone()
+            .try_into_scalar()
+            .map_err(crate::Error::Kernel)?;
+        let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)
+            .map_err(crate::Error::Kernel)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
             .expect("checkpoint action should round-trip");
         assert_eq!(action, back);

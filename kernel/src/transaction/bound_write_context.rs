@@ -11,7 +11,7 @@ use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
-use crate::{KernelError, Result};
+use crate::{Error, KernelError, Result};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
 /// [`BoundWriteContextBuilder`](super::BoundWriteContextBuilder).
@@ -229,12 +229,13 @@ impl BoundWriteContext {
                     "file '{}' is not under table root '{}'",
                     file_location, self.write_state.table_root
                 ))
-            })?;
+            })
+            .map_err(Error::Kernel)?;
         if relative.starts_with("..") {
-            return Err(KernelError::internal_error(format!(
+            return Err(Error::Kernel(KernelError::internal_error(format!(
                 "file '{}' is not under table root '{}'",
                 file_location, self.write_state.table_root
-            )));
+            ))));
         }
         Ok(relative)
     }

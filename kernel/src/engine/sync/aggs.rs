@@ -16,7 +16,7 @@ use crate::engine::arrow_expression::evaluate_expression::{extract_column, extra
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
 use crate::schema::DataType;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// A specific row of input: `(batch index, row index)`.
 type InputRow = (usize, usize);
@@ -43,7 +43,7 @@ trait BoundAggregate {
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
-) -> Result<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let ops: Vec<Box<dyn BoundAggregate>> = aggregate
         .aggs
         .iter()
@@ -55,7 +55,11 @@ pub(super) fn eval_aggregate(
     let mut groups = HashMap::<OwnedRow, (InputRow, Vec<Box<dyn Any>>)>::new();
     let initial_aggs = || ops.iter().map(|op| op.init_state()).collect();
     for (batch_idx, batch) in input.iter().enumerate() {
-        let updaters: Vec<_> = ops.iter().map(|op| op.prepare(batch)).try_collect()?;
+        let updaters: Vec<_> = ops
+            .iter()
+            .map(|op| op.prepare(batch))
+            .try_collect()
+            .map_err(crate::Error::into_kernel_error)?;
         let group_keys = encode_keys_as_rows(batch, &aggregate.group_by)?;
         for (row_idx, group_key) in group_keys.into_iter().enumerate() {
             let row = (batch_idx, row_idx);
@@ -63,7 +67,9 @@ pub(super) fn eval_aggregate(
                 .entry(group_key)
                 .or_insert_with(|| (row, initial_aggs()));
             for (updater, agg_state) in updaters.iter().zip(aggs) {
-                updater.update(agg_state.as_mut(), row)?;
+                updater
+                    .update(agg_state.as_mut(), row)
+                    .map_err(crate::Error::into_kernel_error)?;
             }
         }
     }
@@ -86,27 +92,31 @@ pub(super) fn eval_aggregate(
     }
     for (agg_idx, op) in ops.iter().enumerate() {
         let states = Vec::from_iter(aggs_by_group.iter().map(|aggs| aggs[agg_idx].as_ref()));
-        output_arrays.push(op.finalize(&states, input)?);
+        output_arrays.push(
+            op.finalize(&states, input)
+                .map_err(crate::Error::into_kernel_error)?,
+        );
     }
 
     Ok(vec![RecordBatch::try_new(output_schema, output_arrays)?])
 }
 
 // Extracts the named column from each of the input batches
-fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> Result<Vec<ArrayRef>> {
+fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> KernelResult<Vec<ArrayRef>> {
     input
         .iter()
         .map(|batch| extract_column(batch, name))
         .try_collect()
+        .map_err(crate::Error::into_kernel_error)
 }
 
 // Thin wrapper around arrow `interleave` that converts our `&[ArrayRef]` into `&[&dyn Array]`
-fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> Result<ArrayRef> {
+fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> KernelResult<ArrayRef> {
     let refs = Vec::from_iter(arrays.iter().map(|c| c.as_ref()));
     Ok(interleave(&refs, indices)?)
 }
 
-fn bind_aggregate(agg: &Agg, output_type: &DataType) -> Result<Box<dyn BoundAggregate>> {
+fn bind_aggregate(agg: &Agg, output_type: &DataType) -> KernelResult<Box<dyn BoundAggregate>> {
     match agg {
         Agg::Min(value) => {
             let op = LongAccumulator::MinMax(Comparison::Min);
@@ -156,7 +166,7 @@ impl LongAccumulatorAgg {
         value: &ColumnName,
         output_type: &DataType,
         op: LongAccumulator,
-    ) -> Result<Box<dyn BoundAggregate>> {
+    ) -> KernelResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
             return Err(KernelError::unsupported(
                 "SyncPlanExecutor min/max/sum aggregate with non-LONG value",
@@ -178,7 +188,7 @@ impl BoundAggregate for LongAccumulatorAgg {
 
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> Result<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(LongAccumulatorUpdater {
-            values: extract_long_column(batch, &self.value)?,
+            values: extract_long_column(batch, &self.value).map_err(crate::Error::Kernel)?,
             op: self.op,
         }))
     }
@@ -186,7 +196,11 @@ impl BoundAggregate for LongAccumulatorAgg {
     fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> Result<ArrayRef> {
         let values = states
             .iter()
-            .map(|state| Ok(downcast_state::<LongAccumulatorState>(*state)?.0))
+            .map(|state| {
+                Ok(downcast_state::<LongAccumulatorState>(*state)
+                    .map_err(crate::Error::Kernel)?
+                    .0)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(Int64Array::from(values)))
     }
@@ -200,7 +214,8 @@ struct LongAccumulatorUpdater<'a> {
 impl AggUpdater for LongAccumulatorUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> Result<()> {
         if self.values.is_valid(row_idx) {
-            let state = downcast_state_mut::<LongAccumulatorState>(state)?;
+            let state =
+                downcast_state_mut::<LongAccumulatorState>(state).map_err(crate::Error::Kernel)?;
             let candidate = self.values.value(row_idx);
             match self.op {
                 LongAccumulator::MinMax(cmp) => {
@@ -211,9 +226,13 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
                 LongAccumulator::Sum => {
                     state.0 = Some(match state.0 {
                         None => candidate,
-                        Some(sum) => i64::checked_add(sum, candidate).ok_or_else(|| {
-                            KernelError::generic("SyncPlanExecutor SUM aggregate overflowed i64")
-                        })?,
+                        Some(sum) => i64::checked_add(sum, candidate)
+                            .ok_or_else(|| {
+                                KernelError::generic(
+                                    "SyncPlanExecutor SUM aggregate overflowed i64",
+                                )
+                            })
+                            .map_err(crate::Error::Kernel)?,
                     });
                 }
             }
@@ -229,7 +248,7 @@ impl CountAgg {
     fn try_new(
         value: Option<&ColumnName>,
         output_type: &DataType,
-    ) -> Result<Box<dyn BoundAggregate>> {
+    ) -> KernelResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
             return Err(KernelError::unsupported(
                 "SyncPlanExecutor count aggregate with non-LONG output",
@@ -256,7 +275,11 @@ impl BoundAggregate for CountAgg {
     fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> Result<ArrayRef> {
         let values = states
             .iter()
-            .map(|state| Ok(downcast_state::<CountState>(*state)?.0))
+            .map(|state| {
+                Ok(downcast_state::<CountState>(*state)
+                    .map_err(crate::Error::Kernel)?
+                    .0)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(Int64Array::from(values)))
     }
@@ -267,10 +290,12 @@ struct CountUpdater<'a>(Option<&'a ArrayRef>);
 impl AggUpdater for CountUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> Result<()> {
         if self.0.is_none_or(|values| values.is_valid(row_idx)) {
-            let state = downcast_state_mut::<CountState>(state)?;
-            state.0 = i64::checked_add(state.0, 1).ok_or_else(|| {
-                KernelError::generic("SyncPlanExecutor COUNT aggregate overflowed i64")
-            })?;
+            let state = downcast_state_mut::<CountState>(state).map_err(crate::Error::Kernel)?;
+            state.0 = i64::checked_add(state.0, 1)
+                .ok_or_else(|| {
+                    KernelError::generic("SyncPlanExecutor COUNT aggregate overflowed i64")
+                })
+                .map_err(crate::Error::Kernel)?;
         }
         Ok(())
     }
@@ -290,7 +315,7 @@ impl NonNullByAgg {
         operands: &NonNullByOperands,
         output_type: &DataType,
         comparison: Comparison,
-    ) -> Result<Box<dyn BoundAggregate>> {
+    ) -> KernelResult<Box<dyn BoundAggregate>> {
         Ok(Box::new(Self {
             value: operands.value.clone(),
             null_sentinel: operands.null_sentinel.clone(),
@@ -311,13 +336,13 @@ impl BoundAggregate for NonNullByAgg {
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> Result<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(NonNullByUpdater {
             null_sentinels: extract_column_ref(batch, &self.null_sentinel)?,
-            keys: extract_long_column(batch, &self.key)?,
+            keys: extract_long_column(batch, &self.key).map_err(crate::Error::Kernel)?,
             comparison: self.comparison,
         }))
     }
 
     fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> Result<ArrayRef> {
-        let mut arrays = extract_column_values(input, &self.value)?;
+        let mut arrays = extract_column_values(input, &self.value).map_err(crate::Error::Kernel)?;
         arrays.push(new_null_array(&self.output_type, 1));
 
         // Groups with no winner interleave from the one-row null array we appended above.
@@ -325,12 +350,14 @@ impl BoundAggregate for NonNullByAgg {
         let rows: Vec<_> = states
             .iter()
             .map(|state| -> Result<_> {
-                let winner = downcast_state::<NonNullByState>(*state)?.0;
+                let winner = downcast_state::<NonNullByState>(*state)
+                    .map_err(crate::Error::Kernel)?
+                    .0;
                 Ok(winner.map_or(initial_row, |(row, _)| row))
             })
             .try_collect()?;
 
-        interleave_column_values(&arrays, &rows)
+        interleave_column_values(&arrays, &rows).map_err(crate::Error::Kernel)
     }
 }
 
@@ -343,7 +370,8 @@ struct NonNullByUpdater<'a> {
 impl AggUpdater for NonNullByUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (batch_idx, row_idx): InputRow) -> Result<()> {
         if self.null_sentinels.is_valid(row_idx) && self.keys.is_valid(row_idx) {
-            let state = downcast_state_mut::<NonNullByState>(state)?;
+            let state =
+                downcast_state_mut::<NonNullByState>(state).map_err(crate::Error::Kernel)?;
             let best = state.0.map(|(_, best)| best);
             let candidate = self.keys.value(row_idx);
             if self.comparison.replaces(best, candidate) {
@@ -354,8 +382,11 @@ impl AggUpdater for NonNullByUpdater<'_> {
     }
 }
 
-fn extract_long_column<'a>(batch: &'a RecordBatch, name: &ColumnName) -> Result<&'a Int64Array> {
-    let array = extract_column_ref(batch, name)?;
+fn extract_long_column<'a>(
+    batch: &'a RecordBatch,
+    name: &ColumnName,
+) -> KernelResult<&'a Int64Array> {
+    let array = extract_column_ref(batch, name).map_err(crate::Error::into_kernel_error)?;
     array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
         KernelError::unsupported(format!(
             "SyncPlanExecutor aggregate operand `{name}` has non-LONG type"
@@ -363,7 +394,7 @@ fn extract_long_column<'a>(batch: &'a RecordBatch, name: &ColumnName) -> Result<
     })
 }
 
-fn downcast_state<T: 'static>(state: &dyn Any) -> Result<&T> {
+fn downcast_state<T: 'static>(state: &dyn Any) -> KernelResult<&T> {
     state.downcast_ref().ok_or_else(|| {
         KernelError::generic(format!(
             "Aggregate state is not a {}",
@@ -372,7 +403,7 @@ fn downcast_state<T: 'static>(state: &dyn Any) -> Result<&T> {
     })
 }
 
-fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> Result<&mut T> {
+fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> KernelResult<&mut T> {
     state.downcast_mut().ok_or_else(|| {
         KernelError::generic(format!(
             "Aggregate state is not a {}",
@@ -424,7 +455,9 @@ mod tests {
                 "key",
                 Arc::new(Int64Array::from(vec![Some(1), Some(3), None])),
             ),
-        ])?;
+        ])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let aggregate = Aggregate {
             group_by: vec![column_name!("group")],
             aggs: vec![
@@ -457,7 +490,7 @@ mod tests {
         };
 
         assert_batches_eq(
-            &eval_aggregate(&aggregate, &[input])?,
+            &eval_aggregate(&aggregate, &[input]).map_err(crate::Error::Kernel)?,
             "\
 +-------+---------+---------+---------+---------+---------+-----------+------+
 | group | maximum | minimum | max_key | min_key | sum_key | qualified | rows |
@@ -497,7 +530,9 @@ mod tests {
             ),
             ("sentinel", Arc::new(BooleanArray::from(vec![true]))),
             ("key", Arc::new(Int64Array::from(vec![1]))),
-        ])?;
+        ])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let second = RecordBatch::try_from_iter([
             (
                 "value",
@@ -505,10 +540,12 @@ mod tests {
             ),
             ("sentinel", Arc::new(BooleanArray::from(vec![true]))),
             ("key", Arc::new(Int64Array::from(vec![2]))),
-        ])?;
+        ])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
 
         assert_batches_eq(
-            &eval_aggregate(&aggregate, &[first, second])?,
+            &eval_aggregate(&aggregate, &[first, second]).map_err(crate::Error::Kernel)?,
             "\
 +---------+---------+
 | minimum | maximum |
@@ -551,7 +588,7 @@ mod tests {
             },
         };
         assert_batches_eq(
-            &eval_aggregate(&ungrouped, &[])?,
+            &eval_aggregate(&ungrouped, &[]).map_err(crate::Error::Kernel)?,
             "\
 +---------+---------+-------+-----------+------+-------+------+
 | minimum | maximum | total | qualified | rows | first | last |
@@ -568,7 +605,9 @@ mod tests {
                 nullable "max_key": LONG,
             },
         };
-        assert!(eval_aggregate(&grouped, &[])?.is_empty());
+        assert!(eval_aggregate(&grouped, &[])
+            .map_err(crate::Error::Kernel)?
+            .is_empty());
         Ok(())
     }
 
@@ -607,7 +646,9 @@ mod tests {
         let input = RecordBatch::try_from_iter([(
             "value",
             Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
-        )])?;
+        )])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![
@@ -621,7 +662,10 @@ mod tests {
                 not_null "rows": LONG,
             },
         };
-        assert_batches_eq(&eval_aggregate(&aggregate, &[input])?, expected);
+        assert_batches_eq(
+            &eval_aggregate(&aggregate, &[input]).map_err(crate::Error::Kernel)?,
+            expected,
+        );
         Ok(())
     }
 
@@ -638,7 +682,9 @@ mod tests {
             nested.columns().to_vec(),
             Some(crate::arrow::buffer::NullBuffer::new(validity)),
         ));
-        let input = RecordBatch::try_from_iter([("payload", structs as ArrayRef)])?;
+        let input = RecordBatch::try_from_iter([("payload", structs as ArrayRef)])
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?;
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![Agg::count(column_name!("payload")), Agg::count_star()],
@@ -649,7 +695,7 @@ mod tests {
         };
 
         assert_batches_eq(
-            &eval_aggregate(&aggregate, &[input])?,
+            &eval_aggregate(&aggregate, &[input]).map_err(crate::Error::Kernel)?,
             "\
 +----------+------+
 | payloads | rows |
@@ -689,7 +735,9 @@ mod tests {
             ("sentinel", Arc::new(BooleanArray::from(vec![None]))),
             ("key", Arc::new(Int64Array::from(vec![Some(99)]))),
             ("outer", Arc::new(outer)),
-        ])?;
+        ])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let aggregate = Aggregate {
             group_by: vec![column_name!("outer.group")],
             aggs: vec![
@@ -710,7 +758,7 @@ mod tests {
         };
 
         assert_batches_eq(
-            &eval_aggregate(&aggregate, &[input])?,
+            &eval_aggregate(&aggregate, &[input]).map_err(crate::Error::Kernel)?,
             "\
 +--------------+---------+-----------+--------------+
 | group        | minimum | qualified | winner       |
@@ -730,7 +778,9 @@ mod tests {
             ),
             ("sentinel", Arc::new(BooleanArray::from(vec![true, true]))),
             ("key", Arc::new(Int64Array::from(vec![1, 2]))),
-        ])?;
+        ])
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?;
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![Agg::max_non_null_by(
@@ -744,7 +794,7 @@ mod tests {
         };
 
         assert_batches_eq(
-            &eval_aggregate(&aggregate, &[input])?,
+            &eval_aggregate(&aggregate, &[input]).map_err(crate::Error::Kernel)?,
             "\
 +--------+
 | winner |

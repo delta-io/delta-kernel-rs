@@ -20,7 +20,7 @@ use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, PredicateRef, Result, Snapshot};
+use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -29,7 +29,7 @@ fn normalized_metadata_batch(
     json_stats: Option<ArrayRef>,
     stats_parsed: Option<ArrayRef>,
     partitions_parsed: Option<ArrayRef>,
-) -> Result<RecordBatch> {
+) -> KernelResult<RecordBatch> {
     let mut columns = vec![
         ("path", field("path")),
         ("size", field("size")),
@@ -55,12 +55,20 @@ fn normalized_metadata_batch(
     Ok(RecordBatch::try_from_iter(columns)?)
 }
 
-fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> Result<Vec<RecordBatch>> {
+fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<RecordBatch>> {
     let mut batches = vec![];
-    for metadata in scan.scan_metadata(engine)? {
-        let (data, selection) = metadata?.scan_files.into_parts();
+    for metadata in scan
+        .scan_metadata(engine)
+        .map_err(crate::Error::into_kernel_error)?
+    {
+        let (data, selection) = metadata
+            .map_err(crate::Error::into_kernel_error)?
+            .scan_files
+            .into_parts();
         let batch = filter_record_batch(
-            &data.try_into_record_batch()?,
+            &data
+                .try_into_record_batch()
+                .map_err(crate::Error::into_kernel_error)?,
             &BooleanArray::from(selection),
         )?;
         if batch.num_rows() == 0 {
@@ -91,19 +99,27 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> Result<Vec<RecordBatc
     Ok(batches)
 }
 
-fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> Result<Vec<RecordBatch>> {
-    let Some(plan) = scan.declarative_metadata_scan_plan(engine)? else {
+fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<RecordBatch>> {
+    let Some(plan) = scan
+        .declarative_metadata_scan_plan(engine)
+        .map_err(crate::Error::into_kernel_error)?
+    else {
         return Ok(vec![]);
     };
     let batches = engine
         .plan_executor()
         .unwrap()
-        .execute_op(PlanOperation::QueryPlan(plan))?
-        .into_data()?;
+        .execute_op(PlanOperation::QueryPlan(plan))
+        .map_err(crate::Error::into_kernel_error)?
+        .into_data()
+        .map_err(crate::Error::into_kernel_error)?;
 
     let mut projected = vec![];
     for batch in batches {
-        let batch = batch?.try_into_record_batch()?;
+        let batch = batch
+            .map_err(crate::Error::into_kernel_error)?
+            .try_into_record_batch()
+            .map_err(crate::Error::into_kernel_error)?;
         if batch.num_rows() == 0 {
             continue;
         }
@@ -135,8 +151,8 @@ fn assert_metadata_eq(
     actual: &[RecordBatch],
     expected: &[RecordBatch],
     context: &str,
-) -> Result<()> {
-    fn sorted_pretty_lines(batches: &[RecordBatch]) -> Result<Vec<String>> {
+) -> KernelResult<()> {
+    fn sorted_pretty_lines(batches: &[RecordBatch]) -> KernelResult<Vec<String>> {
         let formatted = pretty_format_batches(batches)?.to_string();
         let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
         let len = lines.len();
@@ -155,7 +171,7 @@ fn assert_metadata_eq(
     Ok(())
 }
 
-fn without_columns(batches: &[RecordBatch], excluded: &[&str]) -> Result<Vec<RecordBatch>> {
+fn without_columns(batches: &[RecordBatch], excluded: &[&str]) -> KernelResult<Vec<RecordBatch>> {
     batches
         .iter()
         .map(|batch| {
@@ -217,7 +233,8 @@ fn declarative_metadata_matches_imperative_scan(
     )]
     predicate: Option<Pred>,
 ) -> Result<()> {
-    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
+    let (engine, snapshot, _tempdir) =
+        crate::unit_test_utils::load_test_table(table).map_err(crate::Error::Kernel)?;
     let predicate = predicate.map(Arc::new);
 
     let imperative_builder = snapshot
@@ -229,7 +246,8 @@ fn declarative_metadata_matches_imperative_scan(
         Some(predicate) => imperative_builder.with_predicate(predicate.clone()),
         None => imperative_builder,
     };
-    let expected = imperative_metadata(imperative_builder.build()?, engine.as_ref())?;
+    let expected = imperative_metadata(imperative_builder.build()?, engine.as_ref())
+        .map_err(crate::Error::Kernel)?;
 
     let declarative_builder = snapshot
         .scan_builder()
@@ -240,16 +258,18 @@ fn declarative_metadata_matches_imperative_scan(
         None => declarative_builder,
     };
     let scan = declarative_builder.build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
 
     if table.contains("struct-stats-only") {
         assert_metadata_eq(
-            &without_columns(&actual, &[STATS])?,
-            &without_columns(&expected, &[STATS])?,
+            &without_columns(&actual, &[STATS]).map_err(crate::Error::Kernel)?,
+            &without_columns(&expected, &[STATS]).map_err(crate::Error::Kernel)?,
             &format!("table {table}"),
         )
+        .map_err(crate::Error::Kernel)
     } else {
         assert_metadata_eq(&actual, &expected, &format!("table {table}"))
+            .map_err(crate::Error::Kernel)
     }
 }
 
@@ -257,7 +277,8 @@ fn declarative_metadata_matches_imperative_scan(
 #[case::parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
 #[case::json_manifest("v2-checkpoints-json-with-sidecars")]
 fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str) -> Result<()> {
-    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
+    let (engine, snapshot, _tempdir) =
+        crate::unit_test_utils::load_test_table(table).map_err(crate::Error::Kernel)?;
     let plan = snapshot
         .scan_builder()
         .build()?
@@ -296,7 +317,8 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> Result<()> {
-    let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
+    let (engine, snapshot, _tempdir) =
+        load_test_table("parsed-stats").map_err(crate::Error::Kernel)?;
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
     let expected_stats = if no_stats {
@@ -311,14 +333,15 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .with_stats(expected_stats)
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate.clone());
-    let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
+    let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())
+        .map_err(crate::Error::Kernel)?;
     let builder = snapshot
         .scan_builder()
         .with_stats(stats.clone())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate);
     let scan = builder.build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
     let actual_fields = leaf_paths(&actual);
     let imperative_fields = leaf_paths(&expected);
     let unexpected_fields: Vec<_> = actual_fields
@@ -364,9 +387,10 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     };
     assert_metadata_eq(
         &actual,
-        &without_columns(&expected, ignored_stats)?,
+        &without_columns(&expected, ignored_stats).map_err(crate::Error::Kernel)?,
         "metadata output options",
     )
+    .map_err(crate::Error::Kernel)
 }
 
 const ADD_FIELDS: &[&str] = &[
@@ -502,7 +526,8 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     (|| -> Result<()> {
         let json_requested = stats.synthesize_json;
         let (engine, snapshot, _tempdir) =
-            load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+            load_test_table("v1-multi-part-partitioned-struct-stats-only")
+                .map_err(crate::Error::Kernel)?;
         let scan = snapshot
             .scan_builder()
             .with_stats(stats)
@@ -562,14 +587,15 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 
 #[test]
 fn declarative_metadata_projects_nested_column_mapped_stats() -> Result<()> {
-    let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
+    let (engine, snapshot, _tempdir) =
+        load_test_table("stats-writing-all-types/delta").map_err(crate::Error::Kernel)?;
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::struct_columns(vec![column_name!(
             "nested_struct.inner_int"
         )]))
         .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
     let parent = "col-481c7590-d3b8-4e9c-b40e-7b7128a972f4";
     let child = "col-7f2f94cf-7082-430c-bba7-852bc6c5215e";
     let stats_paths: Vec<_> = leaf_paths(&actual)
@@ -644,6 +670,7 @@ fn declarative_metadata_output_options_across_log_shapes(
     partitions: PartitionValuesOptions,
 ) -> Result<()> {
     assert_metadata_output_options(log_state, features, table_config, stats, partitions)
+        .map_err(crate::Error::Kernel)
 }
 
 #[rstest]
@@ -680,7 +707,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
-) -> Result<()> {
+) -> KernelResult<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
     let table = TestTableBuilder::new()
@@ -691,21 +718,25 @@ fn assert_metadata_output_options(
         .build()
         .expect("build output-options table");
     let engine = SyncEngine::new_with_store(table.store().clone());
-    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .map_err(crate::Error::into_kernel_error)?;
     let expected = imperative_metadata(
         snapshot
             .clone()
             .scan_builder()
             .with_stats(stats.clone())
             .with_partition_values(partitions.clone())
-            .build()?,
+            .build()
+            .map_err(crate::Error::into_kernel_error)?,
         &engine,
     )?;
     let scan = snapshot
         .scan_builder()
         .with_stats(stats)
         .with_partition_values(partitions)
-        .build()?;
+        .build()
+        .map_err(crate::Error::into_kernel_error)?;
     let actual = declarative_metadata(&scan, &engine)?;
 
     for batches in [&actual, &expected] {
@@ -772,7 +803,8 @@ fn declarative_metadata_data_skipping(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
 ) -> Result<()> {
-    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
+    let (engine, snapshot, _tempdir) =
+        crate::unit_test_utils::load_test_table(table).map_err(crate::Error::Kernel)?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
@@ -783,7 +815,8 @@ fn declarative_metadata_data_skipping(
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
     assert_eq!(metadata_row_count(&expected), expected_count);
 
     let scan = snapshot
@@ -792,13 +825,14 @@ fn declarative_metadata_data_skipping(
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
 
     assert_metadata_eq(
-        &without_columns(&actual, &[STATS])?,
-        &without_columns(&expected, &[STATS])?,
+        &without_columns(&actual, &[STATS]).map_err(crate::Error::Kernel)?,
+        &without_columns(&expected, &[STATS]).map_err(crate::Error::Kernel)?,
         &format!("table {table}"),
     )
+    .map_err(crate::Error::Kernel)
 }
 
 #[rstest]
@@ -810,7 +844,8 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] expected_count: usize,
 ) -> Result<()> {
     let (engine, snapshot, _tempdir) =
-        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")
+            .map_err(crate::Error::Kernel)?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
@@ -820,7 +855,8 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
     assert_eq!(metadata_row_count(&expected), expected_count);
 
     let scan = snapshot
@@ -829,21 +865,25 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     assert!(scan.state_info.physical_stats_read_schema().is_none());
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
 
-    assert_metadata_eq(&actual, &expected, "partition pruning")
+    assert_metadata_eq(&actual, &expected, "partition pruning").map_err(crate::Error::Kernel)
 }
 
 #[test]
 fn declarative_metadata_partition_is_null_keeps_null_partition() -> Result<()> {
-    let (engine, snapshot, _tempdir) = load_test_table("data-reader-timestamp_ntz")?;
+    let (engine, snapshot, _tempdir) =
+        load_test_table("data-reader-timestamp_ntz").map_err(crate::Error::Kernel)?;
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(col!("tsNtzPartition").is_null()))
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let formatted = pretty_format_batches(&actual)?.to_string();
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
+    let formatted = pretty_format_batches(&actual)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");
     let batch = actual.first().expect("null partition metadata");
@@ -878,7 +918,8 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> Result<()> {
 #[test]
 fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Result<()> {
     let (engine, snapshot, _tempdir) =
-        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")
+            .map_err(crate::Error::Kernel)?;
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all())
@@ -902,23 +943,30 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Resul
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("add struct");
-        projected.push(RecordBatch::try_from_iter([
-            (
-                "stats",
-                add.column_by_name(STATS_PARSED)
-                    .expect("add.stats_parsed")
-                    .clone(),
-            ),
-            (
-                "partitionValues",
-                add.column_by_name(PARTITION_VALUES_PARSED)
-                    .expect("add.partitionValues_parsed")
-                    .clone(),
-            ),
-        ])?);
+        projected.push(
+            RecordBatch::try_from_iter([
+                (
+                    "stats",
+                    add.column_by_name(STATS_PARSED)
+                        .expect("add.stats_parsed")
+                        .clone(),
+                ),
+                (
+                    "partitionValues",
+                    add.column_by_name(PARTITION_VALUES_PARSED)
+                        .expect("add.partitionValues_parsed")
+                        .clone(),
+                ),
+            ])
+            .map_err(crate::KernelError::from)
+            .map_err(crate::Error::Kernel)?,
+        );
     }
 
-    let formatted = pretty_format_batches(&projected)?.to_string();
+    let formatted = pretty_format_batches(&projected)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
     let mut actual_rows: Vec<_> = formatted
         .lines()
         .filter(|line| line.starts_with("| {numRecords:"))
@@ -962,7 +1010,8 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
-    )?;
+    )
+    .map_err(crate::Error::Kernel)?;
     assert_eq!(metadata_row_count(&expected), 4);
 
     let scan = snapshot
@@ -970,20 +1019,25 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata(&scan, &engine)?;
+    let actual = declarative_metadata(&scan, &engine).map_err(crate::Error::Kernel)?;
 
     assert_metadata_eq(&actual, &expected, "checkpoint with later commits")
+        .map_err(crate::Error::Kernel)
 }
 
 #[test]
 fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> Result<()> {
-    let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
+    let (engine, snapshot, _tempdir) =
+        load_test_table("with_checkpoint_no_last_checkpoint").map_err(crate::Error::Kernel)?;
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(col!("int").gt(lit(0i64))))
         .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let formatted = pretty_format_batches(&actual)?.to_string();
+    let actual = declarative_metadata(&scan, engine.as_ref()).map_err(crate::Error::Kernel)?;
+    let formatted = pretty_format_batches(&actual)
+        .map_err(crate::KernelError::from)
+        .map_err(crate::Error::Kernel)?
+        .to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");
     let path = actual[0]
@@ -1023,6 +1077,7 @@ fn declarative_metadata_prunes_across_v1_log_states(
         pruning.0,
         pruning.1,
     )
+    .map_err(crate::Error::Kernel)
 }
 
 #[rstest]
@@ -1038,6 +1093,7 @@ fn declarative_metadata_partition_prunes_v2_checkpoints(
         col!("part_string").eq(lit("part_2000")),
         1,
     )
+    .map_err(crate::Error::Kernel)
 }
 
 fn assert_declarative_metadata_matches_imperative(
@@ -1045,7 +1101,7 @@ fn assert_declarative_metadata_matches_imperative(
     features: FeatureSet,
     predicate: Pred,
     expected_count: usize,
-) -> Result<()> {
+) -> KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
@@ -1053,7 +1109,9 @@ fn assert_declarative_metadata_matches_imperative(
         .build()
         .expect("build partitioned table");
     let engine = SyncEngine::new_with_store(table.store().clone());
-    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .map_err(crate::Error::into_kernel_error)?;
     let predicate = Arc::new(predicate);
 
     let expected = imperative_metadata(
@@ -1063,7 +1121,8 @@ fn assert_declarative_metadata_matches_imperative(
             .with_predicate(predicate.clone())
             .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
-            .build()?,
+            .build()
+            .map_err(crate::Error::into_kernel_error)?,
         &engine,
     )?;
     assert_eq!(
@@ -1077,7 +1136,8 @@ fn assert_declarative_metadata_matches_imperative(
         .with_predicate(predicate)
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
-        .build()?;
+        .build()
+        .map_err(crate::Error::into_kernel_error)?;
     let actual = declarative_metadata(&scan, &engine)?;
 
     assert_metadata_eq(&actual, &expected, table.description())
@@ -1098,6 +1158,9 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::KernelError::Unsupported(_)));
+    assert!(matches!(
+        err,
+        crate::Error::Kernel(crate::KernelError::Unsupported(_))
+    ));
     Ok(())
 }

@@ -46,7 +46,7 @@ use crate::table_features::{
 };
 use crate::transaction::{CreateTable, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
-use crate::Result;
+use crate::KernelResult;
 
 /// A type alias for create-table transactions.
 ///
@@ -106,6 +106,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use delta_kernel::committer::FileSystemCommitter;
 /// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 /// use test_utils::delta_kernel_default_engine::storage::store_from_url;
+/// use delta_kernel::{Error, KernelError};
 ///
 /// # fn main() -> delta_kernel::Result<()> {
 /// let schema = Arc::new(StructType::try_new([
@@ -113,7 +114,9 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///     StructField::nullable("name", DataType::STRING),
 /// ])?);
 ///
-/// let url = url::Url::parse("file:///tmp/my_table")?;
+/// let url = url::Url::parse("file:///tmp/my_table")
+///     .map_err(KernelError::from)
+///     .map_err(Error::Kernel)?;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")
@@ -147,7 +150,7 @@ impl CreateTableTransaction {
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
         correlation_id: Option<Arc<str>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         validate_iceberg_compat_if_needed(
             &effective_table_config,
             &V2_VALIDATOR,

@@ -16,9 +16,10 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
-use crate::error::{KernelError, Result};
+use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
+use crate::KernelResult;
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
 // the names of fields, nullable, and metadata in the struct have been transformed to match those
@@ -28,7 +29,7 @@ use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, Str
 // those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
 // through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
 // buffer since RecordBatch cannot have top-level nulls.
-pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> Result<RecordBatch> {
+pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> KernelResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(KernelError::generic(
             "apply_schema at top-level must be passed a struct schema",
@@ -67,14 +68,14 @@ fn new_field_with_metadata(
 fn transform_struct(
     struct_array: &StructArray,
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     let (input_fields, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
     let result_iter = arrow_cols
         .into_iter()
         .zip(input_fields.iter())
         .zip(target_fields)
-        .map(|((sa_col, input_field), target_field)| -> Result<_> {
+        .map(|((sa_col, input_field), target_field)| -> KernelResult<_> {
             let target_field = target_field.borrow();
             let transformed_col = apply_schema_to_inner(
                 &sa_col,
@@ -127,7 +128,7 @@ fn transform_struct(
 pub(crate) fn apply_schema_to_struct(
     array: &dyn Array,
     kernel_fields: &Schema,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
@@ -144,7 +145,7 @@ fn apply_schema_to_list(
     target_inner_type: &ArrayType,
     nearest_ancestor_struct_field: Option<&StructField>,
     relative_path: &str,
-) -> Result<ListArray> {
+) -> KernelResult<ListArray> {
     let Some(la) = array.as_list_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a list but isn't a ListArray",
@@ -188,7 +189,7 @@ fn apply_schema_to_map(
     kernel_map_type: &MapType,
     ancestor: Option<&StructField>,
     relative_path: &str,
-) -> Result<MapArray> {
+) -> KernelResult<MapArray> {
     let Some(ma) = array.as_map_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a map but isn't a MapArray",
@@ -270,7 +271,7 @@ fn apply_schema_to_map(
 
 // Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
 // actual data types don't match, this will return an error.
-pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> Result<ArrayRef> {
+pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> KernelResult<ArrayRef> {
     apply_schema_to_inner(array, schema, None, "")
 }
 
@@ -362,14 +363,15 @@ fn apply_schema_to_inner(
     schema: &DataType,
     ancestor: Option<&StructField>,
     relative_path: &str,
-) -> Result<ArrayRef> {
+) -> KernelResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         _ => {
-            ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
+            ensure_data_types(schema, array.data_type(), ValidationMode::Full)
+                .map_err(crate::Error::into_kernel_error)?;
             array.clone()
         }
     };

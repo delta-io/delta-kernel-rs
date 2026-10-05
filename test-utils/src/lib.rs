@@ -203,7 +203,8 @@ use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
-    LogPath, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIterator, Snapshot,
+    KernelResult, LogPath, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIterator,
+    Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -449,8 +450,11 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-pub(crate) fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> Result<Path> {
-    let url = try_parse_uri(table_root)?;
+pub(crate) fn resolve_table_path(
+    table_root: impl AsRef<str>,
+    relative: &Path,
+) -> KernelResult<Path> {
+    let url = try_parse_uri(table_root).map_err(delta_kernel::Error::into_kernel_error)?;
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }
 
@@ -667,15 +671,18 @@ pub fn test_table_setup() -> Result<(
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
 )> {
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir()
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+        .map_err(delta_kernel::Error::Kernel)?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))
+        .map_err(delta_kernel::Error::Kernel)?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))
+        .map_err(delta_kernel::Error::Kernel)?;
     let engine = create_default_engine(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -690,15 +697,18 @@ pub fn test_table_setup_mt() -> Result<(
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
 )> {
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir()
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+        .map_err(delta_kernel::Error::Kernel)?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
+        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))
+        .map_err(delta_kernel::Error::Kernel)?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
+        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))
+        .map_err(delta_kernel::Error::Kernel)?;
     let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -1017,10 +1027,10 @@ pub fn schema_with_column_defaults(
         })
         .collect();
     if !column_defaults.is_empty() {
-        return Err(KernelError::generic(format!(
+        return Err(delta_kernel::Error::Kernel(KernelError::generic(format!(
             "column defaults reference unknown top-level columns: {:?}",
             column_defaults.into_keys().collect::<Vec<_>>()
-        )));
+        ))));
     }
 
     Ok(Arc::new(StructType::try_new(augmented_fields)?))
@@ -1187,9 +1197,12 @@ pub async fn insert_data_with<E: TaskExecutor>(
     data_change: bool,
     is_blind_append: bool,
 ) -> Result<CommitResult> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::KernelError::from)
+        .map_err(delta_kernel::Error::Kernel)?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+        .map_err(delta_kernel::Error::Kernel)?;
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())

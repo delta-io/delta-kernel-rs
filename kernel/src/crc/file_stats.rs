@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{EngineData, KernelError, Result, RowVisitor};
+use crate::{EngineData, Error, KernelError, KernelResult, Result, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -56,15 +56,16 @@ impl FileStats {
             ("tableSizeBytes", table_size_bytes),
         ] {
             if value < 0 {
-                return Err(KernelError::generic(format!(
+                return Err(Error::Kernel(KernelError::generic(format!(
                     "CRC has invalid {name}: expected a non-negative value, got {value}"
-                )));
+                ))));
             }
         }
         let file_size_histogram = file_size_histogram
             .map(FileSizeHistogram::check_non_negative)
             .transpose()
-            .map_err(|error| KernelError::generic(error.to_string()))?;
+            .map_err(|error| KernelError::generic(error.to_string()))
+            .map_err(Error::Kernel)?;
         Ok(Self {
             num_files,
             table_size_bytes,
@@ -158,7 +159,7 @@ impl FileStatsDelta {
         add_files_metadata: &[Box<dyn EngineData>],
         remove_files_metadata: &[FilteredEngineData],
         bin_boundaries: Option<&[i64]>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let mut histogram = match bin_boundaries {
             Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
             None => FileSizeHistogram::create_default(),
@@ -171,7 +172,9 @@ impl FileStatsDelta {
         // Visit add files (insert into histogram). Every row is a file being added.
         for batch in add_files_metadata {
             let mut visitor = FileStatsVisitor::new(None, false, &mut histogram);
-            visitor.visit_rows_of(batch.as_ref())?;
+            visitor
+                .visit_rows_of(batch.as_ref())
+                .map_err(Error::into_kernel_error)?;
             gross_add_files += visitor.count;
             gross_add_bytes += visitor.total_size;
         }
@@ -182,7 +185,9 @@ impl FileStatsDelta {
             let sv = filtered_batch.selection_vector();
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
             let mut visitor = FileStatsVisitor::new(sv_opt, true, &mut histogram);
-            visitor.visit_rows_of(filtered_batch.data())?;
+            visitor
+                .visit_rows_of(filtered_batch.data())
+                .map_err(Error::into_kernel_error)?;
             gross_remove_files += visitor.count;
             gross_remove_bytes += visitor.total_size;
         }
@@ -199,7 +204,7 @@ impl FileStatsDelta {
 
 /// Read a file `size` (a non-negative byte count stored as `i64`) as `u64`, erroring on a
 /// negative size (corrupt input).
-pub(crate) fn size_to_u64(size: i64) -> Result<u64> {
+pub(crate) fn size_to_u64(size: i64) -> KernelResult<u64> {
     u64::try_from(size).map_err(|_| {
         KernelError::internal_error(format!("File size must be non-negative, got {size}"))
     })
@@ -257,10 +262,10 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of FileStatsVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             let selected = match self.selection_vector {
@@ -270,11 +275,11 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
             if selected {
                 let size: i64 = getters[0].get(i, "size")?;
                 self.count += 1;
-                self.total_size += size_to_u64(size)?;
+                self.total_size += size_to_u64(size).map_err(Error::Kernel)?;
                 if self.is_remove {
-                    self.histogram.remove(size)?;
+                    self.histogram.remove(size).map_err(Error::Kernel)?;
                 } else {
-                    self.histogram.insert(size)?;
+                    self.histogram.insert(size).map_err(Error::Kernel)?;
                 }
             }
         }
