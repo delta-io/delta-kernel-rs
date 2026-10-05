@@ -10,9 +10,9 @@ use delta_kernel::arrow::array::{
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
+use delta_kernel::EngineData;
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::Result;
-use delta_kernel::{EngineData, KernelResult};
+use delta_kernel::{KernelResult, Result};
 
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
