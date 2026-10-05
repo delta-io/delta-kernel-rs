@@ -8,6 +8,8 @@ use bytes::Bytes;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::{internal_api, IntoStructData, ToSchema};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use percent_encoding::percent_decode_str;
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use url::Url;
@@ -29,6 +31,17 @@ const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
 const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
 const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
+
+/// Percent-decodes `s` into an owned UTF-8 string, erroring on invalid UTF-8. Used to decode a
+/// relativized absolute DV path into the same form as the (unencoded) `'u'`/`'r'` paths that name
+/// the same file.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn percent_decode(s: &str) -> KernelResult<String> {
+    percent_decode_str(s)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|e| KernelError::deletion_vector(format!("DV path is not valid UTF-8: {e}")))
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
@@ -306,6 +319,73 @@ impl DeletionVectorDescriptor {
         }
     }
 
+    /// Computes the normalized `adaptiveMetadata` DV object identity for a descriptor's raw parts:
+    /// `<marker><path>[@<offset>]`.
+    ///
+    /// Unlike [`Self::unique_id_from_parts`] (which keys on the literal `storageType`), this names
+    /// the underlying physical DV blob independent of its storage-type encoding, so an `add` and a
+    /// `remove` that encode the same blob under different storage types still match. The storage
+    /// type is normalized to a marker and the path to a table-relative (or, when it cannot be made
+    /// relative, absolute) form, per the AMT v4 RFC (delta-io/delta#7515):
+    ///
+    /// - `'u'` -> marker `r`, path = the z85-decoded `<prefix>/deletion_vector_<uuid>.bin`.
+    /// - `'r'` -> marker `r`, path = the raw path, unchanged.
+    /// - `'p'` -> relativized against `table_root`: marker `r` + relative path if it resolves under
+    ///   the root, else marker `p` + the original absolute path.
+    /// - `'i'` -> marker `i`, path = `path_or_inline_dv`, unchanged.
+    ///
+    /// `offset` is kept in the identity (a single file may pack multiple DVs at different offsets).
+    // TODO(dv-r): drop `allow(dead_code)` once the deduplicator consumes this.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[allow(dead_code)]
+    pub(crate) fn normalized_unique_id_from_parts(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: &str,
+        offset: Option<i32>,
+        table_root: &Url,
+    ) -> KernelResult<String> {
+        let (marker, path) =
+            Self::normalized_marker_and_path(storage_type, path_or_inline_dv, table_root)?;
+        Ok(Self::unique_id_from_parts(marker, &path, offset))
+    }
+
+    /// Normalizes a descriptor's `(storage_type, path_or_inline_dv)` to the `(marker, path)` pair
+    /// used by [`Self::normalized_unique_id_from_parts`]. See that method for the per-storage-type
+    /// rules.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn normalized_marker_and_path(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: &str,
+        table_root: &Url,
+    ) -> KernelResult<(&'static str, String)> {
+        Ok(match storage_type {
+            DeletionVectorStorageType::Inline => ("i", path_or_inline_dv.to_string()),
+            DeletionVectorStorageType::PersistedRelative => {
+                ("r", Self::decode_uuid_relative_path(path_or_inline_dv)?)
+            }
+            DeletionVectorStorageType::PersistedUnencodedRelative => {
+                ("r", path_or_inline_dv.to_string())
+            }
+            DeletionVectorStorageType::PersistedAbsolute => {
+                let absolute = Url::parse(path_or_inline_dv).map_err(|e| {
+                    KernelError::deletion_vector(format!(
+                        "persisted-absolute DV path must parse as a URL: {e}"
+                    ))
+                })?;
+                // `make_relative` returns `None` for a different scheme/host and a `..`-prefixed
+                // path for a URL outside the root; both mean "not under the table root", so the
+                // DV stays absolute (marker `p`). A path under the root relativizes to marker `r`,
+                // percent-decoded so it matches the decoded `'u'`/`'r'` form naming the same file.
+                match table_root.make_relative(&absolute) {
+                    Some(relative) if !relative.is_empty() && !relative.starts_with("../") => {
+                        ("r", percent_decode(&relative)?)
+                    }
+                    _ => ("p", path_or_inline_dv.to_string()),
+                }
+            }
+        })
+    }
+
     /// Decodes a `PersistedRelative` path to its relative-path form
     /// (`<prefix>/deletion_vector_<uuid>.bin`).
     ///
@@ -327,9 +407,16 @@ impl DeletionVectorDescriptor {
                 self.storage_type
             ))
         );
+        Self::decode_uuid_relative_path(&self.path_or_inline_dv)
+    }
+
+    /// Decodes a `'u'`-encoded `pathOrInlineDv` (optional random prefix + 20-character z85 UUID)
+    /// into its table-relative `<prefix>/deletion_vector_<uuid>.bin` form. Shared by
+    /// [`Self::relative_path`] and the normalized DV identity.
+    fn decode_uuid_relative_path(path_or_inline_dv: &str) -> KernelResult<String> {
         // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing would panic if
         // a non-ASCII byte boundary fell inside the trailing 20-byte window. Mirrors `try_new`.
-        let bytes = self.path_or_inline_dv.as_bytes();
+        let bytes = path_or_inline_dv.as_bytes();
         require!(
             bytes.len() >= 20,
             KernelError::DeletionVector(format!("Invalid length {}, must be >= 20", bytes.len()))
@@ -1135,6 +1222,97 @@ mod tests {
                 variant
             );
         }
+    }
+
+    // `expected` is the normalized `<marker><path>[@<offset>]` identity against table root
+    // `s3://mytable/`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    // `'u'`: z85 UUID (with "ab" prefix) decodes to the `.bin` relative path, marker `r`.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        Some(4),
+        "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin@4"
+    )]
+    // `'r'`: raw relative path used as-is, marker `r`.
+    #[case(
+        DeletionVectorStorageType::PersistedUnencodedRelative,
+        "data/deletion_vector_x.bin",
+        Some(2),
+        "rdata/deletion_vector_x.bin@2"
+    )]
+    // `'p'` under the table root -> relativized, marker `r`.
+    #[case(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://mytable/data/dv.bin",
+        Some(1),
+        "rdata/dv.bin@1"
+    )]
+    // `'p'` under the root with a percent-encoded segment -> decoded on relativize.
+    #[case(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://mytable/a%20b/dv.bin",
+        None,
+        "ra b/dv.bin"
+    )]
+    // `'p'` outside the table root (different host) -> stays absolute, marker `p`.
+    #[case(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://other-bucket/dv.bin",
+        Some(1),
+        "ps3://other-bucket/dv.bin@1"
+    )]
+    // `'i'`: inline payload unchanged, marker `i`, no offset.
+    #[case(DeletionVectorStorageType::Inline, "ABC", None, "iABC")]
+    fn test_normalized_unique_id_from_parts(
+        #[case] storage_type: DeletionVectorStorageType,
+        #[case] path_or_inline_dv: &str,
+        #[case] offset: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let table_root = Url::parse("s3://mytable/").unwrap();
+        let id = DeletionVectorDescriptor::normalized_unique_id_from_parts(
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            &table_root,
+        )
+        .unwrap();
+        assert_eq!(id, expected);
+    }
+
+    /// The core property: a `'u'`, `'r'`, and under-root `'p'` descriptor naming the same physical
+    /// DV blob (same offset) all normalize to the same identity, so an `add`/`remove` match
+    /// regardless of how each encoded the blob.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_normalized_unique_id_matches_across_storage_types() {
+        let table_root = Url::parse("s3://mytable/").unwrap();
+        let relative = "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin";
+        let normalize = |storage_type, path: &str| {
+            DeletionVectorDescriptor::normalized_unique_id_from_parts(
+                storage_type,
+                path,
+                Some(4),
+                &table_root,
+            )
+            .unwrap()
+        };
+        let from_u = normalize(
+            DeletionVectorStorageType::PersistedRelative,
+            "ab^-aqEH.-t@S}K{vb[*k^",
+        );
+        let from_r = normalize(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            relative,
+        );
+        let from_p = normalize(
+            DeletionVectorStorageType::PersistedAbsolute,
+            &format!("s3://mytable/{relative}"),
+        );
+        assert_eq!(from_u, from_r);
+        assert_eq!(from_u, from_p);
     }
 
     #[test]
