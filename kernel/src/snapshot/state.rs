@@ -4,6 +4,7 @@
 //! no borrow from connector memory can outlive one FFI call. Log paths are delivered in batches
 //! to avoid a callback for each file.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -16,7 +17,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{AsUrl, LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{DeltaResult, Snapshot, Version};
@@ -80,7 +81,11 @@ impl SnapshotLogState for Snapshot {
         visitor: &mut dyn FnMut(&[LogPath]) -> DeltaResult<()>,
     ) -> DeltaResult<()> {
         let mut batch = Vec::with_capacity(256);
+        let mut seen = HashSet::new();
         for path in self.log_segment().listed.iter_all_paths() {
+            if !seen.insert(path.location.as_url().as_str()) {
+                continue;
+            }
             batch.push(LogPath::from(path.clone()));
             if batch.len() == 256 {
                 visitor(&batch)?;
