@@ -209,6 +209,13 @@ impl<T> FfiSlice<T> {
     }
 }
 
+/// Returns a borrowed pointer to `value`, or null when it is absent.
+///
+/// The returned pointer does not extend the lifetime of the referenced value.
+pub(crate) fn optional_pointer<T>(value: Option<&T>) -> *const T {
+    value.map_or(std::ptr::null(), std::ptr::from_ref)
+}
+
 /// A non-owned slice of a UTF8 string, intended for arg-passing between kernel and engine. The
 /// slice is only valid until the function it was passed into returns, and should not be copied.
 ///

@@ -51,7 +51,7 @@ pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
 #[allow(unused_imports)]
 #[internal_api]
-pub(crate) use builder::{SnapshotHint, SnapshotHintFreshness};
+pub(crate) use builder::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
@@ -393,6 +393,22 @@ impl Snapshot {
     // ============================================================================
     // Field accessors and state queries
     // ============================================================================
+
+    /// Captures retained snapshot state as an owned hint without engine I/O.
+    ///
+    /// The hint preserves whether this snapshot was built as latest, not whether it is still
+    /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
+    /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotHintError::LogCompaction`] when the retained log segment contains
+    /// compaction files, which snapshot hints do not support.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn to_snapshot_hint(&self) -> Result<SnapshotHint> {
+        SnapshotHint::from_snapshot(self)
+    }
 
     /// Log segment this snapshot uses
     #[internal_api]

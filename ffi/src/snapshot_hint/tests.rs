@@ -1,10 +1,17 @@
 use std::error::Error as _;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::actions::{CheckpointMetadata, Sidecar};
-use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use delta_kernel::actions::{Add, LastManifestCommit};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use delta_kernel::crc::Crc;
+use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::object_store::memory::InMemory;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use delta_kernel::snapshot::Snapshot;
 use delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::TestCatalogCommitter;
 
 use super::*;
 use crate::delta_types::*;
@@ -16,8 +23,9 @@ use crate::ffi_test_utils::{
 use crate::log_path::FfiLogPath;
 use crate::{
     engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
-    snapshot_builder_build, snapshot_builder_with_version, FfiFileStats, KernelI64Slice,
-    KernelStringSlice, OptionalValue, SharedExternEngine,
+    snapshot_builder_build, snapshot_builder_with_max_catalog_version,
+    snapshot_builder_with_version, FfiFileStats, KernelI64Slice, KernelStringSlice, OptionalValue,
+    SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -157,6 +165,7 @@ fn test_snapshot_hint(
         metadata: test_metadata(),
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
+        publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
     }
 }
 
@@ -174,6 +183,662 @@ unsafe fn with_minimal_hint(
         FfiSnapshotHintFreshness::Unverified,
     );
     unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
+}
+
+#[rstest::rstest]
+#[case::latest(FfiSnapshotHintFreshness::Latest, true)]
+#[case::unverified(FfiSnapshotHintFreshness::Unverified, false)]
+fn exported_hint_outlives_snapshot_and_preserves_state(
+    #[case] freshness: FfiSnapshotHintFreshness,
+    #[case] expected_latest: bool,
+    #[values(false, true)] with_crc: bool,
+) {
+    let engine = test_engine();
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        123,
+        456,
+    );
+    let crc = empty_crc();
+    let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
+    if with_crc {
+        hint.crc = &crc;
+    }
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
+    let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(snapshot) };
+    let builder = ok_or_panic(install_through_visitor(
+        &exported,
+        test_builder(&engine),
+        &engine,
+    ));
+    unsafe { free_snapshot_hint(exported) };
+    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    assert_eq!(rebuilt_ref.version(), 0);
+    assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
+    assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
+    assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
+    }
+}
+
+#[test]
+fn exported_hint_can_be_freed_without_building() {
+    let engine = test_engine();
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let hint = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe {
+        free_snapshot(snapshot);
+        free_snapshot_hint(hint);
+        free_engine(engine);
+    }
+}
+
+struct VisitedHint {
+    builder: Option<Handle<ExclusiveSnapshotBuilder>>,
+    result: Option<ExternResult<Handle<ExclusiveSnapshotBuilder>>>,
+    watermark: Option<PublicationWatermark>,
+}
+
+extern "C" fn install_visited_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {
+    let state = unsafe { &mut *context.unwrap().as_ptr().cast::<VisitedHint>() };
+    let hint = unsafe { &*hint };
+    state.watermark = Some(hint.publication_watermark.into());
+    state.result =
+        Some(unsafe { snapshot_builder_with_snapshot_hint(state.builder.take().unwrap(), hint) });
+}
+
+fn install_through_visitor(
+    exported: &Handle<ExclusiveSnapshotHint>,
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    engine: &Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let mut state = VisitedHint {
+        builder: Some(builder),
+        result: None,
+        watermark: None,
+    };
+    assert!(unsafe {
+        ok_or_panic(visit_snapshot_hint(
+            exported.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            install_visited_hint,
+        ))
+    });
+    state.result.take().unwrap()
+}
+
+fn rebuild_through_visitor(
+    snapshot: &Handle<SharedSnapshot>,
+    engine: &Handle<SharedExternEngine>,
+) -> Handle<SharedSnapshot> {
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    let builder = ok_or_panic(install_through_visitor(
+        &exported,
+        test_builder(engine),
+        engine,
+    ));
+    unsafe { free_snapshot_hint(exported) };
+    unsafe { ok_or_panic(snapshot_builder_build(builder)) }
+}
+
+#[rstest::rstest]
+#[case::inferred(FfiPublicationWatermark::InferFromLogPaths, Some(0))]
+#[case::explicit_absence(FfiPublicationWatermark::NoPublishedCommits, None)]
+#[case::explicit_version(FfiPublicationWatermark::PublishedThrough(0), Some(0))]
+fn publication_watermark_distinguishes_inference_from_explicit_state(
+    #[case] watermark: FfiPublicationWatermark,
+    #[case] expected: Option<Version>,
+) {
+    assert_eq!(
+        FfiPublicationWatermark::from(PublicationWatermark::from(watermark)),
+        watermark
+    );
+    let engine = test_engine();
+    let path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        1,
+        1,
+    );
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    hint.publication_watermark = watermark;
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    assert_eq!(
+        unsafe { snapshot.as_ref() }
+            .log_segment()
+            .listed
+            .max_published_version,
+        expected
+    );
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    let mut state = VisitedHint {
+        builder: Some(test_builder(&engine)),
+        result: None,
+        watermark: None,
+    };
+    assert!(unsafe {
+        ok_or_panic(visit_snapshot_hint(
+            exported.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            install_visited_hint,
+        ))
+    });
+    assert_eq!(
+        state.watermark,
+        Some(expected.map_or(
+            PublicationWatermark::NoPublishedCommits,
+            PublicationWatermark::PublishedThrough,
+        ))
+    );
+    unsafe {
+        crate::free_snapshot_builder(ok_or_panic(state.result.take().unwrap()));
+        free_snapshot_hint(exported);
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
+#[rstest::rstest]
+#[case::no_published_commits(None)]
+#[case::watermark_absent_from_paths(Some(8))]
+fn visited_hint_round_trips_explicit_watermark_and_outlives_source(
+    #[case] watermark: Option<Version>,
+    #[values(false, true)] with_crc: bool,
+) {
+    let engine = test_engine();
+    let path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000010.checkpoint.parquet"),
+        123,
+        456,
+    );
+    let mut crc = empty_crc();
+    crc.version = 10;
+    crc.all_files = OptionalValue::Some(FfiAddArray::empty());
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&path),
+        10,
+        FfiSnapshotHintFreshness::Latest,
+    );
+    hint.publication_watermark = watermark.map_or(
+        FfiPublicationWatermark::NoPublishedCommits,
+        FfiPublicationWatermark::PublishedThrough,
+    );
+    if with_crc {
+        hint.crc = &crc;
+    }
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
+    let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(snapshot) };
+    let mut state = VisitedHint {
+        builder: Some(test_builder(&engine)),
+        result: None,
+        watermark: None,
+    };
+    let visited = unsafe {
+        ok_or_panic(visit_snapshot_hint(
+            exported.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            install_visited_hint,
+        ))
+    };
+    assert!(visited);
+    assert_eq!(
+        state.watermark,
+        Some(watermark.map_or(
+            PublicationWatermark::NoPublishedCommits,
+            PublicationWatermark::PublishedThrough,
+        ))
+    );
+    unsafe { free_snapshot_hint(exported) };
+    let builder = ok_or_panic(state.result.take().unwrap());
+    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    assert_eq!(unsafe { rebuilt.as_ref() }.log_segment(), &expected_segment);
+    assert_eq!(
+        unsafe { rebuilt.as_ref() }.crc_at_version(),
+        expected_crc.as_ref()
+    );
+    assert!(unsafe { rebuilt.as_ref() }.is_built_as_latest());
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
+    }
+}
+
+#[test]
+fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
+    let engine = test_engine();
+    let path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        1,
+        1,
+    );
+    let transaction = FfiSetTransaction {
+        app_id: slice("app"),
+        version: 7,
+        last_updated: OptionalValue::Some(29),
+    };
+    let domain = FfiDomainMetadata {
+        domain: slice("example.domain"),
+        configuration: slice("payload"),
+        removed: false,
+    };
+    let crc = FfiCrc {
+        file_stats_state: FfiFileStatsState {
+            kind: FfiFileStatsStateKind::Indeterminate,
+            file_stats: FfiFileStats {
+                num_files: 0,
+                table_size_bytes: 0,
+            },
+            file_size_histogram: std::ptr::null(),
+        },
+        set_transaction_state: FfiSetTransactionState {
+            kind: FfiSetTransactionStateKind::Partial,
+            transactions: FfiSetTransactionArray {
+                ptr: &transaction,
+                len: 1,
+            },
+        },
+        domain_metadata_state: FfiDomainMetadataState {
+            kind: FfiDomainMetadataStateKind::Partial,
+            domain_metadata: FfiDomainMetadataArray {
+                ptr: &domain,
+                len: 1,
+            },
+        },
+        ..empty_crc()
+    };
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    hint.crc = &crc;
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt = rebuild_through_visitor(&snapshot, &engine);
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    assert_eq!(
+        rebuilt_ref.crc_at_version(),
+        unsafe { snapshot.as_ref() }.crc_at_version()
+    );
+    assert!(rebuilt_ref.get_file_stats_if_present().is_none());
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    assert_eq!(
+        rebuilt_ref
+            .get_app_id_version("app", kernel_engine.as_ref())
+            .unwrap(),
+        Some(7)
+    );
+    assert_eq!(
+        rebuilt_ref
+            .get_domain_metadata("example.domain", kernel_engine.as_ref())
+            .unwrap()
+            .as_deref(),
+        Some("payload")
+    );
+    unsafe {
+        free_snapshot(rebuilt);
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
+#[test]
+fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
+    let engine = test_engine();
+    let reader_features = [slice("catalogManaged")];
+    let writer_features = [slice("catalogManaged"), slice("inCommitTimestamp")];
+    let configuration = [FfiStringMapEntry {
+        key: slice("delta.enableInCommitTimestamps"),
+        value: slice("true"),
+    }];
+    let protocol = || FfiProtocol {
+        min_reader_version: 3,
+        min_writer_version: 7,
+        reader_features: OptionalValue::Some(FfiStringArray {
+            ptr: reader_features.as_ptr(),
+            len: reader_features.len(),
+        }),
+        writer_features: OptionalValue::Some(FfiStringArray {
+            ptr: writer_features.as_ptr(),
+            len: writer_features.len(),
+        }),
+    };
+    let metadata = || FfiMetadata {
+        configuration: FfiStringMap {
+            ptr: configuration.as_ptr(),
+            len: configuration.len(),
+        },
+        ..test_metadata()
+    };
+    let paths = [
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            1,
+            1,
+        ),
+        FfiLogPath::new(
+            slice(concat!(
+                "memory:///hinted-table/_delta_log/_staged_commits/",
+                "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+            )),
+            2,
+            1,
+        ),
+    ];
+    let crc = FfiCrc {
+        version: 1,
+        protocol: protocol(),
+        metadata: metadata(),
+        in_commit_timestamp: OptionalValue::Some(2),
+        ..empty_crc()
+    };
+    let mut hint = test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest);
+    hint.protocol = protocol();
+    hint.metadata = metadata();
+    hint.crc = &crc;
+    let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source_ref = unsafe { source.clone_as_arc() };
+    assert_eq!(
+        source_ref.log_segment().listed.max_published_version,
+        Some(0)
+    );
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    let published = source_ref
+        .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
+        .unwrap();
+    assert_eq!(
+        published.log_segment().listed.max_published_version,
+        Some(1)
+    );
+    assert_eq!(
+        published.log_segment().listed.ascending_commit_files,
+        source_ref.log_segment().listed.ascending_commit_files
+    );
+    let published: Handle<SharedSnapshot> = published.into();
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            published.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe {
+        free_snapshot(source);
+        free_snapshot(published);
+    }
+    drop(source_ref);
+    let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
+    let mut state = VisitedHint {
+        builder: Some(builder),
+        result: None,
+        watermark: None,
+    };
+    assert!(unsafe {
+        ok_or_panic(visit_snapshot_hint(
+            exported.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            install_visited_hint,
+        ))
+    });
+    assert_eq!(
+        state.watermark,
+        Some(PublicationWatermark::PublishedThrough(1))
+    );
+    let expected_segment = unsafe { exported.as_ref() }.log_segment_files().clone();
+    unsafe { free_snapshot_hint(exported) };
+    let rebuilt =
+        unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
+    assert_eq!(
+        unsafe { rebuilt.as_ref() }.log_segment().listed,
+        expected_segment
+    );
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest::rstest]
+#[case::manifest(true, false)]
+#[case::back_reference(false, true)]
+#[case::both(true, true)]
+fn typed_visit_rejects_adaptive_crc_without_consuming_native_hint(
+    #[case] with_manifest: bool,
+    #[case] with_back_reference: bool,
+) {
+    let engine = test_engine();
+    let mut crc = empty_crc();
+    crc.file_stats_state.file_stats.num_files = 1;
+    crc.file_stats_state.file_stats.table_size_bytes = 13;
+    let crc = unsafe { crc.try_to_kernel() }.unwrap();
+    let back_reference = with_back_reference
+        .then(|| serde_json::json!({"manifest": "metadata/leaf.parquet", "pos": 0}));
+    let add: Add = serde_json::from_value(serde_json::json!({
+        "path": "part.parquet",
+        "partitionValues": {},
+        "size": 13,
+        "modificationTime": 17,
+        "dataChange": false,
+        "backReference": back_reference,
+    }))
+    .unwrap();
+    assert_eq!(add.has_back_reference(), with_back_reference);
+    let expected_crc = Crc::try_from_parts(
+        0,
+        crc.metadata.clone(),
+        crc.protocol.clone(),
+        crc.file_stats_state().clone(),
+        None,
+        crc.set_transaction_state.clone(),
+        crc.domain_metadata_state.clone(),
+        None,
+        Some(vec![add]),
+        None,
+        None,
+        None,
+        with_manifest.then(|| LastManifestCommit::new(0, 0).unwrap()),
+    )
+    .unwrap();
+    let path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        1,
+        1,
+    );
+    let input = test_snapshot_hint(
+        std::slice::from_ref(&path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    let hint = SnapshotHint::try_new(
+        "memory:///",
+        0,
+        PublicationWatermark::InferFromLogPaths,
+        unsafe { input.log_paths.log_paths() }.unwrap(),
+        expected_crc.protocol.clone(),
+        expected_crc.metadata.clone(),
+        None,
+        Some(Arc::new(expected_crc.clone())),
+        SnapshotHintFreshness::Unverified,
+    )
+    .unwrap();
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    let source = Snapshot::builder_for("memory:///hinted-table/")
+        .with_snapshot_hint(hint)
+        .build(kernel_engine.as_ref())
+        .unwrap();
+    let source: Handle<SharedSnapshot> = source.into();
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            source.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(source) };
+    let mut state = VisitedHint {
+        builder: Some(test_builder(&engine)),
+        result: None,
+        watermark: None,
+    };
+    let result = unsafe {
+        visit_snapshot_hint(
+            exported.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            install_visited_hint,
+        )
+    };
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::UnsupportedError,
+        if with_manifest {
+            "lastManifestCommit"
+        } else {
+            "backReference"
+        },
+    );
+    assert!(state.result.is_none());
+    assert!(state.watermark.is_none());
+    assert_eq!(unsafe { exported.as_ref() }.crc(), Some(&expected_crc));
+    unsafe {
+        crate::free_snapshot_builder(state.builder.take().unwrap());
+        free_snapshot_hint(exported);
+        free_engine(engine);
+    }
+}
+
+#[test]
+fn visited_hint_rejects_incremental_builder_without_consuming_hint() {
+    let engine = test_engine();
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let builder = unsafe {
+        ok_or_panic(get_snapshot_builder_from(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    let hint = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    let result = install_through_visitor(&hint, builder, &engine);
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::UnsupportedError,
+        "snapshot hints cannot be set",
+    );
+    assert_eq!(unsafe { hint.as_ref() }.version(), 0);
+    unsafe {
+        free_snapshot_hint(hint);
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
+#[rstest::rstest]
+#[case::different_table("memory:///other-table/", false)]
+#[case::version_mismatch("memory:///hinted-table/", true)]
+fn exported_hint_build_validates_table_and_version(
+    #[case] table_root: &'static str,
+    #[case] version_mismatch: bool,
+) {
+    let engine = test_engine();
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let hint = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    let builder = unsafe {
+        ok_or_panic(get_snapshot_builder(
+            slice(table_root),
+            engine.shallow_copy(),
+        ))
+    };
+    let builder = if version_mismatch {
+        unsafe { snapshot_builder_with_version(builder, 1) }
+    } else {
+        builder
+    };
+    let builder = ok_or_panic(install_through_visitor(&hint, builder, &engine));
+    unsafe { free_snapshot_hint(hint) };
+    let result = unsafe { snapshot_builder_build(builder) };
+    assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
 }
 
 #[test]
@@ -403,6 +1068,7 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
         metadata: test_metadata(),
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
+        publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
     };
     let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
@@ -494,8 +1160,17 @@ fn aggregate_with_rejects_single_bin_histogram() {
     }
 }
 
-#[test]
-fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
+#[rstest::rstest]
+fn aggregate_with_builds_latest_snapshot_from_rich_crc(
+    #[values(1, 3)] num_files: i64,
+    #[values(
+        None,
+        Some(FfiDeletionVectorStorageType::Inline),
+        Some(FfiDeletionVectorStorageType::PersistedRelative),
+        Some(FfiDeletionVectorStorageType::PersistedAbsolute)
+    )]
+    dv_storage_type: Option<FfiDeletionVectorStorageType>,
+) {
     const PARTITIONED_SCHEMA: &str = concat!(
         r#"{"type":"struct","fields":[{"name":"p","type":"string","nullable":true,"#,
         r#""metadata":{}}]}"#,
@@ -504,18 +1179,25 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let partition_columns = [slice("p")];
+    let format_options = [FfiStringMapEntry {
+        key: slice("compression"),
+        value: slice("snappy"),
+    }];
     let metadata = || FfiMetadata {
         id: slice("table-id"),
-        name: none_string(),
-        description: none_string(),
+        name: OptionalValue::Some(slice("partitioned-table")),
+        description: OptionalValue::Some(slice("rich snapshot hint round trip")),
         format_provider: slice("parquet"),
-        format_options: empty_map(),
+        format_options: FfiStringMap {
+            ptr: format_options.as_ptr(),
+            len: format_options.len(),
+        },
         schema_string: slice(PARTITIONED_SCHEMA),
         partition_columns: FfiStringArray {
             ptr: partition_columns.as_ptr(),
             len: partition_columns.len(),
         },
-        created_time: none_i64(),
+        created_time: OptionalValue::Some(123456789),
         configuration: empty_map(),
     };
     let log_path = FfiLogPath::new(
@@ -523,41 +1205,87 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
         1,
         1,
     );
+    let checkpoint_tags = [FfiStringMapEntry {
+        key: slice("checkpoint-tag"),
+        value: slice("checkpoint-value"),
+    }];
     let last_checkpoint = FfiLastCheckpoint {
         version: 0,
-        size: 1,
+        size: num_files + 2,
         parts: OptionalValue::None,
-        size_in_bytes: none_i64(),
-        num_of_add_files: none_i64(),
+        size_in_bytes: OptionalValue::Some(271),
+        num_of_add_files: OptionalValue::Some(num_files),
         checkpoint_schema: none_string(),
-        checksum: none_string(),
-        tags: none_map(),
+        checksum: OptionalValue::Some(slice("checkpoint-checksum")),
+        tags: OptionalValue::Some(FfiStringMap {
+            ptr: checkpoint_tags.as_ptr(),
+            len: checkpoint_tags.len(),
+        }),
         v2_checkpoint: std::ptr::null(),
     };
     let partition_value = FfiStringMapEntry {
         key: slice("p"),
         value: slice("one"),
     };
-    let tag = FfiNullableStringMapEntry {
-        key: slice("optional"),
-        value: OptionalValue::None,
-    };
-    let add = FfiAdd {
-        path: slice("p=one/part-00000.parquet"),
-        partition_values: FfiStringMap {
-            ptr: &partition_value,
-            len: 1,
+    let tags = [
+        FfiNullableStringMapEntry {
+            key: slice("absent"),
+            value: OptionalValue::None,
         },
-        size: 17,
-        modification_time: 19,
-        data_change: true,
-        stats: OptionalValue::Some(slice(r#"{"numRecords":23}"#)),
-        tags: OptionalValue::Some(FfiNullableStringMap { ptr: &tag, len: 1 }),
-        deletion_vector: std::ptr::null(),
-        base_row_id: OptionalValue::None,
-        default_row_commit_version: OptionalValue::None,
-        clustering_provider: OptionalValue::None,
-    };
+        FfiNullableStringMapEntry {
+            key: slice("present"),
+            value: OptionalValue::Some(slice("value")),
+        },
+    ];
+    let with_deletion_vectors = dv_storage_type.is_some();
+    let paths: Vec<_> = (0..num_files)
+        .map(|index| format!("p=one/part-{index:05}.parquet"))
+        .collect();
+    let deletion_vectors: Vec<_> = (0..num_files)
+        .map(|index| FfiDeletionVectorDescriptor {
+            storage_type: dv_storage_type.unwrap_or(FfiDeletionVectorStorageType::Inline),
+            path_or_inline_dv: slice(match dv_storage_type {
+                Some(FfiDeletionVectorStorageType::PersistedAbsolute) => {
+                    "file:///deletion-vector.bin"
+                }
+                Some(FfiDeletionVectorStorageType::PersistedRelative) => "ab^-aqEH.-t@S}K{vb[*k^",
+                _ => "encoded-dv",
+            }),
+            offset: match dv_storage_type {
+                Some(FfiDeletionVectorStorageType::Inline) | None => OptionalValue::None,
+                _ => OptionalValue::Some(7),
+            },
+            size_in_bytes: 8,
+            cardinality: index + 1,
+        })
+        .collect();
+    let adds: Vec<_> = paths
+        .iter()
+        .zip(&deletion_vectors)
+        .map(|(path, deletion_vector)| FfiAdd {
+            path: crate::kernel_string_slice!(path),
+            partition_values: FfiStringMap {
+                ptr: &partition_value,
+                len: 1,
+            },
+            size: 17,
+            modification_time: 19,
+            data_change: true,
+            stats: OptionalValue::Some(slice(r#"{"numRecords":23}"#)),
+            tags: OptionalValue::Some(FfiNullableStringMap {
+                ptr: tags.as_ptr(),
+                len: tags.len(),
+            }),
+            deletion_vector: if with_deletion_vectors {
+                deletion_vector
+            } else {
+                std::ptr::null()
+            },
+            base_row_id: OptionalValue::Some(29),
+            default_row_commit_version: OptionalValue::Some(31),
+            clustering_provider: OptionalValue::Some(slice("liquid")),
+        })
+        .collect();
     let transaction = FfiSetTransaction {
         app_id: slice("app"),
         version: 7,
@@ -569,8 +1297,8 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
         removed: false,
     };
     let boundaries = [0, 18];
-    let counts = [1, 0];
-    let total_bytes = [17, 0];
+    let counts = [num_files, 0];
+    let total_bytes = [17 * num_files, 0];
     let histogram = FfiFileSizeHistogram {
         sorted_bin_boundaries: KernelI64Slice {
             ptr: boundaries.as_ptr(),
@@ -585,7 +1313,11 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
             len: total_bytes.len(),
         },
     };
-    let deleted_record_counts = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let deleted_record_counts = if with_deletion_vectors {
+        [0, num_files, 0, 0, 0, 0, 0, 0, 0, 0]
+    } else {
+        [num_files, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    };
     let deleted_record_counts_histogram = FfiDeletedRecordCountsHistogram {
         deleted_record_counts: KernelI64Slice {
             ptr: deleted_record_counts.as_ptr(),
@@ -597,8 +1329,8 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
         file_stats_state: FfiFileStatsState {
             kind: FfiFileStatsStateKind::Complete,
             file_stats: FfiFileStats {
-                num_files: 1,
-                table_size_bytes: 17,
+                num_files,
+                table_size_bytes: 17 * num_files,
             },
             file_size_histogram: &histogram,
         },
@@ -618,9 +1350,20 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
             },
         },
         txn_id: OptionalValue::Some(slice("txn-id")),
-        all_files: OptionalValue::Some(FfiAddArray { ptr: &add, len: 1 }),
-        num_deleted_records: OptionalValue::Some(0),
-        num_deletion_vectors: OptionalValue::Some(0),
+        all_files: OptionalValue::Some(FfiAddArray {
+            ptr: adds.as_ptr(),
+            len: adds.len(),
+        }),
+        num_deleted_records: OptionalValue::Some(if with_deletion_vectors {
+            num_files * (num_files + 1) / 2
+        } else {
+            0
+        }),
+        num_deletion_vectors: OptionalValue::Some(if with_deletion_vectors {
+            num_files
+        } else {
+            0
+        }),
         deleted_record_counts_histogram: &deleted_record_counts_histogram,
         ..empty_crc()
     };
@@ -643,7 +1386,7 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
             .get_file_stats_if_present()
             .unwrap()
             .num_files(),
-        1
+        num_files
     );
     let kernel_engine = unsafe { engine.as_ref() }.engine();
     assert_eq!(
@@ -660,7 +1403,14 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc() {
         Some("payload")
     );
 
+    let rebuilt = rebuild_through_visitor(&snapshot, &engine);
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    assert_eq!(rebuilt_ref.log_segment(), snapshot_ref.log_segment());
+    assert_eq!(rebuilt_ref.crc_at_version(), snapshot_ref.crc_at_version());
+    assert!(rebuilt_ref.is_built_as_latest());
+
     unsafe {
+        free_snapshot(rebuilt);
         free_snapshot(snapshot);
         free_engine(engine);
     }
@@ -742,13 +1492,40 @@ fn assert_typed_checkpoint_build(
     );
     assert_eq!(segment.checkpoint_hint(), Some(expected_hint));
 
+    let visited = rebuild_through_visitor(&snapshot, &engine);
+    assert_eq!(
+        unsafe { visited.as_ref() }.log_segment(),
+        snapshot_ref.log_segment()
+    );
+    assert_eq!(
+        unsafe { visited.as_ref() }.crc_at_version(),
+        snapshot_ref.crc_at_version()
+    );
+    let rebuilt_ref = unsafe { visited.as_ref() };
+    assert_eq!(
+        rebuilt_ref.log_segment().checkpoint_hint(),
+        Some(expected_hint)
+    );
+    assert_eq!(
+        rebuilt_ref.get_file_stats_if_present().unwrap().num_files(),
+        0
+    );
     unsafe {
+        free_snapshot(visited);
         free_snapshot(snapshot);
         free_engine(engine);
     }
 }
 
-fn typed_multipart_checkpoint_build() {
+const CHECKPOINT_SCHEMA: &str = concat!(
+    r#"{"type":"struct","fields":[{"name":"add","type":{"type":"struct","fields":["#,
+    r#"{"name":"path","type":"string","nullable":false,"metadata":{"description":"file"}},"#,
+    r#"{"name":"tags","type":{"type":"map","keyType":"string","valueType":"string","#,
+    r#""valueContainsNull":true},"nullable":true,"metadata":{}}]},"#,
+    r#""nullable":true,"metadata":{}}]}"#,
+);
+
+fn typed_multipart_checkpoint_build(with_schema: bool) {
     const PART_1: &str = "00000000000000000000.checkpoint.0000000001.0000000002.parquet";
     const PART_2: &str = "00000000000000000000.checkpoint.0000000002.0000000002.parquet";
     const PART_1_URL: &str = concat!(
@@ -769,13 +1546,23 @@ fn typed_multipart_checkpoint_build() {
         parts: OptionalValue::Some(2),
         size_in_bytes: none_i64(),
         num_of_add_files: none_i64(),
-        checkpoint_schema: none_string(),
+        checkpoint_schema: with_schema.then(|| slice(CHECKPOINT_SCHEMA)).into(),
         checksum: none_string(),
         tags: none_map(),
         v2_checkpoint: std::ptr::null(),
     };
-    let expected =
-        LastCheckpointHint::from_parts(0, 2, Some(2), None, None, None, None, None, None).unwrap();
+    let expected = LastCheckpointHint::from_parts(
+        0,
+        2,
+        Some(2),
+        None,
+        None,
+        with_schema.then(|| CHECKPOINT_SCHEMA.to_string()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert_typed_checkpoint_build(
         &log_paths,
         test_protocol(),
@@ -785,7 +1572,7 @@ fn typed_multipart_checkpoint_build() {
     );
 }
 
-fn typed_v2_checkpoint_build() {
+fn typed_v2_checkpoint_build(with_schema: bool) {
     const CHECKPOINT: &str =
         "00000000000000000000.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet";
     const CHECKPOINT_URL: &str = concat!(
@@ -805,63 +1592,117 @@ fn typed_v2_checkpoint_build() {
             len: features.len(),
         }),
     };
-    let sidecar = FfiSidecar {
-        path: slice("sidecar.parquet"),
-        size_in_bytes: 42,
-        modification_time: 123,
-        tags: none_map(),
+    let tag = [FfiStringMapEntry {
+        key: slice("tag"),
+        value: slice("value"),
+    }];
+    let tags = || {
+        OptionalValue::Some(FfiStringMap {
+            ptr: tag.as_ptr(),
+            len: tag.len(),
+        })
     };
+    let sidecars = [
+        FfiSidecar {
+            path: slice("sidecar-1.parquet"),
+            size_in_bytes: 42,
+            modification_time: 123,
+            tags: none_map(),
+        },
+        FfiSidecar {
+            path: slice("sidecar-2.parquet"),
+            size_in_bytes: 84,
+            modification_time: 456,
+            tags: tags(),
+        },
+    ];
     let checkpoint_metadata = FfiCheckpointMetadata {
         version: 0,
-        tags: none_map(),
+        tags: tags(),
     };
-    let action = FfiCheckpointNonFileAction::CheckpointMetadata(&checkpoint_metadata);
+    let metadata = test_metadata();
+    let transactions = [
+        FfiSetTransaction {
+            app_id: slice("first"),
+            version: 7,
+            last_updated: none_i64(),
+        },
+        FfiSetTransaction {
+            app_id: slice("second"),
+            version: 11,
+            last_updated: OptionalValue::Some(29),
+        },
+    ];
+    let domains = [
+        FfiDomainMetadata {
+            domain: slice("first.domain"),
+            configuration: slice("one"),
+            removed: false,
+        },
+        FfiDomainMetadata {
+            domain: slice("second.domain"),
+            configuration: slice("two"),
+            removed: true,
+        },
+    ];
+    let actions = [
+        FfiCheckpointNonFileAction::CheckpointMetadata(&checkpoint_metadata),
+        FfiCheckpointNonFileAction::Metadata(&metadata),
+        FfiCheckpointNonFileAction::Protocol(&protocol),
+        FfiCheckpointNonFileAction::Transaction(&transactions[0]),
+        FfiCheckpointNonFileAction::Transaction(&transactions[1]),
+        FfiCheckpointNonFileAction::DomainMetadata(&domains[0]),
+        FfiCheckpointNonFileAction::DomainMetadata(&domains[1]),
+    ];
     let v2 = FfiLastCheckpointV2 {
         path: slice(CHECKPOINT),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
         sidecar_files: OptionalValue::Some(FfiSidecarArray {
-            ptr: &sidecar,
-            len: 1,
+            ptr: sidecars.as_ptr(),
+            len: sidecars.len(),
         }),
         non_file_actions: OptionalValue::Some(FfiCheckpointNonFileActionArray {
-            ptr: &action,
-            len: 1,
+            ptr: actions.as_ptr(),
+            len: actions.len(),
         }),
     };
     let checkpoint = FfiLastCheckpoint {
         version: 0,
-        size: 2,
+        size: 9,
         parts: OptionalValue::None,
         size_in_bytes: none_i64(),
         num_of_add_files: none_i64(),
-        checkpoint_schema: none_string(),
+        checkpoint_schema: with_schema.then(|| slice(CHECKPOINT_SCHEMA)).into(),
         checksum: none_string(),
         tags: none_map(),
         v2_checkpoint: &v2,
     };
     let expected = LastCheckpointHint::from_parts(
         0,
-        2,
+        9,
         None,
         None,
         None,
-        None,
+        with_schema.then(|| CHECKPOINT_SCHEMA.to_string()),
         None,
         None,
         Some(LastCheckpointV2::from_parts(
             CHECKPOINT.to_string(),
             None,
             None,
-            Some(vec![Sidecar::new(
-                "sidecar.parquet".to_string(),
-                42,
-                123,
-                None,
-            )]),
-            Some(vec![HintAction::CheckpointMetadata(
-                CheckpointMetadata::new(0, None),
-            )]),
+            Some(
+                sidecars
+                    .iter()
+                    .map(|value| unsafe { value.try_to_kernel() }.unwrap())
+                    .collect(),
+            ),
+            Some(
+                actions
+                    .iter()
+                    .map(|value| unsafe { value.try_to_kernel() }.unwrap())
+                    .collect(),
+            ),
         )),
     )
     .unwrap();
@@ -872,8 +1713,11 @@ fn typed_v2_checkpoint_build() {
 #[rstest::rstest]
 #[case::multipart_v1(typed_multipart_checkpoint_build)]
 #[case::uuid_v2(typed_v2_checkpoint_build)]
-fn aggregate_checkpoint_build_preserves_identity_and_reconstructed_state(#[case] run_case: fn()) {
-    run_case();
+fn aggregate_checkpoint_build_preserves_identity_and_reconstructed_state(
+    #[case] run_case: fn(bool),
+    #[values(false, true)] with_schema: bool,
+) {
+    run_case(with_schema);
 }
 
 #[test]

@@ -13,7 +13,9 @@ use delta_kernel::crc::{
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::{KernelError, KernelResult, Version};
 
-use crate::{FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue};
+use crate::{
+    kernel_string_slice, FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue,
+};
 
 /// Borrowed array of UTF-8 strings.
 pub type FfiStringArray = FfiSlice<KernelStringSlice>;
@@ -374,6 +376,23 @@ pub struct FfiCrc {
 
 pub(crate) fn invalid(message: impl Into<String>) -> KernelError {
     KernelError::generic(message.into())
+}
+
+impl FfiStringMapEntry {
+    /// Creates entries borrowing the keys and values in `values`, without copying their bytes.
+    ///
+    /// # Safety
+    ///
+    /// The map must remain valid and unmodified for every use of the returned entries.
+    pub(crate) unsafe fn from_map_unsafe(values: &HashMap<String, String>) -> Vec<Self> {
+        values
+            .iter()
+            .map(|(key, value)| Self {
+                key: kernel_string_slice!(key),
+                value: kernel_string_slice!(value),
+            })
+            .collect()
+    }
 }
 
 /// Borrows a required native payload, with its lifetime bounded by `owner`.

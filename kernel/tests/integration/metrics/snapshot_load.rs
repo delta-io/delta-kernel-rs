@@ -18,7 +18,7 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 #[cfg(feature = "internal-api")]
@@ -26,6 +26,8 @@ use delta_kernel::LogPath;
 use delta_kernel::{Result, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+#[cfg(feature = "internal-api")]
+use test_utils::table_builder::{FeatureSet, LastCheckpointHintState};
 use test_utils::{
     insert_data, test_table_setup, test_table_setup_mt, CountingReporter, SnapshotCompletionStatus,
 };
@@ -63,6 +65,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> Result<()> {
     let hint = SnapshotHint::try_new(
         table.table_root(),
         snapshot.version(),
+        PublicationWatermark::InferFromLogPaths,
         log_paths,
         snapshot.table_configuration().protocol().clone(),
         snapshot.table_configuration().metadata().clone(),
@@ -87,6 +90,71 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> Result<()> {
         ),
         1
     );
+    Ok(())
+}
+
+#[cfg(feature = "internal-api")]
+#[rstest]
+#[case::commit_only(LogState::with_latest_version(2), false, IncrementalReplay::Disabled)]
+#[case::current_crc(
+    LogState::with_latest_version(2).with_crc_at([2]), false, IncrementalReplay::Disabled
+)]
+#[case::stale_crc(
+    LogState::with_latest_version(2).with_crc_at([1]), false, IncrementalReplay::Disabled
+)]
+#[case::advanced_crc(
+    LogState::with_latest_version(2).with_crc_at([1]), false, IncrementalReplay::Unlimited
+)]
+#[case::v1_checkpoint(
+    LogState::with_latest_version(2).with_checkpoint_at([1]), false, IncrementalReplay::Disabled
+)]
+#[case::v2_checkpoint(
+    LogState::with_latest_version(2).with_checkpoint_at([1]), true, IncrementalReplay::Disabled
+)]
+#[case::missing_checkpoint_hint(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([1])
+        .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
+    false, IncrementalReplay::Disabled
+)]
+fn snapshot_to_hint_round_trip_without_storage_io(
+    #[case] log_state: LogState,
+    #[case] v2_checkpoint: bool,
+    #[case] replay: IncrementalReplay,
+    #[values(false, true)] historical: bool,
+) -> Result<()> {
+    let features = if v2_checkpoint {
+        FeatureSet::new().v2_checkpoint()
+    } else {
+        FeatureSet::new()
+    };
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_data(1, 1)
+        .build()?;
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
+    let mut builder = Snapshot::builder_for(table.table_root()).with_incremental_crc_replay(replay);
+    if historical {
+        builder = builder.at_version(1);
+    }
+    let snapshot = builder.build(&engine)?;
+    reporter.reset();
+
+    let hint = snapshot.to_snapshot_hint()?;
+    let rebuilt = Snapshot::builder_for(table.table_root())
+        .with_snapshot_hint(hint)
+        .build(&engine)?;
+
+    assert_eq!(rebuilt.version(), snapshot.version());
+    assert_eq!(rebuilt.schema(), snapshot.schema());
+    assert_eq!(rebuilt.log_segment().listed, snapshot.log_segment().listed);
+    assert_eq!(rebuilt.crc_at_version(), snapshot.crc_at_version());
+    assert_eq!(rebuilt.is_built_as_latest(), snapshot.is_built_as_latest());
+    assert_eq!(reporter.list_calls.get(), 0);
+    assert_eq!(reporter.storage_read_calls.get(), 0);
+    assert_eq!(reporter.json_read_calls.get(), 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
     Ok(())
 }
 
@@ -124,6 +192,7 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> Result<()> {
     let hint = SnapshotHint::try_new(
         table.table_root(),
         snapshot.version(),
+        PublicationWatermark::InferFromLogPaths,
         log_paths,
         snapshot.table_configuration().protocol().clone(),
         snapshot.table_configuration().metadata().clone(),

@@ -171,7 +171,7 @@ impl Crc {
 
     /// Returns the typed file-stats state. Useful for callers that want to inspect the
     /// variant directly (via `matches!` or the `is_*` predicates).
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub fn file_stats_state(&self) -> &FileStatsState {
         &self.file_stats_state
     }
@@ -184,6 +184,37 @@ impl Crc {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub fn all_files(&self) -> Option<&[Add]> {
         self.all_files.as_deref()
+    }
+
+    /// Returns the transaction identifier, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn txn_id(&self) -> Option<&str> {
+        self.txn_id.as_deref()
+    }
+
+    /// Returns the captured number of deleted records.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn num_deleted_records(&self) -> Option<i64> {
+        self.num_deleted_records_opt
+    }
+
+    /// Returns the captured number of deletion vectors.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn num_deletion_vectors(&self) -> Option<i64> {
+        self.num_deletion_vectors_opt
+    }
+
+    /// Returns the captured deleted-record-count histogram.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn deleted_record_counts_histogram(&self) -> Option<&DeletedRecordCountsHistogram> {
+        self.deleted_record_counts_histogram_opt.as_ref()
+    }
+
+    /// Returns the latest manifest commit captured by this CRC, if present.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn last_manifest_commit(&self) -> Option<&LastManifestCommit> {
+        self.last_manifest_commit_opt.as_ref()
     }
 }
 
@@ -622,6 +653,12 @@ impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
 }
 
 impl DeletedRecordCountsHistogram {
+    /// Returns the file counts in the deletion-count bins.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn deleted_record_counts(&self) -> &[i64] {
+        &self.deleted_record_counts
+    }
+
     /// Reconstructs a deleted-record-count histogram from its serialized bins.
     ///
     /// Returns an error unless exactly ten non-negative bin counts are provided.

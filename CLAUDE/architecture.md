@@ -39,7 +39,11 @@ Under `internal-api`, `.with_snapshot_hint(hint)` constructs a snapshot without 
 `_delta_log` root before grouping and checkpoint selection. Kernel preserves the supplied locations;
 the connector must canonicalize them into the same URL form as the table root. Build checks the
 hint's table membership against the builder's root and validates structural consistency. The
-connector owns protocol/metadata provenance and freshness.
+connector owns protocol/metadata provenance, publication state, and freshness.
+`Snapshot::to_snapshot_hint()` exports retained state without engine I/O, preserving build-time
+freshness, the selected log files and publication watermark, a matching checkpoint hint, and any CRC
+resolved at the snapshot version. It rejects log compactions. The FFI exports hints as independently
+owned handles and visits their retained state through a borrowed typed representation.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**
