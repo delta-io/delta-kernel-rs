@@ -241,11 +241,13 @@ class InlineReviewTest(unittest.TestCase):
 
     def test_automatic_reviews_default_to_inline(self) -> None:
         workflow = (Path(__file__).parents[2] / "workflows" / "ai-review.yml").read_text()
-        automatic_trigger = workflow.partition("            pull_request_target)")[2].partition(
-            "            workflow_dispatch)"
-        )[0]
+        automatic_trigger = workflow.partition("            pull_request_target)")[
+            2
+        ].partition("            workflow_dispatch)")[0]
 
+        self.assertIn("opened:*|reopened:*|ready_for_review:*", automatic_trigger)
         self.assertIn("mode=inline", automatic_trigger)
+        self.assertNotIn("labeled:ai-review)", automatic_trigger)
 
     def test_diff_positions_tracks_both_sides_and_context(self) -> None:
         self.assertEqual(
