@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::snapshot::SnapshotScanState;
+use delta_kernel::snapshot::{SnapshotLogState, SnapshotScanState};
 use delta_kernel::{KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
@@ -13,7 +13,11 @@ use super::{
 };
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::{SharedExternEngine, SharedMetadata, SharedProtocol, SharedSchema, SharedSnapshot};
+use crate::log_path::FfiLogPath;
+use crate::{
+    kernel_string_slice, SharedExternEngine, SharedMetadata, SharedProtocol, SharedSchema,
+    SharedSnapshot,
+};
 
 /// Native identity retained after the connector takes ownership of snapshot components.
 #[derive(Debug)]
@@ -27,6 +31,63 @@ pub struct SnapshotCore {
 /// Shared handle for a snapshot whose component state is held by its connector.
 #[handle_descriptor(target=SnapshotCore, mutable=false, sized=true)]
 pub struct SharedSnapshotCore;
+
+/// Visits one borrowed batch of log paths. The callback must copy any data it retains.
+pub type VisitSnapshotLogPathsFn = unsafe extern "C" fn(
+    context: *mut std::ffi::c_void,
+    paths: *const FfiLogPath,
+    count: usize,
+) -> bool;
+
+/// Whether this snapshot was confirmed latest when it was built.
+///
+/// # Safety
+///
+/// `snapshot` must be a valid borrowed handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_is_built_as_latest(snapshot: Handle<SharedSnapshot>) -> bool {
+    unsafe { snapshot.as_ref() }.is_built_as_latest()
+}
+
+/// Copy the exact log paths retained by a snapshot through bounded borrowed batches.
+///
+/// Returns false when the connector callback rejects a batch. Neither the callback nor the
+/// connector may retain the array or any nested string pointer after the callback returns.
+///
+/// # Safety
+///
+/// `snapshot` must be a valid borrowed handle and `visitor` must be safe to call for this method's
+/// duration.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_visit_log_paths(
+    snapshot: Handle<SharedSnapshot>,
+    context: *mut std::ffi::c_void,
+    visitor: VisitSnapshotLogPathsFn,
+) -> bool {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let mut accepted = true;
+    let result = snapshot.visit_log_paths(&mut |batch| {
+        let paths: Vec<FfiLogPath> = batch
+            .iter()
+            .map(|path| {
+                let file = path.file_meta();
+                let location = file.location.as_str();
+                FfiLogPath::new(
+                    kernel_string_slice!(location),
+                    file.last_modified,
+                    file.size,
+                )
+            })
+            .collect();
+        accepted = unsafe { visitor(context, paths.as_ptr(), paths.len()) };
+        if accepted {
+            Ok(())
+        } else {
+            Err(invalid("host rejected snapshot log-path batch"))
+        }
+    });
+    accepted && result.is_ok()
+}
 
 unsafe fn core_from_snapshot(
     snapshot: &Handle<SharedSnapshot>,
