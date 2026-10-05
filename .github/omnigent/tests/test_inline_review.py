@@ -196,16 +196,43 @@ class InlineReviewTest(unittest.TestCase):
                 with self.subTest(agent=agent_dir.name, policy=policy.partition("\n")[0]):
                     self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
                     self.assertIn(policy, _configured_prompt(agent_dir / "config.yaml"))
+        description_policy = review_policy.PR_DESCRIPTION_POLICY.strip()
+        self.assertIn(description_policy, reviewer_contract)
+        self.assertIn("Always dispatch\n`docs-reviewer`", reviewer_contract)
+        self.assertIn("only the PR title and description", reviewer_contract)
+        for agent in (
+            "docs-reviewer",
+        ):
+            with self.subTest(agent=agent, policy="PR description accuracy"):
+                agent_dir = reviewer_dir / "agents" / agent
+                self.assertIn(description_policy, (agent_dir / "REVIEW.md").read_text())
+                self.assertIn(description_policy, _configured_prompt(agent_dir / "config.yaml"))
+        for agent in (
+            "architecture-reviewer",
+            "delta-protocol-reviewer",
+            "disprove-reviewer",
+            "maintainer-claude-reviewer",
+            "maintainer-codex-reviewer",
+            "test-coverage-reviewer",
+        ):
+            with self.subTest(agent=agent, policy="single description reviewer"):
+                agent_dir = reviewer_dir / "agents" / agent
+                self.assertNotIn(description_policy, (agent_dir / "REVIEW.md").read_text())
         self.assertIn(
-            "from review_policy import KNOWN_ISSUE_POLICY, PREVIOUS_REVIEW_POLICY",
+            "PR_DESCRIPTION_POLICY,",
             workflow,
         )
         self.assertIn("known_issue_policy = KNOWN_ISSUE_POLICY.strip()", workflow)
         self.assertIn(
             "previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()", workflow
         )
+        self.assertIn(
+            "pr_description_policy = PR_DESCRIPTION_POLICY.strip()", workflow
+        )
         self.assertEqual(workflow.count("{known_issue_policy}"), 1)
         self.assertEqual(workflow.count("{previous_review_policy}"), 1)
+        self.assertEqual(workflow.count("{pr_description_policy}"), 1)
+        self.assertIn("[PR description truncated at 4096 characters", workflow)
         self.assertIn("format_review_history", workflow)
         self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
         self.assertIn("OMNIGENT_BOT_APP_ID: ${{ vars.OMNIGENT_BOT_APP_ID }}", workflow)

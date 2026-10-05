@@ -3,7 +3,7 @@ use url::Url;
 use super::scan_file::CdfScanFileType;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, selection_treemap_to_bools};
 use crate::table_changes::scan_file::CdfScanFile;
-use crate::{DeltaResult, Engine, KernelError};
+use crate::{Engine, KernelError, Result};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
@@ -37,7 +37,7 @@ pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
-) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+) -> Result<impl Iterator<Item = ResolvedCdfScanFile>> {
     let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
     let rm_dv = scan_file
         .remove_dv

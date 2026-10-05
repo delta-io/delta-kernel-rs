@@ -11,7 +11,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Ti
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -45,7 +45,7 @@ pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
     arrow_type: &ArrowDataType,
     mode: ValidationMode,
-) -> DeltaResult<DataTypeCompat> {
+) -> Result<DataTypeCompat> {
     let check = EnsureDataTypes { mode };
     check.ensure_data_types(kernel_type, arrow_type)
 }
@@ -73,7 +73,7 @@ impl EnsureDataTypes {
         &self,
         kernel_type: &DataType,
         arrow_type: &ArrowDataType,
-    ) -> DeltaResult<DataTypeCompat> {
+    ) -> Result<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
@@ -221,7 +221,7 @@ impl EnsureDataTypes {
         desc: &str,
         kernel_field_is_nullable: bool,
         arrow_field_is_nullable: bool,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         if matches!(self.mode, ValidationMode::Full)
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
@@ -237,7 +237,7 @@ impl EnsureDataTypes {
         &self,
         kernel_field: &StructField,
         arrow_field: &ArrowField,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         self.ensure_nullability(
             &kernel_field.name,
             kernel_field.nullable,
@@ -262,7 +262,7 @@ impl EnsureDataTypes {
 fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
+) -> Result<DataTypeCompat> {
     use ArrowDataType::*;
 
     match (source_type, &target_type) {
@@ -326,23 +326,22 @@ impl PartialEq<String> for MetadataValue {
     }
 }
 
-// allow for comparing our metadata maps to arrow ones. We can't implement PartialEq because both
-// are HashMaps which aren't defined in this crate
-fn metadata_eq(
+// Compare kernel metadata with Arrow's version-specific metadata container.
+fn metadata_eq<'a>(
     kernel_metadata: &HashMap<String, MetadataValue>,
-    arrow_metadata: &HashMap<String, String>,
+    arrow_metadata: impl IntoIterator<Item = (&'a String, &'a String)>,
 ) -> bool {
-    let kernel_len = kernel_metadata.len();
-    if kernel_len != arrow_metadata.len() {
-        return false;
+    let mut arrow_len = 0;
+    for (key, value) in arrow_metadata {
+        arrow_len += 1;
+        if !kernel_metadata
+            .get(key)
+            .is_some_and(|kernel_value| *kernel_value == *value)
+        {
+            return false;
+        }
     }
-    if kernel_len == 0 {
-        // lens are equal, so two empty maps are equal
-        return true;
-    }
-    kernel_metadata
-        .iter()
-        .all(|(key, value)| arrow_metadata.get(key).is_some_and(|v| *value == *v))
+    kernel_metadata.len() == arrow_len
 }
 
 #[cfg(test)]

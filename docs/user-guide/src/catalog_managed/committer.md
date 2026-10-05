@@ -18,9 +18,9 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse>;
+    ) -> Result<CommitResponse>;
 
     fn is_catalog_committer(&self) -> bool;
 
@@ -28,7 +28,7 @@ pub trait Committer: Send {
         &self,
         engine: &dyn Engine,
         publish_metadata: PublishMetadata,
-    ) -> DeltaResult<()>;
+    ) -> Result<()>;
 }
 ```
 
@@ -57,8 +57,8 @@ Kernel constructs `CommitMetadata` and passes it to your `commit()` method. Key 
 
 ```rust,ignore
 impl CommitMetadata {
-    pub fn published_commit_path(&self) -> DeltaResult<Url>;
-    pub fn staged_commit_path(&self) -> DeltaResult<Url>;  // unique UUID each call
+    pub fn published_commit_path(&self) -> Result<Url>;
+    pub fn staged_commit_path(&self) -> Result<Url>;  // unique UUID each call
     pub fn version(&self) -> Version;
     pub fn commit_type(&self) -> CommitType;
     pub fn in_commit_timestamp(&self) -> i64;
@@ -118,9 +118,9 @@ Write the actions to a staged commit file in `_staged_commits/`:
 fn commit(
     &self,
     engine: &dyn Engine,
-    actions: DeltaResultIterator<'_, FilteredEngineData>,
+    actions: ResultIterator<'_, FilteredEngineData>,
     commit_metadata: CommitMetadata,
-) -> DeltaResult<CommitResponse> {
+) -> Result<CommitResponse> {
     // Write actions to _staged_commits/<version>.<uuid>.json. `actions` is
     // already a Box<dyn Iterator<...>>, so pass it directly (do not re-box).
     let staged_path = commit_metadata.staged_commit_path()?;
@@ -197,7 +197,7 @@ fn publish(
     &self,
     engine: &dyn Engine,
     publish_metadata: PublishMetadata,
-) -> DeltaResult<()> {
+) -> Result<()> {
     for catalog_commit in publish_metadata.commits_to_publish() {
         let src = catalog_commit.location();            // _staged_commits/<v>.<uuid>.json
         let dest = catalog_commit.published_location(); // _delta_log/<v>.json
@@ -217,7 +217,7 @@ catalog's client type and fill in the ratification logic:
 
 ```rust,ignore
 // Imports elided for brevity. In addition to the ones below, you will need
-// Committer, CommitMetadata, CommitResponse, PublishMetadata, DeltaResult,
+// Committer, CommitMetadata, CommitResponse, PublishMetadata, Result,
 // FilteredEngineData, and Engine from delta_kernel.
 use delta_kernel::{KernelError, FileMeta};
 
@@ -230,9 +230,9 @@ impl Committer for MyCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
+    ) -> Result<CommitResponse> {
         // 1. Stage: write actions to _staged_commits/
         let staged_path = commit_metadata.staged_commit_path()?;
         let written_size = engine
@@ -268,7 +268,7 @@ impl Committer for MyCatalogCommitter {
         &self,
         engine: &dyn Engine,
         publish_metadata: PublishMetadata,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         for catalog_commit in publish_metadata.commits_to_publish() {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();

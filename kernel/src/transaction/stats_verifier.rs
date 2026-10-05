@@ -13,7 +13,7 @@ use crate::error::KernelError;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::DeltaResult;
+use crate::Result;
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -37,7 +37,7 @@ impl StatsColumnVerifier {
     /// For each required column, extracts all three stat columns (nullCount, minValues,
     /// maxValues) in a single `visit_rows` call per batch.
     #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
         if self.required_columns.is_empty() {
             return Ok(());
         }
@@ -56,7 +56,7 @@ impl StatsColumnVerifier {
         add_files: &[Box<dyn crate::EngineData>],
         column: &ColumnName,
         data_type: &DataType,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let column_names = vec![
             column_name!("path"),
             column_name!("stats", NUM_RECORDS),
@@ -175,7 +175,7 @@ static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 });
 
 /// Select the predefined static type array for a given column data type.
-fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> {
+fn column_types_for(dt: &DataType) -> Result<&'static ColumnNamesAndTypes> {
     match dt {
         &DataType::BOOLEAN => Ok(&COL_TYPES_BOOL),
         &DataType::BYTE => Ok(&COL_TYPES_BYTE),
@@ -214,7 +214,7 @@ fn is_stat_present<'b>(
     getter: &'b dyn GetData<'b>,
     row_idx: usize,
     data_type: &DataType,
-) -> DeltaResult<bool> {
+) -> Result<bool> {
     let field_name = "stat";
     match data_type {
         &DataType::BOOLEAN => Ok(getter.get_bool(row_idx, field_name)?.is_some()),
@@ -269,7 +269,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
         self.types.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 5,
             KernelError::internal_error(format!(
@@ -305,7 +305,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
+pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
@@ -337,7 +337,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
         NUM_RECORDS_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 2,
             KernelError::internal_error(format!(

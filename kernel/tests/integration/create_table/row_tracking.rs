@@ -17,7 +17,7 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use rstest::rstest;
 use test_utils::{
     get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
@@ -72,7 +72,7 @@ async fn test_create_table_with_row_tracking(
     )]
     activation: (&str, &str),
     #[values(false, true)] with_data: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (key, value) = activation;
     let expect_property_enabled = key == "delta.enableRowTracking";
 
@@ -191,7 +191,7 @@ async fn test_create_table_with_row_tracking(
 /// Verifies that CTAS with multiple files assigns non-overlapping baseRowId ranges and
 /// computes the correct cumulative high water mark.
 #[tokio::test]
-async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult<()> {
+async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
@@ -264,7 +264,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
 /// DomainMetadata, which should appear exactly once in the protocol. Both domain metadata
 /// entries (delta.rowTracking and delta.clustering) should be present in the commit.
 #[test]
-fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
+fn test_create_table_with_row_tracking_and_clustering() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
@@ -315,7 +315,7 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
 /// Both features generate domain metadata and the add files need row tracking columns.
 /// Verifies that both domain metadata entries survive when add files are also written.
 #[tokio::test]
-async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaResult<()> {
+async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
@@ -401,7 +401,7 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
 /// subsequent data append. The initial create writes `rowIdHighWaterMark = -1`; the append must
 /// read that and assign `baseRowId = 0` to the first file.
 #[tokio::test]
-async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> DeltaResult<()> {
+async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create empty table with feature signal only (no enablement property)

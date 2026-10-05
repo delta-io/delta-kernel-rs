@@ -7,7 +7,7 @@ use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
-use crate::error::DeltaResult;
+use crate::error::Result;
 use crate::expressions::{
     col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
     ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
@@ -228,8 +228,8 @@ impl DataSkippingFilter {
     /// unlike the scan path which reads pre-parsed `stats_parsed` from transformed batches.
     ///
     /// The stats schema is derived from the predicate's column references via
-    /// [`TableConfiguration::build_expected_stats_schemas`], matching the write side exactly;
-    /// references outside the table's stats columns fold to NULL (keeping the file). Partition
+    /// [`TableConfiguration::stats_schema_builder`], matching the write side exactly.
+    /// References outside the table's stats columns fold to NULL (keeping the file). Partition
     /// values are parsed from the raw `add.partitionValues` string map with
     /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
     ///
@@ -262,10 +262,11 @@ impl DataSkippingFilter {
             .cloned()
             .collect();
         let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
-        let physical_stats_schema = table_configuration
-            .build_expected_stats_schemas(None, Some(&predicate_refs))
-            .ok()?
-            .physical;
+        let physical_stats_read_schema = table_configuration
+            .stats_schema_builder()
+            .with_requested_physical_columns(Some(&predicate_refs))
+            .build()
+            .ok()?;
         let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
 
         // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
@@ -273,7 +274,7 @@ impl DataSkippingFilter {
         // `add.path IS NOT NULL` (raw batches keep the nested layout).
         let stats_expr = Arc::new(Expr::parse_json(
             col!("add.stats"),
-            physical_stats_schema.clone(),
+            physical_stats_read_schema.clone(),
         ));
         let partition_expr = Arc::new(Expr::map_to_struct(
             col!("add.partitionValues"),
@@ -283,7 +284,7 @@ impl DataSkippingFilter {
         Self::new(
             engine,
             Some(physical_predicate),
-            Some(&physical_stats_schema),
+            Some(&physical_stats_read_schema),
             stats_expr,
             partition_schema.as_ref(),
             partition_expr,
@@ -306,7 +307,7 @@ impl DataSkippingFilter {
     /// `DataSkippingPredicateCreator`. Partition values are similarly wrapped under
     /// `partitionValues_parsed` when present.
     fn build_unified_schema_and_expr(
-        physical_stats_schema: Option<&SchemaRef>,
+        physical_stats_read_schema: Option<&SchemaRef>,
         stats_expr: ExpressionRef,
         physical_partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
@@ -336,7 +337,7 @@ impl DataSkippingFilter {
         // true for Add rows and false for Remove/non-file rows) so that predicates can guard
         // against filtering Remove rows: partition predicates and opaque-predicate rewrites are
         // wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
-        let unified_schema = match (physical_stats_schema, physical_partition_schema) {
+        let unified_schema = match (physical_stats_read_schema, physical_partition_schema) {
             (Some(stats), Some(ps)) => schema_ref! {
                 nullable "stats_parsed": (stats.as_ref().clone()),
                 nullable "partitionValues_parsed": (ps.as_ref().clone()),
@@ -354,7 +355,7 @@ impl DataSkippingFilter {
         };
 
         let unified_expr = match (
-            physical_stats_schema.is_some(),
+            physical_stats_read_schema.is_some(),
             physical_partition_schema.is_some(),
         ) {
             (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr, is_add_expr])),
@@ -368,7 +369,7 @@ impl DataSkippingFilter {
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
-    pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+    pub(crate) fn apply(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
         let start_time = Instant::now();
         let batch_len = batch.len();
 
@@ -522,10 +523,11 @@ fn is_partition_value_reference(expr: &Expr) -> bool {
 }
 
 /// A column carries min/max stats iff it's a primitive whose type supports min/max skipping.
-/// Boolean / Binary, Array, Map, and Variant leaves carry nullCount only. Struct columns
-/// have no per-struct stats; only their primitive leaves do, recursively.
-/// Must match `MinMaxStatsTransform`'s acceptance rule. Otherwise the predicate creator
-/// emits refs to min/max fields the stats schema doesn't contain.
+/// Boolean / Binary, Array, and Map leaves carry nullCount only. Struct columns have no per-struct
+/// stats; only their primitive leaves do, recursively.
+/// Must accept no more than `MinMaxStatsTransform` does. Otherwise the predicate creator emits refs
+/// to min/max fields the stats schema doesn't contain. Accepting less is fine: a caller may admit
+/// a VARIANT leaf to the schema, but no kernel predicate can reference it.
 fn has_min_max_stats(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
 }
@@ -538,8 +540,8 @@ struct DataSkippingColumns<'a> {
     physical_partition_columns: &'a HashSet<ColumnName>,
     /// Physical leaf paths whose stats are present in `stats_parsed` (honors
     /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
-    /// columns). Must match the column set used to build `physical_stats_schema`; otherwise the
-    /// rewritten predicate references columns absent from the unified schema.
+    /// columns). Must match the column set used to build `physical_stats_read_schema`; otherwise
+    /// the rewritten predicate references columns absent from the unified schema.
     physical_stats_columns: &'a HashSet<ColumnName>,
 }
 

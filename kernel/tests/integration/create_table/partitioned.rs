@@ -7,7 +7,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use rstest::rstest;
 use test_utils::test_table_setup;
 
@@ -16,7 +16,7 @@ use super::{partition_test_schema, simple_schema};
 #[rstest]
 #[case::exact_casing("date")]
 #[case::mismatched_casing("DATE")]
-fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResult<()> {
+fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> Result<()> {
     let schema = partition_test_schema()?;
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -50,7 +50,7 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResu
 #[case::non_partitioned(false)]
 fn test_create_table_with_materialize_partition_columns_partitioned_and_not(
     #[case] partitioned: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = if partitioned {
         partition_test_schema()?

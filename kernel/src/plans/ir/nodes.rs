@@ -16,7 +16,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
-use crate::{DeltaResult, FileMeta, KernelError};
+use crate::{FileMeta, KernelError, Result};
 
 // ============================================================================
 // Operator: enumerates every operator kind
@@ -35,6 +35,9 @@ pub enum Operator {
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
     Values(Values),
+    /// Reads all rows of a relation previously retained by the engine. The [`RelationRef`]'s
+    /// schema is this node's output schema.
+    RelationSource(RelationRef),
 
     // === Unary operators (1 input) ===========================================
     Project(Project),
@@ -47,6 +50,44 @@ pub enum Operator {
 
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
+}
+
+/// An engine-assigned identifier for a relation retained by a
+/// [`PlanExecutor`](crate::plans::PlanExecutor). Opaque to kernel.
+pub type RelationId = String;
+
+/// An opaque handle to a relation retained by the engine's
+/// [`PlanExecutor`](crate::plans::PlanExecutor). See [`Operator::RelationSource`].
+///
+/// Kernel holds only the [`RelationId`] and the relation's output schema; the rows themselves are
+/// never materialized into kernel. An executor can produce a handle when it retains a relation,
+/// including through
+/// [`ScopedPlanExecutor::execute_and_retain`](crate::plans::ScopedPlanExecutor::execute_and_retain).
+/// An [`Operator::RelationSource`] node reads it while the executor retains it.
+#[derive(Debug, Clone)]
+pub struct RelationRef {
+    id: RelationId,
+    schema: SchemaRef,
+}
+
+impl RelationRef {
+    /// A handle to the relation identified by `id`, producing rows matching `schema`.
+    pub fn new(id: impl Into<RelationId>, schema: impl Into<SchemaRef>) -> Self {
+        Self {
+            id: id.into(),
+            schema: schema.into(),
+        }
+    }
+
+    /// The engine-assigned identifier of the retained relation.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The output schema of the retained relation.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
 }
 
 /// One file to scan plus literal values broadcast to every row read from that file.
@@ -278,7 +319,7 @@ where
 {
     type Error = KernelError;
 
-    fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
+    fn try_from(Values { schema, rows }: Values) -> Result<Self> {
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| {
@@ -448,7 +489,7 @@ impl DynamicScan {
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
         dv_column: Option<ColumnName>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
             .into_iter()
@@ -479,7 +520,7 @@ impl DynamicScan {
     /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
     /// or has invalid nullability; or when a file-constant column is absent from either schema, is
     /// a metadata column, or has different input and output types or nullability.
-    pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
+    pub fn validate_input(&self, input_schema: &SchemaRef) -> Result<()> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
 
@@ -532,7 +573,7 @@ impl DynamicScan {
         schema: &SchemaRef,
         column: &ColumnName,
         expected_type: &DataType,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let fields = schema.fields_of_path(column)?;
         let Some((field, ancestors)) = fields.split_last() else {
             return Err(KernelError::internal_error(
@@ -557,7 +598,7 @@ impl DynamicScan {
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
         file_constant_columns: &[String],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         for name in file_constant_columns {
             let Some(input_field) = input_schema.field(name) else {
                 return Err(KernelError::generic(format!(
@@ -866,7 +907,7 @@ impl Agg {
         &self,
         input_schema: &StructType,
         alias: Option<String>,
-    ) -> DeltaResult<StructField> {
+    ) -> Result<StructField> {
         // `output_data_type: None` preserves the input field's type and metadata; `Some` overrides
         // the type and strips metadata (new column).
         let resolve = |value: &ColumnName, output_data_type: Option<DataType>, nullable: bool| {
@@ -983,7 +1024,7 @@ impl AggregateBuilder {
     ///
     /// Returns an error if a group key or an aggregate's operand column is not found in the input
     /// schema, or if two output columns would share a name (case-insensitive).
-    pub fn build(self) -> DeltaResult<Aggregate> {
+    pub fn build(self) -> Result<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {
             fields.push(self.input_schema.field_at(key)?.clone());
@@ -1005,7 +1046,7 @@ impl AggregateBuilder {
 impl TryFrom<AggregateBuilder> for Aggregate {
     type Error = KernelError;
 
-    fn try_from(builder: AggregateBuilder) -> DeltaResult<Self> {
+    fn try_from(builder: AggregateBuilder) -> Result<Self> {
         builder.build()
     }
 }

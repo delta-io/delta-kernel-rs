@@ -190,9 +190,9 @@ The `delta-kernel-unity-catalog` crate has the following feature flags:
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `arrow` | Yes | Enables Arrow integration (currently delegates to `arrow-59`) |
-| `arrow-59` | Via `arrow` | Uses Arrow version 59 |
-| `arrow-58` | No | Uses Arrow version 58 |
+| `arrow` | Yes | Enables Arrow integration (currently delegates to `arrow-60`) |
+| `arrow-60` | Via `arrow` | Uses Arrow version 60 |
+| `arrow-59` | No | Uses Arrow version 59 |
 
 The `unity-catalog-delta-client-api` crate has one feature flag:
 

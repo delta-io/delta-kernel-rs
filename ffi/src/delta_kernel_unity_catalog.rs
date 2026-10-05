@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::{DeltaResult, DeltaResultIterator};
+use delta_kernel::{Result, ResultIterator};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -172,9 +172,9 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: DeltaResultIterator<'_, delta_kernel::FilteredEngineData>,
+        actions: ResultIterator<'_, delta_kernel::FilteredEngineData>,
         commit_metadata: delta_kernel::committer::CommitMetadata,
-    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+    ) -> Result<delta_kernel::committer::CommitResponse> {
         // We hold this guard until the end of the function so we stay in the tokio context until
         // we're done
         let _guard = engine
@@ -203,7 +203,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
         &self,
         engine: &dyn delta_kernel::Engine,
         publish_metadata: delta_kernel::committer::PublishMetadata,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         self.inner.publish(engine, publish_metadata)
     }
 }
@@ -234,7 +234,7 @@ fn get_uc_committer_impl(
     catalog: KernelStringSlice,
     schema: KernelStringSlice,
     table_name: KernelStringSlice,
-) -> DeltaResult<Handle<MutableCommitter>> {
+) -> Result<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
     let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
     let catalog_str: String = unsafe { TryFromStringSlice::try_from_slice(&catalog) }?;

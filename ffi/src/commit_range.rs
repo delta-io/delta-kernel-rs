@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, KernelError, LogPath, Version};
+use delta_kernel::{KernelError, LogPath, Result, ResultIteratorStatic, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn commit_range_builder_build(
 
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
-) -> DeltaResult<Handle<SharedCommitRange>> {
+) -> Result<Handle<SharedCommitRange>> {
     let engine = builder.engine.engine();
     let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version);
     if let Some(end_version) = builder.end_version {
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn commit_action_get_actions(
 fn commit_action_get_actions_impl(
     commit_action: &CommitAction,
     engine: Arc<dyn ExternEngine>,
-) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
+) -> Result<Handle<ExclusiveFileReadResultIterator>> {
     let actions = commit_action.get_actions(engine.engine().as_ref())?;
     Ok(FileReadResultIterator::into_handle(actions, engine))
 }
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     commit_action.drop_handle();
 }
 
-type CommitActionIter = DeltaResultIteratorStatic<CommitAction>;
+type CommitActionIter = ResultIteratorStatic<CommitAction>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -346,7 +346,7 @@ pub struct FfiCommitActionsIterator {
 }
 
 impl FfiCommitActionsIterator {
-    fn lock_iter(&self) -> DeltaResult<MutexGuard<'_, CommitActionIter>> {
+    fn lock_iter(&self) -> Result<MutexGuard<'_, CommitActionIter>> {
         self.data
             .lock()
             .map_err(|_| KernelError::generic("poisoned commit-actions iterator mutex"))
@@ -420,7 +420,7 @@ fn commit_range_commits_impl(
     engine: Arc<dyn ExternEngine>,
     start_snapshot: Option<SnapshotRef>,
     actions: Vec<KernelDeltaAction>,
-) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
+) -> Result<Handle<SharedCommitActionsIterator>> {
     let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
@@ -460,7 +460,7 @@ fn commit_range_commits_next_impl(
         engine_context: NullableCvoid,
         commit_action: Handle<SharedCommitAction>,
     ),
-) -> DeltaResult<bool> {
+) -> Result<bool> {
     let mut iter = data.lock_iter()?;
     match iter.next().transpose()? {
         Some(commit_action) => {
@@ -757,9 +757,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_build_errors_on_missing_start_version(
+    async fn test_commit_range_builder_build_errors_on_empty_range(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Table has only v=0, but we request a range starting at v=5.
+        // Table has only v=0, but we request a range starting at v=5: nothing at all is
+        // available in [5, latest], so this is EmptyLog, not MissingVersion -- the latter is
+        // reserved for a range where something was found, just not starting at v=5.
         let (engine, table_root) = setup_engine_with_commits(0).await;
 
         let builder = unsafe {
@@ -772,9 +774,45 @@ mod tests {
         let result = unsafe { commit_range_builder_build(builder) };
         assert_extern_result_error_with_message(
             result,
-            FFIKernelError::MissingVersionError,
-            Some("Table version 5 is missing or unavailable for this log operation."),
+            FFIKernelError::EmptyLogError,
+            Some("No table version found."),
         );
+
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_commit_range_builder_build_errors_on_start_version_not_found(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Non-contiguous log: v0 and v2 exist, v1 does not. Requesting start=1 is unavailable but a
+        // later version remains -> StartVersionNotFound, distinct from EmptyLog.
+        let table_root = "memory:///snf_table/";
+        let storage = Arc::new(InMemory::new());
+        for version in [0u64, 2] {
+            add_commit(
+                table_root,
+                storage.as_ref(),
+                version,
+                actions_to_string(vec![TestAction::Metadata]),
+            )
+            .await
+            .unwrap();
+        }
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            allocate_err,
+        );
+
+        let builder = unsafe {
+            ok_or_panic(commit_range_builder_for(
+                kernel_string_slice!(table_root),
+                1,
+                engine.shallow_copy(),
+            ))
+        };
+        let result = unsafe { commit_range_builder_build(builder) };
+        assert_extern_result_error_with_message(result, FFIKernelError::StartVersionNotFound, None);
 
         unsafe { free_engine(engine) }
         Ok(())

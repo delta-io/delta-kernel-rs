@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
-use delta_kernel::{DeltaResult, Engine, KernelError, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, KernelError, Result, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> DeltaResult<()> {
+async fn try_main() -> Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
@@ -139,7 +139,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> DeltaResult<SnapshotRef> {
+) -> Result<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
@@ -157,7 +157,7 @@ async fn create_or_get_base_snapshot(
 }
 
 /// Parse a schema string into a SchemaRef.
-fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
+fn parse_schema(schema_str: &str) -> Result<SchemaRef> {
     let fields = schema_str
         .split(',')
         .map(|field| {
@@ -185,13 +185,13 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
 
             Ok(StructField::nullable(name, data_type))
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Arc::new(StructType::try_new(fields)?))
 }
 
 /// Create a new Delta table with the given schema using the official CreateTable API.
-async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) -> DeltaResult<()> {
+async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) -> Result<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
@@ -203,7 +203,7 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
 }
 
 /// Create sample data based on the schema.
-fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowEngineData> {
+fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> Result<ArrowEngineData> {
     let fields = schema.fields();
     let mut columns = Vec::new();
 
@@ -256,7 +256,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
 async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 

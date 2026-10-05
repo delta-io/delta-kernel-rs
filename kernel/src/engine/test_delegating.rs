@@ -11,6 +11,7 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// rest.
 pub(crate) struct DelegatingEngine {
     inner: Arc<dyn Engine>,
+    evaluation: Option<Arc<dyn EvaluationHandler>>,
     storage: Option<Arc<dyn StorageHandler>>,
     json: Option<Arc<dyn JsonHandler>>,
     parquet: Option<Arc<dyn ParquetHandler>>,
@@ -32,12 +33,18 @@ impl DelegatingEngine {
     pub(crate) fn new(inner: Arc<dyn Engine>) -> Self {
         Self {
             inner,
+            evaluation: None,
             storage: None,
             json: None,
             parquet: None,
             #[cfg(feature = "declarative-plans")]
             plan_executor: PlanExecutorOverride::Inherit,
         }
+    }
+
+    pub(crate) fn with_evaluation_handler(mut self, handler: Arc<dyn EvaluationHandler>) -> Self {
+        self.evaluation = Some(handler);
+        self
     }
 
     pub(crate) fn with_storage_handler(mut self, handler: Arc<dyn StorageHandler>) -> Self {
@@ -70,7 +77,9 @@ impl DelegatingEngine {
 
 impl Engine for DelegatingEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
+        self.evaluation
+            .clone()
+            .unwrap_or_else(|| self.inner.evaluation_handler())
     }
 
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {

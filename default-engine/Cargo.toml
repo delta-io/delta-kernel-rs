@@ -35,9 +35,9 @@ uuid = { version = "1.18.0", features = ["v4"] }
 
 [features]
 default = ["arrow", "rustls"]
-arrow = ["arrow-59"]
+arrow = ["arrow-60"]
+arrow-60 = ["delta_kernel/arrow-60"]
 arrow-59 = ["delta_kernel/arrow-59"]
-arrow-58 = ["delta_kernel/arrow-58"]
 native-tls = ["reqwest/native-tls"]
 rustls = ["reqwest/rustls"]
 
@@ -50,4 +50,5 @@ test_utils = { path = "../test-utils", default-features = false }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 wiremock = "0.6"
-hdfs-native-object-store = { version = "0.16.0" }
+hdfs_native_object_store_13 = { package = "hdfs-native-object-store", version = "0.16.0" }
+hdfs_native_object_store_14 = { package = "hdfs-native-object-store", version = "0.17.0" }

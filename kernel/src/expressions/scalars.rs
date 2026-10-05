@@ -17,7 +17,7 @@ use crate::schema::{
     MapType, PrimitiveType, StructField, StructType,
 };
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
 ///
@@ -35,7 +35,7 @@ pub struct DecimalData {
 }
 
 impl DecimalData {
-    pub fn try_new(bits: impl Into<i128>, ty: DecimalType) -> DeltaResult<Self> {
+    pub fn try_new(bits: impl Into<i128>, ty: DecimalType) -> Result<Self> {
         let bits = bits.into();
         require!(
             ty.precision() >= get_decimal_precision(bits),
@@ -83,7 +83,7 @@ impl ArrayData {
     pub fn try_new(
         tpe: ArrayType,
         elements: impl IntoIterator<Item = impl Into<Scalar>>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let elements = elements
             .into_iter()
             .map(|v| {
@@ -160,7 +160,7 @@ impl MapData {
     pub fn try_new(
         data_type: MapType,
         values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let key_type = data_type.key_type();
         let val_type = data_type.value_type();
         let pairs = values
@@ -254,7 +254,7 @@ impl StructData {
     /// - if the number of fields and values do not match
     /// - if the data types of the values do not match the data types of the fields
     /// - if a null value is assigned to a non-nullable field
-    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> DeltaResult<Self> {
+    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> Result<Self> {
         require!(
             fields.len() == values.len(),
             KernelError::invalid_struct_data(format!(
@@ -417,7 +417,7 @@ impl Scalar {
     }
 
     /// Constructs a Decimal value from raw parts
-    pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
+    pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> Result<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
         let dval = DecimalData::try_new(bits, dtype)?;
         Ok(Self::Decimal(dval))
@@ -430,7 +430,7 @@ impl Scalar {
     }
 
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
-    pub(crate) fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
+    pub(crate) fn timestamp_from_millis(millis: i64) -> Result<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(KernelError::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
@@ -698,7 +698,7 @@ macro_rules! impl_try_from_scalar {
             impl TryFrom<Scalar> for $rust_type {
                 type Error = KernelError;
 
-                fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+                fn try_from(scalar: Scalar) -> Result<Self> {
                     match scalar {
                         Scalar::$variant(value) => Ok(value.into()),
                         other => Err(other.conversion_error(stringify!($rust_type))),
@@ -730,7 +730,7 @@ impl_try_from_scalar!(
 impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for Option<T> {
     type Error = KernelError;
 
-    fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+    fn try_from(scalar: Scalar) -> Result<Self> {
         match scalar {
             Scalar::Null(data_type) => {
                 let expected = T::to_data_type();
@@ -752,7 +752,7 @@ where
 {
     type Error = KernelError;
 
-    fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+    fn try_from(scalar: Scalar) -> Result<Self> {
         let array: ArrayData = scalar.try_into()?;
         let element = T::get_struct_field("element");
         let expected = ArrayType::new(element.data_type().clone(), element.is_nullable());
@@ -792,7 +792,7 @@ where
 {
     type Error = KernelError;
 
-    fn try_from(scalar: Scalar) -> DeltaResult<Self> {
+    fn try_from(scalar: Scalar) -> Result<Self> {
         let map: MapData = scalar.try_into()?;
         let value = V::get_struct_field("value");
         let expected = MapType::new(

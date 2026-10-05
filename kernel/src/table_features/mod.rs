@@ -33,7 +33,7 @@ use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 mod column_mapping;
 #[cfg(feature = "geo-type-in-dev")]
@@ -254,7 +254,7 @@ pub(crate) enum KernelSupport {
     /// Custom logic to determine support based on operation type and table properties.
     /// For example: Column Mapping may support Scan but not CDF, or CDF writes may only
     /// be supported when AppendOnly is true.
-    Custom(fn(&Protocol, &TableProperties, Operation) -> DeltaResult<()>),
+    Custom(fn(&Protocol, &TableProperties, Operation) -> Result<()>),
 }
 
 /// Types of requirements for feature dependencies
@@ -269,7 +269,7 @@ pub(crate) enum FeatureRequirement {
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
     /// Custom validation logic run against the protocol and table properties.
-    Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
+    Custom(fn(&Protocol, &TableProperties) -> Result<()>),
 }
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
@@ -909,7 +909,7 @@ pub(crate) fn auto_enable_property_driven_features(
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
 /// [`KernelError::InvalidProtocol`]; above the maximum yields [`KernelError::Unsupported`].
-pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
+pub(crate) fn check_reader_version_range(protocol: &Protocol) -> Result<()> {
     require!(
         protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
         KernelError::InvalidProtocol(format!(
@@ -930,7 +930,7 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()>
 ///
 /// Unlike `TableConfiguration::ensure_operation_supported`, this does not require a
 /// `Metadata` action or any table properties.
-pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
+pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> Result<()> {
     check_reader_version_range(protocol)?;
 
     for feature in extract_enabled_reader_features(protocol) {

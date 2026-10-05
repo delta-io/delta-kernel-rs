@@ -25,9 +25,9 @@ cargo build -p delta_kernel_ffi --release
 |---------|---------|-------------|
 | `default-engine-rustls` | yes | Includes the `DefaultEngine` with rustls TLS |
 | `default-engine-native-tls` | no | Includes the `DefaultEngine` with native TLS (instead of rustls) |
-| `arrow` | yes | Enables Arrow integration (selects `arrow-59` by default) |
-| `arrow-59` | yes | Pin to Arrow 59 explicitly (enabled transitively by `arrow`) |
-| `arrow-58` | no | Pin to Arrow 58 explicitly |
+| `arrow` | yes | Enables Arrow integration (selects `arrow-60` by default) |
+| `arrow-60` | yes | Pin to Arrow 60 explicitly (enabled transitively by `arrow`) |
+| `arrow-59` | no | Pin to Arrow 59 explicitly |
 | `delta-kernel-unity-catalog` | no | Enables Unity Catalog integration for catalog-managed tables |
 | `tracing` | no | Enables tracing/logging support via `tracing-subscriber` |
 
@@ -187,6 +187,7 @@ borrowed slices. Don't retain the callback's state.
 | `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
+| `visit_field_geometry` / `visit_field_geography` | Build a geospatial `StructField` (geometry with a CRS; geography with a CRS and edge-interpolation algorithm) |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
 | `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
 

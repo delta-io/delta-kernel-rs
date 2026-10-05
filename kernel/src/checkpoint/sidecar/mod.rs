@@ -10,8 +10,8 @@ use crate::expressions::{
 };
 use crate::schema::{try_schema, DataType, SchemaRef, StructField};
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
-    PredicateEvaluator,
+    Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
+    PredicateEvaluator, Result,
 };
 
 /// Field names of the `sidecar` action struct.
@@ -35,7 +35,7 @@ pub(super) fn create_sidecar_action_batch(
     engine: &dyn Engine,
     checkpoint_data_schema: &SchemaRef,
     sidecar_metas: &[(String, FileMeta)],
-) -> DeltaResult<Option<Box<dyn EngineData>>> {
+) -> Result<Option<Box<dyn EngineData>>> {
     if sidecar_metas.is_empty() {
         return Ok(None);
     }
@@ -64,7 +64,7 @@ pub(super) fn create_sidecar_action_batch(
     // Build one row per sidecar.
     let rows: Vec<Vec<Scalar>> = sidecar_metas
         .iter()
-        .map(|(filename, meta)| -> DeltaResult<Vec<Scalar>> {
+        .map(|(filename, meta)| -> Result<Vec<Scalar>> {
             let size_in_bytes = meta.size_as_i64()?;
 
             // Sidecar struct values, ordered to match `sidecar_fields`.
@@ -107,7 +107,7 @@ struct NonNullRowsPicker {
 }
 
 impl NonNullRowsPicker {
-    fn pick(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn pick(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>> {
         let transformed = self.transform.evaluate(batch)?;
         filter_by_predicate(self.null_row_filter.as_ref(), transformed)
     }
@@ -157,7 +157,7 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
         let add_field = checkpoint_data_schema.field(ADD_NAME).ok_or_else(|| {
             KernelError::checkpoint_write(format!(
@@ -245,7 +245,7 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
-    ) -> DeltaResult<Arc<Mutex<Self>>> {
+    ) -> Result<Arc<Mutex<Self>>> {
         Self::new(
             checkpoint_data_iterator,
             eval_handler,
@@ -266,7 +266,7 @@ impl SidecarSplitter {
     /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
     /// parts. Buffers the non-file-action part; returns the next non-empty file-action batch.
     /// Returns `None` and sets `exhausted` when the inner iterator is exhausted.
-    fn next_file_actions_batch(&mut self) -> Option<DeltaResult<Box<dyn EngineData>>> {
+    fn next_file_actions_batch(&mut self) -> Option<Result<Box<dyn EngineData>>> {
         loop {
             let result = self.checkpoint_data_iter.next().or_else(|| {
                 self.exhausted = true;
@@ -304,7 +304,7 @@ impl SingleSidecarDataIterator {
     pub(super) fn new(
         splitter: Arc<Mutex<SidecarSplitter>>,
         max_file_actions_hint: usize,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         if max_file_actions_hint == 0 {
             return Err(KernelError::checkpoint_write(
                 "max_file_actions_hint must be greater than 0",
@@ -319,7 +319,7 @@ impl SingleSidecarDataIterator {
 }
 
 impl Iterator for SingleSidecarDataIterator {
-    type Item = DeltaResult<Box<dyn EngineData>>;
+    type Item = Result<Box<dyn EngineData>>;
 
     /// Yields the next file-action batch for current sidecar.
     ///

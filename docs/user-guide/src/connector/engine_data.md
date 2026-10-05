@@ -15,7 +15,7 @@ pub trait EngineData: AsAny {
         &self,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
-    ) -> DeltaResult<()>;
+    ) -> Result<()>;
 
     fn len(&self) -> usize;
 
@@ -27,12 +27,12 @@ pub trait EngineData: AsAny {
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+    ) -> Result<Box<dyn EngineData>>;
 
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+    ) -> Result<Box<dyn EngineData>>;
 
     fn has_field(&self, name: &ColumnName) -> bool;
 }
@@ -97,7 +97,7 @@ the appropriate typed method based on the column's data type:
 | `get_map(row, name)` | `MapItem` | MAP (string keys and values) |
 | `get_struct_list(row, name)` | `StructList` | ARRAY (of structs) |
 
-All methods return `DeltaResult<Option<T>>`. A `None` value means the field is null. By
+All methods return `Result<Option<T>>`. A `None` value means the field is null. By
 default, every method returns an "unexpected type" error, so you only need to implement the
 one that matches your column's type.
 
@@ -133,7 +133,7 @@ let path: Option<String> = getters[0].get_opt(row, "path")?;
 let size: Option<i64> = getters[1].get_opt(row, "size")?;
 ```
 
-`TypedGetData` also provides a `get` method that returns `DeltaResult<T>` (without
+`TypedGetData` also provides a `get` method that returns `Result<T>` (without
 `Option`), returning an error if the value is null.
 
 ### RowVisitor
@@ -161,7 +161,7 @@ fn append_columns(
     &self,
     schema: SchemaRef,
     columns: Vec<ArrayData>,
-) -> DeltaResult<Box<dyn EngineData>>;
+) -> Result<Box<dyn EngineData>>;
 ```
 
 - **`schema`** describes only the new columns being appended (not the full result schema)
@@ -179,7 +179,7 @@ deletion vector support and other row-level filtering.
 fn apply_selection_vector(
     self: Box<Self>,
     selection_vector: Vec<bool>,
-) -> DeltaResult<Box<dyn EngineData>>;
+) -> Result<Box<dyn EngineData>>;
 ```
 
 - Within the selection_vector, `true` means keep the row, `false` means remove it
@@ -240,9 +240,9 @@ pub trait FilteredRowVisitor {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> DeltaResult<()>;
+    ) -> Result<()>;
 
-    fn visit_rows_of(&mut self, data: &FilteredEngineData) -> DeltaResult<()>;
+    fn visit_rows_of(&mut self, data: &FilteredEngineData) -> Result<()>;
 }
 ```
 
@@ -279,7 +279,7 @@ If you use the default engine, you work with `ArrowEngineData` and never need to
 `EngineData` yourself. `EngineDataArrowExt` provides `try_into_record_batch()` for
 converting the opaque `EngineData` trait object back to an Arrow `RecordBatch` for your
 connector's use. This trait is implemented for both `Box<dyn EngineData>` and
-`DeltaResult<Box<dyn EngineData>>`, so you can call it directly on scan results.
+`Result<Box<dyn EngineData>>`, so you can call it directly on scan results.
 
 ## What's next
 

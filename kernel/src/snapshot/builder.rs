@@ -21,7 +21,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri, PhantomType};
-use crate::{DeltaResult, Engine, KernelError, Snapshot, Version};
+use crate::{Engine, KernelError, Result, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
 #[doc(hidden)]
@@ -100,7 +100,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
-    ) -> DeltaResult<Self> {
+    ) -> Result<Self> {
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
         require!(
             !parsed_paths
@@ -137,7 +137,7 @@ impl SnapshotHint {
 /// ```no_run
 /// # use delta_kernel::{Snapshot, Engine};
 /// # use url::Url;
-/// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
+/// # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
 /// let table_root = Url::parse("file:///path/to/table")?;
 ///
 /// // Build a snapshot
@@ -227,7 +227,7 @@ impl IncrementalReplay {
         self,
         crc_version: Version,
         target_version: Version,
-    ) -> DeltaResult<bool> {
+    ) -> Result<bool> {
         let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
             KernelError::internal_error(format!(
                 "CRC version {crc_version} is ahead of target version {target_version}"
@@ -435,7 +435,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -554,7 +554,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
         snapshot_hint: Box<SnapshotHint>,
-    ) -> DeltaResult<SnapshotRef> {
+    ) -> Result<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
             incremental_replay.is_disabled(),
@@ -691,7 +691,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_snapshot_hint_paths(
         log_segment_files: &LogSegmentFiles,
         log_root: &url::Url,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let log_root = log_root.as_str();
         if let Some(path) = log_segment_files
             .iter_all_paths()
@@ -713,7 +713,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
     }
 
@@ -722,7 +722,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
-    ) -> DeltaResult<()> {
+    ) -> Result<()> {
         let is_catalog_managed = snapshot.table_configuration().is_catalog_managed();
 
         require!(
@@ -885,7 +885,7 @@ mod tests {
         );
     }
 
-    fn assert_log_segment_hint_error(result: DeltaResult<SnapshotRef>, expected_source: &str) {
+    fn assert_log_segment_hint_error(result: Result<SnapshotRef>, expected_source: &str) {
         let error = result.unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -908,7 +908,7 @@ mod tests {
         ]
         .into_iter()
         .map(|path| LogPath::try_new(create_log_path(path).location))
-        .collect::<DeltaResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
             1,

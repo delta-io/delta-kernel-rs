@@ -9,9 +9,9 @@ use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
 };
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{transform_output_type, DeltaResult, KernelError};
+use crate::{KernelError, Result};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
 /// These characters have special meaning in Parquet schema syntax.
@@ -29,7 +29,7 @@ pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
     cdf_enabled: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
@@ -48,7 +48,7 @@ pub(crate) fn validate_schema(
 fn validate_cdf_column_names(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
-) -> DeltaResult<()> {
+) -> Result<()> {
     for field in schema.fields() {
         let name = field.name();
         require!(
@@ -103,7 +103,7 @@ impl SchemaValidator {
         }
     }
 
-    fn into_result(self) -> DeltaResult<()> {
+    fn into_result(self) -> Result<()> {
         if self.errors.is_empty() {
             Ok(())
         } else {
@@ -167,7 +167,7 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
 /// When column mapping is enabled, only rejects newlines since physical names are
 /// auto-generated but newlines in column names break metadata serialization regardless
 /// of column mapping mode.
-fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
+fn validate_field_name(name: &str, cm_enabled: bool) -> Result<()> {
     if name.is_empty() {
         return Err(KernelError::generic("Column name cannot be empty"));
     }

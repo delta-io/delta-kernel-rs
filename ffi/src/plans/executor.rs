@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
-use delta_kernel::{DeltaResult, KernelError, Operation, ParquetFooter, PlanExecutor, PlanResult};
+use delta_kernel::{KernelError, Operation, ParquetFooter, PlanExecutor, PlanResult, Result};
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
 
@@ -57,7 +57,7 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+    fn execute_op(&self, op: Operation) -> Result<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
@@ -90,7 +90,7 @@ impl PlanExecutor for FfiPlanExecutor {
 /// Consumes the embedded [`ExclusiveRustBytes`](crate::ExclusiveRustBytes) handle carrying
 /// the proto-serialized schema, returning an error if the bytes are not a valid schema proto
 /// message.
-fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
+fn decode_parquet_footer(footer: CParquetFooter) -> Result<ParquetFooter> {
     let CParquetFooter { schema_proto } = footer;
     // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
     let bytes = *unsafe { schema_proto.into_inner() };
@@ -144,7 +144,7 @@ mod tests {
 
     /// Executes a dummy plan operation against a `PlanExecutor` whose callback returns the given
     /// `expected_plan_result`, returning the raw result of `execute_op`.
-    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> DeltaResult<PlanResult> {
+    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> Result<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };

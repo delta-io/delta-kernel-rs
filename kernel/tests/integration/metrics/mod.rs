@@ -21,7 +21,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{Result, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::table_builder::{LogState, TestTableBuilder};
@@ -72,7 +72,7 @@ async fn insert_rows(
     >,
     start_val: i32,
     count: i32,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let mut snap = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     for val in start_val..(start_val + count) {
         let committed = insert_data(snap, engine, vec![Arc::new(Int32Array::from(vec![val]))])
@@ -95,7 +95,7 @@ async fn insert_rows(
 ///
 /// Uses `TokioMultiThreadExecutor` because `snapshot.checkpoint()` issues nested
 /// `block_on` calls; `TokioBackgroundExecutor` deadlocks in that pattern.
-async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
+async fn setup_table_with_v1_checkpoint() -> Result<(
     Url,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
     tempfile::TempDir,

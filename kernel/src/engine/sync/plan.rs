@@ -10,8 +10,9 @@
 // TODO: The `IoOperation` paths will eventually be used to replace SyncEngine with an
 // PlanBasedEngine (backed by this PlanExecutor)
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use itertools::Itertools;
@@ -35,13 +36,14 @@ use crate::engine::arrow_utils::coerce_columns_to_schema;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FileType, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
+    DynamicScan, FileType, Operator, Project, RelationId, RelationRef, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
-use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
+use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EvaluationHandler as _, FileMeta, KernelError,
+    EvaluationHandler as _, FileMeta, KernelError, Result, ResultIteratorStatic,
     StorageHandler as _,
 };
 
@@ -57,8 +59,25 @@ use crate::{
 ///
 /// [`JsonHandler`]: crate::JsonHandler
 /// [`ParquetHandler`]: crate::ParquetHandler
+#[derive(Clone)]
 pub(crate) struct SyncPlanExecutor {
-    storage: SyncStorageHandler,
+    storage: Arc<SyncStorageHandler>,
+}
+
+// Distinct IDs prevent a ref from another scope from resolving to a local relation.
+static NEXT_RELATION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A synchronous plan executor that retains relations for its own lifetime.
+pub(crate) struct ScopedSyncPlanExecutor {
+    executor: SyncPlanExecutor,
+    relation_store: RelationStore,
+}
+
+type RelationStore = Mutex<HashMap<RelationId, RetainedRelation>>;
+
+struct RetainedRelation {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
 }
 
 impl SyncPlanExecutor {
@@ -66,8 +85,32 @@ impl SyncPlanExecutor {
     ///
     /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
     pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
-        let storage = SyncStorageHandler::new(store);
-        Self { storage }
+        Self {
+            storage: Arc::new(SyncStorageHandler::new(store)),
+        }
+    }
+
+    /// Returns an executor that retains relations until the scope is dropped.
+    pub(crate) fn get_scoped(&self) -> ScopedSyncPlanExecutor {
+        ScopedSyncPlanExecutor {
+            executor: self.clone(),
+            relation_store: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ScopedSyncPlanExecutor {
+    /// Retains an Arrow batch and returns a ref readable until this scope is dropped.
+    /// `name` is prepended to the relation ID as a debug hint.
+    ///
+    /// Returns an error if `schema` differs from the batch schema or retention fails.
+    pub(crate) fn create_ref(
+        &self,
+        name: &str,
+        schema: SchemaRef,
+        record_batch: RecordBatch,
+    ) -> Result<RelationRef> {
+        retain_relation(&self.relation_store, name, schema, vec![record_batch])
     }
 }
 
@@ -79,29 +122,52 @@ impl Default for SyncPlanExecutor {
 }
 
 impl PlanExecutor for SyncPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
-        match op {
-            Operation::IoOperation(io_op) => self.execute_io(io_op),
-            Operation::QueryPlan(query) => self.execute_query(query),
-        }
+    fn execute_op(&self, op: Operation) -> Result<PlanResult> {
+        self.execute_op_with_relation_store(op, None)
+    }
+}
+
+impl PlanExecutor for ScopedSyncPlanExecutor {
+    fn execute_op(&self, op: Operation) -> Result<PlanResult> {
+        self.executor
+            .execute_op_with_relation_store(op, Some(&self.relation_store))
+    }
+}
+
+impl ScopedPlanExecutor for ScopedSyncPlanExecutor {
+    fn execute_and_retain(&self, name: &str, plan: Plan) -> Result<RelationRef> {
+        let schema = Arc::clone(&plan.schema);
+        let batches = self.executor.eval_plan(plan, Some(&self.relation_store))?;
+        retain_relation(&self.relation_store, name, schema, batches)
     }
 }
 
 impl SyncPlanExecutor {
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
+    fn execute_op_with_relation_store(
+        &self,
+        op: Operation,
+        relation_store: Option<&RelationStore>,
+    ) -> Result<PlanResult> {
+        match op {
+            Operation::IoOperation(io_op) => self.execute_io(io_op),
+            Operation::QueryPlan(query) => self.execute_query(query, relation_store),
+        }
+    }
+
+    fn execute_io(&self, op: IoOperation) -> Result<PlanResult> {
         match op {
             IoOperation::FileListing { url } => {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<DeltaResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<Result<FileMeta>> = self.storage.list_from(&url)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<DeltaResult<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<Result<Bytes>> = self.storage.read_files(files)?.collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {
@@ -132,19 +198,31 @@ impl SyncPlanExecutor {
 
     /// Evaluates `query` by materializing each node's output in slice (topological) order, then
     /// streams the terminal (last) node's batches to the caller.
-    fn execute_query(&self, query: Plan) -> DeltaResult<PlanResult> {
-        let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(query.nodes.len());
-        for node in query.nodes {
-            let output = self.eval_node(node, &outputs)?;
-            outputs.push(output);
-        }
-        let terminal = outputs
-            .pop()
-            .ok_or_else(|| KernelError::generic("plan has no nodes"))?;
+    fn execute_query(
+        &self,
+        query: Plan,
+        relation_store: Option<&RelationStore>,
+    ) -> Result<PlanResult> {
+        let terminal = self.eval_plan(query, relation_store)?;
         let batches = terminal
             .into_iter()
             .map(|batch| Ok(Box::new(ArrowEngineData::new(batch)) as _));
         Ok(PlanResult::Data(Box::new(batches)))
+    }
+
+    fn eval_plan(
+        &self,
+        plan: Plan,
+        relation_store: Option<&RelationStore>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
+        for node in plan.nodes {
+            let output = self.eval_node(node, &outputs, relation_store)?;
+            outputs.push(output);
+        }
+        outputs
+            .pop()
+            .ok_or_else(|| KernelError::generic("plan has no nodes"))
     }
 
     /// Evaluates a single plan node. `node.inputs` are indices into `outputs`, the
@@ -153,7 +231,8 @@ impl SyncPlanExecutor {
         &self,
         node: PlanNode,
         results: &[Vec<RecordBatch>],
-    ) -> DeltaResult<Vec<RecordBatch>> {
+        relation_store: Option<&RelationStore>,
+    ) -> Result<Vec<RecordBatch>> {
         let PlanNode { op, inputs } = node;
         match op {
             Operator::ScanJson(ScanJson {
@@ -167,6 +246,9 @@ impl SyncPlanExecutor {
                 schema,
             }) => self.eval_scan(FileType::Parquet, files, file_constant_columns, schema),
             Operator::Values(values) => Ok(vec![values_to_record_batch(values)?]),
+            Operator::RelationSource(relation_ref) => {
+                self.eval_relation_source(&relation_ref, relation_store)
+            }
             Operator::UnionAll(_) => Ok(Vec::from_iter(
                 inputs.iter().flat_map(|&i| results[i].iter().cloned()),
             )),
@@ -194,7 +276,7 @@ impl SyncPlanExecutor {
         files: Vec<ScanFile>,
         file_constant_columns: Vec<String>,
         schema: SchemaRef,
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    ) -> Result<Vec<RecordBatch>> {
         // The engine reads only the non-constant columns; constants are spliced in afterwards.
         let read_fields = schema
             .fields()
@@ -209,7 +291,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: DeltaResultIteratorStatic<ArrowEngineData> = match file_type {
+            let data: ResultIteratorStatic<ArrowEngineData> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,
@@ -247,7 +329,7 @@ impl SyncPlanExecutor {
         &self,
         dynamic_scan: DynamicScan,
         input: &[RecordBatch],
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    ) -> Result<Vec<RecordBatch>> {
         let files = dynamic_scan_files(&dynamic_scan, input)?;
         self.eval_scan(
             dynamic_scan.file_type,
@@ -256,12 +338,75 @@ impl SyncPlanExecutor {
             dynamic_scan.schema,
         )
     }
+
+    fn eval_relation_source(
+        &self,
+        relation_ref: &RelationRef,
+        relation_store: Option<&RelationStore>,
+    ) -> Result<Vec<RecordBatch>> {
+        let relation_store = relation_store.ok_or_else(|| {
+            KernelError::unsupported("RelationSource requires an executor that can store relations")
+        })?;
+        let retained_relations = relation_store
+            .lock()
+            .map_err(|_| KernelError::internal_error("retained relations mutex poisoned"))?;
+        let retained = retained_relations.get(relation_ref.id()).ok_or_else(|| {
+            KernelError::generic(format!(
+                "RelationSource references unknown relation id {}",
+                relation_ref.id()
+            ))
+        })?;
+        // TODO(#3485): schema equality currently does not consider field order.
+        if &retained.schema != relation_ref.schema() {
+            return Err(KernelError::generic(format!(
+                "RelationSource schema does not match retained relation id {}",
+                relation_ref.id()
+            )));
+        }
+        // RecordBatch clones share their Arrow arrays and is relatively cheap.
+        Ok(retained.batches.clone())
+    }
 }
 
-fn dynamic_scan_files(
-    dynamic_scan: &DynamicScan,
-    input: &[RecordBatch],
-) -> DeltaResult<Vec<ScanFile>> {
+fn retain_relation(
+    relation_store: &RelationStore,
+    name: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<RelationRef> {
+    validate_relation_batches(&schema, &batches)?;
+    // `try_update` is unavailable at the crate's MSRV.
+    #[allow(deprecated)]
+    let counter = NEXT_RELATION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| KernelError::internal_error("relation id space exhausted"))?;
+    let id = format!("{name}-{counter}");
+    relation_store
+        .lock()
+        .map_err(|_| KernelError::internal_error("retained relations mutex poisoned"))?
+        .insert(
+            id.clone(),
+            RetainedRelation {
+                schema: schema.clone(),
+                batches,
+            },
+        );
+    Ok(RelationRef::new(id, schema))
+}
+
+fn validate_relation_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<()> {
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+    for batch in batches {
+        if batch.schema().as_ref() != &arrow_schema {
+            return Err(KernelError::generic(
+                "record batch schema does not match relation schema",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dynamic_scan_files(dynamic_scan: &DynamicScan, input: &[RecordBatch]) -> Result<Vec<ScanFile>> {
     let mut files = Vec::new();
     for batch in input {
         let path = extract_column(batch, dynamic_scan.path_column.path())?;
@@ -350,7 +495,7 @@ fn dynamic_scan_files(
     Ok(files)
 }
 
-fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
+fn eval_project(project: Project, input: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
@@ -370,7 +515,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<Reco
         .collect()
 }
 
-fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
+fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
@@ -398,7 +543,7 @@ fn eval_semi_join(
     join: SemiJoin,
     probe: &[RecordBatch],
     build: &[RecordBatch],
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     let mut build_keys = HashSet::new();
     for batch in build {
         build_keys.extend(encode_keys_as_rows(batch, &join.build_keys)?);
@@ -423,7 +568,7 @@ fn splice_file_constants(
     schema: &SchemaRef,
     file_constant_columns: &[String],
     constants: &[Scalar],
-) -> DeltaResult<Vec<ArrayRef>> {
+) -> Result<Vec<ArrayRef>> {
     let (_, read_columns, rows) = batch.into_parts();
     let mut read_columns = read_columns.into_iter();
     schema
@@ -445,7 +590,7 @@ fn splice_file_constants(
 pub(super) fn encode_keys_as_rows(
     batch: &RecordBatch,
     columns: &[ColumnName],
-) -> DeltaResult<Vec<OwnedRow>> {
+) -> Result<Vec<OwnedRow>> {
     if columns.is_empty() {
         let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
         return Ok(vec![key; batch.num_rows()]);
@@ -465,7 +610,7 @@ pub(super) fn encode_keys_as_rows(
     Ok(rows.iter().map(|row| row.owned()).collect())
 }
 
-fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
+fn scalar_value(array: &dyn Array, row: usize) -> Result<Scalar> {
     if array.is_null(row) {
         return Ok(Scalar::Null(DataType::try_from_arrow(array.data_type())?));
     }
@@ -485,12 +630,12 @@ fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
 /// [`PlanBuilder::build`] output for an absent input) yields zero-row data.
 ///
 /// [`PlanBuilder::build`]: crate::plans::PlanBuilder::build
-fn values_to_record_batch(values: Values) -> DeltaResult<RecordBatch> {
+fn values_to_record_batch(values: Values) -> Result<RecordBatch> {
     let Values { schema, rows } = values;
     let columns: Vec<ArrayRef> = schema
         .fields()
         .enumerate()
-        .map(|(col, field)| -> DeltaResult<ArrayRef> {
+        .map(|(col, field)| -> Result<ArrayRef> {
             let element_type = ArrayType::new(field.data_type().clone(), true);
             let column = ArrayData::try_new(element_type, rows.iter().map(|row| row[col].clone()))?;
             // This produces a single array row. The array contains n elements, one for each
@@ -516,11 +661,196 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
-    use crate::expressions::{column_name, StructData};
+    use crate::expressions::{col, column_name, lit, Predicate, StructData};
+    use crate::plans::PlanBuilder;
     use crate::schema::{schema, schema_ref, ToSchema as _};
 
     #[test]
-    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
+    fn scoped_executor_creates_ref_from_arrow_batch() -> Result<()> {
+        let executor = SyncPlanExecutor::default();
+        let scoped = executor.get_scoped();
+        let schema = schema_ref! { nullable "id": LONG };
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )?;
+
+        let wrong_schema = schema_ref! { nullable "other": LONG };
+        let error = scoped
+            .create_ref("arrow-batch", wrong_schema, batch.clone())
+            .expect_err("a mismatched schema must be rejected");
+        assert!(error
+            .to_string()
+            .contains("record batch schema does not match"));
+
+        let relation_ref = scoped.create_ref("arrow-batch", schema, batch.clone())?;
+        assert!(relation_ref.id().starts_with("arrow-batch-"));
+        let query = PlanBuilder::relation_source(relation_ref.clone()).build()?;
+        let scoped_batches: Vec<RecordBatch> = scoped
+            .execute_op(Operation::QueryPlan(query))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<Result<_>>()?;
+        assert_eq!(scoped_batches, vec![batch]);
+
+        let query = PlanBuilder::relation_source(relation_ref).build()?;
+        let error = executor
+            .execute_op(Operation::QueryPlan(query))
+            .err()
+            .expect("the unscoped executor must reject a scope's relation");
+        assert!(error
+            .to_string()
+            .contains("requires an executor that can store relations"));
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_executor_rejects_batches_that_differ_from_plan_schema() -> Result<()> {
+        let scoped = SyncPlanExecutor::default().get_scoped();
+        let batch_schema = schema_ref! { nullable "id": LONG };
+        let mut plan = PlanBuilder::values(batch_schema, vec![vec![1i64.into()]])?.build()?;
+        plan.schema = schema_ref! { nullable "other": LONG };
+
+        let error = scoped
+            .execute_and_retain("wrong-schema", plan)
+            .expect_err("a mismatched plan schema must be rejected");
+        assert!(error
+            .to_string()
+            .contains("record batch schema does not match"));
+        assert!(scoped.relation_store.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_executor_retains_and_reuses_filtered_relations() -> Result<()> {
+        let executor = SyncPlanExecutor::default();
+        let scoped = executor.get_scoped();
+        let schema = schema_ref! { nullable "id": LONG };
+        let source = PlanBuilder::values(
+            schema.clone(),
+            vec![vec![1i64.into()], vec![2i64.into()], vec![3i64.into()]],
+        )?
+        .filter(Predicate::gt(col!("id"), lit(1i64)))?
+        .build()?;
+        let first = scoped.execute_and_retain("filtered", source)?;
+        assert_eq!(first.schema(), &schema);
+        assert!(first.id().starts_with("filtered-"));
+
+        let second_source = PlanBuilder::relation_source(first.clone())
+            .filter(Predicate::lt(col!("id"), lit(3i64)))?
+            .build()?;
+        let second = scoped.execute_and_retain("refiltered", second_source)?;
+        assert_ne!(first.id(), second.id());
+        assert_eq!(second.schema(), &schema);
+
+        let query = PlanBuilder::relation_source(second).build()?;
+        let batches: Vec<RecordBatch> = scoped
+            .execute_op(Operation::QueryPlan(query))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<Result<_>>()?;
+        assert_eq!(batches.len(), 1);
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.value(0), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_executors_isolate_relations_and_release_batches_on_drop() -> Result<()> {
+        let executor = SyncPlanExecutor::default();
+        let first_scope = executor.get_scoped();
+        let second_scope = executor.get_scoped();
+        let schema = schema_ref! { nullable "id": LONG };
+        let first = first_scope.execute_and_retain(
+            "shared",
+            PlanBuilder::values(schema.clone(), vec![vec![1i64.into()]])?.build()?,
+        )?;
+        let second = second_scope.execute_and_retain(
+            "shared",
+            PlanBuilder::values(schema.clone(), vec![vec![2i64.into()]])?.build()?,
+        )?;
+        assert_ne!(first.id(), second.id());
+
+        let foreign = PlanBuilder::relation_source(first.clone()).build()?;
+        let error = second_scope
+            .execute_op(Operation::QueryPlan(foreign))
+            .err()
+            .expect("a scope must reject another scope's relation");
+        assert!(error.to_string().contains("unknown relation id"));
+
+        let unscoped = PlanBuilder::relation_source(first.clone()).build()?;
+        let error = executor
+            .execute_op(Operation::QueryPlan(unscoped))
+            .err()
+            .expect("the unscoped executor must reject a scope's relation");
+        assert!(error
+            .to_string()
+            .contains("requires an executor that can store relations"));
+
+        let weak_column = {
+            let retained_relations = first_scope.relation_store.lock().unwrap();
+            let batch = &retained_relations.get(first.id()).unwrap().batches[0];
+            Arc::downgrade(batch.column(0))
+        };
+        drop(first_scope);
+        assert!(weak_column.upgrade().is_none());
+
+        let query = PlanBuilder::relation_source(second).build()?;
+        let batches: Vec<RecordBatch> = second_scope
+            .execute_op(Operation::QueryPlan(query))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<Result<_>>()?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_executor_rejects_relation_ref_with_wrong_schema() -> Result<()> {
+        let executor = SyncPlanExecutor::default();
+        let scoped = executor.get_scoped();
+        let schema = schema_ref! { nullable "id": LONG };
+        let retained = scoped.execute_and_retain(
+            "wrong-schema",
+            PlanBuilder::values(schema, vec![vec![1i64.into()]])?.build()?,
+        )?;
+        let wrong_schema = schema_ref! { nullable "other": LONG };
+        let query =
+            PlanBuilder::relation_source(RelationRef::new(retained.id(), wrong_schema)).build()?;
+        let error = scoped
+            .execute_op(Operation::QueryPlan(query))
+            .err()
+            .expect("a relation ref with the wrong schema must fail");
+        assert!(error.to_string().contains("schema does not match"));
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_executor_retains_empty_relation_with_schema() -> Result<()> {
+        let executor = SyncPlanExecutor::default();
+        let scoped = executor.get_scoped();
+        let schema = schema_ref! { nullable "id": LONG };
+        let empty = PlanBuilder::values(schema.clone(), vec![])?.build()?;
+        let retained = scoped.execute_and_retain("empty", empty)?;
+        assert_eq!(retained.schema(), &schema);
+
+        let query = PlanBuilder::relation_source(retained).build()?;
+        let batches: Vec<RecordBatch> = scoped
+            .execute_op(Operation::QueryPlan(query))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<Result<_>>()?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> Result<()> {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
@@ -559,7 +889,7 @@ mod tests {
         size: Scalar,
         last_modified: Scalar,
         dv: Scalar,
-    ) -> DeltaResult<Vec<ScanFile>> {
+    ) -> Result<Vec<ScanFile>> {
         let input_schema = schema_ref! {
             nullable "path": STRING,
             nullable "size": LONG,

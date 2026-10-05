@@ -6,7 +6,7 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use itertools::Itertools;
 
 #[derive(Parser)]
@@ -24,7 +24,7 @@ struct Cli {
     end_version: Option<u64>,
 }
 
-fn main() -> DeltaResult<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse_with_examples(
         env!("CARGO_PKG_NAME"),
         "Read changes in",

@@ -5,8 +5,7 @@ use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData,
-    KernelError as DeltaError,
+    Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, Result, ResultIterator,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
@@ -72,7 +71,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Validates that protocol features and metadata properties are correct for a UC
     /// catalog-managed table.
-    fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+    fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> Result<()> {
         require!(
             commit_metadata.commit_type() != CommitType::UpgradeToCatalogManaged,
             errors::upgrade_downgrade_unsupported("upgrade")
@@ -115,7 +114,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Validates that this commit does not include ALTER TABLE changes (protocol, metadata,
     /// or clustering column changes).
-    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> Result<()> {
         require!(
             !commit_metadata.has_protocol_change(),
             errors::alter_table_unsupported("protocol")
@@ -136,9 +135,9 @@ impl<C: UpdateTableClient> UCCommitter<C> {
     fn commit_version_0(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: &CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
+    ) -> Result<CommitResponse> {
         debug_assert!(
             commit_metadata.version() == 0,
             "commit_version_0 called with version {}",
@@ -173,9 +172,9 @@ impl<C: UpdateTableClient> UCCommitter<C> {
     fn commit_version_non_zero(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse>
+    ) -> Result<CommitResponse>
     where
         C: 'static,
     {
@@ -263,9 +262,9 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        actions: ResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
+    ) -> Result<CommitResponse> {
         if commit_metadata.version() == 0 {
             return self.commit_version_0(engine, actions, &commit_metadata);
         }
@@ -276,7 +275,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         true
     }
 
-    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> Result<()> {
         if publish_metadata.commits_to_publish().is_empty() {
             return Ok(());
         }
@@ -296,13 +295,13 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
 }
 
 /// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
-fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
+fn u64_to_wire_i64(value: u64, field: &str) -> Result<i64> {
     value
         .try_into()
         .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
 }
 
-fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
+fn staged_commit_file_name(path: &url::Url) -> Result<String> {
     path.path_segments()
         .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())

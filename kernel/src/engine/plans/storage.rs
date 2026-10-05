@@ -8,9 +8,7 @@ use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{
-    DeltaResult, DeltaResultIteratorStatic, FileMeta, FileSlice, KernelError, StorageHandler,
-};
+use crate::{FileMeta, FileSlice, KernelError, Result, ResultIteratorStatic, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 #[derive(Constructor)]
@@ -19,40 +17,40 @@ pub struct PlanBasedStorageHandler {
 }
 
 impl PlanBasedStorageHandler {
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
+    fn execute_io(&self, op: IoOperation) -> Result<PlanResult> {
         self.executor.execute_op(Operation::IoOperation(op))
     }
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(&self, path: &Url) -> DeltaResult<DeltaResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
         self.execute_io(IoOperation::file_listing(path.clone()))?
             .into_file_meta()
     }
 
-    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<DeltaResultIteratorStatic<Bytes>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
         self.execute_io(IoOperation::read_bytes(files))?
             .into_bytes()
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()> {
         self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))?
             .into_unit()
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
         self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))?
             .into_unit()
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> Result<FileMeta> {
         self.execute_io(IoOperation::head_file(path.clone()))?
             .into_file_meta()?
             .exactly_one()
             .map_err(|e| KernelError::generic(format!("Expected exactly one file meta: {e}")))?
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> Result<()> {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.

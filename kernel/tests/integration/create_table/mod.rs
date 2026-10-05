@@ -24,14 +24,14 @@ use delta_kernel::table_features::{
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::Result;
 use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
 
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
-pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
+pub(crate) fn simple_schema() -> Result<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "value": STRING,
@@ -40,7 +40,7 @@ pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
 
 /// Helper to create a three-column schema for partition tests (id, date, value).
 /// Shared with sub-modules.
-pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
+pub(crate) fn partition_test_schema() -> Result<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "date": DATE,
@@ -49,7 +49,7 @@ pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
 }
 
 #[tokio::test]
-async fn test_create_simple_table() -> DeltaResult<()> {
+async fn test_create_simple_table() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for an events table
@@ -122,7 +122,7 @@ async fn create_table_validates_cdf_column_names(
     )]
     column_name: &str,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { (StructField::nullable(column_name, DataType::STRING)) };
     let mut properties = vec![
@@ -163,7 +163,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
     #[case] cm_mode: &str,
     #[case] cdf_enabled: bool,
     #[case] expected_error: Option<&str>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         (StructField::nullable("value", DataType::STRING).with_metadata([
@@ -202,7 +202,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
 }
 
 #[tokio::test]
-async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
+async fn test_create_table_with_user_domain_metadata() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -253,7 +253,7 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_create_table_already_exists() -> DeltaResult<()> {
+async fn test_create_table_already_exists() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for a user profiles table
@@ -280,7 +280,7 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
+async fn test_create_table_empty_schema_succeeds() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // CREATE TABLE with no columns is a valid Delta operation; users may add columns
@@ -311,7 +311,7 @@ async fn test_create_table_empty_schema_succeeds() -> DeltaResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_table_empty_schema_checkpoint_round_trip(
     #[case] cm_mode: Option<&str>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! {};
@@ -349,7 +349,7 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
 async fn test_create_table_empty_schema_layout_errors(
     #[case] layout: DataLayout,
     #[case] expected_err: &str,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {};
@@ -385,7 +385,7 @@ fn nested_non_null_schema() -> Arc<StructType> {
 #[case::nested_non_null(nested_non_null_schema())]
 fn test_create_table_with_non_null_columns_auto_enables_invariants(
     #[case] schema: Arc<StructType>,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema, "Test/1.0")
@@ -417,7 +417,7 @@ fn test_create_table_with_non_null_columns_auto_enables_invariants(
 /// together must not duplicate the entry. This also verifies users can pre-enable the
 /// feature so a later ALTER TABLE ADD COLUMN NOT NULL does not need a protocol upgrade.
 #[tokio::test]
-async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResult<()> {
+async fn test_create_table_with_invariants_feature_signal_allowed() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     // Non-null schema auto-enables Invariants; the feature signal also tries to add it.
     // Both code paths firing together must produce exactly one Invariants entry.
@@ -454,7 +454,7 @@ async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResu
 /// CREATE TABLE rejects any schema with `delta.invariants` metadata annotations
 /// because kernel cannot evaluate SQL expression invariants.
 #[tokio::test]
-async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()> {
+async fn test_create_table_rejects_delta_invariants_metadata() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut field = StructField::nullable("x", DataType::INTEGER);
@@ -473,7 +473,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()
 }
 
 #[tokio::test]
-async fn test_create_table_log_actions() -> DeltaResult<()> {
+async fn test_create_table_log_actions() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
@@ -487,6 +487,8 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     // Create table
     let _ = create_table(&table_path, schema, engine_info)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_operation_parameters([("mode", Some("Create")), ("description", None)])
+        .with_operation_metrics([("numFiles", Some("0"))])
         .commit(engine.as_ref())?;
 
     // Read the actual Delta log file
@@ -530,6 +532,14 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     assert_eq!(
         commit_info["operation"], "CREATE TABLE",
         "Operation should be CREATE TABLE"
+    );
+    assert_eq!(
+        commit_info["operationParameters"],
+        serde_json::json!({"description": null, "mode": "Create"})
+    );
+    assert_eq!(
+        commit_info["operationMetrics"],
+        serde_json::json!({"numFiles": "0"})
     );
 
     // Verify Protocol action
@@ -591,7 +601,7 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
 }
 
 /// Helper to create a `CreateTableTransaction` for tests.
-fn create_test_create_table_txn() -> DeltaResult<(
+fn create_test_create_table_txn() -> Result<(
     Arc<impl delta_kernel::Engine>,
     CreateTableTransaction,
     tempfile::TempDir,
@@ -607,7 +617,7 @@ fn create_test_create_table_txn() -> DeltaResult<(
 }
 
 #[tokio::test]
-async fn test_create_table_txn_debug() -> DeltaResult<()> {
+async fn test_create_table_txn_debug() -> Result<()> {
     let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
     let debug_str = format!("{txn:?}");
     assert!(
@@ -642,7 +652,7 @@ fn test_create_table_with_feature_signal(
     #[case] feature: TableFeature,
     #[case] is_reader_writer: bool,
     #[case] enabled_when_supported: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let property_key = format!("delta.feature.{feature_name}");
@@ -683,7 +693,7 @@ fn test_create_table_with_feature_signal(
 }
 
 #[test]
-fn test_create_table_with_variant_shredding_has_variant_feature() -> DeltaResult<()> {
+fn test_create_table_with_variant_shredding_has_variant_feature() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": INTEGER,
@@ -717,7 +727,7 @@ fn test_create_table_with_variant_shredding_has_variant_feature() -> DeltaResult
 fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
     #[case] policy: &str,
     #[case] expect_v2_checkpoint: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
@@ -754,7 +764,7 @@ fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
 fn test_create_table_with_checkpoint_stats_properties(
     #[values(true, false)] write_stats_as_json: bool,
     #[values(true, false)] write_stats_as_struct: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let json_val = write_stats_as_json.to_string();
@@ -792,7 +802,7 @@ fn test_create_table_with_enablement_property(
     #[case] feature: TableFeature,
     #[case] is_reader_writer: bool,
     #[values(true, false)] expect_enabled: bool,
-) -> DeltaResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let value = expect_enabled.to_string();
 
@@ -838,7 +848,7 @@ fn test_create_table_with_enablement_property(
 #[rstest]
 #[case::without_cm(false)]
 #[case::with_cm(true)]
-fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> DeltaResult<()> {
+fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {

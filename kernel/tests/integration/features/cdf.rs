@@ -9,7 +9,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred};
 use delta_kernel::schema::schema_ref;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, KernelError, PredicateRef, Version};
+use delta_kernel::{KernelError, PredicateRef, Result, Version};
 use itertools::Itertools;
 use test_utils::{
     add_commit, create_default_engine, create_default_engine_with_batch, create_table,
@@ -22,7 +22,7 @@ fn read_cdf_for_table(
     start_version: Version,
     end_version: impl Into<Option<Version>>,
     predicate: impl Into<Option<PredicateRef>>,
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     read_cdf_for_table_with_batch_size(test_name, start_version, end_version, predicate, None)
 }
 
@@ -32,7 +32,7 @@ fn read_cdf_for_table_with_batch_size(
     end_version: impl Into<Option<Version>>,
     predicate: impl Into<Option<PredicateRef>>,
     batch_size: Option<usize>,
-) -> DeltaResult<Vec<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
     let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
@@ -62,7 +62,7 @@ fn read_cdf_for_table_with_batch_size(
         ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> DeltaResult<_> {
+        .map(|data| -> Result<_> {
             let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
             assert_eq!(record_batch.schema().as_ref(), &scan_schema_as_arrow);
@@ -277,7 +277,7 @@ fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn simple_cdf_version_ranges() -> DeltaResult<()> {
+fn simple_cdf_version_ranges() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-simple", 0, 0, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -371,7 +371,7 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
 }
 
 #[test]
-fn update_operations() -> DeltaResult<()> {
+fn update_operations() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-update-ops", 0, 2, None)?;
     // Note: `update_pre` and `update_post` are technically not part of the delta spec, and instead
     // should be `update_preimage` and `update_postimage` respectively. However, the tests in
@@ -408,7 +408,7 @@ fn update_operations() -> DeltaResult<()> {
 }
 
 #[test]
-fn false_data_change_is_ignored() -> DeltaResult<()> {
+fn false_data_change_is_ignored() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-data-change", 0, 1, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -442,11 +442,11 @@ fn invalid_range_end_before_start() {
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
-    assert!(matches!(res, Err(KernelError::MissingVersion(3))));
+    assert!(matches!(res, Err(KernelError::EmptyLog)));
 }
 
 #[test]
-fn partition_table() -> DeltaResult<()> {
+fn partition_table() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-partitioned", 0, 2, None)?;
     let mut expected = vec![
         "+----+------+------+------------------+-----------------+",
@@ -472,7 +472,7 @@ fn partition_table() -> DeltaResult<()> {
 }
 
 #[test]
-fn backtick_column_names() -> DeltaResult<()> {
+fn backtick_column_names() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-backtick-column-names", 0, None, None)?;
     let mut expected = vec![
         "+--------+----------+--------------------------+--------------+-----------------+",
@@ -491,7 +491,7 @@ fn backtick_column_names() -> DeltaResult<()> {
 }
 
 #[test]
-fn unconditional_delete() -> DeltaResult<()> {
+fn unconditional_delete() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-delete-unconditional", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -525,7 +525,7 @@ fn unconditional_delete() -> DeltaResult<()> {
 }
 
 #[test]
-fn conditional_delete_all_rows() -> DeltaResult<()> {
+fn conditional_delete_all_rows() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-delete-conditional-all-rows", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -559,7 +559,7 @@ fn conditional_delete_all_rows() -> DeltaResult<()> {
 }
 
 #[test]
-fn conditional_delete_two_rows() -> DeltaResult<()> {
+fn conditional_delete_two_rows() -> Result<()> {
     let batches = read_cdf_for_table("cdf-table-delete-conditional-two-rows", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
@@ -673,7 +673,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Err
     // the predicate pruned the file before reading.
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
+        .map(|data| -> Result<_> { data?.try_into_record_batch() })
         .try_collect()?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
