@@ -1,7 +1,5 @@
 //! Builder for transactions against an existing table.
 
-use std::collections::HashSet;
-
 use delta_kernel_derive::internal_api;
 
 use crate::committer::Committer;
@@ -9,14 +7,15 @@ use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::transaction::builder::TransactionBuilderState;
+use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::SchemaOperation;
 use crate::transaction::{Transaction, UpdateTableOperation};
 use crate::{Engine, EngineData, KernelError, Result};
 
-/// Configures a transaction against an existing table.
+/// Configures DML and schema-changing DDL transactions against an existing table.
 ///
-/// The builder supports both data-changing operations and schema changes. Calling
-/// [`build`](Self::build) validates the accumulated intent and constructs the transaction.
+/// This builder does not create or replace tables. Calling [`build`](Self::build) validates the
+/// accumulated intent and constructs the transaction.
 pub struct UpdateTableTransactionBuilder {
     snapshot: SnapshotRef,
     state: TransactionBuilderState,
@@ -40,7 +39,7 @@ impl UpdateTableTransactionBuilder {
     pub(crate) fn new(snapshot: SnapshotRef) -> Self {
         Self {
             snapshot,
-            state: TransactionBuilderState::new(),
+            state: TransactionBuilderState::for_update_table(),
             operation: None,
             schema_changes: Vec::new(),
             domain_metadata_removals: Vec::new(),
@@ -75,9 +74,10 @@ impl UpdateTableTransactionBuilder {
             is_blind_append,
         } = self;
 
-        let mut transaction = Transaction::try_new_existing_table(snapshot, committer, engine)?
-            .with_builder_state(state);
+        let mut transaction =
+            Transaction::try_new_existing_table(snapshot, committer, engine, state)?;
 
+        // TODO: Construct the transaction from complete validated builder intent.
         if let Some(operation) = operation {
             transaction = transaction.with_update_table_operation(operation);
         }
@@ -184,6 +184,18 @@ impl UpdateTableTransactionBuilder {
         self
     }
 
+    /// Adds a user-controlled domain metadata removal to the transaction.
+    ///
+    /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
+    /// Removing a domain that does not exist is a no-op.
+    ///
+    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
+    /// [`build`](Self::build).
+    pub fn with_domain_metadata_removed(mut self, domain: impl Into<String>) -> Self {
+        self.domain_metadata_removals.push(domain.into());
+        self
+    }
+
     /// Sets whether file actions represent a logical data change.
     ///
     /// `true` indicates that the commit changes the table's logical contents. Use `false` for
@@ -267,18 +279,6 @@ impl UpdateTableTransactionBuilder {
         self
     }
 
-    /// Adds a user-controlled domain metadata removal to the transaction.
-    ///
-    /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
-    /// Removing a domain that does not exist is a no-op.
-    ///
-    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
-    /// [`build`](Self::build).
-    pub fn with_domain_metadata_removed(mut self, domain: impl Into<String>) -> Self {
-        self.domain_metadata_removals.push(domain.into());
-        self
-    }
-
     fn validate(&self) -> Result<()> {
         if let Some(operation) = &self.operation {
             operation
@@ -308,27 +308,23 @@ impl UpdateTableTransactionBuilder {
             ));
         }
 
-        let mut removals = HashSet::with_capacity(self.domain_metadata_removals.len());
-        if let Some(domain) = self
-            .domain_metadata_removals
-            .iter()
-            .find(|domain| !removals.insert(domain.as_str()))
-        {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "domain metadata '{domain}' is removed more than once"
-            )));
+        let removals = validate_unique_domains(
+            self.domain_metadata_removals.iter().map(String::as_str),
+            |domain| {
+                KernelError::invalid_transaction_state(format!(
+                    "domain metadata '{domain}' is removed more than once"
+                ))
+            },
+        )?;
+        for metadata in &self.state.domain_metadata_additions {
+            let domain = metadata.domain();
+            if removals.contains(domain) {
+                return Err(KernelError::invalid_transaction_state(format!(
+                    "domain metadata '{domain}' cannot be added and removed in one transaction"
+                )));
+            }
         }
-        if let Some(domain) = self
-            .state
-            .domain_metadata_additions
-            .iter()
-            .map(|metadata| metadata.domain())
-            .find(|domain| removals.contains(domain))
-        {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "domain metadata '{domain}' cannot be added and removed in one transaction"
-            )));
-        }
+        // Duplicate additions are validated by the shared builder state.
         self.state.validate()?;
         Ok(())
     }
@@ -725,48 +721,48 @@ mod tests {
     }
 
     #[rstest]
-    #[case::duplicate_app_id(0, "app_id app appears more than once")]
-    #[case::duplicate_domain(1, "domain metadata 'domain' appears more than once")]
-    #[case::added_and_removed_domain(2, "cannot be added and removed")]
+    #[case::duplicate_app_id(&[], &[], &["app", "app"], "app_id app appears more than once")]
+    #[case::duplicate_domain(
+        &["domain", "domain"], &[], &[], "domain metadata 'domain' appears more than once"
+    )]
+    #[case::added_and_removed_domain(
+        &["domain"], &["domain"], &[], "cannot be added and removed"
+    )]
+    #[case::duplicate_removals(
+        &[], &["domain", "domain"], &[], "removed more than once"
+    )]
+    #[case::duplicate_removal_precedes_add_remove_conflict(
+        &["domain"], &["domain", "domain"], &[], "removed more than once"
+    )]
+    #[case::add_remove_conflict_precedes_duplicate_addition(
+        &["domain", "domain"], &["domain"], &[], "cannot be added and removed"
+    )]
+    #[case::duplicate_app_id_precedes_duplicate_addition(
+        &["domain", "domain"], &[], &["app", "app"], "app_id app appears more than once"
+    )]
     fn duplicate_builder_values_are_rejected(
-        #[case] kind: u8,
+        #[case] additions: &[&str],
+        #[case] removals: &[&str],
+        #[case] app_ids: &[&str],
         #[case] expected: &str,
     ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let builder = snapshot.transaction_builder();
-        let builder = match kind {
-            0 => builder
-                .with_transaction_id("app", 1)
-                .with_transaction_id("app", 2),
-            1 => builder
-                .with_domain_metadata("domain", "first")
-                .with_domain_metadata("domain", "second"),
-            _ => builder
-                .with_domain_metadata("domain", "value")
-                .with_domain_metadata_removed("domain"),
-        };
+        let mut builder = snapshot.transaction_builder();
+        for domain in additions {
+            builder = builder.with_domain_metadata(*domain, "value");
+        }
+        for domain in removals {
+            builder = builder.with_domain_metadata_removed(*domain);
+        }
+        for app_id in app_ids {
+            builder = builder.with_transaction_id(*app_id, 1);
+        }
 
         let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
+        assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
         assert!(error.to_string().contains(expected), "{error}");
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_domain_metadata_removals_are_rejected() -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let error = snapshot
-            .transaction_builder()
-            .with_domain_metadata_removed("domain")
-            .with_domain_metadata_removed("domain")
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
-
-        assert!(
-            error.to_string().contains("removed more than once"),
-            "{error}"
-        );
         Ok(())
     }
 

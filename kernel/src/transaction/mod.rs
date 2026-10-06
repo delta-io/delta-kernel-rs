@@ -17,7 +17,7 @@ use crate::actions::{BackReference, CheckpointAction};
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{is_incremental_safe_operation, CrcDelta, FileStatsDelta};
+use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -181,15 +181,15 @@ pub(crate) fn augmented_write_metadata_schema() -> KernelResult<SchemaRef> {
 
 /// Marker type for transactions on existing tables.
 ///
-/// This is the default state for [`Transaction`] and provides the full set of operations
-/// including file removal, deletion vector updates, and blind append semantics.
+/// This is the default state for [`Transaction`] and supports schema changes as well as file
+/// additions, removals, deletion-vector updates, and blind append semantics.
 #[derive(Debug)]
 pub struct ExistingTable;
 
 /// Marker type for create-table transactions.
 ///
-/// Transactions in this state have a restricted API surface — operations that are semantically
-/// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
+/// Transactions in this state support file additions but not file removals, deletion-vector
+/// updates, or domain metadata removals.
 #[derive(Debug)]
 pub struct CreateTable;
 
@@ -201,6 +201,11 @@ pub struct CreateTable;
 /// - [`ExistingTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
+///
+/// Both states support file additions. Schema-changing transactions use [`ExistingTable`] rather
+/// than a separate schema-only state, allowing schema and file changes in the same transaction.
+/// The builder validates schema intent, and commit validates the staged actions; schema-only
+/// behavior is not enforced by the type parameter.
 ///
 /// # Examples
 ///
@@ -441,7 +446,6 @@ impl<S> Transaction<S> {
             committer_duration,
         )
     }
-
 }
 
 // =============================================================================
@@ -567,7 +571,7 @@ impl<S> Transaction<S> {
 }
 
 // =============================================================================
-// Data file methods -- only available on transaction types that support data files
+// Shared data file methods
 // =============================================================================
 impl<S> Transaction<S> {
     // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
@@ -717,7 +721,7 @@ impl<S> Transaction<S> {
     }
 }
 
-impl<S: SupportsDataFiles> Transaction<S> {
+impl<S> Transaction<S> {
     /// Add files to include in this transaction. This API generally enables the engine to
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
@@ -773,7 +777,7 @@ impl<S> Transaction<S> {
             (true, true) | (false, false) => Ok(()),
             (false, true) => Err(KernelError::generic(
                 "This table is catalog-managed and requires a catalog committer. \
-                 Please provide a catalog committer via Snapshot::transaction().",
+                 Please provide a catalog committer via UpdateTableTransactionBuilder::build().",
             )),
             (true, false) => Err(KernelError::generic(
                 "This table is path-based and cannot be committed to with a catalog committer.",
@@ -948,8 +952,8 @@ impl<S> Transaction<S> {
         if self.effective_table_config.logical_schema().num_fields() == 0 {
             return Err(KernelError::generic(
                 "Cannot write data files to a Delta table with empty schema; \
-                 use `snapshot.alter_table().add_column(...)` to add at least one \
-                 column before writing data",
+                 use `snapshot.transaction_builder()` with `UpdateTableOperation::AlterTable` and \
+                 `add_column(...)` to add at least one column before writing data",
             ));
         }
         Ok(())
@@ -1021,9 +1025,11 @@ impl<S> Transaction<S> {
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),
-            (false, Some(CommitOperation::CreateTable)) => Err(KernelError::invalid_transaction_state(
-                "CREATE TABLE cannot use an update-table transaction",
-            )),
+            (false, Some(CommitOperation::CreateTable)) => {
+                Err(KernelError::invalid_transaction_state(
+                    "CREATE TABLE cannot use an update-table transaction",
+                ))
+            }
             (false, _) => Ok(()),
         }
     }
@@ -1323,7 +1329,7 @@ impl<S> Transaction<S> {
         let is_incremental_safe = self
             .operation
             .as_ref()
-            .is_some_and(|operation| is_incremental_safe_operation(operation.as_str()));
+            .is_some_and(CommitOperation::is_incremental_safe);
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1613,7 +1619,7 @@ impl<S> Transaction<S> {
             .effective_table_config
             .should_assign_fresh_row_tracking_metadata();
 
-        if self.add_files_metadata.is_empty() {
+        if !self.has_add_file_actions() {
             // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
             // have a valid starting point. For all other empty commits (metadata-only, etc.),
@@ -2053,8 +2059,8 @@ mod tests {
     use crate::actions::CommitInfo;
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        new_null_array, ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
-        StructArray,
+        new_null_array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray,
+        StringArray, StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -3199,6 +3205,11 @@ mod tests {
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
+    fn add_empty_file_batch<S>(txn: &mut Transaction<S>) {
+        let batch = create_valid_add_file_batch(false /* all_nullable */).slice(0, 0);
+        txn.add_files(Box::new(ArrowEngineData::new(batch)));
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum DataRemoval {
         RemoveFile,
@@ -3321,6 +3332,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn generate_adds_treats_empty_batches_as_no_actions() -> Result<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        add_empty_file_batch(&mut txn);
+
+        let (mut adds, row_tracking_domain_metadata) =
+            txn.generate_adds(engine.as_ref(), u64::MAX)?;
+        assert!(adds.next().is_none());
+        assert!(row_tracking_domain_metadata.is_none());
+        Ok(())
+    }
+
+    #[rstest]
+    fn create_table_add_actions_preserve_data_change(
+        #[values(false, true)] data_change: bool,
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let engine = SyncEngine::new();
+        let mut transaction = create_table(
+            tempdir.path().to_string_lossy(),
+            test_schema_flat(),
+            "test-engine",
+        )
+        .with_data_change(data_change)
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        add_dummy_file(&mut transaction);
+        transaction.resolve_data_change();
+
+        let (mut adds, _) = transaction.generate_adds(&engine, 0)?;
+        let add = ArrowEngineData::try_from_engine_data(adds.next().expect("Add action")?)?;
+        let add = get_column!(add.record_batch(), "add", StructArray);
+        assert_eq!(
+            get_column!(add, "dataChange", BooleanArray).value(0),
+            data_change
+        );
+        assert!(adds.next().is_none());
+        Ok(())
+    }
+
     #[rstest]
     #[case::append_only_disabled(
         false, /* append_only */
@@ -3384,10 +3434,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_validate_blind_append_requires_adds() -> Result<()> {
+    #[rstest]
+    #[case::without_batch(false)]
+    #[case::empty_batch(true)]
+    fn test_validate_blind_append_requires_adds(#[case] stage_empty_batch: bool) -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
+        if stage_empty_batch {
+            add_empty_file_batch(&mut txn);
+        }
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,

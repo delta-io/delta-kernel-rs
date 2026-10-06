@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
+use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::utils::require;
 use crate::{EngineData, KernelError, Result};
 
@@ -34,7 +35,7 @@ impl std::fmt::Debug for TransactionBuilderState {
 }
 
 impl TransactionBuilderState {
-    pub(in crate::transaction) fn new() -> Self {
+    pub(in crate::transaction) fn for_update_table() -> Self {
         Self::default()
     }
 
@@ -42,7 +43,7 @@ impl TransactionBuilderState {
         Self {
             engine_info: Some(engine_info),
             data_change: Some(true),
-            ..Self::new()
+            ..Self::default()
         }
     }
 
@@ -134,17 +135,16 @@ impl TransactionBuilderState {
             )));
         }
 
-        let mut domains = HashSet::with_capacity(self.domain_metadata_additions.len());
-        if let Some(domain) = self
-            .domain_metadata_additions
-            .iter()
-            .map(DomainMetadata::domain)
-            .find(|domain| !domains.insert(*domain))
-        {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "domain metadata '{domain}' appears more than once in transaction builder"
-            )));
-        }
+        validate_unique_domains(
+            self.domain_metadata_additions
+                .iter()
+                .map(DomainMetadata::domain),
+            |domain| {
+                KernelError::invalid_transaction_state(format!(
+                    "domain metadata '{domain}' appears more than once in transaction builder"
+                ))
+            },
+        )?;
 
         Ok(())
     }

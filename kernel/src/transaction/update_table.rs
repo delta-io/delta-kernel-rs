@@ -46,6 +46,7 @@ use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
     V2_VALIDATOR, V3_VALIDATOR,
 };
+use crate::transaction::builder::TransactionBuilderState;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -69,6 +70,7 @@ impl Transaction {
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
+        state: TransactionBuilderState,
     ) -> KernelResult<Self> {
         let read_snapshot = snapshot.into();
 
@@ -139,7 +141,8 @@ impl Transaction {
             manifest_write: None,
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
-        })
+        }
+        .with_builder_state(state))
     }
 
     // -------------------------------------------------------------------------

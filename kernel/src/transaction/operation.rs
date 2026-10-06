@@ -1,23 +1,39 @@
 use std::fmt;
 
+use strum::{EnumIter, IntoEnumIterator};
+
 /// Identifies an operation supported by [`UpdateTableTransactionBuilder`].
 ///
-/// Known operations provide compiler-checked names. [`Custom`](Self::Custom) preserves the
-/// protocol's extensibility for connector-specific operations. Custom names are emitted verbatim
-/// in commit history and transaction metrics. Create-table transactions fix their operation
-/// internally; replace-table operations are not supported.
+/// Typed variants provide compiler-checked names. [`Custom`](Self::Custom) preserves the protocol's
+/// extensibility. Create-table transactions fix their operation internally; replace-table
+/// operations are not supported.
 ///
 /// [`UpdateTableTransactionBuilder`]: super::UpdateTableTransactionBuilder
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 #[non_exhaustive]
 pub enum UpdateTableOperation {
+    /// A batch write.
     Write,
+    /// A streaming write.
     StreamingUpdate,
+    /// A schema-changing operation.
     AlterTable,
+    /// A row deletion.
     Delete,
+    /// A row update.
     Update,
+    /// A merge of source rows into the table.
     Merge,
+    /// A data-file reorganization.
     Optimize,
+    /// An operation name recorded verbatim in commit history and successful transaction metrics.
+    ///
+    /// The name must be nonempty and must not exactly match a typed operation's name or a reserved
+    /// create/replace-table name. This comparison is case-sensitive. Kernel does not infer
+    /// built-in operation semantics from the name, but all other transaction and protocol
+    /// checks still apply. Custom operations do not qualify for incremental version checksum
+    /// construction.
+    #[strum(disabled)]
     Custom(String),
 }
 
@@ -33,6 +49,18 @@ impl UpdateTableOperation {
             Self::Merge => "MERGE",
             Self::Optimize => "OPTIMIZE",
             Self::Custom(operation) => operation,
+        }
+    }
+
+    pub(crate) fn is_incremental_safe(&self) -> bool {
+        match self {
+            Self::Write
+            | Self::StreamingUpdate
+            | Self::Delete
+            | Self::Update
+            | Self::Merge
+            | Self::Optimize => true,
+            Self::AlterTable | Self::Custom(_) => false,
         }
     }
 
@@ -70,6 +98,13 @@ impl CommitOperation {
             Self::CreateTable => Ok(()),
         }
     }
+
+    pub(crate) fn is_incremental_safe(&self) -> bool {
+        match self {
+            Self::CreateTable => true,
+            Self::UpdateTable(operation) => operation.is_incremental_safe(),
+        }
+    }
 }
 
 impl fmt::Display for CommitOperation {
@@ -88,18 +123,16 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("custom operation name cannot be empty".to_string());
     }
-    if matches!(
-        name,
-        "CREATE TABLE"
-            | "WRITE"
-            | "STREAMING UPDATE"
-            | "REPLACE TABLE"
-            | "ALTER TABLE"
-            | "DELETE"
-            | "UPDATE"
-            | "MERGE"
-            | "OPTIMIZE"
-    ) {
+    if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
+        || matches!(
+            name,
+            "CREATE TABLE"
+                | "REPLACE TABLE"
+                | "CREATE TABLE AS SELECT"
+                | "REPLACE TABLE AS SELECT"
+                | "CREATE OR REPLACE TABLE AS SELECT"
+        )
+    {
         return Err(format!(
             "custom operation name '{name}' is reserved; use the matching transaction builder or typed update-table operation"
         ));
@@ -109,22 +142,29 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use strum::IntoEnumIterator;
+
     use super::{CommitOperation, UpdateTableOperation};
 
     #[test]
     fn update_table_operations_have_stable_names() {
         let cases = [
-            ("WRITE", UpdateTableOperation::Write),
-            ("STREAMING UPDATE", UpdateTableOperation::StreamingUpdate),
-            ("ALTER TABLE", UpdateTableOperation::AlterTable),
-            ("DELETE", UpdateTableOperation::Delete),
-            ("UPDATE", UpdateTableOperation::Update),
-            ("MERGE", UpdateTableOperation::Merge),
-            ("OPTIMIZE", UpdateTableOperation::Optimize),
+            ("WRITE", UpdateTableOperation::Write, true),
+            (
+                "STREAMING UPDATE",
+                UpdateTableOperation::StreamingUpdate,
+                true,
+            ),
+            ("ALTER TABLE", UpdateTableOperation::AlterTable, false),
+            ("DELETE", UpdateTableOperation::Delete, true),
+            ("UPDATE", UpdateTableOperation::Update, true),
+            ("MERGE", UpdateTableOperation::Merge, true),
+            ("OPTIMIZE", UpdateTableOperation::Optimize, true),
         ];
-        for (name, operation) in cases {
+        for (name, operation, incremental_safe) in cases {
             assert_eq!(operation.as_str(), name);
             assert_eq!(operation.to_string(), name);
+            assert_eq!(operation.is_incremental_safe(), incremental_safe);
             assert_eq!(CommitOperation::from(operation).as_str(), name);
         }
     }
@@ -145,19 +185,38 @@ mod tests {
 
     #[test]
     fn custom_operations_reject_reserved_names() {
-        for name in [
-            "CREATE TABLE",
-            "WRITE",
-            "STREAMING UPDATE",
-            "REPLACE TABLE",
-            "ALTER TABLE",
-            "DELETE",
-            "UPDATE",
-            "MERGE",
-            "OPTIMIZE",
-        ] {
+        for name in UpdateTableOperation::iter()
+            .map(|operation| operation.as_str().to_owned())
+            .chain(
+                [
+                    "CREATE TABLE",
+                    "REPLACE TABLE",
+                    "CREATE TABLE AS SELECT",
+                    "REPLACE TABLE AS SELECT",
+                    "CREATE OR REPLACE TABLE AS SELECT",
+                ]
+                .map(str::to_owned),
+            )
+        {
             let operation = UpdateTableOperation::Custom(name.to_string());
             assert!(operation.validate().unwrap_err().contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn operation_iteration_excludes_custom() {
+        for operation in UpdateTableOperation::iter() {
+            assert!(!matches!(operation, UpdateTableOperation::Custom(_)));
+            assert!(operation.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn custom_name_validation_is_case_sensitive_and_preserves_whitespace() {
+        for name in ["write", "Write", " WRITE ", "INSERT"] {
+            let operation = UpdateTableOperation::Custom(name.to_string());
+            assert!(operation.validate().is_ok());
+            assert_eq!(operation.as_str(), name);
         }
     }
 
@@ -167,5 +226,12 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("cannot be empty"));
+    }
+
+    #[test]
+    fn custom_operations_are_never_incremental_safe() {
+        for name in ["vendor.custom/write-v2", "CREATE TABLE AS SELECT", "WRITE"] {
+            assert!(!UpdateTableOperation::Custom(name.to_string()).is_incremental_safe());
+        }
     }
 }

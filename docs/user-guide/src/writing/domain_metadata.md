@@ -53,12 +53,14 @@ The builder setter accepts values convertible to `String` and validates them dur
 late-bound transaction setter takes owned strings and validates them during `commit()`:
 
 ```rust,ignore
+// UpdateTableTransactionBuilder
 pub fn with_domain_metadata(
     self,
     domain: impl Into<String>,
     configuration: impl Into<String>,
 ) -> Self
 
+// Transaction
 pub fn with_domain_metadata(self, domain: String, configuration: String) -> Self
 ```
 

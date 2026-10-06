@@ -14,11 +14,11 @@ use crate::{
 /// commit.
 ///
 /// # Returns
-/// A new handle to the transaction that will set the `app_id` version to `version` on commit
+/// A new handle to the update-table transaction builder.
 ///
 /// # Safety
-/// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice
-/// must be valid. CONSUMES TRANSACTION
+/// `builder` is consumed, including on error. `engine` must be a [valid][Handle#Validity] handle,
+/// and `app_id` must be a valid string slice.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,

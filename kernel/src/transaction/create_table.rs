@@ -144,7 +144,7 @@ impl CreateTableTransaction {
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
         state: TransactionBuilderState,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         validate_iceberg_compat_if_needed(
             &effective_table_config,
             &V2_VALIDATOR,

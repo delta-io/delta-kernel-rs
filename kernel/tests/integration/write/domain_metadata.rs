@@ -8,7 +8,7 @@ use itertools::Itertools;
 use serde_json::Deserializer;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, begin_transaction_with, create_table,
-    engine_store_setup, load_and_begin_transaction,
+    engine_store_setup, load_and_begin_transaction, load_and_begin_transaction_with,
 };
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -33,22 +33,20 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
-
-    // write context does not conflict with domain metadata
-    let _write_context = txn.write_state()?.write_context_builder().build()?;
-
-    // set multiple domain metadata
     let domain1 = "app.config";
     let config1 = r#"{"version": 1}"#;
     let domain2 = "spark.settings";
     let config2 = r#"{"cores": 4}"#;
+    let txn = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+        builder
+            .with_domain_metadata(domain1, config1)
+            .with_domain_metadata(domain2, config2)
+    })?;
 
-    assert!(txn
-        .with_domain_metadata(domain1.to_string(), config1.to_string())
-        .with_domain_metadata(domain2.to_string(), config2.to_string())
-        .commit(&engine)?
-        .is_committed());
+    // write context does not conflict with domain metadata
+    let _write_context = txn.write_state()?.write_context_builder().build()?;
+
+    assert!(txn.commit(&engine)?.is_committed());
 
     let commit_data = store
         .get(&Path::from(format!(

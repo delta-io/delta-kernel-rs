@@ -911,6 +911,16 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Sets whether files added during creation represent a logical data change.
+    ///
+    /// `data_change` defaults to `true`. `false` indicates no logical change to the table's data.
+    /// Returns the updated builder; consecutive calls replace the previous value. The configured
+    /// value is preserved through commit, including when no files are added.
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.state.data_change = Some(data_change);
+        self
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
@@ -1155,6 +1165,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_name, ColumnName};
+    use crate::metrics::MetricEvent;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
         schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
@@ -1167,6 +1178,7 @@ mod tests {
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
         assert_result_error_with_message, build_complex_nested_kernel_schema,
+        install_thread_local_metrics_reporter, CapturingReporter,
     };
 
     fn test_schema() -> SchemaRef {
@@ -1184,21 +1196,35 @@ mod tests {
         assert!(builder.table_properties.is_empty());
     }
 
-    #[test]
-    fn test_common_builder_state_is_applied() -> Result<()> {
+    #[rstest]
+    #[case::default(&[], true)]
+    #[case::explicit_true(&[true], true)]
+    #[case::explicit_false(&[false], false)]
+    #[case::last_true(&[false, true], true)]
+    #[case::last_false(&[true, false], false)]
+    fn common_builder_state_preserves_data_change_through_empty_commit(
+        #[case] overrides: &[bool],
+        #[case] expected_data_change: bool,
+    ) -> Result<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
         std::fs::create_dir(&table_path)?;
+        let engine = SyncEngine::new();
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let transaction = CreateTableTransactionBuilder::new(
+        let mut builder = CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             test_schema(),
             "test-engine",
         )
         .with_correlation_id("test-correlation")
         .with_operation_parameters([("mode", Some("Create"))])
-        .with_transaction_id("app", 7)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
+        .with_transaction_id("app", 7);
+        for &data_change in overrides {
+            builder = builder.with_data_change(data_change);
+        }
+        let mut transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
         assert_eq!(
@@ -1211,7 +1237,23 @@ mod tests {
         );
         assert_eq!(transaction.set_transactions[0].app_id, "app");
         assert_eq!(transaction.set_transactions[0].version, 7);
-        assert!(transaction.data_change);
+        assert_eq!(transaction.data_change, expected_data_change);
+        assert!(!transaction.infer_data_change);
+        transaction.resolve_data_change();
+        assert_eq!(transaction.data_change, expected_data_change);
+        let committed = transaction.commit(&engine)?.unwrap_committed();
+        assert_eq!(committed.commit_version(), 0);
+        let metrics = reporter
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                MetricEvent::TransactionCommitSuccess(metrics) => Some(metrics),
+                _ => None,
+            })
+            .expect("create-table commit metrics");
+        assert_eq!(metrics.data_change, expected_data_change);
+        assert_eq!(metrics.num_add_files, 0);
+        assert_eq!(metrics.num_remove_files, 0);
         Ok(())
     }
 

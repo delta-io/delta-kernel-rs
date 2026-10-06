@@ -155,6 +155,23 @@ pub unsafe extern "C" fn create_table_txn_commit(
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableTransactionBuilder;
 
+/// Sets whether files added during creation represent a logical data change.
+///
+/// `data_change` defaults to `true`. Returns the updated builder handle. Consecutive calls
+/// replace the previous value, which is preserved through commit even when no files are added.
+///
+/// # Safety
+///
+/// `builder` must be valid. This unconditionally consumes `builder`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_data_change(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    data_change: bool,
+) -> Handle<ExclusiveCreateTableTransactionBuilder> {
+    let builder = unsafe { *builder.into_inner() };
+    Box::new(builder.with_data_change(data_change)).into()
+}
+
 /// Attaches a correlation identifier to create transaction metric events.
 ///
 /// Repeated calls replace the previous value; an empty value clears it.
@@ -400,9 +417,7 @@ pub(super) fn create_table_txn_builder_with_data_layout_impl(
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
-/// The schema is provided via the engine's visitor callback pattern ([`EngineSchema`]): the
-/// kernel allocates a [`KernelSchemaVisitorState`], calls the engine's visitor function to
-/// populate it via `visit_field_*` downcalls, then extracts the final schema.
+/// `schema` supplies the table schema through the [`EngineSchema`] visitor callback.
 ///
 /// The returned builder can be configured with [`create_table_txn_builder_with_table_property`]
 /// before building with [`create_table_txn_builder_build`]. The engine is only used for error

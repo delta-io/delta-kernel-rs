@@ -126,8 +126,9 @@ async fn append_with_defaults(
 ) -> Result<CommitResult> {
     // 1. Start the transaction.
     let table_schema = snapshot.schema();
-    let mut txn = snapshot.transaction_builder()
-    .build(engine, Box::new(FileSystemCommitter::new()))?;
+    let mut txn = snapshot
+        .transaction_builder()
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
 
     // 2. Build one reusable mapping from input columns or parsed defaults.
     let defaults = txn.top_level_column_defaults()?;

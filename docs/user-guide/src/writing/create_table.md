@@ -43,6 +43,10 @@ The three required arguments are:
 `.build()` validates the inputs and creates a `CreateTableTransaction`. `.commit()` writes
 version 0 of the table, producing the initial Protocol and Metadata actions.
 
+Creation defaults to `dataChange = true`. To override it, call `.with_data_change(false)` on
+the builder before `.build()`. The last call wins, and the value is preserved through commit,
+including when you create an empty table. When you add files containing new records, use `true`.
+
 ## Defining a schema
 
 Schemas are built from `StructField`s, each with a name, data type, and nullability:

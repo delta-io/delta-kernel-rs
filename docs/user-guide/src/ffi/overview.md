@@ -229,7 +229,7 @@ feature is enabled; the rest are always available.
 
 | Function | Purpose |
 |----------|---------|
-| `new_update_table_txn_builder` | Create a builder from a snapshot |
+| `new_update_table_txn_builder` | Create an update-table transaction builder from a snapshot |
 | `update_table_txn_builder_with_engine_info` | Record a connector name and version before writing |
 | `update_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
 | `update_table_txn_builder_with_operation` / `update_table_txn_builder_with_custom_operation` | Select the operation stored in table history |
@@ -300,6 +300,7 @@ unpartitioned writes.
 |----------|---------|
 | `new_create_table_txn_builder` | Create a builder for a new Delta table with a schema |
 | `create_table_txn_builder_with_table_property` | Add a table property to the builder |
+| `create_table_txn_builder_with_data_change` | Override the default `true` file-action data-change flag before `build()` |
 | `create_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
 | `create_table_txn_builder_with_operation_parameters` | Replace the operation parameters recorded in `commitInfo` |
 | `create_table_txn_builder_with_operation_metrics` / `create_table_txn_with_operation_metrics` | Set metrics before writing or replace them with write-time results |

@@ -30,7 +30,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
     CommittedTransaction, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
-use delta_kernel::{EngineData, KernelResult};
+use delta_kernel::EngineData;
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
     free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
@@ -123,6 +123,7 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine_data::FilteredEngineData;
+    use delta_kernel::metrics::MetricEvent;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
@@ -149,7 +150,10 @@ mod tests {
     use tempfile::tempdir;
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
-    use test_utils::{set_json_value, setup_test_tables, test_read};
+    use test_utils::{
+        install_thread_local_metrics_reporter, set_json_value, setup_test_tables, test_read,
+        CapturingReporter,
+    };
     use write_context::{
         create_table_txn_get_partitioned_write_context,
         create_table_txn_get_unpartitioned_write_context, free_write_context,
@@ -2080,11 +2084,20 @@ mod tests {
         version
     }
 
+    #[rstest]
+    #[case::default(&[], true)]
+    #[case::explicit_true(&[true], true)]
+    #[case::explicit_false(&[false], false)]
+    #[case::last_true(&[false, true], true)]
+    #[case::last_false(&[true, false], false)]
     #[tokio::test]
-    async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_create_table_basic_preserves_data_change(
+        #[case] overrides: &[bool],
+        #[case] expected_data_change: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_create_table", None);
-        let (table_path, engine, builder) = create_table_txn_builder(
+        let (table_path, engine, mut builder) = create_table_txn_builder(
             &store,
             &table_url,
             vec![
@@ -2093,8 +2106,24 @@ mod tests {
             ],
         );
         let table_path_str = table_path.as_str();
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        for &data_change in overrides {
+            builder = unsafe { create_table_txn_builder_with_data_change(builder, data_change) };
+        }
 
         build_and_commit(builder, &engine);
+        let metrics = reporter
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                MetricEvent::TransactionCommitSuccess(metrics) => Some(metrics),
+                _ => None,
+            })
+            .expect("create-table commit metrics");
+        assert_eq!(metrics.data_change, expected_data_change);
+        assert_eq!(metrics.num_add_files, 0);
+        assert_eq!(metrics.num_remove_files, 0);
 
         // Verify by opening a snapshot of the created table
         let snap =
@@ -2148,10 +2177,6 @@ mod tests {
         }
     }
 
-    /// A visitor-built geo schema handed to the create-table path must be rejected: `create_table`
-    /// does not declare the `geospatial` reader/writer feature for the tables it builds, so a
-    /// schema containing a geometry/geography column always fails table-configuration validation
-    /// before any data write is attempted.
     #[cfg(feature = "geo-type-in-dev")]
     #[tokio::test]
     async fn test_create_table_rejects_geospatial_schema() -> Result<(), Box<dyn std::error::Error>>

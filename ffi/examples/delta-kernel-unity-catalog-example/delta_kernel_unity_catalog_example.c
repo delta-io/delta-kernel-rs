@@ -220,7 +220,6 @@ int main(int argc, char* argv[])
 
     SharedSnapshot* snapshot = snapshot_res.ok;
 
-    // Configure transaction intent, then build with the UC committer.
     HandleExclusiveUpdateTableTransactionBuilder txn_builder =
         new_update_table_txn_builder(snapshot);
     const char* engine_info = "uc_example_engine";
