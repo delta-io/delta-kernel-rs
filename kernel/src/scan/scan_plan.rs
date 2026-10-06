@@ -12,7 +12,8 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD, SIDECAR_NAME,
+    STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
@@ -167,7 +168,7 @@ impl Scan {
                     )
             })?
             .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?
-            .project_patch(|patch| patch.with_metadata_output(self).drop(VERSION).drop(IS_ADD))
+            .project_patch(|patch| patch.with_metadata_output(self).drop(VERSION))
     }
 
     /// Build commit JSON actions in the requested output shape.
@@ -215,12 +216,7 @@ impl Scan {
                 // Removes must survive replay; only adds are safe to prune.
                 p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
             })?
-            .project_patch(|patch| {
-                patch
-                    .with_metadata_output(self)
-                    .drop(crate::actions::REMOVE_NAME)
-                    .drop(IS_ADD)
-            })
+            .project_patch(|patch| patch.with_metadata_output(self))
     }
 }
 
@@ -376,7 +372,8 @@ trait ProjectionStructPatchBuilderExt<'a> {
     /// ```
     /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
     /// partition values are selected independently and omitted for unpartitioned tables. Fields
-    /// needed only for pruning are omitted.
+    /// needed only for pruning are omitted. The consumed `remove` and `is_add` working columns are
+    /// also removed; `version` and `file_action_key` remain available for replay.
     fn with_metadata_output(self, scan: &Scan) -> Self;
 }
 
@@ -444,7 +441,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             self = self.drop_at([ADD_NAME], PARTITION_VALUES_PARSED);
         }
 
-        self
+        if self.input_schema().contains_col([REMOVE_NAME]) {
+            self = self.drop(REMOVE_NAME);
+        }
+
+        self.drop(IS_ADD)
     }
 }
 
