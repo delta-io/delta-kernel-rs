@@ -411,30 +411,27 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         scan: &Scan,
         stats_output_drops: &[(ColumnName, String)],
     ) -> Self {
-        let input_schema = self.input_schema();
-        let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
-        let has_struct_stats = input_schema.contains_col([ADD_NAME, STATS_PARSED]);
-        let has_struct_partitions = input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED]);
-
-        if !scan.stats.synthesize_json && has_json_stats {
+        if !scan.stats.synthesize_json && self.input_schema().contains_col([ADD_NAME, STATS]) {
             self = self.drop_at([ADD_NAME], STATS);
         }
 
-        self = if scan.state_info.physical_stats_output_schema().is_some() {
-            stats_output_drops.iter().fold(self, |patch, (path, name)| {
-                patch.drop_at(path.clone(), name)
-            })
-        } else if has_struct_stats {
-            self.drop_at([ADD_NAME], STATS_PARSED)
-        } else {
-            self
-        };
-
-        if scan.partition_values.parsed_struct || !has_struct_partitions {
-            self
-        } else {
-            self.drop_at([ADD_NAME], PARTITION_VALUES_PARSED)
+        if scan.state_info.physical_stats_output_schema().is_some() {
+            for (path, name) in stats_output_drops {
+                self = self.drop_at(path.clone(), name);
+            }
+        } else if self.input_schema().contains_col([ADD_NAME, STATS_PARSED]) {
+            self = self.drop_at([ADD_NAME], STATS_PARSED);
         }
+
+        if !scan.partition_values.parsed_struct
+            && self
+                .input_schema()
+                .contains_col([ADD_NAME, PARTITION_VALUES_PARSED])
+        {
+            self = self.drop_at([ADD_NAME], PARTITION_VALUES_PARSED);
+        }
+
+        self
     }
 }
 
