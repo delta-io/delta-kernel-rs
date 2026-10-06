@@ -77,6 +77,8 @@ pub(crate) struct SnapshotHint {
     freshness: SnapshotHintFreshness,
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl SnapshotHint {
     /// Creates a hint from connector-provided log paths and table state.
     ///
@@ -124,6 +126,76 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+        })
+    }
+
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn with_max_published_version(mut self, version: Option<Version>) -> Self {
+        self.log_segment_files.max_published_version = version;
+        self
+    }
+
+    /// Returns the version described by this hint.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Returns the retained log files and publication watermark.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn log_segment_files(&self) -> &LogSegmentFiles {
+        &self.log_segment_files
+    }
+
+    /// Returns the protocol at the hinted version.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
+
+    /// Returns the metadata at the hinted version.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Returns the retained checkpoint hint, if present.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn last_checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+        self.last_checkpoint_hint.as_ref()
+    }
+
+    /// Returns the retained CRC state, if present.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn crc(&self) -> Option<&Crc> {
+        self.crc.as_deref()
+    }
+
+    /// Returns the freshness established when the hint was captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn freshness(&self) -> SnapshotHintFreshness {
+        self.freshness
+    }
+
+    pub(crate) fn from_snapshot(snapshot: &Snapshot) -> DeltaResult<Self> {
+        let segment = snapshot.log_segment();
+        require!(
+            segment.listed.ascending_compaction_files.is_empty(),
+            SnapshotHintError::LogCompaction.into()
+        );
+        Ok(Self {
+            version: snapshot.version(),
+            log_segment_files: segment.listed.clone(),
+            protocol: snapshot.table_configuration().protocol().clone(),
+            metadata: snapshot.table_configuration().metadata().clone(),
+            last_checkpoint_hint: segment.checkpoint_hint().cloned(),
+            crc: snapshot.crc_at_version().cloned(),
+            freshness: if snapshot.is_built_as_latest() {
+                SnapshotHintFreshness::Latest
+            } else {
+                SnapshotHintFreshness::Unverified
+            },
         })
     }
 }

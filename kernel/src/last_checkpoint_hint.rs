@@ -108,7 +108,62 @@ pub(crate) enum HintAction {
     CheckpointMetadata(CheckpointMetadata),
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl LastCheckpointHint {
+    /// Returns the checkpoint version.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Returns the checkpoint action count.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn size(&self) -> i64 {
+        self.size
+    }
+
+    /// Returns the number of checkpoint parts, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn parts(&self) -> Option<usize> {
+        self.parts
+    }
+
+    /// Returns the checkpoint byte size, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn size_in_bytes(&self) -> Option<i64> {
+        self.size_in_bytes
+    }
+
+    /// Returns the Add action count, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn num_of_add_files(&self) -> Option<i64> {
+        self.num_of_add_files
+    }
+
+    /// Returns the checkpoint schema, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn checkpoint_schema(&self) -> Option<&SchemaRef> {
+        self.checkpoint_schema.as_ref()
+    }
+
+    /// Returns the checkpoint checksum, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn checksum(&self) -> Option<&str> {
+        self.checksum.as_deref()
+    }
+
+    /// Returns checkpoint tags, preserving absent versus empty maps.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn tags(&self) -> Option<&HashMap<String, String>> {
+        self.tags.as_ref()
+    }
+
+    /// Returns the embedded V2 checkpoint state, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn v2_checkpoint(&self) -> Option<&LastCheckpointV2> {
+        self.v2_checkpoint.as_ref()
+    }
     /// Reconstructs a checkpoint hint from its serialized fields, dropping oversized sidecar and
     /// non-file-action arrays so the retained hint is always bounded.
     ///
@@ -281,7 +336,39 @@ impl LastCheckpointHint {
     }
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl LastCheckpointV2 {
+    /// Returns the checkpoint file name.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the checkpoint byte size, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn size_in_bytes(&self) -> Option<i64> {
+        self.size_in_bytes
+    }
+
+    /// Returns the checkpoint modification time, if captured.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn modification_time(&self) -> Option<i64> {
+        self.modification_time
+    }
+
+    /// Returns sidecar actions, preserving absent versus empty arrays.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn sidecar_files(&self) -> Option<&[Sidecar]> {
+        self.sidecar_files.as_deref()
+    }
+
+    /// Returns non-file actions, preserving absent versus empty arrays.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub fn non_file_actions(&self) -> Option<&[HintAction]> {
+        self.non_file_actions.as_deref()
+    }
+
     /// Reconstructs V2 checkpoint state from its serialized fields.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]

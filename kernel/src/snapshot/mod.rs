@@ -400,6 +400,15 @@ impl Snapshot {
     // Field accessors and state queries
     // ============================================================================
 
+    /// Captures retained snapshot state as an owned hint without engine I/O.
+    ///
+    /// The hint preserves build-time freshness and only state retained at this version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn to_snapshot_hint(&self) -> DeltaResult<SnapshotHint> {
+        SnapshotHint::from_snapshot(self)
+    }
+
     /// Log segment this snapshot uses
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {

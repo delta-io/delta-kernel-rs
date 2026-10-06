@@ -1,16 +1,71 @@
-//! Typed FFI construction of connector-provided snapshot hints.
+//! Construction and export of snapshot hints.
 
 use delta_kernel::snapshot::{
     SnapshotHint, SnapshotHintError, SnapshotHintFreshness, SnapshotLogState, SnapshotScanState,
     SnapshotState,
 };
 use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::delta_types::{FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{FfiSnapshotBuilder, FfiSnapshotBuilderSource, MutableFfiSnapshotBuilder};
+use crate::{
+    FfiSnapshotBuilder, FfiSnapshotBuilderSource, MutableFfiSnapshotBuilder, NullableCvoid,
+    OptionalValue, SharedExternEngine, SharedSnapshot,
+};
+
+mod export;
+
+/// An owned snapshot hint exported from a validated snapshot.
+#[handle_descriptor(target=SnapshotHint, mutable=true, sized=true)]
+pub struct ExclusiveSnapshotHint;
+
+/// Exports retained snapshot state without engine I/O.
+///
+/// The snapshot and engine are borrowed. The caller owns the returned hint and must eventually
+/// release it with [`free_snapshot_hint`].
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_to_snapshot_hint(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveSnapshotHint>> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    snapshot
+        .to_snapshot_hint()
+        .map(|hint| Box::new(hint).into())
+        .into_extern_result(&engine)
+}
+
+/// Releases an exported snapshot hint.
+///
+/// The handle is consumed and must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn free_snapshot_hint(hint: Handle<ExclusiveSnapshotHint>) {
+    unsafe { hint.into_inner() };
+}
+
+/// Receives one complete borrowed hint. Nested storage expires when the callback returns.
+pub type SnapshotHintVisitor = extern "C" fn(context: NullableCvoid, hint: *const FfiSnapshotHint);
+
+/// Visits retained hint state without engine I/O or transferring ownership.
+///
+/// The callback must copy retained values and must not reenter or consume the hint.
+#[no_mangle]
+pub unsafe extern "C" fn visit_snapshot_hint(
+    hint: Handle<ExclusiveSnapshotHint>,
+    engine: Handle<SharedExternEngine>,
+    context: NullableCvoid,
+    visitor: SnapshotHintVisitor,
+) -> ExternResult<bool> {
+    let hint = unsafe { hint.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    export::visit(hint, context, visitor)
+        .map(|()| true)
+        .into_extern_result(&engine)
+}
 
 mod state;
 use state::BorrowedSnapshotState;
@@ -49,6 +104,10 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     /// Optional CRC state. Null means absent.
     pub crc: *const FfiCrc,
+    /// Whether `max_published_version` was exported explicitly.
+    pub has_explicit_max_published_version: bool,
+    /// Observed publication watermark, preserving explicit absence.
+    pub max_published_version: OptionalValue<Version>,
 }
 
 /// Borrowed snapshot components needed to validate and plan a default scan.
@@ -144,7 +203,7 @@ unsafe fn snapshot_builder_set_snapshot_hint_with_schema_impl(
     };
     let last_checkpoint_hint = state.last_checkpoint()?;
     let crc = state.crc()?;
-    let snapshot_hint = SnapshotHint::try_new(
+    let mut snapshot_hint = SnapshotHint::try_new(
         value.version,
         log_paths,
         protocol,
@@ -153,6 +212,11 @@ unsafe fn snapshot_builder_set_snapshot_hint_with_schema_impl(
         crc,
         freshness,
     )?;
+    if value.has_explicit_max_published_version {
+        snapshot_hint = snapshot_hint.with_max_published_version(
+            Option::<&Version>::from(&value.max_published_version).copied(),
+        );
+    }
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(true)
 }

@@ -25,14 +25,13 @@ use crate::log_path::FfiLogPath;
 use crate::plans::result::CPlanResult;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{get_plan_based_engine, get_plan_executor};
+#[cfg(feature = "declarative-plans")]
+use crate::KernelBytesSlice;
 use crate::{
     engine_to_handle, free_engine, free_snapshot, free_snapshot_builder, get_snapshot_builder,
     get_snapshot_builder_from, snapshot_builder_build, snapshot_builder_set_version, FfiFileStats,
-    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    KernelI64Slice, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
 };
-#[cfg(feature = "declarative-plans")]
-use crate::{KernelBytesSlice, NullableCvoid};
-
 fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
 }
@@ -207,6 +206,8 @@ fn test_snapshot_hint(
         metadata: test_metadata(),
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
+        has_explicit_max_published_version: false,
+        max_published_version: OptionalValue::None,
     }
 }
 
@@ -222,6 +223,70 @@ fn test_snapshot_scan_state(hint: &FfiSnapshotHint) -> FfiSnapshotScanState {
         protocol: copy_protocol(&hint.protocol),
         metadata: copy_metadata(&hint.metadata),
         last_checkpoint: hint.last_checkpoint,
+    }
+}
+
+struct VisitedHint {
+    builder: Handle<MutableFfiSnapshotBuilder>,
+    result: Option<ExternResult<bool>>,
+}
+
+extern "C" fn install_visited_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {
+    let state = unsafe { &mut *context.unwrap().as_ptr().cast::<VisitedHint>() };
+    state.result = Some(unsafe { snapshot_builder_set_snapshot_hint(&mut state.builder, &*hint) });
+}
+
+#[test]
+fn exported_hint_outlives_source_and_rebuilds_equivalent_state() {
+    let engine = test_engine();
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        123,
+        456,
+    );
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Latest,
+    );
+    hint.has_explicit_max_published_version = true;
+    hint.max_published_version = OptionalValue::Some(0);
+    let mut builder = test_builder(&engine);
+    unsafe { ok_or_panic(snapshot_builder_set_snapshot_hint(&mut builder, &hint)) };
+    let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let expected_segment = unsafe { source.as_ref() }.log_segment().clone();
+    let exported = unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            source.shallow_copy(),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(source) };
+
+    let mut visited = VisitedHint {
+        builder: test_builder(&engine),
+        result: None,
+    };
+    assert!(unsafe {
+        ok_or_panic(visit_snapshot_hint(
+            exported.shallow_copy(),
+            engine.shallow_copy(),
+            Some(std::ptr::NonNull::from(&mut visited).cast()),
+            install_visited_hint,
+        ))
+    });
+    assert!(ok_or_panic(visited.result.take().unwrap()));
+    unsafe { free_snapshot_hint(exported) };
+    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(visited.builder)) };
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
+    assert_eq!(rebuilt_ref.protocol().unwrap().min_reader_version(), 1);
+    assert_eq!(rebuilt_ref.metadata().unwrap().id(), "table-id");
+    assert!(rebuilt_ref.is_built_as_latest());
+
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
     }
 }
 
@@ -729,6 +794,8 @@ fn aggregate_setter_rejects_null_nonempty_log_path_array() {
         metadata: test_metadata(),
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
+        has_explicit_max_published_version: false,
+        max_published_version: OptionalValue::None,
     };
     let result = unsafe { snapshot_builder_set_snapshot_hint(&mut builder, &hint) };
     assert_extern_result_error_contains(
