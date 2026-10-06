@@ -45,7 +45,7 @@ pub(crate) const TIGHT_BOUNDS: &str = "tight_bounds";
 pub(crate) const VALUE_COUNT: &str = "value_count";
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
 pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
-pub(crate) const AVG_VALUE_SIZE_IN_BYTES: &str = "avg_value_size_in_bytes";
+pub(crate) const TOTAL_BYTES: &str = "total_bytes";
 
 /// In memory reprsentation of a node in the Adaptive Metadata Tree (AMT) format.
 ///
