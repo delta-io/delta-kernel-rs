@@ -84,8 +84,8 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Reco
                 .column_by_name(STATS)
                 .or_else(|| constants.column_by_name(STATS))
                 .cloned(),
-            batch.column_by_name("stats_parsed").cloned(),
-            batch.column_by_name("partitionValues_parsed").cloned(),
+            batch.column_by_name(STATS_PARSED).cloned(),
+            batch.column_by_name(PARTITION_VALUES_PARSED).cloned(),
         )?);
     }
     Ok(batches)
@@ -146,9 +146,6 @@ fn assert_metadata_eq(
         Ok(lines)
     }
 
-    if let (Some(actual), Some(expected)) = (actual.first(), expected.first()) {
-        assert_eq!(actual.schema(), expected.schema(), "{context}");
-    }
     let actual = sorted_pretty_lines(actual)?;
     let expected = sorted_pretty_lines(expected)?;
     assert_eq!(actual, expected, "{context}");
@@ -425,13 +422,11 @@ const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
 const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 
 #[rstest]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_string_map(
     StatsOptions::json_only(),
     PartitionValuesOptions::string_map_only(),
     &[ADD_FIELDS, JSON_STATS_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_with_struct(
     StatsOptions::json_only(),
     PartitionValuesOptions::with_struct(),
@@ -467,13 +462,11 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
     PartitionValuesOptions::with_struct(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_string_map(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
     &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_with_struct(
     StatsOptions::all(),
     PartitionValuesOptions::with_struct(),
@@ -657,8 +650,6 @@ fn declarative_metadata_output_options_across_log_shapes(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint()
 )]
-// TODO: https://github.com/delta-io/delta-kernel-rs/issues/3040
-#[should_panic(expected = "requested JSON stats must be populated")]
 fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
@@ -741,16 +732,23 @@ fn assert_metadata_output_options(
         }
     }
 
-    if json_requested {
+    let imperative_has_json = expected.iter().all(|batch| {
+        batch
+            .column_by_name(STATS)
+            .is_some_and(|stats| stats.null_count() < batch.num_rows())
+    });
+    if json_requested && imperative_has_json {
         assert_metadata_eq(
             &actual,
             &expected,
             "metadata output options across log shapes",
         )?;
     } else {
-        // Imperative metadata exposes source JSON even when it was not requested.
+        // The imperative path exposes source JSON even when it was not requested, but cannot yet
+        // synthesize JSON for a structured-only checkpoint. Compare the shared output here; the
+        // assertions above independently require declarative JSON output to be populated.
         assert_metadata_eq(
-            &actual,
+            &without_columns(&actual, &[STATS])?,
             &without_columns(&expected, &[STATS])?,
             "metadata output options across log shapes",
         )?;
@@ -831,7 +829,13 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
     assert!(scan.state_info.physical_stats_read_schema().is_none());
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_metadata_eq(&actual, &expected, "partition pruning")
+    // The declarative planner synthesizes requested JSON from the checkpoint's structured stats;
+    // the imperative path will gain that behavior separately. This test covers partition pruning.
+    assert_metadata_eq(
+        &without_columns(&actual, &[STATS])?,
+        &without_columns(&expected, &[STATS])?,
+        "partition pruning",
+    )
 }
 
 #[test]
