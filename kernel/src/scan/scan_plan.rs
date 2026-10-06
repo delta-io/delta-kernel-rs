@@ -66,9 +66,8 @@ impl Scan {
 
         let prune = stats_skipping_predicate(state);
         let prune = prune.as_ref();
-        let stats_output_drops = stats_output_drops(state);
 
-        let commit_actions = self.commit_arm(prune, &stats_output_drops)?;
+        let commit_actions = self.commit_arm(prune)?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -81,7 +80,7 @@ impl Scan {
             )
         })?;
 
-        let checkpoint_adds = self.checkpoint_arm(shape, prune, &stats_output_drops)?;
+        let checkpoint_adds = self.checkpoint_arm(shape, prune)?;
 
         let checkpoint_live_adds = checkpoint_adds
             .anti_join(
@@ -115,7 +114,6 @@ impl Scan {
         &self,
         shape: &CheckpointShape,
         prune: Option<&Predicate>,
-        stats_output_drops: &[(ColumnName, String)],
     ) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_read_schema();
@@ -169,12 +167,7 @@ impl Scan {
                     )
             })?
             .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?
-            .project_patch(|patch| {
-                patch
-                    .with_metadata_output(self, stats_output_drops)
-                    .drop(VERSION)
-                    .drop(IS_ADD)
-            })
+            .project_patch(|patch| patch.with_metadata_output(self).drop(VERSION).drop(IS_ADD))
     }
 
     /// Build commit JSON actions in the requested output shape.
@@ -188,11 +181,7 @@ impl Scan {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(
-        &self,
-        prune: Option<&Predicate>,
-        stats_output_drops: &[(ColumnName, String)],
-    ) -> KernelResult<PlanBuilder> {
+    fn commit_arm(&self, prune: Option<&Predicate>) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
         PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
@@ -228,7 +217,7 @@ impl Scan {
             })?
             .project_patch(|patch| {
                 patch
-                    .with_metadata_output(self, stats_output_drops)
+                    .with_metadata_output(self)
                     .drop(crate::actions::REMOVE_NAME)
                     .drop(IS_ADD)
             })
@@ -364,8 +353,7 @@ trait ProjectionStructPatchBuilderExt<'a> {
     fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self;
 
     /// Applies the engine-facing metadata shape after pruning consumes its working columns.
-    fn with_metadata_output(self, scan: &Scan, stats_output_drops: &[(ColumnName, String)])
-        -> Self;
+    fn with_metadata_output(self, scan: &Scan) -> Self;
 }
 
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
@@ -406,18 +394,19 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         }
     }
 
-    fn with_metadata_output(
-        mut self,
-        scan: &Scan,
-        stats_output_drops: &[(ColumnName, String)],
-    ) -> Self {
+    fn with_metadata_output(mut self, scan: &Scan) -> Self {
         if !scan.stats.synthesize_json && self.input_schema().contains_col([ADD_NAME, STATS]) {
             self = self.drop_at([ADD_NAME], STATS);
         }
 
-        if scan.state_info.physical_stats_output_schema().is_some() {
-            for (path, name) in stats_output_drops {
-                self = self.drop_at(path.clone(), name);
+        if let Some(output) = scan.state_info.physical_stats_output_schema() {
+            if let Some(read) = scan.state_info.physical_stats_read_schema() {
+                self = drop_unrequested_struct_fields(
+                    self,
+                    read,
+                    output,
+                    column_name!("add.stats_parsed"),
+                );
             }
         } else if self.input_schema().contains_col([ADD_NAME, STATS_PARSED]) {
             self = self.drop_at([ADD_NAME], STATS_PARSED);
@@ -435,42 +424,34 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
     }
 }
 
-/// Returns sparse nested drops that narrow read stats to the requested output stats.
-fn stats_output_drops(state: &StateInfo) -> Vec<(ColumnName, String)> {
-    let (Some(read), Some(output)) = (
-        state.physical_stats_read_schema(),
-        state.physical_stats_output_schema(),
-    ) else {
-        return Vec::new();
-    };
-    let mut drops = Vec::new();
-    collect_struct_projection_drops(read, output, column_name!("add.stats_parsed"), &mut drops);
-    drops
-}
-
-fn collect_struct_projection_drops(
+/// Applies sparse nested drops that narrow an input struct to the requested output struct.
+///
+/// The output schema is the consumer-visible subset of the read schema: it contains requested
+/// stats, while the read schema may additionally contain fields used only by data skipping.
+fn drop_unrequested_struct_fields<'a>(
+    mut patch: ProjectionStructPatchBuilder<'a>,
     input: &StructType,
     output: &StructType,
     path: ColumnName,
-    drops: &mut Vec<(ColumnName, String)>,
-) {
+) -> ProjectionStructPatchBuilder<'a> {
     for input_field in input.fields() {
         match output.field(input_field.name()) {
-            None => drops.push((path.clone(), input_field.name().clone())),
+            None => patch = patch.drop_at(path.clone(), input_field.name()),
             Some(output_field) => {
                 if let (DataType::Struct(input), DataType::Struct(output)) =
                     (input_field.data_type(), output_field.data_type())
                 {
-                    collect_struct_projection_drops(
+                    patch = drop_unrequested_struct_fields(
+                        patch,
                         input,
                         output,
                         path.join(&ColumnName::new([input_field.name()])),
-                        drops,
                     );
                 }
             }
         }
     }
+    patch
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
