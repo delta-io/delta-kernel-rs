@@ -6,7 +6,7 @@ use serde::de::Error as _;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::DataType;
+use super::{DataType, StructField};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{KernelError, Result};
 
@@ -54,8 +54,8 @@ impl UserDefinedType {
     ///
     /// # Errors
     ///
-    /// Returns an error if `sql_type` contains another UDT or `annotation` contains the reserved
-    /// key `type` or `sqlType`.
+    /// Returns an error if `sql_type` contains another UDT or a metadata column, or if `annotation`
+    /// contains the reserved key `type` or `sqlType`.
     pub fn try_new(
         sql_type: impl Into<DataType>,
         annotation: BTreeMap<String, Option<String>>,
@@ -64,6 +64,11 @@ impl UserDefinedType {
         if contains_udt(&sql_type) {
             return Err(KernelError::schema(
                 "A UDT sqlType must not contain another UDT",
+            ));
+        }
+        if contains_metadata_column(&sql_type) {
+            return Err(KernelError::schema(
+                "A UDT sqlType must not contain a metadata column",
             ));
         }
         if annotation.contains_key("type") || annotation.contains_key("sqlType") {
@@ -139,6 +144,24 @@ fn contains_udt(data_type: &DataType) -> bool {
     ContainsUdt.transform(data_type).is_err()
 }
 
+struct ContainsMetadataColumn;
+
+impl<'a> SchemaTransform<'a> for ContainsMetadataColumn {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+        if field.is_metadata_column() {
+            Err(())
+        } else {
+            self.recurse_into_struct_field(field)
+        }
+    }
+}
+
+fn contains_metadata_column(data_type: &DataType) -> bool {
+    ContainsMetadataColumn.transform(data_type).is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -177,6 +200,20 @@ mod tests {
     ]}}), "another UDT")]
     #[case(json!({"type":"udt", "sqlType":{"type":"map", "keyType":"string",
         "valueType":{"type":"udt", "sqlType":"long"}, "valueContainsNull":true}}), "another UDT")]
+    #[case(json!({"type":"udt", "sqlType":{"type":"struct", "fields":[
+        {"name":"row_index", "type":"long", "nullable":false,
+         "metadata":{"delta.metadataSpec":"row_index"}}
+    ]}}), "metadata column")]
+    #[case(json!({"type":"udt", "sqlType":{"type":"array", "elementType":
+        {"type":"struct", "fields":[
+            {"name":"row_id", "type":"long", "nullable":false,
+             "metadata":{"delta.metadataSpec":"row_id"}}
+        ]}, "containsNull":false}}), "metadata column")]
+    #[case(json!({"type":"udt", "sqlType":{"type":"map", "keyType":"string",
+        "valueType":{"type":"struct", "fields":[
+            {"name":"row_commit_version", "type":"long", "nullable":false,
+             "metadata":{"delta.metadataSpec":"row_commit_version"}}
+        ]}, "valueContainsNull":false}}), "metadata column")]
     fn reject_invalid(#[case] value: Value, #[case] message: &str) {
         let error = serde_json::from_value::<DataType>(value).unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
