@@ -4,24 +4,47 @@ use std::sync::Arc;
 use delta_kernel::actions::{CheckpointMetadata, Sidecar};
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::object_store::memory::InMemory;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::plans::proto::operation as proto_op;
+use delta_kernel::snapshot::{SnapshotLogState, SnapshotScanState, SnapshotState};
 use delta_kernel_default_engine::DefaultEngineBuilder;
+#[cfg(feature = "declarative-plans")]
+use prost::Message as _;
 
 use super::*;
 use crate::delta_types::*;
+#[cfg(feature = "declarative-plans")]
+use crate::error::EngineExecResult;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
     allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
     ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::result::CPlanResult;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{get_plan_based_engine, get_plan_executor};
 use crate::{
     engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
     snapshot_builder_build, snapshot_builder_with_version, FfiFileStats, KernelI64Slice,
     KernelStringSlice, OptionalValue, SharedExternEngine,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::{KernelBytesSlice, NullableCvoid};
 
 fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
+}
+
+fn schema_upload(schema: &str) -> Handle<ExclusiveSnapshotSchemaUpload> {
+    let upload = snapshot_schema_upload_new(schema.len());
+    for chunk in schema.as_bytes().chunks(65536) {
+        assert!(unsafe {
+            snapshot_schema_upload_append(upload.shallow_copy(), chunk.as_ptr(), chunk.len())
+        });
+    }
+    upload
 }
 
 fn invalid_utf8() -> KernelStringSlice {
@@ -81,6 +104,12 @@ fn copy_protocol(value: &FfiProtocol) -> FfiProtocol {
     }
 }
 
+fn copy_metadata(value: &FfiMetadata) -> FfiMetadata {
+    // FFI metadata contains borrowed pointer/length descriptors and has no destructor. This test
+    // keeps the backing values alive while both descriptors are used.
+    unsafe { std::ptr::read(value) }
+}
+
 fn test_metadata() -> FfiMetadata {
     FfiMetadata {
         id: slice("table-id"),
@@ -132,6 +161,27 @@ fn test_engine() -> Handle<SharedExternEngine> {
     )
 }
 
+#[cfg(feature = "declarative-plans")]
+extern "C" fn no_plan_execution(
+    _context: NullableCvoid,
+    _plan_proto: KernelBytesSlice,
+    _out: *mut EngineExecResult<CPlanResult>,
+) {
+    unreachable!("planning a hinted commit must not execute the plan");
+}
+
+#[cfg(feature = "declarative-plans")]
+unsafe fn plan_based_engine(fallback: &Handle<SharedExternEngine>) -> Handle<SharedExternEngine> {
+    let executor = unsafe { get_plan_executor(None, no_plan_execution) };
+    unsafe {
+        get_plan_based_engine(
+            executor,
+            OptionalValue::Some(fallback.shallow_copy()),
+            allocate_err,
+        )
+    }
+}
+
 fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<ExclusiveSnapshotBuilder> {
     unsafe {
         ok_or_panic(get_snapshot_builder(
@@ -157,6 +207,317 @@ fn test_snapshot_hint(
         metadata: test_metadata(),
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
+    }
+}
+
+fn test_snapshot_scan_state(hint: &FfiSnapshotHint) -> FfiSnapshotScanState {
+    FfiSnapshotScanState {
+        log_path_source: std::ptr::null(),
+        version: hint.version,
+        freshness: hint.freshness,
+        log_paths: LogPathArray {
+            ptr: hint.log_paths.ptr,
+            len: hint.log_paths.len,
+        },
+        protocol: copy_protocol(&hint.protocol),
+        metadata: copy_metadata(&hint.metadata),
+        last_checkpoint: hint.last_checkpoint,
+    }
+}
+
+#[test]
+fn externalized_core_borrows_validated_connector_state() {
+    let engine = test_engine();
+    let builder = test_builder(&engine);
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        1,
+        1,
+    );
+    let hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let owned = unsafe { snapshot.as_ref() };
+    assert_eq!(
+        SnapshotLogState::table_root(owned).as_str(),
+        "memory:///hinted-table/"
+    );
+    assert_eq!(SnapshotLogState::version(owned), 0);
+    assert!(!SnapshotLogState::is_latest(owned));
+    assert_eq!(
+        SnapshotScanState::protocol(owned)
+            .unwrap()
+            .min_reader_version(),
+        1
+    );
+    assert_eq!(SnapshotScanState::metadata(owned).unwrap().id(), "table-id");
+    assert!(SnapshotScanState::logical_schema(owned).is_ok());
+    assert!(SnapshotLogState::last_checkpoint(owned).unwrap().is_none());
+    assert!(SnapshotState::crc(owned).unwrap().is_none());
+    let mut path_count = 0;
+    SnapshotLogState::visit_log_paths(owned, &mut |batch| {
+        path_count += batch.len();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(path_count, 1);
+    let wrong_freshness = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Latest,
+    );
+    let rejected = unsafe {
+        snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &wrong_freshness,
+            42,
+            engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, FFIKernelError::InvalidSnapshotHint, "freshness");
+    let mut different_state = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    different_state.metadata.id = slice("different-table-id");
+    let rejected = unsafe {
+        snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &different_state,
+            42,
+            engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, FFIKernelError::InvalidSnapshotHint, "differs");
+    let changed_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+        2,
+        1,
+    );
+    let different_files = test_snapshot_hint(
+        std::slice::from_ref(&changed_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    let rejected = unsafe {
+        snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &different_files,
+            42,
+            engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, FFIKernelError::InvalidSnapshotHint, "differs");
+    assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+
+    let validated_core =
+        unsafe { snapshot_externalize_validated_core(snapshot.shallow_copy(), 41) };
+    assert_eq!(
+        unsafe { snapshot_core_version(validated_core.shallow_copy()) },
+        0
+    );
+    let validated_schema = unsafe {
+        ok_or_panic(snapshot_core_logical_schema(
+            validated_core.shallow_copy(),
+            &hint,
+            41,
+            allocate_err,
+        ))
+    };
+    unsafe {
+        crate::free_schema(validated_schema);
+        free_snapshot_core(validated_core);
+    }
+
+    let core = unsafe {
+        ok_or_panic(snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe { free_snapshot(snapshot) };
+
+    assert_eq!(unsafe { snapshot_core_version(core.shallow_copy()) }, 0);
+    let schema = unsafe {
+        ok_or_panic(snapshot_core_logical_schema(
+            core.shallow_copy(),
+            &hint,
+            42,
+            allocate_err,
+        ))
+    };
+    unsafe { crate::free_schema(schema) };
+    let protocol = unsafe {
+        ok_or_panic(snapshot_core_get_protocol(
+            core.shallow_copy(),
+            &hint,
+            42,
+            allocate_err,
+        ))
+    };
+    unsafe { crate::free_protocol(protocol) };
+    let metadata = unsafe {
+        ok_or_panic(snapshot_core_get_metadata(
+            core.shallow_copy(),
+            &hint,
+            42,
+            allocate_err,
+        ))
+    };
+    unsafe { crate::free_metadata(metadata) };
+
+    // Empty schemas can still be externalized and read through getters, but not scanned.
+    #[cfg(feature = "declarative-plans")]
+    {
+        let plan_engine = unsafe { plan_based_engine(&engine) };
+        let scan_state = test_snapshot_scan_state(&hint);
+        let rejected = unsafe {
+            snapshot_core_declarative_metadata_plan(
+                core.shallow_copy(),
+                &scan_state,
+                42,
+                plan_engine.shallow_copy(),
+            )
+        };
+        assert_extern_result_error_contains(rejected, FFIKernelError::GenericError, "empty schema");
+        unsafe { free_engine(plan_engine) };
+    }
+
+    let wrong_generation =
+        unsafe { snapshot_core_logical_schema(core.shallow_copy(), &hint, 43, allocate_err) };
+    assert_extern_result_error_contains(
+        wrong_generation,
+        FFIKernelError::InvalidSnapshotHint,
+        "generation",
+    );
+    unsafe {
+        free_snapshot_core(core);
+        free_engine(engine);
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+#[rstest::rstest]
+#[case(FfiSnapshotHintFreshness::Unverified)]
+#[case(FfiSnapshotHintFreshness::Latest)]
+fn externalized_core_builds_declarative_plan_from_scoped_host_state(
+    #[case] freshness: FfiSnapshotHintFreshness,
+    #[values(false, true)] partitioned: bool,
+    #[values(false, true)] batched: bool,
+    #[values(false, true)] uploaded: bool,
+) {
+    let engine = test_engine();
+    let builder = test_builder(&engine);
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        1,
+        1,
+    );
+    let mut hint = test_snapshot_hint(std::slice::from_ref(&log_path), 0, freshness);
+    hint.metadata.schema_string = slice(
+        r#"{"type":"struct","fields":[{"name":"value","type":"long","nullable":true,"metadata":{}},{"name":"nested","type":{"type":"struct","fields":[{"name":"child","type":"string","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
+    );
+    let partition_columns = [slice("value")];
+    if partitioned {
+        hint.metadata.partition_columns = unsafe { FfiStringArray::new_unsafe(&partition_columns) };
+    }
+    let schema_text = unsafe { hint.metadata.schema_string.try_to_string() }.unwrap();
+    let builder = if uploaded {
+        let schema = std::mem::replace(&mut hint.metadata.schema_string, slice(""));
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_snapshot_hint_with_schema(
+                builder,
+                &hint,
+                schema_upload(&schema_text),
+            ))
+        };
+        hint.metadata.schema_string = schema;
+        builder
+    } else {
+        unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let core = unsafe {
+        ok_or_panic(snapshot_externalize_core(
+            snapshot.shallow_copy(),
+            &hint,
+            42,
+            engine.shallow_copy(),
+        ))
+    };
+    let plan_engine = unsafe { plan_based_engine(&engine) };
+    let inner_engine = unsafe { plan_engine.as_ref() }.engine();
+    let native_snapshot = unsafe { snapshot.into_inner() };
+    let native_plan = native_snapshot
+        .clone()
+        .scan_builder()
+        .build()
+        .unwrap()
+        .declarative_metadata_scan_plan(inner_engine.as_ref())
+        .unwrap()
+        .expect("expected a native plan for a hinted commit");
+    let native_bytes = delta_kernel::Operation::QueryPlan(native_plan).to_proto_bytes();
+    let mut scan_state = test_snapshot_scan_state(&hint);
+    let source = crate::log_path::FfiLogPathSource {
+        context: std::ptr::from_ref(&hint.log_paths).cast_mut().cast(),
+        read_batch: read_test_log_batch,
+    };
+    if batched {
+        scan_state.log_paths = LogPathArray::empty();
+        scan_state.log_path_source = &source;
+    }
+
+    if uploaded {
+        scan_state.metadata.schema_string = slice("");
+    }
+    let run_plan = |generation| unsafe {
+        if uploaded {
+            snapshot_core_declarative_metadata_plan_with_schema(
+                core.shallow_copy(),
+                &scan_state,
+                generation,
+                schema_upload(&schema_text),
+                plan_engine.shallow_copy(),
+            )
+        } else {
+            snapshot_core_declarative_metadata_plan(
+                core.shallow_copy(),
+                &scan_state,
+                generation,
+                plan_engine.shallow_copy(),
+            )
+        }
+    };
+    let rejected = run_plan(43);
+    assert_extern_result_error_contains(
+        rejected,
+        FFIKernelError::InvalidSnapshotHint,
+        "generation",
+    );
+
+    let result = run_plan(42);
+    let bytes = match ok_or_panic(result) {
+        OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
+        OptionalValue::None => panic!("expected a plan for a hinted commit"),
+    };
+    assert_eq!(bytes, native_bytes);
+    let operation = proto_op::Operation::decode(bytes.as_slice()).unwrap();
+    assert!(matches!(
+        operation.op,
+        Some(proto_op::operation::Op::QueryPlan(_))
+    ));
+
+    unsafe {
+        free_snapshot_core(core);
+        free_engine(plan_engine);
+        free_engine(engine);
     }
 }
 
@@ -894,5 +1255,70 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     unsafe {
         free_snapshot(snapshot);
         free_engine(engine);
+    }
+}
+
+// Return one entry at a time, including a final empty batch, to exercise callback lifetimes.
+unsafe extern "C" fn read_test_log_batch(
+    context: *mut std::ffi::c_void,
+    offset: usize,
+    max_entries: usize,
+    _max_bytes: usize,
+    output: *mut LogPathArray,
+) -> bool {
+    assert!(max_entries > 0);
+    let source = unsafe { &*context.cast::<LogPathArray>() };
+    assert!(offset <= source.len);
+    unsafe {
+        *output = LogPathArray {
+            ptr: source.ptr.add(offset),
+            len: usize::from(offset < source.len),
+        };
+    }
+    true
+}
+
+#[test]
+fn borrowed_log_batch_errors_are_terminal() {
+    unsafe extern "C" fn fail(
+        _: *mut std::ffi::c_void,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: *mut LogPathArray,
+    ) -> bool {
+        false
+    }
+    unsafe extern "C" fn oversized(
+        _: *mut std::ffi::c_void,
+        _: usize,
+        _: usize,
+        _: usize,
+        output: *mut LogPathArray,
+    ) -> bool {
+        unsafe {
+            *output = LogPathArray {
+                ptr: std::ptr::null(),
+                len: 257,
+            };
+        }
+        true
+    }
+    let hint = test_snapshot_hint(&[], 0, FfiSnapshotHintFreshness::Unverified);
+    let root = url::Url::parse("memory:///table/").unwrap();
+    for callback in [fail, oversized] {
+        let source = crate::log_path::FfiLogPathSource {
+            context: std::ptr::null_mut(),
+            read_batch: callback,
+        };
+        let mut value = test_snapshot_scan_state(&hint);
+        value.log_path_source = &source;
+        let state = super::state::BorrowedSnapshotScanState {
+            value: &value,
+            table_root: &root,
+        };
+        let mut paths = state.ordered_log_paths().unwrap().unwrap();
+        assert!(paths.next().unwrap().is_err());
+        assert!(paths.next().is_none());
     }
 }

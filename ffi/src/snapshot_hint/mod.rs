@@ -1,6 +1,9 @@
 //! Typed FFI construction of connector-provided snapshot hints.
 
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
+use delta_kernel::snapshot::{
+    SnapshotHint, SnapshotHintError, SnapshotHintFreshness, SnapshotLogState, SnapshotScanState,
+    SnapshotState,
+};
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::delta_types::{FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol};
@@ -8,6 +11,11 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
+
+mod state;
+use state::BorrowedSnapshotState;
+mod core;
+pub use core::*;
 
 /// Freshness claim attached to a connector-provided snapshot hint.
 ///
@@ -43,6 +51,29 @@ pub struct FfiSnapshotHint {
     pub crc: *const FfiCrc,
 }
 
+/// Borrowed snapshot components needed to validate and plan a default scan.
+///
+/// This omits CRC state because scan planning never reads it. Every pointer is borrowed only for
+/// the FFI call receiving this value.
+#[repr(C)]
+pub struct FfiSnapshotScanState {
+    /// Optional ordered, repeatable log-path source. When present, `log_paths` must be empty.
+    /// Its batches are borrowed until the next read or the end of this FFI call.
+    pub log_path_source: *const crate::log_path::FfiLogPathSource,
+    /// Target table version described by the scan state.
+    pub version: Version,
+    /// Connector-provided freshness claim for `version`.
+    pub freshness: FfiSnapshotHintFreshness,
+    /// Complete set of log paths needed to construct the log segment.
+    pub log_paths: LogPathArray,
+    /// Protocol action at `version`.
+    pub protocol: FfiProtocol,
+    /// Metadata action at `version`.
+    pub metadata: FfiMetadata,
+    /// Optional `_last_checkpoint` state. Null means absent.
+    pub last_checkpoint: *const FfiLastCheckpoint,
+}
+
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
     SnapshotHintError::Connector {
         message: message.into(),
@@ -75,31 +106,33 @@ impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
 unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
+    schema: Option<String>,
 ) -> KernelResult<()> {
-    if matches!(
-        &builder.source,
-        FfiSnapshotBuilderSource::ExistingSnapshot(_)
-    ) {
-        return Err(KernelError::unsupported(
-            "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
-        ));
-    }
+    let table_root = match &builder.source {
+        FfiSnapshotBuilderSource::TableRoot(table_root) => table_root,
+        FfiSnapshotBuilderSource::ExistingSnapshot(_) => {
+            return Err(KernelError::unsupported(
+                "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
+            ))
+        }
+    };
+    let state = BorrowedSnapshotState {
+        hint: value,
+        table_root,
+    };
     let freshness = value.freshness.into();
-    let log_paths = unsafe { value.log_paths.log_paths() }
-        .map_err(|source| invalid_with_source("supplied log paths are invalid", source))?;
-    let protocol = unsafe { value.protocol.try_to_kernel() }
-        .map_err(|source| invalid_with_source("supplied protocol is invalid", source))?;
-    let metadata = unsafe { value.metadata.try_to_kernel() }
-        .map_err(|source| invalid_with_source("supplied metadata is invalid", source))?;
-    let last_checkpoint_hint = unsafe { value.last_checkpoint.as_ref() }
-        .map(|checkpoint| unsafe { checkpoint.try_to_kernel() })
-        .transpose()
-        .map_err(|source| invalid_with_source("supplied _last_checkpoint is invalid", source))?;
-    let crc = unsafe { value.crc.as_ref() }
-        .map(|crc_value| unsafe { crc_value.try_to_kernel() })
-        .map(|result| result.map_err(invalid_crc))
-        .transpose()?
-        .map(std::sync::Arc::new);
+    let mut log_paths = Vec::new();
+    state.visit_log_paths(&mut |batch| {
+        log_paths.extend_from_slice(batch);
+        Ok(())
+    })?;
+    let protocol = state.protocol()?;
+    let metadata = match schema {
+        Some(schema) => unsafe { value.metadata.try_to_kernel_with_schema(schema) }?,
+        None => state.metadata()?,
+    };
+    let last_checkpoint_hint = state.last_checkpoint()?;
+    let crc = state.crc()?;
     let snapshot_hint = SnapshotHint::try_new(
         value.version,
         log_paths,
@@ -143,9 +176,54 @@ pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
+    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value, None) }
         .map(|_| builder.into())
         .into_extern_result(&engine.as_ref())
+}
+
+/// Install a snapshot hint using transferred schema storage instead of an inline schema string.
+/// Validation and builder replacement follow [`snapshot_builder_with_snapshot_hint`].
+///
+/// # Safety
+/// Consumes `builder` and `upload` unconditionally. The hint storage is borrowed as documented by
+/// [`snapshot_builder_with_snapshot_hint`]. The inline schema must be empty. No pinned Java array
+/// may remain acquired because errors may invoke the connector.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint_with_schema(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    value: &FfiSnapshotHint,
+    upload: Handle<ExclusiveSnapshotSchemaUpload>,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let upload = unsafe { upload.into_inner() };
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    let result = (|| {
+        if value.metadata.schema_string.len != 0 {
+            return Err(invalid("Schema supplied both inline and as an upload"));
+        }
+        let schema = upload.finish()?;
+        unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value, Some(schema)) }?;
+        Ok(builder.into())
+    })();
+    result.into_extern_result(&engine.as_ref())
+}
+
+pub(super) fn validate_handoff(
+    owned: &delta_kernel::Snapshot,
+    host: &dyn SnapshotState,
+) -> KernelResult<bool> {
+    if owned.version() != host.version() || owned.is_built_as_latest() != host.is_latest() {
+        return Err(invalid(
+            "host version or freshness differs from the native snapshot",
+        ));
+    }
+    if owned.table_root() != host.table_root() {
+        return Err(invalid("host table root differs from the native snapshot"));
+    }
+    if !owned.matches_state(host)? {
+        return Err(invalid("host state differs from the native snapshot"));
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

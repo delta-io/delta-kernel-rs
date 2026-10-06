@@ -9,11 +9,86 @@
 //! must serialize a reset against native work when they require a meaningful post-reset peak.
 
 #[cfg(feature = "alloc-tracking")]
+use std::alloc::{GlobalAlloc, Layout};
+#[cfg(feature = "alloc-tracking")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(feature = "alloc-tracking")]
 use peak_alloc::PeakAlloc;
 
 #[cfg(feature = "alloc-tracking")]
+static EXTERNAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "alloc-tracking")]
+static ACCOUNTED_PEAK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "alloc-tracking")]
+static INTERVAL_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "alloc-tracking")]
+struct AccountedAllocator;
+
+#[cfg(feature = "alloc-tracking")]
+fn sample_accounted() {
+    let current = PeakAlloc.current_usage();
+    INTERVAL_PEAK.fetch_max(current, Ordering::Relaxed);
+    ACCOUNTED_PEAK.fetch_max(
+        current.saturating_add(EXTERNAL_BYTES.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(feature = "alloc-tracking")]
+unsafe impl GlobalAlloc for AccountedAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let result = unsafe { PeakAlloc.alloc(layout) };
+        sample_accounted();
+        result
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let result = unsafe { PeakAlloc.alloc_zeroed(layout) };
+        sample_accounted();
+        result
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { PeakAlloc.dealloc(ptr, layout) };
+    }
+
+    // GlobalAlloc's default realloc calls this wrapper's alloc and dealloc. Like PeakAlloc,
+    // it allocates, copies and frees, while exposing the transient old-plus-new allocation peak.
+}
+
+#[cfg(feature = "alloc-tracking")]
 #[global_allocator]
-static GLOBAL_ALLOC: PeakAlloc = PeakAlloc;
+static GLOBAL_ALLOC: AccountedAllocator = AccountedAllocator;
+
+/// Report connector-scoped native payload bytes for simultaneous peak accounting.
+/// This excludes unreachable allocations awaiting GC, allocator overhead, and unreported buffers.
+/// It is a process-wide gauge; the caller must report every scope lifetime change consistently.
+#[no_mangle]
+pub extern "C" fn set_external_native_bytes(bytes: usize) {
+    #[cfg(feature = "alloc-tracking")]
+    {
+        EXTERNAL_BYTES.store(bytes, Ordering::Relaxed);
+        sample_accounted();
+    }
+    #[cfg(not(feature = "alloc-tracking"))]
+    let _ = bytes;
+}
+
+/// Maximum simultaneous requested Rust and reported connector-scoped bytes since peak reset.
+/// This is an advisory logical-lifetime measurement, not process RSS or a sum of separate peaks.
+#[no_mangle]
+pub extern "C" fn peak_accounted_native_bytes() -> u64 {
+    #[cfg(feature = "alloc-tracking")]
+    {
+        ACCOUNTED_PEAK.load(Ordering::Relaxed) as u64
+    }
+    #[cfg(not(feature = "alloc-tracking"))]
+    {
+        0
+    }
+}
 
 /// Whether this library was built with allocation tracking.
 ///
@@ -31,7 +106,7 @@ pub extern "C" fn alloc_tracking_enabled() -> bool {
 pub extern "C" fn peak_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
-        GLOBAL_ALLOC.peak_usage() as u64
+        PeakAlloc.peak_usage() as u64
     }
     #[cfg(not(feature = "alloc-tracking"))]
     {
@@ -47,7 +122,7 @@ pub extern "C" fn peak_native_bytes() -> u64 {
 pub extern "C" fn current_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
-        GLOBAL_ALLOC.current_usage() as u64
+        PeakAlloc.current_usage() as u64
     }
     #[cfg(not(feature = "alloc-tracking"))]
     {
@@ -65,9 +140,36 @@ pub extern "C" fn current_native_bytes() -> u64 {
 pub extern "C" fn reset_peak_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
-        let previous_peak = GLOBAL_ALLOC.peak_usage() as u64;
-        GLOBAL_ALLOC.reset_peak_usage();
+        let previous_peak = PeakAlloc.peak_usage() as u64;
+        PeakAlloc.reset_peak_usage();
+        ACCOUNTED_PEAK.store(
+            PeakAlloc
+                .current_usage()
+                .saturating_add(EXTERNAL_BYTES.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         previous_peak
+    }
+    #[cfg(not(feature = "alloc-tracking"))]
+    {
+        0
+    }
+}
+
+/// Returns the peak live Rust allocation bytes since the previous call and starts a new interval.
+///
+/// Taking the interval peak does not affect [`peak_native_bytes`]. The new interval starts from the
+/// current live total, so retained allocations remain represented even if no allocation occurs
+/// before the next call. A concurrent allocation is accounted to either the completed interval or
+/// the next one, depending on its ordering with the atomic exchange. Returns zero when built
+/// without `alloc-tracking`.
+#[no_mangle]
+pub extern "C" fn take_interval_peak_native_bytes() -> u64 {
+    #[cfg(feature = "alloc-tracking")]
+    {
+        let completed_peak = INTERVAL_PEAK.swap(0, Ordering::Relaxed) as u64;
+        INTERVAL_PEAK.fetch_max(PeakAlloc.current_usage(), Ordering::Relaxed);
+        completed_peak
     }
     #[cfg(not(feature = "alloc-tracking"))]
     {
@@ -79,6 +181,7 @@ pub extern "C" fn reset_peak_native_bytes() -> u64 {
 mod disabled_tests {
     use super::{
         alloc_tracking_enabled, current_native_bytes, peak_native_bytes, reset_peak_native_bytes,
+        take_interval_peak_native_bytes,
     };
 
     #[test]
@@ -87,22 +190,51 @@ mod disabled_tests {
         assert_eq!(peak_native_bytes(), 0);
         assert_eq!(current_native_bytes(), 0);
         assert_eq!(reset_peak_native_bytes(), 0);
+        assert_eq!(take_interval_peak_native_bytes(), 0);
     }
 }
 
 #[cfg(all(test, feature = "alloc-tracking"))]
 mod global_allocator_tests {
     use super::{
-        alloc_tracking_enabled, current_native_bytes, peak_native_bytes, reset_peak_native_bytes,
+        alloc_tracking_enabled, current_native_bytes, peak_accounted_native_bytes,
+        peak_native_bytes, reset_peak_native_bytes, set_external_native_bytes,
+        take_interval_peak_native_bytes,
     };
 
     // Far above incidental harness allocation, so the bounds below cannot be met by noise.
     const N: usize = 8 * 1024 * 1024;
 
     #[test]
+    fn joint_peak_includes_both_buffers_during_reallocation() {
+        set_external_native_bytes(0);
+        let mut buf = Vec::with_capacity(N);
+        buf.resize(N, 1u8);
+        reset_peak_native_bytes();
+        let before = current_native_bytes();
+        buf.reserve_exact(N);
+        assert!(peak_native_bytes() >= before + 2 * N as u64);
+        assert!(peak_accounted_native_bytes() >= peak_native_bytes());
+    }
+
+    #[test]
+    fn joint_peak_observes_overlapping_external_and_rust_allocations() {
+        set_external_native_bytes(N);
+        reset_peak_native_bytes();
+        let before = current_native_bytes();
+        let buf = vec![1u8; N];
+        assert!(peak_accounted_native_bytes() >= before + 2 * N as u64);
+        drop(buf);
+        set_external_native_bytes(0);
+        reset_peak_native_bytes();
+        assert!(peak_accounted_native_bytes() >= current_native_bytes());
+    }
+
+    #[test]
     fn installed_global_allocator_accounts_a_large_allocation() {
         assert!(alloc_tracking_enabled());
         let _ = reset_peak_native_bytes();
+        let _ = take_interval_peak_native_bytes();
         let before = current_native_bytes();
 
         let buf = vec![0u8; N];
@@ -112,9 +244,15 @@ mod global_allocator_tests {
             "alloc not tracked: {before} -> {during}"
         );
         assert!(peak_native_bytes() >= during);
+        let lifetime_peak = peak_native_bytes();
+        let interval_peak = take_interval_peak_native_bytes();
+        assert!(interval_peak >= during);
+        assert!(peak_native_bytes() >= lifetime_peak);
 
         drop(buf);
         let previous_peak = reset_peak_native_bytes();
         assert!(previous_peak >= during);
+        let next_interval_peak = take_interval_peak_native_bytes();
+        assert!(next_interval_peak >= during);
     }
 }

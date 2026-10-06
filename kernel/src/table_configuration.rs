@@ -10,7 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::warn;
@@ -24,7 +24,8 @@ use crate::scan::data_skipping::stats_schema::{
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    schema_has_invariants, validate_column_defaults_metadata, MakePhysical, SchemaRef, StructField,
+    StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -277,7 +278,7 @@ fn validate_partition_columns(
 /// After construction, call `ensure_operation_supported` to verify that the kernel supports the
 /// required operations for the table's protocol features.
 #[internal_api]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -285,17 +286,30 @@ pub(crate) struct TableConfiguration {
     logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
-    /// The subset of the logical schema that remains after excluding partition columns.
-    logical_schema_without_partition_columns: SchemaRef,
-    /// Physical schema for all columns (field names respect column mapping mode).
-    physical_schema: SchemaRef,
-    /// The subset of the physical schema that remains after excluding partition columns.
-    physical_data_schema_without_partition_columns: SchemaRef,
+    /// Physical schema, materialized only for operations that request it.
+    physical_schema: OnceLock<SchemaRef>,
+    /// Derived data schemas, built only for operations that use them.
+    filtered_data_schemas: OnceLock<(SchemaRef, SchemaRef)>,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
     version: Version,
 }
+
+impl PartialEq for TableConfiguration {
+    fn eq(&self, other: &Self) -> bool {
+        self.metadata == other.metadata
+            && self.protocol == other.protocol
+            && self.logical_schema == other.logical_schema
+            && self.has_column_with_default == other.has_column_with_default
+            && self.table_properties == other.table_properties
+            && self.column_mapping_mode == other.column_mapping_mode
+            && self.table_root == other.table_root
+            && self.version == other.version
+    }
+}
+
+impl Eq for TableConfiguration {}
 
 impl TableConfiguration {
     /// Constructs a [`TableConfiguration`] for a table located in `table_root` at `version`.
@@ -354,38 +368,13 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
-        let partition_columns: HashSet<&str> = metadata
-            .partition_columns()
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let physical_data_schema_without_partition_columns = {
-            let fields = logical_schema
-                .fields()
-                .zip(physical_schema.fields())
-                .filter(|(logical_field, _)| {
-                    !partition_columns.contains(logical_field.name().as_str())
-                })
-                .map(|(_, physical_field)| physical_field.clone());
-            // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
-        };
-        let logical_schema_without_partition_columns = {
-            let fields = logical_schema
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name().as_str()))
-                .cloned();
-            // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
-        };
+        MakePhysical::validate_read_column_mapping(column_mapping_mode, &logical_schema)?;
 
         let mut table_config = Self {
             logical_schema,
             has_column_with_default: false,
-            logical_schema_without_partition_columns,
-            physical_schema,
-            physical_data_schema_without_partition_columns,
+            physical_schema: OnceLock::new(),
+            filtered_data_schemas: OnceLock::new(),
             metadata,
             protocol,
             table_properties,
@@ -723,12 +712,45 @@ impl TableConfiguration {
 
     /// Returns the logical schema excluding partition columns.
     pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
-        self.logical_schema_without_partition_columns.clone()
+        self.filtered_data_schemas().0.clone()
     }
 
     /// Returns the physical data schema excluding partition columns.
     pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
-        self.physical_data_schema_without_partition_columns.clone()
+        self.filtered_data_schemas().1.clone()
+    }
+
+    fn filtered_data_schemas(&self) -> &(SchemaRef, SchemaRef) {
+        self.filtered_data_schemas.get_or_init(|| {
+            let physical_schema = self.physical_schema();
+            let partition_columns: HashSet<&str> = self
+                .metadata
+                .partition_columns()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if partition_columns.is_empty() {
+                return (self.logical_schema.clone(), physical_schema);
+            }
+            let physical_fields = self
+                .logical_schema
+                .fields()
+                .zip(physical_schema.fields())
+                .filter(|(logical_field, _)| {
+                    !partition_columns.contains(logical_field.name().as_str())
+                })
+                .map(|(_, physical_field)| physical_field.clone());
+            let logical_fields = self
+                .logical_schema
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
+                .cloned();
+            // Both are subsets of already-validated schemas.
+            (
+                Arc::new(StructType::new_unchecked(logical_fields)),
+                Arc::new(StructType::new_unchecked(physical_fields)),
+            )
+        })
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
@@ -801,7 +823,14 @@ impl TableConfiguration {
     /// physical column names derived from column mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
-        self.physical_schema.clone()
+        self.physical_schema
+            .get_or_init(|| {
+                Arc::new(
+                    self.logical_schema
+                        .make_validated_physical(self.column_mapping_mode),
+                )
+            })
+            .clone()
     }
 
     /// Whether partition column values must be materialized into data files.
@@ -1227,6 +1256,7 @@ impl TableConfiguration {
 mod test {
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use rstest::rstest;
 
@@ -1282,6 +1312,80 @@ mod test {
         #[case] error: &str,
     ) {
         assert_result_error_with_message(StatsOutputSchemas::try_new(logical, physical), error);
+    }
+
+    #[test]
+    fn unpartitioned_schema_views_share_backing() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "part": STRING,
+            })
+            .build();
+
+        assert!(Arc::ptr_eq(
+            &table_config.logical_schema,
+            &table_config.logical_schema_without_partition_columns()
+        ));
+        assert!(Arc::ptr_eq(
+            &table_config.physical_schema(),
+            &table_config.physical_data_schema_without_partition_columns()
+        ));
+    }
+
+    #[rstest]
+    fn physical_schema_is_lazy_and_preserves_eager_output(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+    ) {
+        let schema = test_schema_nested_with_column_mapping();
+        let expected = schema.make_physical(mode).unwrap();
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_column_mapping(Some(mode))
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ColumnMapping])
+                    .build(),
+            )
+            .build();
+        let untouched = config.clone();
+        assert!(config.physical_schema.get().is_none());
+        config.ensure_operation_supported(Operation::Scan).unwrap();
+        assert!(config.physical_schema.get().is_none());
+        let physical = config.physical_schema();
+        assert_eq!(*physical, expected);
+        assert!(Arc::ptr_eq(&physical, &config.physical_schema()));
+        assert!(untouched.physical_schema.get().is_none());
+        assert_eq!(config, untouched);
+    }
+
+    #[test]
+    fn partitioned_schema_views_remain_filtered() {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! {
+                nullable "value": INTEGER,
+                nullable "part": STRING,
+            })
+            .with_partition_columns(["part"])
+            .build();
+
+        assert_eq!(
+            table_config
+                .logical_schema_without_partition_columns()
+                .num_fields(),
+            1
+        );
+        assert_eq!(
+            table_config
+                .physical_data_schema_without_partition_columns()
+                .num_fields(),
+            1
+        );
     }
 
     #[test]
