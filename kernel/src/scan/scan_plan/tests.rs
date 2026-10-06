@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ::test_utils::assert_result_error_with_message;
 use ::test_utils::table_builder::{
     checkpoint_json_stats, checkpoint_struct_stats, no_checkpoint_stats, DataLayoutConfig,
     FeatureSet, LogState, TableConfig, TestTableBuilder,
@@ -285,6 +286,10 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str)
     &[ID_STATS_PARSED_FIELDS]
 )]
 #[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
+#[case::all(
+    StatsOptions::all(),
+    &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
+)]
 #[case::none(StatsOptions::none(), &[])]
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
@@ -316,6 +321,13 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate);
     let scan = builder.build()?;
+    if scan.stats.synthesize_json && !matches!(&scan.stats.struct_stats, StructStats::None) {
+        assert_result_error_with_message(
+            scan.declarative_metadata_scan_plan(engine.as_ref()),
+            "cannot output both JSON and structured stats",
+        );
+        return Ok(());
+    }
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     let actual_fields = leaf_paths(&actual);
     let imperative_fields = leaf_paths(&expected);
@@ -463,6 +475,21 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
     PartitionValuesOptions::with_struct(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
+#[case::all_string_map(
+    StatsOptions::all(),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+)]
+#[case::all_with_struct(
+    StatsOptions::all(),
+    PartitionValuesOptions::with_struct(),
+    &[
+        ADD_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        JSON_STATS_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
+)]
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
@@ -487,6 +514,13 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .with_stats(stats)
             .with_partition_values(partition_values)
             .build()?;
+        if scan.stats.synthesize_json && !matches!(&scan.stats.struct_stats, StructStats::None) {
+            assert_result_error_with_message(
+                scan.declarative_metadata_scan_plan(engine.as_ref()),
+                "cannot output both JSON and structured stats",
+            );
+            return Ok(());
+        }
         let plan = scan
             .declarative_metadata_scan_plan(engine.as_ref())?
             .expect("metadata plan");
@@ -666,12 +700,13 @@ fn declarative_metadata_output_options_across_log_shapes(
 fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
+    #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
 ) {
     assert_metadata_output_options(
         log_state,
         features,
         checkpoint_struct_stats(),
-        StatsOptions::json_only(),
+        stats,
         PartitionValuesOptions::with_struct(),
     )
     .unwrap();
@@ -709,6 +744,13 @@ fn assert_metadata_output_options(
         .with_stats(stats)
         .with_partition_values(partitions)
         .build()?;
+    if scan.stats.synthesize_json && !matches!(&scan.stats.struct_stats, StructStats::None) {
+        assert_result_error_with_message(
+            scan.declarative_metadata_scan_plan(&engine),
+            "cannot output both JSON and structured stats",
+        );
+        return Ok(());
+    }
     let actual = declarative_metadata(&scan, &engine)?;
 
     for batches in [&actual, &expected] {
