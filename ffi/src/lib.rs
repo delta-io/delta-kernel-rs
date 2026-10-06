@@ -514,8 +514,9 @@ mod private {
 
     use crate::handle::BoxExt;
 
-    /// Convert a `Vec<T>` into a thin pointer plus length, shrinking capacity to `len` so
-    /// [`Vec::from_raw_parts(ptr, len, len)`](Vec::from_raw_parts).
+    /// Convert a `Vec<T>` into a thin `(ptr, len)` pair, shrinking capacity to `len`.
+    ///
+    /// Pair with [`Vec::from_raw_parts(ptr.as_ptr(), len, len)`](Vec::from_raw_parts).
     fn vec_into_ffi_ptr<T>(val: Vec<T>) -> (NonNull<T>, usize) {
         let ptr = BoxExt::into_non_null(val.into_boxed_slice());
         (ptr.cast(), ptr.len())
