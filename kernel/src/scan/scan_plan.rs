@@ -352,7 +352,31 @@ trait ProjectionStructPatchBuilderExt<'a> {
     /// Parses add partition values when a compatible parsed field is not already present.
     fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self;
 
-    /// Applies the engine-facing metadata shape after pruning consumes its working columns.
+    /// Builds the output projection for requested stats and partition values. The base of this
+    /// transformation is the arm's working projection after parsed metadata has been added for
+    /// pruning.
+    ///
+    /// The output schema is:
+    /// ```text
+    /// add: struct<
+    ///   path: string,
+    ///   partitionValues: map<string, string>,
+    ///   size: long,
+    ///   modificationTime: long,
+    ///   dataChange: boolean,
+    ///   stats: string,                         // when JSON stats are requested
+    ///   tags: map<string, string>,
+    ///   deletionVector: struct<...>,
+    ///   baseRowId: long,
+    ///   defaultRowCommitVersion: long,
+    ///   clusteringProvider: string,
+    ///   stats_parsed: struct<...>,             // when parsed stats are requested
+    ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
+    /// >
+    /// ```
+    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
+    /// partition values are selected independently and omitted for unpartitioned tables. Fields
+    /// needed only for pruning are omitted.
     fn with_metadata_output(self, scan: &Scan) -> Self;
 }
 
