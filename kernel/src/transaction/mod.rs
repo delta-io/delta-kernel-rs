@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::BackReference;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
-    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
-    MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA,
+    LOG_TXN_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{BackReference, CheckpointAction};
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
@@ -367,7 +367,7 @@ where
 }
 
 // =============================================================================
-// Shared methods available on ALL transaction types
+// Imperative commit APIs
 // =============================================================================
 impl<S> Transaction<S> {
     /// Consume the transaction and commit it to the table. The result is a result of
@@ -402,186 +402,29 @@ impl<S> Transaction<S> {
     pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<S>> {
         let commit_start = Instant::now();
 
-        // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
-        // that accompany copied or updated rows, so both require the preservation acknowledgment.
-        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
-            self.effective_table_config
-                .validate_feature_support_for_remove()?;
-            self.ensure_row_tracking_preservation_acknowledged()?;
-        }
+        // === Pre-commit validation ===
+        self.validate_commit()?;
+        self.validate_file_actions()?;
 
-        // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
-        // Note: The commit info must always be the first action in the commit but we generate it in
-        // step 2 to fail early on duplicate transaction appIds
-        // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
-        // in the HashSet?
-        let mut app_ids = HashSet::with_capacity(self.set_transactions.len());
-        if let Some(dup) = self
-            .set_transactions
-            .iter()
-            .find(|t| !app_ids.insert(&t.app_id))
-        {
-            return Err(KernelError::generic(format!(
-                "app_id {} already exists in transaction",
-                dup.app_id
-            )));
-        }
-
-        self.validate_blind_append_semantics()?;
-        self.validate_append_only_semantics()?;
-        self.ensure_schema_non_empty_for_data_writes()?;
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        self.validate_manifest_write_semantics()?;
-
-        // Validate that the schema supports data writes when files are being added. Reads and
-        // metadata-only commits are always allowed.
-        if !self.add_files_metadata.is_empty() {
-            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
-        }
-
-        // If a data-changing transaction has add files together with remove files or DV updates,
-        // block it when CDF is enabled. Kernel cannot discern DML operations. DML operations that
-        // update rows require a `cdc` file, but Kernel does not currently support writing CDC
-        // files.
-        if !self.is_create_table()
-            && !self.add_files_metadata.is_empty()
-            && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
-            && self.data_change
-        {
-            let cdf_enabled = self
-                .effective_table_config
-                .is_feature_enabled(&TableFeature::ChangeDataFeed);
-            require!(
-                !cdf_enabled,
-                KernelError::generic(
-                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
-                     This would require writing CDC files for DML operations, which is not yet supported. \
-                     Consider using separate transactions: one to add files, another to remove files or update deletion vectors."
-                )
-            );
-        }
-
-        // Validate protocol-required add-file statistics.
-        // Note: Stats validation cannot use `StagedDataValidator` because its columns and types
-        // are determined at runtime, whereas `RowVisitor::selected_column_names_and_types` must
-        // return a static projection. Consequently, stats validation makes a separate pass for
-        // each stats column.
-        self.validate_add_files_stats(&self.add_files_metadata)?;
-
-        // Validate required fields for addFile.
-        write_validation::StagedDataValidator::staged_add_file(
-            self.effective_table_config.physical_partition_columns(),
-        )
-        .validate(&self.add_files_metadata)?;
-
-        write_validation::StagedDataValidator::staged_dv_matched_file(
-            self.effective_table_config.physical_partition_columns(),
-        )?
-        .validate_filtered(&self.dv_matched_files)?;
-
-        // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file()
-            .validate_filtered(&self.remove_files_metadata)?;
-
-        // Step 1: Generate SetTransaction actions
-        let set_transaction_actions = self
-            .set_transactions
-            .clone()
-            .into_iter()
-            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
-
-        // Step 2: Construct commit info with ICT if enabled
-        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let mut kernel_commit_info = CommitInfo::new(
-            self.commit_timestamp,
+        // === Action generation ===
+        let NonfileCommitActions {
+            commit_version,
             in_commit_timestamp,
-            self.operation.clone(),
-            self.engine_info.clone(),
-            self.is_blind_append,
-        );
-        if let Some(operation_parameters) = self.operation_parameters.clone() {
-            kernel_commit_info.set_operation_parameters(operation_parameters);
-        }
-        if let Some(operation_metrics) = self.operation_metrics.clone() {
-            kernel_commit_info.set_operation_metrics(operation_metrics);
-        }
-
-        // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
-        // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
-        // no existing Row Tracking state to preserve and therefore omits the flag.
-        if !self.is_create_table()
-            && self
-                .effective_table_config
-                .is_feature_enabled(&TableFeature::RowTracking)
-        {
-            kernel_commit_info.set_row_tracking_preserved();
-        }
-        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
-
-        // Step 3: Generate Protocol and Metadata actions based on emit flags
-        let (protocol_action, protocol) = if self.should_emit_protocol {
-            let protocol = self.effective_table_config.protocol().clone();
-            let schema = LOG_PROTOCOL_SCHEMA.clone();
-            let action = create_row(engine, schema, protocol.clone())?;
-            (Some(action), Some(protocol))
-        } else {
-            (None, None)
-        };
-        let (metadata_action, metadata) = if self.should_emit_metadata {
-            let metadata = self.effective_table_config.metadata().clone();
-            let schema = LOG_METADATA_SCHEMA.clone();
-            let action = create_row(engine, schema, metadata.clone())?;
-            (Some(action), Some(metadata))
-        } else {
-            (None, None)
-        };
-
-        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking
-        // high watermark)
-        let commit_version = self.get_commit_version();
-        let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
-
-        // Step 4b: Generate all domain metadata actions (user and system domains)
-        let (domain_metadata_actions, dm_changes) =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
-
-        // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
-        let dv_update_actions = self.generate_dv_update_actions(engine)?;
-
-        // Step 6: Generate remove actions (collect to avoid borrowing self)
-        let remove_actions = self.generate_remove_actions(
+            kernel_commit_info,
+            protocol,
+            metadata,
+            set_transactions,
+        } = self.prepare_nonfile_actions(engine)?;
+        let (actions, dm_changes) = self.assemble_commit_batches(
             engine,
-            self.remove_files_metadata.iter(),
-            false, /* has_dv_update_columns */
+            commit_version,
+            kernel_commit_info,
+            protocol.as_ref(),
+            metadata.as_ref(),
+            set_transactions,
         )?;
 
-        // Step 6b: checkpoint action for a root manifest file commit, if configured.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action =
-            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let checkpoint_action: Option<Box<dyn EngineData>> = None;
-
-        // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> checkpoint -> adds -> txns ->
-        // domain_metadata -> removes
-        // For existing table: CommitInfo -> checkpoint -> adds -> txns -> domain_metadata ->
-        // removes
-        let actions = iter::once(commit_info_action)
-            .chain(protocol_action.map(Ok))
-            .chain(metadata_action.map(Ok))
-            .chain(checkpoint_action.map(Ok))
-            .chain(add_actions)
-            .chain(set_transaction_actions)
-            .chain(domain_metadata_actions);
-
-        let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
-            .chain(remove_actions)
-            .chain(dv_update_actions);
-
-        // Step 7: Commit via the committer
+        // === Commit ===
         let commit_metadata = self.create_commit_metadata(
             commit_version,
             in_commit_timestamp,
@@ -590,79 +433,55 @@ impl<S> Transaction<S> {
             dm_changes.clone(),
         )?;
         let prepare_duration = commit_start.elapsed();
-        let committer_start = Instant::now();
-        let commit_response =
-            self.committer
-                .commit(engine, Box::new(filtered_actions), commit_metadata);
-        let committer_duration = committer_start.elapsed();
-        match commit_response {
-            Ok(CommitResponse::Committed { file_meta }) => {
-                // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
-                //              below must not fail the txn (and must not mislabel the metric).
-                let bin_boundaries = self
-                    .read_snapshot_opt
-                    .as_ref()
-                    .and_then(|snap| snap.get_file_stats_if_present())
-                    .and_then(|s| s.file_size_histogram)
-                    .map(|h| h.sorted_bin_boundaries);
-                let file_stats = FileStatsDelta::try_compute_for_txn(
-                    &self.add_files_metadata,
-                    &self.remove_files_metadata,
-                    bin_boundaries.as_deref(),
-                )?;
-                self.record_commit_success_metrics(
-                    &file_stats,
-                    prepare_duration,
-                    committer_duration,
-                );
-                let crc_delta =
-                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
-                Ok(CommitResult::Committed(
-                    self.into_committed(file_meta, crc_delta)?,
-                ))
-            }
-            Ok(CommitResponse::Conflict { version }) => {
-                // Flips the metric event from success -> failure.
-                tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
-                Ok(CommitResult::Conflicted(self.into_conflicted(version)))
-            }
-            // TODO: we may want to be more or less selective about what is retryable (this is tied
-            // to the idea of "what kind of Errors should write_json_file return?")
-            Err(e @ KernelError::IOError(_)) => {
-                // Flips the metric event from success -> failure.
-                tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
-                Ok(CommitResult::Retryable(self.into_retryable(e)))
-            }
-            Err(e) => Err(e),
-        }
+        let (commit_response, committer_duration) =
+            self.perform_commit(engine, actions, commit_metadata);
+
+        // === Result translation ===
+        self.translate_commit_result(
+            commit_response,
+            in_commit_timestamp,
+            dm_changes,
+            prepare_duration,
+            committer_duration,
+        )
     }
 
-    fn record_commit_success_metrics(
-        &self,
-        file_stats: &FileStatsDelta,
-        prepare_duration: Duration,
-        committer_duration: Duration,
-    ) {
-        let span = tracing::Span::current();
-        span.record("num_add_files", file_stats.gross_add_files);
-        span.record("num_remove_files", file_stats.gross_remove_files);
-        span.record("num_dv_updates", self.num_dv_updates as u64);
-        span.record("add_files_bytes", file_stats.gross_add_bytes);
-        span.record("remove_files_bytes", file_stats.gross_remove_bytes);
-        span.record("is_blind_append", self.is_blind_append);
-        span.record("data_change", self.data_change);
-        if let Some(operation) = self.operation.as_deref() {
-            span.record("operation", operation);
-        }
-        span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
-        span.record(
-            "committer_duration_ns",
-            committer_duration.as_nanos() as u64,
-        );
+    /// Set the content of the commitInfo action for this transaction. Note that kernel will
+    /// _always_ write a commitInfo, this function simply allows engines to add their own data
+    /// into that action if they wish. Kernel overrides the following fields if they are set in
+    /// `engine_commit_info`, so connectors should not set them:
+    ///
+    /// - `timestamp`
+    /// - `inCommitTimestamp`
+    /// - `operation`
+    /// - `operationParameters`
+    /// - `operationMetrics`
+    /// - `kernelVersion`
+    /// - `isBlindAppend`
+    /// - `engineInfo`
+    /// - `txnId`
+    ///
+    /// Use [`Transaction::with_operation_parameters`] and
+    /// [`Transaction::with_operation_metrics`] to set the operation maps.
+    ///
+    /// Kernel merges the following field if it is set:
+    ///
+    /// - `tags`: When a connector tag has the same key as a Kernel-provided tag, Kernel's value
+    ///   takes precedence. Otherwise, the connector-provided tag is preserved.
+    pub fn with_commit_info(
+        mut self,
+        engine_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self
     }
+}
 
+// =============================================================================
+// Shared methods available on ALL transaction types
+// =============================================================================
+impl<S> Transaction<S> {
     /// Set the data change flag.
     ///
     /// True indicates this commit is a "data changing" commit. False indicates table data was
@@ -740,37 +559,6 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Set the content of the commitInfo action for this transaction. Note that kernel will
-    /// _always_ write a commitInfo, this function simply allows engines to add their own data
-    /// into that action if they wish. Kernel overrides the following fields if they are set in
-    /// `engine_commit_info`, so connectors should not set them:
-    ///
-    /// - `timestamp`
-    /// - `inCommitTimestamp`
-    /// - `operation`
-    /// - `operationParameters`
-    /// - `operationMetrics`
-    /// - `kernelVersion`
-    /// - `isBlindAppend`
-    /// - `engineInfo`
-    /// - `txnId`
-    ///
-    /// Use [`Transaction::with_operation_parameters`] and
-    /// [`Transaction::with_operation_metrics`] to set the operation maps.
-    ///
-    /// Kernel merges the following field if it is set:
-    ///
-    /// - `tags`: When a connector tag has the same key as a Kernel-provided tag, Kernel's value
-    ///   takes precedence. Otherwise, the connector-provided tag is preserved.
-    pub fn with_commit_info(
-        mut self,
-        engine_commit_info: Box<dyn EngineData>,
-        commit_info_schema: SchemaRef,
-    ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
-        self
-    }
-
     /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
     /// `last_updated` timestamp).
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
@@ -794,6 +582,207 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
+    /// information about a Parquet write operation back to Kernel.
+    ///
+    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is
+    /// the base for constructing an add_file. Each row represents metadata about a
+    /// file to be added to the table. Kernel takes this information and extends it to the full
+    /// add_file action schema, adding internal fields (e.g., baseRowID) as necessary.
+    ///
+    /// The `stats` field contains file-level statistics. The schema returned here shows the base
+    /// structure; the actual stats written by `DefaultEngine::write_parquet` include dynamically
+    /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
+    /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
+    /// stats schema.
+    ///
+    /// Note: While currently static, in the future the schema might change depending on
+    /// options set on the transaction or features enabled on the table.
+    ///
+    /// [`add_files`]: crate::transaction::Transaction::add_files
+    /// [`ParquetHandler`]: crate::ParquetHandler
+    /// [`stats_schema`]: Transaction::stats_schema
+    pub fn add_files_schema(&self) -> &'static SchemaRef {
+        &BASE_ADD_FILES_SCHEMA
+    }
+}
+
+// =============================================================================
+// Data file methods -- only available on transaction types that support data files
+// =============================================================================
+impl<S: SupportsDataFiles> Transaction<S> {
+    // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
+    /// Acknowledges that the connector applies column defaults before writing data files.
+    ///
+    /// Call this before requesting write state for a table that enables the
+    /// `allowColumnDefaults` feature and declares at least one column default. The connector must
+    /// materialize every omitted column's default itself; this method records that responsibility
+    /// but does not apply any defaults. Without this acknowledgement, write-state creation fails
+    /// with an error.
+    pub fn ack_column_defaults(&mut self) {
+        self.column_defaults_acknowledged = true;
+    }
+
+    /// Returns the expected schema for file statistics.
+    ///
+    /// The schema structure is derived from table configuration:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Partition columns: Always excluded
+    ///
+    /// The returned schema has the following structure:
+    /// ```ignore
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
+    ///   minValues: { ... },   // Nested struct, only min/max eligible types
+    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
+    ///   tightBounds: boolean,
+    /// }
+    /// ```
+    ///
+    /// Engines should collect statistics matching this schema structure when writing files.
+    ///
+    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
+    /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
+    /// settings.
+    #[allow(unused)]
+    pub fn stats_schema(&self) -> Result<SchemaRef> {
+        self.effective_table_config
+            .stats_schema_builder()
+            .with_required_physical_columns(self.physical_clustering_columns.as_deref())
+            .build()
+    }
+
+    /// Returns the list of column names that should have statistics collected.
+    ///
+    /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
+    /// stores path components separately (e.g., `column_name!("nested.field")`).
+    /// See [`ColumnName`'s `Display` implementation][ColumnName#impl-Display-for-ColumnName]
+    /// for details on string formatting and escaping.
+    ///
+    /// Engines can use this to determine which columns need stats during writes.
+    ///
+    /// Per the Delta protocol, clustering columns are always included in statistics,
+    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
+    #[allow(unused)]
+    pub fn stats_columns(&self) -> Vec<ColumnName> {
+        self.effective_table_config
+            .physical_stats_column_names(self.physical_clustering_columns.as_deref())
+    }
+
+    /// Returns the logical partition column names for this table.
+    pub fn logical_partition_columns(&self) -> &[String] {
+        self.effective_table_config.logical_partition_columns()
+    }
+
+    // TODO(#2630): Expose nested column defaults through the transaction API.
+    /// Returns the column default for every top-level column in this table's logical schema that
+    /// declares one, keyed by logical column name.
+    ///
+    /// Connectors use this to discover which columns have defaults, then call
+    /// [`ColumnDefault::to_scalar`] on each (or fall back to [`ColumnDefault::raw_sql`] when the
+    /// kernel cannot parse the default) to materialize the column before writing. After handling
+    /// every omitted column, call [`ack_column_defaults`](Self::ack_column_defaults) before
+    /// requesting write state.
+    ///
+    /// Keys are `String` rather than [`ColumnName`] because the kernel currently surfaces defaults
+    /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
+    /// not a protocol one.
+    ///
+    /// Malformed defaults (a non-string `CURRENT_DEFAULT`, or a non-`NULL` default on a Variant
+    /// column) are rejected eagerly at snapshot load (when constructing the
+    /// [`TableConfiguration`]), so by the time this runs the metadata is already validated.
+    /// Orphaned metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer feature)
+    /// is tolerated at table load but is not surfaced through this method.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`StructField::column_default`].
+    pub fn top_level_column_defaults(&self) -> Result<HashMap<String, ColumnDefault<'_>>> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            tracing::info!(
+                "allowColumnDefaults is not enabled; the schema may contain orphaned column-default metadata"
+            );
+            return Ok(HashMap::new());
+        }
+        let mut defaults = HashMap::new();
+        for field in self.effective_table_config.logical_schema_ref().fields() {
+            if let Some(column_default) = field.column_default()? {
+                defaults.insert(field.name().clone(), column_default);
+            }
+        }
+        Ok(defaults)
+    }
+
+    /// Validates that the table's logical schema supports data writes.
+    ///
+    /// Called by [`write_state`](Self::write_state), before any Parquet is written, so connectors
+    /// fail fast when the schema contains unsupported data types or void placements that cannot
+    /// produce valid files.
+    /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
+    /// that reach [`add_files`](Self::add_files) without going through write state.
+    fn validate_for_data_write(&self) -> KernelResult<()> {
+        validate_schema_for_write(&self.effective_table_config.logical_schema())
+    }
+
+    /// Creates the table-wide state needed to write data files.
+    ///
+    /// The returned shared state can create [`BoundWriteContext`] instances in this process,
+    /// or it can be encoded and transported to distributed writers. Each context retains a
+    /// reference to the same immutable state. All table-wide write validation runs before the
+    /// state is returned so a writer does not begin producing files for a table that kernel cannot
+    /// write to safely. Use [`WriteState::write_context_builder`] to bind values for each partition
+    /// being written.
+    ///
+    /// The state captures the transaction configuration when this method is called. If the
+    /// transaction is subsequently modified, call this method again to capture the updated
+    /// configuration.
+    ///
+    /// Returns an error if the table has an empty or unsupported schema, or if the table declares
+    /// column defaults that the connector has not acknowledged.
+    pub fn write_state(&self) -> Result<Arc<WriteState>> {
+        self.ensure_schema_non_empty_for_write_state()?;
+        self.ensure_column_defaults_acknowledged()?;
+        self.validate_for_data_write()?;
+        // The effective table configuration can change while building a transaction, so this
+        // state must be derived on demand rather than cached on the transaction. TODO(#3149):
+        // revisit caching if transaction construction becomes immutable.
+        Ok(Arc::new(WriteState::new(
+            &self.effective_table_config,
+            self.stats_columns(),
+        )))
+    }
+}
+
+impl<S: SupportsDataFiles> Transaction<S> {
+    /// Add files to include in this transaction. This API generally enables the engine to
+    /// add/append/insert data (files) to the table. Note that this API can be called multiple times
+    /// to add multiple batches.
+    ///
+    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
+    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
+        self.add_files_metadata.push(add_metadata);
+    }
+}
+
+// =============================================================================
+// Internal methods available on ALL transaction types (used by commit path)
+// =============================================================================
+/// In-memory representation of non-file commit actions, built from the transaction.
+struct NonfileCommitActions {
+    commit_version: Version,
+    in_commit_timestamp: Option<i64>,
+    kernel_commit_info: CommitInfo,
+    protocol: Option<Protocol>,
+    metadata: Option<Metadata>,
+    set_transactions: Vec<SetTransaction>,
+}
+
+impl<S> Transaction<S> {
     /// Determines the commit type based on whether this is a create-table operation and whether
     /// the table is catalog-managed.
     fn determine_commit_type(
@@ -947,7 +936,7 @@ impl<S> Transaction<S> {
         engine: &dyn Engine,
         commit_version: Version,
         dm_changes: &[DomainMetadata],
-    ) -> KernelResult<Option<Box<dyn EngineData>>> {
+    ) -> KernelResult<Option<CheckpointAction>> {
         let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
             return Ok(None);
         };
@@ -958,31 +947,7 @@ impl<S> Transaction<S> {
             dm_changes,
             &self.set_transactions,
         )?;
-        Ok(Some(action.into_engine_data(engine)?))
-    }
-
-    // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
-    fn validate_append_only_semantics(&self) -> KernelResult<()> {
-        if !self.data_change
-            || !self
-                .effective_table_config
-                .is_feature_enabled(&TableFeature::AppendOnly)
-        {
-            return Ok(());
-        }
-
-        let removes_data = self
-            .remove_files_metadata
-            .iter()
-            .chain(&self.dv_matched_files)
-            .any(HasSelectionVector::has_selected_rows);
-        require!(
-            !removes_data,
-            KernelError::invalid_transaction_state(
-                "Append-only tables cannot remove files or update deletion vectors when data_change is true",
-            )
-        );
-        Ok(())
+        Ok(Some(action))
     }
 
     /// Reject data file writes (add/remove/DV) against an empty-schema table.
@@ -1111,200 +1076,453 @@ impl<S> Transaction<S> {
         }
     }
 
-    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
-    /// information about a Parquet write operation back to Kernel.
-    ///
-    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is
-    /// the base for constructing an add_file. Each row represents metadata about a
-    /// file to be added to the table. Kernel takes this information and extends it to the full
-    /// add_file action schema, adding internal fields (e.g., baseRowID) as necessary.
-    ///
-    /// The `stats` field contains file-level statistics. The schema returned here shows the base
-    /// structure; the actual stats written by `DefaultEngine::write_parquet` include dynamically
-    /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
-    /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
-    /// stats schema.
-    ///
-    /// Note: While currently static, in the future the schema might change depending on
-    /// options set on the transaction or features enabled on the table.
-    ///
-    /// [`add_files`]: crate::transaction::Transaction::add_files
-    /// [`ParquetHandler`]: crate::ParquetHandler
-    /// [`stats_schema`]: Transaction::stats_schema
-    pub fn add_files_schema(&self) -> &'static SchemaRef {
-        &BASE_ADD_FILES_SCHEMA
-    }
-
     #[cfg(test)]
     fn replace_effective_table_config(&mut self, table_config: TableConfiguration) {
         self.effective_table_config = table_config;
     }
-}
 
-// =============================================================================
-// Data file methods -- only available on transaction types that support data files
-// =============================================================================
-impl<S: SupportsDataFiles> Transaction<S> {
-    // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
-    /// Acknowledges that the connector applies column defaults before writing data files.
-    ///
-    /// Call this before requesting write state for a table that enables the
-    /// `allowColumnDefaults` feature and declares at least one column default. The connector must
-    /// materialize every omitted column's default itself; this method records that responsibility
-    /// but does not apply any defaults. Without this acknowledgement, write-state creation fails
-    /// with an error.
-    pub fn ack_column_defaults(&mut self) {
-        self.column_defaults_acknowledged = true;
-    }
+    /// Performs all pre-commit validations based on configured transaction settings.
+    /// This method does not introspect into staged file-actions (see validate_file_actions
+    /// instead).
+    fn validate_commit(&self) -> KernelResult<()> {
+        // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
+        // that accompany copied or updated rows, so both require the preservation acknowledgment.
+        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
+            self.effective_table_config
+                .validate_feature_support_for_remove()?;
+            self.ensure_row_tracking_preservation_acknowledged()?;
+        }
 
-    /// Returns the expected schema for file statistics.
-    ///
-    /// The schema structure is derived from table configuration:
-    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
-    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
-    /// - Partition columns: Always excluded
-    ///
-    /// The returned schema has the following structure:
-    /// ```ignore
-    /// {
-    ///   numRecords: long,
-    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
-    ///   minValues: { ... },   // Nested struct, only min/max eligible types
-    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
-    ///   tightBounds: boolean,
-    /// }
-    /// ```
-    ///
-    /// Engines should collect statistics matching this schema structure when writing files.
-    ///
-    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
-    /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
-    /// settings.
-    #[allow(unused)]
-    pub fn stats_schema(&self) -> Result<SchemaRef> {
-        self.effective_table_config
-            .stats_schema_builder()
-            .with_required_physical_columns(self.physical_clustering_columns.as_deref())
-            .build()
-    }
-
-    /// Returns the list of column names that should have statistics collected.
-    ///
-    /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
-    /// stores path components separately (e.g., `column_name!("nested.field")`).
-    /// See [`ColumnName`'s `Display` implementation][ColumnName#impl-Display-for-ColumnName]
-    /// for details on string formatting and escaping.
-    ///
-    /// Engines can use this to determine which columns need stats during writes.
-    ///
-    /// Per the Delta protocol, clustering columns are always included in statistics,
-    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
-    #[allow(unused)]
-    pub fn stats_columns(&self) -> Vec<ColumnName> {
-        self.effective_table_config
-            .physical_stats_column_names(self.physical_clustering_columns.as_deref())
-    }
-
-    /// Returns the logical partition column names for this table.
-    pub fn logical_partition_columns(&self) -> &[String] {
-        self.effective_table_config.logical_partition_columns()
-    }
-
-    // TODO(#2630): Expose nested column defaults through the transaction API.
-    /// Returns the column default for every top-level column in this table's logical schema that
-    /// declares one, keyed by logical column name.
-    ///
-    /// Connectors use this to discover which columns have defaults, then call
-    /// [`ColumnDefault::to_scalar`] on each (or fall back to [`ColumnDefault::raw_sql`] when the
-    /// kernel cannot parse the default) to materialize the column before writing. After handling
-    /// every omitted column, call [`ack_column_defaults`](Self::ack_column_defaults) before
-    /// requesting write state.
-    ///
-    /// Keys are `String` rather than [`ColumnName`] because the kernel currently surfaces defaults
-    /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
-    /// not a protocol one.
-    ///
-    /// Malformed defaults (a non-string `CURRENT_DEFAULT`, or a non-`NULL` default on a Variant
-    /// column) are rejected eagerly at snapshot load (when constructing the
-    /// [`TableConfiguration`]), so by the time this runs the metadata is already validated.
-    /// Orphaned metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer feature)
-    /// is tolerated at table load but is not surfaced through this method.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from [`StructField::column_default`].
-    pub fn top_level_column_defaults(&self) -> Result<HashMap<String, ColumnDefault<'_>>> {
-        if !self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
+        // in the HashSet?
+        let mut app_ids = HashSet::with_capacity(self.set_transactions.len());
+        if let Some(dup) = self
+            .set_transactions
+            .iter()
+            .find(|t| !app_ids.insert(&t.app_id))
         {
-            tracing::info!(
-                "allowColumnDefaults is not enabled; the schema may contain orphaned column-default metadata"
+            return Err(KernelError::generic(format!(
+                "app_id {} already exists in transaction",
+                dup.app_id
+            )));
+        }
+
+        self.validate_blind_append_semantics()?;
+        self.ensure_schema_non_empty_for_data_writes()?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_manifest_write_semantics()?;
+
+        // Validate that the schema supports data writes when files are being added. Reads and
+        // metadata-only commits are always allowed.
+        if !self.add_files_metadata.is_empty() {
+            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+        }
+
+        // If a data-changing transaction has add files together with remove files or DV updates,
+        // block it when CDF is enabled. Kernel cannot discern DML operations. DML operations that
+        // update rows require a `cdc` file, but Kernel does not currently support writing CDC
+        // files.
+        if !self.is_create_table()
+            && !self.add_files_metadata.is_empty()
+            && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
+            && self.data_change
+        {
+            let cdf_enabled = self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::ChangeDataFeed);
+            require!(
+                !cdf_enabled,
+                KernelError::generic(
+                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                     This would require writing CDC files for DML operations, which is not yet supported. \
+                     Consider using separate transactions: one to add files, another to remove files or update deletion vectors."
+                )
             );
-            return Ok(HashMap::new());
         }
-        let mut defaults = HashMap::new();
-        for field in self.effective_table_config.logical_schema_ref().fields() {
-            if let Some(column_default) = field.column_default()? {
-                defaults.insert(field.name().clone(), column_default);
+
+        self.validate_domain_metadata_operations()?;
+        Ok(())
+    }
+
+    /// Generate non-file commit actions as in-memory structs, that can then be encoded into the
+    /// committable format (e.g EngineData)
+    fn prepare_nonfile_actions(&self, engine: &dyn Engine) -> KernelResult<NonfileCommitActions> {
+        let set_transactions = self.set_transactions.clone();
+        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
+        let mut kernel_commit_info = CommitInfo::new(
+            self.commit_timestamp,
+            in_commit_timestamp,
+            self.operation.clone(),
+            self.engine_info.clone(),
+            self.is_blind_append,
+        );
+        if let Some(operation_parameters) = self.operation_parameters.clone() {
+            kernel_commit_info.set_operation_parameters(operation_parameters);
+        }
+        if let Some(operation_metrics) = self.operation_metrics.clone() {
+            kernel_commit_info.set_operation_metrics(operation_metrics);
+        }
+
+        // Kernel requires every commit on an existing Row Tracking-enabled table to preserve
+        // Stable Row IDs and Stable Row Commit Versions, so it always emits true. CREATE TABLE has
+        // no existing Row Tracking state to preserve and therefore omits the flag.
+        if !self.is_create_table()
+            && self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::RowTracking)
+        {
+            kernel_commit_info.set_row_tracking_preserved();
+        }
+        Ok(NonfileCommitActions {
+            commit_version: self.get_commit_version(),
+            in_commit_timestamp,
+            kernel_commit_info,
+            protocol: self
+                .should_emit_protocol
+                .then(|| self.effective_table_config.protocol().clone()),
+            metadata: self
+                .should_emit_metadata
+                .then(|| self.effective_table_config.metadata().clone()),
+            set_transactions,
+        })
+    }
+
+    fn record_commit_success_metrics(
+        &self,
+        file_stats: &FileStatsDelta,
+        num_dv_updates: u64,
+        prepare_duration: Duration,
+        committer_duration: Duration,
+    ) {
+        let span = tracing::Span::current();
+        span.record("num_add_files", file_stats.gross_add_files);
+        span.record("num_remove_files", file_stats.gross_remove_files);
+        span.record("num_dv_updates", num_dv_updates);
+        span.record("add_files_bytes", file_stats.gross_add_bytes);
+        span.record("remove_files_bytes", file_stats.gross_remove_bytes);
+        span.record("is_blind_append", self.is_blind_append);
+        span.record("data_change", self.data_change);
+        if let Some(operation) = self.operation.as_deref() {
+            span.record("operation", operation);
+        }
+        span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
+        span.record(
+            "committer_duration_ns",
+            committer_duration.as_nanos() as u64,
+        );
+    }
+
+    fn into_committed(
+        self,
+        file_meta: FileMeta,
+        crc_delta: CrcDelta,
+    ) -> KernelResult<CommittedTransaction> {
+        let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
+
+        let commit_version = parsed_commit.version;
+
+        let (post_commit_stats, post_commit_snapshot) = match &self.read_snapshot_opt {
+            Some(snap) => {
+                // Existing table path: use the read snapshot to compute post-commit state.
+                let stats = PostCommitStats {
+                    commits_since_checkpoint: snap.log_segment().commits_since_checkpoint() + 1,
+                    commits_since_log_compaction: snap
+                        .log_segment()
+                        .commits_since_log_compaction_or_checkpoint()
+                        + 1,
+                };
+                let snapshot = snap.new_post_commit(parsed_commit, crc_delta)?;
+                (stats, Arc::new(snapshot))
             }
+            None => {
+                // CREATE TABLE path: build a fresh Snapshot at version 0.
+                let log_root = self
+                    .effective_table_config
+                    .table_root()
+                    .join("_delta_log/")?;
+                let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
+                let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
+                    KernelError::internal_error(
+                        "CREATE TABLE CRC delta is missing protocol or metadata",
+                    )
+                })?;
+                let stats = PostCommitStats {
+                    commits_since_checkpoint: 1,
+                    commits_since_log_compaction: 1,
+                };
+                let snapshot = Snapshot::new_with_crc(
+                    log_segment,
+                    self.effective_table_config,
+                    Some(Arc::new(crc)),
+                    true,  /* built_as_latest */
+                    false, /* skipped_new_checkpoints */
+                )?;
+                (stats, Arc::new(snapshot))
+            }
+        };
+
+        Ok(CommittedTransaction {
+            commit_version,
+            post_commit_stats,
+            post_commit_snapshot: Some(post_commit_snapshot),
+        })
+    }
+
+    /// Build a [`CrcDelta`] from the transaction's commit state and a precomputed
+    /// [`FileStatsDelta`].
+    fn build_crc_delta(
+        &self,
+        file_stats: FileStatsDelta,
+        in_commit_timestamp: Option<i64>,
+        dm_changes: Vec<DomainMetadata>,
+    ) -> KernelResult<CrcDelta> {
+        // TODO: drop these conversions by migrating the upstream chain
+        //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
+        //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
+        //       checks into the type system.
+        let domain_metadata = dm_changes
+            .into_iter()
+            .map(|dm| (dm.domain().to_string(), dm))
+            .collect();
+        let set_transactions = self
+            .set_transactions
+            .iter()
+            .map(|txn| (txn.app_id.clone(), txn.clone()))
+            .collect();
+        // Although `remove.size` is optional per the Delta protocol, the kernel write path
+        // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
+        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
+        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
+        // present, and only operation classification can flip `is_incremental_safe`.
+        let is_incremental_safe = self
+            .operation
+            .as_deref()
+            .is_some_and(is_incremental_safe_operation);
+        Ok(CrcDelta {
+            file_stats,
+            protocol: self
+                .should_emit_protocol
+                .then(|| self.effective_table_config.protocol().clone()),
+            metadata: self
+                .should_emit_metadata
+                .then(|| self.effective_table_config.metadata().clone()),
+            domain_metadata,
+            set_transactions,
+            in_commit_timestamp,
+            is_incremental_safe,
+        })
+    }
+
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<S> {
+        ConflictedTransaction {
+            transaction: self,
+            conflict_version,
         }
-        Ok(defaults)
     }
 
-    /// Validates that the table's logical schema supports data writes.
-    ///
-    /// Called by [`write_state`](Self::write_state), before any Parquet is written, so connectors
-    /// fail fast when the schema contains unsupported data types or void placements that cannot
-    /// produce valid files.
-    /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
-    /// that reach [`add_files`](Self::add_files) without going through write state.
-    fn validate_for_data_write(&self) -> KernelResult<()> {
-        validate_schema_for_write(&self.effective_table_config.logical_schema())
-    }
-
-    /// Creates the table-wide state needed to write data files.
-    ///
-    /// The returned shared state can create [`BoundWriteContext`] instances in this process,
-    /// or it can be encoded and transported to distributed writers. Each context retains a
-    /// reference to the same immutable state. All table-wide write validation runs before the
-    /// state is returned so a writer does not begin producing files for a table that kernel cannot
-    /// write to safely. Use [`WriteState::write_context_builder`] to bind values for each partition
-    /// being written.
-    ///
-    /// The state captures the transaction configuration when this method is called. If the
-    /// transaction is subsequently modified, call this method again to capture the updated
-    /// configuration.
-    ///
-    /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged.
-    pub fn write_state(&self) -> Result<Arc<WriteState>> {
-        self.ensure_schema_non_empty_for_write_state()?;
-        self.ensure_column_defaults_acknowledged()?;
-        self.validate_for_data_write()?;
-        // The effective table configuration can change while building a transaction, so this
-        // state must be derived on demand rather than cached on the transaction. TODO(#3149):
-        // revisit caching if transaction construction becomes immutable.
-        Ok(Arc::new(WriteState::new(
-            &self.effective_table_config,
-            self.stats_columns(),
-        )))
-    }
-
-    /// Add files to include in this transaction. This API generally enables the engine to
-    /// add/append/insert data (files) to the table. Note that this API can be called multiple times
-    /// to add multiple batches.
-    ///
-    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
+    fn into_retryable(self, error: KernelError) -> RetryableTransaction<S> {
+        RetryableTransaction {
+            transaction: self,
+            error,
+        }
     }
 }
 
 // =============================================================================
-// Internal methods available on ALL transaction types (used by commit path)
+// Imperative action processing
 // =============================================================================
 impl<S> Transaction<S> {
+    // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
+    fn validate_append_only_semantics(&self) -> KernelResult<()> {
+        if !self.data_change
+            || !self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::AppendOnly)
+        {
+            return Ok(());
+        }
+
+        let removes_data = self
+            .remove_files_metadata
+            .iter()
+            .chain(&self.dv_matched_files)
+            .any(HasSelectionVector::has_selected_rows);
+        require!(
+            !removes_data,
+            KernelError::invalid_transaction_state(
+                "Append-only tables cannot remove files or update deletion vectors when data_change is true",
+            )
+        );
+        Ok(())
+    }
+
+    /// Validates the rows and required fields in staged addFile, removeFile, and dv updates.
+    fn validate_file_actions(&self) -> KernelResult<()> {
+        self.validate_append_only_semantics()?;
+
+        // Validate protocol-required add-file statistics.
+        // Note: Stats validation cannot use `StagedDataValidator` because its columns and types
+        // are determined at runtime, whereas `RowVisitor::selected_column_names_and_types` must
+        // return a static projection. Consequently, stats validation makes a separate pass for
+        // each stats column.
+        self.validate_add_files_stats(&self.add_files_metadata)?;
+
+        // Validate required fields for addFile.
+        write_validation::StagedDataValidator::staged_add_file(
+            self.effective_table_config.physical_partition_columns(),
+        )
+        .validate(&self.add_files_metadata)?;
+
+        write_validation::StagedDataValidator::staged_dv_matched_file(
+            self.effective_table_config.physical_partition_columns(),
+        )?
+        .validate_filtered(&self.dv_matched_files)?;
+
+        // Validate required fields for RemoveFile.
+        write_validation::StagedDataValidator::staged_remove_file()
+            .validate_filtered(&self.remove_files_metadata)?;
+
+        Ok(())
+    }
+
+    /// Encodes actions (both non-file and file) into a committable iterator of EngineData,
+    /// retaining per-action errors in the commit iterator. Returns the action iterator + domain
+    /// changes that can be used by the committer and post-commit CRC logic.
+    fn assemble_commit_batches<'a>(
+        &'a self,
+        engine: &'a dyn Engine,
+        commit_version: Version,
+        kernel_commit_info: CommitInfo,
+        protocol: Option<&Protocol>,
+        metadata: Option<&Metadata>,
+        set_transactions: Vec<SetTransaction>,
+    ) -> KernelResult<(
+        KernelResultIterator<'a, FilteredEngineData>,
+        Vec<DomainMetadata>,
+    )> {
+        let set_transaction_actions = set_transactions
+            .into_iter()
+            .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
+        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
+        let protocol_action = protocol
+            .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
+            .transpose()?;
+        let metadata_action = metadata
+            .map(|metadata| create_row(engine, LOG_METADATA_SCHEMA.clone(), metadata.clone()))
+            .transpose()?;
+
+        let (add_actions, row_tracking_domain_metadata) =
+            self.generate_adds(engine, commit_version)?;
+
+        let dm_changes =
+            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        let domain_metadata_actions: Vec<_> = dm_changes
+            .iter()
+            .cloned()
+            .map(|dm| create_row(engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), dm))
+            .collect();
+
+        let dv_update_actions = self.generate_dv_update_actions(engine)?;
+
+        let remove_actions = self.generate_remove_actions(
+            engine,
+            self.remove_files_metadata.iter(),
+            false, /* has_dv_update_columns */
+        )?;
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let checkpoint_action = self
+            .generate_checkpoint_action(engine, commit_version, &dm_changes)?
+            .map(|action| action.into_engine_data(engine))
+            .transpose()?;
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let checkpoint_action: Option<Box<dyn EngineData>> = None;
+
+        // CommitInfo must precede all other actions.
+        let actions = iter::once(commit_info_action)
+            .chain(protocol_action.map(Ok))
+            .chain(metadata_action.map(Ok))
+            .chain(checkpoint_action.map(Ok))
+            .chain(add_actions)
+            .chain(set_transaction_actions)
+            .chain(domain_metadata_actions);
+
+        let filtered_actions = actions
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .chain(remove_actions)
+            .chain(dv_update_actions);
+
+        Ok((Box::new(filtered_actions), dm_changes))
+    }
+
+    /// Submits the action iterator and returns the committer's response + elapsed time.
+    fn perform_commit(
+        &self,
+        engine: &dyn Engine,
+        actions: KernelResultIterator<'_, FilteredEngineData>,
+        commit_metadata: CommitMetadata,
+    ) -> (KernelResult<CommitResponse>, Duration) {
+        let committer_start = Instant::now();
+        let commit_response = self.committer.commit(engine, actions, commit_metadata);
+        (commit_response, committer_start.elapsed())
+    }
+
+    /// Translates a commit response into a CommitResult, while recording metrics and preserving the
+    /// transaction on retryable failure. Computes file statistics only for a committed response
+    /// and propagates post-commit errors.
+    fn translate_commit_result(
+        self,
+        commit_response: KernelResult<CommitResponse>,
+        in_commit_timestamp: Option<i64>,
+        dm_changes: Vec<DomainMetadata>,
+        prepare_duration: Duration,
+        committer_duration: Duration,
+    ) -> KernelResult<CommitResult<S>> {
+        match commit_response {
+            Ok(CommitResponse::Committed { file_meta }) => {
+                // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
+                //              below must not fail the txn (and must not mislabel the metric).
+                let bin_boundaries = self
+                    .read_snapshot_opt
+                    .as_ref()
+                    .and_then(|snap| snap.get_file_stats_if_present())
+                    .and_then(|s| s.file_size_histogram)
+                    .map(|h| h.sorted_bin_boundaries);
+                let file_stats = FileStatsDelta::try_compute_for_txn(
+                    &self.add_files_metadata,
+                    &self.remove_files_metadata,
+                    bin_boundaries.as_deref(),
+                )?;
+                self.record_commit_success_metrics(
+                    &file_stats,
+                    self.num_dv_updates as u64,
+                    prepare_duration,
+                    committer_duration,
+                );
+                let crc_delta =
+                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
+                Ok(CommitResult::Committed(
+                    self.into_committed(file_meta, crc_delta)?,
+                ))
+            }
+            Ok(CommitResponse::Conflict { version }) => {
+                // Flips the metric event from success -> failure.
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
+                Ok(CommitResult::Conflicted(self.into_conflicted(version)))
+            }
+            // TODO: we may want to be more or less selective about what is retryable (this is tied
+            // to the idea of "what kind of Errors should write_json_file return?")
+            Err(e @ KernelError::IOError(_)) => {
+                // Flips the metric event from success -> failure.
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
+                Ok(CommitResult::Retryable(self.into_retryable(e)))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Validate that add files carry the per-file statistics required by the table's protocol.
     ///
     /// Currently checks two protocol requirements:
@@ -1463,121 +1681,6 @@ impl<S> Transaction<S> {
             RowTrackingDomainMetadata::new(row_id_high_water_mark);
 
         Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
-    }
-
-    fn into_committed(
-        self,
-        file_meta: FileMeta,
-        crc_delta: CrcDelta,
-    ) -> KernelResult<CommittedTransaction> {
-        let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
-
-        let commit_version = parsed_commit.version;
-
-        let (post_commit_stats, post_commit_snapshot) = match &self.read_snapshot_opt {
-            Some(snap) => {
-                // Existing table path: use the read snapshot to compute post-commit state.
-                let stats = PostCommitStats {
-                    commits_since_checkpoint: snap.log_segment().commits_since_checkpoint() + 1,
-                    commits_since_log_compaction: snap
-                        .log_segment()
-                        .commits_since_log_compaction_or_checkpoint()
-                        + 1,
-                };
-                let snapshot = snap.new_post_commit(parsed_commit, crc_delta)?;
-                (stats, Arc::new(snapshot))
-            }
-            None => {
-                // CREATE TABLE path: build a fresh Snapshot at version 0.
-                let log_root = self
-                    .effective_table_config
-                    .table_root()
-                    .join("_delta_log/")?;
-                let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-                let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
-                    KernelError::internal_error(
-                        "CREATE TABLE CRC delta is missing protocol or metadata",
-                    )
-                })?;
-                let stats = PostCommitStats {
-                    commits_since_checkpoint: 1,
-                    commits_since_log_compaction: 1,
-                };
-                let snapshot = Snapshot::new_with_crc(
-                    log_segment,
-                    self.effective_table_config,
-                    Some(Arc::new(crc)),
-                    true,  /* built_as_latest */
-                    false, /* skipped_new_checkpoints */
-                )?;
-                (stats, Arc::new(snapshot))
-            }
-        };
-
-        Ok(CommittedTransaction {
-            commit_version,
-            post_commit_stats,
-            post_commit_snapshot: Some(post_commit_snapshot),
-        })
-    }
-
-    /// Build a [`CrcDelta`] from the transaction's commit state and a precomputed
-    /// [`FileStatsDelta`].
-    fn build_crc_delta(
-        &self,
-        file_stats: FileStatsDelta,
-        in_commit_timestamp: Option<i64>,
-        dm_changes: Vec<DomainMetadata>,
-    ) -> KernelResult<CrcDelta> {
-        // TODO: drop these conversions by migrating the upstream chain
-        //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
-        //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
-        //       checks into the type system.
-        let domain_metadata = dm_changes
-            .into_iter()
-            .map(|dm| (dm.domain().to_string(), dm))
-            .collect();
-        let set_transactions = self
-            .set_transactions
-            .iter()
-            .map(|txn| (txn.app_id.clone(), txn.clone()))
-            .collect();
-        // Although `remove.size` is optional per the Delta protocol, the kernel write path
-        // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
-        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
-        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
-        // present, and only operation classification can flip `is_incremental_safe`.
-        let is_incremental_safe = self
-            .operation
-            .as_deref()
-            .is_some_and(is_incremental_safe_operation);
-        Ok(CrcDelta {
-            file_stats,
-            protocol: self
-                .should_emit_protocol
-                .then(|| self.effective_table_config.protocol().clone()),
-            metadata: self
-                .should_emit_metadata
-                .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata,
-            set_transactions,
-            in_commit_timestamp,
-            is_incremental_safe,
-        })
-    }
-
-    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<S> {
-        ConflictedTransaction {
-            transaction: self,
-            conflict_version,
-        }
-    }
-
-    fn into_retryable(self, error: KernelError) -> RetryableTransaction<S> {
-        RetryableTransaction {
-            transaction: self,
-            error,
-        }
     }
 
     /// Generates Remove actions from scan file metadata.
