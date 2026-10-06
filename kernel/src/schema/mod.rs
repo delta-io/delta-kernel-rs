@@ -2608,7 +2608,7 @@ impl<'a> MakePhysical<'a> {
     pub(crate) fn validate_read_column_mapping(
         mode: ColumnMappingMode,
         schema: &'a StructType,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         let mut walker = Self {
             mode: MakePhysicalMode::ValidateRead,
             ..Self::new(mode)

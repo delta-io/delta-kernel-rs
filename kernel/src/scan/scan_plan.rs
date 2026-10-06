@@ -61,7 +61,7 @@ pub(super) struct MetadataScanPlan<'a> {
     pub(super) physical_stats_schema: Option<&'a SchemaRef>,
     pub(super) physical_partition_schema: Option<&'a SchemaRef>,
     pub(super) stats: &'a StatsOptions,
-    pub(super) physical_stats_output_schema: &'a Option<SchemaRef>,
+    pub(super) physical_stats_output_schema: Option<&'a SchemaRef>,
     pub(super) partition_values: &'a PartitionValuesOptions,
 }
 
@@ -74,7 +74,7 @@ impl<'a> MetadataScanPlan<'a> {
             physical_stats_schema: scan.state_info.physical_stats_read_schema(),
             physical_partition_schema: scan.state_info.physical_partition_schema.as_ref(),
             stats: &scan.stats,
-            physical_stats_output_schema: &scan.physical_stats_output_schema,
+            physical_stats_output_schema: scan.state_info.physical_stats_output_schema(),
             partition_values: &scan.partition_values,
         }
     }
@@ -348,10 +348,7 @@ impl<'a> MetadataScanPlan<'a> {
         };
 
         // Parsed stats output.
-        let projection = match (
-            self.state_info.physical_stats_output_schema(),
-            has_stats_parsed,
-        ) {
+        let projection = match (self.physical_stats_output_schema, has_stats_parsed) {
             (Some(physical_stats), _) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),

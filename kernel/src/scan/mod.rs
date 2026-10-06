@@ -134,7 +134,7 @@ fn metadata_plan_with_components(
             physical_stats_schema: None,
             physical_partition_schema: None,
             stats: &StatsOptions::default(),
-            physical_stats_output_schema: &None,
+            physical_stats_output_schema: None,
             partition_values: &PartitionValuesOptions::default(),
         }
         .build_metadata_scan_plan_with_commits(&shape, commit_files);
@@ -151,8 +151,6 @@ fn metadata_plan_with_components(
         &partition_values,
         (),
     )?;
-    let physical_stats_output_schema =
-        build_physical_stats_output_schema(&table_configuration, &state_info, &stats)?;
     drop(table_configuration);
 
     let executor = engine.require_plan_executor()?;
@@ -164,7 +162,7 @@ fn metadata_plan_with_components(
         physical_stats_schema: state_info.physical_stats_read_schema(),
         physical_partition_schema: state_info.physical_partition_schema.as_ref(),
         stats: &stats,
-        physical_stats_output_schema: &physical_stats_output_schema,
+        physical_stats_output_schema: state_info.physical_stats_output_schema(),
         partition_values: &partition_values,
     }
     .build_metadata_scan_plan_with_commits(&shape, commit_files)

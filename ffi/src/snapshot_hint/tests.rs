@@ -278,7 +278,7 @@ fn externalized_core_borrows_validated_connector_state() {
             engine.shallow_copy(),
         )
     };
-    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "freshness");
+    assert_extern_result_error_contains(rejected, FFIKernelError::InvalidSnapshotHint, "freshness");
     let mut different_state = test_snapshot_hint(
         std::slice::from_ref(&log_path),
         0,
@@ -293,7 +293,7 @@ fn externalized_core_borrows_validated_connector_state() {
             engine.shallow_copy(),
         )
     };
-    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "differs");
+    assert_extern_result_error_contains(rejected, FFIKernelError::InvalidSnapshotHint, "differs");
     let changed_path = FfiLogPath::new(
         slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
         2,
@@ -312,7 +312,7 @@ fn externalized_core_borrows_validated_connector_state() {
             engine.shallow_copy(),
         )
     };
-    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "differs");
+    assert_extern_result_error_contains(rejected, FFIKernelError::InvalidSnapshotHint, "differs");
     assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
 
     let validated_core =
@@ -386,7 +386,7 @@ fn externalized_core_borrows_validated_connector_state() {
                 plan_engine.shallow_copy(),
             )
         };
-        assert_extern_result_error_contains(rejected, KernelError::GenericError, "empty schema");
+        assert_extern_result_error_contains(rejected, FFIKernelError::GenericError, "empty schema");
         unsafe { free_engine(plan_engine) };
     }
 
@@ -394,7 +394,7 @@ fn externalized_core_borrows_validated_connector_state() {
         unsafe { snapshot_core_logical_schema(core.shallow_copy(), &hint, 43, allocate_err) };
     assert_extern_result_error_contains(
         wrong_generation,
-        KernelError::InvalidSnapshotHint,
+        FFIKernelError::InvalidSnapshotHint,
         "generation",
     );
     unsafe {
@@ -496,7 +496,11 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         }
     };
     let rejected = run_plan(43);
-    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
+    assert_extern_result_error_contains(
+        rejected,
+        FFIKernelError::InvalidSnapshotHint,
+        "generation",
+    );
 
     let result = run_plan(42);
     let bytes = match ok_or_panic(result) {
@@ -514,43 +518,6 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         free_snapshot_core(core);
         free_engine(plan_engine);
         free_engine(engine);
-    }
-}
-
-#[cfg(feature = "declarative-plans")]
-struct LogOnlyState<'a>(&'a dyn SnapshotState);
-
-#[cfg(feature = "declarative-plans")]
-impl SnapshotState for LogOnlyState<'_> {
-    fn table_root(&self) -> &url::Url {
-        self.0.table_root()
-    }
-    fn version(&self) -> delta_kernel::Version {
-        self.0.version()
-    }
-    fn is_latest(&self) -> bool {
-        self.0.is_latest()
-    }
-    fn protocol(&self) -> delta_kernel::KernelResult<delta_kernel::actions::Protocol> {
-        panic!("metadata planning must not decode protocol")
-    }
-    fn metadata(&self) -> delta_kernel::KernelResult<delta_kernel::actions::Metadata> {
-        panic!("metadata planning must not decode metadata")
-    }
-    fn logical_schema(&self) -> delta_kernel::KernelResult<delta_kernel::schema::SchemaRef> {
-        panic!("metadata planning must not materialize the table schema")
-    }
-    fn crc(&self) -> delta_kernel::KernelResult<Option<Arc<delta_kernel::crc::Crc>>> {
-        panic!("metadata planning must not decode CRC state")
-    }
-    fn last_checkpoint(&self) -> delta_kernel::KernelResult<Option<LastCheckpointHint>> {
-        self.0.last_checkpoint()
-    }
-    fn visit_log_paths(
-        &self,
-        visitor: &mut dyn FnMut(&[delta_kernel::LogPath]) -> delta_kernel::KernelResult<()>,
-    ) -> delta_kernel::KernelResult<()> {
-        self.0.visit_log_paths(visitor)
     }
 }
 
