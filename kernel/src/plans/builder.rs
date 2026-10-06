@@ -40,10 +40,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use url::Url;
 
 use super::ir::nodes::{
     Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson, WriteParquet,
+    FILE_META_SCHEMA,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -273,6 +275,34 @@ impl PlanBuilder {
     pub fn relation_source(relation_ref: RelationRef) -> Self {
         let schema = Arc::clone(relation_ref.schema());
         Self::present(schema, relation_ref, vec![])
+    }
+
+    /// Writes this relation to the fully qualified `file_path` as newline-delimited JSON.
+    /// `overwrite` controls whether an existing file may be replaced (see [`WriteJson`]).
+    /// Returns a relation with one row of [`FILE_META_SCHEMA`] for non-empty input; empty input
+    /// yields the absent relation and no write.
+    pub fn write_json(self, file_path: Url, overwrite: bool) -> Self {
+        self.unary_op_or_absent(
+            FILE_META_SCHEMA.clone(),
+            WriteJson {
+                file_path,
+                overwrite,
+            },
+        )
+    }
+
+    /// Writes this relation to the fully qualified `file_path` as Parquet.
+    /// `overwrite` controls whether an existing file may be replaced (see [`WriteParquet`]).
+    /// Returns a relation with one row of [`FILE_META_SCHEMA`] for non-empty input; empty input
+    /// yields the absent relation and no write.
+    pub fn write_parquet(self, file_path: Url, overwrite: bool) -> Self {
+        self.unary_op_or_absent(
+            FILE_META_SCHEMA.clone(),
+            WriteParquet {
+                file_path,
+                overwrite,
+            },
+        )
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -942,6 +972,12 @@ mod tests {
     #[case::empty_parquet(PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_json(PlanBuilder::scan_json(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_values(PlanBuilder::values(id_schema(), vec![]))]
+    #[case::write_json(Ok(
+        absent_src().write_json(Url::parse("memory:///output.json")?, false)
+    ))]
+    #[case::write_parquet(Ok(
+        absent_src().write_parquet(Url::parse("memory:///output.parquet")?, false)
+    ))]
     #[case::filter(absent_src().filter(col!("id").is_not_null()))]
     #[case::project(absent_src().project(Expression::struct_from([col!("id")]), id_schema()))]
     #[case::project_patch(absent_src().project_patch(|p| p.drop("id")))]

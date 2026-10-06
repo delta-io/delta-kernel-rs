@@ -16,12 +16,13 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use itertools::Itertools;
+use url::Url;
 
 use super::aggs::eval_aggregate;
 use super::json::try_create_from_json;
 use super::parquet::{parquet_footer, try_create_from_parquet};
-use super::read_files_arrow;
 use super::storage::SyncStorageHandler;
+use super::{put_bytes, read_files_arrow};
 use crate::arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
 };
@@ -32,19 +33,21 @@ use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::arrow_expression::{extract_column, ArrowEvaluationHandler};
-use crate::engine::arrow_utils::coerce_columns_to_schema;
+use crate::engine::arrow_utils::{coerce_columns_to_schema, to_json_bytes};
+use crate::engine::writer_options;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::plans::ir::nodes::{
     DynamicScan, FileType, Operator, Project, RelationId, RelationRef, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values,
+    ScanParquet, SemiJoin, Values, WriteJson, WriteParquet, FILE_META_SCHEMA,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
-    EvaluationHandler as _, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
-    Result, StorageHandler as _,
+    EvaluationHandler as _, FileMeta, FilteredEngineData, KernelError, KernelResult,
+    KernelResultIteratorStatic, Result, StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`].
@@ -258,10 +261,65 @@ impl SyncPlanExecutor {
                 self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
             }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
+            Operator::WriteJson(WriteJson {
+                file_path,
+                overwrite,
+            }) => self.eval_write(FileType::Json, &file_path, overwrite, &results[inputs[0]]),
+            Operator::WriteParquet(WriteParquet {
+                file_path,
+                overwrite,
+            }) => self.eval_write(
+                FileType::Parquet,
+                &file_path,
+                overwrite,
+                &results[inputs[0]],
+            ),
             Operator::SemiJoin(join) => {
                 eval_semi_join(join, &results[inputs[0]], &results[inputs[1]])
             }
         }
+    }
+
+    fn eval_write(
+        &self,
+        file_type: FileType,
+        file_path: &Url,
+        overwrite: bool,
+        input: &[RecordBatch],
+    ) -> KernelResult<Vec<RecordBatch>> {
+        let Some(first) = input.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(vec![]);
+        };
+        let bytes = match file_type {
+            FileType::Json => to_json_bytes(input.iter().map(|batch| {
+                Ok(FilteredEngineData::with_all_rows_selected(Box::new(
+                    ArrowEngineData::new(batch.clone()),
+                )))
+            }))?,
+            FileType::Parquet => {
+                let mut writer = ArrowWriter::try_new_with_options(
+                    Vec::new(),
+                    first.schema(),
+                    writer_options(),
+                )?;
+                for batch in input {
+                    writer.write(batch)?;
+                }
+                writer.into_inner()?
+            }
+        };
+        put_bytes(self.storage.store(), file_path, bytes.into(), overwrite)?;
+        let meta = self.storage.head(file_path)?;
+        let size = i64::try_from(meta.size)
+            .map_err(|_| KernelError::generic("Written file size exceeds LONG range"))?;
+        Ok(vec![values_to_record_batch(Values::new(
+            FILE_META_SCHEMA.clone(),
+            vec![vec![
+                meta.location.to_string().into(),
+                size.into(),
+                meta.last_modified.into(),
+            ]],
+        ))?])
     }
 
     /// Reads `files` as `file_type`, broadcasting each file's [`ScanFile::file_constants`] into the
@@ -664,9 +722,207 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    use crate::engine::sync::get_bytes;
     use crate::expressions::{col, column_name, lit, Predicate, StructData};
+    use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
     use crate::schema::{schema, schema_ref, ToSchema as _};
+
+    fn write_plan(
+        input: PlanBuilder,
+        file_type: FileType,
+        path: &Url,
+        overwrite: bool,
+    ) -> Result<Plan> {
+        match file_type {
+            FileType::Json => input.write_json(path.clone(), overwrite),
+            FileType::Parquet => input.write_parquet(path.clone(), overwrite),
+        }
+        .build()
+    }
+
+    fn write_and_check_output(
+        executor: &SyncPlanExecutor,
+        plan: Plan,
+        file_type: FileType,
+        path: &Url,
+        schema: SchemaRef,
+        expected_ids: &[i64],
+    ) -> Result<()> {
+        assert_eq!(
+            plan.schema,
+            schema_ref! {
+                not_null "location": STRING,
+                not_null "size": LONG,
+                not_null "last_modified": LONG,
+            }
+        );
+        let batches = executor
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<Result<Vec<_>>>()?;
+        let meta = executor.storage.head(path)?;
+        let expected = values_to_record_batch(Values::new(
+            FILE_META_SCHEMA.clone(),
+            vec![vec![
+                path.to_string().into(),
+                (meta.size as i64).into(),
+                meta.last_modified.into(),
+            ]],
+        ))?;
+        assert_eq!(batches, vec![expected]);
+        assert_eq!(
+            meta.size,
+            get_bytes(executor.storage.store(), path)?.len() as u64
+        );
+        let scan = match file_type {
+            FileType::Json => PlanBuilder::scan_json([meta], &[], schema)?,
+            FileType::Parquet => PlanBuilder::scan_parquet([meta], &[], schema)?,
+        }
+        .build()?;
+        let batches = executor.eval_plan(scan, None)?;
+        let mut ids: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids);
+        Ok(())
+    }
+
+    #[rstest]
+    fn write_nodes_write_all_batches_and_honor_overwrite(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values(false, true)] in_memory: bool,
+        #[values(false, true)] overwrite: bool,
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = if in_memory {
+            Url::parse("memory:///nested/output")?
+        } else {
+            Url::from_file_path(dir.path().join("nested/output")).unwrap()
+        };
+        let executor = SyncPlanExecutor::new(in_memory.then(|| Arc::new(InMemory::new()) as _));
+        let schema = schema_ref! { not_null "id": LONG };
+        let input = PlanBuilder::union_all([
+            PlanBuilder::values(schema.clone(), vec![vec![0i64.into()]])?,
+            PlanBuilder::values(schema.clone(), vec![vec![1i64.into()], vec![2i64.into()]])?,
+            PlanBuilder::values(schema.clone(), vec![vec![3i64.into()], vec![4i64.into()]])?,
+        ])?
+        .filter(Predicate::gt(col!("id"), lit(1i64)))?;
+        write_and_check_output(
+            &executor,
+            write_plan(input, file_type, &path, overwrite)?,
+            file_type,
+            &path,
+            schema.clone(),
+            &[2, 3, 4],
+        )?;
+
+        let original_bytes = get_bytes(executor.storage.store(), &path)?;
+        let replacement = PlanBuilder::values(schema.clone(), vec![vec![9i64.into()]])?;
+        let replacement = write_plan(replacement, file_type, &path, overwrite)?;
+        if overwrite {
+            write_and_check_output(&executor, replacement, file_type, &path, schema, &[9])?;
+        } else {
+            let result = executor.execute_op(Operation::QueryPlan(replacement));
+            assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
+            assert_eq!(get_bytes(executor.storage.store(), &path)?, original_bytes);
+        }
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::values("values")]
+    #[case::filter("filter")]
+    #[case::scan("scan")]
+    #[case::aggregate("aggregate")]
+    #[case::retained("retained")]
+    fn write_nodes_skip_empty_input(
+        #[case] source: &str,
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values(false, true)] destination_exists: bool,
+        #[values(false, true)] overwrite: bool,
+    ) -> Result<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let scoped = executor.get_scoped();
+        let schema = schema_ref! { not_null "id": LONG };
+        let filtered = PlanBuilder::values(schema.clone(), vec![vec![1i64.into()]])?
+            .filter(Predicate::FALSE)?;
+        let empty_path = Url::parse("memory:///empty.json")?;
+        executor.storage.put(&empty_path, Bytes::new(), false)?;
+        let scan =
+            PlanBuilder::scan_json([executor.storage.head(&empty_path)?], &[], schema.clone())?;
+        let input = match source {
+            "values" => PlanBuilder::values(schema.clone(), vec![])?,
+            "filter" => filtered,
+            "scan" => scan,
+            "aggregate" => filtered.aggregate_by([column_name!("id")], |aggs| aggs)?,
+            "retained" => {
+                PlanBuilder::relation_source(scoped.execute_and_retain("empty", scan.build()?)?)
+            }
+            _ => unreachable!(),
+        };
+        let path = Url::parse("memory:///output")?;
+        let original = Bytes::from_static(b"original contents");
+        if destination_exists {
+            executor.storage.put(&path, original.clone(), false)?;
+        }
+        let plan = write_plan(input, file_type, &path, overwrite)?;
+        let batches = scoped
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        if destination_exists {
+            assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+        } else {
+            assert!(matches!(
+                executor.storage.head(&path),
+                Err(KernelError::FileNotFound(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    fn write_nodes_preserve_destination_on_input_error(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values(false, true)] overwrite: bool,
+    ) -> Result<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///output")?;
+        let original = Bytes::from_static(b"original contents");
+        executor.storage.put(&path, original.clone(), false)?;
+        let input = PlanBuilder::scan_json(
+            [FileMeta {
+                location: Url::parse("memory:///missing.json")?,
+                size: 0,
+                last_modified: 0,
+            }],
+            &[],
+            schema_ref! { not_null "id": LONG },
+        )?;
+        let plan = write_plan(input, file_type, &path, overwrite)?;
+        // The source file is deliberately absent, so the scan must fail before any write occurs.
+        assert!(matches!(
+            executor.execute_op(Operation::QueryPlan(plan)),
+            Err(KernelError::FileNotFound(missing)) if missing.ends_with("missing.json")
+        ));
+        assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+        Ok(())
+    }
 
     #[test]
     fn scoped_executor_creates_ref_from_arrow_batch() -> Result<()> {
