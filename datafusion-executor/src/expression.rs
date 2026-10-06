@@ -37,8 +37,9 @@ use crate::utils::column_to_df_expr;
 /// `output_type` supplies result type information that the expression itself does not carry.
 /// `Struct` and `StructPatch` require a struct type for output field names and computed child
 /// types. `Array` validates that a supplied type is an array and forwards its element type, while
-/// `Coalesce` forwards the result type unchanged to every branch. Callers pass `None` when the
-/// result type is unknown or the expression does not need it.
+/// `Coalesce` forwards `output_type` to its arguments for construction type information, leaving
+/// common-type resolution to DataFusion. Callers pass `None` when the result type is unknown or
+/// the expression does not need it.
 ///
 /// # Errors
 /// Returns an error when a column cannot be resolved, a scalar cannot be converted, supplied type
@@ -133,10 +134,10 @@ fn binary_expr_to_df_expr(
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`, each
-/// over the converted arguments. Coalesce is type-preserving, so it forwards `output_type` to each
-/// argument (every branch produces the same type). Array is type-wrapping: a known `Array<E>`
-/// target is peeled to `E` and threaded to each element (so an array of structs still gets its
-/// element schema); an unknown target leaves elements untyped.
+/// over the converted arguments. `Coalesce` forwards `output_type` to construct schema-dependent
+/// arguments before DataFusion performs common-type resolution and supported implicit conversions.
+/// A known `Array<E>` target is peeled to `E` and forwarded to each element so an array of structs
+/// gets its element schema; an unknown target leaves elements untyped.
 fn variadic_to_df_expr(
     variadic: &VariadicExpression,
     input_schema: &StructType,
