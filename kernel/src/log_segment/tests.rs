@@ -5443,8 +5443,8 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
 }
 
 // A snapshot's frozen log segment makes `latest_checkpoint_action` stable: a newer checkpoint
-// action written to storage after the snapshot is built does not change the snapshot's result
-// (which also stays consistent across repeated memoized calls). A fresh snapshot does observe it.
+// action written to storage after the snapshot is built does not change the snapshot's result.
+// A fresh snapshot does observe it.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
 fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> Result<()> {
@@ -5471,7 +5471,7 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
         minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
     )?;
 
-    // The frozen snapshot still reports version 1 across repeated (memoized) calls.
+    // The frozen snapshot still reports version 1.
     let second = snapshot
         .latest_checkpoint_action(&engine)?
         .expect("checkpoint present");

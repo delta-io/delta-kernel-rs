@@ -9,8 +9,6 @@ use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::cancellation::CancellationTokenRef;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -261,19 +259,15 @@ impl Snapshot {
         let resolution = match &crc_at_version {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
-                // creation.
-                let new_metadata = (crc.metadata != *existing_table_config.metadata())
-                    .then(|| crc.metadata.clone());
-                let new_protocol = (crc.protocol != *existing_table_config.protocol())
-                    .then(|| crc.protocol.clone());
-                PmResolution {
-                    metadata: new_metadata,
-                    protocol: new_protocol,
-                    source: *source,
-                    // No replay ran: hint from the CRC's manifest-commit pointer when present.
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action: CheckpointActionResolution::from_crc(crc),
-                }
+                // creation, keeping only the P&M that changed.
+                let mut resolution = PmResolution::from_crc(crc, *source);
+                resolution
+                    .metadata
+                    .take_if(|m| m == existing_table_config.metadata());
+                resolution
+                    .protocol
+                    .take_if(|p| p == existing_table_config.protocol());
+                resolution
             }
             None => {
                 // No incremental CRC to reuse: there was no base CRC, or advancing it was out of

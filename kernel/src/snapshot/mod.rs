@@ -109,7 +109,8 @@ pub struct Snapshot {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     checkpoint_action_resolution: CheckpointActionResolution,
     /// Memoized scan result backing [`Self::checkpoint_action_resolution`]'s `Hint`/`Unresolved`
-    /// path, so the log is scanned at most once; unused for a `Captured` resolution, which serves
+    /// path, filled after the first successful scan so later calls do not re-scan (a failed scan
+    /// is not cached and is retried); unused for a `Captured` resolution, which serves
     /// its action directly. `None` means the scan found no checkpoint action in this snapshot's
     /// log segment (a classic non-AMT table, or an AMT table that has none yet).
     ///
@@ -385,8 +386,7 @@ impl Snapshot {
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
         //         first commit. The replay reports its own source (seeded vs full) and, under AMT,
-        //         how it resolved the latest checkpoint action. The CRC-reuse arm runs no replay,
-        //         so it reports the checkpoint action as unresolved (`None`).
+        //         how it resolved the latest checkpoint action.
         let PmResolution {
             metadata,
             protocol,
@@ -394,14 +394,7 @@ impl Snapshot {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action,
         } = match &crc_at_version {
-            Some((crc, crc_source)) => PmResolution {
-                metadata: Some(crc.metadata.clone()),
-                protocol: Some(crc.protocol.clone()),
-                source: *crc_source,
-                // No replay ran: hint from the CRC's manifest-commit pointer when present.
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action: CheckpointActionResolution::from_crc(crc),
-            },
+            Some((crc, crc_source)) => PmResolution::from_crc(crc, *crc_source),
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,

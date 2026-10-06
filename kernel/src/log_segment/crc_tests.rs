@@ -785,7 +785,7 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
 
 // A CRC-seeded pruned replay (CRC below target) that finds a checkpoint action in the commits
 // after the CRC captures it: those commits include the newest, and checkpoint versions strictly
-// increase, so a hit is the latest action. Previously this path always deferred to a log scan.
+// increase, so a hit is the latest action.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
 async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {

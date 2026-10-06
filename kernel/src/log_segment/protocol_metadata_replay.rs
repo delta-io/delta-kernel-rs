@@ -39,7 +39,7 @@ use crate::{Engine, EngineData, KernelError, KernelResult, Result, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns `None` for either if not found.
+    /// The result's `metadata` and `protocol` are `None` if not found.
     ///
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
@@ -57,15 +57,10 @@ impl LogSegment {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
-            return Ok(PmResolution {
-                metadata: Some(crc.metadata.clone()),
-                protocol: Some(crc.protocol.clone()),
-                source: ProtocolMetadataSource::CrcAtTarget,
-                // No replay ran: use the CRC's manifest-commit pointer as a hint when present, so a
-                // consumer can resolve the latest checkpoint action without a full log scan.
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action: CheckpointActionResolution::from_crc(crc),
-            });
+            return Ok(PmResolution::from_crc(
+                crc,
+                ProtocolMetadataSource::CrcAtTarget,
+            ));
         }
 
         // We didn't return above, so we need to do log replay to find P&M.
@@ -322,16 +317,6 @@ impl CheckpointActionResolution {
             None => Self::Unresolved,
         }
     }
-
-    /// Resolves from a CRC that short-circuits replay: its [`LastManifestCommit`] pointer, when
-    /// present, becomes a [`Hint`](Self::Hint); otherwise there is nothing to go on and it is
-    /// [`Unresolved`](Self::Unresolved).
-    pub(crate) fn from_crc(crc: &Crc) -> Self {
-        match &crc.last_manifest_commit_opt {
-            Some(hint) => Self::Hint(hint.clone()),
-            None => Self::Unresolved,
-        }
-    }
 }
 
 /// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
@@ -344,6 +329,24 @@ pub(crate) struct PmResolution {
     /// CRC's manifest-commit pointer, or unresolved. See [`CheckpointActionResolution`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) checkpoint_action: CheckpointActionResolution,
+}
+
+impl PmResolution {
+    /// P&M taken from a CRC that short-circuits replay. With no replay to capture the checkpoint
+    /// action, the CRC's [`LastManifestCommit`] pointer becomes a
+    /// [`Hint`](CheckpointActionResolution::Hint) when present, else it is `Unresolved`.
+    pub(crate) fn from_crc(crc: &Crc, source: ProtocolMetadataSource) -> Self {
+        Self {
+            metadata: Some(crc.metadata.clone()),
+            protocol: Some(crc.protocol.clone()),
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: crc.last_manifest_commit_opt.clone().map_or(
+                CheckpointActionResolution::Unresolved,
+                CheckpointActionResolution::Hint,
+            ),
+        }
+    }
 }
 
 /// Protocol and Metadata, each tagged with the version it was found at. Holds both a single
