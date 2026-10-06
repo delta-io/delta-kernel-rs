@@ -697,23 +697,27 @@ mod tests {
     const METADATA_CONFIG_CHANGE_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"foo":"bar"},"createdTime":2000}}"#;
 
     #[rstest::rstest]
-    #[case::too_high_reader_version(
-        r#"{"protocol":{"minReaderVersion":2147483647,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}"#,
+    #[case::too_high_reader_version_without_features(
+        r#"{"protocol":{"minReaderVersion":2147483647,"minWriterVersion":1}}"#,
         |err: &KernelError| matches!(
             err,
             KernelError::UnsupportedProtocolVersion {
                 version_type: ProtocolVersionType::Reader,
                 min_reader_version: i32::MAX,
-                min_writer_version: 7,
+                min_writer_version: 1,
             }
         ),
+    )]
+    #[case::too_high_reader_version_with_features(
+        r#"{"protocol":{"minReaderVersion":2147483647,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}"#,
+        |err: &KernelError| matches!(err, KernelError::InvalidProtocol(_)),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
         |err: &KernelError| matches!(err, KernelError::InvalidProtocol(_)),
     )]
     #[tokio::test]
-    async fn test_commits_errors_on_unsupported_reader_version(
+    async fn test_commits_errors_on_invalid_or_unsupported_reader_version(
         #[case] v1: &str,
         #[case] is_expected_err: fn(&KernelError) -> bool,
     ) {

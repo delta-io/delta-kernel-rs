@@ -180,7 +180,9 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
     min_reader_version: 4,
     reader_features: &[],
     writer_features: &[],
-    expected_error: Some("Unsupported minimum reader version 4"),
+    expected_error: Some(
+        "Unsupported Delta protocol reader version: minReaderVersion=4, minWriterVersion=7",
+    ),
 })]
 #[cfg_attr(
     not(feature = "adaptive-metadata-in-dev"),

@@ -1160,7 +1160,7 @@ mod tests {
     )]
     #[case::future_reader_version(
         Protocol::try_new_legacy(4, 2).unwrap(),
-        Some("Unsupported minimum reader version 4"),
+        Some("Unsupported Delta protocol reader version: minReaderVersion=4, minWriterVersion=2"),
     )]
     #[case::unknown_reader_feature(
         Protocol::try_new_modern(["futureFeature"], ["futureFeature"]).unwrap(),
