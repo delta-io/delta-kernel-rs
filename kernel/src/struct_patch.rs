@@ -317,20 +317,11 @@ impl<Item> StructPatchBuilder<Item> {
 
     /// Records an optional field drop.
     pub fn drop_if_exists(self, field_name: impl Into<String>) -> Self {
-        self.drop_optional_at(TOP_LEVEL, field_name)
+        self.drop_if_exists_at(TOP_LEVEL, field_name)
     }
 
     /// Records an optional field drop in a nested struct.
-    #[deprecated(note = "inspect the input schema and use drop_at instead")]
     pub fn drop_if_exists_at(
-        self,
-        struct_path: impl CollectInto<ColumnName>,
-        field_name: impl Into<String>,
-    ) -> Self {
-        self.drop_optional_at(struct_path, field_name)
-    }
-
-    fn drop_optional_at(
         self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
@@ -810,13 +801,12 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     }
 
     /// Records an optional field drop in a nested struct.
-    #[deprecated(note = "inspect input_schema and use drop_at instead")]
     pub fn drop_if_exists_at(
         mut self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
     ) -> Self {
-        self.inner = self.inner.drop_optional_at(struct_path, field_name);
+        self.inner = self.inner.drop_if_exists_at(struct_path, field_name);
         self
     }
 
