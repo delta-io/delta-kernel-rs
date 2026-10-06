@@ -516,18 +516,17 @@ mod tests {
 
     use super::*;
 
-    /// Intentionally access `BoxExt::into_non_null` as `Box::into_non_null` so rustc warns about
-    /// `unstable_name_collisions`. The warning will disappear once `Box::into_non_null` stabilizes,
-    /// causing the test expectation to fail so we remember to remove the `BoxExt` trait.
+    // Fails when workspace MSRV is high enough to stabilize `Box::into_non_null`, so that `BoxExt`
+    // trait (and this test) can be removed.
     #[test]
-    #[expect(
-        unstable_name_collisions,
-        reason = "intentional canary to detect that BoxExt trait is no longer needed"
-    )]
-    fn box_into_non_null_still_uses_the_polyfill() {
-        let ptr = Box::into_non_null(Box::new(1u8));
-        let boxed = unsafe { Box::from_raw(ptr.as_ptr()) };
-        assert_eq!(*boxed, 1);
+    fn box_ext_is_required_by_msrv() {
+        let mut parts = env!("CARGO_PKG_RUST_VERSION").split('.');
+        let major: u32 = parts.next().unwrap().parse().unwrap();
+        let minor: u32 = parts.next().unwrap().parse().unwrap();
+        assert!(
+            (major, minor) < (1, 99),
+            "BoxExt is now obsolete. Delete the trait and use Box::into_non_null instead"
+        );
     }
 
     #[allow(dead_code)]
