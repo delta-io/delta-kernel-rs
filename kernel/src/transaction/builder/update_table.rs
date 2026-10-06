@@ -76,7 +76,7 @@ impl UpdateTableTransactionBuilder {
         } = self;
 
         let mut transaction = Transaction::try_new_existing_table(snapshot, committer, engine)?
-            .with_builder_state(state)?;
+            .with_builder_state(state);
 
         if let Some(operation) = operation {
             transaction = transaction.with_update_table_operation(operation);

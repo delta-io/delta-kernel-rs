@@ -62,6 +62,7 @@ fn setup_empty_table() -> Result<(tempfile::TempDir, Url)> {
 
 #[rstest]
 #[case::write_append("WRITE", true, false)]
+#[case::custom_insert("INSERT", true, false)]
 #[case::blind_append("WRITE", true, true)]
 #[case::optimize_no_data_change("OPTIMIZE", false, false)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

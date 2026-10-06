@@ -216,8 +216,9 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Unless overridden, non-`ALTER TABLE` operations default `dataChange` to `true`.
-> `ALTER TABLE` infers `false` for metadata-only commits and `true` when file actions are staged.
+> Unless overridden, transactions with schema changes infer `dataChange` from effective file
+> actions: `false` when none are staged and `true` otherwise. Transactions without schema changes
+> default to `true`; empty or unselected batches don't count as file actions.
 
 ## Committing
 
@@ -258,16 +259,15 @@ Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This f
 enables conflict resolution optimizations: two blind appends to the same table can never
 conflict with each other, because neither depends on the other's output.
 
-Kernel validates the following rules at commit time. If any rule is violated, `commit()`
-returns an error:
+Kernel rejects incompatible intent during `build()`: `ALTER TABLE`, schema changes, and
+`dataChange = false`. During `commit()`, Kernel requires an effective Add action and rejects
+effective Remove or deletion-vector actions.
 
 | Rule | Rationale |
 |------|-----------|
 | The transaction must add at least one file | A blind append with no data is meaningless |
-| `data_change` must be `true` | Blind appends are logical data additions, not reorganizations |
 | The transaction must not remove any files | Removing files means the write depends on existing state |
 | The transaction must not update deletion vectors | Deletion vector updates depend on existing state |
-| The transaction must not be a create-table transaction | Table creation is not an append |
 
 > [!TIP]
 > Mark your transaction as a blind append whenever you are inserting new data without reading
@@ -300,12 +300,12 @@ these fields in your custom commit info:
 |-------|---------|-------------------------|
 | `timestamp` | The transaction's commit timestamp | Current time when the transaction is created |
 | `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled; omitted otherwise |
-| `operation` | The operation name | The value from `with_operation()`; defaults to `UNKNOWN` for existing-table transactions and is fixed for create and alter transactions |
+| `operation` | The operation name | The selected `UpdateTableOperation`; defaults to `UNKNOWN` for existing tables and is fixed to `CREATE TABLE` for creation |
 | `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`; defaults to `{}` |
 | `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`; omitted when unset, while an explicitly empty map is written as `{}` |
 | `kernelVersion` | The Kernel library version | Current Kernel version |
 | `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`; omitted (`false`) otherwise |
-| `engineInfo` | The engine identifier | The value from `with_engine_info()`; omitted for existing and alter transactions when unset, while create uses its required engine identifier |
+| `engineInfo` | The engine identifier | Omitted for existing-table transactions when unset; required by create table |
 | `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
 Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and

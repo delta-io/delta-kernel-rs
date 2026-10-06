@@ -121,8 +121,9 @@ You can call `remove_files()` multiple times to remove files from different
 pending removals.
 
 > [!NOTE]
-> Unless overridden, non-`ALTER TABLE` operations default `dataChange` to `true`.
-> `ALTER TABLE` infers `false` for metadata-only commits and `true` when file actions are staged.
+> Unless overridden, transactions with schema changes infer `dataChange` from effective file
+> actions: `false` when none are staged and `true` otherwise. Transactions without schema changes
+> default to `true`; empty or unselected batches don't count as file actions.
 
 ## Full example
 

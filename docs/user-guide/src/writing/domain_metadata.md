@@ -14,9 +14,9 @@ Before reading this page, make sure you understand
 
 ## Writing domain metadata
 
-To attach domain metadata to a commit, call `with_domain_metadata()` on the
-transaction. This method is available on both create-table and existing-table
-transactions.
+To attach domain metadata known before writing, call `with_domain_metadata()` on the builder. Both
+create-table and existing-table builders support this method. You can also add metadata learned
+while writing to a built transaction before committing it.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -49,9 +49,16 @@ txn.commit(&engine)?;
 # }
 ```
 
-The `with_domain_metadata` signature takes two `String` arguments:
+The builder setter accepts values convertible to `String` and validates them during `build()`. The
+late-bound transaction setter takes owned strings and validates them during `commit()`:
 
 ```rust,ignore
+pub fn with_domain_metadata(
+    self,
+    domain: impl Into<String>,
+    configuration: impl Into<String>,
+) -> Self
+
 pub fn with_domain_metadata(self, domain: String, configuration: String) -> Self
 ```
 
@@ -145,13 +152,13 @@ match config {
 
 ## Constraints and validation
 
-Kernel validates domain metadata operations at commit time. The following rules
-apply:
+Kernel validates builder-provided domain metadata during `build()` and late-bound transaction
+metadata during `commit()`. The following rules apply:
 
 - **One domain per transaction.** Each domain name can appear at most once per
   transaction. You cannot set and remove the same domain in a single commit,
   and you cannot set the same domain twice. If you include a duplicate domain,
-  the commit fails with an error.
+  validation fails at the applicable `build()` or `commit()` boundary.
 
 - **Reserved prefix.** Domain names starting with `delta.` are reserved for
   Kernel's internal use (e.g., clustering metadata). Attempting to read, write,
@@ -159,7 +166,7 @@ apply:
 
 - **Feature requirement.** Domain metadata operations require the
   `domainMetadata` writer feature to be enabled on the table (writer version 7).
-  If the feature is not enabled, the commit fails.
+  If the feature is not enabled, validation fails at the applicable boundary.
 
 - **No removals on create-table.** The `with_domain_metadata_removed()` method
   is only available on existing-table transactions. The Rust type system

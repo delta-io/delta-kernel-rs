@@ -231,8 +231,14 @@ feature is enabled; the rest are always available.
 |----------|---------|
 | `new_update_table_txn_builder` | Create a builder from a snapshot |
 | `update_table_txn_builder_with_engine_info` | Record a connector name and version before writing |
+| `update_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
 | `update_table_txn_builder_with_operation` / `update_table_txn_builder_with_custom_operation` | Select the operation stored in table history |
+| `update_table_txn_builder_with_operation_parameters` | Replace the operation parameters recorded in `commitInfo` |
+| `update_table_txn_builder_with_operation_metrics` / `update_table_txn_with_operation_metrics` | Set metrics before writing or replace them with write-time results |
+| `update_table_txn_builder_with_commit_info` / `update_table_txn_with_commit_info` | Set connector commit information before writing or before commit |
 | `update_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair for idempotent writes (see [Idempotent Writes](../writing/idempotent_writes.md)) |
+| `update_table_txn_builder_with_data_change` / `update_table_txn_builder_with_blind_append` | Configure file-action and blind-append semantics before `build()` |
+| `update_table_txn_builder_add_column` / `update_table_txn_builder_add_column_at` / `update_table_txn_builder_set_nullable` | Configure schema evolution before `build()` |
 | `update_table_txn_builder_with_domain_metadata` / `update_table_txn_builder_with_domain_metadata_removed` | Add or remove user domain metadata |
 | `update_table_txn_builder_build` / `update_table_txn_builder_build_with_committer` | Consume the builder and produce a transaction |
 | `free_update_table_txn_builder` | Release a builder without building it |
@@ -294,7 +300,13 @@ unpartitioned writes.
 |----------|---------|
 | `new_create_table_txn_builder` | Create a builder for a new Delta table with a schema |
 | `create_table_txn_builder_with_table_property` | Add a table property to the builder |
+| `create_table_txn_builder_with_correlation_id` | Attach a correlation identifier to transaction metrics |
+| `create_table_txn_builder_with_operation_parameters` | Replace the operation parameters recorded in `commitInfo` |
+| `create_table_txn_builder_with_operation_metrics` / `create_table_txn_with_operation_metrics` | Set metrics before writing or replace them with write-time results |
+| `create_table_txn_builder_with_commit_info` / `create_table_txn_with_commit_info` | Set connector commit information before writing or before commit |
 | `create_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair to the create commit |
+| `create_table_txn_builder_with_domain_metadata` / `create_table_txn_with_domain_metadata` | Add domain metadata before writing or before commit |
+| `create_table_txn_builder_with_partition_columns` / `create_table_txn_builder_with_clustering_columns` | Configure the table's data layout before `build()` |
 | `create_table_txn_builder_build` | Consume the builder and produce a create-table transaction using the default (filesystem) committer |
 | `create_table_txn_builder_build_with_committer` | Consume the builder and produce a create-table transaction with a custom committer |
 | `create_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` to stage initial data files during table creation |

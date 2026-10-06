@@ -11,6 +11,7 @@ use crate::{OptionalValue, Result, SharedSnapshot};
 ///
 /// The returned handle owns the committed transaction and must be released with
 /// [`free_committed_transaction`].
+// TODO(#3504): Preserve retryable and conflicted transaction state across the FFI boundary.
 pub(super) fn commit_result_to_committed_handle<S>(
     result: Result<CommitResult<S>>,
 ) -> Result<Handle<ExclusiveCommittedTransaction>> {

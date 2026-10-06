@@ -46,7 +46,7 @@ pub use update_table::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use url::Url;
 
-use crate::delta_types::{FfiColumnName, FfiStringMap};
+use crate::delta_types::{FfiColumnName, FfiNullableStringMap};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
@@ -58,37 +58,33 @@ use crate::{
     SharedSnapshot, TryFromStringSlice,
 };
 
-unsafe fn apply_string_map<T>(
+unsafe fn apply_nullable_string_map<T>(
     value: T,
-    input: &FfiStringMap,
+    input: &FfiNullableStringMap,
     apply: impl FnOnce(T, HashMap<String, Option<String>>) -> T,
 ) -> Result<T> {
-    let values = unsafe { input.try_to_hash_map() }?
-        .into_iter()
-        .map(|(key, value)| (key, Some(value)))
-        .collect();
-    Ok(apply(value, values))
+    Ok(apply(value, unsafe { input.try_to_hash_map() }?))
 }
 
 unsafe fn apply_commit_info<T>(
     value: T,
     commit_info: Box<dyn EngineData>,
     schema: &EngineSchema,
-    apply: impl FnOnce(T, Box<dyn EngineData>, SchemaRef) -> Result<T>,
+    apply: impl FnOnce(T, Box<dyn EngineData>, SchemaRef) -> T,
 ) -> Result<T> {
     let schema = decode_engine_schema(schema)?;
-    apply(value, commit_info, Arc::new(schema))
+    Ok(apply(value, commit_info, Arc::new(schema)))
 }
 
 unsafe fn apply_domain_metadata<T>(
     value: T,
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
-    apply: impl FnOnce(T, String, String) -> Result<T>,
+    apply: impl FnOnce(T, String, String) -> T,
 ) -> Result<T> {
     let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
-    apply(value, domain, configuration)
+    Ok(apply(value, domain, configuration))
 }
 
 fn decode_engine_schema(schema: &EngineSchema) -> Result<delta_kernel::schema::StructType> {
@@ -116,6 +112,7 @@ use create_table::{collect_create_table_columns, create_table_txn_builder_with_d
 #[cfg(test)]
 mod tests {
     use std::os::raw::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
@@ -135,7 +132,9 @@ mod tests {
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::Result;
-    use delta_kernel_ffi::delta_types::{FfiColumnNameArray, FfiStringMapEntry};
+    use delta_kernel_ffi::delta_types::{
+        FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
+    };
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
@@ -189,6 +188,39 @@ mod tests {
             Err(delta_kernel::KernelError::IOError(std::io::Error::other(
                 "simulated IO error",
             )))
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+
+        fn publish(
+            &self,
+            _engine: &dyn delta_kernel::Engine,
+            _publish_metadata: delta_kernel::committer::PublishMetadata,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DropTrackingCommitter(Arc<AtomicUsize>);
+
+    impl Drop for DropTrackingCommitter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Committer for DropTrackingCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn delta_kernel::Engine,
+            _actions: delta_kernel::ResultIterator<'_, FilteredEngineData>,
+            _commit_metadata: delta_kernel::committer::CommitMetadata,
+        ) -> Result<delta_kernel::committer::CommitResponse> {
+            Err(delta_kernel::KernelError::generic(
+                "drop-tracking committer must not be called",
+            ))
         }
 
         fn is_catalog_committer(&self) -> bool {
@@ -1988,6 +2020,22 @@ mod tests {
         }
     }
 
+    extern "C" fn visit_invalid_schema_not_struct(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let field = "field";
+        unsafe {
+            ok_or_panic(visit_field_integer(
+                state,
+                kernel_string_slice!(field),
+                true,
+                std::ptr::null(),
+                allocate_err,
+            ))
+        }
+    }
+
     /// Create a [`CreateTableTransactionBuilder`] handle via the FFI, using the given schema
     /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
     /// for freeing/consuming the engine and builder handles.
@@ -2199,21 +2247,34 @@ mod tests {
             )
         });
 
-        let parameter_entries = [FfiStringMapEntry {
+        let parameter_entries = [
+            FfiNullableStringMapEntry {
+                key: ffi_str("key"),
+                value: OptionalValue::Some(ffi_str("parameter")),
+            },
+            FfiNullableStringMapEntry {
+                key: ffi_str("nullParameter"),
+                value: OptionalValue::None,
+            },
+        ];
+        let parameters = unsafe { FfiNullableStringMap::new_unsafe(&parameter_entries) };
+        let builder_metric_entries = [FfiNullableStringMapEntry {
             key: ffi_str("key"),
-            value: ffi_str("parameter"),
+            value: OptionalValue::Some(ffi_str("builder")),
         }];
-        let parameters = unsafe { FfiStringMap::new_unsafe(&parameter_entries) };
-        let builder_metric_entries = [FfiStringMapEntry {
-            key: ffi_str("key"),
-            value: ffi_str("builder"),
-        }];
-        let builder_metrics = unsafe { FfiStringMap::new_unsafe(&builder_metric_entries) };
-        let transaction_metric_entries = [FfiStringMapEntry {
-            key: ffi_str("key"),
-            value: ffi_str("transaction"),
-        }];
-        let transaction_metrics = unsafe { FfiStringMap::new_unsafe(&transaction_metric_entries) };
+        let builder_metrics = unsafe { FfiNullableStringMap::new_unsafe(&builder_metric_entries) };
+        let transaction_metric_entries = [
+            FfiNullableStringMapEntry {
+                key: ffi_str("key"),
+                value: OptionalValue::Some(ffi_str("transaction")),
+            },
+            FfiNullableStringMapEntry {
+                key: ffi_str("nullMetric"),
+                value: OptionalValue::None,
+            },
+        ];
+        let transaction_metrics =
+            unsafe { FfiNullableStringMap::new_unsafe(&transaction_metric_entries) };
         let commit_info_fields = vec![StructField::nullable("connectorField", DataType::STRING)];
         let commit_info_schema = EngineSchema {
             schema: &commit_info_fields as *const Vec<StructField> as *mut c_void,
@@ -2290,10 +2351,12 @@ mod tests {
             commit_info["commitInfo"]["operationParameters"]["key"],
             "parameter"
         );
+        assert!(commit_info["commitInfo"]["operationParameters"]["nullParameter"].is_null());
         assert_eq!(
             commit_info["commitInfo"]["operationMetrics"]["key"],
             "transaction"
         );
+        assert!(commit_info["commitInfo"]["operationMetrics"]["nullMetric"].is_null());
         assert_eq!(commit_info["commitInfo"]["connectorField"], "transaction");
         let transaction = read_transaction_action(&store, &table_url, 0).await;
         assert_eq!(transaction["txn"]["appId"], "create-app");
@@ -2310,21 +2373,34 @@ mod tests {
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
 
-        let parameter_entries = [FfiStringMapEntry {
+        let parameter_entries = [
+            FfiNullableStringMapEntry {
+                key: ffi_str("key"),
+                value: OptionalValue::Some(ffi_str("parameter")),
+            },
+            FfiNullableStringMapEntry {
+                key: ffi_str("nullParameter"),
+                value: OptionalValue::None,
+            },
+        ];
+        let parameters = unsafe { FfiNullableStringMap::new_unsafe(&parameter_entries) };
+        let builder_metric_entries = [FfiNullableStringMapEntry {
             key: ffi_str("key"),
-            value: ffi_str("parameter"),
+            value: OptionalValue::Some(ffi_str("builder")),
         }];
-        let parameters = unsafe { FfiStringMap::new_unsafe(&parameter_entries) };
-        let builder_metric_entries = [FfiStringMapEntry {
-            key: ffi_str("key"),
-            value: ffi_str("builder"),
-        }];
-        let builder_metrics = unsafe { FfiStringMap::new_unsafe(&builder_metric_entries) };
-        let transaction_metric_entries = [FfiStringMapEntry {
-            key: ffi_str("key"),
-            value: ffi_str("transaction"),
-        }];
-        let transaction_metrics = unsafe { FfiStringMap::new_unsafe(&transaction_metric_entries) };
+        let builder_metrics = unsafe { FfiNullableStringMap::new_unsafe(&builder_metric_entries) };
+        let transaction_metric_entries = [
+            FfiNullableStringMapEntry {
+                key: ffi_str("key"),
+                value: OptionalValue::Some(ffi_str("transaction")),
+            },
+            FfiNullableStringMapEntry {
+                key: ffi_str("nullMetric"),
+                value: OptionalValue::None,
+            },
+        ];
+        let transaction_metrics =
+            unsafe { FfiNullableStringMap::new_unsafe(&transaction_metric_entries) };
         let commit_info_fields = vec![StructField::nullable("connectorField", DataType::STRING)];
         let commit_info_schema = EngineSchema {
             schema: &commit_info_fields as *const Vec<StructField> as *mut c_void,
@@ -2417,10 +2493,12 @@ mod tests {
             commit_info["commitInfo"]["operationParameters"]["key"],
             "parameter"
         );
+        assert!(commit_info["commitInfo"]["operationParameters"]["nullParameter"].is_null());
         assert_eq!(
             commit_info["commitInfo"]["operationMetrics"]["key"],
             "transaction"
         );
+        assert!(commit_info["commitInfo"]["operationMetrics"]["nullMetric"].is_null());
         assert_eq!(commit_info["commitInfo"]["connectorField"], "transaction");
         unsafe {
             free_snapshot(snapshot);
@@ -2439,16 +2517,16 @@ mod tests {
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let entries = [
-            FfiStringMapEntry {
+            FfiNullableStringMapEntry {
                 key: ffi_str("duplicate"),
-                value: ffi_str("first"),
+                value: OptionalValue::Some(ffi_str("first")),
             },
-            FfiStringMapEntry {
+            FfiNullableStringMapEntry {
                 key: ffi_str("duplicate"),
-                value: ffi_str("second"),
+                value: OptionalValue::Some(ffi_str("second")),
             },
         ];
-        let values = unsafe { FfiStringMap::new_unsafe(&entries) };
+        let values = unsafe { FfiNullableStringMap::new_unsafe(&entries) };
 
         assert_extern_result_error_contains(
             unsafe {
@@ -2472,11 +2550,11 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
-        let entries = [FfiStringMapEntry {
+        let entries = [FfiNullableStringMapEntry {
             key: ffi_str(""),
-            value: ffi_str("value"),
+            value: OptionalValue::Some(ffi_str("value")),
         }];
-        let values = unsafe { FfiStringMap::new_unsafe(&entries) };
+        let values = unsafe { FfiNullableStringMap::new_unsafe(&entries) };
 
         let builder = ok_or_panic(unsafe {
             update_table_txn_builder_with_operation_parameters(
@@ -2487,6 +2565,283 @@ mod tests {
         });
         unsafe {
             free_update_table_txn_builder(builder);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_info_builder_setters_consume_inputs_on_schema_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_schema = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_invalid_schema_not_struct,
+        };
+
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_builder_invalid_commit_info", None);
+        let (_table_path, create_engine, create_builder) = create_table_txn_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        assert_extern_result_error_contains(
+            unsafe {
+                create_table_txn_builder_with_commit_info(
+                    create_builder,
+                    commit_info_engine_data("create"),
+                    &invalid_schema,
+                    create_engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::SchemaError,
+            "Final returned id was not a struct",
+        );
+        unsafe { free_engine(create_engine) };
+
+        let (table_url, _store, update_engine) =
+            setup_domain_metadata_table("test_update_builder_invalid_commit_info", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), update_engine.shallow_copy()) };
+        let update_builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        assert_extern_result_error_contains(
+            unsafe {
+                update_table_txn_builder_with_commit_info(
+                    update_builder,
+                    commit_info_engine_data("update"),
+                    &invalid_schema,
+                    update_engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::SchemaError,
+            "Final returned id was not a struct",
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(update_engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_info_transaction_setters_consume_inputs_on_schema_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_schema = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_invalid_schema_not_struct,
+        };
+
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_txn_invalid_commit_info", None);
+        let (_table_path, create_engine, create_builder) = create_table_txn_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let create_txn = ok_or_panic(unsafe {
+            create_table_txn_builder_build(create_builder, create_engine.shallow_copy())
+        });
+        assert_extern_result_error_contains(
+            unsafe {
+                create_table_txn_with_commit_info(
+                    create_txn,
+                    commit_info_engine_data("create"),
+                    &invalid_schema,
+                    create_engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::SchemaError,
+            "Final returned id was not a struct",
+        );
+        unsafe { free_engine(create_engine) };
+
+        let (table_url, _store, update_engine) =
+            setup_domain_metadata_table("test_update_txn_invalid_commit_info", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), update_engine.shallow_copy()) };
+        let update_builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let update_txn = ok_or_panic(unsafe {
+            update_table_txn_builder_build(update_builder, update_engine.shallow_copy())
+        });
+        assert_extern_result_error_contains(
+            unsafe {
+                update_table_txn_with_commit_info(
+                    update_txn,
+                    commit_info_engine_data("update"),
+                    &invalid_schema,
+                    update_engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::SchemaError,
+            "Final returned id was not a struct",
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(update_engine);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::zero(0)]
+    #[case::two(2)]
+    #[tokio::test]
+    async fn update_table_add_column_requires_exactly_one_field(
+        #[case] field_count: usize,
+        #[values(false, true)] nested: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_name = format!("test_update_add_column_{field_count}_{nested}");
+        let (table_url, _store, engine) = setup_domain_metadata_table(&table_name, false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let fields = (0..field_count)
+            .map(|index| StructField::nullable(format!("field_{index}"), DataType::INTEGER))
+            .collect::<Vec<_>>();
+        let schema = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
+        let parent_parts = [ffi_str("id")];
+        let parent = FfiColumnName {
+            path: unsafe { FfiStringArray::new_unsafe(&parent_parts) },
+        };
+        let result = if nested {
+            unsafe {
+                update_table_txn_builder_add_column_at(
+                    builder,
+                    &parent,
+                    &schema,
+                    engine.shallow_copy(),
+                )
+            }
+        } else {
+            unsafe { update_table_txn_builder_add_column(builder, &schema, engine.shallow_copy()) }
+        };
+
+        assert_extern_result_error_with_message(
+            result,
+            FFIKernelError::InvalidTransactionStateError,
+            Some("Invalid transaction state: add-column schema must contain exactly one field"),
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    enum InvalidUpdateIntent {
+        EmptyCustomOperation,
+        ReservedCustomOperation,
+        BlindAppendWithoutDataChange,
+        BlindAppendWithSchemaChange,
+    }
+
+    #[rstest]
+    #[case::empty_custom(
+        InvalidUpdateIntent::EmptyCustomOperation,
+        "custom operation name cannot be empty"
+    )]
+    #[case::reserved_custom(
+        InvalidUpdateIntent::ReservedCustomOperation,
+        "custom operation name 'WRITE' is reserved"
+    )]
+    #[case::blind_without_data_change(
+        InvalidUpdateIntent::BlindAppendWithoutDataChange,
+        "blind append requires data_change to be true"
+    )]
+    #[case::blind_with_schema_change(
+        InvalidUpdateIntent::BlindAppendWithSchemaChange,
+        "blind append cannot include schema changes"
+    )]
+    #[tokio::test]
+    async fn invalid_update_table_intent_maps_through_ffi(
+        #[case] intent: InvalidUpdateIntent,
+        #[case] expected: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_name = format!("test_invalid_update_intent_{intent:?}").to_lowercase();
+        let (table_url, _store, engine) = setup_domain_metadata_table(&table_name, false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = match intent {
+            InvalidUpdateIntent::EmptyCustomOperation => ok_or_panic(unsafe {
+                update_table_txn_builder_with_custom_operation(
+                    builder,
+                    ffi_str(""),
+                    engine.shallow_copy(),
+                )
+            }),
+            InvalidUpdateIntent::ReservedCustomOperation => ok_or_panic(unsafe {
+                update_table_txn_builder_with_custom_operation(
+                    builder,
+                    ffi_str("WRITE"),
+                    engine.shallow_copy(),
+                )
+            }),
+            InvalidUpdateIntent::BlindAppendWithoutDataChange => {
+                let builder = unsafe { update_table_txn_builder_with_data_change(builder, false) };
+                unsafe { update_table_txn_builder_with_blind_append(builder) }
+            }
+            InvalidUpdateIntent::BlindAppendWithSchemaChange => {
+                let fields = vec![StructField::nullable("added", DataType::INTEGER)];
+                let field = EngineSchema {
+                    schema: &fields as *const Vec<StructField> as *mut c_void,
+                    visitor: visit_test_schema,
+                };
+                let builder = ok_or_panic(unsafe {
+                    update_table_txn_builder_add_column(builder, &field, engine.shallow_copy())
+                });
+                unsafe { update_table_txn_builder_with_blind_append(builder) }
+            }
+        };
+
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
+            FFIKernelError::InvalidTransactionStateError,
+            expected,
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_build_error_drops_consumed_custom_committer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_build_error_drops_committer", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_custom_operation(
+                builder,
+                ffi_str(""),
+                engine.shallow_copy(),
+            )
+        });
+        let drops = Arc::new(AtomicUsize::new(0));
+        let committer: Box<dyn Committer> = Box::new(DropTrackingCommitter(Arc::clone(&drops)));
+
+        assert_extern_result_error_contains(
+            unsafe {
+                update_table_txn_builder_build_with_committer(
+                    builder,
+                    engine.shallow_copy(),
+                    committer.into(),
+                )
+            },
+            FFIKernelError::InvalidTransactionStateError,
+            "custom operation name cannot be empty",
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        unsafe {
             free_snapshot(snapshot);
             free_engine(engine);
         }

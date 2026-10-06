@@ -15,28 +15,8 @@
 //
 // The target table must already exist (e.g. created by the `create-table` example).
 //
-// Demonstrates the write-path FFI surface:
-//   - new_update_table_txn_builder(snapshot) to start an update builder
-//   - update_table_txn_builder_with_engine_info to set commitInfo.engineInfo
-//   - update_table_txn_get_unpartitioned_write_context(txn, engine) plus the four
-//     write-context accessors an engine needs when writing parquet files itself:
-//       - get_write_schema           -- logical (user-facing) schema
-//       - get_physical_write_schema  -- on-disk parquet schema (carries
-//                                       parquet.field.id under column mapping)
-//       - get_logical_to_physical    -- transform to apply per batch
-//       - get_write_path             -- table root URL (partitioned write
-//                                       directory support tracked by #2355)
-//   - update_table_txn_builder_with_data_change(builder, false) because this empty commit does not add data
-//   - update_table_txn_commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
-//   - committed_transaction_version + committed_transaction_post_commit_snapshot to read the
-//     version and the post-commit snapshot directly from the result, avoiding a fresh
-//     snapshot load
-//   - free_committed_transaction to release the result handle
-//
-// NOTE: This example does NOT call update_table_txn_add_files. Staging new files requires
-// constructing an Arrow RecordBatch that matches Transaction::add_files_schema (path,
-// partitionValues, size, modificationTime, stats), which needs arrow-glib (or equivalent) on the C
-// side. This example demonstrates the transaction lifecycle without staging a parquet file.
+// Commits an empty transaction against an existing table and prints the committed version.
+// Adding files is omitted because constructing the Arrow batch needs an Arrow C builder.
 
 int main(int argc, char* argv[]) {
   if (argc != 2) {

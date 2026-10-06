@@ -1025,6 +1025,8 @@ impl CreateTableTransactionBuilder {
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<CreateTableTransaction> {
+        self.state.validate()?;
+
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
@@ -1292,10 +1294,10 @@ mod tests {
             builder = builder.with_table_properties([property]);
         }
 
-        let error = builder
-            .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
-            .unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
+        assert_result_error_with_message(
+            builder.build(&SyncEngine::new(), Box::new(FileSystemCommitter::new())),
+            expected,
+        );
         Ok(())
     }
 

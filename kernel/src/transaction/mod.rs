@@ -512,8 +512,7 @@ impl<S> Transaction<S> {
         self
     }
 
-    pub(super) fn with_builder_state(mut self, state: TransactionBuilderState) -> Result<Self> {
-        state.validate()?;
+    pub(super) fn with_builder_state(mut self, state: TransactionBuilderState) -> Self {
         let TransactionBuilderState {
             correlation_id,
             operation_parameters,
@@ -539,7 +538,7 @@ impl<S> Transaction<S> {
         self.user_domain_metadata_additions = domain_metadata_additions;
         self.infer_data_change = data_change.is_none();
         self.data_change = data_change.unwrap_or(true);
-        Ok(self)
+        self
     }
 
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
@@ -1230,7 +1229,7 @@ impl<S> Transaction<S> {
         span.record("is_blind_append", self.is_blind_append);
         span.record("data_change", self.data_change);
         if let Some(operation) = &self.operation {
-            span.record("operation", operation.metric_label());
+            span.record("operation", operation.as_str());
         }
         span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
         span.record(

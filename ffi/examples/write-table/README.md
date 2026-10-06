@@ -19,13 +19,5 @@ $ ./write_table /path/to/existing/table
 
 # Limitations
 
-This example currently commits **empty** transactions. Staging new parquet files requires
-building an Arrow batch that matches `Transaction::add_files_schema` (`path`,
-`partitionValues`, `size`, `modificationTime`, `stats`) and handing it to
-`update_table_txn_add_files` via
-`get_engine_data`. Constructing that batch from C needs arrow-glib (or a similar C-level
-Arrow builder). A shared `ffi/examples/common/` arrow-glib writer helper is planned as a
-follow-up; once it lands, this example should grow an `update_table_txn_add_files` flow alongside a
-`update_table_txn_with_domain_metadata` / `with_domain_metadata_removed` demo (the `domainMetadata` writer
-feature can be enabled today via the existing `create_table_txn_builder_with_table_property`
-API by setting `delta.feature.domainMetadata=supported`).
+This example commits an empty transaction. Staging files requires an Arrow batch matching
+`Transaction::add_files_schema`, which this example doesn't construct.

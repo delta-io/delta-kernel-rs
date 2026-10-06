@@ -3,16 +3,9 @@ use std::fmt;
 /// Identifies an operation supported by [`UpdateTableTransactionBuilder`].
 ///
 /// Known operations provide compiler-checked names. [`Custom`](Self::Custom) preserves the
-/// protocol's extensibility for connector-specific operations. Create-table transactions fix their
-/// operation internally; replace-table operations are not supported.
-///
-/// Builder-specific typing prevents create operations from being selected here:
-///
-/// ```compile_fail
-/// use delta_kernel::transaction::UpdateTableOperation;
-///
-/// let operation = UpdateTableOperation::CreateTable;
-/// ```
+/// protocol's extensibility for connector-specific operations. Custom names are emitted verbatim
+/// in commit history and transaction metrics. Create-table transactions fix their operation
+/// internally; replace-table operations are not supported.
 ///
 /// [`UpdateTableTransactionBuilder`]: super::UpdateTableTransactionBuilder
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -49,19 +42,6 @@ impl UpdateTableOperation {
         };
         validate_custom_name(name)
     }
-
-    fn from_name(operation: String) -> Self {
-        match operation.as_str() {
-            "WRITE" => Self::Write,
-            "STREAMING UPDATE" => Self::StreamingUpdate,
-            "ALTER TABLE" => Self::AlterTable,
-            "DELETE" => Self::Delete,
-            "UPDATE" => Self::Update,
-            "MERGE" => Self::Merge,
-            "OPTIMIZE" => Self::Optimize,
-            _ => Self::Custom(operation),
-        }
-    }
 }
 
 impl fmt::Display for UpdateTableOperation {
@@ -84,15 +64,6 @@ impl CommitOperation {
         }
     }
 
-    pub(crate) fn metric_label(&self) -> &str {
-        // Connector-defined names collapse to one bounded-cardinality metric label while the
-        // exact operation name remains available in commitInfo.
-        match self {
-            Self::UpdateTable(UpdateTableOperation::Custom(_)) => "CUSTOM",
-            operation => operation.as_str(),
-        }
-    }
-
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::UpdateTable(operation) => operation.validate(),
@@ -110,22 +81,6 @@ impl fmt::Display for CommitOperation {
 impl From<UpdateTableOperation> for CommitOperation {
     fn from(operation: UpdateTableOperation) -> Self {
         Self::UpdateTable(operation)
-    }
-}
-
-impl From<String> for CommitOperation {
-    fn from(operation: String) -> Self {
-        if operation == "CREATE TABLE" {
-            Self::CreateTable
-        } else {
-            Self::UpdateTable(UpdateTableOperation::from_name(operation))
-        }
-    }
-}
-
-impl From<&str> for CommitOperation {
-    fn from(operation: &str) -> Self {
-        operation.to_string().into()
     }
 }
 
@@ -181,13 +136,26 @@ mod tests {
         assert_eq!(operation, UpdateTableOperation::Custom(value.to_string()));
         assert_eq!(operation.as_str(), value);
         let operation = CommitOperation::from(operation);
-        assert_eq!(operation.metric_label(), "CUSTOM");
-        assert_eq!(CommitOperation::from(value), operation);
+        assert_eq!(operation.as_str(), value);
+        assert_eq!(
+            CommitOperation::from(UpdateTableOperation::Custom(value.to_string())),
+            operation
+        );
     }
 
     #[test]
     fn custom_operations_reject_reserved_names() {
-        for name in ["CREATE TABLE", "REPLACE TABLE", "ALTER TABLE"] {
+        for name in [
+            "CREATE TABLE",
+            "WRITE",
+            "STREAMING UPDATE",
+            "REPLACE TABLE",
+            "ALTER TABLE",
+            "DELETE",
+            "UPDATE",
+            "MERGE",
+            "OPTIMIZE",
+        ] {
             let operation = UpdateTableOperation::Custom(name.to_string());
             assert!(operation.validate().unwrap_err().contains("reserved"));
         }

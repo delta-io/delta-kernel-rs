@@ -45,13 +45,12 @@ pub unsafe extern "C" fn update_table_txn_builder_build(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let builder = unsafe { *builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let transaction = builder.build(
-        extern_engine.engine().as_ref(),
+    update_table_txn_builder_build_with_committer_impl(
+        builder,
+        extern_engine,
         Box::new(FileSystemCommitter::new()),
-    );
-    transaction
-        .map(|txn| Box::new(txn).into())
-        .into_extern_result(&extern_engine)
+    )
+    .into_extern_result(&extern_engine)
 }
 
 /// Starts an update-table transaction with a custom committer.
@@ -130,13 +129,13 @@ pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
-    parameters: &FfiStringMap,
+    parameters: &FfiNullableStringMap,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        apply_string_map(
+        apply_nullable_string_map(
             builder,
             parameters,
             UpdateTableTransactionBuilder::with_operation_parameters,
@@ -158,13 +157,13 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_builder_with_operation_metrics(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
-    metrics: &FfiStringMap,
+    metrics: &FfiNullableStringMap,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        apply_string_map(
+        apply_nullable_string_map(
             builder,
             metrics,
             UpdateTableTransactionBuilder::with_operation_metrics,
@@ -198,7 +197,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_commit_info(
             builder,
             commit_info,
             schema,
-            |builder, commit_info, schema| Ok(builder.with_commit_info(commit_info, schema)),
+            UpdateTableTransactionBuilder::with_commit_info,
         )
     }
     .map(|builder| Box::new(builder).into())
@@ -226,7 +225,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata(
             builder,
             domain,
             configuration,
-            |builder, domain, configuration| Ok(builder.with_domain_metadata(domain, configuration)),
+            UpdateTableTransactionBuilder::with_domain_metadata,
         )
     };
     result
@@ -330,12 +329,12 @@ fn decode_single_field(schema: &EngineSchema) -> Result<delta_kernel::schema::St
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_with_operation_metrics(
     txn: Handle<ExclusiveUpdateTableTransaction>,
-    metrics: &FfiStringMap,
+    metrics: &FfiNullableStringMap,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { apply_string_map(txn, metrics, Transaction::with_operation_metrics) }
+    unsafe { apply_nullable_string_map(txn, metrics, Transaction::with_operation_metrics) }
         .map(|txn| Box::new(txn).into())
         .into_extern_result(&engine)
 }
@@ -358,13 +357,9 @@ pub unsafe extern "C" fn update_table_txn_with_commit_info(
     let txn = unsafe { *txn.into_inner() };
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe {
-        apply_commit_info(txn, commit_info, schema, |txn, commit_info, schema| {
-            Ok(txn.with_commit_info(commit_info, schema))
-        })
-    }
-    .map(|txn| Box::new(txn).into())
-    .into_extern_result(&engine)
+    unsafe { apply_commit_info(txn, commit_info, schema, Transaction::with_commit_info) }
+        .map(|txn| Box::new(txn).into())
+        .into_extern_result(&engine)
 }
 
 /// Free an existing-table transaction handle without committing.
@@ -381,13 +376,13 @@ pub unsafe extern "C" fn free_update_table_txn(txn: Handle<ExclusiveUpdateTableT
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
 pub enum KernelUpdateTableOperation {
-    Write,
-    StreamingUpdate,
-    AlterTable,
-    Delete,
-    Update,
-    Merge,
-    Optimize,
+    Write = 0,
+    StreamingUpdate = 1,
+    AlterTable = 2,
+    Delete = 3,
+    Update = 4,
+    Merge = 5,
+    Optimize = 6,
 }
 
 impl From<KernelUpdateTableOperation> for UpdateTableOperation {
@@ -482,24 +477,22 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     unsafe {
-        apply_domain_metadata(txn, domain, configuration, |txn, domain, configuration| {
-            Ok(txn.with_domain_metadata(domain, configuration))
-        })
+        apply_domain_metadata(
+            txn,
+            domain,
+            configuration,
+            Transaction::with_domain_metadata,
+        )
     }
     .map(|txn| Box::new(txn).into())
     .into_extern_result(&engine)
 }
 
-/// Remove domain metadata from the table in this transaction. A tombstone action with
-/// `removed: true` will be written to the Delta log when the transaction is committed.
-///
-/// The caller does not need to provide a configuration value -- the existing value is
-/// automatically preserved in the tombstone.
+/// Stages a domain-metadata tombstone that preserves the previous configuration.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
-/// a new one.
+/// Inputs must be valid. `txn` is consumed even when this returns an error.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
     txn: Handle<ExclusiveUpdateTableTransaction>,
@@ -514,16 +507,11 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
         .into_extern_result(&engine)
 }
 
-/// Remove domain metadata from the table in this transaction. A tombstone action with
-/// `removed: true` will be written to the Delta log when the transaction is committed.
-///
-/// The caller does not need to provide a configuration value -- the existing value is
-/// automatically preserved in the tombstone.
+/// Adds a domain-metadata removal to the builder.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles. CONSUMES the builder handle and returns a new
-/// one.
+/// Inputs must be valid. `builder` is consumed even when this returns an error.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
