@@ -98,10 +98,10 @@ let txn = snapshot
     .with_operation(UpdateTableOperation::Custom(
         "REMOVE METADATA".to_string(),
     ))
+    .with_domain_metadata_removed("myConnector.settings")
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
-txn.with_domain_metadata_removed("myConnector.settings".to_string())
-    .commit(&engine)?;
+txn.commit(&engine)?;
 # Ok(())
 # }
 ```

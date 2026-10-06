@@ -77,7 +77,7 @@ impl UpdateTableTransactionBuilder {
         let mut transaction =
             Transaction::try_new_existing_table(snapshot, committer, engine, state)?;
 
-        // TODO: Construct the transaction from complete validated builder intent.
+        // TODO(#3149): Construct the transaction from complete validated builder intent.
         if let Some(operation) = operation {
             transaction = transaction.with_update_table_operation(operation);
         }
