@@ -19,7 +19,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, Result, Version};
+use crate::{Engine, KernelError, KernelResult, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -114,7 +114,7 @@ impl Snapshot {
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Arc<Self>> {
+    ) -> KernelResult<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
@@ -155,7 +155,7 @@ impl Snapshot {
         built_as_latest: bool,
         cancellation_token: Option<&CancellationTokenRef>,
         current_segment: &mut Option<LogSegment>,
-    ) -> Result<Arc<Self>> {
+    ) -> KernelResult<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
@@ -334,7 +334,7 @@ impl Snapshot {
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<NewSegment> {
+    ) -> KernelResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -523,7 +523,7 @@ impl Snapshot {
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> Result<Arc<Snapshot>> {
+    ) -> KernelResult<Arc<Snapshot>> {
         let built_as_latest = existing.built_as_latest || built_as_latest;
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
@@ -611,6 +611,7 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
+    use crate::Result;
 
     // ============================================================================
     // Helpers

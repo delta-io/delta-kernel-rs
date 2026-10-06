@@ -45,7 +45,7 @@ pub(crate) use writer::try_write_crc_file;
 use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
-use crate::{KernelError, Result, Version};
+use crate::{KernelError, KernelResult, Result, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -394,7 +394,7 @@ where
 }
 
 impl Crc {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> KernelResult<()> {
         for (name, value) in [
             ("numDeletedRecordsOpt", self.num_deleted_records_opt),
             ("numDeletionVectorsOpt", self.num_deletion_vectors_opt),
@@ -566,7 +566,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
     }
 }
 
-fn validate_sum(name: &str, values: &[i64], expected: i64) -> Result<()> {
+fn validate_sum(name: &str, values: &[i64], expected: i64) -> KernelResult<()> {
     let actual = checked_sum(name, values.iter().copied())?;
     if actual != expected {
         return Err(KernelError::generic(format!(
@@ -576,7 +576,7 @@ fn validate_sum(name: &str, values: &[i64], expected: i64) -> Result<()> {
     Ok(())
 }
 
-fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> Result<i64> {
+fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> KernelResult<i64> {
     values.try_fold(0_i64, |sum, value| {
         sum.checked_add(value)
             .ok_or_else(|| KernelError::generic(format!("CRC {name} overflow")))
@@ -634,7 +634,7 @@ impl DeletedRecordCountsHistogram {
         })
     }
 
-    fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> Result<Self> {
+    fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> KernelResult<Self> {
         let mut bins = vec![0; 10];
         for cardinality in cardinalities {
             if cardinality < 0 {
@@ -659,7 +659,7 @@ impl DeletedRecordCountsHistogram {
         Self::try_new(bins)
     }
 
-    fn validate(deleted_record_counts: &[i64]) -> Result<()> {
+    fn validate(deleted_record_counts: &[i64]) -> KernelResult<()> {
         if deleted_record_counts.len() != 10 {
             return Err(KernelError::generic(format!(
                 "deleted-record-count histogram must contain exactly 10 bins, got {}",

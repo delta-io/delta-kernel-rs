@@ -8,7 +8,7 @@ use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
 const PATH: usize = 0;
@@ -47,7 +47,11 @@ pub(crate) struct AddFileRequiredFields {
 }
 
 impl Validation for AddFileRequiredFields {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;

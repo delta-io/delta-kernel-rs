@@ -32,8 +32,8 @@ use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    FoldWithOption as _, KernelError, ParquetFooter, ParquetHandler, PredicateRef, Result,
-    ResultIteratorStatic,
+    FoldWithOption as _, KernelError, KernelResult, ParquetFooter, ParquetHandler, PredicateRef,
+    Result, ResultIteratorStatic,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -88,7 +88,7 @@ impl DataFileMetadata {
         &self,
         partition_values: &HashMap<String, Option<String>>,
         log_path: &str,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         let path = Arc::new(StringArray::from(vec![log_path]));
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
@@ -196,7 +196,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
         physical_schema: &StructType,
-    ) -> Result<DataFileMetadata> {
+    ) -> KernelResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
@@ -275,7 +275,7 @@ async fn read_parquet_files_impl(
     predicate: Option<PredicateRef>,
     buffer_size: usize,
     batch_size: usize,
-) -> Result<BoxStream<'static, Result<Box<dyn EngineData>>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
@@ -457,7 +457,7 @@ async fn open_parquet_file(
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
-) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
     let file_location = file_meta.location.to_string();
     let path = Path::from_url_path(file_meta.location.path())?;
 

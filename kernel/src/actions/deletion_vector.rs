@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::schema::DataType;
 use crate::utils::require;
-use crate::{KernelError, Result, StorageHandler};
+use crate::{KernelError, KernelResult, Result, StorageHandler};
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -291,7 +291,7 @@ impl DeletionVectorDescriptor {
     ///
     /// Errors if called on a non-`PersistedRelative` descriptor, if the encoded path is shorter
     /// than the 20-character z85 UUID suffix, or if that suffix fails to decode into a UUID.
-    pub(crate) fn relative_path(&self) -> Result<String> {
+    pub(crate) fn relative_path(&self) -> KernelResult<String> {
         require!(
             self.storage_type == DeletionVectorStorageType::PersistedRelative,
             KernelError::DeletionVector(format!(
@@ -506,7 +506,7 @@ pub(crate) fn create_dv_crc32() -> Crc<u32> {
 }
 
 /// small helper to read a big or little endian u32 from a cursor
-fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> Result<u32> {
+fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> KernelResult<u32> {
     let mut buf = [0; 4];
     cursor
         .read(&mut buf)
@@ -518,7 +518,7 @@ fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> Result<u32> {
 }
 
 /// decode a slice into a u32
-fn slice_to_u32(buf: &[u8], endian: Endian) -> Result<u32> {
+fn slice_to_u32(buf: &[u8], endian: Endian) -> KernelResult<u32> {
     let array = buf
         .try_into()
         .map_err(|_| KernelError::generic("Must have a 4 byte slice to decode to u32"))?;

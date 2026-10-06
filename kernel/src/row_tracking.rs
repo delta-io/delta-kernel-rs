@@ -10,7 +10,7 @@ use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,7 +46,7 @@ impl RowTrackingDomainMetadata {
     }
 }
 
-pub(crate) fn parse_row_tracking_high_water_mark(configuration: &str) -> Result<i64> {
+pub(crate) fn parse_row_tracking_high_water_mark(configuration: &str) -> KernelResult<i64> {
     Ok(serde_json::from_str::<RowTrackingDomainMetadata>(configuration)?.high_water_mark())
 }
 

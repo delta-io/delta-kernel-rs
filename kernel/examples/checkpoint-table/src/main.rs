@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
 use delta_kernel::parquet::arrow::AsyncArrowWriter;
 use delta_kernel::parquet::errors::Result as ParquetResult;
-use delta_kernel::{ActionReconciliationIterator, KernelError, Result, Snapshot};
+use delta_kernel::{ActionReconciliationIterator, KernelError, KernelResult, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::future::{BoxFuture, FutureExt};
@@ -48,7 +48,7 @@ async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
     batch_iter: &mut ActionReconciliationIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
-) -> Result<()> {
+) -> KernelResult<()> {
     parquet_writer.write(first_batch).await?;
     for data_res in batch_iter {
         let data = data_res?.apply_selection_vector()?;
@@ -58,7 +58,7 @@ async fn write_data<W: AsyncFileWriter>(
     Ok(())
 }
 
-async fn try_main() -> Result<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;

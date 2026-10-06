@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{DataType, Expression, KernelError, Result};
+use crate::{DataType, Expression, KernelError, KernelResult, Result};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -244,7 +244,7 @@ impl BoundWriteContextBuilder {
         })
     }
 
-    fn build_logical_data_schema(&self) -> Result<SchemaRef> {
+    fn build_logical_data_schema(&self) -> KernelResult<SchemaRef> {
         if self.logical_row_id_col_name.is_none()
             && self.logical_row_commit_version_col_name.is_none()
         {
@@ -265,7 +265,7 @@ impl BoundWriteContextBuilder {
         Ok(Arc::new(StructType::try_new(fields)?))
     }
 
-    fn build_physical_data_schema(&self) -> Result<SchemaRef> {
+    fn build_physical_data_schema(&self) -> KernelResult<SchemaRef> {
         if self.logical_row_id_col_name.is_none()
             && self.logical_row_commit_version_col_name.is_none()
         {
@@ -296,7 +296,7 @@ impl BoundWriteContextBuilder {
         logical_name: Option<&str>,
         physical_name: Option<&str>,
         configuration_key: &str,
-    ) -> Result<Option<StructField>> {
+    ) -> KernelResult<Option<StructField>> {
         if logical_name.is_none() {
             return Ok(None);
         }
@@ -408,7 +408,7 @@ impl WriteState {
     fn generate_logical_to_physical(
         &self,
         partition_values: Option<&HashMap<String, Scalar>>,
-    ) -> Result<Expression> {
+    ) -> KernelResult<Expression> {
         let mut patch = ExpressionStructPatchBuilder::new();
         if self.materialize_partition_columns {
             let partition_cols: HashSet<&str> = self

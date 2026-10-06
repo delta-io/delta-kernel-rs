@@ -15,7 +15,7 @@ use crate::schema::{
     column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
 };
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
@@ -477,7 +477,7 @@ impl DomainMetadataVisitor {
         row_index: usize,
         domain: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> Result<DomainMetadata> {
+    ) -> KernelResult<DomainMetadata> {
         require!(
             getters.len() == 3,
             KernelError::InternalError(format!(
@@ -552,7 +552,7 @@ impl RowVisitor for DomainMetadataVisitor {
 pub(crate) fn visit_deletion_vector_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> Result<Option<DeletionVectorDescriptor>> {
+) -> KernelResult<Option<DeletionVectorDescriptor>> {
     if getters.len() < DELETION_VECTOR_GETTER_COUNT {
         return Err(KernelError::InternalError(format!(
             "Wrong number of DeletionVectorVisitor getters: {}",
@@ -588,7 +588,7 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 fn visit_back_reference_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> Result<Option<BackReference>> {
+) -> KernelResult<Option<BackReference>> {
     if getters.len() < BACK_REFERENCE_GETTER_COUNT {
         return Err(KernelError::InternalError(format!(
             "Wrong number of BackReference getters: {}",
@@ -884,7 +884,7 @@ struct CheckpointElementVisitor {
 impl CheckpointElementVisitor {
     /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
     /// was absent or if `CheckpointAction::validate` rejects the assembled action.
-    fn into_checkpoint_action(self) -> Result<CheckpointAction> {
+    fn into_checkpoint_action(self) -> KernelResult<CheckpointAction> {
         let missing = |field: &str| {
             KernelError::generic(format!(
                 "checkpoint action is missing required `{field}` element"
@@ -968,7 +968,7 @@ impl RowVisitor for CheckpointElementVisitor {
 /// Store `value` in `slot`, erroring if it was already occupied. Checkpoint elements named by
 /// `name` are singletons, so a second occurrence is malformed rather than an override.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> KernelResult<()> {
     if slot.replace(value).is_some() {
         return Err(KernelError::generic(format!(
             "duplicate `{name}` element in checkpoint action"
@@ -983,7 +983,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
 fn visit_content_root_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> Result<Option<ContentRoot>> {
+) -> KernelResult<Option<ContentRoot>> {
     let Some(path) = getters[0].get_opt(row_index, "contentRoot.path")? else {
         return Ok(None);
     };

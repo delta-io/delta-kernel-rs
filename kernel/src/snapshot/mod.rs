@@ -45,7 +45,7 @@ use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
-use crate::{Engine, KernelError, LogCompactionWriter, Result, Version};
+use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Version};
 
 mod builder;
 mod incremental;
@@ -213,7 +213,7 @@ impl Snapshot {
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
         Ok(Self::new_with_validated_crc(
             log_segment,
@@ -231,7 +231,7 @@ impl Snapshot {
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
         crc: Option<Arc<Crc>>,
-    ) -> Result<SnapshotCrc> {
+    ) -> KernelResult<SnapshotCrc> {
         table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
         SnapshotCrc::try_new(
             crc,
@@ -312,7 +312,7 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let PreparedSnapshot {
             table_configuration,
             crc,
@@ -346,7 +346,7 @@ impl Snapshot {
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> Result<PreparedSnapshot> {
+    ) -> KernelResult<PreparedSnapshot> {
         Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
@@ -373,7 +373,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-    ) -> Result<PreparedSnapshot> {
+    ) -> KernelResult<PreparedSnapshot> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -452,7 +452,7 @@ impl Snapshot {
         &self,
         commit: ParsedLogPath,
         crc_delta: CrcDelta,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         require!(
             commit.is_commit(),
             KernelError::internal_error(format!(
@@ -734,7 +734,10 @@ impl Snapshot {
 
     /// Fetch the latest transaction version for every application id in this snapshot.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn get_app_id_versions(&self, engine: &dyn Engine) -> Result<SetTransactionMap> {
+    pub(crate) fn get_app_id_versions(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<SetTransactionMap> {
         if let Some(crc) = self.crc_at_version() {
             if let SetTransactionState::Complete(map) = &crc.set_transaction_state {
                 return Ok(map.clone());
@@ -845,7 +848,7 @@ impl Snapshot {
     pub(crate) fn get_clustering_domain_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> Result<Option<String>> {
+    ) -> KernelResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -1262,7 +1265,7 @@ impl Snapshot {
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> Result<Arc<Crc>> {
+    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> KernelResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {

@@ -7,7 +7,7 @@ use delta_kernel_derive::pub_macro;
 use derive_more::Deref;
 
 use crate::utils::CollectInto;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// A (possibly nested) column name.
 ///
@@ -295,7 +295,7 @@ const FIELD_ESCAPE_CHAR: char = '`';
 const FIELD_SEPARATOR: char = '.';
 const COLUMN_SEPARATOR: char = ',';
 
-fn parse_column_name(chars: &mut Chars<'_>) -> Result<(ColumnName, FieldEnding)> {
+fn parse_column_name(chars: &mut Chars<'_>) -> KernelResult<(ColumnName, FieldEnding)> {
     // Ambiguous case: The empty string `""`could reasonably parse as either `ColumnName::new([""])`
     // or `ColumnName::new([])`. However, `ColumnName::new([""]).to_string()` is `"[]"` and
     // `ColumnName::new([]).to_string()` is `""`, so we choose the latter because it produces a
@@ -335,7 +335,7 @@ fn parse_column_name(chars: &mut Chars<'_>) -> Result<(ColumnName, FieldEnding)>
 }
 
 /// Parses a simple field name, e.g. 'a.b.c'.
-fn parse_simple_field_name(chars: &mut Chars<'_>) -> Result<String> {
+fn parse_simple_field_name(chars: &mut Chars<'_>) -> KernelResult<String> {
     let mut name = String::new();
     let mut first = true;
     while let Some(c) = chars.next_if(|c| is_simple_char(*c)) {
@@ -355,7 +355,7 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> Result<String> {
 /// check-constraint tokenizer ([`crate::expressions::sql`]) so backtick-quoted column references
 /// parse identically.
 /// Examples: `col` -> col;  `ab `` -> ``ab``. Returns an error if there is no closing backtick.
-pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> Result<String> {
+pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> KernelResult<String> {
     let mut name = String::new();
     loop {
         match chars.next() {

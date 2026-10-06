@@ -17,7 +17,7 @@ use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelError,
-    PredicateRef, Result, ResultIterator,
+    KernelResult, PredicateRef, Result, ResultIterator,
 };
 
 #[derive(Constructor)]
@@ -30,7 +30,7 @@ pub(super) fn try_create_from_json(
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
     file_location: String,
-) -> Result<impl Iterator<Item = Result<ArrowEngineData>>> {
+) -> KernelResult<impl Iterator<Item = KernelResult<ArrowEngineData>>> {
     let json_schema = Arc::new(json_arrow_schema(&schema)?);
     let reorder_indices = build_json_reorder_indices(&schema)?;
     let json = ReaderBuilder::new(json_schema)

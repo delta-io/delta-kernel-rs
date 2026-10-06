@@ -13,7 +13,7 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, Result};
+use delta_kernel::{Engine, KernelError, KernelResult, Result};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -46,7 +46,7 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> Result<RecordBa
     Ok(all_data)
 }
 
-fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> Result<()> {
+fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> KernelResult<()> {
     let schema_stripped = strip_metadata(schema);
     let golden_stripped = strip_metadata(golden);
     if schema_stripped.fields() != golden_stripped.fields() {

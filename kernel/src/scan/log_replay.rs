@@ -31,7 +31,7 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{Engine, ExpressionEvaluator, KernelError, Result};
+use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, Result};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -214,7 +214,7 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
             engine,
@@ -246,7 +246,7 @@ impl ScanLogReplayProcessor {
         seen_file_keys: HashSet<FileActionKey>,
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
@@ -504,7 +504,7 @@ impl ScanLogReplayProcessor {
         &self,
         actions: &dyn EngineData,
         is_log_batch: bool,
-    ) -> Result<(Box<dyn EngineData>, Vec<bool>)> {
+    ) -> KernelResult<(Box<dyn EngineData>, Vec<bool>)> {
         let transform = if is_log_batch {
             &self.commit_transform
         } else {
@@ -553,7 +553,7 @@ impl ScanLogReplayProcessor {
         dedup_selection: Vec<bool>,
         row_transform_exprs: Vec<Option<ExpressionRef>>,
         active_add_file_sizes: Vec<u64>,
-    ) -> Result<RetryTransformAndDataSkipOutput> {
+    ) -> KernelResult<RetryTransformAndDataSkipOutput> {
         let row_transform_exprs = dedup_selection
             .iter()
             .enumerate()
@@ -580,7 +580,7 @@ impl ScanLogReplayProcessor {
         &self,
         selection_vector: &[bool],
         active_add_file_sizes: &[u64],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         require!(
             selection_vector.len() == active_add_file_sizes.len(),
             KernelError::internal_error(format!(
@@ -636,7 +636,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         row: usize,
         getters: &[&'b dyn GetData<'b>],
         selected: bool,
-    ) -> Result<bool> {
+    ) -> KernelResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
         // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
@@ -837,7 +837,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let needs_extra = stats_schema.is_some() || partition_schema.is_some();
     if !needs_extra {
         return Ok(SCAN_ROW_SCHEMA.clone());
@@ -1233,12 +1233,15 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = Result<ActionsBatch>>,
+    action_iter: impl Iterator<Item = KernelResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> Result<(impl Iterator<Item = Result<ScanMetadata>>, Arc<ScanMetrics>)> {
+) -> KernelResult<(
+    impl Iterator<Item = KernelResult<ScanMetadata>>,
+    Arc<ScanMetrics>,
+)> {
     let processor = ScanLogReplayProcessor::new(
         engine,
         state_info,

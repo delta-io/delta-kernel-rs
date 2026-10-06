@@ -15,8 +15,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, PredicateRef, Result,
-    Version,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
+    PredicateRef, Result, Version,
 };
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
@@ -168,7 +168,7 @@ impl IncrementalScanBuilder {
     /// constructed. [`AddSkipping::SkipAll`] when the predicate statically excludes every file
     /// ([`PhysicalPredicate::StaticSkipAll`]); the stream still reports Removes but yields no
     /// live Adds. [`AddSkipping::Filter`] carries the reusable [`DataSkippingFilter`].
-    fn resolve_add_skipping(&self, engine: &dyn Engine) -> Result<AddSkipping> {
+    fn resolve_add_skipping(&self, engine: &dyn Engine) -> KernelResult<AddSkipping> {
         let Some(predicate) = self.predicate.as_ref() else {
             return Ok(AddSkipping::KeepAll);
         };
@@ -561,7 +561,7 @@ fn process_batch(
     seen_file_keys: &mut HashSet<FileActionKey>,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
-) -> Result<Option<FilteredEngineData>> {
+) -> KernelResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
     let mut adds_sel = vec![false; row_count];
 

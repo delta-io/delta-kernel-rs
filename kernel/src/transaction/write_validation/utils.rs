@@ -2,13 +2,13 @@ use std::collections::HashSet;
 
 use crate::engine_data::MapItem;
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 pub(super) fn validate_required_field_exist<T>(
     value: Option<T>,
     path: &str,
     field: &str,
-) -> Result<T> {
+) -> KernelResult<T> {
     value.ok_or_else(|| {
         KernelError::missing_data(format!(
             "AddFile for '{path}' is missing required field '{field}'"
@@ -20,7 +20,7 @@ pub(super) fn validate_partition_keys(
     path: &str,
     actual_partition_values: MapItem<'_>,
     expected_physical_partition_columns: &HashSet<String>,
-) -> Result<()> {
+) -> KernelResult<()> {
     let actual_keys_vec: Vec<&str> = actual_partition_values.keys().collect();
     let actual_keys_set: HashSet<&str> = actual_keys_vec.iter().copied().collect();
     let keys_match = actual_keys_set.len() == expected_physical_partition_columns.len()

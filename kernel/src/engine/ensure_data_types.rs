@@ -11,7 +11,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Ti
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::schema::{DataType, MetadataValue, StructField};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -73,7 +73,7 @@ impl EnsureDataTypes {
         &self,
         kernel_type: &DataType,
         arrow_type: &ArrowDataType,
-    ) -> Result<DataTypeCompat> {
+    ) -> KernelResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
@@ -221,7 +221,7 @@ impl EnsureDataTypes {
         desc: &str,
         kernel_field_is_nullable: bool,
         arrow_field_is_nullable: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         if matches!(self.mode, ValidationMode::Full)
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
@@ -237,7 +237,7 @@ impl EnsureDataTypes {
         &self,
         kernel_field: &StructField,
         arrow_field: &ArrowField,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         self.ensure_nullability(
             &kernel_field.name,
             kernel_field.nullable,
@@ -262,7 +262,7 @@ impl EnsureDataTypes {
 fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
-) -> Result<DataTypeCompat> {
+) -> KernelResult<DataTypeCompat> {
     use ArrowDataType::*;
 
     match (source_type, &target_type) {

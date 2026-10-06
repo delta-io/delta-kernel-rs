@@ -11,7 +11,7 @@ use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, FileMeta, Result, Version};
+use crate::{version_as_i64, Engine, FileMeta, KernelResult, Version};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
 /// `checkpoint` action.
@@ -44,7 +44,7 @@ impl RootManifestFile {
         table_config: &TableConfiguration,
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
-    ) -> Result<CheckpointAction> {
+    ) -> KernelResult<CheckpointAction> {
         let (mut domain_metadata, mut transactions, existing_checkpoint) =
             self.scan_non_content_metadata(engine)?;
 
@@ -100,7 +100,7 @@ impl RootManifestFile {
     fn scan_non_content_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> Result<(
+    ) -> KernelResult<(
         DomainMetadataMap,
         SetTransactionMap,
         Option<Arc<CheckpointAction>>,
@@ -170,7 +170,6 @@ mod tests {
     use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
-    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
@@ -181,8 +180,9 @@ mod tests {
         write_commit,
     };
     use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
+    use crate::{create_row, Result};
 
-    fn manifest_file(location: &str, size: u64) -> Result<FileMeta> {
+    fn manifest_file(location: &str, size: u64) -> KernelResult<FileMeta> {
         Ok(FileMeta {
             location: url::Url::parse(location)?,
             last_modified: 0,

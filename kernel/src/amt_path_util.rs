@@ -1,8 +1,11 @@
-//! Resolution of AMT paths (relative vs absolute) against the table root.
+//! Resolution of AMT paths (relative vs absolute) against a table root, per the Iceberg V4
+//! [relative paths specification].
+//!
+//! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
 use url::Url;
 
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
@@ -15,7 +18,7 @@ use crate::{KernelError, Result};
 /// Returns an error if the resolved location fails to parse as a [`Url`].
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
-pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> Result<Url> {
+pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult<Url> {
     if has_scheme(path) {
         // A URI scheme means the path is absolute and used as-is.
         Url::parse(path).map_err(|e| {
@@ -40,8 +43,10 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> Result<Url> 
 /// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
 /// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
 ///
+/// A path without a scheme is relative (per the Iceberg V4 path spec).
+///
 /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
-fn has_scheme(location: &str) -> bool {
+pub(crate) fn has_scheme(location: &str) -> bool {
     for (position, ch) in location.char_indices() {
         if ch == ':' {
             return position > 0;

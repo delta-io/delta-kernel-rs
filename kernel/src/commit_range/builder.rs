@@ -7,7 +7,7 @@ use crate::log_segment::{
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{Engine, KernelError, LogPath, Result, Version};
+use crate::{Engine, KernelError, KernelResult, LogPath, Result, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -158,7 +158,7 @@ impl CommitRangeBuilder {
         })
     }
 
-    fn validate_catalog_managed_inputs(&self, log_tail: &[ParsedLogPath]) -> Result<()> {
+    fn validate_catalog_managed_inputs(&self, log_tail: &[ParsedLogPath]) -> KernelResult<()> {
         if let Some(max_catalog_version) = self.max_catalog_version {
             require!(
                 self.start_version <= max_catalog_version,
@@ -178,7 +178,7 @@ impl CommitRangeBuilder {
     }
 
     /// Parse the stored table-root string into a [`Url`].
-    fn parse_table_root(table_root: &str) -> Result<Url> {
+    fn parse_table_root(table_root: &str) -> KernelResult<Url> {
         crate::utils::try_parse_uri(table_root)
     }
 }
@@ -193,7 +193,7 @@ pub enum CommitOrdering {
     DescendingOrder,
 }
 
-fn validate_version_range(start: Version, end: Version) -> Result<()> {
+fn validate_version_range(start: Version, end: Version) -> KernelResult<()> {
     if start > end {
         return Err(KernelError::generic(format!(
             "start_version ({start}) must be <= end_version ({end})",
@@ -207,7 +207,7 @@ fn validate_number_of_commit_files(
     start: Version,
     end: Version,
     commit_file_count: usize,
-) -> Result<()> {
+) -> KernelResult<()> {
     let expected = end - start + 1;
     let actual = commit_file_count as u64;
     if expected != actual {

@@ -85,6 +85,8 @@ use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod amt_path_util;
 pub mod cancellation;
 pub mod checkpoint;
 pub mod commit_range;
@@ -191,7 +193,10 @@ pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{Error, KernelError, KernelResult, Result, ResultIterator, ResultIteratorStatic};
+pub use error::{
+    Error, KernelError, KernelResult, KernelResultIterator, KernelResultIteratorStatic, Result,
+    ResultIterator, ResultIteratorStatic,
+};
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -211,7 +216,7 @@ pub mod engine;
 pub type Version = u64;
 
 /// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
-pub(crate) fn version_as_i64(version: Version) -> Result<i64> {
+pub(crate) fn version_as_i64(version: Version) -> KernelResult<i64> {
     version
         .try_into()
         .map_err(|_| KernelError::generic(format!("Delta log version {version} exceeds i64::MAX")))
@@ -290,7 +295,7 @@ impl FileMeta {
     }
 
     /// Casts `size` to `i64`. Errors if `size` exceeds `i64::MAX`.
-    pub(crate) fn size_as_i64(&self) -> Result<i64> {
+    pub(crate) fn size_as_i64(&self) -> KernelResult<i64> {
         i64::try_from(self.size)
             .map_err(|_| KernelError::generic(format!("file size {} exceeds i64::MAX", self.size)))
     }
@@ -533,7 +538,7 @@ pub(crate) fn create_row(
     engine: &dyn Engine,
     schema: SchemaRef,
     value: impl Into<Scalar>,
-) -> Result<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     let value = value.into();
     engine
         .evaluation_handler()

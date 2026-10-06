@@ -35,8 +35,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    Engine, FileMeta, KernelError, Predicate, PredicateRef, Result, RowVisitor, StorageHandler,
-    Version,
+    Engine, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, Result, RowVisitor,
+    StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -137,7 +137,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
     requested_version: Option<Version>,
     max_catalog_version: Option<Version>,
     log_tail: &[ParsedLogPath],
-) -> Result<()> {
+) -> KernelResult<()> {
     for pair in log_tail.windows(2) {
         require!(
             pair[0].version.checked_add(1) == Some(pair[1].version),
@@ -167,7 +167,7 @@ pub(crate) fn validate_catalog_managed_versions(
     max_catalog_version: Option<Version>,
     has_staged_commits: bool,
     latest_commit_version: Option<Version>,
-) -> Result<()> {
+) -> KernelResult<()> {
     require!(
         !has_staged_commits || max_catalog_version.is_some(),
         KernelError::MaxCatalogVersion(
@@ -256,7 +256,10 @@ impl LogSegment {
     /// # Errors
     ///
     /// Returns an `internal_error` if `commit_file` is not version 0 or not a commit file type.
-    pub(crate) fn new_for_version_zero(log_root: Url, commit_file: ParsedLogPath) -> Result<Self> {
+    pub(crate) fn new_for_version_zero(
+        log_root: Url,
+        commit_file: ParsedLogPath,
+    ) -> KernelResult<Self> {
         require!(
             commit_file.version == 0,
             crate::KernelError::internal_error(format!(
@@ -485,7 +488,7 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
@@ -557,7 +560,7 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
         log_tail: Vec<ParsedLogPath>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let end_version = end_version.into();
         if let Some(end_version) = end_version {
             if start_version > end_version {
@@ -602,7 +605,7 @@ impl LogSegment {
         end_version: Version,
         limit: Option<NonZero<usize>>,
         log_tail: Vec<ParsedLogPath>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         // Compute the version to start listing from.
         let start_from = limit
             .map(|limit| match NonZero::<Version>::try_from(limit) {
@@ -641,7 +644,10 @@ impl LogSegment {
     /// Creates a new LogSegment with the given commit file added to the end.
     /// TODO: Take in multiple commits when Kernel-RS supports txn retries and conflict rebasing.
     #[allow(unused)]
-    pub(crate) fn new_with_commit_appended(&self, tail_commit_file: ParsedLogPath) -> Result<Self> {
+    pub(crate) fn new_with_commit_appended(
+        &self,
+        tail_commit_file: ParsedLogPath,
+    ) -> KernelResult<Self> {
         require!(
             tail_commit_file.is_commit(),
             KernelError::internal_error(format!(
@@ -682,7 +688,7 @@ impl LogSegment {
     /// If the existing `latest_crc_file` is older than the new checkpoint version, it is
     /// cleared to preserve the `LogSegmentFiles` invariant that `latest_crc_file.version >=
     /// checkpoint version`.
-    pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> Result<Self> {
+    pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> KernelResult<Self> {
         require!(
             matches!(
                 checkpoint.file_type,
@@ -729,7 +735,7 @@ impl LogSegment {
 
     /// Creates a new LogSegment with the given CRC file recorded as the latest.
     /// The CRC file must be at `end_version`.
-    pub(crate) fn try_new_with_crc_file(&self, crc_file: ParsedLogPath<Url>) -> Result<Self> {
+    pub(crate) fn try_new_with_crc_file(&self, crc_file: ParsedLogPath<Url>) -> KernelResult<Self> {
         require!(
             crc_file.file_type == LogPathFileType::Crc,
             KernelError::internal_error(format!(
@@ -766,7 +772,7 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
-    pub(crate) fn new_as_published(&self) -> Result<Self> {
+    pub(crate) fn new_as_published(&self) -> KernelResult<Self> {
         // In the future, we can additionally convert the staged commit files to published commit
         // files. That would reqire faking their FileMeta locations.
         let mut new_log_segment = self.clone();
@@ -774,7 +780,7 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
-    pub(crate) fn get_unpublished_catalog_commits(&self) -> Result<Vec<CatalogCommit>> {
+    pub(crate) fn get_unpublished_catalog_commits(&self) -> KernelResult<Vec<CatalogCommit>> {
         self.listed
             .staged_commits()
             .filter(|file| {
@@ -887,7 +893,7 @@ impl LogSegment {
     pub(crate) fn find_last_checkpoint_action(
         &self,
         engine: &dyn Engine,
-    ) -> Result<Option<CheckpointAction>> {
+    ) -> KernelResult<Option<CheckpointAction>> {
         let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
         for batch in self.read_actions(engine, schema)? {
             if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
@@ -976,7 +982,7 @@ impl LogSegment {
     #[cfg(feature = "declarative-plans")]
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
-    ) -> Result<Vec<ScanFile>> {
+    ) -> KernelResult<Vec<ScanFile>> {
         paths
             .into_iter()
             .map(|path| {
@@ -990,7 +996,7 @@ impl LogSegment {
 
     /// Returns commit-cover files tagged with file-constant `version`.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> Result<Vec<ScanFile>> {
+    pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> KernelResult<Vec<ScanFile>> {
         Self::version_tagged_scan_files(&self.find_commit_cover_paths())
     }
 
@@ -1006,7 +1012,7 @@ impl LogSegment {
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn checkpoint_version_tagged_scan_files(
         &self,
-    ) -> Result<Option<(FileType, Vec<ScanFile>)>> {
+    ) -> KernelResult<Option<(FileType, Vec<ScanFile>)>> {
         let parts = &self.listed.checkpoint_parts;
         let Some(first) = parts.first() else {
             return Ok(None);
@@ -1023,7 +1029,7 @@ impl LogSegment {
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn checkpoint_hint_version_tagged_sidecar_scan_files(
         &self,
-    ) -> Result<Option<Vec<ScanFile>>> {
+    ) -> KernelResult<Option<Vec<ScanFile>>> {
         let Some(sidecars) = self.checkpoint_hint_sidecars() else {
             return Ok(None);
         };
@@ -1041,7 +1047,7 @@ impl LogSegment {
                     file_constants: vec![Scalar::Long(version)],
                 })
             })
-            .collect::<Result<Vec<_>>>()
+            .collect::<KernelResult<Vec<_>>>()
             .map(Some)
     }
 
@@ -1063,7 +1069,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<(Option<SchemaRef>, Vec<FileMeta>)> {
+    ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_hint_schema();
 
@@ -1119,7 +1125,7 @@ impl LogSegment {
         engine: &dyn Engine,
         file: &FileMeta,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<SchemaRef> {
+    ) -> KernelResult<SchemaRef> {
         Ok(engine
             .parquet_handler()
             .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
@@ -1133,7 +1139,7 @@ impl LogSegment {
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<SchemaRef> {
+    ) -> KernelResult<SchemaRef> {
         match hint_schema {
             Some(schema) => Ok(schema.clone()),
             None => Self::read_footer_schema(engine, &checkpoint.location, cancellation_token),
@@ -1149,7 +1155,7 @@ impl LogSegment {
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<(Option<SchemaRef>, Vec<FileMeta>)> {
+    ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         let sidecar_files = self.extract_sidecar_refs(engine, checkpoint, cancellation_token)?;
         let file_actions_schema = match sidecar_files.first() {
             Some(first) => Some(Self::read_footer_schema(engine, first, cancellation_token)?),
@@ -1174,7 +1180,9 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<ActionsWithCheckpointInfo<impl Iterator<Item = Result<ActionsBatch>> + Send>> {
+    ) -> KernelResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
+    > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
@@ -1341,7 +1349,7 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Vec<FileMeta>> {
+    ) -> KernelResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let batches = match checkpoint.extension.as_str() {
             "json" => engine.json_handler().read_json_files_with_cancellation(
@@ -1474,7 +1482,7 @@ impl LogSegment {
         self.end_version - to_sub
     }
 
-    pub(crate) fn validate_published(&self) -> Result<()> {
+    pub(crate) fn validate_published(&self) -> KernelResult<()> {
         match self.listed.max_published_version {
             Some(version) if version == self.end_version => Ok(()),
             Some(version) if version < self.end_version => {
@@ -1650,7 +1658,7 @@ impl LogSegment {
     }
 }
 
-fn validate_compaction_files(compactions: &[ParsedLogPath]) -> Result<()> {
+fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> {
     for (i, f) in compactions.iter().enumerate() {
         let LogPathFileType::CompactedCommit { hi } = f.file_type else {
             return Err(KernelError::invalid_log_segment(format!(
@@ -1679,7 +1687,7 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> Result<()> {
     Ok(())
 }
 
-fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> Result<()> {
+fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> KernelResult<()> {
     for path in listed_files.iter_all_paths() {
         let reparsed = ParsedLogPath::try_from(path.location.clone())?
             .ok_or_else(|| KernelError::invalid_log_path(path.location.location.as_str()))?;
@@ -1694,7 +1702,7 @@ fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> Result<()> {
     Ok(())
 }
 
-fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> Result<()> {
+fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> KernelResult<()> {
     if parts.is_empty() {
         return Ok(());
     }
@@ -1756,7 +1764,7 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> Result<()> {
     Ok(())
 }
 
-fn validate_commit_file_types(commits: &[ParsedLogPath]) -> Result<()> {
+fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelResult<()> {
     for f in commits {
         if !f.is_commit() {
             return Err(KernelError::invalid_log_segment(
@@ -1767,7 +1775,7 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> Result<()> {
     Ok(())
 }
 
-fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> Result<()> {
+fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> KernelResult<()> {
     if let Some(pair) = commits
         .windows(2)
         .find(|pair| pair[0].version >= pair[1].version)
@@ -1792,7 +1800,7 @@ fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> Result<()> {
 pub(crate) fn validate_start_version_available(
     start_version: Version,
     first_commit: Option<&ParsedLogPath>,
-) -> Result<()> {
+) -> KernelResult<()> {
     match first_commit {
         None => Err(KernelError::EmptyLog),
         Some(commit) if commit.version == start_version => Ok(()),
@@ -1803,7 +1811,7 @@ pub(crate) fn validate_start_version_available(
     }
 }
 
-fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> Result<()> {
+fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> KernelResult<()> {
     for pair in commits.windows(2) {
         let Some(expected_version) = pair[0].version.checked_add(1) else {
             return Err(KernelError::invalid_log_segment(format!(
@@ -1826,7 +1834,7 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> Result<()> {
 fn validate_checkpoint_commit_gap(
     checkpoint_version: Option<Version>,
     commits: &[ParsedLogPath],
-) -> Result<()> {
+) -> KernelResult<()> {
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
         let Some(expected_version) = checkpoint_version.checked_add(1) else {
             return Err(KernelError::invalid_checkpoint(format!(
@@ -1852,7 +1860,7 @@ fn validate_end_version(
     commits: &[ParsedLogPath],
     checkpoint_parts: &[ParsedLogPath],
     end_version: Option<Version>,
-) -> Result<Version> {
+) -> KernelResult<Version> {
     let effective_version = commits
         .last()
         .or(checkpoint_parts.first())
@@ -1875,7 +1883,10 @@ fn validate_end_version(
 ///
 /// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
 /// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
-fn validate_latest_commit_file(listed: &LogSegmentFiles, effective_version: Version) -> Result<()> {
+fn validate_latest_commit_file(
+    listed: &LogSegmentFiles,
+    effective_version: Version,
+) -> KernelResult<()> {
     // TODO(#3293): Determine whether every non-empty commit list can require `latest_commit_file`;
     // legacy callers may omit it.
     require!(
@@ -1902,7 +1913,7 @@ fn validate_crc(
     crc: Option<&ParsedLogPath>,
     checkpoint_version: Option<Version>,
     effective_version: Version,
-) -> Result<()> {
+) -> KernelResult<()> {
     let Some(crc) = crc else {
         return Ok(());
     };

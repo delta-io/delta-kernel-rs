@@ -43,8 +43,8 @@ use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
-    EvaluationHandler as _, FileMeta, KernelError, Result, ResultIteratorStatic,
-    StorageHandler as _,
+    EvaluationHandler as _, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
+    Result, StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`].
@@ -109,7 +109,7 @@ impl ScopedSyncPlanExecutor {
         name: &str,
         schema: SchemaRef,
         record_batch: RecordBatch,
-    ) -> Result<RelationRef> {
+    ) -> KernelResult<RelationRef> {
         retain_relation(&self.relation_store, name, schema, vec![record_batch])
     }
 }
@@ -147,27 +147,27 @@ impl SyncPlanExecutor {
         &self,
         op: Operation,
         relation_store: Option<&RelationStore>,
-    ) -> Result<PlanResult> {
+    ) -> KernelResult<PlanResult> {
         match op {
             Operation::IoOperation(io_op) => self.execute_io(io_op),
             Operation::QueryPlan(query) => self.execute_query(query, relation_store),
         }
     }
 
-    fn execute_io(&self, op: IoOperation) -> Result<PlanResult> {
+    fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         match op {
             IoOperation::FileListing { url } => {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<Result<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<Result<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<KernelResult<Bytes>> = self.storage.read_files(files)?.collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {
@@ -202,7 +202,7 @@ impl SyncPlanExecutor {
         &self,
         query: Plan,
         relation_store: Option<&RelationStore>,
-    ) -> Result<PlanResult> {
+    ) -> KernelResult<PlanResult> {
         let terminal = self.eval_plan(query, relation_store)?;
         let batches = terminal
             .into_iter()
@@ -214,7 +214,7 @@ impl SyncPlanExecutor {
         &self,
         plan: Plan,
         relation_store: Option<&RelationStore>,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
             let output = self.eval_node(node, &outputs, relation_store)?;
@@ -232,7 +232,7 @@ impl SyncPlanExecutor {
         node: PlanNode,
         results: &[Vec<RecordBatch>],
         relation_store: Option<&RelationStore>,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         let PlanNode { op, inputs } = node;
         match op {
             Operator::ScanJson(ScanJson {
@@ -276,7 +276,7 @@ impl SyncPlanExecutor {
         files: Vec<ScanFile>,
         file_constant_columns: Vec<String>,
         schema: SchemaRef,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         // The engine reads only the non-constant columns; constants are spliced in afterwards.
         let read_fields = schema
             .fields()
@@ -291,7 +291,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: ResultIteratorStatic<ArrowEngineData> = match file_type {
+            let data: KernelResultIteratorStatic<ArrowEngineData> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,
@@ -329,7 +329,7 @@ impl SyncPlanExecutor {
         &self,
         dynamic_scan: DynamicScan,
         input: &[RecordBatch],
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         let files = dynamic_scan_files(&dynamic_scan, input)?;
         self.eval_scan(
             dynamic_scan.file_type,
@@ -343,7 +343,7 @@ impl SyncPlanExecutor {
         &self,
         relation_ref: &RelationRef,
         relation_store: Option<&RelationStore>,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> KernelResult<Vec<RecordBatch>> {
         let relation_store = relation_store.ok_or_else(|| {
             KernelError::unsupported("RelationSource requires an executor that can store relations")
         })?;
@@ -373,7 +373,7 @@ fn retain_relation(
     name: &str,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
-) -> Result<RelationRef> {
+) -> KernelResult<RelationRef> {
     validate_relation_batches(&schema, &batches)?;
     // `try_update` is unavailable at the crate's MSRV.
     #[allow(deprecated)]
@@ -394,7 +394,7 @@ fn retain_relation(
     Ok(RelationRef::new(id, schema))
 }
 
-fn validate_relation_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<()> {
+fn validate_relation_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> KernelResult<()> {
     let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
     for batch in batches {
         if batch.schema().as_ref() != &arrow_schema {
@@ -406,7 +406,10 @@ fn validate_relation_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Res
     Ok(())
 }
 
-fn dynamic_scan_files(dynamic_scan: &DynamicScan, input: &[RecordBatch]) -> Result<Vec<ScanFile>> {
+fn dynamic_scan_files(
+    dynamic_scan: &DynamicScan,
+    input: &[RecordBatch],
+) -> KernelResult<Vec<ScanFile>> {
     let mut files = Vec::new();
     for batch in input {
         let path = extract_column(batch, dynamic_scan.path_column.path())?;
@@ -495,7 +498,7 @@ fn dynamic_scan_files(dynamic_scan: &DynamicScan, input: &[RecordBatch]) -> Resu
     Ok(files)
 }
 
-fn eval_project(project: Project, input: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+fn eval_project(project: Project, input: &[RecordBatch]) -> KernelResult<Vec<RecordBatch>> {
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
@@ -515,7 +518,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> Result<Vec<RecordBat
         .collect()
 }
 
-fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> KernelResult<Vec<RecordBatch>> {
     let Some(first_batch) = input.first() else {
         return Ok(vec![]);
     };
@@ -543,7 +546,7 @@ fn eval_semi_join(
     join: SemiJoin,
     probe: &[RecordBatch],
     build: &[RecordBatch],
-) -> Result<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let mut build_keys = HashSet::new();
     for batch in build {
         build_keys.extend(encode_keys_as_rows(batch, &join.build_keys)?);
@@ -568,7 +571,7 @@ fn splice_file_constants(
     schema: &SchemaRef,
     file_constant_columns: &[String],
     constants: &[Scalar],
-) -> Result<Vec<ArrayRef>> {
+) -> KernelResult<Vec<ArrayRef>> {
     let (_, read_columns, rows) = batch.into_parts();
     let mut read_columns = read_columns.into_iter();
     schema
@@ -590,7 +593,7 @@ fn splice_file_constants(
 pub(super) fn encode_keys_as_rows(
     batch: &RecordBatch,
     columns: &[ColumnName],
-) -> Result<Vec<OwnedRow>> {
+) -> KernelResult<Vec<OwnedRow>> {
     if columns.is_empty() {
         let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
         return Ok(vec![key; batch.num_rows()]);
@@ -610,7 +613,7 @@ pub(super) fn encode_keys_as_rows(
     Ok(rows.iter().map(|row| row.owned()).collect())
 }
 
-fn scalar_value(array: &dyn Array, row: usize) -> Result<Scalar> {
+fn scalar_value(array: &dyn Array, row: usize) -> KernelResult<Scalar> {
     if array.is_null(row) {
         return Ok(Scalar::Null(DataType::try_from_arrow(array.data_type())?));
     }
@@ -630,12 +633,12 @@ fn scalar_value(array: &dyn Array, row: usize) -> Result<Scalar> {
 /// [`PlanBuilder::build`] output for an absent input) yields zero-row data.
 ///
 /// [`PlanBuilder::build`]: crate::plans::PlanBuilder::build
-fn values_to_record_batch(values: Values) -> Result<RecordBatch> {
+fn values_to_record_batch(values: Values) -> KernelResult<RecordBatch> {
     let Values { schema, rows } = values;
     let columns: Vec<ArrayRef> = schema
         .fields()
         .enumerate()
-        .map(|(col, field)| -> Result<ArrayRef> {
+        .map(|(col, field)| -> KernelResult<ArrayRef> {
             let element_type = ArrayType::new(field.data_type().clone(), true);
             let column = ArrayData::try_new(element_type, rows.iter().map(|row| row[col].clone()))?;
             // This produces a single array row. The array contains n elements, one for each
