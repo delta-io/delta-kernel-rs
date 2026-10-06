@@ -121,9 +121,9 @@ You can call `remove_files()` multiple times to remove files from different
 pending removals.
 
 > [!NOTE]
-> Unless overridden, transactions with schema changes infer `dataChange` from effective file
-> actions: `false` when none are staged and `true` otherwise. Transactions without schema changes
-> default to `true`; empty or unselected batches don't count as file actions.
+> Unless overridden, transactions with schema changes infer `dataChange` from staged file batches:
+> `false` when none are staged and `true` otherwise, including empty or unselected batches.
+> Transactions without schema changes default to `true`.
 
 ## Full example
 

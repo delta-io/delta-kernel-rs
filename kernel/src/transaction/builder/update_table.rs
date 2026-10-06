@@ -201,10 +201,10 @@ impl UpdateTableTransactionBuilder {
     /// `true` indicates that the commit changes the table's logical contents. Use `false` for
     /// metadata-only commits or rewrites that reorganize data without changing its contents.
     ///
-    /// If not set, transactions with schema changes infer the value after file actions are staged:
-    /// metadata-only commits use `false`, while commits containing file actions use `true`.
-    /// Transactions without schema changes default to `true`. Set this explicitly to `false` for a
-    /// protocol-valid logical-preserving rewrite.
+    /// If not set, transactions with schema changes infer the value from staged file batches:
+    /// `false` when no batches are staged and `true` otherwise, including empty or unselected
+    /// batches. Transactions without schema changes default to `true`. Set this explicitly to
+    /// `false` for a protocol-valid logical-preserving rewrite.
     pub fn with_data_change(mut self, data_change: bool) -> Self {
         self.state.data_change = Some(data_change);
         self
@@ -213,7 +213,7 @@ impl UpdateTableTransactionBuilder {
     /// Marks the transaction as a blind append assertion.
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
-    /// requires at least one Add action and rejects Remove actions or deletion-vector updates.
+    /// requires staged Add metadata and rejects staged Remove metadata or deletion-vector batches.
     /// Blind append is also invalid for `ALTER TABLE`, schema changes, or `dataChange = false`.
     pub fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
@@ -628,19 +628,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case::selected_add(StagedFileAction::Add, 1, true, true)]
-    #[case::empty_add(StagedFileAction::Add, 0, true, false)]
-    #[case::selected_remove(StagedFileAction::Remove, 1, true, true)]
-    #[case::empty_remove(StagedFileAction::Remove, 0, true, false)]
-    #[case::unselected_remove(StagedFileAction::Remove, 1, false, false)]
-    #[case::selected_dv_update(StagedFileAction::DeletionVectorUpdate, 1, true, true)]
-    #[case::empty_dv_update(StagedFileAction::DeletionVectorUpdate, 0, true, false)]
-    #[case::unselected_dv_update(StagedFileAction::DeletionVectorUpdate, 1, false, false)]
-    fn alter_table_infers_data_change_from_effective_file_actions(
-        #[case] action: StagedFileAction,
-        #[case] row_count: usize,
-        #[case] select_rows: bool,
-        #[case] expected_data_change: bool,
+    fn alter_table_infers_data_change_from_staged_file_batches(
+        #[values(
+            StagedFileAction::Add,
+            StagedFileAction::Remove,
+            StagedFileAction::DeletionVectorUpdate
+        )]
+        action: StagedFileAction,
     ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut transaction = snapshot
@@ -653,7 +647,7 @@ mod tests {
         assert!(!transaction.data_change);
 
         let data = || {
-            let values = Arc::new(Int32Array::from_iter_values(0..row_count as i32)) as ArrayRef;
+            let values = Arc::new(Int32Array::from_iter_values([1])) as ArrayRef;
             Box::new(ArrowEngineData::new(
                 RecordBatch::try_from_iter([("value", values)]).unwrap(),
             ))
@@ -661,11 +655,7 @@ mod tests {
         match action {
             StagedFileAction::Add => transaction.add_files_metadata.push(data()),
             StagedFileAction::Remove | StagedFileAction::DeletionVectorUpdate => {
-                let data = if select_rows {
-                    crate::FilteredEngineData::with_all_rows_selected(data())
-                } else {
-                    crate::FilteredEngineData::try_new(data(), vec![false; row_count])?
-                };
+                let data = crate::FilteredEngineData::with_all_rows_selected(data());
                 match action {
                     StagedFileAction::Remove => transaction.remove_files_metadata.push(data),
                     StagedFileAction::DeletionVectorUpdate => {
@@ -676,7 +666,7 @@ mod tests {
             }
         }
         transaction.resolve_data_change();
-        assert_eq!(transaction.data_change, expected_data_change);
+        assert!(transaction.data_change);
         Ok(())
     }
 

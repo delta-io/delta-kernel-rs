@@ -216,9 +216,9 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Unless overridden, transactions with schema changes infer `dataChange` from effective file
-> actions: `false` when none are staged and `true` otherwise. Transactions without schema changes
-> default to `true`; empty or unselected batches don't count as file actions.
+> Unless overridden, transactions with schema changes infer `dataChange` from staged file batches:
+> `false` when none are staged and `true` otherwise, including empty or unselected batches.
+> Transactions without schema changes default to `true`.
 
 ## Committing
 
