@@ -24,7 +24,6 @@ use crate::expressions::{
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
-use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 #[cfg(test)]
 use crate::schema::schema_ref;
 use crate::schema::{
@@ -218,9 +217,31 @@ impl<'a> MetadataPlanner<'a> {
         if parse_stats || parse_partitions || self.stats_predicate.is_some() {
             plan.project_patch(|patch| {
                 let patch = patch
-                    .with_parsed_add_stats(parse_stats.then_some(required_stats).flatten())
-                    .with_parsed_add_partition_values(
+                    .fold_with(
+                        parse_stats.then_some(required_stats).flatten(),
+                        |patch, schema| {
+                            patch.append_at(
+                                [ADD_NAME],
+                                StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
+                                Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
+                            )
+                        },
+                    )
+                    .fold_with(
                         parse_partitions.then_some(required_partitions).flatten(),
+                        |patch, schema| {
+                            patch.append_at(
+                                [ADD_NAME],
+                                StructField::nullable(
+                                    PARTITION_VALUES_PARSED,
+                                    schema.as_ref().clone(),
+                                ),
+                                Expr::map_to_struct(
+                                    col!(ADD_NAME, PARTITION_VALUES),
+                                    MapToStructOptions::default(),
+                                ),
+                            )
+                        },
                     );
                 if self.stats_predicate.is_some() {
                     patch.append(
@@ -585,56 +606,6 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
             Expr::from_pred(storage_type.is_not_null()),
         ),
     ])
-}
-
-trait ProjectionStructPatchBuilderExt<'a> {
-    /// Parses add stats, preferring a compatible parsed field.
-    ///
-    /// When `physical_stats` is present, the input must contain either
-    /// `add.stats_parsed` or the fallback `add.stats` JSON field.
-    fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self;
-
-    /// Parses add partition values when a compatible parsed field is not already present.
-    fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self;
-}
-
-impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
-    fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self {
-        let has_stats_parsed = self
-            .input_schema()
-            .contains_col([ADD_NAME, STATS_PARSED_NAME]);
-        let add = [ADD_NAME];
-        match physical_stats {
-            Some(schema) => {
-                let field = StructField::nullable(STATS_PARSED, schema.as_ref().clone());
-                let expr = Expr::parse_json(col!("add.stats"), Arc::clone(schema));
-                if has_stats_parsed {
-                    self
-                } else {
-                    self.append_at(add, field, expr)
-                }
-            }
-            None => self,
-        }
-    }
-
-    fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self {
-        let has_partition_values_parsed = self
-            .input_schema()
-            .contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
-        let add = [ADD_NAME];
-        match (physical_partitions, has_partition_values_parsed) {
-            (Some(schema), false) => self.append_at(
-                add,
-                StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                Expr::map_to_struct(
-                    col!(ADD_NAME, PARTITION_VALUES),
-                    MapToStructOptions::default(),
-                ),
-            ),
-            (Some(_), true) | (None, _) => self,
-        }
-    }
 }
 
 /// Drops stats needed only by the predicate, preserving sparse nested struct patches.
