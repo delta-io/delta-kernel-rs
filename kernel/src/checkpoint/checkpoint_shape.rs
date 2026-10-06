@@ -16,13 +16,13 @@ use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{ADD_NAME, SIDECAR_NAME};
+use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{FileMeta, KernelResult};
 
@@ -229,20 +229,6 @@ impl CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema,
         }
-    }
-
-    /// Returns the physical `add` schema stored in checkpoint leaves, when it was retained during
-    /// shape discovery.
-    pub(crate) fn file_actions_add_schema(&self) -> Option<&StructType> {
-        let DataType::Struct(add_schema) = self
-            .leaf_checkpoint_schema
-            .as_ref()?
-            .field(ADD_NAME)?
-            .data_type()
-        else {
-            return None;
-        };
-        Some(add_schema)
     }
 
     /// Returns `stats_schema` when the checkpoint has compatible parsed stats.

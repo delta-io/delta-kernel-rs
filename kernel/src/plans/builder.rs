@@ -92,7 +92,7 @@ impl PlanBuilder {
     }
 
     /// The output schema of this relation -- carried whether present or absent.
-    fn schema(&self) -> &SchemaRef {
+    pub(crate) fn schema(&self) -> &SchemaRef {
         match &self.0 {
             PlanBuilderRoot::Present(node) => &node.schema,
             PlanBuilderRoot::Absent(schema) => schema,
