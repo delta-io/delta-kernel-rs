@@ -9,7 +9,7 @@ use crate::row_tracking::{
 use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};
 
-impl<S, E: ExecutionMode> Transaction<S, E> {
+impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
     /// Enforces the following rules:

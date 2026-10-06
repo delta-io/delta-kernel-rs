@@ -55,7 +55,7 @@ use crate::{DataType, Engine, Expression, KernelResult, Result};
 // =============================================================================
 // Update table transactions only
 // =============================================================================
-impl<E: ExecutionMode> Transaction<ExistingTable, E> {
+impl<MODE: ExecutionMode> Transaction<ExistingTable, MODE> {
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -271,8 +271,8 @@ impl<E: ExecutionMode> Transaction<ExistingTable, E> {
 
     /// Stages `file` to be committed as the table's root manifest.
     ///
-    /// Mutually exclusive with [`with_manifest_commit`](Transaction::with_manifest_commit), which has
-    /// kernel build the tree instead.
+    /// Mutually exclusive with [`with_manifest_commit`](Transaction::with_manifest_commit), which
+    /// has kernel build the tree instead.
     ///
     /// # Errors
     ///
@@ -668,7 +668,7 @@ pub(super) fn new_dv_column_schema() -> &'static SchemaRef {
 
 // DV updates can only be staged on existing-table transactions. The create-table guard protects
 // action generation, which is shared by all imperative transaction states.
-impl<S> Transaction<S, Imperative> {
+impl<STATE> Transaction<STATE, Imperative> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
     /// This method processes the cached matched files, generating the necessary Remove and Add

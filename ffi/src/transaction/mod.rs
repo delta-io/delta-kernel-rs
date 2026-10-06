@@ -131,8 +131,8 @@ fn transaction_with_committer_impl(
 /// [`free_committed_transaction`].
 ///
 /// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
-fn commit_result_to_committed_handle<S>(
-    result: KernelResult<CommitResult<S>>,
+fn commit_result_to_committed_handle<STATE>(
+    result: KernelResult<CommitResult<STATE>>,
 ) -> KernelResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),

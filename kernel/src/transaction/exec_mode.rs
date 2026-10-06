@@ -7,10 +7,14 @@ use crate::EngineData;
 ///
 /// The mode stores staged data-file changes and determines which staging and commit methods are
 /// available. Its default value contains no staged changes.
-pub trait ExecutionMode: StagedDataChanges + Default + std::fmt::Debug {}
+///
+/// This trait is sealed; only kernel-provided execution modes can implement it.
+#[allow(private_bounds)] // Staged-data inspection is an internal implementation detail.
+pub trait ExecutionMode: sealed::Sealed + StagedDataChanges + Default + std::fmt::Debug {}
 
-/// Checks staged work without inspecting rows or executing relations.
-pub trait StagedDataChanges {
+/// Surfaces methods for inspecting staged operations without inspecting the actual row contents.
+/// This allows validations (that are independent of the physical format of data) to share code.
+pub(crate) trait StagedDataChanges {
     /// Whether any add-file inputs are staged, regardless of their row counts.
     fn has_adds(&self) -> bool;
     /// Whether any remove-file inputs are staged, regardless of selection vectors.
@@ -62,4 +66,11 @@ impl std::fmt::Debug for Imperative {
             .field("num_dv_updates", &self.num_dv_updates)
             .finish()
     }
+}
+
+mod sealed {
+    use super::Imperative;
+
+    pub trait Sealed {}
+    impl Sealed for Imperative {}
 }

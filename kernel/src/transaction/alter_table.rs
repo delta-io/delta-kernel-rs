@@ -23,7 +23,7 @@ use crate::KernelResult;
 /// does not implement [`SupportsDataFiles`](super::SupportsDataFiles).
 pub type AlterTableTransaction = Transaction<AlterTable>;
 
-impl<E: ExecutionMode> Transaction<AlterTable, E> {
+impl<MODE: ExecutionMode> Transaction<AlterTable, MODE> {
     /// Create a new transaction for altering a table's schema. Produces a metadata-only commit
     /// that emits an updated Metadata action with the evolved schema.
     ///

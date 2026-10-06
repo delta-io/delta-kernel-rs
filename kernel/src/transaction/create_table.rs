@@ -132,7 +132,7 @@ pub fn create_table(
     CreateTableTransactionBuilder::new(path, schema, engine_info)
 }
 
-impl<E: ExecutionMode> Transaction<CreateTable, E> {
+impl<MODE: ExecutionMode> Transaction<CreateTable, MODE> {
     /// Create a new transaction for creating a new table. This is used when the table doesn't
     /// exist yet and we need to create it with Protocol and Metadata actions.
     ///

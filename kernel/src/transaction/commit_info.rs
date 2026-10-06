@@ -73,7 +73,7 @@ fn string_map_literal_expr(
     Ok(Arc::new(expression))
 }
 
-impl<S> Transaction<S, Imperative> {
+impl<STATE> Transaction<STATE, Imperative> {
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,
