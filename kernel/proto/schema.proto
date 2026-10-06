@@ -85,6 +85,8 @@ message StructType {
 
 message VariantType {}
 
+message FileType {}
+
 message MetadataValue {
   oneof value {
     int64 number = 1;
@@ -108,5 +110,6 @@ message DataType {
     StructType struct = 3;
     MapType map = 4;
     VariantType variant = 5;
+    FileType file = 6;
   }
 }

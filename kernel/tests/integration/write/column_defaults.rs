@@ -625,6 +625,59 @@ async fn test_variant_column_default_validation_at_snapshot_load(
     Ok(())
 }
 
+/// A `file` column's default must be NULL: a non-NULL default is rejected at snapshot load.
+#[rstest]
+#[case::null_default("null", "NULL", None)]
+#[case::non_null_default("non_null", "'value'", Some("must be NULL"))]
+#[tokio::test]
+async fn test_file_column_default_validation_at_snapshot_load(
+    #[case] label: &str,
+    #[case] default_sql: &str,
+    #[case] expected_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_type = DataType::file_type();
+    let base = schema! { nullable "f": (file_type) };
+    let schema = schema_with_column_defaults(&base, HashMap::from([("f", default_sql)]))?;
+
+    let (store, engine, table_location) =
+        engine_store_setup(&format!("test_file_default_{label}"), None);
+    let table_url = create_table(
+        store,
+        table_location,
+        schema,
+        &[],
+        true,
+        vec!["fileType-preview"],
+        vec!["fileType-preview", "allowColumnDefaults"],
+    )
+    .await?;
+
+    match expected_error {
+        Some(expected_error) => {
+            let error = Snapshot::builder_for(table_url)
+                .build(&engine)
+                .expect_err("a non-NULL File default must be rejected at snapshot load")
+                .to_string();
+            assert!(error.contains(expected_error), "got: {error}");
+        }
+        None => {
+            let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+            let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            let defaults = txn.top_level_column_defaults()?;
+            let column_default = &defaults["f"];
+            assert_eq!(column_default.raw_sql(), default_sql);
+            assert!(
+                column_default
+                    .to_scalar()?
+                    .is_some_and(|value| value.is_null()),
+                "a File NULL default must surface as a null scalar",
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Defaults kernel cannot materialize surface via raw SQL so the connector can evaluate them.
 #[rstest]
 #[case::type_mismatch("type_mismatch", DataType::INTEGER, "'not an int'")]

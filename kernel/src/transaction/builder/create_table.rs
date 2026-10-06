@@ -384,12 +384,15 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
     }
 }
 
-/// Conditionally adds the `fileType` feature to the protocol when the schema contains File
+/// Conditionally adds the `fileType-preview` feature to the protocol when the schema contains File
 /// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+///
+/// The stable `fileType` feature is deliberately not written: the protocol change is still only
+/// proposed, and a stable feature name is permanent once it is in a table's protocol.
 fn maybe_enable_file_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
     if schema_contains_file_type(schema) {
         add_feature_to_lists(
-            TableFeature::FileType,
+            TableFeature::FileTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );

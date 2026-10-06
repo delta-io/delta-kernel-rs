@@ -52,15 +52,20 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// # Errors
     ///
-    /// Returns a [`KernelError::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
-    /// (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is accepted;
-    /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
+    /// Returns a [`KernelError::schema`] when `data_type` is a Variant or a File and `raw_sql` is
+    /// not `NULL` (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is
+    /// accepted; the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> KernelResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
 
         if matches!(data_type, DataType::Variant(_)) && !is_null {
             return Err(KernelError::schema(format!(
                 "a Variant column's default must be NULL, got {raw_sql:?}"
+            )));
+        }
+        if matches!(data_type, DataType::File(_)) && !is_null {
+            return Err(KernelError::schema(format!(
+                "a File column's default must be NULL, got {raw_sql:?}"
             )));
         }
         let parsed_sql = parse_sql(&raw_sql, data_type).ok();
@@ -179,6 +184,12 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
     fn transform_variant(&mut self, _stype: &'a StructType) -> KernelResult<()> {
         Ok(())
     }
+
+    /// The inner fields of a `file` are protocol-defined, not user columns, so they carry no
+    /// defaults of their own.
+    fn transform_file(&mut self, _stype: &'a StructType) -> KernelResult<()> {
+        Ok(())
+    }
 }
 
 /// Validates the column-default metadata on a table's logical schema and reports whether any
@@ -291,6 +302,7 @@ mod tests {
     )]
     #[case::null_struct("NULL", struct_ty(), Expect::ParsedNull)]
     #[case::null_variant("NULL", DataType::unshredded_variant(), Expect::ParsedNull)]
+    #[case::null_file("NULL", DataType::file_type(), Expect::ParsedNull)]
     #[case::function_call("current_timestamp()", DataType::TIMESTAMP, Expect::Unparsable)]
     #[case::type_mismatch("'not an int'", DataType::INTEGER, Expect::Unparsable)]
     #[case::arithmetic("1 + 1", DataType::INTEGER, Expect::Unparsable)]
@@ -306,6 +318,7 @@ mod tests {
     )]
     #[case::non_primitive_struct("STRUCT(1)", struct_ty(), Expect::Unparsable)]
     #[case::non_null_variant("1", DataType::unshredded_variant(), Expect::NewErr("Variant"))]
+    #[case::non_null_file("1", DataType::file_type(), Expect::NewErr("File"))]
     fn column_default_from_new(
         #[case] raw_sql: &str,
         #[case] data_type: DataType,
@@ -364,6 +377,16 @@ mod tests {
         vec![field_with_default("v", DataType::unshredded_variant(), "1")],
         false,
         Some("Variant")
+    )]
+    #[case::non_null_default_on_file_rejected(
+        vec![field_with_default("f", DataType::file_type(), "1")],
+        false,
+        Some("File")
+    )]
+    #[case::null_default_on_file_accepted(
+        vec![field_with_default("f", DataType::file_type(), "NULL")],
+        true,
+        None
     )]
     #[case::nested_default(
         vec![StructField::nullable(

@@ -83,26 +83,36 @@ impl EnsureDataTypes {
             // wrapper. Requiring exactly the variant's fields keeps this in sync with
             // `validate_parquet_variant`. The rejection of shredded layouts relies on the kernel
             // type being unshredded (the only variant kernel constructs today).
-            (DataType::Variant(variant_fields), ArrowDataType::Struct(arrow_fields)) => {
-                require!(arrow_fields.len() == variant_fields.num_fields(), {
+            (
+                DataType::Variant(fields) | DataType::File(fields),
+                ArrowDataType::Struct(arrow_fields),
+            ) => {
+                // A file is physically a struct of fixed fields matched by name, exactly like a
+                // variant, so the two share this check.
+                let type_name = if matches!(kernel_type, DataType::Variant(_)) {
+                    "Variant"
+                } else {
+                    "File"
+                };
+                require!(arrow_fields.len() == fields.num_fields(), {
                     let unexpected = arrow_fields
                         .iter()
                         .map(|f| f.name().as_str())
-                        .filter(|name| variant_fields.field(name).is_none())
+                        .filter(|name| fields.field(name).is_none())
                         .join(", ");
                     make_arrow_error(format!(
-                        "Variant struct has {} fields, expected {} (unexpected: [{unexpected}])",
+                        "{type_name} struct has {} fields, expected {} (unexpected: [{unexpected}])",
                         arrow_fields.len(),
-                        variant_fields.num_fields(),
+                        fields.num_fields(),
                     ))
                 });
-                for kernel_field in variant_fields.fields() {
+                for kernel_field in fields.fields() {
                     let Some(arrow_field) = arrow_fields
                         .iter()
                         .find(|arrow_field| arrow_field.name() == &kernel_field.name)
                     else {
                         return Err(make_arrow_error(format!(
-                            "Variant struct is missing field `{}`",
+                            "{type_name} struct is missing field `{}`",
                             kernel_field.name
                         )));
                     };
@@ -110,38 +120,9 @@ impl EnsureDataTypes {
                 }
                 Ok(DataTypeCompat::Nested)
             }
-            (&DataType::Variant(_), _) => {
+            (&DataType::Variant(_) | &DataType::File(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
-            // A file is physically a struct, matched by name, exactly like a variant.
-            (DataType::File(file_fields), ArrowDataType::Struct(arrow_fields)) => {
-                require!(arrow_fields.len() == file_fields.num_fields(), {
-                    let unexpected = arrow_fields
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .filter(|name| file_fields.field(name).is_none())
-                        .join(", ");
-                    make_arrow_error(format!(
-                        "File struct has {} fields, expected {} (unexpected: [{unexpected}])",
-                        arrow_fields.len(),
-                        file_fields.num_fields(),
-                    ))
-                });
-                for kernel_field in file_fields.fields() {
-                    let Some(arrow_field) = arrow_fields
-                        .iter()
-                        .find(|arrow_field| arrow_field.name() == &kernel_field.name)
-                    else {
-                        return Err(make_arrow_error(format!(
-                            "File struct is missing field `{}`",
-                            kernel_field.name
-                        )));
-                    };
-                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
-                }
-                Ok(DataTypeCompat::Nested)
-            }
-            (&DataType::File(_), _) => check_cast_compat(kernel_type.try_into_arrow()?, arrow_type),
             // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
             // excludes Boolean, the string and binary variants, and Null -- even though
             // kernel models all of these as `PrimitiveType` variants. Match them
@@ -574,6 +555,105 @@ mod tests {
                 &arrow_type,
                 ValidationMode::Full,
             ),
+            expected_err,
+        );
+    }
+
+    /// The canonical Arrow shape of a `file`: a struct of its six fields.
+    fn file_arrow_struct(order: &[&'static str]) -> ArrowDataType {
+        let field = |name: &'static str| {
+            let data_type = match name {
+                "offset" | "size" => ArrowDataType::Int64,
+                "inline" => ArrowDataType::Binary,
+                _ => ArrowDataType::Utf8,
+            };
+            (name, data_type)
+        };
+        variant_arrow_struct(order.iter().copied().map(field), true)
+    }
+
+    const FILE_FIELDS: [&str; 6] = [
+        "uri",
+        "offset",
+        "size",
+        "content_type",
+        "checksum",
+        "inline",
+    ];
+
+    /// A `file` is matched by field name, in both name-based validation modes.
+    #[rstest]
+    fn ensure_file_accepts_canonical_struct(
+        #[values(ValidationMode::TypesAndNames, ValidationMode::Full)] mode: ValidationMode,
+    ) {
+        assert_eq!(
+            ensure_data_types(
+                &DataType::file_type(),
+                &file_arrow_struct(&FILE_FIELDS),
+                mode
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[test]
+    fn ensure_file_accepts_reversed_field_order() {
+        let mut reversed = FILE_FIELDS;
+        reversed.reverse();
+        assert_eq!(
+            ensure_data_types(
+                &DataType::file_type(),
+                &file_arrow_struct(&reversed),
+                ValidationMode::Full,
+            )
+            .unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[rstest]
+    #[case::too_few_fields(
+        file_arrow_struct(&["uri", "offset", "size", "content_type", "checksum"]),
+        "File struct has 5 fields, expected 6"
+    )]
+    #[case::extra_field(
+        variant_arrow_struct(
+            [
+                ("uri", ArrowDataType::Utf8),
+                ("offset", ArrowDataType::Int64),
+                ("size", ArrowDataType::Int64),
+                ("content_type", ArrowDataType::Utf8),
+                ("checksum", ArrowDataType::Utf8),
+                ("inline", ArrowDataType::Binary),
+                ("extra", ArrowDataType::Int64),
+            ],
+            true,
+        ),
+        "expected 6"
+    )]
+    #[case::wrong_field_name(
+        file_arrow_struct(&["uri", "offset", "size", "content_type", "checksum", "payload"]),
+        "File struct is missing field `inline`"
+    )]
+    #[case::wrong_child_type(
+        variant_arrow_struct(
+            [
+                ("uri", ArrowDataType::Utf8),
+                ("offset", ArrowDataType::Utf8),
+                ("size", ArrowDataType::Int64),
+                ("content_type", ArrowDataType::Utf8),
+                ("checksum", ArrowDataType::Utf8),
+                ("inline", ArrowDataType::Binary),
+            ],
+            true,
+        ),
+        "Incorrect datatype"
+    )]
+    #[case::not_a_struct(ArrowDataType::Binary, "Incorrect datatype")]
+    fn ensure_file_rejects(#[case] arrow_type: ArrowDataType, #[case] expected_err: &str) {
+        assert_result_error_with_message(
+            ensure_data_types(&DataType::file_type(), &arrow_type, ValidationMode::Full),
             expected_err,
         );
     }

@@ -349,6 +349,7 @@ Features enabled when specific column types or annotations appear in the schema.
 | Trigger | Reader/Writer feature | Writer feature | Properties set |
 |---------|-----------------------|----------------|----------------|
 | `VARIANT` type in schema | `variantType` | — | — |
+| `FILE` type in schema | `fileType-preview` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
 

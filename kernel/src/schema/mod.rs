@@ -1286,8 +1286,8 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are
-            // validated at creation
+            // Primitive types cannot contain nested metadata columns, and variant and file types
+            // are validated at creation
             DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {}
         };
 
@@ -2303,7 +2303,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
 
         let value = Value::deserialize(deserializer)?;
 
-        // String values are either primitive types or "variant"
+        // String values are either primitive types, "variant" or "file"
         if let Value::String(s) = &value {
             if s == "variant" {
                 return match DataType::unshredded_variant() {
@@ -2312,10 +2312,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
                 };
             }
             if s == "file" {
-                return match DataType::file_type() {
-                    DataType::File(st) => Ok(DataType::File(st)),
-                    _ => Err(Error::custom("Failed to create file type")),
-                };
+                return Ok(DataType::file_type());
             }
 
             // Try PrimitiveType - this will give us good error messages for unsupported types
@@ -2875,6 +2872,31 @@ mod tests {
                     "delta.identity.start": 2147483648
                 }
             }"#
+    }
+
+    #[test]
+    fn test_serde_file_type() {
+        let file = DataType::file_type();
+        assert_eq!(serde_json::to_string(&file).unwrap(), "\"file\"");
+        assert_eq!(serde_json::from_str::<DataType>("\"file\"").unwrap(), file);
+
+        // The canonical file has exactly the six protocol-defined, nullable fields.
+        let DataType::File(fields) = &file else {
+            panic!("expected a file type");
+        };
+        let names: Vec<_> = fields.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "uri",
+                "offset",
+                "size",
+                "content_type",
+                "checksum",
+                "inline"
+            ]
+        );
+        assert!(fields.fields().all(|f| f.is_nullable()));
     }
 
     #[test]

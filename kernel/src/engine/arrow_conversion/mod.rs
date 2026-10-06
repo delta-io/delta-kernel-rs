@@ -1186,6 +1186,28 @@ mod tests {
         Ok(())
     }
 
+    /// Only the canonical `file` schema converts to Arrow; a struct that merely resembles it, or a
+    /// file with a different field set, is rejected rather than silently converted.
+    #[test]
+    fn test_non_canonical_file_schema_is_rejected() {
+        let non_canonical = DataType::File(Box::new(crate::schema::StructType::new_unchecked([
+            crate::schema::StructField::nullable("uri", DataType::STRING),
+        ])));
+        let err = ArrowDataType::try_from_kernel(&non_canonical).unwrap_err();
+        assert!(
+            err.to_string().contains("Only the canonical file schema"),
+            "unexpected error: {err}"
+        );
+
+        // The canonical file converts to a struct of its six fields.
+        let ArrowDataType::Struct(fields) =
+            ArrowDataType::try_from_kernel(&DataType::file_type()).unwrap()
+        else {
+            panic!("expected a struct");
+        };
+        assert_eq!(fields.len(), 6);
+    }
+
     fn arc_elem_with_id(id: i32) -> Arc<ArrowField> {
         Arc::new(
             ArrowField::new("element", ArrowDataType::Int32, true).with_metadata(HashMap::from([
