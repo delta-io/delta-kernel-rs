@@ -87,10 +87,14 @@ impl SnapshotHint {
     /// supplied locations. Snapshot construction performs the remaining consistency and
     /// table-configuration validation.
     ///
+    /// Local table roots, including `file:` URLs, are resolved and canonicalized through the
+    /// local filesystem and must refer to an existing directory.
+    ///
     /// # Errors
     ///
     /// Returns an error if `table_root` is invalid,
-    /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside its log root, or
+    /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
+    /// root, or
     /// [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an error
     /// when the supplied paths cannot be grouped into a valid log-segment file set.
     #[internal_api]
@@ -278,8 +282,7 @@ impl SnapshotBuilder<FromTableRoot> {
     /// version. The caller must canonicalize supplied log paths into the same URL form as the table
     /// root. Kernel preserves the paths, requires them to be beneath this builder's table log root,
     /// and validates structural consistency without reading the supplied files. The caller must
-    /// ensure the protocol and metadata came from those files, and `max_published_version`
-    /// accurately describes the published commit prefix.
+    /// ensure the protocol and metadata came from those files.
     ///
     /// # Errors
     ///
@@ -635,6 +638,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::LogCompaction.into()
         );
 
+        // Construction checks every path before grouping can discard it. Recheck retained paths
+        // because a hint can be attached to a builder for a different table.
         validate_snapshot_hint_paths(log_segment_files.iter_all_paths(), &log_root)?;
         let log_segment = LogSegment::try_new(
             log_segment_files,
@@ -904,18 +909,20 @@ mod tests {
         assert!(source.to_string().contains(expected_source));
     }
 
-    #[test]
-    fn snapshot_hint_sorts_caller_supplied_log_paths() {
+    #[rstest::rstest]
+    fn snapshot_hint_sorts_caller_supplied_log_paths(
+        #[values("memory:///target/", "memory:///target")] table_root: &str,
+    ) {
         let log_paths = [
-            "memory:///_delta_log/00000000000000000001.json",
-            "memory:///_delta_log/00000000000000000000.json",
+            "memory:///target/_delta_log/00000000000000000001.json",
+            "memory:///target/_delta_log/00000000000000000000.json",
         ]
         .into_iter()
         .map(|path| LogPath::try_new(create_log_path(path).location))
         .collect::<Result<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
-            "memory:///",
+            table_root,
             1,
             log_paths,
             Protocol::default(),
@@ -934,6 +941,29 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::invalid_local_root("file:///invalid%00table/", "Invalid table location")]
+    #[case::non_hierarchical_root(
+        "mailto:table@example.com",
+        "relative URL with a cannot-be-a-base base"
+    )]
+    fn snapshot_hint_rejects_invalid_table_roots(
+        #[case] table_root: &str,
+        #[case] expected_error: &str,
+    ) {
+        let result = SnapshotHint::try_new(
+            table_root,
+            0,
+            Vec::new(),
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        );
+        assert_result_error_with_message(result, expected_error);
     }
 
     #[rstest::rstest]
@@ -1016,20 +1046,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_hint_build_rejects_a_hint_constructed_for_another_table() -> Result<()> {
+    fn snapshot_hint_build_rejects_a_hint_constructed_for_another_table() {
         let supplied = "memory:///target/_delta_log/00000000000000000010.checkpoint.parquet";
         let hint = SnapshotHint::try_new(
             "memory:///target/",
             10,
-            vec![LogPath::try_new(
-                create_log_path_with_size(supplied, 1).location,
-            )?],
-            Protocol::try_new_legacy(1, 2)?,
-            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            vec![LogPath::try_new(create_log_path_with_size(supplied, 1).location).unwrap()],
+            Protocol::try_new_legacy(1, 2).unwrap(),
+            Metadata::default()
+                .with_schema(schema_ref! { nullable "id": INTEGER })
+                .unwrap(),
             None,
             None,
             SnapshotHintFreshness::Unverified,
-        )?;
+        )
+        .unwrap();
         let (engine, _store, _table_root) = setup_test();
         let error = SnapshotBuilder::new_for("memory:///other/")
             .with_snapshot_hint(hint)
@@ -1044,7 +1075,6 @@ mod tests {
                         if path == supplied && log_root == "memory:///other/_delta_log/"
                 )
         ));
-        Ok(())
     }
 
     #[derive(Clone, Copy)]
