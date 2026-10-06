@@ -411,22 +411,29 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         scan: &Scan,
         stats_output_drops: &[(ColumnName, String)],
     ) -> Self {
-        if !scan.stats.synthesize_json {
-            self = self.drop_if_exists_at([ADD_NAME], STATS);
+        let input_schema = self.input_schema();
+        let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
+        let has_struct_stats = input_schema.contains_col([ADD_NAME, STATS_PARSED]);
+        let has_struct_partitions = input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED]);
+
+        if !scan.stats.synthesize_json && has_json_stats {
+            self = self.drop_at([ADD_NAME], STATS);
         }
 
         self = if scan.state_info.physical_stats_output_schema().is_some() {
             stats_output_drops.iter().fold(self, |patch, (path, name)| {
                 patch.drop_at(path.clone(), name)
             })
+        } else if has_struct_stats {
+            self.drop_at([ADD_NAME], STATS_PARSED)
         } else {
-            self.drop_if_exists_at([ADD_NAME], STATS_PARSED)
+            self
         };
 
-        if scan.partition_values.parsed_struct {
+        if scan.partition_values.parsed_struct || !has_struct_partitions {
             self
         } else {
-            self.drop_if_exists_at([ADD_NAME], PARTITION_VALUES_PARSED)
+            self.drop_at([ADD_NAME], PARTITION_VALUES_PARSED)
         }
     }
 }
