@@ -539,32 +539,59 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     .unwrap()
 }
 
-#[test]
-fn declarative_metadata_projects_nested_column_mapped_stats() -> Result<()> {
+#[rstest]
+#[case::nested(
+    column_name!("nested_struct.inner_int"),
+    concat!("col-481c7590-d3b8-4e9c-b40e-7b7128a972f4.",
+        "col-7f2f94cf-7082-430c-bba7-852bc6c5215e"),
+    true
+)]
+#[case::null_count_only(column_name!("binary_col"), "col-cbe103e8-96dc-4fd7-821e-602cf8902e6b", false)]
+fn declarative_metadata_projects_nested_column_mapped_stats(
+    #[case] requested: ColumnName,
+    #[case] physical: &str,
+    #[case] min_max: bool,
+    #[values(None, Some(Pred::and(
+        col!("nested_struct.inner_double").gt(lit(0.0)),
+        col!("nested_struct.inner_string").is_not_null()
+    )))]
+    predicate: Option<Pred>,
+) -> Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::struct_columns(vec![column_name!(
-            "nested_struct.inner_int"
-        )]))
+        .with_stats(StatsOptions::struct_columns(vec![requested]))
+        .with_predicate(predicate.map(Arc::new))
         .build()?;
+    let plan = scan
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .expect("metadata plan");
+    let actual_stats = plan
+        .schema
+        .field_at(&column_name!(ADD_NAME, STATS_PARSED))?;
+    let expected_stats = scan.state_info.physical_stats_output_schema().unwrap();
+    assert_eq!(
+        actual_stats.data_type(),
+        &DataType::from(expected_stats.as_ref().clone())
+    );
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let parent = "col-481c7590-d3b8-4e9c-b40e-7b7128a972f4";
-    let child = "col-7f2f94cf-7082-430c-bba7-852bc6c5215e";
     let stats_paths: Vec<_> = leaf_paths(&actual)
         .into_iter()
         .filter(|path| path.starts_with(STATS_PARSED))
         .collect();
-    assert_eq!(
-        stats_paths,
-        [
-            format!("stats_parsed.maxValues.{parent}.{child}"),
-            format!("stats_parsed.minValues.{parent}.{child}"),
-            format!("stats_parsed.nullCount.{parent}.{child}"),
-            "stats_parsed.numRecords".to_string(),
-            "stats_parsed.tightBounds".to_string(),
-        ]
-    );
+    let mut expected = vec![
+        format!("stats_parsed.nullCount.{physical}"),
+        "stats_parsed.numRecords".to_string(),
+        "stats_parsed.tightBounds".to_string(),
+    ];
+    if min_max {
+        expected.extend([
+            format!("stats_parsed.maxValues.{physical}"),
+            format!("stats_parsed.minValues.{physical}"),
+        ]);
+    }
+    expected.sort_unstable();
+    assert_eq!(stats_paths, expected);
     Ok(())
 }
 
