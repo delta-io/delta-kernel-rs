@@ -148,12 +148,17 @@ impl<'a> MetadataPlanner<'a> {
         }
     }
 
-    /// Selects the `add` fields to read from a metadata source.
+    /// Selects the action fields to read from a metadata source.
     ///
-    /// The returned schema contains only metadata needed by the predicate or requested output.
+    /// The `add` field contains only metadata needed by the predicate or requested output.
     /// Compatible structured fields are read directly; otherwise their raw encodings are read so
-    /// they can be derived after the source is built.
-    fn read_add_schema(&self, available_file_schema: &StructType) -> KernelResult<SchemaRef> {
+    /// they can be derived after the source is built. `remove` is included only when the source
+    /// participates in add/remove reconciliation; `version` is always included for replay.
+    fn read_schema(
+        &self,
+        available_file_schema: &StructType,
+        read_removes: bool,
+    ) -> KernelResult<SchemaRef> {
         let available_add_schema = action_add_schema(available_file_schema)?;
         let required_stats = self.scan.state_info.physical_stats_read_schema();
         let required_partitions = self.scan.state_info.physical_partition_schema.as_ref();
@@ -191,7 +196,13 @@ impl<'a> MetadataPlanner<'a> {
                     schema.as_ref().clone(),
                 ))
             });
-        Ok(Arc::new(add_patch.build(&ADD_SCHEMA)?))
+        let add_schema = add_patch.build(&ADD_SCHEMA)?;
+        let mut fields = vec![StructField::nullable(ADD_NAME, add_schema)];
+        if read_removes {
+            fields.push(REMOVE_FIELD.clone());
+        }
+        fields.push(StructField::nullable(VERSION, DataType::LONG));
+        Ok(Arc::new(StructType::new_unchecked(fields)))
     }
 
     /// Derives structured metadata needed by the predicate or requested output when the source
@@ -280,10 +291,11 @@ impl<'a> MetadataPlanner<'a> {
     fn build_source(
         &self,
         available_file_schema: &StructType,
+        read_removes: bool,
         source: impl FnOnce(SchemaRef) -> KernelResult<PlanBuilder>,
     ) -> KernelResult<PlanBuilder> {
-        let read_add_schema = self.read_add_schema(available_file_schema)?;
-        let plan = source(read_add_schema)?;
+        let read_schema = self.read_schema(available_file_schema, read_removes)?;
+        let plan = source(read_schema)?;
         let plan = self.with_derived_metadata(plan)?;
         let plan = self.with_metadata_filter(plan)?;
         self.project_metadata_output(plan)
@@ -370,10 +382,10 @@ impl Scan {
             .leaf_checkpoint_schema
             .as_deref()
             .unwrap_or(get_all_actions_schema());
+        let read_removes = false;
 
         metadata
-            .build_source(available_file_schema, |read_add| {
-                let schema = action_read_schema(read_add, /* include_remove */ false);
+            .build_source(available_file_schema, read_removes, |schema| {
                 let actions = match (&shape.checkpoint_type, checkpoint) {
                     (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
                         PlanBuilder::scan_parquet(parts, &[VERSION], schema)
@@ -420,14 +432,10 @@ impl Scan {
     fn commit_arm(&self, metadata: &MetadataPlanner<'_>) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        let read_removes = true;
         metadata
-            .build_source(get_all_actions_schema(), |read_add| {
-                PlanBuilder::scan_json(
-                    commit_files,
-                    &[VERSION],
-                    action_read_schema(read_add, /* include_remove */ true),
-                )?
-                .filter(Predicate::or(
+            .build_source(get_all_actions_schema(), read_removes, |schema| {
+                PlanBuilder::scan_json(commit_files, &[VERSION], schema)?.filter(Predicate::or(
                     col!("add.path").is_not_null(),
                     col!("remove.path").is_not_null(),
                 ))
@@ -506,16 +514,6 @@ fn sidecar_actions(
 
 // === Helpers ===
 
-/// Wrap an `add` read schema with the source's replay columns.
-fn action_read_schema(add_schema: SchemaRef, include_remove: bool) -> SchemaRef {
-    let mut fields = vec![StructField::nullable(ADD_NAME, add_schema.as_ref().clone())];
-    if include_remove {
-        fields.push(REMOVE_FIELD.clone());
-    }
-    fields.push(StructField::nullable(VERSION, DataType::LONG));
-    Arc::new(StructType::new_unchecked(fields))
-}
-
 /// Read schema for parquet add actions. Kept as a compact test helper.
 #[cfg(test)]
 fn parquet_read_schema(
@@ -532,10 +530,11 @@ fn parquet_read_schema(
                 schema.as_ref().clone(),
             ))
         });
-    Ok(action_read_schema(
-        Arc::new(add_patch.build(&ADD_SCHEMA)?),
-        /* include_remove */ false,
-    ))
+    let add_schema = add_patch.build(&ADD_SCHEMA)?;
+    Ok(Arc::new(StructType::new_unchecked([
+        StructField::nullable(ADD_NAME, add_schema),
+        StructField::nullable(VERSION, DataType::LONG),
+    ])))
 }
 
 /// Return the `add` struct from an action schema.
