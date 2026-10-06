@@ -78,21 +78,26 @@ pub(crate) struct SnapshotHint {
 }
 
 impl SnapshotHint {
-    /// Creates a hint from connector-provided log paths and table state.
+    /// Creates a hint for `table_root` at `version` from connector-provided log paths and table
+    /// state.
     ///
-    /// The typed paths are sorted and grouped using the same checkpoint-selection logic as storage
-    /// listing. The connector must canonicalize every path into the same URL form as the table
-    /// root; Kernel preserves the supplied locations. Snapshot construction validates their
-    /// membership beneath the table's `_delta_log` root and performs the remaining consistency
-    /// and table-configuration validation.
+    /// Every path is validated beneath the table's `_delta_log` root before sorting and grouping
+    /// using the same checkpoint-selection logic as storage listing. The connector must
+    /// canonicalize every path into the same URL form as `table_root`; Kernel preserves the
+    /// supplied locations. Snapshot construction performs the remaining consistency and
+    /// table-configuration validation.
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an
-    /// error when the supplied paths cannot be grouped into a valid log-segment file set.
+    /// Returns an error if `table_root` is invalid,
+    /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside its log root, or
+    /// [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an error
+    /// when the supplied paths cannot be grouped into a valid log-segment file set.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
+        table_root: impl AsRef<str>,
         version: Version,
         log_paths: Vec<LogPath>,
         protocol: Protocol,
@@ -101,6 +106,7 @@ impl SnapshotHint {
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
     ) -> Result<Self> {
+        let log_root = try_parse_uri(table_root)?.join("_delta_log/")?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
         require!(
             !parsed_paths
@@ -108,6 +114,7 @@ impl SnapshotHint {
                 .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
             SnapshotHintError::LogCompaction.into()
         );
+        validate_snapshot_hint_paths(parsed_paths.iter(), &log_root)?;
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
         let parsed_paths = parsed_paths.into_iter().map(Ok);
@@ -628,7 +635,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::LogCompaction.into()
         );
 
-        Self::validate_snapshot_hint_paths(&log_segment_files, &log_root)?;
+        validate_snapshot_hint_paths(log_segment_files.iter_all_paths(), &log_root)?;
         let log_segment = LogSegment::try_new(
             log_segment_files,
             log_root,
@@ -685,25 +692,6 @@ impl<Mode> SnapshotBuilder<Mode> {
             false, /* skipped_new_checkpoints */
         )
         .map(Into::into)
-    }
-
-    /// Validates that hinted log locations are beneath the builder's log root.
-    fn validate_snapshot_hint_paths(
-        log_segment_files: &LogSegmentFiles,
-        log_root: &url::Url,
-    ) -> KernelResult<()> {
-        let log_root = log_root.as_str();
-        if let Some(path) = log_segment_files
-            .iter_all_paths()
-            .find(|path| !path.location.location.as_str().starts_with(log_root))
-        {
-            return Err(SnapshotHintError::LogPathOutsideRoot {
-                path: path.location.location.to_string(),
-                log_root: log_root.to_string(),
-            }
-            .into());
-        }
-        Ok(())
     }
 
     // ===== Catalog-managed Validations =====
@@ -785,6 +773,22 @@ impl<Mode> SnapshotBuilder<Mode> {
     }
 }
 
+/// Validates that hinted log locations are beneath the given log root.
+fn validate_snapshot_hint_paths<'a>(
+    mut paths: impl Iterator<Item = &'a ParsedLogPath>,
+    log_root: &url::Url,
+) -> KernelResult<()> {
+    let log_root = log_root.as_str();
+    if let Some(path) = paths.find(|path| !path.location.location.as_str().starts_with(log_root)) {
+        return Err(SnapshotHintError::LogPathOutsideRoot {
+            path: path.location.location.to_string(),
+            log_root: log_root.to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
@@ -806,8 +810,8 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{
-        create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
-        TestCancellationToken,
+        create_log_path, create_log_path_with_size, install_thread_local_metrics_reporter,
+        CapturingReporter, TestCancellationToken,
     };
     use crate::utils::FoldWithOption as _;
 
@@ -911,6 +915,7 @@ mod tests {
         .collect::<Result<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
+            "memory:///",
             1,
             log_paths,
             Protocol::default(),
@@ -929,6 +934,117 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::published_commit("00000000000000000008.json", Some(8))]
+    #[case::staged_commit(
+        "_staged_commits/00000000000000000008.11111111-1111-1111-1111-111111111111.json",
+        None
+    )]
+    #[case::checkpoint("00000000000000000008.checkpoint.parquet", None)]
+    #[case::incomplete_checkpoint(
+        "00000000000000000008.checkpoint.0000000001.0000000002.parquet",
+        None
+    )]
+    #[case::crc("00000000000000000008.crc", None)]
+    fn snapshot_hint_validates_paths_discarded_by_checkpoint_selection(
+        #[case] filename: &str,
+        #[case] expected_published_version: Option<Version>,
+        #[values(false, true)] foreign_table: bool,
+        #[values(false, true)] reverse_paths: bool,
+    ) -> Result<()> {
+        const TABLE_ROOT: &str = "memory:///target/";
+        const LOG_ROOT: &str = "memory:///target/_delta_log/";
+
+        let supplied_root = if foreign_table {
+            "memory:///other/_delta_log/"
+        } else {
+            LOG_ROOT
+        };
+        let supplied = format!("{supplied_root}{filename}");
+        let mut log_paths = [
+            supplied.as_str(),
+            "memory:///target/_delta_log/00000000000000000010.checkpoint.parquet",
+        ]
+        .into_iter()
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
+        .collect::<Result<Vec<_>>>()?;
+        if reverse_paths {
+            log_paths.reverse();
+        }
+        let (engine, _store, _table_root) = setup_test();
+        let result = SnapshotHint::try_new(
+            TABLE_ROOT,
+            10,
+            log_paths,
+            Protocol::try_new_legacy(1, 2)?,
+            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .and_then(|hint| {
+            SnapshotBuilder::new_for(TABLE_ROOT)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref())
+        });
+
+        if foreign_table {
+            assert!(matches!(
+                result.unwrap_err(),
+                KernelError::SnapshotHint(source)
+                    if matches!(
+                        &*source,
+                        SnapshotHintError::LogPathOutsideRoot { path, log_root }
+                            if path == &supplied && log_root == LOG_ROOT
+                    )
+            ));
+        } else {
+            let snapshot = result?;
+            let segment = snapshot.log_segment();
+            assert_eq!(segment.checkpoint_version, Some(10));
+            assert!(segment.listed.ascending_commit_files.is_empty());
+            assert!(segment.listed.latest_commit_file.is_none());
+            assert!(segment.listed.latest_crc_file.is_none());
+            assert_eq!(
+                segment.listed.max_published_version,
+                expected_published_version
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_hint_build_rejects_a_hint_constructed_for_another_table() -> Result<()> {
+        let supplied = "memory:///target/_delta_log/00000000000000000010.checkpoint.parquet";
+        let hint = SnapshotHint::try_new(
+            "memory:///target/",
+            10,
+            vec![LogPath::try_new(
+                create_log_path_with_size(supplied, 1).location,
+            )?],
+            Protocol::try_new_legacy(1, 2)?,
+            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )?;
+        let (engine, _store, _table_root) = setup_test();
+        let error = SnapshotBuilder::new_for("memory:///other/")
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KernelError::SnapshotHint(source)
+                if matches!(
+                    &*source,
+                    SnapshotHintError::LogPathOutsideRoot { path, log_root }
+                        if path == supplied && log_root == "memory:///other/_delta_log/"
+                )
+        ));
+        Ok(())
     }
 
     #[derive(Clone, Copy)]
@@ -1021,8 +1137,8 @@ mod tests {
             SnapshotHintPathField::LatestCommit => files.latest_commit_file = Some(path),
         }
 
-        let result = SnapshotBuilder::<FromTableRoot>::validate_snapshot_hint_paths(
-            &files,
+        let result = validate_snapshot_hint_paths(
+            files.iter_all_paths(),
             &url::Url::parse(LOG_ROOT).unwrap(),
         );
         if expected_valid {

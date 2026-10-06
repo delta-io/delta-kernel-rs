@@ -351,6 +351,43 @@ fn aggregate_with_wraps_invalid_log_path_errors(#[case] location: &'static str) 
     }
 }
 
+#[rstest::rstest]
+#[case::published_commit("memory:///other/_delta_log/00000000000000000008.json")]
+#[case::staged_commit(concat!(
+    "memory:///other/_delta_log/_staged_commits/",
+    "00000000000000000008.11111111-1111-1111-1111-111111111111.json"
+))]
+#[case::checkpoint("memory:///other/_delta_log/00000000000000000008.checkpoint.parquet")]
+#[case::incomplete_checkpoint(concat!(
+    "memory:///other/_delta_log/",
+    "00000000000000000008.checkpoint.0000000001.0000000002.parquet"
+))]
+#[case::crc("memory:///other/_delta_log/00000000000000000008.crc")]
+fn aggregate_with_rejects_foreign_paths_discarded_by_checkpoint_selection(
+    #[case] location: &'static str,
+) {
+    let engine = test_engine();
+    let builder = test_builder(&engine);
+    let log_paths = [
+        FfiLogPath::new(slice(location), 1, 1),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000010.checkpoint.parquet"),
+            1,
+            1,
+        ),
+    ];
+    let hint = test_snapshot_hint(&log_paths, 10, FfiSnapshotHintFreshness::Unverified);
+    let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::InvalidSnapshotHint,
+        &format!(
+            "log path '{location}' is not beneath log root 'memory:///hinted-table/_delta_log/'"
+        ),
+    );
+    unsafe { free_engine(engine) };
+}
+
 #[test]
 fn aggregate_with_rejects_null_nonempty_log_path_array() {
     let engine = test_engine();
