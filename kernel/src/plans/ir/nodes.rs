@@ -64,17 +64,19 @@ pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 
 /// Writes all rows from its single input to one newline-delimited JSON file at `file_path`.
 /// The input schema supplies the JSON field names and types. Row order is unspecified.
-/// An input with no rows leaves the destination untouched and produces no output rows.
 ///
-/// Returns exactly one row matching [`FILE_META_SCHEMA`] after the write succeeds. When `overwrite`
-/// is false, the destination must be created atomically without replacing an existing file.
-/// When true, the file is replaced, rather than appended to.
+/// For non-empty input, returns exactly one row matching [`FILE_META_SCHEMA`] after the write
+/// succeeds. Empty input emits no rows and skips both writing and checking whether the destination
+/// exists, even when `overwrite` is false. Zero output rows mean no file was written or replaced.
+///
+/// When `overwrite` is false, the destination must be created atomically without replacing an
+/// existing file. When true, the file is replaced, rather than appended to.
 ///
 /// Behavior is undefined if a single plan contains multiple writes to the same destination,
 /// because execution order is unspecified and executors may optimize away common table expressions.
 ///
-/// Returns an error if input serialization or storage I/O fails, or if the destination already
-/// exists and `overwrite` is false.
+/// Returns an error if input serialization or storage I/O fails, or if non-empty input targets an
+/// existing destination and `overwrite` is false.
 #[derive(Debug, Clone)]
 pub struct WriteJson {
     /// Fully qualified URL of the destination file.
