@@ -83,7 +83,8 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Reco
             batch
                 .column_by_name(STATS)
                 .or_else(|| constants.column_by_name(STATS))
-                .cloned(),
+                .cloned()
+                .filter(|_| scan.stats.synthesize_json),
             batch.column_by_name(STATS_PARSED).cloned(),
             batch.column_by_name(PARTITION_VALUES_PARSED).cloned(),
         )?);
@@ -220,7 +221,7 @@ fn declarative_metadata_matches_imperative_scan(
     let imperative_builder = snapshot
         .clone()
         .scan_builder()
-        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct());
     let imperative_builder = match &predicate {
         Some(predicate) => imperative_builder.with_predicate(predicate.clone()),
@@ -230,7 +231,7 @@ fn declarative_metadata_matches_imperative_scan(
 
     let declarative_builder = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct());
     let declarative_builder = match predicate {
         Some(predicate) => declarative_builder.with_predicate(predicate),
@@ -284,10 +285,6 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str)
     &[ID_STATS_PARSED_FIELDS]
 )]
 #[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
-#[case::all(
-    StatsOptions::all(),
-    &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
-)]
 #[case::none(StatsOptions::none(), &[])]
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
@@ -306,8 +303,12 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .clone()
         .scan_builder()
         .with_stats(expected_stats)
-        .with_partition_values(PartitionValuesOptions::with_struct())
-        .with_predicate(predicate.clone());
+        .with_partition_values(PartitionValuesOptions::with_struct());
+    let expected_builder = if stats.synthesize_json {
+        expected_builder
+    } else {
+        expected_builder.with_predicate(predicate.clone())
+    };
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
     let builder = snapshot
         .scan_builder()
@@ -462,21 +463,6 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
     PartitionValuesOptions::with_struct(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
-#[case::all_string_map(
-    StatsOptions::all(),
-    PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
-)]
-#[case::all_with_struct(
-    StatsOptions::all(),
-    PartitionValuesOptions::with_struct(),
-    &[
-        ADD_FIELDS,
-        ALL_STATS_PARSED_FIELDS,
-        JSON_STATS_FIELDS,
-        PARTITION_PARSED_FIELDS,
-    ]
-)]
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
@@ -587,13 +573,13 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> Result<()> {
     LogState::with_latest_version(2),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all_struct()
 )]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all_struct()
 )]
 #[case::v1_checkpoint_struct(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
@@ -607,7 +593,7 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> Result<()> {
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all_struct()
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
@@ -653,13 +639,12 @@ fn declarative_metadata_output_options_across_log_shapes(
 fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
-    #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
 ) {
     assert_metadata_output_options(
         log_state,
         features,
         checkpoint_struct_stats(),
-        stats,
+        StatsOptions::json_only(),
         PartitionValuesOptions::with_struct(),
     )
     .unwrap();
@@ -777,7 +762,7 @@ fn declarative_metadata_data_skipping(
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::all())
+            .with_stats(StatsOptions::all_struct())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
@@ -787,7 +772,7 @@ fn declarative_metadata_data_skipping(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
@@ -824,13 +809,12 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
+        .with_stats(StatsOptions::none())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     assert!(scan.state_info.physical_stats_read_schema().is_none());
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    // The declarative planner synthesizes requested JSON from the checkpoint's structured stats;
-    // the imperative path will gain that behavior separately. This test covers partition pruning.
     assert_metadata_eq(
         &without_columns(&actual, &[STATS])?,
         &without_columns(&expected, &[STATS])?,
@@ -844,6 +828,7 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> Result<()> {
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(col!("tsNtzPartition").is_null()))
+        .with_stats(StatsOptions::none())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
@@ -885,7 +870,7 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Resul
         crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let plan = scan
@@ -962,7 +947,7 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
         snapshot
             .clone()
             .scan_builder()
-            .with_stats(StatsOptions::all())
+            .with_stats(StatsOptions::all_struct())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
@@ -971,7 +956,7 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
 
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
@@ -985,6 +970,7 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(col!("int").gt(lit(0i64))))
+        .with_stats(StatsOptions::all_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     let formatted = pretty_format_batches(&actual)?.to_string();
@@ -1065,7 +1051,7 @@ fn assert_declarative_metadata_matches_imperative(
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::all())
+            .with_stats(StatsOptions::all_struct())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
@@ -1079,7 +1065,7 @@ fn assert_declarative_metadata_matches_imperative(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
