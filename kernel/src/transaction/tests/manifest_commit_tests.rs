@@ -1,8 +1,10 @@
 //! Tests for `adaptiveMetadata-preview` manifest (content-tree) commits and root manifest file
 //! commits.
 
+use rstest::rstest;
+
 use super::super::{ManifestCommitState, ManifestWrite, SchemaOperation, Transaction};
-use super::{add_dummy_file, create_existing_table_txn};
+use super::{create_existing_table_txn, StagedFileAction};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::{DataType, StructField};
@@ -61,17 +63,46 @@ fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()
     Ok(())
 }
 
-#[test]
-fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<()> {
+#[rstest]
+fn root_manifest_ignores_noop_batches_but_rejects_file_actions(
+    #[values(
+        StagedFileAction::None,
+        StagedFileAction::EmptyAdd,
+        StagedFileAction::Add,
+        StagedFileAction::EmptyRemove,
+        StagedFileAction::UnselectedRemove,
+        StagedFileAction::Remove,
+        StagedFileAction::ImplicitRemove,
+        StagedFileAction::EmptyDv,
+        StagedFileAction::UnselectedDv,
+        StagedFileAction::Dv,
+        StagedFileAction::ImplicitDv
+    )]
+    action: StagedFileAction,
+    #[values(false, true)] action_first: bool,
+) -> Result<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
     txn = txn.with_root_manifest_file(file)?;
-    add_dummy_file(&mut txn);
-    assert_result_error_with_message(
-        txn.validate_manifest_write_semantics(),
-        "cannot include file actions",
-    );
+    let companion = if action.has_actions() {
+        StagedFileAction::EmptyAdd
+    } else {
+        StagedFileAction::None
+    };
+    for staged_action in if action_first {
+        [action, companion]
+    } else {
+        [companion, action]
+    } {
+        staged_action.stage(&mut txn);
+    }
+    let result = txn.validate_manifest_write_semantics();
+    if action.has_actions() {
+        assert_result_error_with_message(result, "cannot include file actions");
+    } else {
+        result?;
+    }
     Ok(())
 }
 

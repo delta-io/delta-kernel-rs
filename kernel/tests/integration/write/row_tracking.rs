@@ -5,22 +5,124 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::RowTrackingMetadataColumns;
 use delta_kernel::{Engine, Result, Snapshot};
 use test_utils::{
-    assert_result_error_with_message, insert_data, into_record_batch, read_scan, test_table_setup,
-    test_table_setup_mt,
+    assert_result_error_with_message, create_add_files_metadata, insert_data, into_record_batch,
+    read_actions_from_commit, read_scan, test_table_setup, test_table_setup_mt,
 };
+use url::Url;
 
 use crate::common::read_utils::read_row_tracking_scan;
+
+#[rstest::rstest]
+#[tokio::test]
+async fn row_tracking_noop_adds_preserve_ids_and_only_real_adds_advance_high_water_mark(
+    #[values(0, 1, 2)] empty_batch_count: usize,
+    #[values(false, true)] with_real_add: bool,
+    #[values(false, true)] empty_first: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let schema = schema_ref! { nullable "number": INTEGER };
+    let snapshot = kernel_create_table(&table_path, schema.clone(), "test")
+        .with_table_properties([("delta.enableRowTracking", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    assert_eq!(
+        snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        Some(2)
+    );
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    if empty_first {
+        for _ in 0..empty_batch_count {
+            txn.add_files(create_add_files_metadata(txn.add_files_schema(), vec![])?);
+        }
+    }
+    if with_real_add {
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![4, 5]))],
+        )?;
+        let context = txn.write_state()?.write_context_builder().build()?;
+        txn.add_files(
+            engine
+                .write_parquet(&ArrowEngineData::new(batch), &context)
+                .await?,
+        );
+    }
+    if !empty_first {
+        for _ in 0..empty_batch_count {
+            txn.add_files(create_add_files_metadata(txn.add_files_schema(), vec![])?);
+        }
+    }
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    assert_eq!(snapshot.version(), 2);
+    assert_eq!(
+        snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        Some(if with_real_add { 4 } else { 2 })
+    );
+    let domain_metadata = read_actions_from_commit(&table_url, 2, "domainMetadata")?;
+    assert_eq!(
+        domain_metadata
+            .iter()
+            .filter(|action| action["domain"] == "delta.rowTracking")
+            .count(),
+        usize::from(with_real_add)
+    );
+    let batches = read_row_tracking_scan(
+        snapshot,
+        engine,
+        [
+            MetadataColumnSpec::RowId,
+            MetadataColumnSpec::RowCommitVersion,
+        ],
+    )?;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let numbers = batch
+            .column_by_name("number")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let ids = batch
+            .column_by_name(MetadataColumnSpec::RowId.text_value())
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        let versions = batch
+            .column_by_name(MetadataColumnSpec::RowCommitVersion.text_value())
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            rows.push((numbers.value(row), ids.value(row), versions.value(row)));
+        }
+    }
+    rows.sort_unstable();
+    let mut expected = vec![(1, 0, 1), (2, 1, 1), (3, 2, 1)];
+    if with_real_add {
+        expected.extend([(4, 3, 2), (5, 4, 2)]);
+    }
+    assert_eq!(rows, expected);
+    Ok(())
+}
+
 mod row_tracking_preservation {
     use std::collections::HashMap;
 
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
     use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
+    use delta_kernel::engine_data::FilteredEngineData;
     use delta_kernel::schema::{DataType, SchemaRef, StructField};
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
@@ -325,6 +427,87 @@ mod row_tracking_preservation {
     }
 
     #[rstest::rstest]
+    #[case::row_tracking(&[
+        ("delta.enableRowTracking", "true"),
+        ("delta.enableDeletionVectors", "true"),
+    ])]
+    #[case::iceberg_compat_v3(&[
+        ("delta.enableIcebergCompatV3", "true"),
+        ("delta.enableDeletionVectors", "true"),
+    ])]
+    #[tokio::test]
+    async fn noop_removals_bypass_preservation_and_iceberg_restrictions(
+        #[case] properties: &[(&str, &str)],
+        #[values(false, true)] dv_update: bool,
+        #[values(false, true)] empty_batch: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, table_path, engine) = test_table_setup()?;
+        let snapshot = kernel_create_table(
+            &table_path,
+            schema_ref! { nullable "number": INTEGER },
+            "test",
+        )
+        .with_table_properties(properties.iter().copied())
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+        let snapshot = insert_data(
+            snapshot,
+            &engine,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .await?
+        .unwrap_post_commit_snapshot();
+        let high_water_mark = snapshot.get_row_tracking_high_water_mark(engine.as_ref())?;
+        let files = get_scan_files(snapshot.clone(), engine.as_ref())?
+            .into_iter()
+            .map(|files| {
+                let (data, _) = files.into_parts();
+                if empty_batch {
+                    let batch = into_record_batch(data).slice(0, 0);
+                    Ok(FilteredEngineData::with_all_rows_selected(Box::new(
+                        ArrowEngineData::new(batch),
+                    )))
+                } else {
+                    let selection = vec![false; data.len()];
+                    FilteredEngineData::try_new(data, selection)
+                }
+            })
+            .collect::<delta_kernel::Result<Vec<_>>>()?;
+        let mut txn =
+            snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        if dv_update {
+            txn.update_deletion_vectors(HashMap::new(), files.into_iter().map(Ok))?;
+        } else {
+            for file in files {
+                txn.remove_files(file);
+            }
+        }
+        let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        assert_eq!(snapshot.version(), 2);
+        assert_eq!(
+            snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+            high_water_mark
+        );
+        let scan = snapshot.scan_builder().build()?;
+        let mut rows = Vec::new();
+        for batch in read_scan(&scan, engine)? {
+            rows.extend(
+                batch
+                    .column_by_name("number")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    #[rstest::rstest]
     #[case::enabled_without_acknowledgment(RemoveTestCase::EnabledUnacknowledged)]
     #[case::enabled_with_acknowledgment(RemoveTestCase::EnabledAcknowledged)]
     #[case::supported_without_acknowledgment(RemoveTestCase::SupportedUnacknowledged)]
@@ -341,6 +524,7 @@ mod row_tracking_preservation {
     #[tokio::test(flavor = "multi_thread")]
     async fn remove_files_requires_row_tracking_preservation_acknowledgment(
         #[case] test_case: RemoveTestCase,
+        #[values(false, true)] selected: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // === Create the table and insert data ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -380,30 +564,45 @@ mod row_tracking_preservation {
             .unwrap()?
             .scan_files;
         let mut txn = snapshot
+            .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_data_change(true);
+        let high_water_mark = snapshot.get_row_tracking_high_water_mark(engine.as_ref())?;
+        let scan_files = if selected {
+            scan_files
+        } else {
+            let (data, _) = scan_files.into_parts();
+            let selection = vec![false; data.len()];
+            FilteredEngineData::try_new(data, selection)?
+        };
         txn.remove_files(scan_files);
         if test_case.acknowledges_preservation() {
             txn.ack_row_tracking_preservation();
         }
 
         // === Commit and verify the result ===
-        if let Some(expected_error) = test_case.expects_error() {
+        if let Some(expected_error) = selected.then(|| test_case.expects_error()).flatten() {
             assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
         } else {
             let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+            assert_eq!(
+                snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+                high_water_mark
+            );
             let scan = snapshot.scan_builder().build()?;
             let row_count: usize = read_scan(&scan, engine)?
                 .iter()
                 .map(RecordBatch::num_rows)
                 .sum();
-            assert_eq!(row_count, 0);
+            assert_eq!(row_count, if selected { 0 } else { 3 });
         }
         Ok(())
     }
 
+    #[rstest::rstest]
     #[tokio::test]
     async fn deletion_vector_update_requires_preservation_acknowledgment(
+        #[values(false, true)] matched: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // === Create a Row Tracking table with deletion vectors and insert data ===
         let tmp_dir = tempfile::tempdir()?;
@@ -433,18 +632,39 @@ mod row_tracking_preservation {
         let file_path = read_add_infos(snapshot.as_ref(), engine.as_ref())?[0]
             .path
             .clone();
+        let high_water_mark = snapshot.get_row_tracking_high_water_mark(engine.as_ref())?;
+        let descriptors = if matched {
+            HashMap::from([(file_path, descriptor)])
+        } else {
+            HashMap::new()
+        };
         txn.update_deletion_vectors(
-            HashMap::from([(file_path, descriptor)]),
+            descriptors,
             get_scan_files(snapshot, engine.as_ref())?
                 .into_iter()
                 .map(Ok),
         )?;
 
-        // === Verify the commit is rejected ===
-        assert_result_error_with_message(
-            txn.commit(engine.as_ref()),
-            "Transaction::ack_row_tracking_preservation()",
-        );
+        // === Verify only actual updates require preservation acknowledgment ===
+        let result = txn.commit(engine.as_ref());
+        if matched {
+            assert_result_error_with_message(
+                result,
+                "Transaction::ack_row_tracking_preservation()",
+            );
+        } else {
+            let snapshot = result?.unwrap_post_commit_snapshot();
+            assert_eq!(
+                snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+                high_water_mark
+            );
+            let scan = snapshot.scan_builder().build()?;
+            let row_count: usize = read_scan(&scan, engine)?
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert_eq!(row_count, 2);
+        }
         Ok(())
     }
 
