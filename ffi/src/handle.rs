@@ -22,32 +22,17 @@
 
 use std::ptr::NonNull;
 
-/// Converts between owned [`Box`] values and [`NonNull`] pointers.
-///
-/// Matches the standard library associated functions `Box::into_non_null` and `Box::from_non_null`,
-/// which are not stable until 1.99+. Call them as `BoxExt::into_non_null` / `BoxExt::from_non_null`
-/// to avoid `unstable_name_collisions` warnings.
-pub(crate) trait BoxExt<T: ?Sized>: Sized {
+/// Emulates the standard library associated function `Box::into_non_null`, which is not stable
+/// until 1.99+. Call as [`BoxExt::into_non_null`] to avoid `unstable_name_collisions` warnings.
+pub(crate) trait BoxExt<T: ?Sized> {
     /// Converts `self` into a [`NonNull`] pointer, transferring ownership to the caller.
     fn into_non_null(self) -> NonNull<T>;
-
-    /// Constructs a `Box` from a [`NonNull`] pointer previously produced by
-    /// [`Self::into_non_null`].
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be a currently unique pointer to a `T` allocated by `Box`.
-    unsafe fn from_non_null(ptr: NonNull<T>) -> Self;
 }
 
 impl<T: ?Sized> BoxExt<T> for Box<T> {
     fn into_non_null(self) -> NonNull<T> {
         // SAFETY: `Box::into_raw` never returns a null pointer.
         unsafe { NonNull::new_unchecked(Box::into_raw(self)) }
-    }
-
-    unsafe fn from_non_null(ptr: NonNull<T>) -> Self {
-        Box::from_raw(ptr.as_ptr())
     }
 }
 
@@ -380,7 +365,7 @@ mod private {
             &*ptr
         }
         unsafe fn into_inner(ptr: *mut T) -> Box<T> {
-            BoxExt::from_non_null(unsafe { NonNull::new_unchecked(ptr) })
+            Box::from_raw(ptr)
         }
     }
 
@@ -444,8 +429,7 @@ mod private {
             boxed.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Box<T>) -> Box<T> {
-            let boxed: Box<Box<T>> = BoxExt::from_non_null(unsafe { NonNull::new_unchecked(ptr) });
-            *boxed
+            *Box::from_raw(ptr)
         }
     }
 
@@ -478,8 +462,7 @@ mod private {
             arc.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Arc<T>) -> Arc<T> {
-            let boxed: Box<Arc<T>> = BoxExt::from_non_null(unsafe { NonNull::new_unchecked(ptr) });
-            *boxed
+            *Box::from_raw(ptr)
         }
     }
 
@@ -533,19 +516,17 @@ mod tests {
 
     use super::*;
 
-    /// Compiles `Box::{into,from}_non_null` against [`BoxExt`] so rustc emits
-    /// `unstable_name_collisions`. Those inherent associated functions will stabilize when MSRV
-    /// moves to 1.99+, leading to clippy warnings because the expectation is unfulfilled. When that
-    /// happens, just remove the `BoxExt` trait, update all calls sites to use the inherent
-    /// associated functions, and delete this test.
+    /// Intentionally access `BoxExt::into_non_null` as `Box::into_non_null` so rustc warns about
+    /// `unstable_name_collisions`. The warning will disappear once `Box::into_non_null` stabilizes,
+    /// causing the test expectation to fail so we remember to remove the `BoxExt` trait.
     #[test]
     #[expect(
         unstable_name_collisions,
-        reason = "delete BoxExt when Box::{into,from}_non_null are inherent"
+        reason = "intentional canary to detect that BoxExt trait is no longer needed"
     )]
-    fn box_non_null_round_trip_still_uses_the_polyfill() {
+    fn box_into_non_null_still_uses_the_polyfill() {
         let ptr = Box::into_non_null(Box::new(1u8));
-        let boxed = unsafe { Box::from_non_null(ptr) };
+        let boxed = unsafe { Box::from_raw(ptr.as_ptr()) };
         assert_eq!(*boxed, 1);
     }
 
