@@ -1104,7 +1104,7 @@ pub unsafe extern "C" fn free_scan_metadata_arrow_result(result: *mut ScanMetada
         selection_vector,
         transforms,
     } = unsafe { *Box::from_raw(result) };
-    // KernelBoolSlice is a leaked Vec<bool>; reconstitute and drop to free
+    // KernelBoolSlice owns a Vec<bool> allocation; reconstitute and drop to free
     let _ = unsafe { selection_vector.into_vec() };
     // ArrowFFIData's FFI_ArrowArray/FFI_ArrowSchema have Drop impls that call
     // their release callbacks if non-null. If the consumer already imported the

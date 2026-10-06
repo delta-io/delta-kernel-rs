@@ -20,6 +20,37 @@
 //! NOTE: While shared handles could conceptually impl [`Clone`], cloning would require unsafe code
 //! and so we can't actually implement the trait. Use [`Handle::clone_handle`] instead.
 
+use std::ptr::NonNull;
+
+/// Converts between owned [`Box`] values and [`NonNull`] pointers.
+///
+/// Matches the standard library associated functions `Box::into_non_null` and `Box::from_non_null`,
+/// which are not stable until 1.99+. Call them as `BoxExt::into_non_null` / `BoxExt::from_non_null`
+/// to avoid `unstable_name_collisions` warnings.
+pub(crate) trait BoxExt<T: ?Sized>: Sized {
+    /// Converts `self` into a [`NonNull`] pointer, transferring ownership to the caller.
+    fn into_non_null(self) -> NonNull<T>;
+
+    /// Constructs a `Box` from a [`NonNull`] pointer previously produced by
+    /// [`Self::into_non_null`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a currently unique pointer to a `T` allocated by `Box`.
+    unsafe fn from_non_null(ptr: NonNull<T>) -> Self;
+}
+
+impl<T: ?Sized> BoxExt<T> for Box<T> {
+    fn into_non_null(self) -> NonNull<T> {
+        // SAFETY: `Box::into_raw` never returns a null pointer.
+        unsafe { NonNull::new_unchecked(Box::into_raw(self)) }
+    }
+
+    unsafe fn from_non_null(ptr: NonNull<T>) -> Self {
+        Box::from_raw(ptr.as_ptr())
+    }
+}
+
 /// Describes the kind of handle a given opaque pointer type represents.
 ///
 /// It is not normally necessary to implement this trait directly; instead, use the provided
@@ -343,13 +374,13 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<T> {
-            Box::leak(val).into()
+            BoxExt::into_non_null(val)
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
             &*ptr
         }
         unsafe fn into_inner(ptr: *mut T) -> Box<T> {
-            Box::from_raw(ptr)
+            BoxExt::from_non_null(unsafe { NonNull::new_unchecked(ptr) })
         }
     }
 
@@ -406,14 +437,15 @@ mod private {
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<Box<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::leak(Box::new(val)).into()
+            BoxExt::into_non_null(Box::new(val))
         }
         unsafe fn as_ref<'a>(ptr: *const Box<T>) -> &'a T {
             let boxed = unsafe { &*ptr };
             boxed.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Box<T>) -> Box<T> {
-            *Box::from_raw(ptr)
+            let boxed: Box<Box<T>> = BoxExt::from_non_null(unsafe { NonNull::new_unchecked(ptr) });
+            *boxed
         }
     }
 
@@ -439,14 +471,15 @@ mod private {
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<Arc<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::leak(Box::new(val)).into()
+            BoxExt::into_non_null(Box::new(val))
         }
         unsafe fn as_ref<'a>(ptr: *const Arc<T>) -> &'a T {
             let arc = unsafe { &*ptr };
             arc.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Arc<T>) -> Arc<T> {
-            *Box::from_raw(ptr)
+            let boxed: Box<Arc<T>> = BoxExt::from_non_null(unsafe { NonNull::new_unchecked(ptr) });
+            *boxed
         }
     }
 
@@ -499,6 +532,22 @@ mod tests {
     use delta_kernel_ffi_macros::handle_descriptor;
 
     use super::*;
+
+    /// Compiles `Box::{into,from}_non_null` against [`BoxExt`] so rustc emits
+    /// `unstable_name_collisions`. Those inherent associated functions will stabilize when MSRV
+    /// moves to 1.99+, leading to clippy warnings because the expectation is unfulfilled. When that
+    /// happens, just remove the `BoxExt` trait, update all calls sites to use the inherent
+    /// associated functions, and delete this test.
+    #[test]
+    #[expect(
+        unstable_name_collisions,
+        reason = "delete BoxExt when Box::{into,from}_non_null are inherent"
+    )]
+    fn box_non_null_round_trip_still_uses_the_polyfill() {
+        let ptr = Box::into_non_null(Box::new(1u8));
+        let boxed = unsafe { Box::from_non_null(ptr) };
+        assert_eq!(*boxed, 1);
+    }
 
     #[allow(dead_code)]
     #[derive(Debug)]

@@ -338,15 +338,11 @@ mod tests {
             key: KernelStringSlice,
             value: KernelStringSlice,
         ) {
-            let mut collected_metadata = unsafe {
-                Box::from_raw(
-                    state.unwrap().as_ptr() as *mut std::collections::HashMap<String, String>
-                )
-            };
+            let ptr: *mut HashMap<String, String> = state.unwrap().as_ptr().cast();
+            let collected_metadata = unsafe { &mut *ptr };
             let key: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
             let value: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
             collected_metadata.insert(key.unwrap(), value.unwrap());
-            Box::leak(collected_metadata);
         }
 
         // Visit all (user) domain metadata
@@ -467,8 +463,8 @@ mod tests {
             precision: u8,
             scale: u8,
         ) {
-            let mut columns =
-                unsafe { Box::from_raw(state.unwrap().as_ptr() as *mut Vec<VisitedColumn>) };
+            let ptr: *mut Vec<VisitedColumn> = state.unwrap().as_ptr().cast();
+            let columns = unsafe { &mut *ptr };
             let logical: Result<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&logical_column) };
             let physical: Result<String> =
@@ -480,7 +476,6 @@ mod tests {
                 precision,
                 scale,
             ));
-            Box::leak(columns);
         }
 
         let count: Option<usize> = ok_or_panic(unsafe {
