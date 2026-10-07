@@ -1945,8 +1945,7 @@ pub enum PrimitiveType {
     TimestampNtz,
     Void,
     /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
-    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings). As with the year-month
-    /// variant above, the serde rename is the multi-word `schemaString` type-name string.
+    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings).
     #[serde(rename = "interval day to second")]
     IntervalDayTime,
     #[from]
