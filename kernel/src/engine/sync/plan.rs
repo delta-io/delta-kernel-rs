@@ -262,14 +262,23 @@ impl SyncPlanExecutor {
             }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
             Operator::WriteJson(WriteJson {
+                schema,
                 file_path,
                 overwrite,
-            }) => self.eval_write(FileType::Json, &file_path, overwrite, &results[inputs[0]]),
+            }) => self.eval_write(
+                FileType::Json,
+                &schema,
+                &file_path,
+                overwrite,
+                &results[inputs[0]],
+            ),
             Operator::WriteParquet(WriteParquet {
+                schema,
                 file_path,
                 overwrite,
             }) => self.eval_write(
                 FileType::Parquet,
+                &schema,
                 &file_path,
                 overwrite,
                 &results[inputs[0]],
@@ -283,43 +292,64 @@ impl SyncPlanExecutor {
     fn eval_write(
         &self,
         file_type: FileType,
+        schema: &SchemaRef,
         file_path: &Url,
         overwrite: bool,
         input: &[RecordBatch],
     ) -> KernelResult<Vec<RecordBatch>> {
-        let Some(first) = input.iter().find(|batch| batch.num_rows() > 0) else {
-            return Ok(vec![]);
-        };
-        let bytes = match file_type {
-            FileType::Json => to_json_bytes(input.iter().map(|batch| {
-                Ok(FilteredEngineData::with_all_rows_selected(Box::new(
-                    ArrowEngineData::new(batch.clone()),
-                )))
-            }))?,
-            FileType::Parquet => {
-                let mut writer = ArrowWriter::try_new_with_options(
-                    Vec::new(),
-                    first.schema(),
-                    writer_options(),
-                )?;
-                for batch in input {
-                    writer.write(batch)?;
-                }
-                writer.into_inner()?
+        let arrow_schema: ArrowSchema = schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(|err| KernelError::schema(format!("Unsupported write schema: {err}")))?;
+        for batch in input {
+            if batch.schema().as_ref() != &arrow_schema {
+                return Err(KernelError::schema(
+                    "Write input batch schema does not match the declared schema",
+                ));
             }
+        }
+        if input.iter().all(|batch| batch.num_rows() == 0) {
+            return Err(KernelError::generic(
+                "Write requires at least one input row",
+            ));
+        }
+        // Use a closure in order to map internal errors to kernel's expected variants
+        let write = || -> KernelResult<Vec<RecordBatch>> {
+            let bytes = match file_type {
+                FileType::Json => to_json_bytes(input.iter().map(|batch| {
+                    Ok(FilteredEngineData::with_all_rows_selected(Box::new(
+                        ArrowEngineData::new(batch.clone()),
+                    )))
+                }))?,
+                FileType::Parquet => {
+                    let mut writer = ArrowWriter::try_new_with_options(
+                        Vec::new(),
+                        Arc::new(arrow_schema),
+                        writer_options(),
+                    )?;
+                    for batch in input {
+                        writer.write(batch)?;
+                    }
+                    writer.into_inner()?
+                }
+            };
+            put_bytes(self.storage.store(), file_path, bytes.into(), overwrite)?;
+            let meta = self.storage.head(file_path)?;
+            let size = i64::try_from(meta.size)
+                .map_err(|_| KernelError::generic("Written file size exceeds LONG range"))?;
+            Ok(vec![values_to_record_batch(Values::new(
+                FILE_META_SCHEMA.clone(),
+                vec![vec![
+                    meta.location.to_string().into(),
+                    size.into(),
+                    meta.last_modified.into(),
+                ]],
+            ))?])
         };
-        put_bytes(self.storage.store(), file_path, bytes.into(), overwrite)?;
-        let meta = self.storage.head(file_path)?;
-        let size = i64::try_from(meta.size)
-            .map_err(|_| KernelError::generic("Written file size exceeds LONG range"))?;
-        Ok(vec![values_to_record_batch(Values::new(
-            FILE_META_SCHEMA.clone(),
-            vec![vec![
-                meta.location.to_string().into(),
-                size.into(),
-                meta.last_modified.into(),
-            ]],
-        ))?])
+        write().map_err(|err| match err {
+            KernelError::FileAlreadyExists(_) => err,
+            other => KernelError::generic(format!("Failed to write {file_path}: {other}")),
+        })
     }
 
     /// Reads `files` as `file_type`, broadcasting each file's [`ScanFile::file_constants`] into the
@@ -716,6 +746,7 @@ fn values_to_record_batch(values: Values) -> KernelResult<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use test_utils::assert_batches_sorted_eq;
     use url::Url;
 
     use super::*;
@@ -726,7 +757,7 @@ mod tests {
     use crate::expressions::{col, column_name, lit, Predicate, StructData};
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
-    use crate::schema::{schema, schema_ref, ToSchema as _};
+    use crate::schema::{schema, schema_ref, MetadataValue, StructField, ToSchema as _};
 
     fn write_plan(
         input: PlanBuilder,
@@ -737,7 +768,7 @@ mod tests {
         match file_type {
             FileType::Json => input.write_json(path.clone(), overwrite),
             FileType::Parquet => input.write_parquet(path.clone(), overwrite),
-        }
+        }?
         .build()
     }
 
@@ -747,7 +778,7 @@ mod tests {
         file_type: FileType,
         path: &Url,
         schema: SchemaRef,
-        expected_ids: &[i64],
+        expected_rows: &[&str],
     ) -> Result<()> {
         assert_eq!(
             plan.schema,
@@ -782,20 +813,7 @@ mod tests {
         }
         .build()?;
         let batches = executor.eval_plan(scan, None)?;
-        let mut ids: Vec<_> = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        ids.sort_unstable();
-        assert_eq!(ids, expected_ids);
+        assert_batches_sorted_eq!(expected_rows, &batches);
         Ok(())
     }
 
@@ -825,14 +843,23 @@ mod tests {
             file_type,
             &path,
             schema.clone(),
-            &[2, 3, 4],
+            &[
+                "+----+", "| id |", "+----+", "| 2  |", "| 3  |", "| 4  |", "+----+",
+            ],
         )?;
 
         let original_bytes = get_bytes(executor.storage.store(), &path)?;
         let replacement = PlanBuilder::values(schema.clone(), vec![vec![9i64.into()]])?;
         let replacement = write_plan(replacement, file_type, &path, overwrite)?;
         if overwrite {
-            write_and_check_output(&executor, replacement, file_type, &path, schema, &[9])?;
+            write_and_check_output(
+                &executor,
+                replacement,
+                file_type,
+                &path,
+                schema,
+                &["+----+", "| id |", "+----+", "| 9  |", "+----+"],
+            )?;
         } else {
             let result = executor.execute_op(Operation::QueryPlan(replacement));
             assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
@@ -843,12 +870,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::values("values")]
     #[case::filter("filter")]
     #[case::scan("scan")]
     #[case::aggregate("aggregate")]
     #[case::retained("retained")]
-    fn write_nodes_skip_empty_input(
+    fn write_nodes_reject_empty_input(
         #[case] source: &str,
         #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
         #[values(false, true)] destination_exists: bool,
@@ -864,7 +890,6 @@ mod tests {
         let scan =
             PlanBuilder::scan_json([executor.storage.head(&empty_path)?], &[], schema.clone())?;
         let input = match source {
-            "values" => PlanBuilder::values(schema.clone(), vec![])?,
             "filter" => filtered,
             "scan" => scan,
             "aggregate" => filtered.aggregate_by([column_name!("id")], |aggs| aggs)?,
@@ -879,12 +904,10 @@ mod tests {
             executor.storage.put(&path, original.clone(), false)?;
         }
         let plan = write_plan(input, file_type, &path, overwrite)?;
-        let batches = scoped
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?
-            .map(|data| data.try_into_record_batch())
-            .collect::<Result<Vec<_>>>()?;
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert!(matches!(
+            scoped.execute_op(Operation::QueryPlan(plan)),
+            Err(KernelError::Generic(message)) if message.contains("at least one input row")
+        ));
         if destination_exists {
             assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
         } else {
@@ -893,6 +916,76 @@ mod tests {
                 Err(KernelError::FileNotFound(_))
             ));
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::name(schema_ref! { not_null "other": LONG, not_null "value": LONG })]
+    #[case::order(schema_ref! { not_null "value": LONG, not_null "id": LONG })]
+    #[case::nullability(schema_ref! { nullable "id": LONG, not_null "value": LONG })]
+    #[case::type_mismatch(schema_ref! { not_null "id": INTEGER, not_null "value": LONG })]
+    #[case::metadata(schema_ref! {
+        (StructField::not_null("id", DataType::LONG)
+            .add_metadata([("parquet.field.id", MetadataValue::Number(1))])),
+        not_null "value": LONG,
+    })]
+    fn write_nodes_reject_mismatched_batch_without_writing(
+        #[case] mismatched_schema: SchemaRef,
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values(false, true)] empty_batch: bool,
+        #[values(false, true)] overwrite: bool,
+    ) -> Result<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///output")?;
+        let original = Bytes::from_static(b"original contents");
+        executor.storage.put(&path, original.clone(), false)?;
+        let schema = schema_ref! { not_null "id": LONG, not_null "value": LONG };
+        let input = PlanBuilder::values(schema.clone(), vec![vec![1i64.into(), 2i64.into()]])?;
+        let plan = write_plan(input, file_type, &path, overwrite)?;
+        let valid =
+            values_to_record_batch(Values::new(schema, vec![vec![1i64.into(), 2i64.into()]]))?;
+        let first_value =
+            if mismatched_schema.fields().next().unwrap().data_type() == &DataType::INTEGER {
+                1i32.into()
+            } else {
+                1i64.into()
+            };
+        let mismatched = values_to_record_batch(Values::new(
+            mismatched_schema,
+            if empty_batch {
+                vec![]
+            } else {
+                vec![vec![first_value, 2i64.into()]]
+            },
+        ))?;
+        // A valid first batch must not hide a later schema mismatch, even in an empty batch.
+        let result = executor.eval_node(
+            plan.nodes.into_iter().last().unwrap(),
+            &[vec![valid, mismatched]],
+            None,
+        );
+        assert!(matches!(result, Err(KernelError::Schema(_))));
+        assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
+        Ok(())
+    }
+
+    #[rstest]
+    fn write_nodes_report_storage_errors(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let parent_file = dir.path().join("file");
+        std::fs::write(&parent_file, b"original contents")?;
+        let path = Url::from_file_path(parent_file.join("nested/output")).unwrap();
+        let input =
+            PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])?;
+        let plan = write_plan(input, file_type, &path, true)?;
+        // Creating the destination's parent directory fails because an ancestor is a file.
+        assert!(matches!(
+            SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan)),
+            Err(KernelError::Generic(_))
+        ));
+        assert_eq!(std::fs::read(parent_file)?, b"original contents");
         Ok(())
     }
 

@@ -32,6 +32,7 @@ use crate::{FileMeta, KernelError, KernelResult, Result};
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
+    // TODO(#3517): Unify JSON and Parquet scan/write nodes.
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
     Values(Values),
@@ -44,6 +45,7 @@ pub enum Operator {
     Filter(Filter),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
+    // TODO(#3517): Unify JSON and Parquet scan/write nodes.
     WriteJson(WriteJson),
     WriteParquet(WriteParquet),
 
@@ -63,22 +65,35 @@ pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 /// Writes all rows from its single input to one newline-delimited JSON file at `file_path`.
-/// The input schema supplies the JSON field names and types. Row order is unspecified.
+/// Outputs exactly one row matching [`FILE_META_SCHEMA`] after the write succeeds.
 ///
-/// For non-empty input, returns exactly one row matching [`FILE_META_SCHEMA`] after the write
-/// succeeds. Empty input emits no rows and skips both writing and checking whether the destination
-/// exists, even when `overwrite` is false. Zero output rows mean no file was written or replaced.
+/// # Implementation Contract
 ///
-/// When `overwrite` is false, the destination must be created atomically without replacing an
-/// existing file. When true, the file is replaced, rather than appended to.
+/// - The declared `schema` supplies the JSON field names and types. Every input batch must match
+///   it, including field order, nullability, and metadata. A schema mismatch is an error and must
+///   leave the destination untouched.
+/// - When `overwrite` is false, the destination must be created atomically without replacing an
+///   existing file. When true, the file is replaced, rather than appended to.
+/// - Empty input is considered invalid; valid Delta metadata files (e.g commits and checkpoints)
+///   should never be empty. It is recommended that implementors reject such inputs with an error,
+///   however kernel does not rely on such behavior and will perform its own pre-write validations
+///   to ensure this does not happen.
+/// - The output row order is unspecified.
+/// - Behavior can be undefined if a single plan contains multiple writes to the same destination,
+///   because execution order is unspecified and executors may optimize away common table
+///   expressions.
 ///
-/// Behavior is undefined if a single plan contains multiple writes to the same destination,
-/// because execution order is unspecified and executors may optimize away common table expressions.
+/// # Errors
 ///
-/// Returns an error if input serialization or storage I/O fails, or if non-empty input targets an
-/// existing destination and `overwrite` is false.
+/// - [`KernelError::Schema`] if the declared schema is unsupported or an input batch does not match
+///   it.
+/// - [`KernelError::FileAlreadyExists`] if the destination exists and `overwrite` is false.
+/// - [`KernelError::Generic`] otherwise (e.g. no input rows, serialization or storage I/O fails,
+///   etc.).
 #[derive(Debug, Clone)]
 pub struct WriteJson {
+    /// Declared schema for the output rows.
+    pub schema: SchemaRef,
     /// Fully qualified URL of the destination file.
     pub file_path: Url,
     /// Whether an existing destination may be replaced.
@@ -88,6 +103,8 @@ pub struct WriteJson {
 /// The Parquet equivalent of [`WriteJson`], with the same behavior and semantics.
 #[derive(Debug, Clone)]
 pub struct WriteParquet {
+    /// Declared schema for the output rows.
+    pub schema: SchemaRef,
     /// Fully qualified URL of the destination file.
     pub file_path: Url,
     /// Whether an existing destination may be replaced.

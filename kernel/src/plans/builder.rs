@@ -279,30 +279,44 @@ impl PlanBuilder {
 
     /// Writes this relation to the fully qualified `file_path` as newline-delimited JSON.
     /// `overwrite` controls whether an existing file may be replaced (see [`WriteJson`]).
-    /// Returns a relation with one row of [`FILE_META_SCHEMA`] for non-empty input; empty input
-    /// yields the absent relation and no write.
-    pub fn write_json(self, file_path: Url, overwrite: bool) -> Self {
-        self.unary_op_or_absent(
+    /// Returns a relation with one row of [`FILE_META_SCHEMA`], declaring this relation's schema
+    /// as the write's input schema. Returns [`KernelError::Generic`] if this relation is absent.
+    pub fn write_json(self, file_path: Url, overwrite: bool) -> Result<Self> {
+        let PlanBuilderRoot::Present(input) = self.0 else {
+            return Err(KernelError::generic(
+                "WriteJson requires at least one input row",
+            ));
+        };
+        Ok(Self::present(
             FILE_META_SCHEMA.clone(),
             WriteJson {
+                schema: input.schema.clone(),
                 file_path,
                 overwrite,
             },
-        )
+            vec![input],
+        ))
     }
 
     /// Writes this relation to the fully qualified `file_path` as Parquet.
     /// `overwrite` controls whether an existing file may be replaced (see [`WriteParquet`]).
-    /// Returns a relation with one row of [`FILE_META_SCHEMA`] for non-empty input; empty input
-    /// yields the absent relation and no write.
-    pub fn write_parquet(self, file_path: Url, overwrite: bool) -> Self {
-        self.unary_op_or_absent(
+    /// Returns a relation with one row of [`FILE_META_SCHEMA`], declaring this relation's schema
+    /// as the write's input schema. Returns [`KernelError::Generic`] if this relation is absent.
+    pub fn write_parquet(self, file_path: Url, overwrite: bool) -> Result<Self> {
+        let PlanBuilderRoot::Present(input) = self.0 else {
+            return Err(KernelError::generic(
+                "WriteParquet requires at least one input row",
+            ));
+        };
+        Ok(Self::present(
             FILE_META_SCHEMA.clone(),
             WriteParquet {
+                schema: input.schema.clone(),
                 file_path,
                 overwrite,
             },
-        )
+            vec![input],
+        ))
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -964,6 +978,48 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    fn writes_declare_input_schema(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+        #[values(false, true)] overwrite: bool,
+    ) -> Result<()> {
+        let input = vals(id_schema());
+        let path = Url::parse("memory:///output")?;
+        let builder = match file_type {
+            FileType::Json => input.write_json(path.clone(), overwrite),
+            FileType::Parquet => input.write_parquet(path.clone(), overwrite),
+        }?;
+        assert_eq!(builder.schema(), &*FILE_META_SCHEMA);
+        let op_name = match file_type {
+            FileType::Json => "write_json",
+            FileType::Parquet => "write_parquet",
+        };
+        let plan = assert_plan(builder, &[(&[], "values"), (&[0], op_name)]);
+        let (schema, file_path, actual_overwrite) = match &plan.nodes[1].op {
+            Operator::WriteJson(node) => (&node.schema, &node.file_path, node.overwrite),
+            Operator::WriteParquet(node) => (&node.schema, &node.file_path, node.overwrite),
+            other => panic!("expected write node, got {other:?}"),
+        };
+        assert_eq!(schema, &id_schema());
+        assert_eq!(file_path, &path);
+        assert_eq!(actual_overwrite, overwrite);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn writes_reject_absent_input(
+        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
+    ) -> Result<()> {
+        let path = Url::parse("memory:///output")?;
+        let result = match file_type {
+            FileType::Json => absent_src().write_json(path, false),
+            FileType::Parquet => absent_src().write_parquet(path, false),
+        };
+        assert!(matches!(result, Err(KernelError::Generic(message))
+            if message.contains("at least one input row")));
+        Ok(())
+    }
+
     // === Absent (uninhabited) relation =======================================
 
     /// Empty sources and transforms over an absent input all collapse to the absent relation, which
@@ -972,12 +1028,6 @@ mod tests {
     #[case::empty_parquet(PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_json(PlanBuilder::scan_json(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_values(PlanBuilder::values(id_schema(), vec![]))]
-    #[case::write_json(Ok(
-        absent_src().write_json(Url::parse("memory:///output.json")?, false)
-    ))]
-    #[case::write_parquet(Ok(
-        absent_src().write_parquet(Url::parse("memory:///output.parquet")?, false)
-    ))]
     #[case::filter(absent_src().filter(col!("id").is_not_null()))]
     #[case::project(absent_src().project(Expression::struct_from([col!("id")]), id_schema()))]
     #[case::project_patch(absent_src().project_patch(|p| p.drop("id")))]

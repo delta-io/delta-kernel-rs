@@ -230,6 +230,7 @@ impl From<&WriteJson> for proto_plan::WriteJsonNode {
         Self {
             file_path: node.file_path.to_string(),
             overwrite: node.overwrite,
+            schema: Some(node.schema.as_ref().into()),
         }
     }
 }
@@ -239,6 +240,7 @@ impl From<&WriteParquet> for proto_plan::WriteParquetNode {
         Self {
             file_path: node.file_path.to_string(),
             overwrite: node.overwrite,
+            schema: Some(node.schema.as_ref().into()),
         }
     }
 }
@@ -1376,10 +1378,10 @@ mod tests {
     )]
     #[case(Operator::UnionAll(UnionAll), "union_all")]
     #[case(Operator::WriteJson(WriteJson {
-        file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false,
+        file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false, schema: sample_schema(),
     }), "write_json")]
     #[case(Operator::WriteParquet(WriteParquet {
-        file_path: Url::parse("memory:///out.parquet").unwrap(), overwrite: true,
+        file_path: Url::parse("memory:///out.parquet").unwrap(), overwrite: true, schema: sample_schema(),
     }), "write_parquet")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
         use proto_plan::operator::Op;
@@ -1405,10 +1407,12 @@ mod tests {
         let node = WriteJson {
             file_path: Url::parse("memory:///output%20file.json").unwrap(),
             overwrite,
+            schema: sample_schema(),
         };
         let proto = proto_plan::WriteJsonNode::from(&node);
         assert_eq!(proto.file_path, node.file_path.as_str());
         assert_eq!(proto.overwrite, overwrite);
+        assert_eq!(proto.schema, Some(node.schema.as_ref().into()));
     }
 
     #[rstest]
@@ -1416,10 +1420,12 @@ mod tests {
         let node = WriteParquet {
             file_path: Url::parse("memory:///output%20file.parquet").unwrap(),
             overwrite,
+            schema: sample_schema(),
         };
         let proto = proto_plan::WriteParquetNode::from(&node);
         assert_eq!(proto.file_path, node.file_path.as_str());
         assert_eq!(proto.overwrite, overwrite);
+        assert_eq!(proto.schema, Some(node.schema.as_ref().into()));
     }
 
     #[test]

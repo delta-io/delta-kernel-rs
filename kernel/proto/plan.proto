@@ -75,11 +75,13 @@ message UnionAllNode {}
 message WriteJsonNode {
   string file_path = 1;
   bool overwrite = 2;
+  delta.kernel.schema.StructType schema = 3;
 }
 
 message WriteParquetNode {
   string file_path = 1;
   bool overwrite = 2;
+  delta.kernel.schema.StructType schema = 3;
 }
 
 enum FileType {
