@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{KernelError, PredicateRef, Result, Version};
+use delta_kernel::{KernelError, KernelResult, PredicateRef, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
@@ -142,7 +142,7 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
 fn incremental_scan_builder_with_predicate_impl(
     mut builder: FfiIncrementalScanBuilder,
     predicate: &mut EnginePredicate,
-) -> Result<Handle<ExclusiveIncrementalScanBuilder>> {
+) -> KernelResult<Handle<ExclusiveIncrementalScanBuilder>> {
     builder.predicate = Some(Arc::new(decode_engine_predicate(predicate)?));
     Ok(Box::new(builder).into())
 }
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 
 fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
-) -> Result<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+) -> KernelResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
     let maybe_stream = builder
         .target_snapshot
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn incremental_scan_stream_next_arrow_impl(
     stream: &FfiIncrementalScanStream,
-) -> Result<*mut ScanMetadataArrowResult> {
+) -> KernelResult<*mut ScanMetadataArrowResult> {
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
         // The stream was already consumed by `into_summary` or dropped by a prior error.
@@ -251,7 +251,9 @@ fn incremental_scan_stream_next_arrow_impl(
 }
 
 #[cfg(feature = "default-engine-base")]
-fn next_arrow_batch(stream: &mut IncrementalScanStream) -> Result<*mut ScanMetadataArrowResult> {
+fn next_arrow_batch(
+    stream: &mut IncrementalScanStream,
+) -> KernelResult<*mut ScanMetadataArrowResult> {
     let Some(filtered) = stream.next().transpose()? else {
         return Ok(std::ptr::null_mut());
     };
@@ -290,7 +292,7 @@ pub unsafe extern "C" fn incremental_scan_stream_into_summary(
 
 fn incremental_scan_stream_into_summary_impl(
     stream: &FfiIncrementalScanStream,
-) -> Result<Handle<SharedIncrementalScanSummary>> {
+) -> KernelResult<Handle<SharedIncrementalScanSummary>> {
     let inner = lock_stream(stream)?
         .take()
         .ok_or_else(|| KernelError::generic("incremental scan stream was already consumed"))?;
@@ -300,7 +302,7 @@ fn incremental_scan_stream_into_summary_impl(
 
 fn lock_stream(
     stream: &FfiIncrementalScanStream,
-) -> Result<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
+) -> KernelResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
     stream
         .stream
         .lock()
@@ -426,6 +428,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::Result;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use test_utils::{actions_to_string, add_commit, TestAction};
 

@@ -349,6 +349,7 @@ Keep this list updated when new protocol features are added to kernel.
     `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Prefer the `ResultIterator<'a, T>` / `ResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = Result<T>> + Send (+ 'a)>`.
+  Private kernel-error streams use `KernelResultIterator` / `KernelResultIteratorStatic`.
 - Prefer the `lit` / `null_lit` constructors over `Expression::literal(...)` / `lit(Scalar::Null(...))`
   when building expressions inline. They take `impl Into<Scalar>` and `impl Into<DataType>`,
   respectively. Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically

@@ -35,6 +35,7 @@ use crate::schema::{
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
+use crate::KernelResult;
 
 #[test]
 fn test_array_column() {
@@ -664,7 +665,7 @@ impl OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> Result<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         let op_fn = match inverted {
             true => gt_eq,
             false => lt,

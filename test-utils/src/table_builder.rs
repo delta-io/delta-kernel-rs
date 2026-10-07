@@ -75,7 +75,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Engine, Result, Snapshot};
+use delta_kernel::{Engine, KernelResult, Result, Snapshot};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -107,7 +107,7 @@ pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 /// A multi-threaded runtime is required so kernel operations that call
 /// `block_in_place` (e.g. `Snapshot::checkpoint`) do not deadlock, which is why
 /// the sync wrappers in this module all route through this helper.
-fn block_on_sync<F, Fut, T>(make_fut: F) -> Result<T>
+fn block_on_sync<F, Fut, T>(make_fut: F) -> KernelResult<T>
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = Result<T>>,
@@ -436,7 +436,7 @@ fn log_file_version(location: &Path) -> Option<u64> {
     prefix.parse::<u64>().ok()
 }
 
-async fn read_hint_bytes(store: &Arc<DynObjectStore>, path: &Path) -> Result<Vec<u8>> {
+async fn read_hint_bytes(store: &Arc<DynObjectStore>, path: &Path) -> KernelResult<Vec<u8>> {
     let result = store
         .get(path)
         .await
@@ -1268,7 +1268,7 @@ impl TestTableBuilder {
         block_on_sync(|| self.build_async())
     }
 
-    async fn build_async(self) -> Result<TestTable> {
+    async fn build_async(self) -> KernelResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let executor = Arc::new(TokioMultiThreadExecutor::new(
@@ -1426,7 +1426,7 @@ impl TestTableBuilder {
 /// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
 /// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
 /// that version cannot already exist on disk.
-fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> Result<()> {
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> KernelResult<()> {
     let (result, _) = snapshot.write_checksum(engine)?;
     assert_eq!(
         result,
@@ -1450,7 +1450,7 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> Result<delta_kernel::transaction::CommitResult> {
+) -> KernelResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;

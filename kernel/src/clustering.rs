@@ -15,7 +15,7 @@ use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::schema::{DataType, StructType};
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Domain metadata structure for clustering columns.
 ///
@@ -81,7 +81,7 @@ pub(crate) struct ClusteringColumnInfo {
 pub(crate) fn validate_clustering_columns(
     schema: &StructType,
     columns: &[ColumnName],
-) -> Result<()> {
+) -> KernelResult<()> {
     use std::collections::HashSet;
 
     // Structural validation: at least one column required
@@ -141,7 +141,7 @@ pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> Domai
 /// Parses clustering columns from a JSON configuration string.
 ///
 /// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
-pub(crate) fn parse_clustering_columns(json_str: &str) -> Result<Vec<ColumnName>> {
+pub(crate) fn parse_clustering_columns(json_str: &str) -> KernelResult<Vec<ColumnName>> {
     let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
     Ok(metadata
         .clustering_columns

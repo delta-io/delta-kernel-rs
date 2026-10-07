@@ -17,7 +17,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{FileMeta, KernelError, Result, StorageHandler, Version};
+use crate::{FileMeta, KernelError, KernelResult, Result, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -217,6 +217,69 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
+    /// Returns the checkpoint version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Returns the checkpoint action count.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn size(&self) -> i64 {
+        self.size
+    }
+
+    /// Returns the number of checkpoint parts, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn parts(&self) -> Option<usize> {
+        self.parts
+    }
+
+    /// Returns the checkpoint byte size, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn size_in_bytes(&self) -> Option<i64> {
+        self.size_in_bytes
+    }
+
+    /// Returns the Add action count, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn num_of_add_files(&self) -> Option<i64> {
+        self.num_of_add_files
+    }
+
+    /// Returns the checkpoint schema, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn checkpoint_schema(&self) -> Option<&SchemaRef> {
+        self.checkpoint_schema.as_ref()
+    }
+
+    /// Returns the checkpoint checksum, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn checksum(&self) -> Option<&str> {
+        self.checksum.as_deref()
+    }
+
+    /// Returns checkpoint tags, preserving absent versus empty maps.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn tags(&self) -> Option<&HashMap<String, String>> {
+        self.tags.as_ref()
+    }
+
+    /// Returns the embedded V2 checkpoint state, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn v2_checkpoint(&self) -> Option<&LastCheckpointV2> {
+        self.v2_checkpoint.as_ref()
+    }
+
     /// Reconstructs a checkpoint hint from its serialized fields, dropping oversized sidecar and
     /// non-file-action arrays so the retained hint is always bounded.
     ///
@@ -352,7 +415,7 @@ impl LastCheckpointHint {
         storage: &dyn StorageHandler,
         log_root: &Url,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Option<LastCheckpointHint>> {
+    ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         match storage
             .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
@@ -404,6 +467,43 @@ impl LastCheckpointHint {
     #[cfg(test)]
     pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Failed to convert LastCheckpointHint to JSON bytes")
+    }
+}
+
+impl LastCheckpointV2 {
+    /// Returns the checkpoint file name.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the checkpoint byte size, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn size_in_bytes(&self) -> Option<i64> {
+        self.size_in_bytes
+    }
+
+    /// Returns the checkpoint modification time, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn modification_time(&self) -> Option<i64> {
+        self.modification_time
+    }
+
+    /// Returns sidecar actions, preserving absent versus empty arrays.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn sidecar_files(&self) -> Option<&[Sidecar]> {
+        self.sidecar_files.as_deref()
+    }
+
+    /// Returns non-file actions, preserving absent versus empty arrays.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn non_file_actions(&self) -> Option<&[HintAction]> {
+        self.non_file_actions.as_deref()
     }
 }
 

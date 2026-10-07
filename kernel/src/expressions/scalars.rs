@@ -17,7 +17,7 @@ use crate::schema::{
     IntervalYearToMonthType, MapType, PrimitiveType, StructField, StructType,
 };
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 pub(crate) const MONTHS_PER_YEAR: i32 = 12;
 
@@ -251,7 +251,7 @@ impl MapData {
 
     /// Infallible constructor used by `From<HashMap<K, V>>` / `From<HashMap<K, Option<V>>>`
     /// where key/value scalars are known to match `K`/`V`'s [`ToDataType`].
-    fn from_pairs<K: ToDataType, V: ToDataType>(
+    pub(crate) fn from_pairs<K: ToDataType, V: ToDataType>(
         pairs: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
         value_contains_null: bool,
     ) -> Self {
@@ -476,7 +476,7 @@ impl Scalar {
     }
 
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
-    pub(crate) fn timestamp_from_millis(millis: i64) -> Result<Self> {
+    pub(crate) fn timestamp_from_millis(millis: i64) -> KernelResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(KernelError::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
@@ -1010,14 +1010,14 @@ impl PrimitiveType {
         &self,
         raw: &str,
         f: impl FnOnce(T) -> Scalar,
-    ) -> Result<Scalar, KernelError> {
+    ) -> KernelResult<Scalar> {
         match raw.parse() {
             Ok(val) => Ok(f(val)),
             Err(..) => Err(self.parse_error(raw)),
         }
     }
 
-    fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, KernelError> {
+    fn parse_decimal(raw: &str, dtype: DecimalType) -> KernelResult<Scalar> {
         let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
@@ -1264,7 +1264,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, lit, BinaryPredicateOp};
-    use crate::schema::{schema, ToSchema as _};
+    use crate::schema::{schema, ToSchema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::Predicate as Pred;
@@ -2290,6 +2290,24 @@ mod tests {
         features: Option<Vec<TableFeature>>,
     }
 
+    #[derive(IntoStructData)]
+    struct NullableMapValues {
+        #[allow_null_container_values]
+        values: HashMap<String, String>,
+    }
+
+    impl ToSchema for NullableMapValues {
+        fn to_schema() -> StructType {
+            schema! { not_null "values": { STRING => nullable STRING } }
+        }
+    }
+
+    #[derive(ToSchema, IntoStructData)]
+    struct OptionalNullableMapValues {
+        #[allow_null_container_values]
+        values: Option<HashMap<String, String>>,
+    }
+
     fn test_person() -> Person {
         Person {
             id: 1,
@@ -2304,6 +2322,45 @@ mod tests {
     #[test]
     fn derived_struct_conversions_round_trip() {
         assert_round_trip(test_person(), Person::to_schema());
+    }
+
+    #[test]
+    fn derived_struct_conversion_preserves_nullable_map_value_type() {
+        let data: StructData = NullableMapValues {
+            values: HashMap::from([("key".to_string(), "value".to_string())]),
+        }
+        .into();
+        let [Scalar::Map(values)] = data.values() else {
+            panic!("expected one map value");
+        };
+        assert!(values.map_type().value_contains_null());
+        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+            .expect("derived value must match its declared schema");
+    }
+
+    #[rstest]
+    #[case::absent(None)]
+    #[case::empty(Some(HashMap::new()))]
+    #[case::present(Some(HashMap::from([("key".to_string(), "value".to_string())])))]
+    fn derived_optional_struct_conversion_preserves_nullable_map_value_type(
+        #[case] values: Option<HashMap<String, String>>,
+    ) {
+        let data: StructData = OptionalNullableMapValues {
+            values: values.clone(),
+        }
+        .into();
+        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+            .expect("derived value must match its declared schema");
+        match (values, &data.values()[0]) {
+            (None, Scalar::Null(_)) => {}
+            (Some(expected), Scalar::Map(actual)) => {
+                assert_eq!(actual.pairs().len(), expected.len());
+                for (key, value) in expected {
+                    assert!(actual.pairs().contains(&(key.into(), value.into())));
+                }
+            }
+            (expected, actual) => panic!("expected {expected:?}, got {actual:?}"),
+        }
     }
 
     #[test]

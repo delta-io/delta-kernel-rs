@@ -10,7 +10,10 @@ use uuid::Uuid;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, Result, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Result, Version};
+
+/// The delta log subdirectory with a trailing slash for directory URL joins.
+pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -23,7 +26,6 @@ const UUID_PART_LEN: usize = 36;
 
 /// The subdirectory name within the table root where the delta log resides
 const DELTA_LOG_DIR: &str = "_delta_log";
-const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 /// The subdirectory name within the delta log where staged commits reside
 const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 /// The subdirectory name within the delta log where checkpoint sidecars reside
@@ -312,7 +314,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 
     /// Parse a location into a commit path (published or staged), returning an error if invalid or
     /// not a commit.
-    pub(crate) fn parse_commit(location: Location) -> Result<Self> {
+    pub(crate) fn parse_commit(location: Location) -> KernelResult<Self> {
         let url = location.as_url().to_string();
         let parsed =
             Self::try_from(location)?.ok_or_else(|| KernelError::invalid_log_path(&url))?;
@@ -341,7 +343,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 
     /// Convenience wrapper around [`version_as_i64`] for this parsed path's `version`.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn version_as_i64(&self) -> Result<i64> {
+    pub(crate) fn version_as_i64(&self) -> KernelResult<i64> {
         crate::version_as_i64(self.version)
     }
 
@@ -382,7 +384,7 @@ impl ParsedLogPath<FileMeta> {
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
     #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
-    pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> Result<i64> {
+    pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
             return Err(KernelError::generic(format!(
@@ -416,7 +418,7 @@ impl ParsedLogPath<FileMeta> {
 
 impl ParsedLogPath<Url> {
     /// Helper method to create a path with the given filename generator
-    fn create_path(table_root: &Url, filename: String) -> Result<Self> {
+    fn create_path(table_root: &Url, filename: String) -> KernelResult<Self> {
         let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
         Self::try_from(location)?.ok_or_else(|| {
             KernelError::internal_error(format!("Attempted to create an invalid path: {filename}"))
@@ -427,7 +429,7 @@ impl ParsedLogPath<Url> {
     // LogRoot types.
     #[allow(unused)]
     /// Create a new ParsedCommitPath<Url> for a new json commit file
-    pub(crate) fn new_commit(table_root: &Url, version: Version) -> Result<Self> {
+    pub(crate) fn new_commit(table_root: &Url, version: Version) -> KernelResult<Self> {
         let filename = format!("{version:020}.json");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_commit() {
@@ -442,7 +444,7 @@ impl ParsedLogPath<Url> {
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let filename = format!("{version:020}.checkpoint.parquet");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
@@ -455,7 +457,10 @@ impl ParsedLogPath<Url> {
 
     /// Create a new ParsedCheckpointPath<Url> for a UUID-based parquet checkpoint file
     #[allow(dead_code)] // TODO: Remove this once we have a use case for it
-    pub(crate) fn new_uuid_parquet_checkpoint(table_root: &Url, version: Version) -> Result<Self> {
+    pub(crate) fn new_uuid_parquet_checkpoint(
+        table_root: &Url,
+        version: Version,
+    ) -> KernelResult<Self> {
         let filename = format!("{:020}.checkpoint.{}.parquet", version, Uuid::new_v4());
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
@@ -486,7 +491,7 @@ impl ParsedLogPath<Url> {
         table_root: &Url,
         start_version: Version,
         end_version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let filename = format!("{start_version:020}.{end_version:020}.compacted.json");
         let path = Self::create_path(table_root, filename)?;
         if !matches!(path.file_type, LogPathFileType::CompactedCommit { .. }) {
@@ -503,7 +508,7 @@ impl ParsedLogPath<Url> {
 ///
 /// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
 /// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
-pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> Result<(String, Url)> {
+pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> KernelResult<(String, Url)> {
     let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
     let url = table_root
         .join(DELTA_LOG_DIR_WITH_SLASH)?
@@ -525,7 +530,7 @@ impl LogRoot {
     /// s3://bucket/table/_delta_log/)
     ///
     /// TODO: could take a `table_root: TableRoot`
-    pub(crate) fn new(mut table_root: Url) -> Result<Self> {
+    pub(crate) fn new(mut table_root: Url) -> KernelResult<Self> {
         if !table_root.path().ends_with('/') {
             let new_path = format!("{}/", table_root.path());
             table_root.set_path(&new_path);
@@ -546,7 +551,7 @@ impl LogRoot {
     }
 
     /// Create a new commit path (absolute path) for the given version.
-    pub(crate) fn new_commit_path(&self, version: Version) -> Result<ParsedLogPath<Url>> {
+    pub(crate) fn new_commit_path(&self, version: Version) -> KernelResult<ParsedLogPath<Url>> {
         let filename = format!("{version:020}.json");
         let path = self.log_root().join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
@@ -555,7 +560,10 @@ impl LogRoot {
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
-    pub(crate) fn new_staged_commit_path(&self, version: Version) -> Result<ParsedLogPath<Url>> {
+    pub(crate) fn new_staged_commit_path(
+        &self,
+        version: Version,
+    ) -> KernelResult<ParsedLogPath<Url>> {
         let uuid = uuid::Uuid::new_v4();
         let filename = format!("{version:020}.{uuid}.json");
         let path = self.log_root().join(STAGED_COMMITS_DIR)?.join(&filename)?;

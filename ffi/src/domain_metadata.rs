@@ -1,5 +1,5 @@
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::Result;
+use delta_kernel::KernelResult;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
@@ -37,10 +37,10 @@ pub unsafe extern "C" fn get_domain_metadata(
 
 fn get_domain_metadata_impl(
     snapshot: &Snapshot,
-    domain: Result<String>,
+    domain: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
-) -> Result<NullableCvoid> {
+) -> KernelResult<NullableCvoid> {
     Ok(snapshot
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
@@ -131,7 +131,7 @@ fn visit_clustering_columns_impl(
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
-) -> Result<OptionalValue<usize>> {
+) -> KernelResult<OptionalValue<usize>> {
     let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
         return Ok(OptionalValue::None);
     };
@@ -184,7 +184,7 @@ fn visit_domain_metadata_impl(
         key: KernelStringSlice,
         value: KernelStringSlice,
     ),
-) -> Result<bool> {
+) -> KernelResult<bool> {
     let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();

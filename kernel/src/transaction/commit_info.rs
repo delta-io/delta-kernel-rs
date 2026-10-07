@@ -8,7 +8,9 @@ use crate::expressions::{lit, null_lit, MapData, Scalar};
 use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
-use crate::{create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError};
+use crate::{
+    create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError, KernelResult,
+};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -16,7 +18,7 @@ use crate::{create_row, DataType, Engine, EngineData, Expression, ExpressionRef,
 /// inserting kernel-only fields after the last engine field.
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
-) -> Result<Vec<(&'static str, ExpressionRef)>, KernelError> {
+) -> KernelResult<Vec<(&'static str, ExpressionRef)>> {
     let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
     let mut literal_exprs = vec![
@@ -59,7 +61,7 @@ fn commit_info_literal_exprs(
 fn string_map_literal_expr(
     map: Option<HashMap<String, Option<String>>>,
     map_type: &MapType,
-) -> Result<ExpressionRef, KernelError> {
+) -> KernelResult<ExpressionRef> {
     let expression = match map {
         Some(map) => lit(MapData::try_new(
             map_type.clone(),
@@ -76,7 +78,7 @@ impl<S> Transaction<S> {
         &self,
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
-    ) -> Result<Box<dyn EngineData>, KernelError> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
@@ -197,7 +199,7 @@ mod tests {
     use crate::transaction::Transaction;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::utils::FoldWithOption as _;
-    use crate::{Engine, EngineData, Result, RowVisitor};
+    use crate::{Engine, EngineData, KernelResult, Result, RowVisitor};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
 
@@ -288,7 +290,7 @@ mod tests {
     /// Create a transaction with the given engine_commit_info, using the shared test table.
     fn make_txn(
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    ) -> Result<(Arc<dyn Engine>, Transaction)> {
+    ) -> KernelResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?

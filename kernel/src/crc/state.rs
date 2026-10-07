@@ -16,7 +16,7 @@ use delta_kernel_derive::internal_api;
 
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// The state of file statistics for a CRC.
 ///
@@ -115,7 +115,7 @@ impl DomainMetadataState {
 fn domain_metadata_map(
     values: impl IntoIterator<Item = DomainMetadata>,
     reject_tombstones: bool,
-) -> Result<HashMap<String, DomainMetadata>> {
+) -> KernelResult<HashMap<String, DomainMetadata>> {
     let values = values.into_iter();
     let mut result = HashMap::with_capacity(values.size_hint().0);
     for value in values {
@@ -202,7 +202,7 @@ impl SetTransactionState {
 
 fn transaction_map(
     values: impl IntoIterator<Item = SetTransaction>,
-) -> Result<HashMap<String, SetTransaction>> {
+) -> KernelResult<HashMap<String, SetTransaction>> {
     let values = values.into_iter();
     let mut result = HashMap::with_capacity(values.size_hint().0);
     for value in values {

@@ -14,7 +14,7 @@ use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 #[cfg(feature = "internal-api")]
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::Transaction;
@@ -222,7 +222,9 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> Result<()> {
         .map(|path| LogPath::try_new(path.location.clone()))
         .collect::<Result<Vec<_>>>()?;
     let hint = SnapshotHint::try_new(
+        &table_root,
         snapshot.version(),
+        PublicationWatermark::InferFromLogPaths,
         log_paths,
         snapshot.table_configuration().protocol().clone(),
         snapshot.table_configuration().metadata().clone(),

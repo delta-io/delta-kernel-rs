@@ -24,7 +24,7 @@ use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
 /// from it.
@@ -65,7 +65,7 @@ impl EngineDataArrowExt for Result<Box<dyn EngineData>> {
 }
 
 /// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
-pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> Result<&RecordBatch> {
+pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> KernelResult<&RecordBatch> {
     let Some(arrow_data) = engine_data.any_ref().downcast_ref::<ArrowEngineData>() else {
         return Err(KernelError::engine_data_type("ArrowEngineData"));
     };
@@ -321,7 +321,7 @@ impl ArrowEngineData {
         path: &mut Vec<String>,
         column_map: &mut HashMap<ColumnName, ColumnState<'a>>,
         data: &'a dyn ProvidesColumnsAndFields,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         for (column, field) in data.columns().iter().zip(data.fields()) {
             path.push(field.name().to_string());
 
@@ -380,7 +380,7 @@ impl ArrowEngineData {
         path: &[String],
         data_type: &DataType,
         col: &'a dyn Array,
-    ) -> Result<&'a dyn GetData<'a>> {
+    ) -> KernelResult<&'a dyn GetData<'a>> {
         // TODO: Replace with `ArrowDataType::is_string()` once we bump arrow-schema past 57.2.0
         let is_string_type = |dt: &ArrowDataType| {
             matches!(

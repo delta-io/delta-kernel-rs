@@ -11,7 +11,7 @@ use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
     Carrier,
 };
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// Generic framework for recursive bottom-up transforms of expressions and predicates.
 ///
@@ -488,9 +488,9 @@ impl ExpressionDepthChecker {
     // Triggers the requested recursion only doing so would not exceed the depth limit.
     fn depth_limited<'a, T: std::fmt::Debug + ToOwned + ?Sized>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> Result<()>,
+        recurse: impl FnOnce(&mut Self, &'a T) -> KernelResult<()>,
         arg: &'a T,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         self.call_count += 1;
         if self.current_depth > self.max_depth_seen {
             self.max_depth_seen = self.current_depth;

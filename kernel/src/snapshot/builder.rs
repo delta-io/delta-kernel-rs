@@ -17,11 +17,11 @@ use crate::log_segment::{
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{LogPathFileType, ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri, PhantomType};
-use crate::{Engine, KernelError, Result, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
 #[doc(hidden)]
@@ -31,18 +31,40 @@ pub struct FromTableRoot;
 #[doc(hidden)]
 pub struct FromSnapshot;
 
-/// The connector-provided freshness of the version carried by a [`SnapshotHint`].
+/// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
 /// Kernel trusts this value: [`Latest`](Self::Latest) makes
 /// [`Snapshot::is_built_as_latest`] true, while [`Unverified`](Self::Unverified) makes it false.
+/// Connector inputs supply this claim; exports preserve the snapshot's build-time claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 #[internal_api]
 pub(crate) enum SnapshotHintFreshness {
-    /// The connector supplied the version without establishing that it was the latest version.
+    /// The hinted version was not established as latest.
     Unverified,
-    /// The connector established that the supplied version was the latest version.
+    /// The hinted version was established as latest when the claim was made.
     Latest,
+}
+
+/// Publication state supplied when constructing a [`SnapshotHint`].
+///
+/// Publication is separate from ratification: staged commits can belong to a snapshot without
+/// having been published. Neither the snapshot version nor its freshness establishes publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+#[internal_api]
+pub(crate) enum PublicationWatermark {
+    /// Infer the highest published commit version from the supplied log paths.
+    ///
+    /// Staged paths do not count. If no published commit path is supplied, the watermark is
+    /// absent.
+    InferFromLogPaths,
+    /// Record that no published commits were observed, without inferring from paths.
+    NoPublishedCommits,
+    /// Preserve the highest observed published version independently of the supplied paths.
+    ///
+    /// Retained paths may omit published commits or still name their staged locations.
+    PublishedThrough(Version),
 }
 
 /// Complete state for constructing a [`Snapshot`] without engine I/O.
@@ -73,27 +95,40 @@ pub(crate) struct SnapshotHint {
     ///
     /// This may have been advanced from an older `latest_crc_file`.
     crc: Option<Arc<Crc>>,
-    /// Whether the connector established that `version` was latest.
+    /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
 }
 
 impl SnapshotHint {
-    /// Creates a hint from connector-provided log paths and table state.
+    /// Creates a hint for `table_root` at `version` from connector-provided log paths and table
+    /// state.
     ///
-    /// The typed paths are sorted and grouped using the same checkpoint-selection logic as storage
-    /// listing. The connector must canonicalize every path into the same URL form as the table
-    /// root; Kernel preserves the supplied locations. Snapshot construction validates their
-    /// membership beneath the table's `_delta_log` root and performs the remaining consistency
-    /// and table-configuration validation.
+    /// Every path is validated beneath the table's `_delta_log` root before sorting and grouping
+    /// using the same checkpoint-selection logic as storage listing. The connector must
+    /// canonicalize every path into the same URL form as `table_root`; Kernel preserves the
+    /// supplied locations. Snapshot construction performs the remaining consistency and
+    /// table-configuration validation.
+    ///
+    /// Local table roots, including `file:` URLs, are resolved and canonicalized through the
+    /// local filesystem and must refer to an existing directory.
+    ///
+    /// `publication_watermark` selects path-based inference or an explicit observation that may
+    /// no longer be represented by a retained path.
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an
-    /// error when the supplied paths cannot be grouped into a valid log-segment file set.
+    /// Returns an error if `table_root` is invalid,
+    /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
+    /// root, or
+    /// [`SnapshotHintError::LogCompaction`] if any path is a compacted commit. Returns an error
+    /// when the supplied paths cannot be grouped into a valid log-segment file set.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
+        table_root: impl AsRef<str>,
         version: Version,
+        publication_watermark: PublicationWatermark,
         log_paths: Vec<LogPath>,
         protocol: Protocol,
         metadata: Metadata,
@@ -101,6 +136,7 @@ impl SnapshotHint {
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
     ) -> Result<Self> {
+        let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
         require!(
             !parsed_paths
@@ -108,16 +144,26 @@ impl SnapshotHint {
                 .any(|path| matches!(path.file_type, LogPathFileType::CompactedCommit { .. })),
             SnapshotHintError::LogCompaction.into()
         );
+        validate_snapshot_hint_paths(parsed_paths.iter(), &log_root)?;
         parsed_paths
             .sort_unstable_by(|a, b| (a.version, &a.filename).cmp(&(b.version, &b.filename)));
         let parsed_paths = parsed_paths.into_iter().map(Ok);
-        let log_segment_files = LogSegmentFiles::build_log_segment_files(
+        let mut log_segment_files = LogSegmentFiles::build_log_segment_files(
             parsed_paths,
             Vec::new(),
             0,
             None,
             CheckpointHandling::Adopt,
         )?;
+        match publication_watermark {
+            PublicationWatermark::InferFromLogPaths => {}
+            PublicationWatermark::NoPublishedCommits => {
+                log_segment_files.max_published_version = None;
+            }
+            PublicationWatermark::PublishedThrough(version) => {
+                log_segment_files.max_published_version = Some(version);
+            }
+        }
         Ok(Self {
             version,
             log_segment_files,
@@ -126,6 +172,92 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+        })
+    }
+
+    /// Returns the version described by this hint.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn version(&self) -> Version {
+        self.version
+    }
+
+    /// Returns the retained log files, including the observed publication watermark.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn log_segment_files(&self) -> &LogSegmentFiles {
+        &self.log_segment_files
+    }
+
+    /// Returns the resolved publication observation, never a request for inference.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn publication_watermark(&self) -> PublicationWatermark {
+        match self.log_segment_files.max_published_version {
+            Some(version) => PublicationWatermark::PublishedThrough(version),
+            None => PublicationWatermark::NoPublishedCommits,
+        }
+    }
+
+    /// Returns the protocol at the hinted version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
+
+    /// Returns the metadata at the hinted version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Returns the retained checkpoint hint, if present.
+    ///
+    /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only a matching checkpoint hint.
+    /// Connector-provided inputs are checked when the snapshot is built.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn last_checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+        self.last_checkpoint_hint.as_ref()
+    }
+
+    /// Returns the retained CRC state, if present.
+    ///
+    /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only CRC state at the snapshot
+    /// version. Connector-provided inputs are checked when the snapshot is built.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn crc(&self) -> Option<&Crc> {
+        self.crc.as_deref()
+    }
+
+    /// Returns the freshness established when the hint was captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn freshness(&self) -> SnapshotHintFreshness {
+        self.freshness
+    }
+
+    pub(crate) fn from_snapshot(snapshot: &Snapshot) -> KernelResult<Self> {
+        let segment = snapshot.log_segment();
+        require!(
+            segment.listed.ascending_compaction_files.is_empty(),
+            SnapshotHintError::LogCompaction.into()
+        );
+        Ok(Self {
+            version: snapshot.version(),
+            log_segment_files: segment.listed.clone(),
+            protocol: snapshot.table_configuration().protocol().clone(),
+            metadata: snapshot.table_configuration().metadata().clone(),
+            last_checkpoint_hint: segment.checkpoint_hint().cloned(),
+            crc: snapshot.crc_at_version().cloned(),
+            freshness: if snapshot.is_built_as_latest() {
+                SnapshotHintFreshness::Latest
+            } else {
+                SnapshotHintFreshness::Unverified
+            },
         })
     }
 }
@@ -227,7 +359,7 @@ impl IncrementalReplay {
         self,
         crc_version: Version,
         target_version: Version,
-    ) -> Result<bool> {
+    ) -> KernelResult<bool> {
         let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
             KernelError::internal_error(format!(
                 "CRC version {crc_version} is ahead of target version {target_version}"
@@ -271,8 +403,7 @@ impl SnapshotBuilder<FromTableRoot> {
     /// version. The caller must canonicalize supplied log paths into the same URL form as the table
     /// root. Kernel preserves the paths, requires them to be beneath this builder's table log root,
     /// and validates structural consistency without reading the supplied files. The caller must
-    /// ensure the protocol and metadata came from those files, and `max_published_version`
-    /// accurately describes the published commit prefix.
+    /// ensure the protocol and metadata came from those files.
     ///
     /// # Errors
     ///
@@ -502,7 +633,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 let table_url = try_parse_uri(table_root)?;
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
+                    table_url.join(DELTA_LOG_DIR_WITH_SLASH)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
@@ -554,7 +685,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
         snapshot_hint: Box<SnapshotHint>,
-    ) -> Result<SnapshotRef> {
+    ) -> KernelResult<SnapshotRef> {
         require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
         require!(
             incremental_replay.is_disabled(),
@@ -586,7 +717,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             )
         })?;
         let table_url = try_parse_uri(table_root)?;
-        let log_root = table_url.join("_delta_log/")?;
+        let log_root = table_url.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let SnapshotHint {
             version,
             log_segment_files,
@@ -628,7 +759,10 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::LogCompaction.into()
         );
 
-        Self::validate_snapshot_hint_paths(&log_segment_files, &log_root)?;
+        // Construction validates every path against one root, and grouping preserves locations.
+        // One retained path suffices to reject a hint attached to a different table's builder.
+        // LogSegment::try_new below rejects empty replay history.
+        validate_snapshot_hint_paths(log_segment_files.iter_all_paths().take(1), &log_root)?;
         let log_segment = LogSegment::try_new(
             log_segment_files,
             log_root,
@@ -687,25 +821,6 @@ impl<Mode> SnapshotBuilder<Mode> {
         .map(Into::into)
     }
 
-    /// Validates that hinted log locations are beneath the builder's log root.
-    fn validate_snapshot_hint_paths(
-        log_segment_files: &LogSegmentFiles,
-        log_root: &url::Url,
-    ) -> Result<()> {
-        let log_root = log_root.as_str();
-        if let Some(path) = log_segment_files
-            .iter_all_paths()
-            .find(|path| !path.location.location.as_str().starts_with(log_root))
-        {
-            return Err(SnapshotHintError::LogPathOutsideRoot {
-                path: path.location.location.to_string(),
-                log_root: log_root.to_string(),
-            }
-            .into());
-        }
-        Ok(())
-    }
-
     // ===== Catalog-managed Validations =====
 
     /// Pre-build validations for catalog-managed table invariants.
@@ -713,7 +828,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail)
     }
 
@@ -722,7 +837,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let is_catalog_managed = snapshot.table_configuration().is_catalog_managed();
 
         require!(
@@ -785,6 +900,22 @@ impl<Mode> SnapshotBuilder<Mode> {
     }
 }
 
+/// Validates that hinted log locations are beneath the given log root.
+fn validate_snapshot_hint_paths<'a>(
+    mut paths: impl Iterator<Item = &'a ParsedLogPath>,
+    log_root: &url::Url,
+) -> KernelResult<()> {
+    let log_root = log_root.as_str();
+    if let Some(path) = paths.find(|path| !path.location.location.as_str().starts_with(log_root)) {
+        return Err(SnapshotHintError::LogPathOutsideRoot {
+            path: path.location.location.to_string(),
+            log_root: log_root.to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
@@ -806,8 +937,8 @@ mod tests {
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{
-        create_log_path, install_thread_local_metrics_reporter, CapturingReporter,
-        TestCancellationToken,
+        create_log_path, create_log_path_with_size, install_thread_local_metrics_reporter,
+        CapturingReporter, TestCancellationToken,
     };
     use crate::utils::FoldWithOption as _;
 
@@ -847,15 +978,9 @@ mod tests {
         snapshot: &SnapshotRef,
         freshness: SnapshotHintFreshness,
     ) -> SnapshotHint {
-        SnapshotHint {
-            version: snapshot.version(),
-            log_segment_files: snapshot.log_segment().listed.clone(),
-            protocol: snapshot.table_configuration().protocol().clone(),
-            metadata: snapshot.table_configuration().metadata().clone(),
-            last_checkpoint_hint: snapshot.log_segment().last_checkpoint_metadata.clone(),
-            crc: snapshot.crc_at_version().cloned(),
-            freshness,
-        }
+        let mut hint = snapshot.to_snapshot_hint().unwrap();
+        hint.freshness = freshness;
+        hint
     }
 
     async fn snapshot_and_hint(
@@ -900,18 +1025,152 @@ mod tests {
         assert!(source.to_string().contains(expected_source));
     }
 
-    #[test]
-    fn snapshot_hint_sorts_caller_supplied_log_paths() {
+    #[rstest::rstest]
+    #[case::latest(None, SnapshotHintFreshness::Latest)]
+    #[case::historical(Some(0), SnapshotHintFreshness::Unverified)]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_to_hint_preserves_build_time_freshness(
+        #[case] version: Option<Version>,
+        #[case] expected: SnapshotHintFreshness,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+        let mut builder = Snapshot::builder_for(&table_root);
+        if let Some(version) = version {
+            builder = builder.at_version(version);
+        }
+        let snapshot = builder.build(engine.as_ref())?;
+        let hint = snapshot.to_snapshot_hint()?;
+        assert_eq!(hint.freshness, expected);
+        assert_eq!(hint.log_segment_files, snapshot.log_segment().listed);
+        assert!(hint.crc.is_none());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::matching(1, true)]
+    #[case::stale(0, false)]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_to_hint_retains_only_matching_checkpoint_hint(
+        #[case] hint_version: Version,
+        #[case] expected_present: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, snapshot, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        hint.log_segment_files.checkpoint_parts = vec![create_log_path(&format!(
+            "{table_root}_delta_log/00000000000000000001.checkpoint.parquet"
+        ))];
+        hint.last_checkpoint_hint = Some(LastCheckpointHint {
+            version: hint_version,
+            ..Default::default()
+        });
+        let snapshot = Snapshot::new_with_crc(
+            LogSegment::try_new(
+                hint.log_segment_files,
+                snapshot.log_segment().log_root.clone(),
+                Some(snapshot.version()),
+                hint.last_checkpoint_hint,
+            )?,
+            snapshot.table_configuration().clone(),
+            snapshot.crc_at_version().cloned(),
+            false,
+            false,
+        )?;
+        let exported = snapshot.to_snapshot_hint()?;
+        assert_eq!(exported.last_checkpoint_hint.is_some(), expected_present);
+        assert_eq!(exported.crc, snapshot.crc_at_version().cloned());
+        let rebuilt = Snapshot::builder_for(table_root)
+            .with_snapshot_hint(exported)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.version(), snapshot.version());
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_to_hint_rejects_log_compaction() -> Result<(), Box<dyn std::error::Error>> {
+        let (_engine, table_root, snapshot, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        hint.log_segment_files
+            .ascending_compaction_files
+            .push(create_log_path(&format!(
+                "{table_root}_delta_log/00000000000000000000.\
+                 00000000000000000001.compacted.json"
+            )));
+        let snapshot = Snapshot::new_with_crc(
+            LogSegment::try_new(
+                hint.log_segment_files,
+                snapshot.log_segment().log_root.clone(),
+                Some(snapshot.version()),
+                None,
+            )?,
+            snapshot.table_configuration().clone(),
+            None,
+            false,
+            false,
+        )?;
+        assert!(matches!(
+            snapshot.to_snapshot_hint(),
+            Err(KernelError::SnapshotHint(source))
+                if matches!(*source, SnapshotHintError::LogCompaction)
+        ));
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::infer_published(PublicationWatermark::InferFromLogPaths, false, Some(1))]
+    #[case::infer_staged_only(PublicationWatermark::InferFromLogPaths, true, None)]
+    #[case::explicit_absence(PublicationWatermark::NoPublishedCommits, false, None)]
+    #[case::explicit_version(PublicationWatermark::PublishedThrough(0), true, Some(0))]
+    fn snapshot_hint_resolves_publication_watermark(
+        #[case] watermark: PublicationWatermark,
+        #[case] staged: bool,
+        #[case] expected: Option<Version>,
+    ) {
+        let path = if staged {
+            "memory:///target/_delta_log/_staged_commits/\
+             00000000000000000001.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json"
+        } else {
+            "memory:///target/_delta_log/00000000000000000001.json"
+        };
+        let hint = SnapshotHint::try_new(
+            "memory:///target/",
+            1,
+            watermark,
+            vec![LogPath::try_new(create_log_path(path).location).unwrap()],
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .unwrap();
+
+        assert_eq!(hint.log_segment_files().max_published_version, expected);
+        assert_eq!(
+            hint.publication_watermark(),
+            expected.map_or(
+                PublicationWatermark::NoPublishedCommits,
+                PublicationWatermark::PublishedThrough,
+            )
+        );
+    }
+
+    #[rstest::rstest]
+    fn snapshot_hint_sorts_caller_supplied_log_paths(
+        #[values("memory:///target/", "memory:///target")] table_root: &str,
+    ) {
         let log_paths = [
-            "memory:///_delta_log/00000000000000000001.json",
-            "memory:///_delta_log/00000000000000000000.json",
+            "memory:///target/_delta_log/00000000000000000001.json",
+            "memory:///target/_delta_log/00000000000000000000.json",
         ]
         .into_iter()
         .map(|path| LogPath::try_new(create_log_path(path).location))
         .collect::<Result<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
+            table_root,
             1,
+            PublicationWatermark::InferFromLogPaths,
             log_paths,
             Protocol::default(),
             Metadata::default(),
@@ -928,6 +1187,202 @@ mod tests {
                 .map(|path| path.version)
                 .collect_vec(),
             vec![0, 1]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::invalid_local_root("file:///invalid%00table/", "Invalid table location")]
+    #[case::non_hierarchical_root(
+        "mailto:table@example.com",
+        "relative URL with a cannot-be-a-base base"
+    )]
+    fn snapshot_hint_rejects_invalid_table_roots(
+        #[case] table_root: &str,
+        #[case] expected_error: &str,
+    ) {
+        let result = SnapshotHint::try_new(
+            table_root,
+            0,
+            PublicationWatermark::InferFromLogPaths,
+            Vec::new(),
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        );
+        assert_result_error_with_message(result, expected_error);
+    }
+
+    #[rstest::rstest]
+    #[case::published_commit("00000000000000000008.json", Some(8))]
+    #[case::staged_commit(
+        "_staged_commits/00000000000000000008.11111111-1111-1111-1111-111111111111.json",
+        None
+    )]
+    #[case::checkpoint("00000000000000000008.checkpoint.parquet", None)]
+    #[case::incomplete_checkpoint(
+        "00000000000000000008.checkpoint.0000000001.0000000002.parquet",
+        None
+    )]
+    #[case::crc("00000000000000000008.crc", None)]
+    fn snapshot_hint_validates_paths_discarded_by_checkpoint_selection(
+        #[case] filename: &str,
+        #[case] expected_published_version: Option<Version>,
+        #[values(false, true)] foreign_table: bool,
+        #[values(false, true)] reverse_paths: bool,
+    ) -> Result<()> {
+        const TABLE_ROOT: &str = "memory:///target/";
+        const LOG_ROOT: &str = "memory:///target/_delta_log/";
+
+        let supplied_root = if foreign_table {
+            "memory:///other/_delta_log/"
+        } else {
+            LOG_ROOT
+        };
+        let supplied = format!("{supplied_root}{filename}");
+        let mut log_paths = [
+            supplied.as_str(),
+            "memory:///target/_delta_log/00000000000000000010.checkpoint.parquet",
+        ]
+        .into_iter()
+        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
+        .collect::<Result<Vec<_>>>()?;
+        if reverse_paths {
+            log_paths.reverse();
+        }
+        let (engine, _store, _table_root) = setup_test();
+        let result = SnapshotHint::try_new(
+            TABLE_ROOT,
+            10,
+            PublicationWatermark::InferFromLogPaths,
+            log_paths,
+            Protocol::try_new_legacy(1, 2)?,
+            Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .and_then(|hint| {
+            SnapshotBuilder::new_for(TABLE_ROOT)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref())
+        });
+
+        if foreign_table {
+            assert!(matches!(
+                result.unwrap_err(),
+                KernelError::SnapshotHint(source)
+                    if matches!(
+                        &*source,
+                        SnapshotHintError::LogPathOutsideRoot { path, log_root }
+                            if path == &supplied && log_root == LOG_ROOT
+                    )
+            ));
+        } else {
+            let snapshot = result?;
+            let segment = snapshot.log_segment();
+            assert_eq!(segment.checkpoint_version, Some(10));
+            assert!(segment.listed.ascending_commit_files.is_empty());
+            assert!(segment.listed.latest_commit_file.is_none());
+            assert!(segment.listed.latest_crc_file.is_none());
+            assert_eq!(
+                segment.listed.max_published_version,
+                expected_published_version
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::commit_only(0, &["00000000000000000000.json"])]
+    #[case::checkpoint_only(10, &["00000000000000000010.checkpoint.parquet"])]
+    #[case::checkpoint_and_commit(
+        11,
+        &[
+            "00000000000000000010.checkpoint.parquet",
+            "00000000000000000011.json",
+        ]
+    )]
+    fn snapshot_hint_build_validates_the_hint_table_root(
+        #[case] version: Version,
+        #[case] filenames: &[&str],
+        #[values("memory:///target/", "memory:///other/")] builder_table_root: &str,
+    ) {
+        const TABLE_ROOT: &str = "memory:///target/";
+        let log_paths = filenames
+            .iter()
+            .map(|filename| {
+                let supplied = format!("{TABLE_ROOT}_delta_log/{filename}");
+                LogPath::try_new(create_log_path_with_size(&supplied, 1).location).unwrap()
+            })
+            .collect_vec();
+        let hint = SnapshotHint::try_new(
+            TABLE_ROOT,
+            version,
+            PublicationWatermark::InferFromLogPaths,
+            log_paths,
+            Protocol::try_new_legacy(1, 2).unwrap(),
+            Metadata::default()
+                .with_schema(schema_ref! { nullable "id": INTEGER })
+                .unwrap(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .unwrap();
+        let first_retained_path = hint
+            .log_segment_files
+            .iter_all_paths()
+            .next()
+            .unwrap()
+            .location
+            .location
+            .to_string();
+        let (engine, _store, _table_root) = setup_test();
+        let result = SnapshotBuilder::new_for(builder_table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref());
+        if builder_table_root == TABLE_ROOT {
+            let snapshot = result.unwrap();
+            assert_eq!(snapshot.version(), version);
+            assert_eq!(snapshot.table_root().as_str(), TABLE_ROOT);
+        } else {
+            assert!(matches!(
+                result.unwrap_err(),
+                KernelError::SnapshotHint(source)
+                    if matches!(
+                        &*source,
+                        SnapshotHintError::LogPathOutsideRoot { path, log_root }
+                            if path == &first_retained_path
+                                && log_root == "memory:///other/_delta_log/"
+                    )
+            ));
+        }
+    }
+
+    #[rstest::rstest]
+    fn snapshot_hint_build_rejects_empty_replay_history(
+        #[values("memory:///target/", "memory:///other/")] builder_table_root: &str,
+    ) {
+        let hint = SnapshotHint::try_new(
+            "memory:///target/",
+            0,
+            PublicationWatermark::InferFromLogPaths,
+            Vec::new(),
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .unwrap();
+        let (engine, _store, _table_root) = setup_test();
+        assert_log_segment_hint_error(
+            SnapshotBuilder::new_for(builder_table_root)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref()),
+            "No table version found",
         );
     }
 
@@ -1021,8 +1476,8 @@ mod tests {
             SnapshotHintPathField::LatestCommit => files.latest_commit_file = Some(path),
         }
 
-        let result = SnapshotBuilder::<FromTableRoot>::validate_snapshot_hint_paths(
-            &files,
+        let result = validate_snapshot_hint_paths(
+            files.iter_all_paths(),
             &url::Url::parse(LOG_ROOT).unwrap(),
         );
         if expected_valid {
@@ -1984,7 +2439,8 @@ mod tests {
                 .with_log_tail(vec![create_log_path(&table_root, staged_path)])
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
-            let hint = hint_from_snapshot(&source, SnapshotHintFreshness::Latest);
+            let hint = source.to_snapshot_hint()?;
+            assert_eq!(hint.log_segment_files, source.log_segment().listed);
 
             let hinted = SnapshotBuilder::new_for(table_root)
                 .with_max_catalog_version(1)
@@ -1993,6 +2449,7 @@ mod tests {
 
             assert_eq!(hinted.version(), 1);
             assert!(hinted.is_built_as_latest());
+            assert_eq!(hinted.log_segment().listed, source.log_segment().listed);
             Ok(())
         }
 

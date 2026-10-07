@@ -12,7 +12,6 @@
 
 // TODO: add `extract_scalar` that handles complex types (Struct, Array, Map) via recursive
 // extraction into StructData/ArrayData/MapData when there is a concrete use case.
-
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
@@ -22,7 +21,7 @@ use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use crate::expressions::Scalar;
 use crate::schema::DataType;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// Extracts a primitive kernel [`Scalar`] from the given row of an Arrow array.
 ///
@@ -131,7 +130,7 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Sca
 /// `arrow_conversion` because this function has different requirements: we accept any
 /// timezone annotation (not just UTC) and reject types like UInt*, Utf8View, Date64
 /// that `TryFromArrow` supports but are not valid for direct scalar extraction.
-fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> Result<DataType> {
+fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> KernelResult<DataType> {
     match arrow_type {
         ArrowDataType::Int8 => Ok(DataType::BYTE),
         ArrowDataType::Int16 => Ok(DataType::SHORT),

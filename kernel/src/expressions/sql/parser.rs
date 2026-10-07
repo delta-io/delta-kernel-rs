@@ -14,7 +14,7 @@ use std::vec;
 
 use super::token::Token;
 use crate::expressions::ColumnName;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// An operand of a comparison: a column reference (its as-written path) or a literal (raw source
 /// text, e.g. `42`, `'foo'`, `NULL`).
@@ -48,7 +48,7 @@ pub(super) struct Comparison {
 
 /// Parse a token stream into a single [`Comparison`]. The grammar has no junctions, so any tokens
 /// left over after one comparison are an error.
-pub(super) fn parse(tokens: Vec<Token>) -> Result<Comparison> {
+pub(super) fn parse(tokens: Vec<Token>) -> KernelResult<Comparison> {
     let mut parser = Parser {
         tokens: tokens.into_iter().peekable(),
     };
@@ -75,14 +75,14 @@ impl Parser {
     }
 
     // comparison := operand cmp operand
-    fn parse_comparison(&mut self) -> Result<Comparison> {
+    fn parse_comparison(&mut self) -> KernelResult<Comparison> {
         let left = self.parse_operand()?;
         let op = self.parse_cmp_op()?;
         let right = self.parse_operand()?;
         Ok(Comparison { op, left, right })
     }
 
-    fn parse_cmp_op(&mut self) -> Result<CmpOp> {
+    fn parse_cmp_op(&mut self) -> KernelResult<CmpOp> {
         let op = match self.advance() {
             Some(Token::Lt) => CmpOp::Lt,
             Some(Token::Le) => CmpOp::Le,
@@ -103,7 +103,7 @@ impl Parser {
     // types it, e.g. `-234` -> Literal("-234"). A sign before anything else (a column, string/date
     // literal, keyword) is not a single-comparison operand and errors: unary minus on a column and
     // binary arithmetic are out of grammar.
-    fn parse_operand(&mut self) -> Result<Operand> {
+    fn parse_operand(&mut self) -> KernelResult<Operand> {
         match self.advance() {
             Some(sign @ (Token::Plus | Token::Minus)) => {
                 let sign = if sign == Token::Minus { '-' } else { '+' };
@@ -119,7 +119,7 @@ impl Parser {
     }
 
     // Continue a dotted column path after its first `Ident`: `( '.' Ident )*`.
-    fn parse_column_path(&mut self, first: String) -> Result<Operand> {
+    fn parse_column_path(&mut self, first: String) -> KernelResult<Operand> {
         let mut path = vec![first];
         while self.peek() == Some(&Token::Dot) {
             self.advance();

@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::table_changes::scan_file::{TableChangesFileAction, TableChangesScanFile};
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// One flattened side of a per-commit [`TableChangesFileAction`], tagged with which side it is so a
 /// path's boundaries can be ordered. `is_add` sorts a remove before an add at the same commit.
@@ -51,7 +51,7 @@ struct Side {
 /// a deterministic listing, since the intermediate path map has no defined iteration order.
 pub(super) fn collapse_net_changes(
     actions: Vec<TableChangesFileAction>,
-) -> Result<Vec<TableChangesFileAction>> {
+) -> KernelResult<Vec<TableChangesFileAction>> {
     let mut by_path: HashMap<String, Vec<Side>> = HashMap::new();
     for action in actions {
         if let Some(add) = action.add {

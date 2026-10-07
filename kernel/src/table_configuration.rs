@@ -40,7 +40,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{KernelError, Result, Version};
+use crate::{KernelError, KernelResult, Result, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -60,7 +60,7 @@ pub struct StatsOutputSchemas {
 }
 
 impl StatsOutputSchemas {
-    fn try_new(logical: SchemaRef, physical: SchemaRef) -> Result<Self> {
+    fn try_new(logical: SchemaRef, physical: SchemaRef) -> KernelResult<Self> {
         validate_stats_schema_alignment(&logical, &physical, "stats")?;
         Ok(Self { logical, physical })
     }
@@ -70,7 +70,7 @@ fn validate_stats_schema_alignment(
     logical: &StructType,
     physical: &StructType,
     path: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     if logical.num_fields() != physical.num_fields() {
         return Err(KernelError::internal_error(format!(
             "logical and physical stats schemas differ at '{path}'"
@@ -180,7 +180,7 @@ impl<'a> StatsSchemaBuilder<'a> {
     /// # Errors
     ///
     /// Returns an error if the derived stats schema is invalid (see [`StructType::try_new`]).
-    pub(crate) fn build(self) -> Result<SchemaRef> {
+    pub(crate) fn build(self) -> KernelResult<SchemaRef> {
         let tc = self.table_configuration;
         let physical_data_schema = tc.physical_data_schema_without_partition_columns();
         let required_physical_stats_columns = tc.required_physical_stats_columns();
@@ -230,7 +230,7 @@ fn build_stats_schema_for_columns(
     data_schema: &StructType,
     selected_columns: &[ColumnName],
     variant_min_max: bool,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let config = StatsConfig {
         data_skipping_stats_columns: Some(selected_columns),
         data_skipping_num_indexed_cols: None,
@@ -247,7 +247,10 @@ fn build_stats_schema_for_columns(
     Ok(strip_metadata(schema))
 }
 
-fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> Result<()> {
+fn validate_partition_columns(
+    metadata: &Metadata,
+    logical_schema: &StructType,
+) -> KernelResult<()> {
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
@@ -331,7 +334,7 @@ impl TableConfiguration {
         base: &Self,
         metadata: Metadata,
         logical_schema: SchemaRef,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -347,7 +350,7 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -435,7 +438,7 @@ impl TableConfiguration {
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
         if new_metadata.is_none() && new_protocol.is_none() {
             return Ok(Self {
@@ -475,7 +478,7 @@ impl TableConfiguration {
         new_version: Version,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
@@ -489,7 +492,7 @@ impl TableConfiguration {
         &self,
         extra_indexed_columns: &[ColumnName],
         variant_min_max: bool,
-    ) -> Result<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<Option<StatsOutputSchemas>> {
         let logical_data_schema = self.logical_schema_without_partition_columns();
         let logical_schema = self.logical_schema();
         let column_mapping_mode = self.column_mapping_mode();
@@ -551,7 +554,7 @@ impl TableConfiguration {
                         )
                     })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
 
         self.build_stats_output_schemas_for_resolved_columns(
             &logical_columns,
@@ -570,7 +573,7 @@ impl TableConfiguration {
         &self,
         logical_columns: &[ColumnName],
         variant_min_max: bool,
-    ) -> Result<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<Option<StatsOutputSchemas>> {
         if logical_columns.is_empty() {
             return Ok(None);
         }
@@ -587,7 +590,7 @@ impl TableConfiguration {
                     column_mapping_mode,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
 
         self.build_stats_output_schemas_for_resolved_columns(
             logical_columns,
@@ -601,7 +604,7 @@ impl TableConfiguration {
         logical_columns: &[ColumnName],
         physical_columns: &[ColumnName],
         variant_min_max: bool,
-    ) -> Result<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<Option<StatsOutputSchemas>> {
         let logical = build_stats_schema_for_columns(
             &self.logical_schema_without_partition_columns(),
             logical_columns,
@@ -896,7 +899,7 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(&self, feature: &TableFeature) -> Result<()> {
+    fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
         for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
@@ -941,7 +944,11 @@ impl TableConfiguration {
 
     /// Checks that kernel supports a feature for the given operation.
     /// Returns an error if the feature is unknown, not supported, or fails validation.
-    fn check_feature_support(&self, feature: &TableFeature, operation: Operation) -> Result<()> {
+    fn check_feature_support(
+        &self,
+        feature: &TableFeature,
+        operation: Operation,
+    ) -> KernelResult<()> {
         let info = feature.info();
         match &info.kernel_support {
             KernelSupport::Supported => {}
@@ -1004,13 +1011,13 @@ impl TableConfiguration {
     }
 
     /// Ensures Kernel supports both scanning and writing this table.
-    pub(crate) fn ensure_read_write_supported(&self) -> Result<()> {
+    pub(crate) fn ensure_read_write_supported(&self) -> KernelResult<()> {
         self.ensure_operation_supported(Operation::Scan)?;
         self.ensure_operation_supported(Operation::Write)
     }
 
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
-    fn ensure_read_supported(&self, operation: Operation) -> Result<()> {
+    fn ensure_read_supported(&self, operation: Operation) -> KernelResult<()> {
         check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
@@ -1022,7 +1029,7 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> Result<()> {
+    fn ensure_write_supported(&self) -> KernelResult<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -1063,7 +1070,9 @@ impl TableConfiguration {
     /// Returns an error if only one of the enablement properties is present, as this indicates
     /// an inconsistent state.
     #[allow(unused)]
-    pub(crate) fn in_commit_timestamp_enablement(&self) -> Result<InCommitTimestampEnablement> {
+    pub(crate) fn in_commit_timestamp_enablement(
+        &self,
+    ) -> KernelResult<InCommitTimestampEnablement> {
         if !self.is_feature_enabled(&TableFeature::InCommitTimestamp) {
             return Ok(InCommitTimestampEnablement::NotEnabled);
         }
@@ -1204,7 +1213,7 @@ impl TableConfiguration {
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
 
-    pub(crate) fn validate_feature_support_for_remove(&self) -> Result<()> {
+    pub(crate) fn validate_feature_support_for_remove(&self) -> KernelResult<()> {
         if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(KernelError::unsupported(
                 "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
@@ -3153,6 +3162,37 @@ mod test {
         let mut deps = all_adaptive_metadata_deps();
         deps.push(extra);
         deps
+    }
+
+    #[rstest]
+    #[case::all_satisfied(
+        vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4Preview],
+        None
+    )]
+    #[case::missing_adaptive_metadata(
+        vec![TableFeature::IcebergNativeV4Preview],
+        Some("requires 'adaptiveMetadata-preview' to be enabled")
+    )]
+    #[case::invariants_enabled(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::Invariants,
+        ],
+        Some("requires 'invariants' to not be enabled")
+    )]
+    fn test_iceberg_native_v4_feature_requirements(
+        #[case] features: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

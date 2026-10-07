@@ -5,7 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
-use crate::{EngineData, KernelError, Result};
+use crate::{EngineData, KernelError, KernelResult, Result};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -21,7 +21,7 @@ use crate::{EngineData, KernelError, Result};
 ///   first before being added to metadata.
 pub(crate) fn extract_deletion_vector_content(
     dv: &DeletionVectorDescriptor,
-) -> Result<DeletionVectorInfo> {
+) -> KernelResult<DeletionVectorInfo> {
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
             // Use absolute path as-is
@@ -171,7 +171,7 @@ impl DecodedDvVisitor {
         self.decoded_paths.iter().any(|s| !s.is_null())
     }
 
-    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> Result<Box<dyn EngineData>> {
+    fn append_decoded_dv_columns(self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         data.append_columns(
             DV_DECODED_FLAT_SCHEMA.clone(),
             vec![

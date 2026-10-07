@@ -125,8 +125,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, Result, ResultIteratorStatic,
-    Version,
+    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult,
+    KernelResultIteratorStatic, Result, Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -369,7 +369,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> Result<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> KernelResult<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;
@@ -558,7 +558,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
-    ) -> Result<WrittenCheckpointInfo> {
+    ) -> KernelResult<WrittenCheckpointInfo> {
         let data_iter = self.checkpoint_data(engine)?;
         let iter_state = data_iter.state();
 
@@ -611,7 +611,7 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: ResultIteratorStatic<Box<dyn EngineData>> =
+        let main_data: KernelResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         let main_size = engine
             .parquet_handler()
@@ -638,7 +638,7 @@ impl CheckpointWriter {
     pub(crate) fn write_checkpoint_without_sidecars(
         &self,
         engine: &dyn Engine,
-    ) -> Result<WrittenCheckpointInfo> {
+    ) -> KernelResult<WrittenCheckpointInfo> {
         let checkpoint_path = self.checkpoint_path()?;
         let data_iter = self.checkpoint_data(engine)?;
         let state = data_iter.state();
@@ -681,7 +681,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
         schema: &SchemaRef,
-    ) -> Result<ActionReconciliationBatch> {
+    ) -> KernelResult<ActionReconciliationBatch> {
         // Build the checkpointMetadata struct value. `tags` is left unset (null) since kernel
         // does not currently emit checkpoint tags.
         let checkpoint_metadata_value: Scalar = CheckpointMetadata {
@@ -718,7 +718,7 @@ impl CheckpointWriter {
     fn checkpoint_schema_context(
         snapshot: &SnapshotRef,
         engine: &dyn Engine,
-    ) -> Result<CheckpointSchemaContext> {
+    ) -> KernelResult<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
         let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
 
@@ -780,7 +780,7 @@ pub(crate) fn create_last_checkpoint_data(
     actions_counter: i64,
     add_actions_counter: i64,
     size_in_bytes: i64,
-) -> Result<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
         vec![vec![
@@ -800,7 +800,7 @@ fn write_single_sidecar(
     file_actions_per_sidecar_hint: usize,
     table_root: &Url,
     version: Version,
-) -> Result<Option<(String, FileMeta)>> {
+) -> KernelResult<Option<(String, FileMeta)>> {
     let mut iter =
         SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
     if iter.peek().is_none() {
@@ -818,7 +818,7 @@ fn write_single_sidecar(
 /// Verifies that the size the parquet writer reported matches the size the storage layer reports
 /// via `head`, guarding against a truncated or partially-written file. `path` names the file in
 /// the error message.
-fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> Result<()> {
+fn verify_written_size(path: &Url, written_size: u64, observed_size: u64) -> KernelResult<()> {
     if written_size != observed_size {
         return Err(KernelError::generic(format!(
             "parquet file size mismatch at {path}: writer reported {written_size} bytes, \
@@ -835,7 +835,7 @@ fn build_written_checkpoint_info(
     written_size: u64,
     sidecar_sizes_sum: u64,
     sidecar_count: u64,
-) -> Result<WrittenCheckpointInfo> {
+) -> KernelResult<WrittenCheckpointInfo> {
     let file_meta = engine.storage_handler().head(checkpoint_path)?;
     verify_written_size(checkpoint_path, written_size, file_meta.size)?;
     let total_size_in_bytes = file_meta

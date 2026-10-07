@@ -175,8 +175,22 @@ pub enum BinaryExpressionOp {
 /// A variadic expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
-    /// SQL `COALESCE(exprs...)`: the first non-null value, or null when every input is null. All
-    /// inputs share one type, which is also the result type. Requires at least one input.
+    /// SQL `COALESCE(exprs...)`: the first non-null argument value per row, or NULL when every
+    /// argument is NULL. Requires at least one argument.
+    ///
+    /// For COALESCE expressions generated internally, Kernel guarantees that every argument has
+    /// the same logical data type as the result. Engines may translate these expressions to native
+    /// ANSI SQL COALESCE, including native type resolution and implicit casts, while preserving
+    /// the result type and value semantics.
+    ///
+    /// Caller-constructed expressions may have different argument types if the evaluator supports
+    /// implicit conversion to a common result type. The result has that type regardless of which
+    /// argument supplies a value. Supported type combinations and conversions depend on the
+    /// engine; an engine may require all arguments to have the same type. Callers that need
+    /// portable expressions should use arguments with the same type.
+    ///
+    /// The Arrow evaluator used by the default engine does not insert implicit COALESCE
+    /// conversions and requires evaluated argument arrays to have matching Arrow types.
     Coalesce,
     /// SQL `ARRAY(exprs...)`: an array built by evaluating each input per row, so
     /// `ARRAY(1, 1 + 2, my_int_col)` yields `[1, 3, <my_int_col value>]`. All inputs must share
@@ -478,9 +492,9 @@ where
 
 /// A SQL expression.
 ///
-/// These expressions do not track or validate data types, other than the type
-/// of literals. It is up to the expression evaluator to validate the
-/// expression against a schema and add appropriate casts as required.
+/// Expression construction does not validate argument types or infer result types. The
+/// expression evaluator validates the expression against a schema and the expected result type,
+/// and applies supported implicit conversions. Conversion support depends on the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, From)]
 pub enum Expression {
     /// A literal value.
@@ -939,10 +953,10 @@ impl Expression {
         Self::Variadic(VariadicExpression::new(op, exprs))
     }
 
-    /// Creates a new COALESCE expression that returns the first non-null value.
+    /// Creates a COALESCE expression from `exprs` that returns the first non-null value.
     ///
-    /// COALESCE evaluates expressions in order and returns the first non-null result.
     /// If all expressions evaluate to null, the result is null.
+    /// See [`VariadicExpressionOp::Coalesce`] for the type contract and engine-specific support.
     pub fn coalesce(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
         Self::variadic(VariadicExpressionOp::Coalesce, exprs)
     }
