@@ -222,6 +222,7 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> Result<()> {
         .map(|path| LogPath::try_new(path.location.clone()))
         .collect::<Result<Vec<_>>>()?;
     let hint = SnapshotHint::try_new(
+        &table_root,
         snapshot.version(),
         log_paths,
         snapshot.table_configuration().protocol().clone(),

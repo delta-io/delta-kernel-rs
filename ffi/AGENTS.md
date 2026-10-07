@@ -68,8 +68,9 @@ Snapshot builder API (`ffi/src/lib.rs`):
 - `snapshot_builder_with_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
 - `snapshot_builder_with_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
   typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
-  files, or CRC files; log compaction paths are rejected. Kernel cannot verify that supplied log
-  paths belong to the builder's table, so the caller must ensure every path addresses that table.
+  files, or CRC files; log compaction paths are rejected. Kernel validates every supplied path beneath
+  the builder's `_delta_log` root before grouping and checkpoint selection, preserving supplied
+  locations. The connector must canonicalize paths into the same URL form as the table root.
   A failed call consumes and drops the builder
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)

@@ -76,14 +76,11 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
 ) -> KernelResult<()> {
-    if matches!(
-        &builder.source,
-        FfiSnapshotBuilderSource::ExistingSnapshot(_)
-    ) {
+    let FfiSnapshotBuilderSource::TableRoot(table_root) = &builder.source else {
         return Err(KernelError::unsupported(
             "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
         ));
-    }
+    };
     let freshness = value.freshness.into();
     let log_paths = unsafe { value.log_paths.log_paths() }
         .map_err(|source| invalid_with_source("supplied log paths are invalid", source))?;
@@ -101,6 +98,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         .transpose()?
         .map(std::sync::Arc::new);
     let snapshot_hint = SnapshotHint::try_new(
+        table_root,
         value.version,
         log_paths,
         protocol,
@@ -116,18 +114,19 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// Copies and installs a complete typed snapshot hint, returning the updated builder handle on
 /// success.
 ///
-/// The input is converted and validated before replacing any previously installed hint. Build
-/// preserves the supplied log locations and requires them to be beneath the builder's table log
-/// root, then performs the remaining structural and table-configuration validation. The connector
-/// must canonicalize every location into the same URL form as the table root. `Latest` makes
-/// `is_built_as_latest()` true, and kernel trusts that caller claim. `Unverified` makes it false.
+/// The input is converted and validated before replacing any previously installed hint. Every
+/// supplied log location must be beneath the builder's table log root, including paths discarded by
+/// checkpoint selection. Kernel preserves the locations; the connector must canonicalize them into
+/// the same URL form as the table root. Build performs the remaining structural and
+/// table-configuration validation. `Latest` makes `is_built_as_latest()` true, and kernel trusts
+/// that caller claim. `Unverified` makes it false.
 ///
 /// # Errors
 ///
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
-/// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path names an unsupported
-/// log compaction file.
+/// `InvalidSnapshotHint` when a supplied field cannot be decoded, a log path is outside the table
+/// log root, or a log path names an unsupported log compaction file.
 /// Structural log-segment and table-configuration errors are returned when the builder is built.
 /// A failed call drops the builder.
 ///
