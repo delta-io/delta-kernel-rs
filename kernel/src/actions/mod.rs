@@ -1117,6 +1117,13 @@ impl Add {
     pub fn data_change(&self) -> bool {
         self.data_change
     }
+
+    /// Returns whether this action references an entry in an adaptive metadata tree.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub fn has_back_reference(&self) -> bool {
+        self.back_reference.is_some()
+    }
+
     /// Reconstructs an Add action from its serialized fields.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]

@@ -21,6 +21,17 @@ pub(super) fn visit(
     context: NullableCvoid,
     visitor: SnapshotHintVisitor,
 ) -> DeltaResult<()> {
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    if hint
+        .crc()
+        .and_then(Crc::all_files)
+        .is_some_and(|files| files.iter().any(Add::has_back_reference))
+    {
+        return Err(delta_kernel::Error::unsupported(
+            "Snapshot hint export does not support adaptive metadata back references",
+        ));
+    }
+
     let files = hint.log_segment_files();
     let mut paths: Vec<_> = files
         .checkpoint_parts

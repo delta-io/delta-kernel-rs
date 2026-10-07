@@ -159,7 +159,10 @@ pub unsafe extern "C" fn snapshot_externalize_validated_core(
 ///
 /// # Safety
 ///
-/// `snapshot` is borrowed and must reference a valid snapshot for this call.
+/// `snapshot` is borrowed and must reference a valid snapshot for this call. The caller must retain
+/// the exact immutable ordered log paths and scan state exported from this source snapshot,
+/// associate them with `generation`, and return the same state on every pass for the core's
+/// lifetime. State from a different snapshot or generation must never be used with the core.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_externalize_trusted_core(
     snapshot: Handle<SharedSnapshot>,
@@ -330,7 +333,9 @@ fn metadata_plan(
 ///
 /// # Safety
 ///
-/// Handles are borrowed. `value` and its log-path storage must be valid for this call.
+/// Handles are borrowed. `value` and its log-path storage must be valid for this call. `value` must
+/// be the exact immutable scan state exported from the source snapshot used to create `core`, must
+/// be associated with the same `generation`, and must return the same ordered paths on both passes.
 #[cfg(feature = "declarative-plans")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted(
@@ -511,7 +516,9 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_with_schema(
 ///
 /// # Safety
 /// Consumes `upload` unconditionally, including on errors. Other handles and `value` are borrowed
-/// and its log-path storage must be valid for this call.
+/// and its log-path storage must be valid for this call. `value` and the uploaded schema bytes must
+/// be the exact immutable scan state exported from the source snapshot used to create `core`, must
+/// be associated with the same `generation`, and must return the same ordered paths on both passes.
 #[cfg(feature = "declarative-plans")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted_with_schema(
@@ -528,7 +535,21 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted_with_sc
         if value.metadata.schema_string.len != 0 {
             return Err(invalid("Schema supplied both inline and as an upload"));
         }
-        drop(upload.finish_bytes()?);
+        let uploaded_schema = upload.finish_bytes()?;
+        let expected_schema_len = core
+            .validated_configuration
+            .as_deref()
+            .ok_or_else(|| {
+                invalid("trusted planning requires a trusted externalized snapshot core")
+            })?
+            .metadata()
+            .schema_string()
+            .len();
+        if uploaded_schema.len() != expected_schema_len {
+            return Err(invalid(
+                "Uploaded schema length differs from the trusted source snapshot",
+            ));
+        }
         trusted_metadata_plan(core, value, generation, engine.engine().as_ref())
     })();
     result.into_extern_result(&engine)
