@@ -7,14 +7,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::{internal_api, ToSchema};
+use delta_kernel_derive::{internal_api, IntoStructData, ToSchema};
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use url::Url;
 
 use crate::schema::DataType;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result, StorageHandler};
+use crate::{KernelError, KernelResult, Result, Scalar, StorageHandler};
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -67,6 +67,12 @@ impl std::fmt::Display for DeletionVectorStorageType {
 impl ToDataType for DeletionVectorStorageType {
     fn to_data_type() -> DataType {
         DataType::STRING
+    }
+}
+
+impl From<DeletionVectorStorageType> for Scalar {
+    fn from(value: DeletionVectorStorageType) -> Self {
+        value.to_string().into()
     }
 }
 
@@ -127,7 +133,7 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
