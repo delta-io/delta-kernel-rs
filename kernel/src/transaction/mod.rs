@@ -2085,6 +2085,10 @@ mod tests {
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::{
+        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+    };
     use crate::unit_test_utils::{
         assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
         install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
@@ -2092,10 +2096,6 @@ mod tests {
         CapturingReporter,
     };
     use crate::{EvaluationHandler, ResultIterator, Snapshot};
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::{
-        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
-    };
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
