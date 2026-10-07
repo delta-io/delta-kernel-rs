@@ -467,6 +467,15 @@ impl TryFromArrow<&ArrowField> for StructField {
                         MetadataValue::Number(id),
                     ));
                 }
+                if k == ColumnMetadataKey::Collations.as_ref() {
+                    let value = serde_json::from_str(v).map_err(|error| {
+                        ArrowError::SchemaError(format!(
+                            "__COLLATIONS on field '{}' must be JSON: {error}",
+                            arrow_field.name()
+                        ))
+                    })?;
+                    return Ok((k.clone(), MetadataValue::Other(value)));
+                }
                 Ok((k.clone(), MetadataValue::from(v)))
             })
             .collect::<Result<_, _>>()?;
@@ -721,6 +730,32 @@ mod tests {
             &"hello world".to_owned()
         );
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::string(DataType::STRING, "field")]
+    #[case::array(ArrayType::new(DataType::STRING, true).into(), "field.element")]
+    #[case::map(MapType::new(DataType::STRING, DataType::STRING, true).into(), "field.value")]
+    fn collation_objects_round_trip_through_arrow(#[case] data_type: DataType, #[case] path: &str) {
+        let field = StructField::nullable("field", data_type).with_metadata([(
+            ColumnMetadataKey::Collations.as_ref(),
+            MetadataValue::Other(serde_json::json!({ path: "custom.name.75.1" })),
+        )]);
+        let kernel_schema = StructType::try_new([field]).unwrap();
+        let arrow: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();
+        let recovered = StructType::try_from_arrow(&arrow).unwrap();
+        assert_eq!(recovered, kernel_schema);
+        crate::schema::collation_utils::validate_collation_annotations(&recovered).unwrap();
+    }
+
+    #[test]
+    fn invalid_arrow_collation_json_is_rejected() {
+        let field = ArrowField::new("field", ArrowDataType::Utf8, true)
+            .with_metadata(HashMap::from([("__COLLATIONS".into(), "{invalid".into())]));
+        assert!(StructField::try_from_arrow(&field)
+            .unwrap_err()
+            .to_string()
+            .contains("__COLLATIONS"));
     }
 
     // Delta tables can have void columns. The kernel should parse them and convert

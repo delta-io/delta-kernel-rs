@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use crate::schema::collation_utils::validate_collation_annotations;
 use crate::schema::{StructField, StructType};
 use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
@@ -36,6 +37,7 @@ pub(crate) fn validate_schema(
     // collects errors. The return value is intentionally discarded.
     validator.transform_struct(schema);
     validator.into_result()?;
+    validate_collation_annotations(schema)?;
     if cdf_enabled {
         validate_cdf_column_names(schema, column_mapping_mode)?;
     }
