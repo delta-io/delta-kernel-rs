@@ -7,14 +7,15 @@
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::{IntoStructData, ToSchema};
 use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    get_all_actions_schema, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
-    SIDECAR_NAME, STATS_PARSED,
+    get_all_actions_schema, Add, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
+    SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
@@ -31,7 +32,11 @@ use crate::schema::{
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult, PlanBuilder};
+use crate::{KernelError, KernelResult, PlanBuilder, Version};
+
+mod metadata_replay_base;
+
+pub(super) use metadata_replay_base::MetadataReplayBase;
 
 // === Internal column names ===
 
@@ -44,6 +49,11 @@ const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
+
+#[derive(IntoStructData, ToSchema)]
+struct CrcAdd {
+    add: Option<Add>,
+}
 
 /// This planner centralizes schema and projection decisions shared by commits and checkpoints.
 /// For each source, it constructs a plan that:
@@ -369,7 +379,7 @@ impl Scan {
     )]
     pub(super) fn build_metadata_scan_plan_with(
         &self,
-        shape: &CheckpointShape,
+        base: &MetadataReplayBase,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
@@ -377,7 +387,7 @@ impl Scan {
             return Ok(None);
         }
 
-        let commit_actions = self.commit_arm(planner)?;
+        let commit_actions = self.commit_arm(base.version(), planner)?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -390,9 +400,12 @@ impl Scan {
             )
         })?;
 
-        let checkpoint_adds = self.checkpoint_arm(shape, planner)?;
+        let base_adds = match base {
+            MetadataReplayBase::Crc { version } => self.crc_arm(*version, planner),
+            MetadataReplayBase::Checkpoint { shape, .. } => self.checkpoint_arm(shape, planner),
+        }?;
 
-        let checkpoint_live_adds = checkpoint_adds
+        let base_live_adds = base_adds
             .anti_join(
                 deduped_commit.clone(),
                 [column_name!(FILE_ACTION_KEY)],
@@ -404,12 +417,59 @@ impl Scan {
             .filter(col!("add").is_not_null())?
             .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
 
-        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
+        PlanBuilder::union_all([commit_live_adds, base_live_adds])?.build_opt()
     }
 
     #[cfg(test)]
     fn build_metadata_scan_plan(&self, shape: &CheckpointShape) -> KernelResult<Option<Plan>> {
-        self.build_metadata_scan_plan_with(shape, &MetadataPlanner::try_new(self)?)
+        let base = MetadataReplayBase::Checkpoint {
+            version: self.snapshot.log_segment().checkpoint_version,
+            shape: shape.clone(),
+        };
+        self.build_metadata_scan_plan_with(&base, &MetadataPlanner::try_new(self)?)
+    }
+
+    fn crc_arm(
+        &self,
+        version: Version,
+        planner: &MetadataPlanner<'_>,
+    ) -> KernelResult<PlanBuilder> {
+        let files = self
+            .snapshot
+            .base_crc_all_files()
+            .filter(|(crc_version, _)| *crc_version == version)
+            .map(|(_, files)| files)
+            .ok_or_else(|| {
+                KernelError::internal_error(format!(
+                    "Selected CRC version {version} has no allFiles"
+                ))
+            })?;
+
+        planner
+            .build_metadata_arm(&LOG_ADD_SCHEMA, false, |schema| {
+                let DataType::Struct(read_add) =
+                    schema.field_at(&column_name!(ADD_NAME))?.data_type()
+                else {
+                    return Err(KernelError::schema(
+                        "metadata source add field must be a struct",
+                    ));
+                };
+                PlanBuilder::values_from(files.iter().cloned().map(|add| CrcAdd { add: Some(add) }))
+                    .project_patch(|patch| {
+                        ADD_SCHEMA
+                            .fields()
+                            .filter(|field| read_add.field(field.name()).is_none())
+                            .fold(patch, |patch, field| {
+                                patch.drop_at([ADD_NAME], field.name())
+                            })
+                    })
+            })?
+            .project_patch(|patch| {
+                patch.append(
+                    FILE_ACTION_KEY_FIELD.clone(),
+                    file_action_key_expr(|col| joined_column_expr!("add", col)),
+                )
+            })
     }
 
     /// Build checkpoint adds in the requested output shape. Returns an empty relation when no
@@ -481,9 +541,18 @@ impl Scan {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(&self, planner: &MetadataPlanner<'_>) -> KernelResult<PlanBuilder> {
+    fn commit_arm(
+        &self,
+        base_version: Option<Version>,
+        planner: &MetadataPlanner<'_>,
+    ) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
-        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        let commit_files = match base_version {
+            Some(version) => log_segment
+                .segment_after_version(version)
+                .commit_cover_version_tagged_scan_files()?,
+            None => log_segment.commit_cover_version_tagged_scan_files()?,
+        };
         planner
             .build_metadata_arm(get_all_actions_schema(), true, |schema| {
                 PlanBuilder::scan_json(commit_files, &[VERSION], schema)?.filter(Predicate::or(
@@ -705,7 +774,11 @@ mod tests {
         Url::parse("file:///_delta_log/").unwrap()
     }
 
-    fn log_segment(log_root: Url, commits: &[&str], checkpoint: Option<&str>) -> LogSegment {
+    pub(super) fn log_segment(
+        log_root: Url,
+        commits: &[&str],
+        checkpoint: Option<&str>,
+    ) -> LogSegment {
         let ascending_commit_files: Vec<_> =
             commits.iter().map(|path| create_log_path(path)).collect();
         let checkpoint_parts: Vec<_> = checkpoint.into_iter().map(create_log_path).collect();
@@ -921,7 +994,7 @@ mod tests {
             leaf_checkpoint_schema: Some(Arc::new(file_schema)),
         };
         let planner = MetadataPlanner::try_new(&scan)?;
-        let commit = scan.commit_arm(&planner)?.build()?;
+        let commit = scan.commit_arm(None, &planner)?.build()?;
         let checkpoint = scan.checkpoint_arm(&shape, &planner)?.build()?;
         let commit_add: ArrowSchema = add_struct(&commit.schema).try_into_arrow()?;
         let checkpoint_add: ArrowSchema = add_struct(&checkpoint.schema).try_into_arrow()?;

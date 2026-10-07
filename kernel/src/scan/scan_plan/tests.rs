@@ -22,7 +22,7 @@ use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot};
+use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -501,12 +501,16 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
     #[case] partition_values: PartitionValuesOptions,
     #[case] expected_field_groups: &[&[&str]],
+    #[values(4, 5)] version: Version,
 ) {
     (|| -> Result<()> {
         let json_requested = stats.synthesize_json;
         let parsed_partitions_requested = partition_values.parsed_struct;
-        let (engine, snapshot, _tempdir) =
+        let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        let snapshot = Snapshot::builder_for(latest.table_root().clone())
+            .at_version(version)
+            .build(engine.as_ref())?;
         let scan = snapshot
             .scan_builder()
             .with_stats(stats)
@@ -709,6 +713,66 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
         PartitionValuesOptions::with_struct(),
     )
     .unwrap();
+}
+
+#[test]
+fn declarative_metadata_crc_source_plan_is_sparse() -> Result<()> {
+    let (engine, latest, _tempdir) =
+        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    let snapshot = Snapshot::builder_for(latest.table_root().clone())
+        .at_version(4)
+        .build(engine.as_ref())?;
+    assert_eq!(snapshot.log_segment().checkpoint_version, None);
+    assert_eq!(
+        snapshot.base_crc_all_files().map(|(version, _)| version),
+        Some(4)
+    );
+
+    let plan = snapshot
+        .scan_builder()
+        .build()?
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .expect("CRC metadata plan");
+    assert!(plan.schema.field(IS_ADD).is_none());
+    let values = plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            Operator::Values(values) => Some(values),
+            _ => None,
+        })
+        .expect("CRC values source");
+    assert_eq!(values.schema.num_fields(), 1);
+    assert!(values.rows.iter().all(|row| row.len() == 1));
+    assert!(plan.nodes.iter().all(|node| match &node.op {
+        Operator::Project(project) => matches!(project.expr.as_ref(), Expr::StructPatch(_)),
+        _ => true,
+    }));
+    Ok(())
+}
+
+#[test]
+fn declarative_metadata_crc_structured_stats_prune_with_predicate() -> Result<()> {
+    let (engine, latest, _tempdir) =
+        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    let snapshot = Snapshot::builder_for(latest.table_root().clone())
+        .at_version(4)
+        .build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .with_predicate(Arc::new(col!("id").gt(lit(3i64))))
+        .build()?;
+
+    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    assert_eq!(metadata_row_count(&actual), 1);
+    assert!(actual
+        .iter()
+        .all(|batch| batch.column_by_name(STATS).is_none()));
+    assert!(actual
+        .iter()
+        .all(|batch| batch.column_by_name(STATS_PARSED).is_some()));
+    Ok(())
 }
 
 fn assert_metadata_output_options(

@@ -17,8 +17,6 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-#[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -1180,8 +1178,9 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Builds a declarative plan that produces the scan's live `add` actions.
     ///
-    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
-    /// no Delta metadata matches this scan.
+    /// `engine` supplies the plan executor used to inspect checkpoint shape unless a CRC at least
+    /// as new as the checkpoint provides `allFiles`. Returns `None` when no Delta metadata matches
+    /// this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1191,8 +1190,9 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// Returns an error if checkpoint inspection is required and the engine provides no
+    /// [`PlanExecutor`](crate::plans::PlanExecutor), or if log discovery, checkpoint inspection,
+    /// or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1201,15 +1201,8 @@ impl Scan {
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
         let planner = scan_plan::MetadataPlanner::try_new(self)?;
-        // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
-        // action schema; checkpoint discovery owns how that schema is obtained.
-        let plan_executor = engine.require_plan_executor()?;
-        let shape = if planner.requires_checkpoint_add_schema() {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
-        };
-        self.build_metadata_scan_plan_with(&shape, &planner)
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
+        self.build_metadata_scan_plan_with(&base, &planner)
     }
 
     // Factored out to facilitate testing

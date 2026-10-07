@@ -71,6 +71,7 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::actions::Add;
     use crate::crc::{FileStats, FileStatsState};
 
     fn crc_at(version: Version) -> Arc<Crc> {
@@ -81,6 +82,7 @@ mod tests {
                 table_size_bytes: 100,
                 file_size_histogram: None,
             }),
+            all_files: Some(vec![Add::default()]),
             ..Default::default()
         })
     }
@@ -94,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_crc_below_checkpoint() {
+    fn new_rejects_crc_all_files_below_checkpoint() {
         assert_result_error_with_message(
             SnapshotCrc::try_new(Some(crc_at(2)), 5, Some(3)),
             "is below checkpoint version",
