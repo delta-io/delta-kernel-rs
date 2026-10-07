@@ -3,6 +3,7 @@
 mod alter_table;
 mod cdf;
 mod clustering_e2e;
+mod collations;
 mod column_mapping;
 mod dv;
 mod iceberg_compat;
