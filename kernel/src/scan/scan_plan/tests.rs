@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use ::test_utils::assert_result_error_with_message;
 use ::test_utils::table_builder::{
     checkpoint_json_stats, checkpoint_struct_stats, no_checkpoint_stats, DataLayoutConfig,
     FeatureSet, LogState, TableConfig, TestTableBuilder,
 };
 use rstest::rstest;
+use serde_json::Value;
 
 use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
@@ -86,8 +86,8 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Reco
                 .or_else(|| constants.column_by_name(STATS))
                 .cloned()
                 .filter(|_| scan.stats.synthesize_json),
-            batch.column_by_name(STATS_PARSED).cloned(),
-            batch.column_by_name(PARTITION_VALUES_PARSED).cloned(),
+            batch.column_by_name("stats_parsed").cloned(),
+            batch.column_by_name("partitionValues_parsed").cloned(),
         )?);
     }
     Ok(batches)
@@ -290,6 +290,10 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str)
     StatsOptions::all(),
     &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
 )]
+#[case::both_columns(
+    StatsOptions { synthesize_json: true, ..StatsOptions::struct_columns(vec![column_name!("id")]) },
+    &[ID_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+)]
 #[case::none(StatsOptions::none(), &[])]
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
@@ -303,17 +307,13 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     } else {
         stats.clone()
     };
-    let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
+    let predicate: PredicateRef = col!("id").gt(lit(200i64)).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
         .with_stats(expected_stats)
-        .with_partition_values(PartitionValuesOptions::with_struct());
-    let expected_builder = if stats.synthesize_json {
-        expected_builder
-    } else {
-        expected_builder.with_predicate(predicate.clone())
-    };
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_predicate((!stats.synthesize_json).then_some(predicate.clone()));
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
     let builder = snapshot
         .scan_builder()
@@ -321,13 +321,6 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate);
     let scan = builder.build()?;
-    if scan.stats.synthesize_json && !matches!(&scan.stats.struct_stats, StructStats::None) {
-        assert_result_error_with_message(
-            scan.declarative_metadata_scan_plan(engine.as_ref()),
-            "cannot output both JSON and structured stats",
-        );
-        return Ok(());
-    }
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     let actual_fields = leaf_paths(&actual);
     let imperative_fields = leaf_paths(&expected);
@@ -490,6 +483,11 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
         PARTITION_PARSED_FIELDS,
     ]
 )]
+#[case::both_columns(
+    StatsOptions { synthesize_json: true, ..StatsOptions::struct_columns(vec![column_name!("id")]) },
+    PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
+)]
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
@@ -514,13 +512,6 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .with_stats(stats)
             .with_partition_values(partition_values)
             .build()?;
-        if scan.stats.synthesize_json && !matches!(&scan.stats.struct_stats, StructStats::None) {
-            assert_result_error_with_message(
-                scan.declarative_metadata_scan_plan(engine.as_ref()),
-                "cannot output both JSON and structured stats",
-            );
-            return Ok(());
-        }
         let plan = scan
             .declarative_metadata_scan_plan(engine.as_ref())?
             .expect("metadata plan");
@@ -551,6 +542,10 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
                     0,
                     "requested JSON stats must be populated"
                 );
+                // JSON must retain columns omitted from the requested structured subset.
+                for stats in stats.iter().flatten() {
+                    assert!(serde_json::from_str::<Value>(stats)?["minValues"]["value"].is_string());
+                }
             }
         }
 
@@ -574,17 +569,9 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 }
 
 #[rstest]
-#[case::nested(
-    column_name!("nested_struct.inner_int"),
-    concat!("col-481c7590-d3b8-4e9c-b40e-7b7128a972f4.",
-        "col-7f2f94cf-7082-430c-bba7-852bc6c5215e"),
-    true
-)]
-#[case::null_count_only(column_name!("binary_col"), "col-cbe103e8-96dc-4fd7-821e-602cf8902e6b", false)]
 fn declarative_metadata_projects_nested_column_mapped_stats(
-    #[case] requested: ColumnName,
-    #[case] physical: &str,
-    #[case] min_max: bool,
+    #[values(column_name!("nested_struct.inner_int"), column_name!("binary_col"))]
+    requested: ColumnName,
     #[values(None, Some(Pred::and(
         col!("nested_struct.inner_double").gt(lit(0.0)),
         col!("nested_struct.inner_string").is_not_null()
@@ -594,7 +581,7 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
     let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::struct_columns(vec![requested]))
+        .with_stats(StatsOptions::struct_columns(vec![requested.clone()]))
         .with_predicate(predicate.map(Arc::new))
         .build()?;
     let plan = scan
@@ -609,23 +596,25 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
         &DataType::from(expected_stats.as_ref().clone())
     );
     let actual = declarative_metadata(&scan, engine.as_ref())?;
+    if requested != column_name!("nested_struct.inner_int") {
+        return Ok(());
+    }
+    let parent = "col-481c7590-d3b8-4e9c-b40e-7b7128a972f4";
+    let child = "col-7f2f94cf-7082-430c-bba7-852bc6c5215e";
     let stats_paths: Vec<_> = leaf_paths(&actual)
         .into_iter()
         .filter(|path| path.starts_with(STATS_PARSED))
         .collect();
-    let mut expected = vec![
-        format!("stats_parsed.nullCount.{physical}"),
-        "stats_parsed.numRecords".to_string(),
-        "stats_parsed.tightBounds".to_string(),
-    ];
-    if min_max {
-        expected.extend([
-            format!("stats_parsed.maxValues.{physical}"),
-            format!("stats_parsed.minValues.{physical}"),
-        ]);
-    }
-    expected.sort_unstable();
-    assert_eq!(stats_paths, expected);
+    assert_eq!(
+        stats_paths,
+        [
+            format!("stats_parsed.maxValues.{parent}.{child}"),
+            format!("stats_parsed.minValues.{parent}.{child}"),
+            format!("stats_parsed.nullCount.{parent}.{child}"),
+            "stats_parsed.numRecords".to_string(),
+            "stats_parsed.tightBounds".to_string(),
+        ]
+    );
     Ok(())
 }
 
@@ -634,13 +623,13 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
     LogState::with_latest_version(2),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all()
 )]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all()
 )]
 #[case::v1_checkpoint_struct(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
@@ -654,7 +643,7 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_json_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all()
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
@@ -744,13 +733,6 @@ fn assert_metadata_output_options(
         .with_stats(stats)
         .with_partition_values(partitions)
         .build()?;
-    if scan.stats.synthesize_json && !matches!(&scan.stats.struct_stats, StructStats::None) {
-        assert_result_error_with_message(
-            scan.declarative_metadata_scan_plan(&engine),
-            "cannot output both JSON and structured stats",
-        );
-        return Ok(());
-    }
     let actual = declarative_metadata(&scan, &engine)?;
 
     for batches in [&actual, &expected] {
@@ -939,7 +921,7 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Resul
         crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let plan = scan
@@ -1016,7 +998,7 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
         snapshot
             .clone()
             .scan_builder()
-            .with_stats(StatsOptions::all_struct())
+            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
@@ -1025,7 +1007,7 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
 
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;

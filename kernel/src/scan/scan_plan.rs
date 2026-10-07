@@ -11,7 +11,7 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, Scan, StructStats};
+use super::{PhysicalPredicate, Scan};
 use crate::actions::{
     get_all_actions_schema, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
     SIDECAR_NAME, STATS_PARSED,
@@ -72,20 +72,15 @@ enum StatsKind {
 
 impl<'a> MetadataPlanner<'a> {
     pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
-        let (pre_filter_stats_schema, stats_filter) =
-            match (scan.stats.synthesize_json, &scan.stats.struct_stats) {
-                // JSON output disables metadata filtering, not the data-row predicate.
-                (true, StructStats::None) => (None, None),
-                (false, _) => (
-                    scan.state_info.physical_stats_read_schema(),
-                    stats_skipping_predicate(&scan.state_info),
-                ),
-                (true, _) => {
-                    return Err(KernelError::unsupported(
-                        "declarative metadata scans cannot output both JSON and structured stats",
-                    ));
-                }
-            };
+        let (pre_filter_stats_schema, stats_filter) = if scan.stats.synthesize_json {
+            // JSON output disables metadata filtering, not the data-row predicate.
+            (None, None)
+        } else {
+            (
+                scan.state_info.physical_stats_read_schema(),
+                stats_skipping_predicate(&scan.state_info),
+            )
+        };
         let parsed_partition_schema = (stats_filter.is_some()
             || scan.partition_values.parsed_struct)
             .then(|| scan.state_info.physical_partition_schema.as_ref())
@@ -210,40 +205,37 @@ impl<'a> MetadataPlanner<'a> {
         mut stats: StatsKind,
         has_struct_partitions: bool,
     ) -> KernelResult<(PlanBuilder, StatsKind)> {
+        let pre_filter_stats_schema = self
+            .pre_filter_stats_schema
+            .filter(|_| stats == StatsKind::Json);
+        let parsed_partition_schema = self
+            .parsed_partition_schema
+            .filter(|_| !has_struct_partitions);
         let plan = plan.project_patch(|patch| {
-            patch
-                .fold_with(
-                    self.pre_filter_stats_schema
-                        .filter(|_| stats == StatsKind::Json),
-                    |patch, schema| {
-                        stats = StatsKind::Struct;
-                        patch.drop_at([ADD_NAME], STATS).append_at(
-                            [ADD_NAME],
-                            StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
-                            Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
-                        )
-                    },
+            let patch = patch.fold_with(pre_filter_stats_schema, |patch, schema| {
+                stats = StatsKind::Struct;
+                patch.drop_at([ADD_NAME], STATS).append_at(
+                    [ADD_NAME],
+                    StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
+                    Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
                 )
-                .fold_with(
-                    self.parsed_partition_schema
-                        .filter(|_| !has_struct_partitions),
-                    |patch, schema| {
-                        patch.append_at(
-                            [ADD_NAME],
-                            StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                            Expr::map_to_struct(
-                                col!(ADD_NAME, PARTITION_VALUES),
-                                MapToStructOptions::default(),
-                            ),
-                        )
-                    },
+            });
+            let patch = patch.fold_with(parsed_partition_schema, |patch, schema| {
+                patch.append_at(
+                    [ADD_NAME],
+                    StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
+                    Expr::map_to_struct(
+                        col!(ADD_NAME, PARTITION_VALUES),
+                        MapToStructOptions::default(),
+                    ),
                 )
-                .fold_with(self.stats_filter.as_ref(), |patch, _| {
-                    patch.append(
-                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                        Expr::from(col!("add.path").is_not_null()),
-                    )
-                })
+            });
+            patch.fold_with(self.stats_filter.as_ref(), |patch, _| {
+                patch.append(
+                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                    Expr::from(col!("add.path").is_not_null()),
+                )
+            })
         })?;
         Ok((plan, stats))
     }
@@ -270,26 +262,44 @@ impl<'a> MetadataPlanner<'a> {
     ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
     /// >
     /// ```
-    /// Stats output may contain neither representation, JSON only, or parsed only. Parsed partition
-    /// values are selected independently and omitted for unpartitioned tables. Fields needed only
-    /// for pruning are omitted. Source-specific top-level columns remain available for replay.
+    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
+    /// partition values are selected independently and omitted for unpartitioned tables. Fields
+    /// needed only for pruning are omitted. Source-specific top-level columns remain for replay.
     fn project_post_stats_filter(
         &self,
         plan: PlanBuilder,
-        stats: StatsKind,
+        mut stats: StatsKind,
     ) -> KernelResult<PlanBuilder> {
         let output_stats_schema = self.scan.state_info.physical_stats_output_schema();
 
-        plan.project_patch(|mut patch| {
-            if self.scan.stats.synthesize_json && stats == StatsKind::Struct {
-                patch = patch.insert_after_at(
-                    [ADD_NAME],
-                    "dataChange",
-                    StructField::nullable(STATS, DataType::STRING),
-                    Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
-                );
-            }
+        let plan = if self.scan.stats.synthesize_json && stats == StatsKind::Struct {
+            stats = StatsKind::Json;
+            plan.project_patch(|patch| {
+                patch
+                    .insert_after_at(
+                        [ADD_NAME],
+                        "dataChange",
+                        StructField::nullable(STATS, DataType::STRING),
+                        Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED)),
+                    )
+                    .drop_at([ADD_NAME], STATS_PARSED)
+            })?
+        } else {
+            plan
+        };
 
+        plan.project_patch(|mut patch| {
+            // TODO: Remove both-output compatibility once legacy connectors use structured stats.
+            // Parse only at the output boundary, preserving full JSON even for a structured subset.
+            if stats == StatsKind::Json {
+                patch = patch.fold_with(output_stats_schema, |patch, schema| {
+                    patch.append_at(
+                        [ADD_NAME],
+                        StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
+                        Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
+                    )
+                });
+            }
             if stats == StatsKind::Struct && output_stats_schema.is_none() {
                 patch = patch.drop_at([ADD_NAME], STATS_PARSED);
             }
@@ -325,14 +335,9 @@ impl<'a> MetadataPlanner<'a> {
         output: &StructType,
         parent: &mut Vec<String>,
     ) -> ProjectionStructPatchBuilder<'s> {
-        if read == output {
-            return patch;
-        }
         for field in read.fields() {
-            match (
-                field.data_type(),
-                output.field(field.name()).map(StructField::data_type),
-            ) {
+            let output = output.field(field.name()).map(StructField::data_type);
+            match (field.data_type(), output) {
                 (_, None) => patch = patch.drop_at(parent.as_slice(), field.name()),
                 (DataType::Struct(read), Some(DataType::Struct(output))) => {
                     parent.push(field.name().to_owned());
@@ -662,12 +667,11 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
-    use crate::scan::{PartitionValuesOptions, StatsOptions};
+    use crate::scan::{build_stats_output_schemas, PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, create_log_path, MockProtocolBuilder,
-        MockTableConfigurationBuilder,
+        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
     use crate::{Engine as _, Result};
 
@@ -825,21 +829,6 @@ mod tests {
         Ok(())
     }
 
-    fn struct_stats_schema() -> SchemaRef {
-        let segment = log_segment(log_root(), &[], None);
-        mock_snapshot(segment)
-            .unwrap()
-            .scan_builder()
-            .with_predicate(Arc::new(col!("x").gt(lit(5i64))))
-            .with_stats(StatsOptions::all_struct())
-            .build()
-            .unwrap()
-            .state_info
-            .physical_stats_read_schema()
-            .cloned()
-            .expect("stats schema")
-    }
-
     // Commit-arm operator sequence without optional pruning or metadata transformations.
     const COMMIT_ARM_TAGS: &[&str] = &[
         "scan_json", // commits
@@ -886,16 +875,33 @@ mod tests {
     fn metadata_plan_checkpoint_metadata_columns(
         #[case] parsed_partitions: Option<SchemaRef>,
         #[case] expect_native_partitions: bool,
-        #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
+        #[values(false, true)] native_stats: bool,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
         #[values(StatsOptions::all_struct(), StatsOptions::json_only())] stats: StatsOptions,
         #[values(true, false)] source_json_stats: bool,
+        #[values(1, 32)] width: usize,
     ) -> Result<()> {
-        let expect_struct_stats =
-            parsed_stats.is_some() && (!stats.synthesize_json || !source_json_stats);
+        let expect_struct_stats = native_stats && (!stats.synthesize_json || !source_json_stats);
         let partition_values = PartitionValuesOptions::with_struct();
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
-        let scan = mock_snapshot(segment)?
+        let table_schema = StructType::new_unchecked(partitioned_schema().fields().cloned().chain(
+            (1..width).map(|index| StructField::nullable(format!("c{index}"), DataType::LONG)),
+        ));
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(table_schema)
+            .with_partition_columns(["p"])
+            .with_table_root("memory:///")
+            .try_build()?;
+        let parsed_stats = if native_stats {
+            Some(
+                build_stats_output_schemas(&config, &StatsOptions::all_struct())?
+                    .expect("stats schema")
+                    .physical,
+            )
+        } else {
+            None
+        };
+        let scan = Arc::new(Snapshot::new(segment, config)?)
             .scan_builder()
             .with_stats(stats)
             .with_partition_values(partition_values)
@@ -946,7 +952,23 @@ mod tests {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operator::Project(project) => Some(project.expr.to_string()),
+                Operator::Project(project) => {
+                    let expression = project.expr.to_string();
+                    if expect_struct_stats
+                        && !scan.stats.synthesize_json
+                        && project.schema.field(ADD_NAME).is_some()
+                    {
+                        assert!(!expression.contains("PARSE_JSON"));
+                        assert!(!expression.contains(STATS_PARSED));
+                        let Expr::StructPatch(patch) = project.expr.as_ref() else {
+                            panic!("metadata projections should use sparse struct patches");
+                        };
+                        if expect_native_partitions {
+                            assert!(!patch.field_patches.contains_key(ADD_NAME));
+                        }
+                    }
+                    Some(expression)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -956,56 +978,6 @@ mod tests {
             !expect_native_partitions
         );
         assert!(!normalization.contains("COALESCE"));
-        Ok(())
-    }
-
-    #[test]
-    fn native_struct_stats_output_patch_is_sparse_and_width_independent() -> Result<()> {
-        let mut projections = Vec::new();
-        for width in [1, 32] {
-            let table_schema = StructType::new_unchecked(
-                (0..width).map(|index| StructField::nullable(format!("c{index}"), DataType::LONG)),
-            );
-            let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
-            let config = MockTableConfigurationBuilder::new()
-                .with_schema(table_schema)
-                .try_build()?;
-            let scan = Arc::new(Snapshot::new(segment, config)?)
-                .scan_builder()
-                .with_stats(StatsOptions::all_struct())
-                .build()?;
-            let native_stats = scan
-                .state_info
-                .physical_stats_read_schema()
-                .cloned()
-                .expect("all-struct output has a stats schema");
-            let plan = scan
-                .build_metadata_scan_plan(&shape(CheckpointType::Leaf, Some(native_stats)))?
-                .expect("checkpoint plan");
-
-            let mut expressions = Vec::new();
-            for node in &plan.nodes {
-                match &node.op {
-                    Operator::ScanParquet(read) => {
-                        let add = add_struct(&read.schema);
-                        assert!(add.contains(STATS_PARSED));
-                        assert!(!add.contains(STATS));
-                    }
-                    Operator::Project(project) => {
-                        assert!(!project.expr.to_string().contains("PARSE_JSON"));
-                        let Expr::StructPatch(patch) = project.expr.as_ref() else {
-                            panic!("metadata projections should use sparse struct patches");
-                        };
-                        assert!(!patch.field_patches.contains_key(ADD_NAME));
-                        expressions.push(project.expr.clone());
-                    }
-                    _ => {}
-                }
-            }
-            projections.push(expressions);
-        }
-
-        assert_eq!(projections[0], projections[1]);
         Ok(())
     }
 
@@ -1139,6 +1111,8 @@ mod tests {
     #[case::prunes_non_matching_file(StatsOptions::all_struct(), col!("x").gt(lit(20i64)), 0)]
     #[case::json_ignores_predicate(StatsOptions::json_only(), col!("x").gt(lit(20i64)), 1)]
     #[case::json_ignores_false(StatsOptions::json_only(), Predicate::FALSE, 1)]
+    #[case::both_ignores_predicate(StatsOptions::all(), col!("x").gt(lit(20i64)), 1)]
+    #[case::both_ignores_false(StatsOptions::all(), Predicate::FALSE, 1)]
     fn metadata_plan_executes_leaf_without_stats_parsed(
         #[case] stats: StatsOptions,
         #[case] predicate: Predicate,
@@ -1165,12 +1139,10 @@ mod tests {
             .expect("non-empty");
 
         for node in &plan.nodes {
-            let schema = match &node.op {
-                Operator::ScanParquet(scan) => &scan.schema,
-                Operator::Project(project) => &project.schema,
-                _ => continue,
+            let Operator::ScanParquet(read) = &node.op else {
+                continue;
             };
-            let add = add_struct(schema);
+            let add = add_struct(&read.schema);
             assert!(!add.contains(STATS) || !add.contains(STATS_PARSED));
         }
         assert_eq!(
@@ -1188,19 +1160,6 @@ mod tests {
             Ok::<_, KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
         })?;
         assert_eq!(actual_rows, expected_rows);
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_plan_rejects_multiple_stats_representations() -> Result<()> {
-        let scan = mock_snapshot(log_segment(log_root(), &[], None))?
-            .scan_builder()
-            .with_stats(StatsOptions::all())
-            .build()?;
-        assert_result_error_with_message(
-            scan.build_metadata_scan_plan(&no_checkpoint()),
-            "cannot output both JSON and structured stats",
-        );
         Ok(())
     }
 }
